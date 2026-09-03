@@ -1,0 +1,39 @@
+package trove:plugin@0.1.0;
+
+/// RGBA 颜色。
+record rgba {
+    r: u8,
+    g: u8,
+    b: u8,
+    a: u8,
+}
+
+/// 解码后的 RGBA8 图像。
+record decoded-image {
+    /// RGBA8 像素，长度 = width * height * 4。
+    data: list<u8>,
+    width: u32,
+    height: u32,
+}
+
+/// 图像元数据（建索引用，不参与渲染）。
+record image-meta {
+    width: u32,
+    height: u32,
+    color-space: option<string>,
+    /// 预留：主色（v2 颜色筛选）。
+    dominant-colors: list<rgba>,
+}
+
+interface format {
+    /// 支持的文件扩展名（不含点，小写）。
+    extensions: func() -> list<string>;
+    /// 解码为 RGBA8。
+    decode: func(bytes: list<u8>) -> result<decoded-image, string>;
+    /// 提取元数据。
+    extract-meta: func(bytes: list<u8>) -> result<image-meta, string>;
+}
+
+world format-plugin {
+    export format;
+}
