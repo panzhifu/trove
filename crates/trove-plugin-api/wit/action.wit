@@ -1,0 +1,18 @@
+package trove:plugin@0.1.0;
+
+/// 动作执行结果。
+record action-result {
+    success: bool,
+    message: string,
+    /// 输出字节（压缩/转换后的文件）；失败或无输出时为 none。
+    output: option<list<u8>>,
+}
+
+interface action {
+    /// 执行动作。params 为 JSON 字符串（v1 简化）。
+    run: func(bytes: list<u8>, params: string) -> result<action-result, string>;
+}
+
+world action-plugin {
+    export action;
+}

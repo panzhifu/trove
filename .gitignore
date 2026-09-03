@@ -1,0 +1,7 @@
+/target
+
+# 技能安装产物：由 `npx skills add` / WorkBuddy 安装，内容是第三方 Markdown，不该进仓库。
+# 只忽略 skills 子目录，保留 .claude/ 下可能存在的自有配置。
+.claude/skills/
+.agents/
+.workbuddy/skills/

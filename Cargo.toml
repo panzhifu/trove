@@ -1,0 +1,11 @@
+[workspace]
+members = ["crates/trove-core", "crates/trove-plugin-api"]
+resolver = "2"
+
+[package]
+name = "trove"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+trove-core = { path = "crates/trove-core" }
