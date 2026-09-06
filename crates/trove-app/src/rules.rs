@@ -501,7 +501,6 @@ pub fn open_rule_editor(
     draft.update(cx, |d, _| d._subs = subs);
 
     window.open_dialog(cx, move |dialog, _, cx| {
-        // Recompute the live count when the draft moved since the last draw.
         draft.update(cx, RuleDraft::recompute_if_stale);
         let (and_mode, status, _color) = {
             let d = draft.read(cx);
