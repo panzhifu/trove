@@ -11,8 +11,8 @@
 |---|---|---|---|
 | 资产编辑（title / description / source_url / kind） | `AssetPatch` | ✅ | Inspector 编辑区，失焦/回车保存，空值清空列 |
 | 评分 rating（0–5） | `Asset.rating` / `AssetPatch.rating` | ✅ | 五角星行，点击当前最高星清除 |
-| 智能集合创建 / 编辑 / 重命名 | `Library::create_smart_collection` / `rename_smart_collection` | ⬜ | 只能浏览与删除；无"保存当前搜索为智能集合" |
-| 批量收藏 | `Library::set_assets_favorite`（batch.rs） | ⬜ | 收藏只对单资产 |
+| 智能集合创建 / 编辑 / 重命名 | `Library::create_smart_collection` / `rename_smart_collection` | ✅ | 搜索框激活时「+」保存为智能集合；右键重命名（行内编辑） |
+| 批量收藏 | `Library::set_assets_favorite`（batch.rs） | ✅ | 多选浮动工具栏 |
 | 从集合移出资产 | `collections::remove_asset` | ⬜ | 只能加入 |
 | 集合拖拽重排 / 改父级 | `collections::move_to` | ⬜ | 集合树固定两层、不可拖动 |
 | 收藏视图 / 类型过滤 | `AssetQuery.is_favorite` / `kind` | ⬜ | 无收藏视图、无类型筛选 |
@@ -35,8 +35,8 @@
 | 网格虚拟化 | ✅ | `gpui::list` 变高虚拟列表，justify 行结构冻结复用 |
 | 分页加载 | ✅ | 每页 200，滚动接近底部自动追加 |
 | 菜单栏 File / Edit / View / Help | ✅ | `set_menus` + gpui-kit `AppMenuBar` |
-| 多选工具栏 | ⬜ | 多选后无浮动批量操作栏 |
-| Shift 范围选择 | ⬜ | |
+| 多选工具栏 | ✅ | 选中 ≥2 项时底部浮动：计数/收藏/加入收藏夹/回收站/清除 |
+| Shift 范围选择 | ✅ | 锚点 + 展示顺序范围替换 |
 | 排序 / 视图切换（网格/列表） | ⬜ | 顺序固定 |
 | 拖拽集合重排 / 标签拖出 | ⬜ | 仅资产可拖 |
 | 状态栏（选中数 / 库路径 / 导入状态） | ⬜ | |
@@ -46,7 +46,7 @@
 
 ## 三、工程性问题
 
-- 非图片单元格图标恒为 `FileText`（`panels/common.rs` `kind_icon` 忽略参数）—— ⬜
+- 非图片单元格图标恒为 `FileText`（`panels/common.rs` `kind_icon` 忽略参数）—— ✅ 已按类型映射（含新增字体类型）
 - 大量 `eprintln!` 代替结构化日志 / 通知 —— ⬜
 - 搜索输入框聚焦时全局快捷键仍注册（依赖 key context 隔离，注意回归） —— 🚧
 

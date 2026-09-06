@@ -20,6 +20,10 @@ thiserror = "2"
 uuid = { version = "1", features = ["v4", "serde"] }
 dirs = "5"
 
+# Media probing
+ttf-parser = "0.25"
+mp4 = "0.14"
+
 # i18n
 rust-i18n = "4.2"
 sys-locale = "0.3"

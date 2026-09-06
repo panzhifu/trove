@@ -18,7 +18,7 @@ use gpui_kit::component::dock::{BasePanel, Panel as DockPanel, PanelControl, Pan
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::WindowExt as _;
 use gpui_kit::component::Sizable;
-use gpui_kit::component::menu::{ContextMenuExt as _, PopupMenu, PopupMenuItem};
+use gpui_kit::component::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenu, PopupMenuItem};
 use gpui_kit::component::popover::Popover;
 use gpui_kit::component::{ActiveTheme, Icon, IconName};
 use gpui_kit::*;
@@ -35,7 +35,8 @@ use trove_core::layout::{
     GRID_GAP, MAX_ROW_HEIGHT, MIN_ASPECT, MIN_ROW_HEIGHT, TARGET_ROW_HEIGHT, RowLayout,
     justify_layout,
 };
-use trove_core::model::{AssetKind, AssetPatch, AssetQuery};
+use trove_core::model::{AssetKind, AssetPatch, AssetQuery, NewSmartCollection};
+use serde_json::json;
 use trove_core::store::{assets, collections, smart_collections};
 use uuid::Uuid;
 
@@ -173,7 +174,7 @@ impl DockPanel for WorkspacePanel {
     /// `overflow_hidden` container, so the buttons are always visible.
     fn title_suffix(
         &mut self,
-        _: &mut Window,
+        _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<impl IntoElement> {
         let ctl = self.controller.read(cx);
@@ -257,6 +258,16 @@ impl DockPanel for WorkspacePanel {
                 })
                 .when(search_active, |this| {
                     this.child(
+                        Button::new("save-smart")
+                            .ghost()
+                            .xsmall()
+                            .icon(IconName::Plus)
+                            .tooltip(rust_i18n::t!("workspace.save_as_smart").to_string())
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.save_search_as_smart(window, cx);
+                            })),
+                    )
+                    .child(
                         Button::new("clear-search")
                             .ghost()
                             .xsmall()
@@ -265,9 +276,9 @@ impl DockPanel for WorkspacePanel {
                             .on_click(move |_, window, cx| {
                                 controller.update(cx, |ctl, _| ctl.set_search(String::new()));
                                 input.update(cx, |state, cx| state.set_value("", window, cx));
-                            }),
+                            })
                     )
-                }),
+                })
         )
     }
 }
@@ -310,6 +321,57 @@ impl WorkspacePanel {
         })
         .detach();
         this
+    }
+
+    /// Save the active full-text search as a smart collection. The stored
+    /// query tree uses the same `fts_query` the live search runs, so the
+    /// saved results match 1:1 and track future imports.
+    fn save_search_as_smart(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let search = self.controller.read(cx).search_text.trim().to_string();
+        if search.is_empty() {
+            return;
+        }
+        let name_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder(rust_i18n::t!("explorer.name_placeholder").to_string())
+        });
+        let ctl = self.controller.clone();
+        window.open_dialog(cx, move |dialog, _, _| {
+            dialog
+                .title(rust_i18n::t!("workspace.save_as_smart").to_string())
+                .width(px(380.))
+                .child(Input::new(&name_input).small().appearance(true))
+                .on_ok({
+                    let name_input = name_input.clone();
+                    let ctl = ctl.clone();
+                    let search = search.clone();
+                    move |_, _, cx| {
+                        let name: String = name_input.read(cx).value().trim().to_string();
+                        if !name.is_empty() {
+                            ctl.update(cx, |ctl, cx| {
+                                let input = NewSmartCollection {
+                                    name,
+                                    query: json!({
+                                        "op": "match",
+                                        "field": "text",
+                                        "value": search,
+                                    }),
+                                    color: None,
+                                    position: 0,
+                                };
+                                match ctl.library.create_smart_collection(&input) {
+                                    Ok(_) => {
+                                        ctl.generation += 1;
+                                        cx.notify();
+                                    }
+                                    Err(e) => eprintln!("create smart collection: {e}"),
+                                }
+                            });
+                        }
+                        true
+                    }
+                })
+        });
     }
 
     fn empty_trash(&mut self, cx: &mut Context<Self>) {
@@ -481,7 +543,7 @@ impl WorkspacePanel {
 impl Render for WorkspacePanel {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // --- context snapshot (drop the controller borrow early) -----------
-        let (collection, active_tag, in_trash, search, smart, grid_loaded) = {
+        let (collection, active_tag, in_trash, search, smart, grid_loaded, selected) = {
             let ctl = self.controller.read(cx);
             (
                 ctl.current_collection,
@@ -490,6 +552,7 @@ impl Render for WorkspacePanel {
                 ctl.search_text.trim().to_string(),
                 ctl.active_smart,
                 ctl.grid_loaded,
+                ctl.selected_assets.clone(),
             )
         };
         let library_root = self.controller.read(cx).library.root().to_path_buf();
@@ -593,7 +656,18 @@ impl Render for WorkspacePanel {
             let old_rows = self.rows.len();
             self.rows = Rc::new(refill_rows(cells, &counts, content_width));
             self.covered = self.rows.iter().map(|r| r.cells.len()).sum();
-            self.list_state.splice(old_rows..self.rows.len(), self.rows.len());
+            // The frozen head rows are untouched; only the tail changed size.
+            // splice(start..end, count) replaces [start, end) with `count`
+            // items, so "append N rows" must replace an empty tail range with
+            // exactly N items — the old call double-counted the tail and
+            // corrupted the list state (sum_tree seek panic on the next
+            // layout).
+            let new_rows = self.rows.len();
+            if new_rows >= old_rows {
+                self.list_state.splice(old_rows..old_rows, new_rows - old_rows);
+            } else {
+                self.list_state.splice(new_rows..old_rows, 0);
+            }
         }
         let rows = self.rows.clone();
         self.last_total = total;
@@ -611,6 +685,7 @@ impl Render for WorkspacePanel {
         // --- virtualized list -----------------------------------------------------
         let list_state = self.list_state.clone();
         let controller = self.controller.clone();
+        let toolbar_controller = controller.clone();
         let focus_handle = self.focus_handle.clone();
         let rows_for_render = rows.clone();
         let rows_len = rows.len();
@@ -684,6 +759,7 @@ impl Render for WorkspacePanel {
             .child(
                 div()
                     .id("assets-grid-area")
+                    .relative()
                     .flex_1()
                     .min_h_0()
                     .overflow_hidden()
@@ -702,7 +778,13 @@ impl Render for WorkspacePanel {
                             });
                         }
                     })
-                    .child(grid),
+                    // The toolbar must come AFTER the grid: later siblings
+                    // paint on top, and the bar has to float over the cells.
+                    .child(grid)
+                    .when(selected.len() >= 2, |area| {
+                        let ids = selected.clone();
+                        area.child(selection_toolbar(&toolbar_controller, in_trash, ids, cx))
+                    }),
             )
     }
 }
@@ -781,6 +863,188 @@ fn fit_row(aspects: &[f32], content_width: f32) -> RowLayout {
     }
 }
 
+/// Floating batch-action bar over the grid while two or more assets are
+/// selected. Every action hits the existing batch APIs, then deselects.
+fn selection_toolbar(
+    controller: &Entity<LibraryController>,
+    in_trash: bool,
+    ids: Vec<Uuid>,
+    cx: &App,
+) -> Div {
+    let count = ids.len();
+    let all_favorite = if in_trash {
+        false
+    } else {
+        let conn = controller.read(cx).library.store().conn();
+        assets::by_ids(conn, &ids)
+            .map(|list| list.iter().all(|a| a.is_favorite))
+            .unwrap_or(false)
+    };
+    let ctl_fav = controller.clone();
+    let ctl_trash = controller.clone();
+    let ctl_restore = controller.clone();
+    let ctl_purge = controller.clone();
+    let ctl_add = controller.clone();
+    let ctl_clear = controller.clone();
+
+    let mut bar = h_flex()
+        .items_center()
+        .gap_1()
+        .px_2()
+        .py_1()
+        .rounded_full()
+        .bg(cx.theme().background)
+        .border_1()
+        .border_color(cx.theme().border)
+        .shadow_lg()
+        .child(
+            div()
+                .px_1()
+                .text_xs()
+                .text_color(cx.theme().muted_foreground)
+                .child(rust_i18n::t!("workspace.selected_many", count = count).to_string()),
+        );
+
+    if in_trash {
+        bar = bar
+            .child(
+                Button::new("sel-restore")
+                    .xsmall()
+                    .ghost()
+                    .icon(IconName::Undo)
+                    .tooltip(rust_i18n::t!("workspace.restore").to_string())
+                    .on_click(move |_, _, cx| {
+                        ctl_restore.update(cx, |ctl, cx| {
+                            let ids = std::mem::take(&mut ctl.selected_assets);
+                            let _ = ctl.library.restore_assets(&ids);
+                            ctl.selection_anchor = None;
+                            ctl.generation += 1;
+                            cx.notify();
+                        });
+                    }),
+            )
+            .child(
+                Button::new("sel-purge")
+                    .xsmall()
+                    .ghost()
+                    .icon(IconName::Delete)
+                    .tooltip(rust_i18n::t!("workspace.delete_forever").to_string())
+                    .on_click(move |_, _, cx| {
+                        ctl_purge.update(cx, |ctl, cx| {
+                            let ids = std::mem::take(&mut ctl.selected_assets);
+                            if let Err(e) = ctl.library.purge_assets(&ids) {
+                                eprintln!("purge selection: {e}");
+                            }
+                            ctl.selection_anchor = None;
+                            ctl.generation += 1;
+                            cx.notify();
+                        });
+                    }),
+            );
+    } else {
+        bar = bar
+            .child(
+                Button::new("sel-fav")
+                    .xsmall()
+                    .ghost()
+                    .icon(if all_favorite {
+                        IconName::HeartOff
+                    } else {
+                        IconName::Heart
+                    })
+                    .tooltip(rust_i18n::t!(if all_favorite {
+                        "workspace.remove_from_favorites"
+                    } else {
+                        "workspace.add_to_favorites"
+                    }).to_string())
+                    .on_click(move |_, _, cx| {
+                        ctl_fav.update(cx, |ctl, cx| {
+                            let ids = ctl.selected_assets.clone();
+                            let _ = ctl.library.set_assets_favorite(&ids, !all_favorite);
+                            ctl.generation += 1;
+                            cx.notify();
+                        });
+                    }),
+            )
+            .child(
+                Button::new("sel-add")
+                    .xsmall()
+                    .ghost()
+                    .icon(IconName::Plus)
+                    .tooltip(rust_i18n::t!("workspace.add_to_collection").to_string())
+                    .dropdown_menu_with_anchor(Anchor::TopLeft, move |menu, _, cx| {
+                        let conn = ctl_add.read(cx).library.store().conn();
+                        let mut items: Vec<(Uuid, String)> = Vec::new();
+                        if let Ok(roots) = collections::roots(conn) {
+                            for root in roots {
+                                items.push((root.id, root.name.clone()));
+                                if let Ok(children) = collections::children_of(conn, Some(root.id)) {
+                                    for child in children {
+                                        items.push((child.id, child.name.clone()));
+                                    }
+                                }
+                            }
+                        }
+                        let mut menu = menu.min_w(px(180.));
+                        if items.is_empty() {
+                            menu = menu.item(PopupMenuItem::label(
+                                rust_i18n::t!("workspace.no_collections").to_string(),
+                            ));
+                        }
+                        for (cid, cname) in items {
+                            let ctl = ctl_add.clone();
+                            menu = menu.item(PopupMenuItem::new(cname).on_click(move |_, _, cx| {
+                                ctl.update(cx, |ctl, cx| {
+                                    let ids = ctl.selected_assets.clone();
+                                    let _ = ctl.library.add_assets_to_collection(cid, &ids);
+                                    ctl.generation += 1;
+                                    cx.notify();
+                                });
+                            }));
+                        }
+                        menu
+                    }),
+            )
+            .child(
+                Button::new("sel-trash")
+                    .xsmall()
+                    .ghost()
+                    .icon(IconName::Delete)
+                    .tooltip(rust_i18n::t!("app.move_to_trash").to_string())
+                    .on_click(move |_, _, cx| {
+                        ctl_trash.update(cx, |ctl, cx| {
+                            ctl.trash_or_purge_selection();
+                            ctl.selection_anchor = None;
+                            cx.notify();
+                        });
+                    }),
+            );
+    }
+
+    let bar = bar.child(
+        Button::new("sel-clear")
+            .xsmall()
+            .ghost()
+            .label("×")
+            .tooltip(rust_i18n::t!("app.clear_selection").to_string())
+            .on_click(move |_, _, cx| {
+                ctl_clear.update(cx, |ctl, cx| {
+                    ctl.clear_selection();
+                    cx.notify();
+                });
+            }),
+    );
+
+    div()
+        .absolute()
+        .left_0()
+        .right_0()
+        .bottom_3()
+        .flex()
+        .justify_center()
+        .child(bar)
+}
+
 // ============================ cell rendering =================================
 
 /// One cell thumbnail with click / drag / context-menu behavior, rendered at
@@ -835,7 +1099,11 @@ fn build_cell_element(
         let m = event.modifiers();
         let multi = m.control || m.platform;
         ctl_click.update(_cx, move |ctl, _| {
-            if multi {
+            if m.shift {
+                // Range select: anchor (last plain click) to this cell in
+                // display order, replacing the selection.
+                ctl.select_range_to(id_click);
+            } else if multi {
                 ctl.toggle_asset(id_click);
             } else {
                 ctl.select_asset(Some(id_click));

@@ -124,6 +124,44 @@ mod tests {
     }
 
     #[test]
+    fn font_kind_roundtrips_and_filters() {
+        let store = Store::in_memory().unwrap();
+        assets::insert(store.conn(), &sample_asset("Inter.ttf", AssetKind::Font)).unwrap();
+        assets::insert(store.conn(), &sample_asset("a.png", AssetKind::Image)).unwrap();
+
+        let (total, list) = assets::query(
+            store.conn(),
+            &AssetQuery {
+                kind: Some(AssetKind::Font),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(total, 1);
+        assert_eq!(list[0].kind, AssetKind::Font);
+        // A patch can move an asset into (and back out of) the new kind.
+        let id = list[0].id;
+        assets::update(
+            store.conn(),
+            id,
+            &AssetPatch {
+                kind: Some(AssetKind::Document),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let (total, _) = assets::query(
+            store.conn(),
+            &AssetQuery {
+                kind: Some(AssetKind::Font),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(total, 0);
+    }
+
+    #[test]
     fn migrations_run_and_store_reopens() {
         let store = Store::in_memory().unwrap();
         assert_eq!(store.user_version().unwrap(), schema::SCHEMA_VERSION);

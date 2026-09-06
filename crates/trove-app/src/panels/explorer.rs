@@ -31,6 +31,7 @@ enum EditorMode {
     /// right-click "New collection inside" sets it to that folder.
     Adding { parent: Option<Uuid> },
     Renaming(Uuid),
+    RenamingSmart(Uuid),
 }
 
 pub struct ExplorerPanel {
@@ -95,6 +96,22 @@ impl ExplorerPanel {
         self.open_add(Some(parent), window, cx);
     }
 
+    /// Right-click → Rename on a smart collection: same inline editor.
+    pub fn begin_rename_smart(
+        &mut self,
+        id: Uuid,
+        name: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.editor_input.update(cx, |state, cx| {
+            state.set_value(name, window, cx);
+        });
+        self.mode = EditorMode::RenamingSmart(id);
+        self.focus_editor(window, cx);
+        cx.notify();
+    }
+
     /// Right-click → Rename: the row becomes a prefilled, focused editor.
     fn begin_rename(&mut self, id: Uuid, name: String, window: &mut Window, cx: &mut Context<Self>) {
         self.editor_input.update(cx, |state, cx| {
@@ -143,6 +160,12 @@ impl ExplorerPanel {
             EditorMode::Renaming(id) => {
                 self.controller.update(cx, |ctl, cx| {
                     let _ = collections::rename(ctl.library.store().conn(), id, &name);
+                    cx.notify();
+                });
+            }
+            EditorMode::RenamingSmart(id) => {
+                self.controller.update(cx, |ctl, cx| {
+                    let _ = smart_collections::rename(ctl.library.store().conn(), id, &name);
                     cx.notify();
                 });
             }
@@ -373,6 +396,7 @@ impl Render for ExplorerPanel {
         // Smart collections: saved searches, activated live against the library.
         items.push(separator_label(cx, rust_i18n::t!("panel.smart").to_string()).into_any_element());
         for (sid, sname) in smart_rows {
+            let menu_name = sname.clone();
             let controller = self.controller.clone();
             items.push(
                 selectable_row(
@@ -386,8 +410,10 @@ impl Render for ExplorerPanel {
                     }),
                     Some({
                         let controller = self.controller.clone();
+                        let explorer = cx.entity();
+                        let menu_name = menu_name.clone();
                         Box::new(move |menu, window, cx| {
-                            smart_menu(menu, window, cx, &controller, sid)
+                            smart_menu(menu, window, cx, &controller, &explorer, sid, menu_name.clone())
                         })
                     }),
                 )
@@ -490,10 +516,22 @@ fn smart_menu(
     _window: &mut Window,
     _cx: &mut Context<PopupMenu>,
     controller: &Entity<LibraryController>,
+    explorer: &Entity<ExplorerPanel>,
     id: Uuid,
+    name: String,
 ) -> PopupMenu {
+    let ctl_rename = explorer.clone();
     let ctl_delete = controller.clone();
     menu.min_w(px(160.))
+        .item(
+            PopupMenuItem::new(rust_i18n::t!("explorer.rename").to_string()).on_click(
+                move |_, window, cx| {
+                    ctl_rename.update(cx, |this, cx| {
+                        this.begin_rename_smart(id, name.clone(), window, cx);
+                    });
+                },
+            ),
+        )
         .item(
             PopupMenuItem::new(rust_i18n::t!("explorer.delete").to_string()).on_click(move |_, _, cx| {
                 ctl_delete.update(cx, move |ctl, cx| {

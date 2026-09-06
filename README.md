@@ -46,6 +46,16 @@ The first launch creates a library under the platform's config directory. Open *
 - Cascading delete removes child folders.
 - 删除父文件夹会级联删除子文件夹。
 
+### Asset types / 资产类型
+- Images, videos, audio, documents, archives, **fonts** (ttf/otf/ttc/woff), and more — with per-kind icons in the grid.
+- 图片、视频、音频、文档、压缩包、**字体**（ttf/otf/ttc/woff）等类型，网格中按类型显示图标。
+- Import-time mining: EXIF, audio tags & duration, font family/style/weight, MP4 dimensions & duration; video posters via the system `ffmpeg` when available.
+- 导入时挖掘元数据：EXIF、音频标签与时长、字体族/样式/字重、MP4 尺寸与时长；系统装有 `ffmpeg` 时自动生成视频封面。
+
+### Bulk selection / 批量操作
+- Multi-select with Ctrl/Cmd+click or Shift range click; a floating toolbar offers favorite / add-to-collection / trash / clear.
+- Ctrl/Cmd+点击或 Shift 范围选择；浮动工具栏提供收藏 / 加入收藏夹 / 移入回收站 / 清除。
+
 ### Tags & favorites & ratings / 标签、收藏与评分
 - Case-insensitive tags attach to any asset.
 - 标签不区分大小写，可附加到任意资产。

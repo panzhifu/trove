@@ -145,18 +145,31 @@ pub fn stage_source(root: &Path, src: &Path) -> Result<StagedFile> {
     let staged = blob::stage(src, root, &ext)?;
     let p = probe::probe(&ext);
     let blob_path = root.join(&staged.rel_path);
-    let (width, height) = if p.kind == AssetKind::Image {
-        match probe::image_dimensions(&blob_path) {
-            Some(d) => (Some(d.width), Some(d.height)),
-            None => (None, None),
-        }
-    } else {
-        (None, None)
+    let (width, height, video_duration_ms) = match p.kind {
+        AssetKind::Image => match probe::image_dimensions(&blob_path) {
+            Some(d) => (Some(d.width), Some(d.height), None),
+            None => (None, None, None),
+        },
+        // MP4-family containers carry track dimensions + duration in the moov
+        // box (pure-Rust read); other containers stay empty until probed.
+        AssetKind::Video => match probe::video_facts(&blob_path) {
+            Some(f) => (
+                Some(f.width),
+                Some(f.height),
+                f.duration_ms,
+            ),
+            None => (None, None, None),
+        },
+        _ => (None, None, None),
     };
     // Generate (or confirm) the thumbnail cache entry on the background thread.
     thumb::ensure(root, &staged.sha256, p.kind, &blob_path);
-    // Mine rich metadata (EXIF camera fields, audio tags/duration). Best-effort.
-    let mined = metadata::mine(&blob_path, p.kind);
+    // Mine rich metadata (EXIF camera fields, audio tags/duration, font
+    // tables, video container). Best-effort.
+    let mut mined = metadata::mine(&blob_path, p.kind);
+    if mined.duration_ms.is_none() {
+        mined.duration_ms = video_duration_ms;
+    }
 
     Ok(StagedFile {
         path: src.to_path_buf(),

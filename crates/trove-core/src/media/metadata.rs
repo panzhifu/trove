@@ -40,10 +40,67 @@ pub fn mine(path: &Path, kind: AssetKind) -> MinedMetadata {
     match kind {
         AssetKind::Image => mine_image(path),
         AssetKind::Audio => mine_audio(path).unwrap_or_default(),
-        // Video / document decoding is not implemented yet; they keep only the
-        // lightweight probe facts (mime, kind, dimensions).
+        AssetKind::Font => mine_font(path).unwrap_or_default(),
+        // Video duration rides the mp4 container when it is one (mkv/webm/avi
+        // fall back to defaults); documents keep only the probe facts.
+        AssetKind::Video => mine_video(path).unwrap_or_default(),
         _ => MinedMetadata::default(),
     }
+}
+
+// -- font ---------------------------------------------------------------------
+
+/// Read font facts (family, style, weight) from the name/OS2 tables via
+/// ttf-parser. Covers ttf/otf/ttc (first face) and woff; woff2 would need a
+/// Brotli decoder and stays metadata-less.
+fn mine_font(path: &Path) -> Option<MinedMetadata> {
+    let data = std::fs::read(path).ok()?;
+    let face = ttf_parser::Face::parse(&data, 0).ok()?;
+    let mut m = MinedMetadata::default();
+
+    // Prefer the Windows/English name records; any language beats none.
+    let named = |name_id| {
+        face.names()
+            .into_iter()
+            .filter(|n| n.name_id == name_id)
+            .find(|n| n.is_unicode())
+            .and_then(|n| n.to_string())
+            .or_else(|| {
+                face.names()
+                    .into_iter()
+                    .filter(|n| n.name_id == name_id)
+                    .find_map(|n| n.to_string())
+            })
+    };
+    let family = named(ttf_parser::name_id::TYPOGRAPHIC_FAMILY)
+        .or_else(|| named(ttf_parser::name_id::FAMILY));
+    let family = family?;
+    m.insert("font_family", family);
+    if let Some(style) = named(ttf_parser::name_id::TYPOGRAPHIC_SUBFAMILY)
+        .or_else(|| named(ttf_parser::name_id::SUBFAMILY))
+    {
+        m.insert("font_style", style);
+    }
+    let weight = face.weight().to_number();
+    if weight != 0 {
+        m.insert("font_weight", weight);
+    }
+    if face.style() == ttf_parser::Style::Italic {
+        m.insert("font_italic", true);
+    }
+    m.insert("font_glyphs", face.number_of_glyphs());
+    Some(m)
+}
+
+// -- video --------------------------------------------------------------------
+
+/// Container duration of an MP4-family file (dimensions are probed separately
+/// in `probe::video_facts` because they belong on the asset row).
+fn mine_video(path: &Path) -> Option<MinedMetadata> {
+    let facts = super::probe::video_facts(path)?;
+    let mut m = MinedMetadata::default();
+    m.duration_ms = facts.duration_ms;
+    Some(m)
 }
 
 // -- image -------------------------------------------------------------------
@@ -301,9 +358,51 @@ mod tests {
         let m = mine(&g, AssetKind::Audio);
         assert!(m.duration_ms.is_none());
         assert!(m.extra.is_empty());
-        for kind in [AssetKind::Video, AssetKind::Document, AssetKind::Archive, AssetKind::Other] {
+        for kind in [AssetKind::Video, AssetKind::Document, AssetKind::Archive, AssetKind::Font, AssetKind::Other] {
             assert_eq!(mine(&g, kind), MinedMetadata::default());
         }
+    }
+
+    #[test]
+    fn font_metadata_mines_family_from_a_real_face() {
+        // Hermetic when the system has no fonts: the assertions only run on a
+        // found face; otherwise the test only proves garbage never panics.
+        let face = find_system_font();
+        let Some(path) = face else { return };
+        let m = mine(&path, AssetKind::Font);
+        assert!(
+            m.extra.get("font_family").is_some_and(|v| v.as_str().is_some_and(|s| !s.is_empty())),
+            "family missing for {}",
+            path.display()
+        );
+    }
+
+    fn find_system_font() -> Option<std::path::PathBuf> {
+        fn walk(dir: &Path, depth: usize) -> Option<std::path::PathBuf> {
+            if depth > 4 {
+                return None;
+            }
+            let entries = std::fs::read_dir(dir).ok()?;
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir()
+                    && let Some(found) = walk(&path, depth + 1)
+                {
+                    return Some(found);
+                }
+                let is_face = path
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .is_some_and(|e| matches!(e, "ttf" | "otf"));
+                if is_face {
+                    return Some(path);
+                }
+            }
+            None
+        }
+        ["/usr/share/fonts", "/usr/local/share/fonts"]
+            .iter()
+            .find_map(|root| walk(std::path::Path::new(root), 0))
     }
 
     #[test]

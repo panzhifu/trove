@@ -42,6 +42,9 @@ pub struct LibraryController {
     /// Asset ids currently displayed by the workspace grid (this page only).
     /// Written by the panel each render; the source of Select-all.
     pub visible_assets: Vec<Uuid>,
+    /// The last clicked asset in the grid: the fixed end of a Shift range
+    /// selection. Cleared whenever the selection is cleared.
+    pub selection_anchor: Option<Uuid>,
     /// How many assets the grid has loaded so far (pagination cursor).
     pub grid_loaded: usize,
 }
@@ -59,6 +62,7 @@ impl LibraryController {
             search_text: String::new(),
             import_phase: ImportPhase::Idle,
             visible_assets: Vec::new(),
+            selection_anchor: None,
             grid_loaded: GRID_PAGE_SIZE,
         }
     }
@@ -141,6 +145,27 @@ impl LibraryController {
     /// Single click: select only `id` (`None` clears the selection).
     pub fn select_asset(&mut self, asset: Option<Uuid>) {
         self.selected_assets = asset.into_iter().collect();
+        self.selection_anchor = asset;
+        self.generation += 1;
+    }
+
+    /// Shift+click: replace the selection with the contiguous range between
+    /// the anchor and `id` in the grid's display order. Without an anchor
+    /// (or when either end is off-view) this degrades to a single select.
+    pub fn select_range_to(&mut self, id: Uuid) {
+        let anchor = self.selection_anchor;
+        let Some(start) = anchor.or(Some(id)) else { return };
+        let flat = &self.visible_assets;
+        let (a, b) = (
+            flat.iter().position(|&x| x == start),
+            flat.iter().position(|&x| x == id),
+        );
+        self.selected_assets = match (a, b) {
+            (Some(a), Some(b)) if a <= b => flat[a..=b].to_vec(),
+            (Some(a), Some(b)) => flat[b..=a].to_vec(),
+            _ => vec![id],
+        };
+        self.selection_anchor = Some(id);
         self.generation += 1;
     }
 
@@ -151,6 +176,7 @@ impl LibraryController {
         } else {
             self.selected_assets.push(id);
         }
+        self.selection_anchor = Some(id);
         self.generation += 1;
     }
 
@@ -187,6 +213,7 @@ impl LibraryController {
     pub fn clear_selection(&mut self) {
         if !self.selected_assets.is_empty() {
             self.selected_assets.clear();
+            self.selection_anchor = None;
             self.generation += 1;
         }
     }
