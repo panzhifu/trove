@@ -82,6 +82,8 @@ struct RuleDraft {
     rows: Vec<ConditionRow>,
     /// Tag names for the tag dropdown (snapshot at open).
     tag_names: Vec<String>,
+    /// Display color of the smart collection itself (`#rrggbb` or none).
+    color: Option<String>,
     /// Bumped by every mutation; the dialog recomputes the match count when
     /// it drifts from `evaluated`.
     revision: u64,
@@ -159,6 +161,11 @@ impl RuleDraft {
 
     fn set_and_mode(&mut self, and_mode: bool, cx: &mut Context<Self>) {
         self.and_mode = and_mode;
+        self.touch(cx);
+    }
+
+    fn set_color(&mut self, color: Option<String>, cx: &mut Context<Self>) {
+        self.color = color;
         self.touch(cx);
     }
 
@@ -340,6 +347,10 @@ pub fn open_rule_editor(
             .map(|list| list.into_iter().map(|t| t.name).collect())
             .unwrap_or_default()
     };
+    let color = editing
+        .as_ref()
+        .and_then(|sc| sc.color.clone())
+        .and_then(|c| normalize_color(&c));
     let draft = cx.new(|_| RuleDraft {
         controller,
         editing: editing.map(|sc| sc.id),
@@ -347,6 +358,7 @@ pub fn open_rule_editor(
         and_mode,
         rows,
         tag_names,
+        color,
         revision: 1,
         evaluated: 0,
         match_total: None,
@@ -356,9 +368,13 @@ pub fn open_rule_editor(
     window.open_dialog(cx, move |dialog, _, cx| {
         // Recompute the live count when the draft moved since the last draw.
         draft.update(cx, RuleDraft::recompute_if_stale);
-        let (and_mode, status) = {
+        let (and_mode, status, color) = {
             let d = draft.read(cx);
-            (d.and_mode, (d.match_total, d.error.clone()))
+            (
+                d.and_mode,
+                (d.match_total, d.error.clone()),
+                d.color.clone(),
+            )
         };
 
         dialog
@@ -371,7 +387,7 @@ pub fn open_rule_editor(
                 .to_string(),
             )
             .width(px(680.))
-            .child(render_body(&draft, and_mode, status, cx))
+            .child(render_body(&draft, and_mode, status, color, cx))
             .on_ok({
                 let draft = draft.clone();
                 move |_, _, cx| save_draft(&draft, cx)
@@ -405,14 +421,14 @@ fn save_draft(draft: &Entity<RuleDraft>, cx: &mut App) -> bool {
     let outcome = draft.update(cx, |d, cx| {
         let conn = d.controller.read(cx).library.store().conn();
         match d.editing {
-            Some(id) => smart_collections::update_query(conn, id, &json)
+            Some(id) => smart_collections::update_query(conn, id, &json, d.color.as_deref())
                 .map(|_| id)
                 .map_err(|e| e.to_string()),
             None => {
                 let input = trove_core::model::NewSmartCollection {
                     name: name.clone(),
                     query: json,
-                    color: None,
+                    color: d.color.clone(),
                     position: smart_collections::list(conn).map(|l| l.len()).unwrap_or(0)
                         as i64,
                 };
@@ -446,6 +462,7 @@ fn render_body(
     draft: &Entity<RuleDraft>,
     and_mode: bool,
     status: (Option<u64>, Option<String>),
+    color: Option<String>,
     cx: &mut App,
 ) -> Div {
     let t = |k: &str| rust_i18n::t!(k).to_string();
@@ -485,6 +502,12 @@ fn render_body(
                             d.update(cx, |d, cx| d.set_and_mode(false, cx));
                         })
                 }),
+        )
+        .child(
+            v_flex()
+                .gap_1()
+                .child(field_label(cx, "rules.color"))
+                .child(color_swatch_row(&draft.clone(), color, cx)),
         )
         .child(field_label(cx, "rules.conditions"));
 
@@ -679,6 +702,57 @@ fn render_row(
             .icon(IconName::Close)
             .on_click(move |_, _, cx| d.update(cx, |d, cx| d.remove_row(ix, cx)))
     })
+}
+
+/// Curated palette for smart-collection colors.
+const COLOR_PALETTE: &[&str] = &[
+    "#ef4444", "#f97316", "#eab308", "#22c55e", "#14b8a6", "#06b6d4", "#3b82f6", "#6366f1",
+    "#a855f7", "#ec4899", "#78716c", "#1f2937",
+];
+
+fn color_swatch_row(draft: &Entity<RuleDraft>, color: Option<String>, cx: &App) -> Div {
+    let mut row = h_flex().flex_wrap().gap_1().child({
+        // "No color" clears the accent.
+        let d = draft.clone();
+        let selected = color.is_none();
+        div()
+            .id("swatch-none")
+            .cursor_pointer()
+            .size_5()
+            .rounded_full()
+            .border_1()
+            .border_color(if selected {
+                cx.theme().foreground
+            } else {
+                cx.theme().border
+            })
+            .when(selected, |this| this.border_2())
+            .on_click(move |_, _, cx| d.update(cx, |d, cx| d.set_color(None, cx)))
+    });
+    for hex in COLOR_PALETTE {
+        let d = draft.clone();
+        let hex = hex.to_string();
+        let selected = color.as_deref() == Some(hex.as_str());
+        let rgb = gpui_kit::rgb(u32::from_str_radix(hex.trim_start_matches('#'), 16).unwrap_or(0));
+        row = row.child(
+            div()
+                .id(format!("swatch-{hex}"))
+                .cursor_pointer()
+                .size_5()
+                .rounded_full()
+                .bg(rgb)
+                .border_2()
+                .border_color(if selected {
+                    cx.theme().foreground
+                } else {
+                    gpui::transparent_black()
+                })
+                .on_click(move |_, _, cx| {
+                    d.update(cx, |d, cx| d.set_color(Some(hex.clone()), cx));
+                }),
+        );
+    }
+    row
 }
 
 // ---- small widget helpers ---------------------------------------------------

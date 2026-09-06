@@ -85,17 +85,23 @@ pub fn rename(conn: &Connection, id: Uuid, name: &str) -> Result<()> {
 
 /// Replace the stored condition tree of a smart collection. The tree is
 /// validated by compiling it before the row is touched.
-pub fn update_query(conn: &Connection, id: Uuid, query: &serde_json::Value) -> Result<()> {
+pub fn update_query(
+    conn: &Connection,
+    id: Uuid,
+    query: &serde_json::Value,
+    color: Option<&str>,
+) -> Result<()> {
     // Validate up front: an uncompilable tree must not land in the store.
     let node = super::smart::node_from_json(query)?;
     super::smart::compile(&node)?;
     let changed = rows::execute(
         conn,
-        "UPDATE smart_collections SET query = ?1, updated_at = ?2 WHERE id = ?3",
+        "UPDATE smart_collections SET query = ?1, color = ?2, updated_at = ?3 WHERE id = ?4",
         vec![
             serde_json::to_string(query)
                 .map_err(|e| Error::Db(format!("serialize query: {e}")))?
                 .into(),
+            color.map(|c| c.to_string()).into(),
             rows::ts(Utc::now()).into(),
             rows::uuid(id).into(),
         ],

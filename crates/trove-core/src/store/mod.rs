@@ -184,22 +184,24 @@ mod tests {
                 {"op": "match", "field": "tag", "value": "三毛"}
             ]
         });
-        smart_collections::update_query(store.conn(), sc.id, &tree).unwrap();
+        smart_collections::update_query(store.conn(), sc.id, &tree, Some("#3b82f6")).unwrap();
         let stored = smart_collections::get(store.conn(), sc.id).unwrap().unwrap();
         assert_eq!(stored.query, tree);
+        assert_eq!(stored.color.as_deref(), Some("#3b82f6"));
 
         // A garbage tree is refused and the stored one survives.
         assert!(smart_collections::update_query(
             store.conn(),
             sc.id,
-            &serde_json::json!({"op": "match", "field": "text", "compare": "gte", "value": "x"})
+            &serde_json::json!({"op": "match", "field": "text", "compare": "gte", "value": "x"}),
+            None,
         )
         .is_err());
         assert_eq!(
             smart_collections::get(store.conn(), sc.id).unwrap().unwrap().query,
             tree
         );
-        assert!(smart_collections::update_query(store.conn(), Uuid::new_v4(), &tree).is_err());
+        assert!(smart_collections::update_query(store.conn(), Uuid::new_v4(), &tree, None).is_err());
     }
 
     #[test]
