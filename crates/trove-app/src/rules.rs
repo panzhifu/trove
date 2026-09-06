@@ -206,7 +206,10 @@ impl RuleDraft {
             if !row.is_complete(cx) {
                 continue;
             }
-            let mut node = serde_json::json!({ "field": field_json(row.field) });
+            // The `op` tag is required by the internally-tagged SmartNode
+            // enum — omitting it makes node_from_json fail with
+            // "missing field `op`".
+            let mut node = serde_json::json!({ "op": "match", "field": field_json(row.field) });
             if row.op != SmartCompare::Eq {
                 node["compare"] = serde_json::json!(compare_json(row.op));
             }
@@ -217,11 +220,11 @@ impl RuleDraft {
                 )),
                 SmartField::Color => match normalize_color(&row.text.read(cx).value()) {
                     Some(hex) => serde_json::json!(hex),
-                    None => return Err(t("rules.value_color_hint")),
+                    None => return Err(t("rules.invalid_color")),
                 },
                 SmartField::SizeBytes => match row.text.read(cx).value().trim().parse::<i64>() {
                     Ok(n) if n > 0 => serde_json::json!(n),
-                    _ => return Err(t("rules.value_bytes")),
+                    _ => return Err(t("rules.invalid_bytes")),
                 },
                 SmartField::Tag => serde_json::json!(row.tag),
                 SmartField::Rating => serde_json::json!(row.rating),
@@ -245,8 +248,10 @@ impl RuleDraft {
         self.evaluated = self.revision;
         let conn = self.controller.read(cx).library.store().conn();
         let outcome = self.build_json(cx).and_then(|json| {
+            // The raw serde message is English internals; the localized
+            // "invalid rule" label is enough for the live count status.
             let node = smart::node_from_json(&json)
-                .map_err(|e| e.to_string())?;
+                .map_err(|_| rust_i18n::t!("rules.match_error").to_string())?;
             smart::evaluate(conn, &node, None, 0)
                 .map(|(total, _)| total)
                 .map_err(|e| e.to_string())

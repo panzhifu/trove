@@ -15,8 +15,8 @@
 | 批量收藏 | `Library::set_assets_favorite`（batch.rs） | ✅ | 多选浮动工具栏 |
 | 从集合移出资产 | `collections::remove_asset` | ⬜ | 只能加入 |
 | 集合拖拽重排 / 改父级 | `collections::move_to` | ⬜ | 集合树固定两层、不可拖动 |
-| 收藏视图 / 类型过滤 | `AssetQuery.is_favorite` / `kind` | ⬜ | 无收藏视图、无类型筛选 |
-| 维护工具（缩略图重建 / FTS 重建 / 孤儿清理） | `maintenance.rs` | ⬜ | 无 UI 入口，适合放 Settings |
+| 收藏视图 / 类型过滤 | `AssetQuery.is_favorite` / `kind` | ✅ | 标题栏：类型下拉 + 收藏 toggle + 清除；与集合/搜索/智能集合视图组合（core `evaluate_filtered`）；过滤后无命名视图时标题显示「收藏」 |
+| 维护工具（缩略图重建 / FTS 重建 / 孤儿清理） | `maintenance.rs` | ✅ | Settings ▸ 维护：缩略图增量/全量（后台线程）、索引重建、孤儿清理，结果写入状态行 |
 | 标签重命名 / 颜色 | `NewTag.color`；rename 后端也缺 | ⬜ | 需先补后端 rename |
 | 整组替换标签 | `tags::set_for_asset` | ⬜ | Inspector 只逐个加/删 |
 | 导出库 | — | ⬜ | 菜单项占位（disabled） |
@@ -42,7 +42,7 @@
 | 状态栏（选中数 / 库路径 / 导入状态） | ⬜ | |
 | 撤销 / 重做 | ⬜ | 前后端都没有 |
 | 界面多语言（中/英，实时切换） | ✅ | rust-i18n + `locales/*.toml`；设置 ▸ 语言，跟随系统 |
-| 库热切换（改 path 后重开） | ⬜ | Settings 的 Browse 不回填、不重开库 |
+| 库热切换（改 path 后重开） | ✅ | Settings ▸ 通用：浏览选择后立即 `swap_library` 并持久化，失败原地报错，无需重启 |
 
 ## 三、工程性问题
 

@@ -164,8 +164,8 @@ impl Render for AppView {
             .on_action(cx.listener(|this, _: &ImportFiles, window, cx| {
                 this.prompt_import(window, cx);
             }))
-            .on_action(cx.listener(|_this, _: &OpenSettings, window, cx| {
-                crate::settings::SettingsDialog::open(window, cx);
+            .on_action(cx.listener(|this, _: &OpenSettings, window, cx| {
+                crate::settings::SettingsDialog::open(window, cx, this.controller.clone());
             }))
             .on_action(cx.listener(|this, _: &ShowAllAssets, _, cx| {
                 this.controller.update(cx, |ctl, _cx| ctl.select_collection(None));
