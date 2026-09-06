@@ -42,18 +42,44 @@ pub struct TitleBarView {
     #[allow(dead_code)]
     controller: Entity<LibraryController>,
     menu_bar: Entity<AppMenuBar>,
+    /// Signature of the menu names the bar was built from. The bar's data
+    /// source (gpui-kit's `GlobalState`) is replaced on a language switch;
+    /// the drift detected here triggers a reload on the next render.
+    menu_signature: String,
 }
 
 impl TitleBarView {
     pub fn new(controller: Entity<LibraryController>, cx: &mut Context<Self>) -> Self {
         // `AppMenuBar::new` already returns an `Entity<AppMenuBar>`.
         let menu_bar = AppMenuBar::new(cx);
-        Self { controller, menu_bar }
+        let menu_signature = menu_signature(cx);
+        Self { controller, menu_bar, menu_signature }
     }
 }
 
+/// The joined names of the menus stored in gpui-kit's `GlobalState`.
+fn menu_signature(cx: &App) -> String {
+    use gpui_kit::component::global_state::GlobalState;
+    if !cx.has_global::<GlobalState>() {
+        return String::new();
+    }
+    GlobalState::global(cx)
+        .app_menus()
+        .iter()
+        .map(|menu| menu.name.to_string())
+        .collect::<Vec<_>>()
+        .join("|")
+}
+
 impl Render for TitleBarView {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // A live language switch replaces the GlobalState menu catalog; pick
+        // the drift up here and rebuild the bar with the new names.
+        let signature = menu_signature(cx);
+        if signature != self.menu_signature {
+            self.menu_signature = signature;
+            self.menu_bar.update(cx, |bar, cx| bar.reload(cx));
+        }
         TitleBar::new().child(
             h_flex()
                 .h_full()
