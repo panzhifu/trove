@@ -2,6 +2,7 @@
 
 use uuid::Uuid;
 use gpui_kit::base::h_flex;
+use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::component::menu::{ContextMenuExt as _, PopupMenu};
 use gpui_kit::component::{ActiveTheme, IconName};
 use gpui_kit::*;
@@ -111,6 +112,7 @@ pub(crate) fn selectable_row(
     name: String,
     selected: bool,
     indent: Pixels,
+    accent: Option<u32>,
     on_click: RowClick,
     context_menu: Option<RowMenu>,
 ) -> AnyElement {
@@ -127,6 +129,16 @@ pub(crate) fn selectable_row(
             h_flex()
                 .w_full()
                 .items_center()
+                .gap_1p5()
+                .when_some(accent, |this, rgb| {
+                    this.child(
+                        div()
+                            .size_2()
+                            .flex_shrink_0()
+                            .rounded_full()
+                            .bg(gpui_kit::rgb(rgb)),
+                    )
+                })
                 .child(
                     div()
                         .flex_1()

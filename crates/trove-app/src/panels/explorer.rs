@@ -21,7 +21,10 @@ use uuid::Uuid;
 
 use crate::state::LibraryController;
 
-use super::common::{live_count, observe_controller, selectable_row, separator_label, trash_count, AssetsDrag};
+use super::common::{
+    hex_to_rgb, live_count, observe_controller, selectable_row, separator_label, trash_count,
+    AssetsDrag,
+};
 
 /// What the single inline editor is doing right now.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -276,9 +279,18 @@ impl Render for ExplorerPanel {
                     }
                 }
             }
-            let mut smart_rows: Vec<(Uuid, String)> = Vec::new();
+            let mut smart_rows: Vec<(Uuid, String, Option<u32>)> = Vec::new();
             if let Ok(list) = smart_collections::list(conn) {
-                smart_rows = list.into_iter().map(|sc| (sc.id, sc.name)).collect();
+                smart_rows = list
+                    .into_iter()
+                    .map(|sc| {
+                        let accent = sc
+                            .color
+                            .as_deref()
+                            .and_then(hex_to_rgb);
+                        (sc.id, sc.name, accent)
+                    })
+                    .collect();
             }
             (
                 ctl.current_collection,
@@ -416,7 +428,7 @@ impl Render for ExplorerPanel {
                     .into_any_element(),
             );
         }
-        for (sid, sname) in smart_rows {
+        for (sid, sname, accent) in smart_rows {
             let menu_name = sname.clone();
             let controller = self.controller.clone();
             items.push(
@@ -426,6 +438,7 @@ impl Render for ExplorerPanel {
                     sname,
                     active_smart == Some(sid),
                     px(0.),
+                    accent,
                     Box::new(move |_ev, _window, cx| {
                         controller.update(cx, |ctl, _| ctl.select_smart(Some(sid)));
                     }),
