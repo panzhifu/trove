@@ -202,6 +202,11 @@ impl ExplorerPanel {
                 return c.name;
             }
         }
+        // The favorites toggle turns the "all assets" view into the
+        // favorites view; named views keep their names.
+        if ctl.filter_favorite {
+            return rust_i18n::t!("workspace.title_favorites").to_string();
+        }
         rust_i18n::t!("app.all_assets").to_string()
     }
 }

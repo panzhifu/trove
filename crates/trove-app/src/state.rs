@@ -1,8 +1,11 @@
 //! Application-level library state shared by the dock panels.
 
+use std::path::PathBuf;
+
 use uuid::Uuid;
 
 use trove_core::library::Library;
+use trove_core::model::AssetKind;
 
 /// Current import activity, shown by the Explorer panel.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -37,6 +40,9 @@ pub struct LibraryController {
     pub active_smart: Option<Uuid>,
     /// Active full-text search term (FTS). Overrides the other views when set.
     pub search_text: String,
+    /// Grid filters (compose with any view; cleared on library swap).
+    pub filter_kind: Option<AssetKind>,
+    pub filter_favorite: bool,
     /// Progress of the most recent import.
     pub import_phase: ImportPhase,
     /// Asset ids currently displayed by the workspace grid (this page only).
@@ -47,6 +53,12 @@ pub struct LibraryController {
     pub selection_anchor: Option<Uuid>,
     /// How many assets the grid has loaded so far (pagination cursor).
     pub grid_loaded: usize,
+    /// Status line surfaced by the Settings dialog (maintenance jobs,
+    /// library switches). Set by whichever action ran last.
+    pub notice: Option<String>,
+    /// A maintenance / library job is running; Settings buttons refuse to
+    /// start a second one until it finishes.
+    pub busy: bool,
 }
 
 impl LibraryController {
@@ -60,10 +72,14 @@ impl LibraryController {
             active_tag: None,
             active_smart: None,
             search_text: String::new(),
+            filter_kind: None,
+            filter_favorite: false,
             import_phase: ImportPhase::Idle,
             visible_assets: Vec::new(),
             selection_anchor: None,
             grid_loaded: GRID_PAGE_SIZE,
+            notice: None,
+            busy: false,
         }
     }
 
@@ -128,6 +144,60 @@ impl LibraryController {
 
     /// Set the full-text search term. Any non-empty term takes over the
     /// browsed view; clearing it restores the previous context.
+    /// Grid filters; each change resets the pagination cursor.
+    pub fn set_filter_kind(&mut self, kind: Option<AssetKind>) {
+        if self.filter_kind != kind {
+            self.filter_kind = kind;
+            self.reset_grid_page();
+            self.generation += 1;
+        }
+    }
+
+    pub fn set_filter_favorite(&mut self, favorite: bool) {
+        if self.filter_favorite != favorite {
+            self.filter_favorite = favorite;
+            self.reset_grid_page();
+            self.generation += 1;
+        }
+    }
+
+    pub fn clear_filters(&mut self) {
+        let changed = self.filter_kind.is_some() || self.filter_favorite;
+        self.filter_kind = None;
+        self.filter_favorite = false;
+        if changed {
+            self.reset_grid_page();
+            self.generation += 1;
+        }
+    }
+
+    /// Swap the open library for another one at `path` (hot switch from
+    /// Settings). Resets every view state; refused mid-import so a running
+    /// job cannot keep writing into the previous store.
+    pub fn swap_library(&mut self, path: PathBuf) -> Result<(), trove_core::Error> {
+        if self.is_importing() {
+            return Err(trove_core::Error::Validation(
+                "import in progress".into(),
+            ));
+        }
+        let library = Library::open(path)?;
+        self.library = library;
+        self.current_collection = None;
+        self.showing_trash = false;
+        self.active_smart = None;
+        self.active_tag = None;
+        self.selected_assets.clear();
+        self.selection_anchor = None;
+        self.search_text.clear();
+        self.filter_kind = None;
+        self.filter_favorite = false;
+        self.import_phase = ImportPhase::Idle;
+        self.visible_assets.clear();
+        self.reset_grid_page();
+        self.generation += 1;
+        Ok(())
+    }
+
     pub fn set_search(&mut self, text: String) {
         self.search_text = text;
         if !self.search_text.trim().is_empty() {

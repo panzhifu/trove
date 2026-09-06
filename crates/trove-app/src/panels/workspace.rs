@@ -110,6 +110,8 @@ struct ViewKey {
     smart: Option<Uuid>,
     tag: Option<Uuid>,
     search: String,
+    filter_kind: Option<AssetKind>,
+    filter_favorite: bool,
     content_width: f32,
 }
 
@@ -203,8 +205,9 @@ impl DockPanel for WorkspacePanel {
                 .gap_1()
                 .child(count_label)
                 .when(!in_trash, |this| {
-                    this.child(
-                        Popover::new("search-popover")
+                    this.child(filter_controls(&controller, cx))
+                        .child(
+                            Popover::new("search-popover")
                             .anchor(Anchor::TopRight)
                             // The pill-shaped search input IS the surface:
                             // strip the popover's own bg/border/shadow/padding
@@ -412,6 +415,11 @@ impl WorkspacePanel {
                 return c.name;
             }
         }
+        // The favorites toggle turns the unfiltered "all assets" view into
+        // the favorites view; named views keep their names.
+        if ctl.filter_favorite {
+            return rust_i18n::t!("workspace.title_favorites").to_string();
+        }
         rust_i18n::t!("app.all_assets").to_string()
     }
 
@@ -543,7 +551,7 @@ impl WorkspacePanel {
 impl Render for WorkspacePanel {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // --- context snapshot (drop the controller borrow early) -----------
-        let (collection, active_tag, in_trash, search, smart, grid_loaded, selected) = {
+        let (collection, active_tag, in_trash, search, smart, grid_loaded, selected, filter_kind, filter_favorite) = {
             let ctl = self.controller.read(cx);
             (
                 ctl.current_collection,
@@ -553,6 +561,8 @@ impl Render for WorkspacePanel {
                 ctl.active_smart,
                 ctl.grid_loaded,
                 ctl.selected_assets.clone(),
+                ctl.filter_kind,
+                ctl.filter_favorite,
             )
         };
         let library_root = self.controller.read(cx).library.root().to_path_buf();
@@ -564,6 +574,8 @@ impl Render for WorkspacePanel {
             let q = AssetQuery {
                 collection_id: collection,
                 tag_ids: active_tag.map(|t| vec![t]).unwrap_or_default(),
+                kind: filter_kind,
+                is_favorite: filter_favorite.then_some(true),
                 is_trashed: false,
                 text: None,
                 limit,
@@ -574,12 +586,13 @@ impl Render for WorkspacePanel {
                 Err(_) => (0, Vec::new()),
             }
         } else if let Some(sid) = smart {
-            match self
-                .controller
-                .read(cx)
-                .library
-                .evaluate_smart_collection(sid, limit, 0)
-            {
+            match self.controller.read(cx).library.evaluate_smart_collection(
+                sid,
+                filter_kind,
+                filter_favorite.then_some(true),
+                limit,
+                0,
+            ) {
                 Ok((t, a)) => (t as usize, a),
                 Err(_) => (0, Vec::new()),
             }
@@ -593,6 +606,10 @@ impl Render for WorkspacePanel {
                     } else {
                         active_tag.map(|t| vec![t]).unwrap_or_default()
                     },
+                    // The trash view hides the filter controls, so it also
+                    // ignores the grid filters entirely.
+                    kind: if in_trash { None } else { filter_kind },
+                    is_favorite: (!in_trash && filter_favorite).then_some(true),
                     is_trashed: in_trash,
                     limit,
                     ..Default::default()
@@ -638,6 +655,8 @@ impl Render for WorkspacePanel {
             smart,
             tag: active_tag,
             search: search.clone(),
+            filter_kind,
+            filter_favorite,
             content_width,
         };
         if self.view_key.as_ref() != Some(&key) {
@@ -786,6 +805,115 @@ impl Render for WorkspacePanel {
                         area.child(selection_toolbar(&toolbar_controller, in_trash, ids, cx))
                     }),
             )
+    }
+}
+
+// ============================ filter controls ================================
+
+/// Type + favorites grid filters for the title bar: a kind dropdown, a
+/// heart toggle and a clear button when anything is active. The filters
+/// compose with every view (collection, search, smart collection) and are
+/// also how the favorites view is entered.
+fn filter_controls(controller: &Entity<LibraryController>, cx: &App) -> Div {
+    let (kind, favorite) = {
+        let ctl = controller.read(cx);
+        (ctl.filter_kind, ctl.filter_favorite)
+    };
+    let t = |k: &str| rust_i18n::t!(k).to_string();
+
+    let mut bar = h_flex().items_center().gap_1();
+
+    // Kind dropdown: label shows the active kind, "all" when unset.
+    let kind_label = match kind {
+        Some(k) => t(kind_key(k)),
+        None => t("workspace.filter_all_kinds"),
+    };
+    let options: Vec<(Option<AssetKind>, String)> = std::iter::once((None, t("workspace.filter_all_kinds")))
+        .chain(
+            [
+                AssetKind::Image,
+                AssetKind::Video,
+                AssetKind::Audio,
+                AssetKind::Document,
+                AssetKind::Archive,
+                AssetKind::Font,
+                AssetKind::Other,
+            ]
+            .into_iter()
+            .map(|k| (Some(k), t(kind_key(k)))),
+        )
+        .collect();
+    bar = bar.child(
+        Button::new("filter-kind")
+            .xsmall()
+            .outline()
+            .label(kind_label)
+            .dropdown_menu_with_anchor(Anchor::TopLeft, {
+                let controller = controller.clone();
+                move |menu, _, _| {
+                    let mut menu = menu.min_w(px(150.));
+                    for (value, label) in &options {
+                        let checked = *value == kind;
+                        let value = *value;
+                        let controller = controller.clone();
+                        menu = menu.item(
+                            PopupMenuItem::new(label.clone())
+                                .checked(checked)
+                                .on_click(move |_, _, cx| {
+                                    controller.update(cx, |ctl, cx| {
+                                        ctl.set_filter_kind(value);
+                                        cx.notify();
+                                    });
+                                }),
+                        );
+                    }
+                    menu
+                }
+            }),
+    );
+
+    // Favorites toggle: the primary (filled) state marks the active filter.
+    bar = bar.child(
+        Button::new("filter-favorite")
+            .xsmall()
+            .when(favorite, |b| b.primary())
+            .when(!favorite, |b| b.ghost())
+            .icon(IconName::Heart)
+            .tooltip(t("workspace.filter_favorite"))
+            .on_click({
+                let controller = controller.clone();
+                move |_, _, cx| {
+                    controller.update(cx, |ctl, _| ctl.set_filter_favorite(!favorite));
+                }
+            }),
+    );
+
+    // Reset when anything is active.
+    if kind.is_some() || favorite {
+        bar = bar.child(
+            Button::new("clear-filters")
+                .xsmall()
+                .ghost()
+                .label("×")
+                .tooltip(t("workspace.clear_filters"))
+                .on_click({
+                    let controller = controller.clone();
+                    move |_, _, cx| controller.update(cx, |ctl, _| ctl.clear_filters())
+                }),
+        );
+    }
+    bar
+}
+
+fn kind_key(kind: AssetKind) -> &'static str {
+    match kind {
+        AssetKind::Image => "asset.kind.image",
+        AssetKind::Video => "asset.kind.video",
+        AssetKind::Audio => "asset.kind.audio",
+        AssetKind::Document => "asset.kind.document",
+        AssetKind::Archive => "asset.kind.archive",
+        AssetKind::Font => "asset.kind.font",
+        AssetKind::Other => "asset.kind.other",
     }
 }
 
