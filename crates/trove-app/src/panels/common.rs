@@ -44,7 +44,7 @@ pub(crate) fn observe_controller<V: Render + 'static>(
     cx.observe(controller, |_, _, cx| cx.notify()).detach();
 }
 
-pub(crate) fn separator_label(cx: &Context<impl Render>, text: &'static str) -> Div {
+pub(crate) fn separator_label(cx: &Context<impl Render>, text: impl Into<String>) -> Div {
     h_flex()
         .px_1()
         .pt_1()
@@ -53,7 +53,7 @@ pub(crate) fn separator_label(cx: &Context<impl Render>, text: &'static str) -> 
                 .text_xs()
                 .font_weight(FontWeight::SEMIBOLD)
                 .text_color(cx.theme().muted_foreground)
-                .child(text),
+                .child(text.into()),
         )
 }
 

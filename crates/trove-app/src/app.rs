@@ -92,7 +92,7 @@ impl AppView {
             files: true,
             directories: false,
             multiple: true,
-            prompt: Some("Import files".into()),
+            prompt: Some(rust_i18n::t!("app.import_prompt").into_owned().into()),
         });
         cx.spawn(async move |_, cx| {
             if let Ok(result) = rx.await {
@@ -110,7 +110,7 @@ impl AppView {
     fn show_about(&self, window: &mut Window, cx: &mut Context<Self>) {
         window.open_dialog(cx, |dialog, _, _| {
             dialog
-                .title("About Trove")
+                .title(rust_i18n::t!("app.about").to_string())
                 .width(px(360.))
                 .child(
                     div()
@@ -127,8 +127,8 @@ impl AppView {
                                 .text_color(rgb(0x1f1f1f))
                                 .child("Trove"),
                         )
-                        .child("A local-first asset library.")
-                        .child("Version 0.1.0"),
+                        .child(rust_i18n::t!("app.about_body").to_string())
+                        .child(rust_i18n::t!("app.version", version = "0.1.0").to_string()),
                 )
         });
     }

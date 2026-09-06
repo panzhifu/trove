@@ -188,11 +188,11 @@ impl DockPanel for WorkspacePanel {
             .text_xs()
             .text_color(cx.theme().muted_foreground)
             .child(if loaded < total {
-                format!("{loaded} of {total} — scroll to load more")
+                rust_i18n::t!("workspace.scroll_hint", loaded = loaded, total = total).to_string()
             } else if total == 1 {
-                "1 item".into()
+                rust_i18n::t!("workspace.item_one").to_string()
             } else {
-                format!("{total} items")
+                rust_i18n::t!("workspace.items_many", count = total).to_string()
             });
         let input = self.search_input.clone();
         let controller = self.controller.clone();
@@ -218,7 +218,7 @@ impl DockPanel for WorkspacePanel {
                                     .ghost()
                                     .xsmall()
                                     .icon(IconName::Search)
-                                    .tooltip("Search"),
+                                    .tooltip(rust_i18n::t!("workspace.search").to_string()),
                             )
                             .content({
                                 let input = input.clone();
@@ -250,8 +250,8 @@ impl DockPanel for WorkspacePanel {
                             .ghost()
                             .danger()
                             .xsmall()
-                            .label("Empty all")
-                            .tooltip("Permanently delete every asset in the trash")
+                            .label(rust_i18n::t!("workspace.empty_all").to_string())
+                            .tooltip(rust_i18n::t!("workspace.empty_all_tooltip").to_string())
                             .on_click(cx.listener(|this, _, _, cx| this.empty_trash(cx))),
                     )
                 })
@@ -261,7 +261,7 @@ impl DockPanel for WorkspacePanel {
                             .ghost()
                             .xsmall()
                             .label("×")
-                            .tooltip("Clear search")
+                            .tooltip(rust_i18n::t!("workspace.clear_search").to_string())
                             .on_click(move |_, window, cx| {
                                 controller.update(cx, |ctl, _| ctl.set_search(String::new()));
                                 input.update(cx, |state, cx| state.set_value("", window, cx));
@@ -284,7 +284,7 @@ impl WorkspacePanel {
         cx: &mut Context<Self>,
         controller: Entity<LibraryController>,
     ) -> Self {
-        let search_input = cx.new(|cx| InputState::new(window, cx).placeholder("Search…"));
+        let search_input = cx.new(|cx| InputState::new(window, cx).placeholder(rust_i18n::t!("workspace.search_placeholder").to_string()));
         let available_width = cx.new(|_| px(0.));
         let list_state = ListState::new(0, ListAlignment::Top, px(LIST_OVERDRAW_PX));
         let this = Self {
@@ -333,7 +333,7 @@ impl WorkspacePanel {
         let conn = ctl.library.store().conn();
 
         if ctl.showing_trash {
-            return "Trash".into();
+            return rust_i18n::t!("app.trash").to_string();
         }
         if let Some(sid) = ctl.active_smart {
             if let Ok(Some(sc)) = smart_collections::get(conn, sid) {
@@ -350,7 +350,7 @@ impl WorkspacePanel {
                 return c.name;
             }
         }
-        "All assets".into()
+        rust_i18n::t!("app.all_assets").to_string()
     }
 
     // -- keyboard navigation ---------------------------------------------------
@@ -882,7 +882,7 @@ fn asset_context_menu(
         return menu
             .min_w(px(180.))
             .item(
-                PopupMenuItem::new("Restore").on_click(move |_, _, cx| {
+                PopupMenuItem::new(rust_i18n::t!("workspace.restore").to_string()).on_click(move |_, _, cx| {
                     ctl_restore.update(cx, move |ctl, cx| {
                         let ids = ctl.action_targets(asset_id);
                         let _ = ctl.library.restore_assets(&ids);
@@ -893,7 +893,7 @@ fn asset_context_menu(
             )
             .separator()
             .item(
-                PopupMenuItem::new("Delete forever").on_click(move |_, _, cx| {
+                PopupMenuItem::new(rust_i18n::t!("workspace.delete_forever").to_string()).on_click(move |_, _, cx| {
                     ctl_purge.update(cx, move |ctl, cx| {
                         let ids = ctl.action_targets(asset_id);
                         if let Err(e) = ctl.library.purge_assets(&ids) {
@@ -933,7 +933,7 @@ fn asset_context_menu(
         }
         let mut menu = menu;
         if items.is_empty() {
-            menu = menu.item(PopupMenuItem::label("No collections yet"));
+            menu = menu.item(PopupMenuItem::label(rust_i18n::t!("workspace.no_collections").to_string()));
         }
         for (cid, cname) in items {
             let controller = controller.clone();
@@ -954,9 +954,9 @@ fn asset_context_menu(
     menu.min_w(px(200.))
         .item(
             PopupMenuItem::new(if favorite {
-                "Remove from favorites"
+                rust_i18n::t!("workspace.remove_from_favorites").to_string()
             } else {
-                "Add to favorites"
+                rust_i18n::t!("workspace.add_to_favorites").to_string()
             })
             .checked(favorite)
             .on_click(move |_, _, cx| {
@@ -976,10 +976,10 @@ fn asset_context_menu(
             }),
         )
         .separator()
-        .item(PopupMenuItem::submenu("Add to collection", add_submenu))
+        .item(PopupMenuItem::submenu(rust_i18n::t!("workspace.add_to_collection").to_string(), add_submenu))
         .separator()
         .item(
-            PopupMenuItem::new("Move to trash").on_click(move |_, _, cx| {
+            PopupMenuItem::new(rust_i18n::t!("app.move_to_trash").to_string()).on_click(move |_, _, cx| {
                 c_trash.update(cx, move |ctl, cx| {
                     let ids = ctl.action_targets(asset_id);
                     let _ = ctl.library.trash_assets(&ids);
@@ -1004,9 +1004,9 @@ impl Render for AssetsDragPreview {
             .text_sm()
             .text_color(cx.theme().primary_foreground)
             .child(if self.count == 1 {
-                "1 asset".to_string()
+                rust_i18n::t!("workspace.drag_one").to_string()
             } else {
-                format!("{} assets", self.count)
+                rust_i18n::t!("workspace.drag_many", count = self.count).to_string()
             })
     }
 }

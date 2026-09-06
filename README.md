@@ -101,10 +101,16 @@ The first launch creates a library under the platform's config directory. Open *
 ### Inspector / 检查器
 - Thumbnail preview, tags, and mined color palette.
 - 缩略图预览、标签、提取的色板。
-- Properties: kind, MIME type, size, dimensions, added date, SHA-256.
-- 属性：类型、MIME 类型、大小、尺寸、添加日期、SHA-256。
+- Inline editing: title, description, source URL, kind, and a 1–5 star rating — committed on blur/Enter or click.
+- 行内编辑：标题、描述、来源链接、类型与 1–5 星评分——失焦/回车或点击即保存。
+- Properties: MIME type, size, dimensions, added date, SHA-256.
+- 属性：MIME 类型、大小、尺寸、添加日期、SHA-256。
 - Add or remove tags directly.
 - 可直接添加或移除标签。
+
+### Interface language / 界面语言
+- English and 简体中文, switchable live in Settings ▸ Language; follows the system language by default.
+- 支持英文与简体中文，设置 ▸ 语言实时切换；默认跟随系统语言。
 
 ### Configuration / 配置
 - Persisted JSON config in the platform config directory.

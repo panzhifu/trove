@@ -47,7 +47,7 @@ impl ExplorerPanel {
         cx: &mut Context<Self>,
         controller: Entity<LibraryController>,
     ) -> Self {
-        let editor_input = cx.new(|cx| InputState::new(window, cx).placeholder("Name"));
+        let editor_input = cx.new(|cx| InputState::new(window, cx).placeholder(rust_i18n::t!("explorer.name_placeholder").to_string()));
         let this = Self {
             focus_handle: cx.focus_handle(),
             controller,
@@ -159,7 +159,7 @@ impl ExplorerPanel {
         let conn = ctl.library.store().conn();
 
         if ctl.showing_trash {
-            return "Trash".into();
+            return rust_i18n::t!("app.trash").to_string();
         }
         if let Some(sid) = ctl.active_smart {
             if let Ok(Some(sc)) = smart_collections::get(conn, sid) {
@@ -176,7 +176,7 @@ impl ExplorerPanel {
                 return c.name;
             }
         }
-        "All assets".into()
+        rust_i18n::t!("app.all_assets").to_string()
     }
 }
 
@@ -210,7 +210,7 @@ impl DockPanel for ExplorerPanel {
                 .ghost()
                 .xsmall()
                 .label("+")
-                .tooltip("Add collection")
+                .tooltip(rust_i18n::t!("explorer.add_collection").to_string())
                 .on_click(move |_, window, cx| {
                     entity.update(cx, |this, cx| this.begin_add(window, cx));
                 }),
@@ -278,7 +278,7 @@ impl Render for ExplorerPanel {
                 cx,
                 self.controller.clone(),
                 None,
-                "All assets".into(),
+                rust_i18n::t!("app.all_assets").to_string(),
                 all_count,
                 all_selected,
                 true,
@@ -319,7 +319,7 @@ impl Render for ExplorerPanel {
                                 .truncate()
                                 .text_sm()
                                 .text_color(cx.theme().foreground)
-                                .child("Trash"),
+                                .child(rust_i18n::t!("app.trash").to_string()),
                         )
                         .child(
                             div()
@@ -371,7 +371,7 @@ impl Render for ExplorerPanel {
         }
 
         // Smart collections: saved searches, activated live against the library.
-        items.push(separator_label(cx, "Smart").into_any_element());
+        items.push(separator_label(cx, rust_i18n::t!("panel.smart").to_string()).into_any_element());
         for (sid, sname) in smart_rows {
             let controller = self.controller.clone();
             items.push(
@@ -495,7 +495,7 @@ fn smart_menu(
     let ctl_delete = controller.clone();
     menu.min_w(px(160.))
         .item(
-            PopupMenuItem::new("Delete").on_click(move |_, _, cx| {
+            PopupMenuItem::new(rust_i18n::t!("explorer.delete").to_string()).on_click(move |_, _, cx| {
                 ctl_delete.update(cx, move |ctl, cx| {
                     let _ = smart_collections::delete(ctl.library.store().conn(), id);
                     if ctl.active_smart == Some(id) {
@@ -523,12 +523,12 @@ fn collection_menu(
 
     menu.min_w(px(180.))
         .item(
-            PopupMenuItem::new("New collection inside").on_click(move |_, window, cx| {
+            PopupMenuItem::new(rust_i18n::t!("explorer.new_collection_inside").to_string()).on_click(move |_, window, cx| {
                 explorer_new.update(cx, |this, cx| this.add_inside(id, window, cx));
             }),
         )
         .item(
-            PopupMenuItem::new("Rename").on_click(move |_, window, cx| {
+            PopupMenuItem::new(rust_i18n::t!("explorer.rename").to_string()).on_click(move |_, window, cx| {
                 explorer_rename.update(cx, |this, cx| {
                     this.begin_rename(id, name.clone(), window, cx);
                 });
@@ -536,7 +536,7 @@ fn collection_menu(
         )
         .separator()
         .item(
-            PopupMenuItem::new("Delete").on_click(move |_, _, cx| {
+            PopupMenuItem::new(rust_i18n::t!("explorer.delete").to_string()).on_click(move |_, _, cx| {
                 explorer_delete.update(cx, |this, cx| {
                     let ctl = this.controller.clone();
                     ctl.update(cx, |ctl, cx| {

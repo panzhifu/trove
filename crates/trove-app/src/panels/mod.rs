@@ -2,7 +2,7 @@
 //! lives in its own file; shared rendering helpers are in `common`.
 
 macro_rules! panel {
-    ($name:ident, $title:literal) => {
+    ($name:ident, $title:expr) => {
         pub struct $name {
             focus_handle: FocusHandle,
             controller: Entity<LibraryController>,

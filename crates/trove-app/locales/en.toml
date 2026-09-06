@@ -1,0 +1,100 @@
+# Trove English source catalog. Semantic keys, shared by every locale file.
+# When adding a key here, add the same key to zh-CN.toml in the same change.
+
+[app]
+file = "File"
+edit = "Edit"
+view = "View"
+help = "Help"
+import_files = "Import files…"
+export_library = "Export library…"
+settings = "Settings…"
+select_all = "Select All"
+clear_selection = "Clear Selection"
+move_to_trash = "Move to Trash"
+all_assets = "All Assets"
+trash = "Trash"
+refresh = "Refresh"
+about = "About Trove"
+about_body = "A local-first asset library."
+version = "Version %{version}"
+import_prompt = "Import files"
+
+[panel]
+explorer = "Explorer"
+workspace = "Assets"
+tags = "Tags"
+inspector = "Inspector"
+smart = "Smart"
+
+[explorer]
+name_placeholder = "Name"
+add_collection = "Add collection"
+new_collection_inside = "New collection inside"
+rename = "Rename"
+delete = "Delete"
+
+[tags]
+all_tags = "All tags"
+filter_by_tag = "Filter by tag"
+delete_tag = "Delete tag"
+
+[workspace]
+search = "Search"
+search_placeholder = "Search…"
+clear_search = "Clear search"
+empty_all = "Empty all"
+empty_all_tooltip = "Permanently delete every asset in the trash"
+item_one = "1 item"
+items_many = "%{count} items"
+scroll_hint = "%{loaded} of %{total} — scroll to load more"
+restore = "Restore"
+delete_forever = "Delete forever"
+add_to_favorites = "Add to favorites"
+remove_from_favorites = "Remove from favorites"
+add_to_collection = "Add to collection"
+no_collections = "No collections yet"
+drag_one = "1 asset"
+drag_many = "%{count} assets"
+
+[inspector]
+nothing_selected = "Nothing selected."
+asset_missing = "Asset no longer exists."
+tags = "Tags"
+colors = "Colors"
+properties = "Properties"
+edit = "Edit"
+title = "Title"
+description = "Description"
+source_url = "Source URL"
+rating = "Rating"
+kind = "Kind"
+mime_type = "Type"
+size = "Size"
+dimensions = "Dimensions"
+added = "Added"
+add_tag_placeholder = "Add tag + Enter"
+
+[asset]
+kind.image = "Image"
+kind.video = "Video"
+kind.audio = "Audio"
+kind.document = "Document"
+kind.archive = "Archive"
+kind.other = "Other"
+
+[settings]
+title = "Settings"
+general = "General"
+language = "Language"
+library = "Library"
+library_location = "Library location"
+library_location_desc = "Where the library database and media blobs are stored. Takes effect after restarting the app."
+browse = "Browse…"
+select_folder = "Select library folder"
+follow_system = "Follow system"
+language_desc = "Interface language. Applied immediately."
+
+[i18n]
+lang_en = "English"
+lang_zh = "简体中文"

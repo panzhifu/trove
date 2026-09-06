@@ -1,0 +1,99 @@
+# Trove 简体中文语录。键与 en.toml 一一对应（同键同序），缺失键会以原文键名显示。
+
+[app]
+file = "文件"
+edit = "编辑"
+view = "视图"
+help = "帮助"
+import_files = "导入文件…"
+export_library = "导出素材库…"
+settings = "设置…"
+select_all = "全选"
+clear_selection = "取消选择"
+move_to_trash = "移入回收站"
+all_assets = "全部资产"
+trash = "回收站"
+refresh = "刷新"
+about = "关于 Trove"
+about_body = "一个本地优先的素材库。"
+version = "版本 %{version}"
+import_prompt = "导入文件"
+
+[panel]
+explorer = "收藏夹"
+workspace = "资产"
+tags = "标签"
+inspector = "检查器"
+smart = "智能收藏夹"
+
+[explorer]
+name_placeholder = "名称"
+add_collection = "新建收藏夹"
+new_collection_inside = "在其中新建收藏夹"
+rename = "重命名"
+delete = "删除"
+
+[tags]
+all_tags = "全部标签"
+filter_by_tag = "按标签筛选"
+delete_tag = "删除标签"
+
+[workspace]
+search = "搜索"
+search_placeholder = "搜索…"
+clear_search = "清除搜索"
+empty_all = "清空全部"
+empty_all_tooltip = "彻底删除回收站中的所有资产"
+item_one = "1 项"
+items_many = "%{count} 项"
+scroll_hint = "%{loaded} / %{total} — 滚动加载更多"
+restore = "恢复"
+delete_forever = "彻底删除"
+add_to_favorites = "加入收藏"
+remove_from_favorites = "取消收藏"
+add_to_collection = "加入收藏夹"
+no_collections = "还没有收藏夹"
+drag_one = "1 个资产"
+drag_many = "%{count} 个资产"
+
+[inspector]
+nothing_selected = "未选中资产。"
+asset_missing = "资产已不存在。"
+tags = "标签"
+colors = "颜色"
+properties = "属性"
+edit = "编辑"
+title = "标题"
+description = "描述"
+source_url = "来源链接"
+rating = "评分"
+kind = "类型"
+mime_type = "格式"
+size = "大小"
+dimensions = "尺寸"
+added = "添加于"
+add_tag_placeholder = "添加标签 + 回车"
+
+[asset]
+kind.image = "图片"
+kind.video = "视频"
+kind.audio = "音频"
+kind.document = "文档"
+kind.archive = "压缩包"
+kind.other = "其他"
+
+[settings]
+title = "设置"
+general = "通用"
+language = "语言"
+library = "素材库"
+library_location = "素材库位置"
+library_location_desc = "素材库数据库与媒体文件存放的位置。重启应用后生效。"
+browse = "浏览…"
+select_folder = "选择素材库文件夹"
+follow_system = "跟随系统"
+language_desc = "界面语言，切换后立即生效。"
+
+[i18n]
+lang_en = "English"
+lang_zh = "简体中文"

@@ -5,11 +5,17 @@
 //! carries no feature or layout logic. The [`AppView`] lives in the sibling
 //! `app` module.
 
+// Embeds `locales/*.toml` into the binary (compile-time parse; `en.toml` is
+// the fallback catalog). After this, `rust_i18n::t!` resolves keys and
+// `rust_i18n::set_locale` switches the process-global language — see `i18n`.
+rust_i18n::i18n!("locales", fallback = "en");
+
 use gpui_kit::component::Root;
 use gpui_kit::*;
 
 mod actions;
 mod app;
+mod i18n;
 mod jobs;
 mod panels;
 mod settings;
@@ -24,41 +30,53 @@ use app::AppView;
 /// search input or elsewhere never triggers grid navigation.
 const WORKSPACE_CONTEXT: &str = "Workspace";
 
-fn register_menus(cx: &mut App) {
+/// (Re)build the application menus from the active locale. Called at startup
+/// and again after a live language switch in Settings.
+pub fn apply_menus(cx: &mut App) {
     cx.set_menus(vec![
         Menu {
-            name: "File".into(),
+            name: rust_i18n::t!("app.file").into_owned().into(),
             items: vec![
-                MenuItem::action("Import files…", ImportFiles),
-                MenuItem::action("Export library…", ExportLibrary).disabled(true),
+                MenuItem::action(rust_i18n::t!("app.import_files").to_string(), ImportFiles),
+                MenuItem::action(
+                    rust_i18n::t!("app.export_library").to_string(),
+                    ExportLibrary,
+                )
+                .disabled(true),
                 MenuItem::separator(),
-                MenuItem::action("Settings…", OpenSettings),
+                MenuItem::action(rust_i18n::t!("app.settings").to_string(), OpenSettings),
             ],
             disabled: false,
         },
         Menu {
-            name: "Edit".into(),
+            name: rust_i18n::t!("app.edit").into_owned().into(),
             items: vec![
-                MenuItem::action("Select all", SelectAll),
-                MenuItem::action("Clear selection", ClearSelection),
+                MenuItem::action(rust_i18n::t!("app.select_all").to_string(), SelectAll),
+                MenuItem::action(
+                    rust_i18n::t!("app.clear_selection").to_string(),
+                    ClearSelection,
+                ),
                 MenuItem::separator(),
-                MenuItem::action("Move to trash", TrashSelected),
+                MenuItem::action(rust_i18n::t!("app.move_to_trash").to_string(), TrashSelected),
             ],
             disabled: false,
         },
         Menu {
-            name: "View".into(),
+            name: rust_i18n::t!("app.view").into_owned().into(),
             items: vec![
-                MenuItem::action("All assets", ShowAllAssets),
-                MenuItem::action("Trash", ShowTrash),
+                MenuItem::action(rust_i18n::t!("app.all_assets").to_string(), ShowAllAssets),
+                MenuItem::action(rust_i18n::t!("app.trash").to_string(), ShowTrash),
                 MenuItem::separator(),
-                MenuItem::action("Refresh", RefreshLibrary),
+                MenuItem::action(rust_i18n::t!("app.refresh").to_string(), RefreshLibrary),
             ],
             disabled: false,
         },
         Menu {
-            name: "Help".into(),
-            items: vec![MenuItem::action("About Trove", About)],
+            name: rust_i18n::t!("app.help").into_owned().into(),
+            items: vec![MenuItem::action(
+                rust_i18n::t!("app.about").to_string(),
+                About,
+            )],
             disabled: false,
         },
     ]);
@@ -79,11 +97,12 @@ fn register_keys(cx: &mut App) {
 }
 
 fn main() {
+    i18n::init_from_config();
     gpui_kit::application()
         .with_assets(gpui_kit::assets::Assets)
         .run(|cx| {
             gpui_kit::init(cx);
-            register_menus(cx);
+            apply_menus(cx);
             register_keys(cx);
 
             cx.spawn(async move |cx| {

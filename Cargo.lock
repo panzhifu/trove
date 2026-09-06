@@ -7177,6 +7177,8 @@ name = "trove-app"
 version = "0.1.0"
 dependencies = [
  "gpui-kit",
+ "rust-i18n",
+ "sys-locale",
  "trove-core",
  "uuid",
 ]
