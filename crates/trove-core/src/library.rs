@@ -8,6 +8,7 @@ use uuid::Uuid;
 use crate::error::Result;
 use crate::media;
 use crate::store::{assets, batch, collections, rows, smart, smart_collections, tags, Store};
+use crate::undo::{self, Op, SharedUndoStack};
 
 /// Serialize the whole metadata catalog of `store` (assets, collections,
 /// tags, smart collections) as pretty JSON. Media blobs are not included —
@@ -50,6 +51,8 @@ pub struct PurgeReport {
 pub struct Library {
     store: Store,
     root: PathBuf,
+    /// Undo/redo log for invertible metadata mutations (see [`crate::undo`]).
+    undo: SharedUndoStack,
 }
 
 impl Library {
@@ -58,7 +61,7 @@ impl Library {
         let root = root.as_ref().to_path_buf();
         std::fs::create_dir_all(&root)?;
         let store = Store::open(&root.join("library.db"))?;
-        let lib = Self { store, root };
+        let lib = Self { store, root, undo: SharedUndoStack::default() };
         // Backfill the FTS index for a library migrated from a schema that had
         // no search table: without this, `search` silently returns nothing for
         // assets that predate the index.
@@ -90,7 +93,7 @@ impl Library {
         let root = root.as_ref().to_path_buf();
         std::fs::create_dir_all(&root)?;
         let store = Store::in_memory()?;
-        Ok(Self { store, root })
+        Ok(Self { store, root, undo: SharedUndoStack::default() })
     }
 
     pub fn store(&self) -> &Store {
@@ -240,25 +243,260 @@ impl Library {
     }
 
     // -- batch asset mutations ------------------------------------------------
+    //
+    // Every method here records an invertible `undo::Op` (see [`crate::undo`]).
+    // Destructive operations that cannot be inverted — purge, empty trash,
+    // imports, tag/collection deletes — are deliberately not recorded.
 
     /// Trash many assets (single atomic statement).
     pub fn trash_assets(&self, ids: &[Uuid]) -> Result<u64> {
-        batch::set_trashed_many(self.store.conn(), ids, true)
+        self.set_assets_trashed(ids, true)
     }
 
     /// Restore many trashed assets (single atomic statement).
     pub fn restore_assets(&self, ids: &[Uuid]) -> Result<u64> {
-        batch::set_trashed_many(self.store.conn(), ids, false)
+        self.set_assets_trashed(ids, false)
     }
 
     /// Favorite / unfavorite many assets (single atomic statement).
     pub fn set_assets_favorite(&self, ids: &[Uuid], favorite: bool) -> Result<u64> {
-        batch::set_favorite_many(self.store.conn(), ids, favorite)
+        let conn = self.store.conn();
+        let before = ids
+            .iter()
+            .map(|id| {
+                Ok((
+                    *id,
+                    assets::get(conn, *id)?.map(|a| a.is_favorite).unwrap_or(false),
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let changed = batch::set_favorite_many(conn, ids, favorite)?;
+        if changed > 0 {
+            self.undo.record(Op::SetFavorite {
+                before,
+                after: ids.iter().map(|id| (*id, favorite)).collect(),
+            });
+        }
+        Ok(changed)
     }
 
-    /// Attach many assets to a collection (idempotent).
+    /// Attach many assets to a collection (idempotent). Only the actual
+    /// membership delta is recorded for undo.
     pub fn add_assets_to_collection(&self, collection_id: Uuid, ids: &[Uuid]) -> Result<u64> {
-        batch::add_to_collection_many(self.store.conn(), collection_id, ids)
+        let conn = self.store.conn();
+        let members = collections::asset_ids(conn, collection_id)?;
+        let changed = batch::add_to_collection_many(conn, collection_id, ids)?;
+        let added: Vec<Uuid> = ids
+            .iter()
+            .filter(|id| !members.contains(id))
+            .copied()
+            .collect();
+        if !added.is_empty() {
+            self.undo.record(Op::MembershipAdd {
+                collection: collection_id,
+                added,
+            });
+        }
+        Ok(changed)
+    }
+
+    /// Detach many assets from a collection. Returns the number actually
+    /// removed (assets that were not members are ignored).
+    pub fn remove_assets_from_collection(
+        &self,
+        collection_id: Uuid,
+        ids: &[Uuid],
+    ) -> Result<usize> {
+        let conn = self.store.conn();
+        let members = collections::asset_ids(conn, collection_id)?;
+        let removed: Vec<Uuid> = ids
+            .iter()
+            .filter(|id| members.contains(id))
+            .copied()
+            .collect();
+        for id in &removed {
+            collections::remove_asset(conn, collection_id, *id)?;
+        }
+        let count = removed.len();
+        if count > 0 {
+            self.undo.record(Op::MembershipRemove {
+                collection: collection_id,
+                removed,
+            });
+        }
+        Ok(count)
+    }
+
+    /// Apply a metadata patch to one asset, recording the full pre-state so
+    /// undo restores every editable column (title/description edits also
+    /// re-sync the FTS index through `assets::update`).
+    pub fn patch_asset(&self, asset_id: Uuid, patch: &crate::model::AssetPatch) -> Result<()> {
+        let conn = self.store.conn();
+        let before = assets::get(conn, asset_id)?
+            .map(|asset| undo::restore_patch(&asset))
+            .ok_or(crate::Error::NotFound("asset"))?;
+        assets::update(conn, asset_id, patch)?;
+        self.undo.record(Op::PatchAsset {
+            id: asset_id,
+            before,
+            after: patch.clone(),
+        });
+        Ok(())
+    }
+
+    /// Replace one asset's whole tag group (missing tags must already exist —
+    /// use [`tags::ensure_named`] at the call site first).
+    pub fn set_asset_tags(&self, asset_id: Uuid, tag_ids: &[Uuid]) -> Result<()> {
+        let conn = self.store.conn();
+        let before: Vec<Uuid> = tags::for_asset(conn, asset_id)?
+            .iter()
+            .map(|t| t.id)
+            .collect();
+        tags::set_for_asset(conn, asset_id, tag_ids)?;
+        self.undo.record(Op::SetTags {
+            asset: asset_id,
+            before,
+            after: tag_ids.to_vec(),
+        });
+        Ok(())
+    }
+
+    /// Attach (`add = true`) or detach one tag on many assets, recording the
+    /// per-asset tag-group delta.
+    pub fn tag_assets(&self, asset_ids: &[Uuid], tag_id: Uuid, add: bool) -> Result<()> {
+        let conn = self.store.conn();
+        for asset_id in asset_ids {
+            let before: Vec<Uuid> = tags::for_asset(conn, *asset_id)?
+                .iter()
+                .map(|t| t.id)
+                .collect();
+            let after: Vec<Uuid> = if add {
+                if before.contains(&tag_id) {
+                    continue;
+                }
+                let mut v = before.clone();
+                v.push(tag_id);
+                v
+            } else {
+                if !before.contains(&tag_id) {
+                    continue;
+                }
+                before.iter().copied().filter(|id| *id != tag_id).collect()
+            };
+            tags::set_for_asset(conn, *asset_id, &after)?;
+            self.undo.record(Op::SetTags {
+                asset: *asset_id,
+                before,
+                after,
+            });
+        }
+        Ok(())
+    }
+
+    /// Rename a tag (FTS re-synced), recording the previous name.
+    pub fn rename_tag(&self, tag_id: Uuid, name: &str) -> Result<()> {
+        let conn = self.store.conn();
+        let before = tags::get(conn, tag_id)?
+            .ok_or(crate::Error::NotFound("tag"))?
+            .name;
+        tags::rename(conn, tag_id, name)?;
+        self.undo.record(Op::TagRename {
+            id: tag_id,
+            before,
+            after: name.to_string(),
+        });
+        Ok(())
+    }
+
+    /// Set (or clear) a tag's display color, recording the previous value.
+    pub fn set_tag_color(&self, tag_id: Uuid, color: Option<&str>) -> Result<()> {
+        let conn = self.store.conn();
+        let before = tags::get(conn, tag_id)?
+            .ok_or(crate::Error::NotFound("tag"))?
+            .color;
+        tags::set_color(conn, tag_id, color)?;
+        self.undo.record(Op::TagColor {
+            id: tag_id,
+            before,
+            after: color.map(|c| c.to_string()),
+        });
+        Ok(())
+    }
+
+    /// Rename a collection, recording the previous name.
+    pub fn rename_collection(&self, collection_id: Uuid, name: &str) -> Result<()> {
+        let conn = self.store.conn();
+        let before = collections::get(conn, collection_id)?
+            .ok_or(crate::Error::NotFound("collection"))?
+            .name;
+        collections::rename(conn, collection_id, name)?;
+        self.undo.record(Op::CollectionRename {
+            id: collection_id,
+            before,
+            after: name.to_string(),
+        });
+        Ok(())
+    }
+
+    /// Move a collection under `new_parent` at `position`, recording the
+    /// previous placement.
+    pub fn move_collection(
+        &self,
+        collection_id: Uuid,
+        new_parent: Option<Uuid>,
+        position: i64,
+    ) -> Result<()> {
+        let conn = self.store.conn();
+        let c = collections::get(conn, collection_id)?
+            .ok_or(crate::Error::NotFound("collection"))?;
+        collections::move_to(conn, collection_id, new_parent, position)?;
+        self.undo.record(Op::CollectionMove {
+            id: collection_id,
+            before: (c.parent_id, c.position),
+            after: (new_parent, position),
+        });
+        Ok(())
+    }
+
+    /// Undo the most recent recorded mutation. Returns `false` when there is
+    /// nothing to undo.
+    pub fn undo(&self) -> Result<bool> {
+        self.undo.undo(self.store.conn())
+    }
+
+    /// Redo the most recently undone mutation. Returns `false` when there is
+    /// nothing to redo.
+    pub fn redo(&self) -> Result<bool> {
+        self.undo.redo(self.store.conn())
+    }
+
+    pub fn undo_len(&self) -> usize {
+        self.undo.undo_len()
+    }
+
+    pub fn redo_len(&self) -> usize {
+        self.undo.redo_len()
+    }
+
+    fn set_assets_trashed(&self, ids: &[Uuid], trashed: bool) -> Result<u64> {
+        let conn = self.store.conn();
+        let before = ids
+            .iter()
+            .map(|id| {
+                Ok((
+                    *id,
+                    assets::get(conn, *id)?.map(|a| a.trashed_at.is_some()).unwrap_or(false),
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let changed = batch::set_trashed_many(conn, ids, trashed)?;
+        if changed > 0 {
+            self.undo.record(Op::SetTrashed {
+                before,
+                after: ids.iter().map(|id| (*id, trashed)).collect(),
+            });
+        }
+        Ok(changed)
     }
 
     /// Full metadata export (assets, collections, tags, smart collections) as

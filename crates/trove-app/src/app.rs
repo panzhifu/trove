@@ -143,6 +143,7 @@ impl AppView {
             .to_string(),
         };
         let notice = ctl.notice.clone();
+        let (undo_len, redo_len) = (ctl.library.undo_len(), ctl.library.redo_len());
         h_flex()
             .h(px(26.))
             .px_3()
@@ -155,6 +156,18 @@ impl AppView {
             .text_xs()
             .text_color(cx.theme().muted_foreground)
             .child(rust_i18n::t!("statusbar.selected", count = selected).to_string())
+            .when(undo_len > 0 || redo_len > 0, |bar| {
+                bar.child(
+                    div()
+                        .when(undo_len > 0, |seg| {
+                            seg.child(rust_i18n::t!("statusbar.undo", count = undo_len).to_string())
+                        })
+                        .when(undo_len > 0 && redo_len > 0, |seg| seg.child(" · "))
+                        .when(redo_len > 0, |seg| {
+                            seg.child(rust_i18n::t!("statusbar.redo", count = redo_len).to_string())
+                        }),
+                )
+            })
             .child(
                 div()
                     .flex_1()
@@ -282,6 +295,28 @@ impl Render for AppView {
             .on_action(cx.listener(|this, _: &TrashSelected, _, cx| {
                 this.controller.update(cx, |ctl, cx| {
                     ctl.trash_or_purge_selection();
+                    cx.notify();
+                });
+            }))
+            .on_action(cx.listener(|this, _: &Undo, _, cx| {
+                this.controller.update(cx, |ctl, cx| {
+                    if let Err(e) = ctl.library.undo() {
+                        ctl.notice = Some(
+                            rust_i18n::t!("app.undo_failed", error = e.to_string()).to_string(),
+                        );
+                    }
+                    ctl.generation += 1;
+                    cx.notify();
+                });
+            }))
+            .on_action(cx.listener(|this, _: &Redo, _, cx| {
+                this.controller.update(cx, |ctl, cx| {
+                    if let Err(e) = ctl.library.redo() {
+                        ctl.notice = Some(
+                            rust_i18n::t!("app.redo_failed", error = e.to_string()).to_string(),
+                        );
+                    }
+                    ctl.generation += 1;
                     cx.notify();
                 });
             }))

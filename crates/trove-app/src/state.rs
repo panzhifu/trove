@@ -6,7 +6,6 @@ use uuid::Uuid;
 
 use trove_core::library::Library;
 use trove_core::model::{AssetKind, AssetSort};
-use trove_core::store::collections;
 
 /// Current import activity, shown by the Explorer panel.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -216,17 +215,20 @@ impl LibraryController {
         let Some(cid) = self.current_collection else {
             return 0;
         };
-        let conn = self.library.store().conn();
-        let mut removed = 0;
-        for id in ids {
-            if collections::remove_asset(conn, cid, *id).is_ok() {
-                removed += 1;
+        match self.library.remove_assets_from_collection(cid, ids) {
+            Ok(removed) => {
+                if removed > 0 {
+                    self.generation += 1;
+                }
+                removed
+            }
+            Err(e) => {
+                self.notice = Some(
+                    rust_i18n::t!("workspace.remove_failed", error = e.to_string()).to_string(),
+                );
+                0
             }
         }
-        if removed > 0 {
-            self.generation += 1;
-        }
-        removed
     }
 
     /// Swap the open library for another one at `path` (hot switch from

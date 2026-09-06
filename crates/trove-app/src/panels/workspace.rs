@@ -35,7 +35,7 @@ use trove_core::layout::{
     GRID_GAP, MAX_ROW_HEIGHT, MIN_ASPECT, MIN_ROW_HEIGHT, TARGET_ROW_HEIGHT, RowLayout,
     justify_layout,
 };
-use trove_core::model::{AssetKind, AssetPatch, AssetQuery, AssetSort, NewSmartCollection};
+use trove_core::model::{AssetKind, AssetQuery, AssetSort, NewSmartCollection};
 use serde_json::json;
 use trove_core::store::{assets, collections, smart_collections};
 use uuid::Uuid;
@@ -1616,15 +1616,8 @@ fn asset_context_menu(    menu: PopupMenu,
             .checked(favorite)
             .on_click(move |_, _, cx| {
                 c_fav.update(cx, move |ctl, cx| {
-                    let conn = ctl.library.store().conn();
-                    let _ = assets::update(
-                        conn,
-                        asset_id,
-                        &AssetPatch {
-                            is_favorite: Some(!favorite),
-                            ..Default::default()
-                        },
-                    );
+                    let ids = ctl.action_targets(asset_id);
+                    let _ = ctl.library.set_assets_favorite(&ids, !favorite);
                     ctl.generation += 1;
                     cx.notify();
                 });

@@ -162,7 +162,7 @@ impl ExplorerPanel {
             }
             EditorMode::Renaming(id) => {
                 self.controller.update(cx, |ctl, cx| {
-                    let _ = collections::rename(ctl.library.store().conn(), id, &name);
+                    let _ = ctl.library.rename_collection(id, &name);
                     cx.notify();
                 });
             }
@@ -558,7 +558,7 @@ fn collection_row(
                     let position = collections::children_of(conn, Some(cid))
                         .map(|c| c.len() as i64)
                         .unwrap_or(0);
-                    if let Err(e) = collections::move_to(conn, payload.0, Some(cid), position) {
+                    if let Err(e) = ctl.library.move_collection(payload.0, Some(cid), position) {
                         ctl.notice = Some(
                             rust_i18n::t!("explorer.move_failed", error = e.to_string())
                                 .to_string(),
@@ -580,7 +580,7 @@ fn collection_row(
                     let position = collections::roots(conn)
                         .map(|r| r.len() as i64)
                         .unwrap_or(0);
-                    if let Err(e) = collections::move_to(conn, payload.0, None, position) {
+                    if let Err(e) = ctl.library.move_collection(payload.0, None, position) {
                         ctl.notice = Some(
                             rust_i18n::t!("explorer.move_failed", error = e.to_string())
                                 .to_string(),

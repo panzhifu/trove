@@ -129,10 +129,7 @@ impl Render for TagsPanel {
                                     })
                                     .on_drop(move |payload: &AssetsDrag, _window, cx| {
                                         ctl_tag.update(cx, move |ctl, cx| {
-                                            let conn = ctl.library.store().conn();
-                                            for aid in &payload.0 {
-                                                let _ = tags::add_to_asset(conn, *aid, id);
-                                            }
+                                            let _ = ctl.library.tag_assets(&payload.0, id, true);
                                             ctl.generation += 1;
                                             cx.notify();
                                         });
@@ -198,8 +195,7 @@ fn tag_context_menu(
                 PopupMenuItem::new(label).on_click(move |_, _, cx| {
                     let value = value.clone();
                     ctl.update(cx, move |ctl, cx| {
-                        let conn = ctl.library.store().conn();
-                        let _ = tags::set_color(conn, tag_id, Some(&value));
+                        let _ = ctl.library.set_tag_color(tag_id, Some(&value));
                         ctl.generation += 1;
                         cx.notify();
                     });
@@ -211,8 +207,7 @@ fn tag_context_menu(
             PopupMenuItem::new(rust_i18n::t!("tags.no_color").to_string()).on_click(
                 move |_, _, cx| {
                     ctl_clear.update(cx, move |ctl, cx| {
-                        let conn = ctl.library.store().conn();
-                        let _ = tags::set_color(conn, tag_id, None);
+                        let _ = ctl.library.set_tag_color(tag_id, None);
                         ctl.generation += 1;
                         cx.notify();
                     });
@@ -277,8 +272,7 @@ fn open_rename_dialog(
                     let name: String = name_input.read(cx).value().trim().to_string();
                     if !name.is_empty() {
                         ctl.update(cx, |ctl, cx| {
-                            let conn = ctl.library.store().conn();
-                            let _ = tags::rename(conn, tag_id, &name);
+                            let _ = ctl.library.rename_tag(tag_id, &name);
                             ctl.generation += 1;
                             cx.notify();
                         });

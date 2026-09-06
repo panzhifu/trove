@@ -73,6 +73,9 @@ fn build_menus() -> Vec<Menu> {
                 ),
                 MenuItem::separator(),
                 MenuItem::action(rust_i18n::t!("app.move_to_trash").to_string(), TrashSelected),
+                MenuItem::separator(),
+                MenuItem::action(rust_i18n::t!("app.undo").to_string(), Undo),
+                MenuItem::action(rust_i18n::t!("app.redo").to_string(), Redo),
             ],
             disabled: false,
         },
@@ -108,6 +111,11 @@ fn register_keys(cx: &mut App) {
         KeyBinding::new("backspace", TrashSelected, Some(WORKSPACE_CONTEXT)),
         KeyBinding::new("ctrl-a", SelectAll, Some(WORKSPACE_CONTEXT)),
         KeyBinding::new("escape", ClearSelection, Some(WORKSPACE_CONTEXT)),
+        // Undo/redo keys live in the Workspace context so typing in the search
+        // input or editors keeps its own text-level undo. The Edit menu items
+        // dispatch anywhere.
+        KeyBinding::new("ctrl-z", Undo, Some(WORKSPACE_CONTEXT)),
+        KeyBinding::new("ctrl-shift-z", Redo, Some(WORKSPACE_CONTEXT)),
     ]);
 }
 
