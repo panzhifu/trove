@@ -10,6 +10,7 @@ use gpui_kit::base::{h_flex, v_flex};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::dock::{BasePanel, Panel as DockPanel, PanelControl, PanelEvent};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
+use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::{ActiveTheme, Icon, IconName, Sizable};
 use gpui_kit::*;
 use gpui_kit::prelude::FluentBuilder as _;
@@ -329,7 +330,10 @@ impl Render for InspectorPanel {
                 .child(rust_i18n::t!(key).to_string())
         };
 
-        v_flex()
+        // The edit section made the panel taller than its dock slot: the
+        // whole content scrolls inside a bounded container (same pattern as
+        // the tags panel).
+        let content = v_flex()
             .p_3()
             .gap_2()
             .w_full()
@@ -410,7 +414,17 @@ impl Render for InspectorPanel {
             .child(property_row(cx, "inspector.size", human_bytes(asset.size_bytes)))
             .child(property_row(cx, "inspector.dimensions", dims))
             .child(property_row(cx, "inspector.added", added))
-            .child(property_row(cx, "inspector.sha256", hash))
+            .child(property_row(cx, "inspector.sha256", hash));
+
+        v_flex()
+            .size_full()
+            .child(
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scrollbar()
+                    .child(content),
+            )
             .into_any_element()
     }
 }
