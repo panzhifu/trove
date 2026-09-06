@@ -1,29 +1,34 @@
-//! core 的统一错误类型。
+//! Error types for the Trove core.
 
-/// 资产仓库核心错误。
-#[derive(Debug, thiserror::Error)]
-pub enum CoreError {
-    #[error("invalid sha256: {0}")]
-    InvalidSha256(String),
+use thiserror::Error;
 
-    #[error("invalid rating: {0} (must be 0..=5)")]
-    InvalidRating(u8),
+/// Result alias used across the core crate.
+pub type Result<T> = std::result::Result<T, Error>;
 
-    #[error("invalid input: {0}")]
-    InvalidInput(String),
+/// Top-level error for domain and persistence operations.
+#[derive(Debug, Error)]
+pub enum Error {
+    /// A value failed domain validation (bad input, name too long, ...).
+    #[error("invalid value: {0}")]
+    Validation(String),
 
+    /// The requested record does not exist.
     #[error("not found: {0}")]
-    NotFound(String),
+    NotFound(&'static str),
 
-    #[error("io error: {0}")]
-    Io(#[from] std::io::Error),
+    /// A uniqueness or referential constraint was violated.
+    #[error("constraint violation: {0}")]
+    Conflict(String),
 
-    #[error("json error: {0}")]
+    /// Underlying database failure.
+    #[error("database error: {0}")]
+    Db(String),
+
+    /// Serde (de)serialization failure — persisted data, JSON fields, ...
+    #[error("serialization error: {0}")]
     Json(#[from] serde_json::Error),
 
-    #[error("database error: {0}")]
-    Db(#[from] libsql::Error),
-
-    #[error("uuid parse error: {0}")]
-    Uuid(#[from] uuid::Error),
+    /// Filesystem / I/O failure.
+    #[error("io error: {0}")]
+    Io(#[from] std::io::Error),
 }

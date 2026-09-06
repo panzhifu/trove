@@ -5,3 +5,6 @@
 .claude/skills/
 .agents/
 .workbuddy/skills/
+
+# 无关项目的本地打包文件，不属于 trove。
+tty7-bin/

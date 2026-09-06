@@ -1,11 +1,25 @@
 [workspace]
-members = ["crates/trove-core", "crates/trove-plugin-api"]
-resolver = "2"
+members = ["crates/trove-core", "crates/trove-app"]
+resolver = "3"
 
-[package]
-name = "trove"
-version = "0.1.0"
-edition = "2024"
+[workspace.dependencies]
+# UI
+gpui-kit = "0.6"
 
-[dependencies]
-trove-core = { path = "crates/trove-core" }
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Persistence
+libsql = { version = "0.6", default-features = false, features = ["core"] }
+sha2 = "0.10"
+
+# Utilities
+chrono = { version = "0.4", features = ["serde"] }
+thiserror = "2"
+uuid = { version = "1", features = ["v4", "serde"] }
+dirs = "5"
+
+[patch.crates-io]
+gpui-kit = { git = "https://github.com/panzhifu/gpui-kit.git", branch = "feat/optional-ellipsis-menu" }
+gpui-kit-assets = { git = "https://github.com/panzhifu/gpui-kit.git", branch = "feat/optional-ellipsis-menu" }
