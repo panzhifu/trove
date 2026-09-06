@@ -73,9 +73,13 @@ impl AppConfig {
         self.save()
     }
 
-    /// Resolved library path: the configured one, or a sensible default
-    /// (`~/.trove/library`) when none is set yet.
+    /// Resolved library path: the `TROVE_LIBRARY_DIR` override when set,
+    /// then the configured one, then a sensible default (`~/.trove/library`)
+    /// when none is set yet.
     pub fn resolved_library_path(&self) -> PathBuf {
+        if let Ok(dir) = std::env::var("TROVE_LIBRARY_DIR") {
+            return PathBuf::from(dir);
+        }
         self.library_path.clone().unwrap_or_else(default_library_path)
     }
 }

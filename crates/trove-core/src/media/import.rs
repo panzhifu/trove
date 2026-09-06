@@ -112,24 +112,51 @@ pub fn import_files_assigned(
         && collections::get(store.conn(), cid)?.is_none() {
             return Err(Error::NotFound("collection"));
         }
+    Ok(commit_staged_all(store, into_collection, auto, stage_all(root, sources)))
+}
 
+/// Phase one for a batch: stage every source file (copy + hash + probe + thumbnail).
+/// Pure filesystem work, safe to run on a background thread. Individual
+/// failures never abort the batch; they are collected as [`ImportSkip`]s.
+pub fn stage_all(
+    root: &Path,
+    sources: &[PathBuf],
+) -> Vec<std::result::Result<StagedFile, ImportSkip>> {
+    sources
+        .iter()
+        .map(|src| {
+            stage_source(root, src).map_err(|e| ImportSkip {
+                path: src.clone(),
+                reason: e.to_string(),
+            })
+        })
+        .collect()
+}
+
+/// Phase two for a batch: commit staged files (or pass through staging
+/// failures) into the database, collecting per-file outcomes into an
+/// [`ImportReport`]. Runs on whatever thread owns the [`Store`]; callers that
+/// keep a `Store` on the UI thread should commit from that thread.
+pub fn commit_staged_all(
+    store: &Store,
+    into_collection: Option<Uuid>,
+    auto: Option<AutoCollection>,
+    staged: Vec<std::result::Result<StagedFile, ImportSkip>>,
+) -> ImportReport {
     let mut report = ImportReport::default();
-    for src in sources {
-        match stage_source(root, src) {
-            Ok(staged) => match commit_staged(store, into_collection, auto, &staged) {
+    for item in staged {
+        match item {
+            Ok(file) => match commit_staged(store, into_collection, auto, &file) {
                 Ok(item) => report.imported.push(item),
                 Err(e) => report.skipped.push(ImportSkip {
-                    path: src.clone(),
+                    path: file.path,
                     reason: e.to_string(),
                 }),
             },
-            Err(e) => report.skipped.push(ImportSkip {
-                path: src.clone(),
-                reason: e.to_string(),
-            }),
+            Err(skip) => report.skipped.push(skip),
         }
     }
-    Ok(report)
+    report
 }
 
 /// Phase one (slow, pure I/O): copy + hash + probe one source file.
@@ -306,4 +333,73 @@ fn file_name_of(src: &Path) -> Result<String> {
     let mut name = name;
     name.truncate(crate::model::MAX_NAME_LEN);
     Ok(name)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::Store;
+
+    /// A minimal valid 1x1 PNG.
+    const PNG_1X1: &[u8] = &[
+        0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48,
+        0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00,
+        0x00, 0x1F, 0x15, 0xC4, 0x89, 0x00, 0x00, 0x00, 0x0A, 0x49, 0x44, 0x41, 0x54, 0x78,
+        0x9C, 0x63, 0x00, 0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0D, 0x0A, 0x2D, 0xB4, 0x00,
+        0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+    ];
+
+    fn temp_root(name: &str) -> PathBuf {
+        let root =
+            std::env::temp_dir().join(format!("trove-import-{name}-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    #[test]
+    fn batch_pipeline_collects_skips_and_dedupes() {
+        let root = temp_root("batch");
+        let store = Store::in_memory().unwrap();
+
+        let good = root.join("pic.png");
+        std::fs::write(&good, PNG_1X1).unwrap();
+        let missing = root.join("nope.png");
+
+        // Phase one: staging collects failures instead of aborting the batch.
+        let staged = stage_all(&root, &[good.clone(), missing.clone()]);
+        assert_eq!(staged.len(), 2);
+        assert!(staged[0].is_ok());
+        assert!(staged[1].is_err());
+
+        // Phase two: the commit loop turns everything into an ImportReport.
+        let report = commit_staged_all(
+            &store,
+            None,
+            Some(AutoCollection::SourceFolder),
+            staged,
+        );
+        assert_eq!(report.imported_count(), 1);
+        assert_eq!(report.skipped_count(), 1);
+        assert_eq!(report.skipped[0].path, missing);
+        assert!(!report.skipped[0].reason.is_empty());
+
+        // The auto collection named after the source folder exists.
+        let conn = store.conn();
+        let roots = collections::roots(conn).unwrap();
+        assert!(roots.iter().any(|c| c.name == "trove-import-batch"
+            || c.name.starts_with("trove-import-")));
+
+        // Re-importing identical content dedupes (reused = true).
+        let staged2 = stage_all(&root, &[good]);
+        let report2 = commit_staged_all(
+            &store,
+            None,
+            Some(AutoCollection::SourceFolder),
+            staged2,
+        );
+        assert_eq!(report2.imported_count(), 1);
+        assert!(report2.imported[0].reused);
+
+        std::fs::remove_dir_all(&root).ok();
+    }
 }
