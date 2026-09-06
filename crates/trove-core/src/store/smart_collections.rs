@@ -83,6 +83,29 @@ pub fn rename(conn: &Connection, id: Uuid, name: &str) -> Result<()> {
     Ok(())
 }
 
+/// Replace the stored condition tree of a smart collection. The tree is
+/// validated by compiling it before the row is touched.
+pub fn update_query(conn: &Connection, id: Uuid, query: &serde_json::Value) -> Result<()> {
+    // Validate up front: an uncompilable tree must not land in the store.
+    let node = super::smart::node_from_json(query)?;
+    super::smart::compile(&node)?;
+    let changed = rows::execute(
+        conn,
+        "UPDATE smart_collections SET query = ?1, updated_at = ?2 WHERE id = ?3",
+        vec![
+            serde_json::to_string(query)
+                .map_err(|e| Error::Db(format!("serialize query: {e}")))?
+                .into(),
+            rows::ts(Utc::now()).into(),
+            rows::uuid(id).into(),
+        ],
+    )?;
+    if changed == 0 {
+        return Err(Error::NotFound("smart_collection"));
+    }
+    Ok(())
+}
+
 /// Delete a smart collection (just the saved search; assets are untouched).
 pub fn delete(conn: &Connection, id: Uuid) -> Result<()> {
     rows::execute(

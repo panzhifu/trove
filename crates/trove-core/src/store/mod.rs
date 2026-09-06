@@ -162,6 +162,47 @@ mod tests {
     }
 
     #[test]
+    fn smart_collection_update_query_validates() {
+        use crate::store::smart_collections;
+        let store = Store::in_memory().unwrap();
+        let sc = smart_collections::create(
+            store.conn(),
+            &crate::model::NewSmartCollection {
+                name: "pics".into(),
+                query: serde_json::json!({"op": "match", "field": "kind", "value": "image"}),
+                color: None,
+                position: 0,
+            },
+        )
+        .unwrap();
+
+        // A valid tree replaces the stored query.
+        let tree = serde_json::json!({
+            "op": "and",
+            "children": [
+                {"op": "match", "field": "rating", "compare": "gte", "value": 4},
+                {"op": "match", "field": "tag", "value": "三毛"}
+            ]
+        });
+        smart_collections::update_query(store.conn(), sc.id, &tree).unwrap();
+        let stored = smart_collections::get(store.conn(), sc.id).unwrap().unwrap();
+        assert_eq!(stored.query, tree);
+
+        // A garbage tree is refused and the stored one survives.
+        assert!(smart_collections::update_query(
+            store.conn(),
+            sc.id,
+            &serde_json::json!({"op": "match", "field": "text", "compare": "gte", "value": "x"})
+        )
+        .is_err());
+        assert_eq!(
+            smart_collections::get(store.conn(), sc.id).unwrap().unwrap().query,
+            tree
+        );
+        assert!(smart_collections::update_query(store.conn(), Uuid::new_v4(), &tree).is_err());
+    }
+
+    #[test]
     fn migrations_run_and_store_reopens() {
         let store = Store::in_memory().unwrap();
         assert_eq!(store.user_version().unwrap(), schema::SCHEMA_VERSION);

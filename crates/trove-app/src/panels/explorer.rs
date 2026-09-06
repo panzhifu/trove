@@ -394,7 +394,28 @@ impl Render for ExplorerPanel {
         }
 
         // Smart collections: saved searches, activated live against the library.
-        items.push(separator_label(cx, rust_i18n::t!("panel.smart").to_string()).into_any_element());
+        // Smart-collection section header with its own "+" (new rule editor).
+        {
+            let controller = self.controller.clone();
+            items.push(
+                h_flex()
+                    .w_full()
+                    .items_center()
+                    .justify_between()
+                    .child(separator_label(cx, rust_i18n::t!("panel.smart").to_string()))
+                    .child(
+                        Button::new("add-smart-title")
+                            .ghost()
+                            .xsmall()
+                            .label("+")
+                            .tooltip(rust_i18n::t!("rules.title_new").to_string())
+                            .on_click(move |_, window, cx| {
+                                crate::rules::open_rule_editor(window, cx, controller.clone(), None);
+                            }),
+                    )
+                    .into_any_element(),
+            );
+        }
         for (sid, sname) in smart_rows {
             let menu_name = sname.clone();
             let controller = self.controller.clone();
@@ -521,6 +542,7 @@ fn smart_menu(
     name: String,
 ) -> PopupMenu {
     let ctl_rename = explorer.clone();
+    let ctl_edit = controller.clone();
     let ctl_delete = controller.clone();
     menu.min_w(px(160.))
         .item(
@@ -529,6 +551,15 @@ fn smart_menu(
                     ctl_rename.update(cx, |this, cx| {
                         this.begin_rename_smart(id, name.clone(), window, cx);
                     });
+                },
+            ),
+        )
+        .item(
+            PopupMenuItem::new(rust_i18n::t!("rules.edit_rule").to_string()).on_click(
+                move |_, window, cx| {
+                    let editing = ctl_edit.read(cx).library.store().conn();
+                    let editing = smart_collections::get(editing, id).ok().flatten();
+                    crate::rules::open_rule_editor(window, cx, ctl_edit.clone(), editing);
                 },
             ),
         )
