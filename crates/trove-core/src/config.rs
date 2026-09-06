@@ -15,6 +15,10 @@ use crate::error::Result;
 pub struct AppConfig {
     /// The path of the currently-open library. `None` until the user picks one.
     pub library_path: Option<PathBuf>,
+    /// UI language (`None` = follow the system preference). See
+    /// `trove-app/src/i18n.rs` for how the code resolves to a catalog.
+    #[serde(default)]
+    pub language: Option<String>,
 }
 
 impl AppConfig {
@@ -60,6 +64,12 @@ impl AppConfig {
     /// Set the library path and persist.
     pub fn set_library_path(&mut self, path: PathBuf) -> Result<()> {
         self.library_path = Some(path);
+        self.save()
+    }
+
+    /// Set the UI language (`None` = follow system) and persist.
+    pub fn set_language(&mut self, language: Option<String>) -> Result<()> {
+        self.language = language;
         self.save()
     }
 

@@ -9,8 +9,8 @@
 
 | 功能 | 后端位置 | 状态 | 说明 |
 |---|---|---|---|
-| 资产编辑（title / description / source_url / kind） | `AssetPatch` | ⬜ | Inspector 纯只读 |
-| 评分 rating（0–5） | `Asset.rating` / `AssetPatch.rating` | ⬜ | 无任何 UI |
+| 资产编辑（title / description / source_url / kind） | `AssetPatch` | ✅ | Inspector 编辑区，失焦/回车保存，空值清空列 |
+| 评分 rating（0–5） | `Asset.rating` / `AssetPatch.rating` | ✅ | 五角星行，点击当前最高星清除 |
 | 智能集合创建 / 编辑 / 重命名 | `Library::create_smart_collection` / `rename_smart_collection` | ⬜ | 只能浏览与删除；无"保存当前搜索为智能集合" |
 | 批量收藏 | `Library::set_assets_favorite`（batch.rs） | ⬜ | 收藏只对单资产 |
 | 从集合移出资产 | `collections::remove_asset` | ⬜ | 只能加入 |
@@ -41,6 +41,7 @@
 | 拖拽集合重排 / 标签拖出 | ⬜ | 仅资产可拖 |
 | 状态栏（选中数 / 库路径 / 导入状态） | ⬜ | |
 | 撤销 / 重做 | ⬜ | 前后端都没有 |
+| 界面多语言（中/英，实时切换） | ✅ | rust-i18n + `locales/*.toml`；设置 ▸ 语言，跟随系统 |
 | 库热切换（改 path 后重开） | ⬜ | Settings 的 Browse 不回填、不重开库 |
 
 ## 三、工程性问题
@@ -51,9 +52,8 @@
 
 ## 建议优先级
 
-1. Inspector 编辑 + 评分（核心闭环）
-2. 多选浮动工具栏
-3. 搜索结果保存为智能集合
-4. 导入进度接入通知层
-5. 收藏视图 + 类型过滤
-6. 维护工具入 Settings + 库热切换
+1. 多选浮动工具栏
+2. 搜索结果保存为智能集合
+3. 导入进度接入通知层
+4. 收藏视图 + 类型过滤
+5. 维护工具入 Settings + 库热切换

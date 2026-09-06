@@ -18,7 +18,7 @@ use super::common::{AssetsDrag, observe_controller};
 
 // =========================== Tags panel ======================================
 
-panel!(TagsPanel, "Tags");
+panel!(TagsPanel, rust_i18n::t!("panel.tags").to_string());
 
 impl TagsPanel {
     pub fn new(cx: &mut Context<Self>, controller: Entity<LibraryController>) -> Self {
@@ -48,7 +48,7 @@ impl Render for TagsPanel {
                     .font_weight(FontWeight::SEMIBOLD)
                     .text_color(cx.theme().muted_foreground)
                     .px_1()
-                    .child("All tags"),
+                    .child(rust_i18n::t!("tags.all_tags").to_string()),
             )
             .child(
                 div()
@@ -140,7 +140,7 @@ fn tag_context_menu(
     let ctl_del = controller.clone();
     menu.min_w(px(160.))
         .item(
-            PopupMenuItem::new("Filter by tag").on_click(move |_, _, cx| {
+            PopupMenuItem::new(rust_i18n::t!("tags.filter_by_tag").to_string()).on_click(move |_, _, cx| {
                 ctl_filter.update(cx, move |ctl, cx| {
                     if ctl.active_tag == Some(tag_id) {
                         ctl.select_tag(None);
@@ -153,7 +153,7 @@ fn tag_context_menu(
         )
         .separator()
         .item(
-            PopupMenuItem::new("Delete tag").on_click(move |_, _, cx| {
+            PopupMenuItem::new(rust_i18n::t!("tags.delete_tag").to_string()).on_click(move |_, _, cx| {
                 ctl_del.update(cx, move |ctl, cx| {
                     let conn = ctl.library.store().conn();
                     let _ = tags::delete(conn, tag_id);
