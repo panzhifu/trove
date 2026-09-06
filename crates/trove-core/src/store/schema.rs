@@ -1,99 +1,113 @@
-//! libSQL schema 定义与迁移。
+//! Schema versioning and DDL.
 //!
-//! 迁移策略：`meta` 表记录 `schema_version`，打开库时按 [`MIGRATIONS`] 逐级应用。
-//! 时间戳一律存 Unix 毫秒（INTEGER），ID 与哈希存 TEXT。
+//! The library tracks its schema with `PRAGMA user_version`. A migration is a
+//! full `execute_batch` script applied atomically by the caller. Never edit a
+//! released migration; append a new one.
 
-/// 当前 schema 版本（等于 [`MIGRATIONS`] 的长度）。
-pub const SCHEMA_VERSION: i64 = 1;
+/// Current schema version, bumped whenever a migration is appended.
+pub const SCHEMA_VERSION: i64 = 3;
 
-/// 迁移列表：`MIGRATIONS[i]` 把库从版本 `i` 升到 `i + 1`。
-pub const MIGRATIONS: &[&str] = &[MIGRATION_1];
+/// One migration per version index: `MIGRATIONS[0]` upgrades 0 -> 1, and so on.
+pub const MIGRATIONS: &[&str] = &[
+    // v1: initial asset library.
+    r#"
+    CREATE TABLE assets (
+        id          TEXT PRIMARY KEY,
+        origin      TEXT NOT NULL DEFAULT 'stored'
+                    CHECK (origin IN ('stored', 'linked')),
+        rel_path    TEXT,
+        file_name   TEXT NOT NULL,
+        ext         TEXT NOT NULL DEFAULT '',
+        mime        TEXT NOT NULL DEFAULT '',
+        size_bytes  INTEGER NOT NULL DEFAULT 0,
+        sha256      TEXT,
+        kind        TEXT NOT NULL DEFAULT '',
+        width       INTEGER,
+        height      INTEGER,
+        duration_ms INTEGER,
+        captured_at TEXT,
+        title       TEXT,
+        description TEXT,
+        rating      INTEGER,
+        is_favorite INTEGER NOT NULL DEFAULT 0,
+        source_url  TEXT,
+        extra       TEXT NOT NULL DEFAULT '{}',
+        created_at  TEXT NOT NULL,
+        updated_at  TEXT NOT NULL,
+        trashed_at  TEXT
+    );
 
-/// v1：初始 schema。
-///
-/// 库的 id/name 存于 `library.json` 清单（见 [`crate::Library`]），不进表。
-const MIGRATION_1: &str = r#"
-CREATE TABLE blobs (
-    sha256     TEXT PRIMARY KEY,
-    ext        TEXT NOT NULL,
-    rel_path   TEXT NOT NULL,
-    size_bytes INTEGER NOT NULL,
-    ref_count  INTEGER NOT NULL DEFAULT 0
-);
+    CREATE INDEX idx_assets_trashed ON assets(trashed_at);
+    CREATE INDEX idx_assets_ext      ON assets(ext);
+    CREATE INDEX idx_assets_kind     ON assets(kind);
+    CREATE INDEX idx_assets_sha256   ON assets(sha256);
 
-CREATE TABLE folders (
-    id         TEXT PRIMARY KEY,
-    name       TEXT NOT NULL,
-    parent_id  TEXT REFERENCES folders(id),
-    sort_order INTEGER NOT NULL DEFAULT 0,
-    color      TEXT,
-    created_at INTEGER NOT NULL,
-    updated_at INTEGER NOT NULL
-);
+    CREATE TABLE collections (
+        id         TEXT PRIMARY KEY,
+        parent_id  TEXT REFERENCES collections(id) ON DELETE CASCADE,
+        name       TEXT NOT NULL,
+        position   INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    );
 
-CREATE TABLE assets (
-    id          TEXT PRIMARY KEY,
-    sha256      TEXT NOT NULL REFERENCES blobs(sha256),
-    name        TEXT NOT NULL,
-    ext         TEXT NOT NULL,
-    folder_id   TEXT REFERENCES folders(id),
-    size_bytes  INTEGER NOT NULL,
-    width       INTEGER,
-    height      INTEGER,
-    mime        TEXT,
-    rating      INTEGER NOT NULL DEFAULT 0,
-    annotation  TEXT NOT NULL DEFAULT '',
-    source_url  TEXT,
-    is_trashed  INTEGER NOT NULL DEFAULT 0,
-    imported_at INTEGER NOT NULL,
-    modified_at INTEGER NOT NULL
-);
+    CREATE INDEX idx_collections_parent ON collections(parent_id);
 
-CREATE TABLE tag_groups (
-    id    TEXT PRIMARY KEY,
-    name  TEXT NOT NULL,
-    color TEXT
-);
+    -- Many-to-many: one asset may appear in several collections.
+    CREATE TABLE asset_collection (
+        asset_id      TEXT NOT NULL REFERENCES assets(id) ON DELETE CASCADE,
+        collection_id TEXT NOT NULL REFERENCES collections(id) ON DELETE CASCADE,
+        position      INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (asset_id, collection_id)
+    );
 
-CREATE TABLE tags (
-    id       TEXT PRIMARY KEY,
-    group_id TEXT NOT NULL REFERENCES tag_groups(id),
-    name     TEXT NOT NULL,
-    color    TEXT,
-    UNIQUE(group_id, name)
-);
+    CREATE INDEX idx_asset_collection_col ON asset_collection(collection_id);
 
-CREATE TABLE asset_tags (
-    asset_id TEXT NOT NULL REFERENCES assets(id),
-    tag_id   TEXT NOT NULL REFERENCES tags(id),
-    PRIMARY KEY (asset_id, tag_id)
-);
+    CREATE TABLE tags (
+        id         TEXT PRIMARY KEY,
+        name       TEXT NOT NULL COLLATE NOCASE UNIQUE,
+        color      TEXT,
+        created_at TEXT NOT NULL
+    );
 
-CREATE TABLE smart_folders (
-    id    TEXT PRIMARY KEY,
-    name  TEXT NOT NULL,
-    query TEXT NOT NULL
-);
+    CREATE TABLE asset_tag (
+        asset_id TEXT NOT NULL REFERENCES assets(id) ON DELETE CASCADE,
+        tag_id   TEXT NOT NULL REFERENCES tags(id) ON DELETE CASCADE,
+        PRIMARY KEY (asset_id, tag_id)
+    );
 
-CREATE INDEX idx_assets_sha256   ON assets(sha256);
-CREATE INDEX idx_assets_folder   ON assets(folder_id);
-CREATE INDEX idx_assets_ext      ON assets(ext);
-CREATE INDEX idx_assets_rating   ON assets(rating);
-CREATE INDEX idx_assets_imported ON assets(imported_at);
-CREATE INDEX idx_assets_modified ON assets(modified_at);
-CREATE INDEX idx_folders_parent  ON folders(parent_id);
-CREATE INDEX idx_tags_group      ON tags(group_id);
-CREATE INDEX idx_asset_tags_tag  ON asset_tags(tag_id);
-"#;
+    CREATE INDEX idx_asset_tag_tag ON asset_tag(tag_id);
+    "#,
+    // v2: full-text search index + smart (saved-search) collections.
+    // The FTS table mirrors live+trashed assets; search filters live rows at
+    // query time so trash/restore never touch the index.
+    r#"
+    CREATE VIRTUAL TABLE asset_fts USING fts5(
+        asset_id UNINDEXED,
+        file_name, title, description,
+        tokenize = 'unicode61'
+    );
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+    CREATE TABLE smart_collections (
+        id         TEXT PRIMARY KEY,
+        name       TEXT NOT NULL,
+        query      TEXT NOT NULL,
+        color      TEXT,
+        position   INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    );
+    "#,
+    // v3: tag names join the full-text index. FTS5 tables cannot be altered,
+    // so the index is dropped and recreated; the Library backfill (which runs
+    // after migrations) rebuilds it from the live asset rows.
+    r#"
+    DROP TABLE IF EXISTS asset_fts;
 
-    #[test]
-    fn schema_version_matches_migration_count() {
-        // 迁移是逐级应用的：MIGRATIONS[i] 把版本 i 升到 i+1，
-        // 因此最终版本必须等于迁移条数，否则迁移链断裂。
-        assert_eq!(SCHEMA_VERSION, MIGRATIONS.len() as i64);
-    }
-}
+    CREATE VIRTUAL TABLE asset_fts USING fts5(
+        asset_id UNINDEXED,
+        file_name, title, description, tags,
+        tokenize = 'unicode61'
+    );
+    "#,
+];
