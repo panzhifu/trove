@@ -18,6 +18,7 @@ mod app;
 mod i18n;
 mod jobs;
 mod panels;
+mod rules;
 mod settings;
 mod state;
 mod title_bar;
