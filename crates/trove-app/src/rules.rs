@@ -16,6 +16,7 @@ use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::WindowExt as _;
+use gpui_kit::component::slider::{Slider, SliderEvent, SliderState};
 use gpui_kit::component::{ActiveTheme, IconName, Sizable};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -24,6 +25,7 @@ use trove_core::model::{AssetKind, SmartCollection, SmartCompare, SmartField, Sm
 use trove_core::store::{smart, smart_collections, tags};
 use uuid::Uuid;
 
+use crate::panels::common::color_swatch;
 use crate::state::LibraryController;
 
 // ============================ draft state ====================================
@@ -84,6 +86,14 @@ struct RuleDraft {
     tag_names: Vec<String>,
     /// Display color of the smart collection itself (`#rrggbb` or none).
     color: Option<String>,
+    /// HSL pickers feeding [`Self::color`] (kept in sync both ways).
+    pick: (f32, f32, f32),
+    hue: Entity<SliderState>,
+    sat: Entity<SliderState>,
+    lig: Entity<SliderState>,
+    /// Lives with the draft: when the dialog closes the draft (and these)
+    /// drop, unsubscribing the sliders.
+    _subs: Vec<Subscription>,
     /// Bumped by every mutation; the dialog recomputes the match count when
     /// it drifts from `evaluated`.
     revision: u64,
@@ -164,8 +174,26 @@ impl RuleDraft {
         self.touch(cx);
     }
 
-    fn set_color(&mut self, color: Option<String>, cx: &mut Context<Self>) {
-        self.color = color;
+    /// Set the color from a preset swatch (or clear it) and sync the HSL
+    /// sliders to the new value.
+    fn set_color(&mut self, color: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
+        self.color = color.clone();
+        self.pick = color
+            .as_deref()
+            .and_then(hex_to_hsl)
+            .unwrap_or(self.pick);
+        let (h, sat, lig) = self.pick;
+        self.hue.update(cx, |st, cx| st.set_value(h, window, cx));
+        self.sat.update(cx, |st, cx| st.set_value(sat, window, cx));
+        self.lig.update(cx, |st, cx| st.set_value(lig, window, cx));
+        self.touch(cx);
+    }
+
+    /// Set the color from the slider panel (no slider sync — they are the
+    /// source).
+    fn set_pick(&mut self, h: f32, s: f32, l: f32, cx: &mut Context<Self>) {
+        self.pick = (h, s, l);
+        self.color = Some(hsl_to_hex(h, s, l));
         self.touch(cx);
     }
 
@@ -238,6 +266,69 @@ impl RuleDraft {
 
 fn normalize_extension(raw: &str) -> String {
     raw.trim().trim_start_matches('.').to_lowercase()
+}
+
+/// HSL (h 0–360, s/l 0–100) → `#rrggbb`.
+fn hsl_to_hex(h: f32, s: f32, l: f32) -> String {
+    let (r, g, b) = hsl_to_rgb(h, s, l);
+    format!("#{r:02x}{g:02x}{b:02x}")
+}
+
+fn hsl_to_rgb(h: f32, s: f32, l: f32) -> (u8, u8, u8) {
+    let h = h.rem_euclid(360.) / 360.;
+    let s = (s / 100.).clamp(0., 1.);
+    let l = (l / 100.).clamp(0., 1.);
+    if s == 0. {
+        let v = (l * 255.).round() as u8;
+        return (v, v, v);
+    }
+    let q = if l < 0.5 { l * (1. + s) } else { l + s - l * s };
+    let p = 2. * l - q;
+    let channel = |mut t: f32| -> u8 {
+        if t < 0. {
+            t += 1.;
+        }
+        if t > 1. {
+            t -= 1.;
+        }
+        let v = if t < 1. / 6. {
+            p + (q - p) * 6. * t
+        } else if t < 1. / 2. {
+            q
+        } else if t < 2. / 3. {
+            p + (q - p) * (2. / 3. - t) * 6.
+        } else {
+            p
+        };
+        (v * 255.).round() as u8
+    };
+    (channel(h + 1. / 3.), channel(h), channel(h - 1. / 3.))
+}
+
+fn hex_to_hsl(hex: &str) -> Option<(f32, f32, f32)> {
+    let hex = normalize_color(hex)?;
+    let n = u32::from_str_radix(hex.trim_start_matches('#'), 16).ok()?;
+    let (r, g, b) = (
+        ((n >> 16) & 0xff) as f32 / 255.,
+        ((n >> 8) & 0xff) as f32 / 255.,
+        (n & 0xff) as f32 / 255.,
+    );
+    let max = r.max(g).max(b);
+    let min = r.min(g).min(b);
+    let l = (max + min) / 2.;
+    if (max - min).abs() < f32::EPSILON {
+        return Some((0., 0., l * 100.));
+    }
+    let d = max - min;
+    let s = if l > 0.5 { d / (2. - max - min) } else { d / (max + min) };
+    let h = if max == r {
+        (g - b) / d + if g < b { 6. } else { 0. }
+    } else if max == g {
+        (b - r) / d + 2.
+    } else {
+        (r - g) / d + 4.
+    } * 60.;
+    Some((h, s * 100., l * 100.))
 }
 
 fn normalize_color(raw: &str) -> Option<String> {
@@ -351,6 +442,13 @@ pub fn open_rule_editor(
         .as_ref()
         .and_then(|sc| sc.color.clone())
         .and_then(|c| normalize_color(&c));
+    let pick = color
+        .as_deref()
+        .and_then(hex_to_hsl)
+        .unwrap_or((210., 75., 55.));
+    let hue = cx.new(|_| SliderState::new().min(0.).max(360.).default_value(pick.0));
+    let sat = cx.new(|_| SliderState::new().min(0.).max(100.).default_value(pick.1));
+    let lig = cx.new(|_| SliderState::new().min(0.).max(100.).default_value(pick.2));
     let draft = cx.new(|_| RuleDraft {
         controller,
         editing: editing.map(|sc| sc.id),
@@ -359,16 +457,53 @@ pub fn open_rule_editor(
         rows,
         tag_names,
         color,
+        pick,
+        hue: hue.clone(),
+        sat: sat.clone(),
+        lig: lig.clone(),
+        _subs: Vec::new(),
         revision: 1,
         evaluated: 0,
         match_total: None,
         error: None,
     });
 
+    // Slider → draft: pick channels update the color live while dragging.
+    #[derive(Clone, Copy)]
+    enum Channel {
+        H,
+        S,
+        L,
+    }
+    let mut subs = Vec::new();
+    let sliders = [
+        (hue.clone(), Channel::H),
+        (sat.clone(), Channel::S),
+        (lig.clone(), Channel::L),
+    ];
+    for (slider, channel) in &sliders {
+        let channel = *channel;
+        let d = draft.clone();
+        subs.push(cx.subscribe(slider, move |_slider, event: &SliderEvent, cx| {
+            let value = match event {
+                SliderEvent::Change(v) | SliderEvent::Release(v) => v.start(),
+            };
+            d.update(cx, |d, cx| {
+                let (h, s, l) = d.pick;
+                match channel {
+                    Channel::H => d.set_pick(value.clamp(0., 360.), s, l, cx),
+                    Channel::S => d.set_pick(h, value.clamp(0., 100.), l, cx),
+                    Channel::L => d.set_pick(h, s, value.clamp(0., 100.), cx),
+                }
+            });
+        }));
+    }
+    draft.update(cx, |d, _| d._subs = subs);
+
     window.open_dialog(cx, move |dialog, _, cx| {
         // Recompute the live count when the draft moved since the last draw.
         draft.update(cx, RuleDraft::recompute_if_stale);
-        let (and_mode, status, color) = {
+        let (and_mode, status, _color) = {
             let d = draft.read(cx);
             (
                 d.and_mode,
@@ -387,7 +522,7 @@ pub fn open_rule_editor(
                 .to_string(),
             )
             .width(px(680.))
-            .child(render_body(&draft, and_mode, status, color, cx))
+            .child(render_body(&draft, and_mode, status, cx))
             .on_ok({
                 let draft = draft.clone();
                 move |_, _, cx| save_draft(&draft, cx)
@@ -462,7 +597,6 @@ fn render_body(
     draft: &Entity<RuleDraft>,
     and_mode: bool,
     status: (Option<u64>, Option<String>),
-    color: Option<String>,
     cx: &mut App,
 ) -> Div {
     let t = |k: &str| rust_i18n::t!(k).to_string();
@@ -503,12 +637,56 @@ fn render_body(
                         })
                 }),
         )
-        .child(
+        .child({
+            let (hue, sat, lig, color) = {
+                let d = draft.read(cx);
+                (d.hue.clone(), d.sat.clone(), d.lig.clone(), d.color.clone())
+            };
+            let hex = color.clone();
             v_flex()
-                .gap_1()
+                .gap_1p5()
                 .child(field_label(cx, "rules.color"))
-                .child(color_swatch_row(&draft.clone(), color, cx)),
-        )
+                // Current pick + hex, right-click copies the value (same as
+                // the Inspector swatches).
+                .child({
+                    h_flex()
+                        .items_center()
+                        .gap_1p5()
+                        .child(match &color {
+                            Some(hex) => color_swatch(
+                                cx,
+                                "pick-preview".into(),
+                                hex,
+                                false,
+                                |_, _, _| {},
+                            )
+                            .on_mouse_down(gpui::MouseButton::Right, {
+                                let hex = hex.clone();
+                                move |_, _, cx| {
+                                    cx.write_to_clipboard(
+                                        gpui::ClipboardItem::new_string(hex.clone()),
+                                    );
+                                }
+                            }),
+                            None => div()
+                                .id("pick-none")
+                                .size_5()
+                                .rounded_full()
+                                .border_1()
+                                .border_color(cx.theme().border),
+                        })
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(hex.unwrap_or_else(|| "—".into())),
+                        )
+                })
+                .child(slider_row("rules.hue", &hue, cx))
+                .child(slider_row("rules.saturation", &sat, cx))
+                .child(slider_row("rules.lightness", &lig, cx))
+                .child(color_swatch_row(draft, color, cx))
+        })
         .child(field_label(cx, "rules.conditions"));
 
     let rows: Vec<(usize, SmartField, SmartCompare)> = {
@@ -706,9 +884,27 @@ fn render_row(
 
 /// Curated palette for smart-collection colors.
 const COLOR_PALETTE: &[&str] = &[
-    "#ef4444", "#f97316", "#eab308", "#22c55e", "#14b8a6", "#06b6d4", "#3b82f6", "#6366f1",
-    "#a855f7", "#ec4899", "#78716c", "#1f2937",
+    "#ef4444", "#f97316", "#eab308", "#84cc16", "#22c55e", "#14b8a6", "#06b6d4", "#3b82f6",
+    "#6366f1", "#a855f7", "#ec4899", "#f43f5e", "#78716c", "#57534e", "#1f2937", "#0f172a",
 ];
+
+fn slider_row(
+    label_key: &'static str,
+    state: &Entity<SliderState>,
+    cx: &App,
+) -> Div {
+    h_flex()
+        .items_center()
+        .gap_2()
+        .child(
+            div()
+                .w(px(36.))
+                .text_xs()
+                .text_color(cx.theme().muted_foreground)
+                .child(rust_i18n::t!(label_key).to_string()),
+        )
+        .child(Slider::new(state).horizontal().flex_1())
+}
 
 fn color_swatch_row(draft: &Entity<RuleDraft>, color: Option<String>, cx: &App) -> Div {
     let mut row = h_flex().flex_wrap().gap_1().child({
@@ -727,30 +923,25 @@ fn color_swatch_row(draft: &Entity<RuleDraft>, color: Option<String>, cx: &App) 
                 cx.theme().border
             })
             .when(selected, |this| this.border_2())
-            .on_click(move |_, _, cx| d.update(cx, |d, cx| d.set_color(None, cx)))
+            .on_click(move |_, window, cx| {
+                d.update(cx, |d, cx| d.set_color(None, window, cx));
+            })
     });
     for hex in COLOR_PALETTE {
         let d = draft.clone();
         let hex = hex.to_string();
         let selected = color.as_deref() == Some(hex.as_str());
-        let rgb = gpui_kit::rgb(u32::from_str_radix(hex.trim_start_matches('#'), 16).unwrap_or(0));
-        row = row.child(
-            div()
-                .id(format!("swatch-{hex}"))
-                .cursor_pointer()
-                .size_5()
-                .rounded_full()
-                .bg(rgb)
-                .border_2()
-                .border_color(if selected {
-                    cx.theme().foreground
-                } else {
-                    gpui::transparent_black()
-                })
-                .on_click(move |_, _, cx| {
-                    d.update(cx, |d, cx| d.set_color(Some(hex.clone()), cx));
-                }),
-        );
+        let id = format!("swatch-{hex}");
+        let hex_arg = hex.clone();
+        row = row.child(color_swatch(
+            cx,
+            id,
+            &hex_arg,
+            selected,
+            move |_, window, cx| {
+                d.update(cx, |d, cx| d.set_color(Some(hex.clone()), window, cx));
+            },
+        ));
     }
     row
 }

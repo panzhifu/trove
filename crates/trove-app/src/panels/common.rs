@@ -98,6 +98,33 @@ pub(crate) fn hex_to_rgb(s: &str) -> Option<u32> {
     u32::from_str_radix(s, 16).ok()
 }
 
+/// A round color chip in the shared palette style: hairline border, a
+/// stronger ring when `selected`, hover feedback. Used by the smart-collection
+/// palette and the Inspector's mined-color swatches.
+pub(crate) fn color_swatch(
+    cx: &App,
+    id: String,
+    hex: &str,
+    selected: bool,
+    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> Stateful<Div> {
+    let rgb = u32::from_str_radix(hex.trim_start_matches('#'), 16).unwrap_or(0);
+    div()
+        .id(id)
+        .cursor_pointer()
+        .size_5()
+        .flex_shrink_0()
+        .rounded_full()
+        .bg(gpui_kit::rgb(rgb))
+        .border_1()
+        .border_color(cx.theme().border)
+        .hover(|this| this.border_color(cx.theme().muted_foreground))
+        .when(selected, |this| {
+            this.border_2().border_color(cx.theme().foreground)
+        })
+        .on_click(on_click)
+}
+
 /// A clickable sidebar row with a selected highlight and an optional
 /// right-click menu. Shared by the collection, tag and smart-collection lists.
 /// `on_click` and `context_menu` each receive the full window/cx so they can
