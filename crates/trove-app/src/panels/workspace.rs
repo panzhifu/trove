@@ -35,13 +35,13 @@ use trove_core::layout::{
     GRID_GAP, MAX_ROW_HEIGHT, MIN_ASPECT, MIN_ROW_HEIGHT, TARGET_ROW_HEIGHT, RowLayout,
     justify_layout,
 };
-use trove_core::model::{AssetKind, AssetPatch, AssetQuery, NewSmartCollection};
+use trove_core::model::{AssetKind, AssetPatch, AssetQuery, AssetSort, NewSmartCollection};
 use serde_json::json;
 use trove_core::store::{assets, collections, smart_collections};
 use uuid::Uuid;
 
 use crate::actions::{MoveDown, MoveLeft, MoveRight, MoveUp, OpenPreview};
-use crate::state::{GRID_PAGE_SIZE, LibraryController};
+use crate::state::{GRID_PAGE_SIZE, LibraryController, ViewMode};
 
 use super::common::{display_name, kind_icon, observe_controller, AssetsDrag};
 
@@ -53,6 +53,8 @@ const H_PADDING: f32 = 40.0;
 const FALLBACK_WIDTH: f32 = 1024.0 - 590.0 - H_PADDING;
 /// Rows rendered beyond the viewport by the virtualized list, in px.
 const LIST_OVERDRAW_PX: f32 = 400.0;
+/// Fixed height of one row in list view mode.
+const LIST_ROW_HEIGHT: f32 = 44.0;
 /// How close (in rows) to the end of the list the next page is requested.
 const PAGE_TRIGGER_ROWS: usize = 3;
 
@@ -67,6 +69,10 @@ struct Cell {
     width: Option<u32>,
     height: Option<u32>,
     trashed: bool,
+    /// Display name + facts for the list view rows.
+    name: String,
+    size_bytes: u64,
+    added: String,
 }
 
 impl Cell {
@@ -112,6 +118,9 @@ struct ViewKey {
     search: String,
     filter_kind: Option<AssetKind>,
     filter_favorite: bool,
+    view_mode: ViewMode,
+    sort: AssetSort,
+    sort_desc: bool,
     content_width: f32,
 }
 
@@ -367,7 +376,11 @@ impl WorkspacePanel {
                                         ctl.generation += 1;
                                         cx.notify();
                                     }
-                                    Err(e) => eprintln!("create smart collection: {e}"),
+                                    Err(e) => {
+                                        ctl.notice =
+                                            Some(rust_i18n::t!("workspace.smart_create_failed", error = e.to_string()).to_string());
+                                        cx.notify();
+                                    }
                                 }
                             });
                         }
@@ -380,10 +393,10 @@ impl WorkspacePanel {
     fn empty_trash(&mut self, cx: &mut Context<Self>) {
         let controller = self.controller.clone();
         controller.update(cx, |ctl, cx| {
-            match ctl.library.empty_trash() {
-                Ok(n) => eprintln!("emptied trash: {n}"),
-                Err(e) => eprintln!("empty trash failed: {e}"),
-            }
+            ctl.notice = match ctl.library.empty_trash() {
+                Ok(n) => Some(rust_i18n::t!("workspace.trash_emptied", count = n).to_string()),
+                Err(e) => Some(rust_i18n::t!("workspace.trash_empty_failed", error = e.to_string()).to_string()),
+            };
             ctl.selected_assets.clear();
             ctl.generation += 1;
             cx.notify();
@@ -551,7 +564,7 @@ impl WorkspacePanel {
 impl Render for WorkspacePanel {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // --- context snapshot (drop the controller borrow early) -----------
-        let (collection, active_tag, in_trash, search, smart, grid_loaded, selected, filter_kind, filter_favorite) = {
+        let (collection, active_tag, in_trash, search, smart, grid_loaded, selected, filter_kind, filter_favorite, view_mode, sort, sort_desc) = {
             let ctl = self.controller.read(cx);
             (
                 ctl.current_collection,
@@ -563,6 +576,9 @@ impl Render for WorkspacePanel {
                 ctl.selected_assets.clone(),
                 ctl.filter_kind,
                 ctl.filter_favorite,
+                ctl.view_mode,
+                ctl.sort,
+                ctl.sort_desc,
             )
         };
         let library_root = self.controller.read(cx).library.root().to_path_buf();
@@ -611,6 +627,8 @@ impl Render for WorkspacePanel {
                     kind: if in_trash { None } else { filter_kind },
                     is_favorite: (!in_trash && filter_favorite).then_some(true),
                     is_trashed: in_trash,
+                    sort,
+                    sort_desc,
                     limit,
                     ..Default::default()
                 },
@@ -636,6 +654,9 @@ impl Render for WorkspacePanel {
                     width: a.width,
                     height: a.height,
                     trashed: a.trashed_at.is_some(),
+                    name: display_name(a),
+                    size_bytes: a.size_bytes,
+                    added: a.created_at.format("%Y-%m-%d %H:%M").to_string(),
                 }
             })
             .collect();
@@ -657,23 +678,52 @@ impl Render for WorkspacePanel {
             search: search.clone(),
             filter_kind,
             filter_favorite,
+            view_mode,
+            sort,
+            sort_desc,
             content_width,
         };
         if self.view_key.as_ref() != Some(&key) {
-            // View or width changed: full DP layout, scroll resets to top.
-            let aspects: Vec<f32> = cells.iter().map(|c| c.aspect()).collect();
-            let layouts = justify_layout(&aspects, content_width);
-            self.rows = Rc::new(materialize_rows(cells, &layouts));
+            // View or width changed: full layout, scroll resets to top.
+            let rows = if view_mode == ViewMode::List {
+                // List mode: one full-width row per asset, no justification.
+                cells
+                    .into_iter()
+                    .map(|c| Row {
+                        height: LIST_ROW_HEIGHT,
+                        widths: vec![content_width],
+                        cells: vec![c],
+                    })
+                    .collect()
+            } else {
+                let aspects: Vec<f32> = cells.iter().map(|c| c.aspect()).collect();
+                let layouts = justify_layout(&aspects, content_width);
+                materialize_rows(cells, &layouts)
+            };
+            self.rows = Rc::new(rows);
             self.view_key = Some(key);
             self.covered = self.rows.iter().map(|r| r.cells.len()).sum();
             self.list_state.reset(self.rows.len());
         } else if self.covered != cells.len() {
             // Assets were added or removed: keep the frozen row *shapes*
             // (cells per row) and refill them, so scrolling stays stable
-            // across unrelated mutations.
-            let counts: Vec<usize> = self.rows.iter().map(|r| r.cells.len()).collect();
+            // across unrelated mutations. List mode just rebuilds its
+            // trivial one-cell rows.
+            let new_rows: Vec<Row> = if view_mode == ViewMode::List {
+                cells
+                    .into_iter()
+                    .map(|c| Row {
+                        height: LIST_ROW_HEIGHT,
+                        widths: vec![content_width],
+                        cells: vec![c],
+                    })
+                    .collect()
+            } else {
+                let counts: Vec<usize> = self.rows.iter().map(|r| r.cells.len()).collect();
+                refill_rows(cells, &counts, content_width)
+            };
             let old_rows = self.rows.len();
-            self.rows = Rc::new(refill_rows(cells, &counts, content_width));
+            self.rows = Rc::new(new_rows);
             self.covered = self.rows.iter().map(|r| r.cells.len()).sum();
             // The frozen head rows are untouched; only the tail changed size.
             // splice(start..end, count) replaces [start, end) with `count`
@@ -681,11 +731,11 @@ impl Render for WorkspacePanel {
             // exactly N items — the old call double-counted the tail and
             // corrupted the list state (sum_tree seek panic on the next
             // layout).
-            let new_rows = self.rows.len();
-            if new_rows >= old_rows {
-                self.list_state.splice(old_rows..old_rows, new_rows - old_rows);
+            let new_count = self.rows.len();
+            if new_count >= old_rows {
+                self.list_state.splice(old_rows..old_rows, new_count - old_rows);
             } else {
-                self.list_state.splice(new_rows..old_rows, 0);
+                self.list_state.splice(new_count..old_rows, 0);
             }
         }
         let rows = self.rows.clone();
@@ -708,6 +758,7 @@ impl Render for WorkspacePanel {
         let focus_handle = self.focus_handle.clone();
         let rows_for_render = rows.clone();
         let rows_len = rows.len();
+        let list_mode = view_mode == ViewMode::List;
         // One page request per frame at most (several visible rows can all
         // sit within the trigger window of the end).
         let page_guard = Rc::new(CellFlag::new(false));
@@ -733,6 +784,16 @@ impl Render for WorkspacePanel {
                 let widths = row.widths.clone();
                 let height = row.height;
                 let cells = row.cells.clone();
+                if list_mode {
+                    // One full-width info row per asset.
+                    return build_list_row_element(
+                        cx,
+                        &controller,
+                        &focus_handle,
+                        &cells[0],
+                        widths[0],
+                    );
+                }
                 h_flex()
                     .w_full()
                     .gap(px(GRID_GAP))
@@ -815,13 +876,79 @@ impl Render for WorkspacePanel {
 /// compose with every view (collection, search, smart collection) and are
 /// also how the favorites view is entered.
 fn filter_controls(controller: &Entity<LibraryController>, cx: &App) -> Div {
-    let (kind, favorite) = {
+    let (kind, favorite, view_mode, sort, sort_desc) = {
         let ctl = controller.read(cx);
-        (ctl.filter_kind, ctl.filter_favorite)
+        (ctl.filter_kind, ctl.filter_favorite, ctl.view_mode, ctl.sort, ctl.sort_desc)
     };
     let t = |k: &str| rust_i18n::t!(k).to_string();
 
     let mut bar = h_flex().items_center().gap_1();
+
+    // View toggle: grid ⇄ list presentation.
+    let (next_mode, toggle_icon, toggle_tip) = match view_mode {
+        ViewMode::Grid => (ViewMode::List, IconName::Menu, "workspace.view_list"),
+        ViewMode::List => (ViewMode::Grid, IconName::GalleryVerticalEnd, "workspace.view_grid"),
+    };
+    bar = bar.child(
+        Button::new("view-toggle")
+            .xsmall()
+            .ghost()
+            .icon(toggle_icon)
+            .tooltip(t(toggle_tip))
+            .on_click({
+                let controller = controller.clone();
+                move |_, _, cx| {
+                    controller.update(cx, |ctl, cx| {
+                        ctl.set_view_mode(next_mode);
+                        cx.notify();
+                    });
+                }
+            }),
+    );
+
+    // Sort dropdown: key + direction pairs.
+    let sort_options: Vec<(AssetSort, bool, String)> = vec![
+        (AssetSort::CreatedAt, true, t("workspace.sort_newest")),
+        (AssetSort::CreatedAt, false, t("workspace.sort_oldest")),
+        (AssetSort::Name, false, t("workspace.sort_name_asc")),
+        (AssetSort::Name, true, t("workspace.sort_name_desc")),
+        (AssetSort::SizeBytes, true, t("workspace.sort_size_desc")),
+        (AssetSort::SizeBytes, false, t("workspace.sort_size_asc")),
+        (AssetSort::Rating, true, t("workspace.sort_rating_desc")),
+    ];
+    bar = bar.child(
+        Button::new("sort-menu")
+            .xsmall()
+            .ghost()
+            .icon(if sort_desc {
+                IconName::SortDescending
+            } else {
+                IconName::SortAscending
+            })
+            .tooltip(t("workspace.sort"))
+            .dropdown_menu_with_anchor(Anchor::TopLeft, {
+                let controller = controller.clone();
+                move |menu, _, _| {
+                    let mut menu = menu.min_w(px(170.));
+                    for (value, desc, label) in &sort_options {
+                        let checked = *value == sort && *desc == sort_desc;
+                        let (value, desc) = (*value, *desc);
+                        let controller = controller.clone();
+                        menu = menu.item(
+                            PopupMenuItem::new(label.clone())
+                                .checked(checked)
+                                .on_click(move |_, _, cx| {
+                                    controller.update(cx, |ctl, cx| {
+                                        ctl.set_sort(value, desc);
+                                        cx.notify();
+                                    });
+                                }),
+                        );
+                    }
+                    menu
+                }
+            }),
+    );
 
     // Kind dropdown: label shows the active kind, "all" when unset.
     let kind_label = match kind {
@@ -1061,7 +1188,9 @@ fn selection_toolbar(
                         ctl_purge.update(cx, |ctl, cx| {
                             let ids = std::mem::take(&mut ctl.selected_assets);
                             if let Err(e) = ctl.library.purge_assets(&ids) {
-                                eprintln!("purge selection: {e}");
+                                ctl.notice = Some(
+                                    rust_i18n::t!("workspace.purge_failed", error = e.to_string()).to_string(),
+                                );
                             }
                             ctl.selection_anchor = None;
                             ctl.generation += 1;
@@ -1263,9 +1392,133 @@ fn build_cell_element(
     .into_any_element()
 }
 
+/// One full-width info row for list view: small thumbnail (or kind icon),
+/// name, kind label, size and import date, with the same click / drag /
+/// context-menu behavior as the grid cells.
+fn build_list_row_element(
+    cx: &mut App,
+    controller: &Entity<LibraryController>,
+    focus_handle: &FocusHandle,
+    cell: &Cell,
+    w: f32,
+) -> AnyElement {
+    let (kind, thumb, id, trashed) = (cell.kind, cell.thumb.clone(), cell.id, cell.trashed);
+    let (name, size, added) = (cell.name.clone(), cell.size_bytes, cell.added.clone());
+    let is_sel = controller.read(cx).selected_assets.contains(&id);
+
+    let lead: AnyElement = match &thumb {
+        Some(path) => img(path.clone())
+            .w(px(60.))
+            .h(px(36.))
+            .object_fit(gpui_kit::ObjectFit::Cover)
+            .rounded(cx.theme().radius)
+            .into_any_element(),
+        None => div()
+            .w(px(60.))
+            .h(px(36.))
+            .items_center()
+            .justify_center()
+            .rounded(cx.theme().radius)
+            .bg(cx.theme().secondary)
+            .child(Icon::new(kind_icon(kind)).size_5())
+            .into_any_element(),
+    };
+
+    let base = div()
+        .id(format!("row-{id}"))
+        .cursor_pointer()
+        .w(px(w))
+        .h(px(LIST_ROW_HEIGHT))
+        .px_2()
+        .rounded(cx.theme().radius)
+        .border_1()
+        .border_color(if is_sel {
+            cx.theme().primary
+        } else {
+            cx.theme().border
+        })
+        .child(
+            h_flex()
+                .w_full()
+                .h_full()
+                .items_center()
+                .gap_3()
+                .child(lead)
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .text_sm()
+                        .text_color(cx.theme().foreground)
+                        .child(name),
+                )
+                .child(
+                    div()
+                        .w(px(64.))
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(rust_i18n::t!(kind_key(kind)).to_string()),
+                )
+                .child(
+                    div()
+                        .w(px(80.))
+                        .text_right()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(super::common::human_bytes(size)),
+                )
+                .child(
+                    div()
+                        .w(px(110.))
+                        .text_right()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(added),
+                ),
+        );
+
+    let ctl_click = controller.clone();
+    let focus = focus_handle.clone();
+    let base = base.on_click(move |event: &ClickEvent, window, _cx| {
+        window.focus(&focus, _cx);
+        let m = event.modifiers();
+        let multi = m.control || m.platform;
+        ctl_click.update(_cx, move |ctl, _| {
+            if m.shift {
+                ctl.select_range_to(id);
+            } else if multi {
+                ctl.toggle_asset(id);
+            } else {
+                ctl.select_asset(Some(id));
+            }
+        });
+    });
+
+    let selected_now = controller.read(cx).selected_assets.clone();
+    let ids_for_drag = if selected_now.contains(&id) {
+        selected_now
+    } else {
+        vec![id]
+    };
+    let base = base.on_drag(
+        AssetsDrag(ids_for_drag),
+        move |payload, _offset, _, cx| {
+            cx.new(|_cx| AssetsDragPreview {
+                count: payload.0.len(),
+            })
+        },
+    );
+
+    let ctl_menu = controller.clone();
+    base.context_menu(move |menu, window, cx| {
+        asset_context_menu(menu, window, cx, &ctl_menu, id, trashed)
+    })
+    .into_any_element()
+}
+
 /// Right-click menu on an asset thumbnail.
-fn asset_context_menu(
-    menu: PopupMenu,
+fn asset_context_menu(    menu: PopupMenu,
     _window: &mut Window,
     cx: &mut Context<PopupMenu>,
     controller: &Entity<LibraryController>,
@@ -1293,7 +1546,9 @@ fn asset_context_menu(
                     ctl_purge.update(cx, move |ctl, cx| {
                         let ids = ctl.action_targets(asset_id);
                         if let Err(e) = ctl.library.purge_assets(&ids) {
-                            eprintln!("purge failed: {e}");
+                            ctl.notice = Some(
+                                rust_i18n::t!("workspace.purge_failed", error = e.to_string()).to_string(),
+                            );
                         }
                         ctl.deselect(&ids);
                         cx.notify();
@@ -1308,10 +1563,13 @@ fn asset_context_menu(
         .flatten()
         .map(|a| a.is_favorite)
         .unwrap_or(false);
+    // Membership removal only makes sense inside a collection view.
+    let browsed_collection = controller.read(cx).current_collection;
 
     let ctl_build = controller.clone();
     let c_fav = controller.clone();
     let c_trash = controller.clone();
+    let c_remove = controller.clone();
 
     let add_submenu = PopupMenu::build(_window, cx, move |menu, _window, cx| {
         let controller = ctl_build;
@@ -1347,7 +1605,8 @@ fn asset_context_menu(
         menu
     });
 
-    menu.min_w(px(200.))
+    let mut menu = menu
+        .min_w(px(200.))
         .item(
             PopupMenuItem::new(if favorite {
                 rust_i18n::t!("workspace.remove_from_favorites").to_string()
@@ -1373,17 +1632,31 @@ fn asset_context_menu(
         )
         .separator()
         .item(PopupMenuItem::submenu(rust_i18n::t!("workspace.add_to_collection").to_string(), add_submenu))
-        .separator()
-        .item(
-            PopupMenuItem::new(rust_i18n::t!("app.move_to_trash").to_string()).on_click(move |_, _, cx| {
-                c_trash.update(cx, move |ctl, cx| {
-                    let ids = ctl.action_targets(asset_id);
-                    let _ = ctl.library.trash_assets(&ids);
-                    ctl.deselect(&ids);
-                    cx.notify();
-                });
-            }),
-        )
+        .separator();
+    if browsed_collection.is_some() {
+        menu = menu.item(
+            PopupMenuItem::new(rust_i18n::t!("workspace.remove_from_collection").to_string())
+                .on_click(move |_, _, cx| {
+                    c_remove.update(cx, move |ctl, cx| {
+                        let ids = ctl.action_targets(asset_id);
+                        ctl.remove_from_current_collection(&ids);
+                        ctl.deselect(&ids);
+                        cx.notify();
+                    });
+                }),
+        );
+        menu = menu.separator();
+    }
+    menu.item(
+        PopupMenuItem::new(rust_i18n::t!("app.move_to_trash").to_string()).on_click(move |_, _, cx| {
+            c_trash.update(cx, move |ctl, cx| {
+                let ids = ctl.action_targets(asset_id);
+                let _ = ctl.library.trash_assets(&ids);
+                ctl.deselect(&ids);
+                cx.notify();
+            });
+        }),
+    )
 }
 
 /// Drag preview shown while dragging assets.

@@ -125,6 +125,52 @@ impl InspectorPanel {
         });
     }
 
+    /// Replace the asset's whole tag group with the comma-separated names in
+    /// the tag input (backed by `tags::set_for_asset`). Missing names are
+    /// created; a failure keeps the old group and surfaces a notice.
+    fn replace_tags_from_input(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let raw: String = self.tag_input.read(cx).value().to_string();
+        let names: Vec<String> = raw
+            .split([',', '，', ';', '；'])
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect();
+        if names.is_empty() {
+            return;
+        }
+        let controller = self.controller.clone();
+        let Some(asset_id) = controller.read(cx).primary() else {
+            return;
+        };
+        let mut failed: Option<String> = None;
+        controller.update(cx, |ctl, cx| {
+            let conn = ctl.library.store().conn();
+            let mut ids = Vec::with_capacity(names.len());
+            for name in &names {
+                match tags::ensure_named(conn, name) {
+                    Ok(tag) => ids.push(tag.id),
+                    Err(e) => {
+                        failed = Some(e.to_string());
+                        break;
+                    }
+                }
+            }
+            if failed.is_none() {
+                let _ = tags::set_for_asset(conn, asset_id, &ids);
+            } else if let Some(e) = failed.clone() {
+                ctl.notice = Some(
+                    rust_i18n::t!("inspector.replace_tags_failed", error = e).to_string(),
+                );
+            }
+            ctl.generation += 1;
+            cx.notify();
+        });
+        if failed.is_none() {
+            self.tag_input.update(cx, |state, cx| state.set_value("", window, cx));
+        }
+    }
+
     /// Write one text field back to the store when it changed. An empty
     /// field clears the column (display falls back to the file name).
     fn commit_text(&mut self, field: TextField, cx: &mut Context<Self>) {
@@ -167,11 +213,17 @@ impl InspectorPanel {
                 },
             };
             if let Err(e) = patch.validate() {
-                eprintln!("invalid patch: {e}");
+                ctl.notice = Some(
+                    rust_i18n::t!("inspector.invalid_patch", error = e.to_string()).to_string(),
+                );
+                cx.notify();
                 return;
             }
             if let Err(e) = assets::update(conn, asset_id, &patch) {
-                eprintln!("update asset: {e}");
+                ctl.notice = Some(
+                    rust_i18n::t!("inspector.update_failed", error = e.to_string()).to_string(),
+                );
+                cx.notify();
                 return;
             }
             // Title/description feed the search index; the generation bump
@@ -407,7 +459,22 @@ impl Render for InspectorPanel {
                             .into_any_element()
                     })),
             )
-            .child(Input::new(&self.tag_input).small())
+            .child(
+                h_flex()
+                    .gap_1()
+                    .items_center()
+                    .child(Input::new(&self.tag_input).small().flex_1())
+                    .child(
+                        Button::new("replace-tags")
+                            .xsmall()
+                            .ghost()
+                            .icon(IconName::Replace)
+                            .tooltip(rust_i18n::t!("inspector.replace_tags_hint").to_string())
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.replace_tags_from_input(window, cx);
+                            })),
+                    ),
+            )
             .when(!swatches.is_empty(), |this| {
                 this.child(
                     separator_label(cx, rust_i18n::t!("inspector.colors").to_string()),

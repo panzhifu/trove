@@ -3,9 +3,12 @@
 
 use gpui_kit::base::{h_flex, v_flex};
 use gpui_kit::component::dock::{BasePanel, Panel as DockPanel, PanelEvent};
+use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::component::menu::{ContextMenuExt as _, PopupMenu, PopupMenuItem};
 use gpui_kit::component::scroll::ScrollableElement as _;
-use gpui_kit::component::ActiveTheme;
+use gpui_kit::component::WindowExt as _;
+use gpui_kit::component::{ActiveTheme, Sizable as _};
+use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use trove_core::store::tags;
@@ -13,7 +16,7 @@ use uuid::Uuid;
 
 use crate::state::LibraryController;
 
-use super::common::{AssetsDrag, observe_controller};
+use super::common::{AssetsDrag, hex_to_rgb, observe_controller};
 
 
 // =========================== Tags panel ======================================
@@ -62,6 +65,9 @@ impl Render for TagsPanel {
                             .children(all_tags.into_iter().map(|tag| {
                                 let id = tag.id;
                                 let count = tags::count_assets(conn, id).unwrap_or(0);
+                                let color = tag.color.clone();
+                                let name = tag.name.clone();
+                                let name_for_menu = name.clone();
                                 let controller = self.controller.clone();
                                 let mut row = div()
                                     .id(format!("tag-row-{id}"))
@@ -84,6 +90,19 @@ impl Render for TagsPanel {
                                         h_flex()
                                             .w_full()
                                             .items_center()
+                                            .gap_1p5()
+                                            .when_some(color, |row, hex| {
+                                                // Small color dot when the tag has one.
+                                                let rgb = hex_to_rgb(&hex);
+                                                row.child(
+                                                    div()
+                                                        .size_2()
+                                                        .rounded_full()
+                                                        .when_some(rgb, |dot, rgb| {
+                                                            dot.bg(gpui::rgb(rgb))
+                                                        }),
+                                                )
+                                            })
                                             .child(
                                                 div()
                                                     .flex_1()
@@ -91,7 +110,7 @@ impl Render for TagsPanel {
                                                     .truncate()
                                                     .text_sm()
                                                     .text_color(cx.theme().foreground)
-                                                    .child(tag.name),
+                                                    .child(name),
                                             )
                                             .child(
                                                 div()
@@ -120,7 +139,7 @@ impl Render for TagsPanel {
                                     });
                                 let controller = self.controller.clone();
                                 row.context_menu(move |menu, _window, cx| {
-                                    tag_context_menu(menu, cx, &controller, id)
+                                    tag_context_menu(menu, _window, cx, &controller, id, name_for_menu.clone())
                                 })
                                 .into_any_element()
                             })),
@@ -129,41 +148,144 @@ impl Render for TagsPanel {
     }
 }
 
-/// Right-click menu for a tag row.
+/// Right-click menu for a tag row: filter, rename (inline dialog), color,
+/// delete.
 fn tag_context_menu(
     menu: PopupMenu,
-    _cx: &mut Context<PopupMenu>,
+    window: &mut Window,
+    cx: &mut Context<PopupMenu>,
     controller: &Entity<LibraryController>,
     tag_id: Uuid,
+    tag_name: String,
 ) -> PopupMenu {
     let ctl_filter = controller.clone();
     let ctl_del = controller.clone();
-    menu.min_w(px(160.))
+    let ctl_rename = controller.clone();
+    let ctl_color = controller.clone();
+    let rename_name = tag_name.clone();
+    let mut m = menu
+        .min_w(px(160.))
         .item(
-            PopupMenuItem::new(rust_i18n::t!("tags.filter_by_tag").to_string()).on_click(move |_, _, cx| {
-                ctl_filter.update(cx, move |ctl, cx| {
-                    if ctl.active_tag == Some(tag_id) {
-                        ctl.select_tag(None);
-                    } else {
-                        ctl.select_tag(Some(tag_id));
-                    }
-                    cx.notify();
-                });
-            }),
+            PopupMenuItem::new(rust_i18n::t!("tags.filter_by_tag").to_string()).on_click(
+                move |_, _, cx| {
+                    ctl_filter.update(cx, move |ctl, cx| {
+                        if ctl.active_tag == Some(tag_id) {
+                            ctl.select_tag(None);
+                        } else {
+                            ctl.select_tag(Some(tag_id));
+                        }
+                        cx.notify();
+                    });
+                },
+            ),
         )
+        .item(
+            PopupMenuItem::new(rust_i18n::t!("tags.rename_tag").to_string()).on_click(
+                move |_, window, cx| {
+                    open_rename_dialog(window, cx, &ctl_rename, tag_id, rename_name.clone());
+                },
+            ),
+        );
+
+    // Color submenu: a preset palette plus "no color".
+    let color_menu = PopupMenu::build(window, cx, move |menu, _window, _cx| {
+        let mut menu = menu.min_w(px(130.));
+        for hex in TAG_COLORS {
+            let ctl = ctl_color.clone();
+            let label = hex.to_string();
+            let value = hex.to_string();
+            menu = menu.item(
+                PopupMenuItem::new(label).on_click(move |_, _, cx| {
+                    let value = value.clone();
+                    ctl.update(cx, move |ctl, cx| {
+                        let conn = ctl.library.store().conn();
+                        let _ = tags::set_color(conn, tag_id, Some(&value));
+                        ctl.generation += 1;
+                        cx.notify();
+                    });
+                }),
+            );
+        }
+        let ctl_clear = ctl_color.clone();
+        menu.item(
+            PopupMenuItem::new(rust_i18n::t!("tags.no_color").to_string()).on_click(
+                move |_, _, cx| {
+                    ctl_clear.update(cx, move |ctl, cx| {
+                        let conn = ctl.library.store().conn();
+                        let _ = tags::set_color(conn, tag_id, None);
+                        ctl.generation += 1;
+                        cx.notify();
+                    });
+                },
+            ),
+        )
+    });
+
+    m = m
+        .item(PopupMenuItem::submenu(
+            rust_i18n::t!("tags.color").to_string(),
+            color_menu,
+        ))
         .separator()
         .item(
-            PopupMenuItem::new(rust_i18n::t!("tags.delete_tag").to_string()).on_click(move |_, _, cx| {
-                ctl_del.update(cx, move |ctl, cx| {
-                    let conn = ctl.library.store().conn();
-                    let _ = tags::delete(conn, tag_id);
-                    if ctl.active_tag == Some(tag_id) {
-                        ctl.select_tag(None);
+            PopupMenuItem::new(rust_i18n::t!("tags.delete_tag").to_string()).on_click(
+                move |_, _, cx| {
+                    ctl_del.update(cx, move |ctl, cx| {
+                        let conn = ctl.library.store().conn();
+                        let _ = tags::delete(conn, tag_id);
+                        if ctl.active_tag == Some(tag_id) {
+                            ctl.select_tag(None);
+                        }
+                        ctl.generation += 1;
+                        cx.notify();
+                    });
+                },
+            ),
+        );
+    m
+}
+
+/// Preset tag colors (hex, no `#` — `set_color` normalizes).
+const TAG_COLORS: [&str; 8] = [
+    "#ef4444", "#f97316", "#eab308", "#22c55e", "#06b6d4", "#3b82f6", "#a855f7", "#ec4899",
+];
+
+/// Rename a tag via a small modal dialog (the tags panel has no inline
+/// editor row like the explorer does).
+fn open_rename_dialog(
+    window: &mut Window,
+    cx: &mut App,
+    controller: &Entity<LibraryController>,
+    tag_id: Uuid,
+    current_name: String,
+) {
+    let name_input = cx.new(|cx| {
+        InputState::new(window, cx)
+            .placeholder(rust_i18n::t!("explorer.name_placeholder").to_string())
+    });
+    name_input.update(cx, |state, cx| state.set_value(current_name.clone(), window, cx));
+    let ctl = controller.clone();
+    window.open_dialog(cx, move |dialog, _, _| {
+        dialog
+            .title(rust_i18n::t!("tags.rename_tag").to_string())
+            .width(px(340.))
+            .child(Input::new(&name_input).small().appearance(true))
+            .on_ok({
+                let name_input = name_input.clone();
+                let ctl = ctl.clone();
+                move |_, _, cx| {
+                    let name: String = name_input.read(cx).value().trim().to_string();
+                    if !name.is_empty() {
+                        ctl.update(cx, |ctl, cx| {
+                            let conn = ctl.library.store().conn();
+                            let _ = tags::rename(conn, tag_id, &name);
+                            ctl.generation += 1;
+                            cx.notify();
+                        });
                     }
-                    ctl.generation += 1;
-                    cx.notify();
-                });
-            }),
-        )
+                    true
+                }
+            })
+    });
 }
 

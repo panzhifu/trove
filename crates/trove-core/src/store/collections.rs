@@ -50,6 +50,18 @@ pub fn roots(conn: &Connection) -> Result<Vec<Collection>> {
     children_of(conn, None)
 }
 
+/// Every collection in the library (any depth), parents before children.
+pub fn list(conn: &Connection) -> Result<Vec<Collection>> {
+    rows::query_map(
+        conn,
+        "SELECT id, parent_id, name, position, created_at, updated_at
+         FROM collections
+         ORDER BY created_at ASC, position ASC, name ASC",
+        vec![],
+        collection_from_row,
+    )
+}
+
 /// Direct children of `parent` (or of the library root when `None`), ordered
 /// by position then name.
 pub fn children_of(conn: &Connection, parent: Option<Uuid>) -> Result<Vec<Collection>> {

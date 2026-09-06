@@ -164,3 +164,53 @@ pub fn delete(conn: &Connection, tag_id: Uuid) -> Result<()> {
     }
     Ok(())
 }
+
+/// Rename a tag. Tag names are part of the FTS index, so every asset
+/// carrying the tag is re-synced afterwards. Renaming onto an existing
+/// (case-insensitive) name hits the unique constraint and fails.
+pub fn rename(conn: &Connection, tag_id: Uuid, name: &str) -> Result<()> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err(Error::Validation("tag name must not be empty".into()));
+    }
+    if let Some(existing) = get_by_name(conn, name)?
+        && existing.id != tag_id {
+            return Err(Error::Validation(format!(
+                "tag `{name}` already exists"
+            )));
+        }
+    rows::execute(
+        conn,
+        "UPDATE tags SET name = ?1 WHERE id = ?2",
+        vec![name.to_string().into(), rows::uuid(tag_id).into()],
+    )?;
+    for asset_id in tagged_assets(conn, tag_id)? {
+        assets::fts_sync(conn, asset_id)?;
+    }
+    Ok(())
+}
+
+/// Set (or clear) the display color of a tag. Not part of the FTS index,
+/// so no re-sync is needed. The color is normalized to lowercase `#rrggbb`.
+pub fn set_color(conn: &Connection, tag_id: Uuid, color: Option<&str>) -> Result<()> {
+    let color = color.map(super::smart::normalize_color).transpose()?;
+    rows::execute(
+        conn,
+        "UPDATE tags SET color = ?1 WHERE id = ?2",
+        vec![
+            rows::bind_opt_str(color.as_deref()),
+            rows::uuid(tag_id).into(),
+        ],
+    )?;
+    Ok(())
+}
+
+/// Ids of every asset carrying `tag_id` (shared by rename and delete).
+fn tagged_assets(conn: &Connection, tag_id: Uuid) -> Result<Vec<Uuid>> {
+    rows::query_map(
+        conn,
+        "SELECT asset_id FROM asset_tag WHERE tag_id = ?1",
+        vec![rows::uuid(tag_id).into()],
+        |row| req_uuid(row, 0),
+    )
+}

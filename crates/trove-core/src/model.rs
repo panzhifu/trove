@@ -330,6 +330,21 @@ pub enum SmartCompare {
 // Queries
 // ---------------------------------------------------------------------------
 
+/// Sort key of an asset listing. The FTS search path always sorts by
+/// bm25 relevance and ignores this.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum AssetSort {
+    /// Import time (newest first by default).
+    #[default]
+    CreatedAt,
+    /// File name, case-insensitive.
+    Name,
+    /// File size in bytes.
+    SizeBytes,
+    /// Star rating (un-rated assets sort last when descending).
+    Rating,
+}
+
 /// Filtering + paging options for listing assets.
 #[derive(Debug, Clone, Default)]
 pub struct AssetQuery {
@@ -341,6 +356,10 @@ pub struct AssetQuery {
     pub tag_ids: Vec<Uuid>,
     pub is_favorite: Option<bool>,
     pub is_trashed: bool,
+    /// Sort key of the listing (default: import time).
+    pub sort: AssetSort,
+    /// Sort direction: `true` (default) = descending.
+    pub sort_desc: bool,
     /// `Some(limit)` enables paging; cap applied by the caller.
     pub limit: Option<u32>,
     pub offset: u64,

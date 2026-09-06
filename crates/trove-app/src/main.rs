@@ -57,8 +57,7 @@ fn build_menus() -> Vec<Menu> {
                 MenuItem::action(
                     rust_i18n::t!("app.export_library").to_string(),
                     ExportLibrary,
-                )
-                .disabled(true),
+                ),
                 MenuItem::separator(),
                 MenuItem::action(rust_i18n::t!("app.settings").to_string(), OpenSettings),
             ],

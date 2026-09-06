@@ -7,7 +7,29 @@ use uuid::Uuid;
 
 use crate::error::Result;
 use crate::media;
-use crate::store::{assets, batch, rows, smart, smart_collections, Store};
+use crate::store::{assets, batch, collections, rows, smart, smart_collections, tags, Store};
+
+/// Serialize the whole metadata catalog of `store` (assets, collections,
+/// tags, smart collections) as pretty JSON. Media blobs are not included —
+/// the export is a portable catalog, not a backup of the files.
+pub fn export_metadata_from_store(store: &Store) -> Result<String> {
+    let conn = store.conn();
+    let (_, assets) = assets::query(conn, &crate::model::AssetQuery::default())?;
+    let collections = collections::list(conn)?;
+    let tags = tags::list(conn)?;
+    let smart_collections = smart_collections::list(conn)?;
+    let export = serde_json::json!({
+        "format": "trove-export",
+        "version": 1,
+        "exported_at": chrono::Utc::now().to_rfc3339(),
+        "asset_count": assets.len(),
+        "assets": assets,
+        "collections": collections,
+        "tags": tags,
+        "smart_collections": smart_collections,
+    });
+    Ok(serde_json::to_string_pretty(&export)?)
+}
 
 /// Outcome of permanently deleting a batch of assets.
 #[derive(Debug, Clone, Default)]
@@ -237,6 +259,13 @@ impl Library {
     /// Attach many assets to a collection (idempotent).
     pub fn add_assets_to_collection(&self, collection_id: Uuid, ids: &[Uuid]) -> Result<u64> {
         batch::add_to_collection_many(self.store.conn(), collection_id, ids)
+    }
+
+    /// Full metadata export (assets, collections, tags, smart collections) as
+    /// pretty JSON. Media blobs are not included — the export is a portable
+    /// catalog, not a backup of the files.
+    pub fn export_metadata(&self) -> Result<String> {
+        export_metadata_from_store(&self.store)
     }
 
     /// Permanently delete many assets atomically, freeing any content-addressed

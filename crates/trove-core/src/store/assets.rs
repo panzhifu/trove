@@ -261,7 +261,14 @@ pub fn query(conn: &Connection, q: &AssetQuery) -> Result<(u64, Vec<Asset>)> {
     )? as u64;
 
     let mut sql = format!("SELECT {COLS} FROM assets {where_sql}");
-    sql.push_str(" ORDER BY created_at DESC, id ASC");
+    let order_col = match q.sort {
+        crate::model::AssetSort::CreatedAt => "created_at",
+        crate::model::AssetSort::Name => "file_name COLLATE NOCASE",
+        crate::model::AssetSort::SizeBytes => "size_bytes",
+        crate::model::AssetSort::Rating => "rating",
+    };
+    let dir = if q.sort_desc { "DESC" } else { "ASC" };
+    sql.push_str(&format!(" ORDER BY {order_col} {dir}, id ASC"));
     if let Some(limit) = q.limit {
         let limit = limit.min(1_000);
         sql.push_str(" LIMIT ? OFFSET ?");

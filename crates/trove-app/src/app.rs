@@ -7,6 +7,10 @@
 
 use std::path::PathBuf;
 
+use gpui_kit::base::h_flex;
+use gpui_kit::component::notification::Notification;
+use gpui_kit::prelude::FluentBuilder as _;
+use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::component::WindowExt as _;
 use gpui_kit::component::dock::{DockLayout, DockPlacement, DockSkin, panel_handle};
 
@@ -17,7 +21,7 @@ use gpui_kit::*;
 use crate::actions::*;
 use crate::jobs;
 use crate::panels::{ExplorerPanel, InspectorPanel, TagsPanel, WorkspacePanel};
-use crate::state::LibraryController;
+use crate::state::{ImportPhase, LibraryController};
 use crate::title_bar::TitleBarView;
 use trove_core::config::AppConfig;
 use trove_core::library::Library;
@@ -79,7 +83,95 @@ impl AppView {
         });
         skin.set_ellipsis_menu(false, cx);
 
+        // Redraw the status bar whenever the controller state changes.
+        cx.observe(&controller, |_, _, cx| cx.notify()).detach();
+
         Self { controller, dock, title_bar }
+    }
+
+    /// File ▸ Export library… : save-dialog, then write the metadata catalog
+    /// as pretty JSON (`Library::export_metadata`). Library is not `Send`, so
+    /// serialization happens on the main thread inside the window callback.
+    fn prompt_export(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let ctl = self.controller.clone();
+        let handle = window.window_handle();
+        let dir = ctl.read(cx).library.root().to_path_buf();
+        let rx = cx.prompt_for_new_path(&dir, Some("trove-export.json"));
+        cx.spawn(async move |_, cx| {
+            if let Ok(Ok(Some(path))) = rx.await {
+                let _ = handle.update(cx, |_, window, cx| {
+                    let outcome = ctl
+                        .update(cx, |ctl, _| ctl.library.export_metadata())
+                        .and_then(|json| {
+                            std::fs::write(&path, json).map_err(|e| e.into())
+                        });
+                    let note = match outcome {
+                        Ok(()) => Notification::success(
+                            rust_i18n::t!("app.export_done", path = path.display().to_string())
+                                .to_string(),
+                        ),
+                        Err(e) => Notification::warning(
+                            rust_i18n::t!("app.export_failed", error = e.to_string()).to_string(),
+                        ),
+                    };
+                    window.push_notification(note, cx);
+                });
+            }
+        })
+        .detach();
+    }
+
+    /// Bottom status bar: selection count, library path, import state and the
+    /// latest notice (errors surface here even outside Settings).
+    fn status_bar(&self, cx: &Context<Self>) -> Div {
+        let ctl = self.controller.read(cx);
+        let selected = ctl.selected_assets.len();
+        let root = ctl.library.root().display().to_string();
+        let import = match &ctl.import_phase {
+            ImportPhase::Idle => rust_i18n::t!("statusbar.import_idle").to_string(),
+            ImportPhase::Running { total, done } => rust_i18n::t!(
+                "statusbar.import_running",
+                done = done,
+                total = total
+            )
+            .to_string(),
+            ImportPhase::Done { imported, skipped } => rust_i18n::t!(
+                "statusbar.import_done",
+                imported = imported,
+                skipped = skipped
+            )
+            .to_string(),
+        };
+        let notice = ctl.notice.clone();
+        h_flex()
+            .h(px(26.))
+            .px_3()
+            .items_center()
+            .gap_4()
+            .flex_shrink_0()
+            .border_t_1()
+            .border_color(cx.theme().border)
+            .bg(cx.theme().secondary)
+            .text_xs()
+            .text_color(cx.theme().muted_foreground)
+            .child(rust_i18n::t!("statusbar.selected", count = selected).to_string())
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .child(rust_i18n::t!("statusbar.library", path = root).to_string()),
+            )
+            .child(import)
+            .when_some(notice, |bar, notice| {
+                bar.child(
+                    div()
+                        .max_w(px(420.))
+                        .truncate()
+                        .text_color(cx.theme().warning)
+                        .child(notice),
+                )
+            })
     }
 
     /// File ▸ Import files… : system file picker, then background import.
@@ -163,6 +255,9 @@ impl Render for AppView {
             .on_action(cx.listener(|this, _: &ImportFiles, window, cx| {
                 this.prompt_import(window, cx);
             }))
+            .on_action(cx.listener(|this, _: &ExportLibrary, window, cx| {
+                this.prompt_export(window, cx);
+            }))
             .on_action(cx.listener(|this, _: &OpenSettings, window, cx| {
                 crate::settings::SettingsDialog::open(window, cx, this.controller.clone());
             }))
@@ -200,6 +295,7 @@ impl Render for AppView {
                     .min_h_0()
                     .child(self.dock.clone()),
             )
+            .child(self.status_bar(cx))
             .children(dialog_layer)
             .children(sheet_layer)
             .children(notification_layer)
