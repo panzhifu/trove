@@ -21,11 +21,23 @@ pub struct ThumbRebuildReport {
     pub missing_blobs: u64,
 }
 
-/// Regenerate thumbnails for every live image asset.
+/// Work plan for a thumbnail rebuild, collected by
+/// [`plan_thumbnail_rebuild`]. Plain data (`Send`), so the actual file work
+/// ([`run_thumbnail_plan`]) can run on a background thread while the plan is
+/// gathered where the non-`Send` [`Library`] lives.
+#[derive(Debug, Clone, Default)]
+pub struct ThumbPlan {
+    /// `(blob path, sha256)` pairs whose thumbnail should be regenerated.
+    pub items: Vec<(PathBuf, String)>,
+    /// Image assets whose stored blob file is missing on disk.
+    pub missing_blobs: u64,
+}
+
+/// Collect the work for a thumbnail rebuild without doing any of it.
 ///
-/// `force = false` only fills gaps (missing thumbnails); `force = true`
-/// rewrites every thumbnail, repairing corrupt cache entries.
-pub fn rebuild_thumbnails(lib: &Library, force: bool) -> Result<ThumbRebuildReport> {
+/// `force = false` only plans gaps (missing thumbnails); `force = true`
+/// plans a rewrite of every thumbnail, repairing corrupt cache entries.
+pub fn plan_thumbnail_rebuild(lib: &Library, force: bool) -> Result<ThumbPlan> {
     let conn = lib.store().conn();
     let root = lib.root();
     let (_, images) = assets::query(
@@ -37,24 +49,47 @@ pub fn rebuild_thumbnails(lib: &Library, force: bool) -> Result<ThumbRebuildRepo
         },
     )?;
 
-    let mut report = ThumbRebuildReport::default();
+    let mut plan = ThumbPlan::default();
     for asset in images {
         let Some(sha) = asset.sha256 else { continue };
         let Some(rel) = asset.rel_path else { continue };
         let blob = root.join(&rel);
         if !blob.is_file() {
-            report.missing_blobs += 1;
+            plan.missing_blobs += 1;
             continue;
         }
         // Skip existing thumbnails unless a full rewrite was requested.
         if !force && thumb::abs_path(root, &sha).is_file() {
             continue;
         }
+        plan.items.push((blob, sha));
+    }
+    Ok(plan)
+}
+
+/// Execute a [`ThumbPlan`]: pure filesystem work with no database access.
+/// Designed for a background thread.
+pub fn run_thumbnail_plan(root: &Path, plan: ThumbPlan) -> ThumbRebuildReport {
+    let mut report = ThumbRebuildReport {
+        regenerated: 0,
+        missing_blobs: plan.missing_blobs,
+    };
+    for (blob, sha) in plan.items {
         if thumb::regenerate(root, &sha, AssetKind::Image, &blob).is_some() {
             report.regenerated += 1;
         }
     }
-    Ok(report)
+    report
+}
+
+/// Regenerate thumbnails for every live image asset.
+///
+/// `force = false` only fills gaps (missing thumbnails); `force = true`
+/// rewrites every thumbnail, repairing corrupt cache entries.
+pub fn rebuild_thumbnails(lib: &Library, force: bool) -> Result<ThumbRebuildReport> {
+    let root = lib.root().to_path_buf();
+    let plan = plan_thumbnail_rebuild(lib, force)?;
+    Ok(run_thumbnail_plan(&root, plan))
 }
 
 /// Rebuild the full-text index from the current asset rows (live and trashed
