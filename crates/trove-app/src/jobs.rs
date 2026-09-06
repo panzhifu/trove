@@ -68,14 +68,56 @@ pub fn import_paths_app(
     cx.spawn(async move |cx| {
         let staged = task.await;
         let mut report = import::ImportReport::default();
+
+        // Commit one file per main-thread turn, yielding in between so the
+        // UI (status bar + progress toast) repaints with live per-file
+        // progress instead of jumping from 0 to done.
+        for (done, item) in staged.into_iter().enumerate() {
+            controller.update(cx, |ctl, cx| {
+                match item {
+                    Ok(file) => {
+                        match import::commit_staged(
+                            ctl.library.store(),
+                            into_collection,
+                            Some(import::AutoCollection::SourceFolder),
+                            &file,
+                        ) {
+                            Ok(imported) => report.imported.push(imported),
+                            Err(e) => report.skipped.push(import::ImportSkip {
+                                path: file.path,
+                                reason: e.to_string(),
+                            }),
+                        }
+                    }
+                    Err(skip) => report.skipped.push(skip),
+                }
+                ctl.import_progress(done + 1);
+                cx.notify();
+            });
+
+            // Keep the keyed progress toast current.
+            let _ = handle.update(cx, |_view, window, cx| {
+                window.push_notification(
+                    Notification::info(
+                        rust_i18n::t!(
+                            "notice.import_running",
+                            done = done + 1,
+                            total = total
+                        )
+                        .to_string(),
+                    )
+                    .id1::<ImportNotice>("import-progress"),
+                    cx,
+                );
+            });
+
+            // Yield so the frame with the updated progress actually draws.
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(1))
+                .await;
+        }
+
         controller.update(cx, |ctl, cx| {
-            report = import::commit_staged_all(
-                ctl.library.store(),
-                into_collection,
-                Some(import::AutoCollection::SourceFolder),
-                staged,
-            );
-            ctl.import_progress(total);
             ctl.finish_import(report.imported_count(), report.skipped_count());
             cx.notify();
         });

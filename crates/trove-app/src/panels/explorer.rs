@@ -11,7 +11,7 @@ use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::dock::{BasePanel, Panel as DockPanel, PanelControl, PanelEvent};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::menu::{ContextMenuExt as _, PopupMenu, PopupMenuItem};
-use gpui_kit::component::{ActiveTheme, Sizable};
+use gpui_kit::component::{ActiveTheme, Icon, IconName, Sizable};
 use gpui_kit::*;
 use gpui_kit::prelude::FluentBuilder as _;
 
@@ -23,7 +23,7 @@ use crate::state::LibraryController;
 
 use super::common::{
     hex_to_rgb, live_count, observe_controller, selectable_row, separator_label, trash_count,
-    AssetsDrag,
+    AssetsDrag, CollectionDrag,
 };
 
 /// What the single inline editor is doing right now.
@@ -532,7 +532,8 @@ fn collection_row(
         row = row.pl(px(22.));
     }
 
-    // Drop target: add dragged assets to this collection.
+    // Drop target: add dragged assets to this collection. Managed rows are
+    // also drag sources (reparent) and drop targets for other collections.
     if let Some(cid) = id {
         let controller_drop = controller.clone();
         row = row
@@ -544,9 +545,72 @@ fn collection_row(
                     cx.notify();
                 });
             });
+
+        let controller_move = controller.clone();
+        row = row
+            .on_drag(CollectionDrag(cid), |_, _, _, cx| {
+                cx.new(|_| CollectionDragPreview)
+            })
+            .drag_over::<CollectionDrag>(|this, _, _, cx| this.bg(cx.theme().secondary))
+            .on_drop(move |payload: &CollectionDrag, _window, cx| {
+                controller_move.update(cx, move |ctl, cx| {
+                    let conn = ctl.library.store().conn();
+                    let position = collections::children_of(conn, Some(cid))
+                        .map(|c| c.len() as i64)
+                        .unwrap_or(0);
+                    if let Err(e) = collections::move_to(conn, payload.0, Some(cid), position) {
+                        ctl.notice = Some(
+                            rust_i18n::t!("explorer.move_failed", error = e.to_string())
+                                .to_string(),
+                        );
+                    }
+                    ctl.generation += 1;
+                    cx.notify();
+                });
+            });
+    } else {
+        // "All assets" row: dropping a collection here moves it back to the
+        // root level.
+        let controller_root = controller.clone();
+        row = row
+            .drag_over::<CollectionDrag>(|this, _, _, cx| this.bg(cx.theme().secondary))
+            .on_drop(move |payload: &CollectionDrag, _window, cx| {
+                controller_root.update(cx, move |ctl, cx| {
+                    let conn = ctl.library.store().conn();
+                    let position = collections::roots(conn)
+                        .map(|r| r.len() as i64)
+                        .unwrap_or(0);
+                    if let Err(e) = collections::move_to(conn, payload.0, None, position) {
+                        ctl.notice = Some(
+                            rust_i18n::t!("explorer.move_failed", error = e.to_string())
+                                .to_string(),
+                        );
+                    }
+                    ctl.generation += 1;
+                    cx.notify();
+                });
+            });
     }
 
     row
+}
+
+/// Drag ghost for a dragged collection row.
+struct CollectionDragPreview;
+impl Render for CollectionDragPreview {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        h_flex()
+            .px_3()
+            .py_1()
+            .rounded(cx.theme().radius)
+            .bg(cx.theme().primary)
+            .gap_1()
+            .items_center()
+            .text_sm()
+            .text_color(cx.theme().primary_foreground)
+            .child(Icon::new(IconName::Folder).size_4())
+            .child(rust_i18n::t!("explorer.drag_collection").to_string())
+    }
 }
 
 /// Right-click menu for a smart collection.

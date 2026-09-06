@@ -188,3 +188,7 @@ pub(crate) fn selectable_row(
 /// Payload for internal drag & drop of one or many selected assets.
 #[derive(Debug, Clone)]
 pub struct AssetsDrag(pub Vec<Uuid>);
+
+/// Payload for dragging a collection row (reparent / reorder in the tree).
+#[derive(Debug, Clone)]
+pub struct CollectionDrag(pub Uuid);
