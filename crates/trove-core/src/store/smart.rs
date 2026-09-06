@@ -11,8 +11,33 @@ use crate::model::{AssetKind, SmartCompare, SmartField, SmartNode};
 
 /// Deserialize a stored JSON condition tree into a [`SmartNode`].
 pub fn node_from_json(json: &Json) -> Result<SmartNode> {
-    serde_json::from_value(json.clone())
+    let json = compat_insert_match_tag(json.clone());
+    serde_json::from_value(json)
         .map_err(|e| Error::Validation(format!("invalid condition tree: {e}")))
+}
+
+/// Re-insert the `"op": "match"` tag on nodes that lack it but carry a
+/// `field`.
+///
+/// Early builds serialized match nodes without the internally-tagged `op`
+/// key (`rules.rs` bug), so libraries saved with them hold trees that fail
+/// deserialization with "missing field `op`". The shape is unambiguous — an
+/// object with a `field` is always a match node — so the tag is restored
+/// recursively before parsing instead of orphaning those saved collections.
+fn compat_insert_match_tag(json: Json) -> Json {
+    match json {
+        Json::Object(mut map) => {
+            if !map.contains_key("op") && map.contains_key("field") {
+                map.insert("op".into(), Json::String("match".into()));
+            }
+            if let Some(children) = map.remove("children") {
+                map.insert("children".into(), compat_insert_match_tag(children));
+            }
+            Json::Object(map)
+        }
+        Json::Array(items) => Json::Array(items.into_iter().map(compat_insert_match_tag).collect()),
+        other => other,
+    }
 }
 
 /// Compile a condition tree into a boolean `WHERE` fragment (no leading
@@ -117,7 +142,33 @@ pub fn evaluate(
     limit: Option<u32>,
     offset: u64,
 ) -> Result<(u64, Vec<uuid::Uuid>)> {
-    let (expr, mut args) = compile(node)?;
+    evaluate_filtered(conn, node, None, None, limit, offset)
+}
+
+/// Like [`evaluate`], with extra grid filters (`kind` / favorite) AND-ed
+/// onto the tree — the toolbar filters compose with smart collections the
+/// same way they compose with plain views.
+pub fn evaluate_filtered(
+    conn: &libsql::Connection,
+    node: &SmartNode,
+    kind: Option<AssetKind>,
+    favorite: Option<bool>,
+    limit: Option<u32>,
+    offset: u64,
+) -> Result<(u64, Vec<uuid::Uuid>)> {
+    let (tree, mut args) = compile(node)?;
+    // Parenthesize the tree before appending: a compiled `or` group is a
+    // bare `a OR b`, and `a OR b AND kind = ?` would let the AND bind to
+    // only the last branch.
+    let mut expr = format!("({tree})");
+    if let Some(kind) = kind {
+        expr.push_str(" AND assets.kind = ?");
+        args.push(kind_sql(kind).into());
+    }
+    if let Some(favorite) = favorite {
+        expr.push_str(" AND assets.is_favorite = ?");
+        args.push(Value::Integer(favorite as i64));
+    }
     let where_sql = format!("WHERE trashed_at IS NULL AND ({expr})");
 
     let total = rows::query_count(
