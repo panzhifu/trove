@@ -1,25 +1,23 @@
 //! Import jobs: heavy file work on the background executor, database commits
-//! on the main thread, with progress published to the [`LibraryController`].
+//! on the main thread, with progress reported through the notification layer.
+//!
+//! The pipeline itself lives in `trove-core::media::import` — this module is
+//! only the executor orchestration: stage in the background, commit where the
+//! [`LibraryController`] lives, then surface the outcome as a toast.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
+use gpui_kit::component::notification::Notification;
+use gpui_kit::component::WindowExt as _;
 use gpui_kit::*;
 
-use trove_core::media::import::{self, StagedFile};
+use trove_core::media::import;
 
 use crate::state::LibraryController;
 
-type StageResult = std::result::Result<StagedFile, (PathBuf, String)>;
-
-/// Stage every source file (copy + hash + probe) on a background thread.
-fn stage_all(library_root: &Path, paths: Vec<PathBuf>) -> Vec<StageResult> {
-    paths
-        .iter()
-        .map(|p| {
-            import::stage_source(library_root, p).map_err(|e| (p.clone(), e.to_string()))
-        })
-        .collect()
-}
+/// Marker type for the import progress toast: pushing with the same id
+/// replaces the previous toast instead of stacking a new one.
+pub struct ImportNotice;
 
 /// Start an import from a set of file paths.
 ///
@@ -29,6 +27,7 @@ fn stage_all(library_root: &Path, paths: Vec<PathBuf>) -> Vec<StageResult> {
 pub fn import_paths_app(
     controller: &Entity<LibraryController>,
     paths: Vec<PathBuf>,
+    window: &mut Window,
     cx: &mut App,
 ) {
     if paths.is_empty() || controller.read(cx).is_importing() {
@@ -52,42 +51,52 @@ pub fn import_paths_app(
     let library_root = controller.read(cx).library.root().to_path_buf();
     controller.update(cx, |ctl, _| ctl.begin_import(total));
 
+    // One keyed toast that tracks the batch: replaced by the completion
+    // notification when the import finishes.
+    window.push_notification(
+        Notification::info(rust_i18n::t!("notice.import_started", count = total).to_string())
+            .id1::<ImportNotice>("import-progress"),
+        cx,
+    );
+
     let controller = controller.clone();
+    let handle = window.window_handle();
     let task = cx
         .background_executor()
-        .spawn(async move { stage_all(&library_root, paths) });
+        .spawn(async move { import::stage_all(&library_root, &paths) });
 
     cx.spawn(async move |cx| {
         let staged = task.await;
-
+        let mut report = import::ImportReport::default();
         controller.update(cx, |ctl, cx| {
-            let mut imported = 0usize;
-            let mut skipped = 0usize;
-            for item in staged {
-                match item {
-                    Ok(file) => {
-                        match import::commit_staged(
-                            ctl.library.store(),
-                            into_collection,
-                            Some(import::AutoCollection::SourceFolder),
-                            &file,
-                        ) {
-                            Ok(_) => imported += 1,
-                            Err(e) => {
-                                skipped += 1;
-                                eprintln!("skipped {}: {e}", file.path.display());
-                            }
-                        }
-                    }
-                    Err((path, reason)) => {
-                        skipped += 1;
-                        eprintln!("skipped {}: {reason}", path.display());
-                    }
-                }
-            }
+            report = import::commit_staged_all(
+                ctl.library.store(),
+                into_collection,
+                Some(import::AutoCollection::SourceFolder),
+                staged,
+            );
             ctl.import_progress(total);
-            ctl.finish_import(imported, skipped);
+            ctl.finish_import(report.imported_count(), report.skipped_count());
             cx.notify();
+        });
+
+        let note = if report.skipped.is_empty() {
+            Notification::success(
+                rust_i18n::t!("notice.import_done", imported = report.imported_count())
+                    .to_string(),
+            )
+        } else {
+            Notification::warning(
+                rust_i18n::t!(
+                    "notice.import_done_skipped",
+                    imported = report.imported_count(),
+                    skipped = report.skipped_count()
+                )
+                .to_string(),
+            )
+        };
+        let _ = handle.update(cx, |_view, window, cx| {
+            window.push_notification(note, cx);
         });
     })
     .detach();
