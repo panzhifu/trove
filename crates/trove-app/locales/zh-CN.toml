@@ -167,3 +167,8 @@ job_failed = "操作失败：%{error}"
 [i18n]
 lang_en = "English"
 lang_zh = "简体中文"
+
+[notice]
+import_started = "正在导入 %{count} 个文件…"
+import_done = "导入完成：已添加 %{imported} 个文件"
+import_done_skipped = "导入完成：%{imported} 个已导入，%{skipped} 个跳过"

@@ -23,12 +23,9 @@ use trove_core::config::AppConfig;
 use trove_core::library::Library;
 
 fn default_library_path() -> PathBuf {
-    if let Ok(dir) = std::env::var("TROVE_LIBRARY_DIR") {
-        return PathBuf::from(dir);
-    }
-    // Use the configured library path if available
-    let config = AppConfig::load();
-    config.resolved_library_path()
+    // `TROVE_LIBRARY_DIR` overrides, then the persisted choice, then the
+    // default — resolution lives in `trove-core::config`.
+    AppConfig::load().resolved_library_path()
 }
 
 /// Root view: owns the controller and hosts the dock area, plus a drop
@@ -86,8 +83,9 @@ impl AppView {
     }
 
     /// File ▸ Import files… : system file picker, then background import.
-    fn prompt_import(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+    fn prompt_import(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let ctl = self.controller.clone();
+        let handle = window.window_handle();
         let rx = cx.prompt_for_paths(PathPromptOptions {
             files: true,
             directories: false,
@@ -97,8 +95,8 @@ impl AppView {
         cx.spawn(async move |_, cx| {
             if let Ok(result) = rx.await {
                 if let Ok(Some(paths)) = result {
-                    let _ = cx.update(|cx| {
-                        jobs::import_paths_app(&ctl, paths, cx);
+                    let _ = handle.update(cx, |_view, window, cx| {
+                        jobs::import_paths_app(&ctl, paths, window, cx);
                     });
                 }
             }
@@ -152,10 +150,11 @@ impl Render for AppView {
             .flex()
             .flex_col()
             // Whole-window file drop surface.
-            .on_drop::<ExternalPaths>(move |paths, _window, cx| {
+            .on_drop::<ExternalPaths>(move |paths, window, cx| {
                 jobs::import_paths_app(
                     &controller,
                     paths.0.iter().cloned().collect(),
+                    window,
                     cx,
                 );
             })

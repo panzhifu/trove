@@ -26,9 +26,6 @@ use gpui_kit::*;
 use crate::i18n::SUPPORTED;
 use crate::state::LibraryController;
 use trove_core::config::AppConfig;
-use trove_core::media::thumb;
-use trove_core::model::{AssetKind, AssetQuery};
-use trove_core::store::assets;
 
 /// Sentinel value for the "follow the system language" choice, which the
 /// config stores as `None`.
@@ -236,9 +233,9 @@ fn finish_job(controller: &Entity<LibraryController>, message: String, cx: &mut 
 }
 
 /// Thumbnails row: incremental rebuild plus a full "rewrite everything"
-/// pass. The file work runs on the background executor; the plan (which
-/// files need work) is collected on the main thread because the library
-/// handle is not `Send`.
+/// pass. The plan (which files need work) is collected on the main thread
+/// because the library handle is not `Send`; the file work runs on the
+/// background executor via the `Send` [`trove_core::maintenance::ThumbPlan`].
 fn thumbs_row(controller: &Entity<LibraryController>, cx: &mut App) -> Div {
     let (busy, controller2) = (controller.read(cx).busy, controller.clone());
     h_flex()
@@ -270,56 +267,39 @@ fn rebuild_thumbs(controller: &Entity<LibraryController>, force: bool, cx: &mut 
     if !start_job(controller, cx) {
         return;
     }
+    // Plan on the main thread (needs the library), run on a worker thread
+    // (pure filesystem work).
+    let plan = {
+        let library = &controller.read(cx).library;
+        match trove_core::maintenance::plan_thumbnail_rebuild(library, force) {
+            Ok(plan) => plan,
+            Err(e) => {
+                finish_job(
+                    controller,
+                    rust_i18n::t!("settings.job_failed", error = e.to_string()).to_string(),
+                    cx,
+                );
+                return;
+            }
+        }
+    };
     let root = controller.read(cx).library.root().to_path_buf();
-    let conn = controller.read(cx).library.store().conn();
 
-    let mut plan: Vec<(PathBuf, String)> = Vec::new();
-    let mut missing = 0u64;
-    if let Ok((_, images)) = assets::query(
-        conn,
-        &AssetQuery {
-            kind: Some(AssetKind::Image),
-            is_trashed: false,
-            ..Default::default()
-        },
-    ) {
-        for asset in images {
-            let Some(sha) = asset.sha256 else { continue };
-            let Some(rel) = asset.rel_path else { continue };
-            let blob = root.join(&rel);
-            if !blob.is_file() {
-                missing += 1;
-                continue;
-            }
-            // Skip existing thumbnails unless a full rewrite was requested.
-            if !force && thumb::abs_path(&root, &sha).is_file() {
-                continue;
-            }
-            plan.push((blob, sha));
-        }
-    }
-
-    let task = cx.background_executor().spawn(async move {
-        let mut done = 0u64;
-        for (blob, sha) in plan {
-            if thumb::regenerate(&root, &sha, AssetKind::Image, &blob).is_some() {
-                done += 1;
-            }
-        }
-        done
-    });
+    let task = cx
+        .background_executor()
+        .spawn(async move { trove_core::maintenance::run_thumbnail_plan(&root, plan) });
 
     cx.spawn({
         let controller = controller.clone();
         async move |cx| {
-            let done = task.await;
+            let report = task.await;
             let _ = cx.update(|cx| {
                 finish_job(
                     &controller,
                     rust_i18n::t!(
                         "settings.rebuild_thumbs_done",
-                        count = done,
-                        missing = missing
+                        count = report.regenerated,
+                        missing = report.missing_blobs
                     )
                     .to_string(),
                     cx,
