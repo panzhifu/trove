@@ -21,7 +21,9 @@ use uuid::Uuid;
 
 use crate::state::LibraryController;
 
-use super::common::{hex_to_rgb, human_bytes, kind_icon, observe_controller, separator_label};
+use super::common::{
+    color_swatch, hex_to_rgb, human_bytes, kind_icon, observe_controller, separator_label,
+};
 
 // ==================== Inspector: details + tags ==============================
 
@@ -411,18 +413,22 @@ impl Render for InspectorPanel {
                     separator_label(cx, rust_i18n::t!("inspector.colors").to_string()),
                 )
                 .child(
-                    h_flex()
-                        .gap_2()
-                        .px_1()
-                        .children(swatches.iter().map(|(rgb, _hex)| {
-                            let bg = gpui_kit::rgb(*rgb);
-                            div()
-                                .size_8()
-                                .rounded_full()
-                                .bg(bg)
-                                .border_1()
-                                .border_color(cx.theme().border)
-                        })),
+                    h_flex().flex_wrap().gap_1p5().px_1().children(
+                        swatches.iter().map(|(_rgb, hex)| {
+                            let hex = hex.clone();
+                            // Right-click copies the hex value straight to the
+                            // clipboard — the palette doubles as a picker.
+                            color_swatch(cx, format!("swatch-{hex}"), &hex, false, |_, _, _| {})
+                                .on_mouse_down(gpui::MouseButton::Right, {
+                                    let hex = hex.clone();
+                                    move |_, _, cx| {
+                                        cx.write_to_clipboard(
+                                            gpui::ClipboardItem::new_string(hex.clone()),
+                                        );
+                                    }
+                                })
+                        }),
+                    ),
                 )
             })
             .when(kind == AssetKind::Font, |this| {
