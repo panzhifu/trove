@@ -32,8 +32,23 @@ const WORKSPACE_CONTEXT: &str = "Workspace";
 
 /// (Re)build the application menus from the active locale. Called at startup
 /// and again after a live language switch in Settings.
+///
+/// Menus go two places: `cx.set_menus` feeds the platform (shortcuts,
+/// Wayland global-menu integration), while gpui-kit's in-window
+/// [`gpui_kit::component::menu::AppMenuBar`] reads its own `GlobalState`
+/// catalog — without the second write the title-bar bar renders empty.
 pub fn apply_menus(cx: &mut App) {
-    cx.set_menus(vec![
+    use gpui_kit::component::global_state::GlobalState;
+
+    // `Menu` is not `Clone` (it carries action trait objects), so build the
+    // list once per consumer.
+    cx.set_menus(build_menus());
+    let owned: Vec<gpui::OwnedMenu> = build_menus().into_iter().map(|menu| menu.owned()).collect();
+    GlobalState::global_mut(cx).set_app_menus(owned);
+}
+
+fn build_menus() -> Vec<Menu> {
+    vec![
         Menu {
             name: rust_i18n::t!("app.file").into_owned().into(),
             items: vec![
@@ -79,7 +94,7 @@ pub fn apply_menus(cx: &mut App) {
             )],
             disabled: false,
         },
-    ]);
+    ]
 }
 
 fn register_keys(cx: &mut App) {
