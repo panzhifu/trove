@@ -223,7 +223,7 @@ fn number_value(v: &Json, what: &str) -> Result<i64> {
 
 /// Accept `#rrggbb` (case-insensitive, `#` optional) and normalize to lowercase
 /// with the `#` prefix, matching what mining stores in `extra.dominant_color`.
-fn normalize_color(v: &str) -> Result<String> {
+pub(crate) fn normalize_color(v: &str) -> Result<String> {
     let mut s = v.trim().to_lowercase();
     if !s.starts_with('#') {
         s.insert(0, '#');

@@ -5,7 +5,8 @@ use std::path::PathBuf;
 use uuid::Uuid;
 
 use trove_core::library::Library;
-use trove_core::model::AssetKind;
+use trove_core::model::{AssetKind, AssetSort};
+use trove_core::store::collections;
 
 /// Current import activity, shown by the Explorer panel.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -14,6 +15,16 @@ pub enum ImportPhase {
     Idle,
     Running { total: usize, done: usize },
     Done { imported: usize, skipped: usize },
+}
+
+/// Presentation of the workspace asset area.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ViewMode {
+    /// Justified thumbnail grid.
+    #[default]
+    Grid,
+    /// Compact full-width rows (name / kind / size / date).
+    List,
 }
 
 /// Page size of the workspace asset grid: how many assets one page of the
@@ -43,6 +54,12 @@ pub struct LibraryController {
     /// Grid filters (compose with any view; cleared on library swap).
     pub filter_kind: Option<AssetKind>,
     pub filter_favorite: bool,
+    /// Grid or list presentation of the asset area.
+    pub view_mode: ViewMode,
+    /// Listing sort (ignored by the live FTS search, which sorts by
+    /// relevance). Cleared state = newest first.
+    pub sort: AssetSort,
+    pub sort_desc: bool,
     /// Progress of the most recent import.
     pub import_phase: ImportPhase,
     /// Asset ids currently displayed by the workspace grid (this page only).
@@ -74,6 +91,9 @@ impl LibraryController {
             search_text: String::new(),
             filter_kind: None,
             filter_favorite: false,
+            view_mode: ViewMode::default(),
+            sort: AssetSort::default(),
+            sort_desc: true,
             import_phase: ImportPhase::Idle,
             visible_assets: Vec::new(),
             selection_anchor: None,
@@ -169,6 +189,44 @@ impl LibraryController {
             self.reset_grid_page();
             self.generation += 1;
         }
+    }
+
+    /// Switch the asset-area presentation. Re-layouts the frozen rows.
+    pub fn set_view_mode(&mut self, mode: ViewMode) {
+        if self.view_mode != mode {
+            self.view_mode = mode;
+            self.reset_grid_page();
+            self.generation += 1;
+        }
+    }
+
+    /// Change the listing sort. Re-layouts the frozen rows.
+    pub fn set_sort(&mut self, sort: AssetSort, desc: bool) {
+        if self.sort != sort || self.sort_desc != desc {
+            self.sort = sort;
+            self.sort_desc = desc;
+            self.reset_grid_page();
+            self.generation += 1;
+        }
+    }
+
+    /// Remove assets from the currently browsed collection (no-op outside a
+    /// collection view — trash / smart / tag views have no membership).
+    pub fn remove_from_current_collection(&mut self, ids: &[Uuid]) -> usize {
+        let Some(cid) = self.current_collection else {
+            return 0;
+        };
+        let conn = self.library.store().conn();
+        let mut removed = 0;
+        for id in ids {
+            if collections::remove_asset(conn, cid, *id).is_ok() {
+                removed += 1;
+            }
+        }
+        if removed > 0 {
+            self.generation += 1;
+        }
+        removed
     }
 
     /// Swap the open library for another one at `path` (hot switch from
@@ -301,7 +359,9 @@ impl LibraryController {
             self.library.trash_assets(&ids)
         };
         if let Err(e) = result {
-            eprintln!("trash/purge selection failed: {e}");
+            self.notice = Some(
+                rust_i18n::t!("workspace.trash_failed", error = e.to_string()).to_string(),
+            );
         }
         self.generation += 1;
         ids.len()

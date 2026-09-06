@@ -872,5 +872,125 @@ mod tests {
         let (total, _) = assets::search(conn, "treasure", &AssetQuery::default()).unwrap();
         assert_eq!(total, 1);
     }
+
+    #[test]
+    fn tag_rename_updates_fts_and_rejects_duplicates() {
+        let store = Store::in_memory().unwrap();
+        let conn = store.conn();
+        let tag = tags::create(conn, &NewTag { name: "beach".into(), color: None }).unwrap();
+        let mut a = sample_asset("a.png", AssetKind::Image);
+        a.title = Some("sunset".into());
+        assets::insert(conn, &a).unwrap();
+        tags::add_to_asset(conn, a.id, tag.id).unwrap();
+        // The old name is searchable before the rename.
+        let (total, _) = assets::search(conn, "beach", &AssetQuery::default()).unwrap();
+        assert_eq!(total, 1);
+
+        tags::rename(conn, tag.id, "coastline").unwrap();
+        let renamed = tags::get(conn, tag.id).unwrap().unwrap();
+        assert_eq!(renamed.name, "coastline");
+        // Search index followed the rename in both directions.
+        let (total, _) = assets::search(conn, "coastline", &AssetQuery::default()).unwrap();
+        assert_eq!(total, 1);
+        let (total, _) = assets::search(conn, "beach", &AssetQuery::default()).unwrap();
+        assert_eq!(total, 0);
+
+        // Renaming onto an existing name (case-insensitive) fails.
+        let other = tags::create(conn, &NewTag { name: "night".into(), color: None }).unwrap();
+        assert!(tags::rename(conn, tag.id, "NIGHT").is_err());
+        let _ = other;
+    }
+
+    #[test]
+    fn tag_color_validates_and_persists() {
+        let store = Store::in_memory().unwrap();
+        let conn = store.conn();
+        let tag = tags::create(conn, &NewTag { name: "t".into(), color: None }).unwrap();
+        tags::set_color(conn, tag.id, Some("FF00AA")).unwrap();
+        assert_eq!(tags::get(conn, tag.id).unwrap().unwrap().color, Some("#ff00aa".into()));
+        tags::set_color(conn, tag.id, None).unwrap();
+        assert_eq!(tags::get(conn, tag.id).unwrap().unwrap().color, None);
+        assert!(tags::set_color(conn, tag.id, Some("nothex")).is_err());
+    }
+
+    #[test]
+    fn asset_query_sort_orders() {
+        use crate::model::AssetSort;
+        let store = Store::in_memory().unwrap();
+        let conn = store.conn();
+        let mut a = sample_asset("aaa.png", AssetKind::Image);
+        a.size_bytes = 300;
+        a.rating = Some(2);
+        let mut b = sample_asset("zzz.png", AssetKind::Image);
+        b.size_bytes = 100;
+        b.rating = Some(5);
+        // Stagger import times so the default newest-first order is
+        // deterministic (sample timestamps would otherwise collide).
+        let mut c = sample_asset("mmm.png", AssetKind::Image);
+        a.created_at = now();
+        b.created_at = now() - chrono::Duration::seconds(1);
+        c.created_at = now() - chrono::Duration::seconds(2);
+        assets::insert(conn, &a).unwrap();
+        assets::insert(conn, &b).unwrap();
+        assets::insert(conn, &c).unwrap();
+
+        let names = |q: AssetQuery| -> Vec<String> {
+            assets::query(conn, &q).unwrap().1.iter().map(|x| x.file_name.clone()).collect()
+        };
+        // Default: newest first (insert order C, B, A).
+        assert_eq!(names(AssetQuery::default()), vec!["mmm.png", "zzz.png", "aaa.png"]);
+        assert_eq!(
+            names(AssetQuery { sort: AssetSort::Name, sort_desc: false, ..Default::default() }),
+            vec!["aaa.png", "mmm.png", "zzz.png"]
+        );
+        assert_eq!(
+            names(AssetQuery { sort: AssetSort::SizeBytes, sort_desc: true, ..Default::default() }),
+            vec!["aaa.png", "mmm.png", "zzz.png"]
+        );
+        // Un-rated assets come last in a descending rating sort.
+        assert_eq!(
+            names(AssetQuery { sort: AssetSort::Rating, sort_desc: true, ..Default::default() }),
+            vec!["zzz.png", "aaa.png", "mmm.png"]
+        );
+    }
+
+    #[test]
+    fn export_metadata_roundtrip() {
+        use crate::store::{collections, smart_collections};
+        let store = Store::in_memory().unwrap();
+        let conn = store.conn();
+        let mut a = sample_asset("a.png", AssetKind::Image);
+        a.title = Some("sunset".into());
+        assets::insert(conn, &a).unwrap();
+        let coll = collections::create(
+            conn,
+            &NewCollection { parent_id: None, name: "trip".into(), position: 0 },
+        )
+        .unwrap();
+        collections::add_asset(conn, coll.id, a.id).unwrap();
+        let tag = tags::create(conn, &NewTag { name: "beach".into(), color: None }).unwrap();
+        tags::add_to_asset(conn, a.id, tag.id).unwrap();
+        smart_collections::create(
+            conn,
+            &crate::model::NewSmartCollection {
+                name: "fav".into(),
+                query: serde_json::json!({
+                    "op": "match", "field": "is_favorite", "value": true
+                }),
+                color: None,
+                position: 0,
+            },
+        )
+        .unwrap();
+
+        let json = crate::library::export_metadata_from_store(&store).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value["format"], "trove-export");
+        assert_eq!(value["asset_count"], 1);
+        assert_eq!(value["assets"][0]["title"], "sunset");
+        assert_eq!(value["collections"][0]["name"], "trip");
+        assert_eq!(value["tags"][0]["name"], "beach");
+        assert_eq!(value["smart_collections"][0]["name"], "fav");
+    }
 }
 
