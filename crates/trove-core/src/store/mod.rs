@@ -638,6 +638,93 @@ mod tests {
     }
 
     #[test]
+    fn legacy_tree_without_op_tag_roundtrips() {
+        // Trees saved by early builds lack the internally-tagged `op` key on
+        // match nodes ("missing field `op`"); node_from_json restores it.
+        let store = Store::in_memory().unwrap();
+        let mut a = sample_asset("old.png", AssetKind::Image);
+        a.is_favorite = true;
+        assets::insert(store.conn(), &a).unwrap();
+
+        let legacy = serde_json::json!({
+            "op": "and",
+            "children": [
+                { "field": "is_favorite", "value": true },
+                { "field": "kind", "value": "image" },
+            ]
+        });
+        let node = super::smart::node_from_json(&legacy).unwrap();
+        let (total, ids) = super::smart::evaluate(store.conn(), &node, None, 0).unwrap();
+        assert_eq!(total, 1);
+        assert_eq!(ids, vec![a.id]);
+
+        // A truly malformed tree (no field either) is still an error.
+        assert!(super::smart::node_from_json(&serde_json::json!({
+            "op": "and", "children": [{ "value": 1 }]
+        }))
+        .is_err());
+    }
+
+    #[test]
+    fn evaluate_filtered_and_grid_filters() {
+        let store = Store::in_memory().unwrap();
+        let mut img = sample_asset("p.png", AssetKind::Image);
+        img.is_favorite = true;
+        let mut vid = sample_asset("v.mp4", AssetKind::Video);
+        vid.is_favorite = true;
+        let doc = sample_asset("d.md", AssetKind::Document);
+        assets::insert(store.conn(), &img).unwrap();
+        assets::insert(store.conn(), &vid).unwrap();
+        assets::insert(store.conn(), &doc).unwrap();
+
+        // The match-all tree: an OR over favorite/kind always true for all.
+        let node = smart_node(serde_json::json!({
+            "op": "or", "children": [
+                { "op": "match", "field": "is_favorite", "value": true },
+                { "op": "match", "field": "is_favorite", "compare": "ne", "value": true },
+            ]
+        }));
+
+        // kind filter narrows to images.
+        let (total, ids) = super::smart::evaluate_filtered(
+            store.conn(),
+            &node,
+            Some(AssetKind::Image),
+            None,
+            None,
+            0,
+        )
+        .unwrap();
+        assert_eq!(total, 1);
+        assert_eq!(ids, vec![img.id]);
+
+        // favorite filter narrows to the two favorites (img + vid).
+        let (total, _) = super::smart::evaluate_filtered(
+            store.conn(),
+            &node,
+            None,
+            Some(true),
+            None,
+            0,
+        )
+        .unwrap();
+        assert_eq!(total, 2);
+
+        // Both compose with AND.
+        let (total, ids) = super::smart::evaluate_filtered(
+            store.conn(),
+            &node,
+            Some(AssetKind::Video),
+            Some(true),
+            None,
+            0,
+        )
+        .unwrap();
+        assert_eq!(total, 1);
+        assert_eq!(ids, vec![vid.id]);
+    }
+
+    #[test]
     fn smart_collection_text_and_tag_match() {
         let store = Store::in_memory().unwrap();
         let mut a = sample_asset("notes.md", AssetKind::Document);
@@ -786,3 +873,4 @@ mod tests {
         assert_eq!(total, 1);
     }
 }
+

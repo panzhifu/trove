@@ -154,9 +154,13 @@ impl Library {
 
     /// Evaluate a stored smart collection live, materialising the matching
     /// assets as a relevance/paged list. Returns `(total_matching, page)`.
+    /// `kind` / `favorite` are extra grid filters AND-ed onto the tree (the
+    /// toolbar filters compose with smart collections too).
     pub fn evaluate_smart_collection(
         &self,
         id: Uuid,
+        kind: Option<crate::model::AssetKind>,
+        favorite: Option<bool>,
         limit: Option<u32>,
         offset: u64,
     ) -> Result<(u64, Vec<crate::model::Asset>)> {
@@ -165,7 +169,7 @@ impl Library {
             return Err(crate::Error::NotFound("smart_collection"));
         };
         let node = smart::node_from_json(&smart_collection.query)?;
-        let (total, ids) = smart::evaluate(conn, &node, limit, offset)?;
+        let (total, ids) = smart::evaluate_filtered(conn, &node, kind, favorite, limit, offset)?;
         let page = assets::by_ids(conn, &ids)?;
         Ok((total, page))
     }
@@ -608,7 +612,8 @@ mod tests {
             })
             .unwrap();
         assert_eq!(lib.list_smart_collections().unwrap().len(), 1);
-        let (total, assets) = lib.evaluate_smart_collection(sc.id, None, 0).unwrap();
+        let (total, assets) =
+            lib.evaluate_smart_collection(sc.id, None, None, None, 0).unwrap();
         assert_eq!(total, 1);
         assert_eq!(assets[0].id, photo_id);
 
