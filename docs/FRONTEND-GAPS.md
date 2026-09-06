@@ -14,14 +14,14 @@
 | 智能集合创建 / 编辑 / 重命名 | `Library::create_smart_collection` / `rename_smart_collection` | ✅ | 搜索框激活时「+」保存为智能集合；右键重命名（行内编辑） |
 | 批量收藏 | `Library::set_assets_favorite`（batch.rs） | ✅ | 多选浮动工具栏 |
 | 从集合移出资产 | `collections::remove_asset` | ✅ | 集合视图内资产右键「移出收藏夹」（按选中集合批量移出） |
-| 集合拖拽重排 / 改父级 | `collections::move_to` | ⬜ | 集合树固定两层、不可拖动 |
+| 集合拖拽重排 / 改父级 | `collections::move_to` | ✅ | 集合树行可拖拽：拖到另一集合上改为其子级（追加到末尾），拖到「全部资产」回到根级；环/自引用由后端拒绝并提示 |
 | 收藏视图 / 类型过滤 | `AssetQuery.is_favorite` / `kind` | ✅ | 标题栏：类型下拉 + 收藏 toggle + 清除；与集合/搜索/智能集合视图组合（core `evaluate_filtered`）；过滤后无命名视图时标题显示「收藏」 |
 | 维护工具（缩略图重建 / FTS 重建 / 孤儿清理） | `maintenance.rs` | ✅ | Settings ▸ 维护：缩略图增量/全量（后台线程）、索引重建、孤儿清理，结果写入状态行 |
 | 标签重命名 / 颜色 | `NewTag.color`；`tags::rename` / `tags::set_color` | ✅ | 标签面板右键：重命名对话框（rename 后重同步 FTS）+ 预设色板取色 / 清除颜色；行内色点展示 |
 | 整组替换标签 | `tags::set_for_asset` | ✅ | Inspector 标签输入框 + 替换按钮（逗号/分号分隔，缺失名自动创建） |
 | 导出库 | `Library::export_metadata` | ✅ | File ▸ 导出素材库：另存为 JSON 元数据目录（资产/集合/标签/智能集合，不含媒体文件），结果推 toast |
 | 通知层 | notification_layer 已挂载 | ✅ | 导入开始/完成推键控 toast（同一批次替换）；跳过原因进 `ImportReport.skipped` 并体现在通知 |
-| 导入进度 | `ImportPhase::Running` / `import_progress` | 🚧 | toast 级开始/完成已接通知层；逐文件实时进度面板仍无 |
+| 导入进度 | `ImportPhase::Running` / `import_progress` | ✅ | 逐文件提交 + 主线程让帧：状态栏与键控 toast 实时显示 (done/total)；staging 阶段为整批 |
 | 单资产 purge / import / search facade | `Library::purge_asset` 等 | ⬜ | 前端直接调 store 层，语义等价 |
 
 ## 二、前端基础功能
@@ -58,4 +58,4 @@
 4. 收藏视图 + 类型过滤 ✅
 5. 维护工具入 Settings + 库热切换 ✅
 
-> 剩余项：集合拖拽重排/改父级、标签拖出、撤销/重做、逐文件导入进度面板、搜索框聚焦时快捷键回归验证、导出库只含元数据（媒体文件导入侧还原未做）。
+> 剩余项：标签拖出、撤销/重做（前后端均无）、搜索框聚焦时快捷键回归验证、导出库只含元数据（媒体文件导入侧还原未做）。

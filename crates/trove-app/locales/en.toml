@@ -31,6 +31,8 @@ smart = "Smart"
 
 [explorer]
 name_placeholder = "Name"
+move_failed = "Move failed: %{error}"
+drag_collection = "Collection"
 add_collection = "Add collection"
 new_collection_inside = "New collection inside"
 rename = "Rename"
@@ -198,6 +200,7 @@ lang_zh = "简体中文"
 
 [notice]
 import_started = "Importing %{count} files…"
+import_running = "Importing… (%{done}/%{total})"
 import_done = "Import finished: %{imported} files added"
 import_done_skipped = "Import finished: %{imported} added, %{skipped} skipped"
 

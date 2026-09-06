@@ -30,6 +30,8 @@ smart = "智能收藏夹"
 
 [explorer]
 name_placeholder = "名称"
+move_failed = "移动失败：%{error}"
+drag_collection = "收藏夹"
 add_collection = "新建收藏夹"
 new_collection_inside = "在其中新建收藏夹"
 rename = "重命名"
@@ -195,6 +197,7 @@ lang_zh = "简体中文"
 
 [notice]
 import_started = "正在导入 %{count} 个文件…"
+import_running = "正在导入…（%{done}/%{total}）"
 import_done = "导入完成：已添加 %{imported} 个文件"
 import_done_skipped = "导入完成：%{imported} 个已导入，%{skipped} 个跳过"
 
