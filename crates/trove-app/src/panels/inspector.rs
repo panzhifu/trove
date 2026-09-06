@@ -118,7 +118,7 @@ impl InspectorPanel {
         controller.update(cx, |ctl, cx| {
             let conn = ctl.library.store().conn();
             if let Ok(tag) = tags::ensure_named(conn, &name) {
-                let _ = tags::add_to_asset(conn, asset_id, tag.id);
+                let _ = ctl.library.tag_assets(&[asset_id], tag.id, true);
             }
             ctl.generation += 1;
             cx.notify();
@@ -157,7 +157,7 @@ impl InspectorPanel {
                 }
             }
             if failed.is_none() {
-                let _ = tags::set_for_asset(conn, asset_id, &ids);
+                let _ = ctl.library.set_asset_tags(asset_id, &ids);
             } else if let Some(e) = failed.clone() {
                 ctl.notice = Some(
                     rust_i18n::t!("inspector.replace_tags_failed", error = e).to_string(),
@@ -219,7 +219,7 @@ impl InspectorPanel {
                 cx.notify();
                 return;
             }
-            if let Err(e) = assets::update(conn, asset_id, &patch) {
+            if let Err(e) = ctl.library.patch_asset(asset_id, &patch) {
                 ctl.notice = Some(
                     rust_i18n::t!("inspector.update_failed", error = e.to_string()).to_string(),
                 );
@@ -449,8 +449,7 @@ impl Render for InspectorPanel {
                                     .label("×")
                                     .on_click(move |_, _, cx| {
                                         controller.update(cx, move |ctl, cx| {
-                                            let conn = ctl.library.store().conn();
-                                            let _ = tags::remove_from_asset(conn, asset_id, id);
+                                            let _ = ctl.library.tag_assets(&[asset_id], id, false);
                                             ctl.generation += 1;
                                             cx.notify();
                                         });
@@ -566,12 +565,11 @@ impl InspectorPanel {
                     .on_click(move |_, _, cx| {
                         controller.update(cx, |ctl, cx| {
                             let Some(id) = ctl.primary() else { return };
-                            let conn = ctl.library.store().conn();
                             let patch = AssetPatch {
                                 kind: Some(kind),
                                 ..Default::default()
                             };
-                            let _ = assets::update(conn, id, &patch);
+                            let _ = ctl.library.patch_asset(id, &patch);
                             ctl.generation += 1;
                             cx.notify();
                         });
@@ -685,7 +683,6 @@ impl InspectorPanel {
                 .on_click(move |_, _, cx| {
                     controller.update(cx, |ctl, cx| {
                         let Some(id) = ctl.primary() else { return };
-                        let conn = ctl.library.store().conn();
                         let value = if filled && current == star {
                             None
                         } else {
@@ -695,7 +692,7 @@ impl InspectorPanel {
                             rating: Some(value),
                             ..Default::default()
                         };
-                        let _ = assets::update(conn, id, &patch);
+                        let _ = ctl.library.patch_asset(id, &patch);
                         ctl.generation += 1;
                         cx.notify();
                     });

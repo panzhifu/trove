@@ -10,5 +10,6 @@ pub mod maintenance;
 pub mod media;
 pub mod model;
 pub mod store;
+pub mod undo;
 
 pub use error::{Error, Result};

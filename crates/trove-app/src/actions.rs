@@ -17,6 +17,8 @@ gpui_kit::actions!(
         SelectAll,
         ClearSelection,
         TrashSelected,
+        Undo,
+        Redo,
         // -- View menu -----------------------------------------------------
         ShowAllAssets,
         ShowTrash,
