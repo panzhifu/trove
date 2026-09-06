@@ -202,6 +202,7 @@ fn kind_sql(kind: AssetKind) -> &'static str {
         AssetKind::Audio => "audio",
         AssetKind::Document => "document",
         AssetKind::Archive => "archive",
+        AssetKind::Font => "font",
         AssetKind::Other => "other",
     }
 }

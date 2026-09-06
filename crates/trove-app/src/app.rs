@@ -82,7 +82,6 @@ impl AppView {
         });
         skin.set_ellipsis_menu(false, cx);
 
-
         Self { controller, dock, title_bar }
     }
 

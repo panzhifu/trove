@@ -43,6 +43,9 @@ pub struct InspectorPanel {
     /// The asset the edit inputs currently hold. Refills happen only when
     /// the selection changes.
     editing_id: Option<Uuid>,
+    /// Font families already registered with the text system for previews
+    /// (registration is process-global; skip repeats).
+    font_previews: std::collections::HashSet<String>,
 }
 
 impl InspectorPanel {
@@ -72,6 +75,7 @@ impl InspectorPanel {
             description_input,
             source_input,
             editing_id: None,
+            font_previews: std::collections::HashSet::new(),
         };
         observe_controller(cx, &this.controller);
 
@@ -301,6 +305,18 @@ impl Render for InspectorPanel {
         let rating = asset.rating;
         let added = asset.created_at.format("%Y-%m-%d %H:%M").to_string();
         let mime = asset.mime.clone();
+        let (font_family, font_style, font_weight, font_glyphs, font_italic) = (
+            asset.extra.get("font_family").and_then(|v| v.as_str()).map(str::to_string),
+            asset.extra.get("font_style").and_then(|v| v.as_str()).map(str::to_string),
+            asset.extra.get("font_weight").and_then(|v| v.as_u64()),
+            asset.extra.get("font_glyphs").and_then(|v| v.as_u64()),
+            asset.extra.get("font_italic").and_then(|v| v.as_bool()).unwrap_or(false),
+        );
+        let font_blob = if kind == AssetKind::Font {
+            asset.rel_path.as_ref().map(|rel| ctl.library.root().join(rel))
+        } else {
+            None
+        };
 
         // Re-populate the edit inputs when the selection changed.
         self.sync_editors(asset_id, window, cx);
@@ -409,9 +425,24 @@ impl Render for InspectorPanel {
                         })),
                 )
             })
+            .when(kind == AssetKind::Font, |this| {
+                this.child(separator_label(cx, rust_i18n::t!("inspector.font").to_string()))
+                    .child(self.font_section(
+                        cx,
+                        font_family,
+                        font_style,
+                        font_weight,
+                        font_glyphs,
+                        font_italic,
+                        font_blob.as_deref(),
+                    ))
+            })
             .child(separator_label(cx, rust_i18n::t!("inspector.properties").to_string()))
             .child(property_row(cx, "inspector.mime_type", mime))
             .child(property_row(cx, "inspector.size", human_bytes(asset.size_bytes)))
+            .when_some(asset.duration_ms, |this, ms| {
+                this.child(property_row(cx, "inspector.duration", format_duration(ms)))
+            })
             .child(property_row(cx, "inspector.dimensions", dims))
             .child(property_row(cx, "inspector.added", added))
             .child(property_row(cx, "inspector.sha256", hash));
@@ -439,6 +470,7 @@ impl InspectorPanel {
                 AssetKind::Audio => "asset.kind.audio",
                 AssetKind::Document => "asset.kind.document",
                 AssetKind::Archive => "asset.kind.archive",
+                AssetKind::Font => "asset.kind.font",
                 AssetKind::Other => "asset.kind.other",
             }
         }
@@ -475,6 +507,94 @@ impl InspectorPanel {
         )
     }
 
+    /// Font facts + a live specimen. The blob is registered with the text
+    /// system once per family (registration is process-global); until that
+    /// succeeds the section shows only the metadata lines.
+    #[allow(clippy::too_many_arguments)]
+    fn font_section(
+        &mut self,
+        cx: &mut Context<Self>,
+        family: Option<String>,
+        style: Option<String>,
+        weight: Option<u64>,
+        glyphs: Option<u64>,
+        italic: bool,
+        blob: Option<&std::path::Path>,
+    ) -> Div {
+        let registered = family
+            .as_ref()
+            .is_some_and(|f| self.ensure_font_registered(f, blob, cx));
+
+        let mut section = v_flex().gap_1();
+        if let (Some(family), true) = (&family, registered) {
+            section = section.child(
+                div()
+                    .font_family(family.clone())
+                    .text_xl()
+                    .text_color(cx.theme().foreground)
+                    .child("AaBbYyZz 允 123"),
+            );
+        }
+        if let Some(family) = &family {
+            section = section.child(
+                div()
+                    .text_sm()
+                    .truncate()
+                    .text_color(cx.theme().foreground)
+                    .child(family.clone()),
+            );
+        }
+        let mut meta: Vec<String> = Vec::new();
+        if let Some(style) = &style {
+            meta.push(style.clone());
+        }
+        if let Some(weight) = weight {
+            meta.push(weight.to_string());
+        }
+        if italic {
+            meta.push(rust_i18n::t!("inspector.italic").to_string());
+        }
+        if let Some(glyphs) = glyphs {
+            meta.push(format!("{glyphs} glyphs"));
+        }
+        if !meta.is_empty() {
+            section = section.child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(meta.join(" · ")),
+            );
+        }
+        section
+    }
+
+    /// Register the font bytes behind `family` with the process text system
+    /// so `.font_family(family)` resolves to the imported face. Best-effort.
+    fn ensure_font_registered(
+        &mut self,
+        family: &str,
+        blob: Option<&std::path::Path>,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if self.font_previews.contains(family) {
+            return true;
+        }
+        let Some(path) = blob else {
+            return false;
+        };
+        let Ok(bytes) = std::fs::read(path) else {
+            return false;
+        };
+        let ok = cx
+            .text_system()
+            .add_fonts(vec![std::borrow::Cow::Owned(bytes)])
+            .is_ok();
+        if ok {
+            self.font_previews.insert(family.to_string());
+        }
+        ok
+    }
+
     /// Five star toggles; clicking the current top star clears the rating.
     fn rating_row(&self, rating: Option<u8>) -> Div {
         let current = rating.unwrap_or(0);
@@ -508,6 +628,21 @@ impl InspectorPanel {
                     });
                 })
         }))
+    }
+}
+
+/// `90500` → `1:30.5`, `3725000` → `1:02:05`.
+fn format_duration(ms: u64) -> String {
+    let secs = (ms / 1000).max(1);
+    let h = secs / 3600;
+    let m = (secs % 3600) / 60;
+    let s = secs % 60;
+    if h > 0 {
+        format!("{h}:{m:02}:{s:02}")
+    } else if ms % 1000 != 0 {
+        format!("{m}:{s:02}.{:.2}", (ms % 1000) / 10)
+    } else {
+        format!("{m}:{s:02}")
     }
 }
 

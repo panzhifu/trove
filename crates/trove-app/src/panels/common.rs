@@ -11,8 +11,18 @@ use trove_core::store::assets;
 
 use crate::state::LibraryController;
 
-pub(crate) fn kind_icon(_kind: AssetKind) -> IconName {
-    IconName::FileText
+/// Distinct icon per asset kind (image cells only fall back to this when no
+/// thumbnail was generated). Icon names resolve to the gpui-kit asset set.
+pub(crate) fn kind_icon(kind: AssetKind) -> IconName {
+    match kind {
+        AssetKind::Image => IconName::Frame,
+        AssetKind::Video => IconName::Play,
+        AssetKind::Audio => IconName::Pause,
+        AssetKind::Document => IconName::FileText,
+        AssetKind::Archive => IconName::File,
+        AssetKind::Font => IconName::CaseSensitive,
+        AssetKind::Other => IconName::File,
+    }
 }
 
 pub(crate) fn display_name(asset: &Asset) -> String {

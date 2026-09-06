@@ -48,6 +48,7 @@ pub enum AssetKind {
     Audio,
     Document,
     Archive,
+    Font,
     Other,
 }
 
