@@ -41,7 +41,9 @@ pub mod common;
 mod explorer;
 mod inspector;
 mod tags_panel;
-mod workspace;
+pub mod workspace;
+mod workspace_context_menu;
+mod workspace_search;
 
 pub use explorer::ExplorerPanel;
 pub use inspector::InspectorPanel;

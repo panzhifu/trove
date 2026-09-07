@@ -365,7 +365,7 @@ mod tests {
         // Same histogram → 1.0.
         hist1.total = 1.0;
         hist1.buckets[0] = 1.0;
-        let mut hist3 = hist1.clone();
+        let hist3 = hist1.clone();
         assert!(hist1.cosine_similarity(&hist3) > 0.99);
     }
 

@@ -26,13 +26,15 @@ pub struct AppConfig {
     /// histogram, no model needed) or "semantic" (CLIP embeddings).
     #[serde(default)]
     pub search_mode: Option<String>,
-    /// Directory holding the CLIP ONNX models (`clip-image.onnx` +
-    /// `clip-text.onnx`). Used only when `search_mode` is `semantic`.
+    /// Path to the single CLIP ONNX model file that exposes both the image
+    /// encoder (`pixel_values` → `image_embeds`) and the text encoder
+    /// (`input_ids` → `text_embeds`). Used only when `search_mode` is
+    /// `semantic`. Defaults to `models/model.onnx` under the config dir.
     #[serde(default)]
-    pub clip_model_dir: Option<PathBuf>,
+    pub clip_model_path: Option<PathBuf>,
     /// Path to the ONNX Runtime dynamic library (`libonnxruntime.so` /
     /// `.dylib` / `.dll`). When `None`, the engine falls back to
-    /// `ORT_DYLIB_PATH` env var then the executable directory.
+    /// `ORT_DYLIB_PATH` env var then the executable / config directory.
     #[serde(default)]
     pub ort_lib_path: Option<PathBuf>,
 }
@@ -94,11 +96,20 @@ impl AppConfig {
         self.search_mode.as_deref().unwrap_or("visual").to_string()
     }
 
-    /// Directory that should hold the CLIP image/text ONNX models.
+    /// Directory that should hold the CLIP model file.
     pub fn clip_model_dir(&self) -> Option<PathBuf> {
-        self.clip_model_dir
-            .clone()
+        self.clip_model_path
+            .as_ref()
+            .and_then(|p| p.parent())
+            .map(|p| p.to_path_buf())
             .or_else(|| Self::config_dir().map(|d| d.join("models")))
+    }
+
+    /// Full path to the single CLIP ONNX model file.
+    pub fn clip_model_path(&self) -> Option<PathBuf> {
+        self.clip_model_path.clone().or_else(|| {
+            Self::config_dir().map(|d| d.join("models").join("model.onnx"))
+        })
     }
 
     /// Effective path to the ONNX Runtime library: explicit config wins,

@@ -12,7 +12,7 @@ gpui-kit = "0.6"
 
 # ML inference (CLIP semantic search)
 ort = { version = "2.0.0-rc.13", default-features = false, features = ["load-dynamic", "ndarray", "std", "api-27"] }
-ndarray = "0.15"
+ndarray = "0.17"
 rayon = "1"
 
 # Serialization

@@ -678,13 +678,13 @@ fn search_page(controller: &Entity<LibraryController>) -> SettingPage {
                 )
                 .item(
                     SettingItem::new(
-                        rust_i18n::t!("settings.clip_model_dir").to_string(),
+                        rust_i18n::t!("settings.clip_model_file").to_string(),
                         SettingField::render({
                             let controller = controller.clone();
-                            move |_, _, cx| clip_model_dir_row(&controller, cx)
+                            move |_, _, cx| clip_model_file_row(&controller, cx)
                         }),
                     )
-                    .description(rust_i18n::t!("settings.clip_model_dir_desc").to_string()),
+                    .description(rust_i18n::t!("settings.clip_model_file_desc").to_string()),
                 )
                 .item(
                     SettingItem::new(
@@ -725,10 +725,10 @@ fn search_mode_options() -> Vec<(SharedString, SharedString)> {
 
 /// Model-directory row: shows the resolved path and a Browse button that
 /// opens a folder picker and saves the choice.
-fn clip_model_dir_row(controller: &Entity<LibraryController>, cx: &mut App) -> Div {
+fn clip_model_file_row(controller: &Entity<LibraryController>, cx: &mut App) -> Div {
     let config = AppConfig::load();
-    let dir = config
-        .clip_model_dir()
+    let path = config
+        .clip_model_path()
         .map(|p| p.display().to_string())
         .unwrap_or_default();
     let ctl = controller.clone();
@@ -743,28 +743,28 @@ fn clip_model_dir_row(controller: &Entity<LibraryController>, cx: &mut App) -> D
                 .truncate()
                 .text_sm()
                 .text_color(cx.theme().muted_foreground)
-                .child(dir),
+                .child(path),
         )
         .child(
-            Button::new("browse-model-dir")
+            Button::new("browse-model-file")
                 .outline()
                 .small()
                 .label(rust_i18n::t!("settings.browse").to_string())
                 .on_click(move |_, _, cx| {
                     let ctl = ctl.clone();
-                    prompt_model_dir(&ctl, cx);
+                    prompt_model_file(&ctl, cx);
                 }),
         )
 }
 
-/// Pick a directory via the system dialog and persist it.
-fn prompt_model_dir(controller: &Entity<LibraryController>, cx: &mut App) {
+/// Pick the single CLIP ONNX model file via the system dialog and persist it.
+fn prompt_model_file(controller: &Entity<LibraryController>, cx: &mut App) {
     let rx = cx.prompt_for_paths(PathPromptOptions {
-        files: false,
-        directories: true,
+        files: true,
+        directories: false,
         multiple: false,
         prompt: Some(
-            rust_i18n::t!("settings.select_model_dir")
+            rust_i18n::t!("settings.select_model_file")
                 .into_owned()
                 .into(),
         ),
@@ -778,17 +778,14 @@ fn prompt_model_dir(controller: &Entity<LibraryController>, cx: &mut App) {
                 let path = path.to_path_buf();
                 let _ = cx.update(|cx| {
                     let mut config = AppConfig::load();
-                    config.clip_model_dir = Some(path.clone());
-                    if config.save().is_ok() {
-                        // Try to (re)initialise the engine with the new dir.
-                        let image = path.join("clip-image.onnx");
-                        let text = path.join("clip-text.onnx");
-                        let _ = trove_core::media::clip::configure(&image, &text);
+                    config.clip_model_path = Some(path.clone());
+                    let res = config.save();
+                    if res.is_ok() {
+                        // (Re)initialise the engine with the new model file.
+                        let _ = trove_core::media::clip::configure(&path);
                         cx.refresh_windows();
                     }
-                    // Surface the outcome on the controller so the status row
-                    // and any open views refresh.
-                    let _ = controller.update(cx, |ctl, cx| cx.notify());
+                    let _ = controller.update(cx, |_, cx| cx.notify());
                 });
             }
         }
