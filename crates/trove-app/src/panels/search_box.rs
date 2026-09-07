@@ -17,7 +17,7 @@ use gpui_kit::component::{ActiveTheme, IconName};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
-use crate::state::LibraryController;
+use crate::library::LibraryController;
 
 /// Floating asset search, rendered in the workspace title bar.
 pub struct SearchBox {

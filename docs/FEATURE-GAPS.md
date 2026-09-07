@@ -1,0 +1,171 @@
+# Trove 功能差距分析（对标同类软件）
+
+> 调研日期：2026-09-08 ｜ 适用版本：Trove 0.2.1
+>
+> 本文取代已删除的 `FRONTEND-GAPS.md`（前后端对照清单）。它回答一个问题：
+> **与市面上的素材管理软件相比，Trove 还缺什么。**
+>
+> 优先级定义：
+> - **P0** 核心体验缺口，用户第一天就会撞上；本次迭代实现
+> - **P1** 高价值，下一两个迭代应补齐
+> - **P2** 有明显需求但工程量大，进路线图
+> - **P3** 长尾/存疑，暂不规划
+
+---
+
+## 一、调研对象
+
+| 软件 | 类型 | 定位 | 对 Trove 的参考价值 |
+|---|---|---|---|
+| [Eagle](https://en.eagle.cool/) | 商业（付费） | 设计师素材管理事实标准，AI 深度集成 | ★★★★★ 直接竞品 |
+| [Billfish](https://www.billfish.cn/) | 商业（个人免费） | Eagle 的免费替代，浏览器采集 1000+ 网站 | ★★★★★ 直接竞品 |
+| [Pixcall](https://pixcall.com/) | 商业 | 素材库同步与团队协作 | ★★★☆☆ 直接竞品 |
+| [TagStudio](https://github.com/TagStudioDev/TagStudio) | 开源 | 不复制文件的"元数据层"（Obsidian 式） | ★★★★☆ 文件系统哲学 |
+| [Allusion](https://github.com/allusion-app/Allusion) | 开源 | 参考图管理，Watched Folders + Web Clipper | ★★★★☆ 直接竞品 |
+| [digiKam](https://www.digikam.org/) | 开源 | 照片管理全能王（人脸/地图/时间线/批处理） | ★★★☆☆ 照片向功能 |
+| [XnView MP](https://www.xnview.com/en/xnviewmp/) | 免费（个人） | 500+ 格式浏览、批量转换 | ★★★☆☆ 格式与批处理 |
+| [Adobe Bridge](https://helpx.adobe.com/bridge.html) | 商业 | 专业 DAM，元数据模板/色标/输出 | ★★★☆☆ 元数据工作流 |
+| [IMatch](https://www.photools.com/) | 商业 | DAM 元数据标杆（受控词表/写回/版本） | ★★☆☆☆ 理念借鉴 |
+| [ACDSee](https://www.acdsee.com/) | 商业 | 双体系组织 + AI 人脸 | ★★☆☆☆ 理念借鉴 |
+| [PhotoPrism](https://photoprism.app/) / [Immich](https://immich.app/) | 开源自托管 | 本地 AI 自动分类/人脸/时刻/地图 | ★★★☆☆ AI 路线参考 |
+
+---
+
+## 二、Trove 现有能力（截至 0.2.1）
+
+内容寻址去重导入（SHA-256）、集合树（多对多、拖拽改父级）、智能集合（JSON 规则树：kind/评分/收藏/标签/文本/扩展名/大小/主色）、标签（大小写不敏感、颜色）、收藏、1–5 评分、FTS 全文搜索（标题/描述/标签名）、视觉搜索（pHash + 颜色直方图 + 按颜色）、CLIP 语义搜索（英文 ViT-B/32）、回收站（还原/彻底删除/孤儿清理）、多选与浮动工具栏、拖拽导入与打标、Inspector 行内编辑、网格/列表视图与排序、撤销/重做、维护工具（缩略图重建/索引重建/孤儿清理）、库热切换、元数据 JSON 导出、中英双语、字体元数据与实况预览、EXIF/音频标签/MP4 挖掘、系统 ffmpeg 视频海报。
+
+**一句话总结：组织与检索内核已接近同类产品水准，缺口集中在「收集入口、文件格式、批处理出口、库安全、AI 自动化」五条线上。**
+
+---
+
+## 三、功能差距总表
+
+### 3.1 导入与收集 —— 最大缺口线
+
+| # | 功能 | 现状 | 竞品参照 | 优先级 |
+|---|---|---|---|---|
+| 1 | **文件夹监听自动导入** | 无 | Eagle/Billfish/Allusion Watched Folders | **P0（本次实现）** |
+| 2 | **剪贴板粘贴导入**（截图直接入库） | 无 | Eagle/Billfish/Allusion | **P0（本次实现）** |
+| 3 | **重复导入检测**（同内容已入库时提示：跳过/仍导入/引用已有） | 静默跳过，无提示 | Eagle 重复检测、XnView 查重器 | **P0（本次实现：重复文件查找器）** |
+| 4 | 浏览器扩展 / 网页采集 | 无 | Eagle 扩展（批量/自动识别高清）、Billfish 1000+ 站点、Allusion Web Clipper | **P1**（需扩展工程，可先做本地 HTTP 服务器接收） |
+| 5 | URL 导入（粘贴链接抓取文件） | 无 | Eagle/Billfish | P1 |
+| 6 | 链接原文件（Linked origin，文件留原地不复制） | 模型预留 `Origin::Linked`，未实现 | TagStudio/Allusion 核心卖点 | P1（大工程：缺文件重连、移动跟随） |
+| 7 | 移动/删除文件重连（Unlinked Entries） | 无 | TagStudio Search & Relink | P1（与 #6 配套） |
+| 8 | 相机/手机/扫描仪导入 | 无 | digiKam | P3 |
+| 9 | 导入预设（自动打标签/目标集合） | 无 | Eagle/Billfish 导入规则 | P2 |
+| 10 | 压缩包解包导入 | 无 | Eagle | P3 |
+
+### 3.2 格式与预览
+
+| # | 功能 | 现状 | 竞品参照 | 优先级 |
+|---|---|---|---|---|
+| 1 | RAW（CR2/NEF/ARW/DNG）、HEIC/HEIF、AVIF、JPEG-XL 缩略图 | 无 | XnView 500+、digiKam 全流程 | **P1** |
+| 2 | SVG/PSD/AI/EPS/CDR 等设计格式预览 | SVG 走浏览器能力未做，PSD 系列无 | Eagle/Billfish 核心格式 | **P1** |
+| 3 | 视频播放/逐帧/音频波形预览 | 仅静态海报 | Eagle/Billfish | P2 |
+| 4 | GIF/WebP/APNG 动图播放 | 静态首帧 | TagStudio/XnView | P2 |
+| 5 | 3D 模型查看（OBJ/FBX/GLB） | 无 | Eagle 4 内置查看器 | P3 |
+| 6 | 字体网格实况预览（用样张文本渲染单元格） | Inspector 内预览，网格仍是图标 | Eagle/Billfish | P2 |
+| 7 | 悬停放大/快速查看（空格预览增强） | Enter 大图弹窗 | XnView 胶片条 | P2 |
+
+### 3.3 浏览与检索
+
+| # | 功能 | 现状 | 竞品参照 | 优先级 |
+|---|---|---|---|---|
+| 1 | **资产色标**（Lightroom/Bridge 式彩色标签，可筛选） | 无（只有标签有色） | Bridge/ACDSee/digiKam 标配 | **P0（本次实现）** |
+| 2 | 日历/时间线视图（按拍摄/导入日期） | 无 | digiKam/ACDSee/PhotoPrism | P2 |
+| 3 | 对比视图（Light Table，2–4 图并排挑图） | 无 | digiKam/XnView 4 图对比 | P2 |
+| 4 | 地图/地理位置（EXIF GPS 反查地名） | 无 | digiKam/PhotoPrism/Immich | P3 |
+| 5 | 时刻/回忆自动聚合（按日期地点分组） | 无 | PhotoPrism Moments/Immich | P3 |
+| 6 | 文件夹面板（按来源目录浏览） | 无 | Eagle/Billfish/TagStudio | P1 |
+| 7 | 智能集合支持更多字段（捕获日期、宽高比、方向） | 已有 8 种字段 | Bridge/IMatch | P2 |
+| 8 | 搜索语法（path:/filetype: 等操作符） | 纯 FTS | TagStudio | P3 |
+| 9 | 最近查看历史 | 无 | Eagle | P3 |
+
+### 3.4 标签与元数据
+
+| # | 功能 | 现状 | 竞品参照 | 优先级 |
+|---|---|---|---|---|
+| 1 | **层级标签**（父子继承，搜父含子） | 扁平 | Eagle/Billfish/digiKam/Bridge/ACDSee 全部层级 | **P1** |
+| 2 | 标签同义词/别名 + 输入自动补全 | 无 | IMatch 受控词表、TagStudio 别名 | P2 |
+| 3 | 元数据模板（保存字段组，批量追加/替换应用） | 无 | Bridge/IMatch | P2 |
+| 4 | 多选时元数据差异高亮 | 无 | Bridge | P3 |
+| 5 | 版本管理（派生文件元数据自动传播、堆栈） | 无 | IMatch Smart Versioning | P3 |
+| 6 | XMP/IPTC 元数据写回文件或 sidecar | 无（仅 JSON 导出） | IMatch/ACDSee/digiKam/XnView | P2 |
+
+### 3.5 AI 自动化
+
+| # | 功能 | 现状 | 竞品参照 | 优先级 |
+|---|---|---|---|---|
+| 1 | **图片内文字 OCR 并入搜索** | 无 | Eagle/Billfish/Immich | **P1**（本地 ONNX，与 CLIP 同栈） |
+| 2 | 人脸检测 + 识别聚类（People） | 无 | digiKam/ACDSee/PhotoPrism/Immich/IMatch 全部本地模型 | P2（工程量大） |
+| 3 | 物体/场景自动打标（本地 TF/ONNX 分类） | 无 | PhotoPrism/Immich | P2 |
+| 4 | CLIP 多语言模型支持 | 英文专用 | Immich 多语种 | P2 |
+| 5 | 相似图搜索结果合并进网格（Eagle Similar Images 插件式） | 有（视觉搜索面板） | — | — |
+| 6 | AI 对话式整理（自然语言找图/打标） | 无 | Eagle 4 AI | P3 |
+
+> AI 路线共识：**调研的所有产品均用本地模型、隐私优先**（Immich 甚至不落盘人脸裁剪图）。Trove 已有 ONNX Runtime + CLIP 栈，OCR/分类/人脸可复用同一套推理基建，无需云服务。
+
+### 3.6 编辑与批处理 —— 第二大缺口线
+
+| # | 功能 | 现状 | 竞品参照 | 优先级 |
+|---|---|---|---|---|
+| 1 | **批量重命名**（模板 + 序号） | 无 | 全部竞品标配 | **P1** |
+| 2 | 批量格式转换/压缩（导出向） | 无 | XnView/digiKam BQM | P2 |
+| 3 | 旋转/翻转/裁剪、JPEG 无损变换 | 无 | digiKam/XnView | P2 |
+| 4 | 图片标注（箭头/框选/涂鸦，非破坏图层） | 无 | Eagle 标注/Billfish | P3 |
+| 5 | 水印（批量文字/图片水印） | 无 | Bridge/XnView | P3 |
+| 6 | 拍摄时间批量校正（时区/偏移） | 无 | digiKam | P3 |
+
+### 3.7 导出与交付
+
+| # | 功能 | 现状 | 竞品参照 | 优先级 |
+|---|---|---|---|---|
+| 1 | **媒体文件+元数据整库导出/再导入** | 仅元数据 JSON，导入侧还原未做 | 全部竞品 | **P1** |
+| 2 | Contact Sheet / PDF 图库输出 | 无 | Bridge Output/XnView | P2 |
+| 3 | 导出预设（尺寸/格式/命名模板） | 无 | Eagle/Billfish | P2 |
+| 4 | 复制到剪贴板（图片数据） | 无 | Eagle | P2 |
+| 5 | 在文件管理器中显示 / 复制原始路径 | 无 | 全部竞品 | **P0（本次顺带实现，见 3.8 #5）** |
+
+### 3.8 库管理与安全
+
+| # | 功能 | 现状 | 竞品参照 | 优先级 |
+|---|---|---|---|---|
+| 1 | **自动备份**（定时快照 library.db，滚动保留） | 无（库损坏即灾难） | TagStudio Backups/Eagle 备份 | **P0（本次实现）** |
+| 2 | **多库/最近库列表** | 单库路径热切换，无历史 | Eagle 多库/Billfish 资源库 | **P0（本次实现）** |
+| 3 | 库统计面板（类型分布/容量/标签数） | 无 | Eagle/Billfish | **P0（本次实现）** |
+| 4 | 在文件管理器中显示资产/库 | 无 | 全部竞品 | **P0（本次实现）** |
+| 5 | 完整性校验（SHA 校验损坏检测） | 无 | IMatch | P2 |
+| 6 | 云同步（WebDAV/S3）与团队共享库 | 无 | Pixcall/Eagle Team/Billfish 团队版 | P3 |
+| 7 | 库加密/锁定视图 | 无 | Pixcall | P3 |
+
+### 3.9 界面与平台
+
+| # | 功能 | 现状 | 竞品参照 | 优先级 |
+|---|---|---|---|---|
+| 1 | 亮色主题 | 仅暗色 | 全部竞品 | P2 |
+| 2 | 插件/脚本系统 | 无 | Eagle 插件生态（重复查找/相似图均来自插件） | P3 |
+| 3 | 命令行接口（trove-cli 导入/查询） | 无 | — | P3 |
+| 4 | Figma/PS/AI 面板集成 | 无 | Eagle/Billfish/MuseDAM | P3 |
+| 5 | 多窗口 | 单窗口 | Eagle | P3 |
+
+---
+
+## 四、本次实现（P0 项）
+
+| 功能 | 说明 |
+|---|---|
+| 重复文件查找器 | 按 SHA-256 分组列出库内重复资产，支持每组"保留一份、其余入回收站"（File ▸ 查找重复文件…） |
+| 资产色标 | `color_label` 列（红/橙/黄/绿/蓝/紫 6 色），Inspector 取色、右键菜单设置、智能集合新字段 `color_label` 可筛选 |
+| 自动备份 | 打开库时若最近 24h 内无备份则快照 `library.db` 到 `<root>/backups/`，滚动保留 10 份；维护页可手动备份并打开备份目录 |
+| 最近库列表 | Settings ▸ 通用列出最近打开的库，一键热切换 |
+| 剪贴板导入 | Edit ▸ 粘贴导入：剪贴板图片直接入库；URL 文本导入进路线图 |
+| 文件夹监听 | Settings ▸ 通用添加监视文件夹，后台扫描新增文件自动导入 |
+| 库统计 | Settings ▸ 通用显示各类型数量/总容量/标签与集合数 |
+| 文件管理器集成 | 右键/Inspector「在文件管理器中显示」资产文件 |
+
+## 五、路线图建议
+
+- **下一迭代（P1）**：RAW/HEIC/SVG/PSD 缩略图 → OCR（复用 ONNX 栈）→ 层级标签 → 批量重命名 → 文件夹面板 → 媒体+元数据整库导出还原 → 本地 HTTP 采集服务（为浏览器扩展铺路）
+- **中期（P2）**：时间线/对比视图、视频/动图预览、批量转换、XMP 写回、物体自动打标、人脸聚类、亮色主题、元数据模板
+- **远期（P3）**：地图、3D/标注/水印、插件系统、协作同步、CLI

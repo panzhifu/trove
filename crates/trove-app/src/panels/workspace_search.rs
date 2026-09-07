@@ -9,7 +9,7 @@ use gpui_kit::component::{ActiveTheme, Icon, IconName};
 use gpui_kit::*;
 use uuid::Uuid;
 
-use crate::state::LibraryController;
+use crate::library::LibraryController;
 
 /// One search result row (unified across visual + semantic backends).
 pub(crate) struct SearchResult {

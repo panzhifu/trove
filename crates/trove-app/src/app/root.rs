@@ -18,11 +18,11 @@ use gpui_kit::prelude::FluentBuilder as _;
 // Render, IntoElement, ExternalPaths, …) plus gpui-kit's styling extensions.
 use gpui_kit::*;
 
-use crate::actions::*;
-use crate::jobs;
+use crate::app::actions::*;
+use crate::library::jobs;
 use crate::panels::{ExplorerPanel, InspectorPanel, TagsPanel, WorkspacePanel};
-use crate::state::{ImportPhase, LibraryController};
-use crate::title_bar::TitleBarView;
+use crate::library::{ImportPhase, LibraryController};
+use crate::app::title_bar::TitleBarView;
 use trove_core::config::AppConfig;
 use trove_core::library::Library;
 
@@ -266,7 +266,7 @@ impl Render for AppView {
                 this.prompt_export(window, cx);
             }))
             .on_action(cx.listener(|this, _: &OpenSettings, window, cx| {
-                crate::settings::SettingsDialog::open(window, cx, this.controller.clone());
+                crate::dialogs::settings::SettingsDialog::open(window, cx, this.controller.clone());
             }))
             .on_action(cx.listener(|this, _: &ShowAllAssets, _, cx| {
                 this.controller

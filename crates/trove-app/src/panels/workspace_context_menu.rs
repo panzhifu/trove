@@ -7,7 +7,7 @@ use gpui_kit::*;
 use uuid::Uuid;
 
 use crate::panels::workspace_search::open_image_search;
-use crate::state::LibraryController;
+use crate::library::LibraryController;
 use trove_core::store::{assets, collections};
 
 /// Build the right-click context menu for an asset cell.

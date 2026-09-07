@@ -23,8 +23,8 @@ use gpui_kit::component::{ActiveTheme, Disableable as _, IconName, Sizable, Wind
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
-use crate::i18n::SUPPORTED;
-use crate::state::LibraryController;
+use crate::app::i18n::SUPPORTED;
+use crate::library::LibraryController;
 use trove_core::config::AppConfig;
 use trove_core::keybindings::{self, KeyBindingConfig};
 
@@ -449,7 +449,7 @@ fn language_page(controller: &Entity<LibraryController>) -> SettingPage {
                             let language = (&*value != SYSTEM_LANGUAGE).then(|| value.to_string());
                             // The locale switch applies regardless; persist
                             // failures (rare: full disk, ...) surface here.
-                            if let Err(e) = crate::i18n::set_language(language) {
+                            if let Err(e) = crate::app::i18n::set_language(language) {
                                 controller.update(cx, |ctl, cx| {
                                     ctl.notice = Some(
                                         rust_i18n::t!(

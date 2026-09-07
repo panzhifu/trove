@@ -13,7 +13,7 @@ use gpui_kit::*;
 
 use trove_core::media::import;
 
-use crate::state::LibraryController;
+use crate::library::LibraryController;
 
 /// Embed freshly imported images, one per main-thread turn with a short
 /// yield in between, so the UI stays responsive. `Store` is thread-confined

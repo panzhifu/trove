@@ -10,7 +10,7 @@ use gpui_kit::component::TitleBar;
 use gpui_kit::component::menu::AppMenuBar;
 use gpui_kit::*;
 
-use crate::state::LibraryController;
+use crate::library::LibraryController;
 
 /// Correct `WindowOptions` for a window whose title bar we draw ourselves.
 ///
