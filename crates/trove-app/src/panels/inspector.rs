@@ -11,7 +11,7 @@ use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::dock::{BasePanel, Panel as DockPanel, PanelControl, PanelEvent};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::scroll::ScrollableElement as _;
-use gpui_kit::component::{ActiveTheme, Disableable as _, Icon, IconName, Sizable};
+use gpui_kit::component::{ActiveTheme, Icon, IconName, Sizable};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
@@ -48,8 +48,6 @@ pub struct InspectorPanel {
     /// Font families already registered with the text system for previews
     /// (registration is process-global; skip repeats).
     font_previews: std::collections::HashSet<String>,
-    /// Preview zoom level (percent). Persisted per-panel.
-    zoom: u32,
 }
 
 impl InspectorPanel {
@@ -82,7 +80,6 @@ impl InspectorPanel {
             source_input,
             editing_id: None,
             font_previews: std::collections::HashSet::new(),
-            zoom: 100,
         };
         observe_controller(cx, &this.controller);
 
@@ -287,58 +284,9 @@ impl DockPanel for InspectorPanel {
         None
     }
 
-    /// Zoom controls pinned to the trailing edge of the title bar.
-    fn title_suffix(&mut self, _: &mut Window, cx: &mut Context<Self>) -> Option<impl IntoElement> {
-        let zoom = self.zoom;
-        let entity = cx.entity();
-        let min_zoom: u32 = 50;
-        let max_zoom: u32 = 300;
-        let step: u32 = 25;
-        Some(
-            h_flex()
-                .items_center()
-                .gap_1()
-                .child(
-                    Button::new("zoom-out-title")
-                        .ghost()
-                        .xsmall()
-                        .disabled(zoom <= min_zoom)
-                        .label("−")
-                        .on_click({
-                            let entity = entity.clone();
-                            move |_, _, cx| {
-                                entity.update(cx, |this, cx| {
-                                    this.zoom = this.zoom.saturating_sub(step).max(min_zoom);
-                                    cx.notify();
-                                });
-                            }
-                        }),
-                )
-                .child(
-                    div()
-                        .text_xs()
-                        .w(px(32.))
-                        .text_center()
-                        .text_color(cx.theme().muted_foreground)
-                        .child(format!("{}%", zoom)),
-                )
-                .child(
-                    Button::new("zoom-in-title")
-                        .ghost()
-                        .xsmall()
-                        .disabled(zoom >= max_zoom)
-                        .label("+")
-                        .on_click({
-                            let entity = entity.clone();
-                            move |_, _, cx| {
-                                entity.update(cx, |this, cx| {
-                                    this.zoom = (this.zoom + step).min(max_zoom);
-                                    cx.notify();
-                                });
-                            }
-                        }),
-                ),
-        )
+    /// No title suffix controls (zoom removed from inspector).
+    fn title_suffix(&mut self, _: &mut Window, _: &mut Context<Self>) -> Option<impl IntoElement> {
+        None::<Div>
     }
 }
 impl EventEmitter<PanelEvent> for InspectorPanel {}
@@ -452,17 +400,23 @@ impl Render for InspectorPanel {
         // Re-populate the edit inputs when the selection changed.
         self.sync_editors(asset_id, window, cx);
 
-        let preview: AnyElement = match thumb_path {
-            Some(path) => {
-                // Fill the full panel width; height scales with zoom.
-                let scale = self.zoom as f32 / 100.0;
-                let base_h = 200.0_f32 * scale;
-                img(path)
-                    .w_full()
-                    .h(px(base_h))
-                    .object_fit(gpui_kit::ObjectFit::Contain)
-                    .into_any_element()
+        // Preview container height based on image aspect ratio.
+        // Falls back to 200px if dimensions are unknown.
+        let preview_height = match (asset.width, asset.height) {
+            (Some(w), Some(h)) if w > 0 && h > 0 => {
+                let aspect = w as f32 / h as f32;
+                // Clamp to reasonable range: min 120px, max 360px.
+                (300.0 / aspect).clamp(120.0, 360.0)
             }
+            _ => 200.0,
+        };
+
+        let preview: AnyElement = match thumb_path {
+            Some(path) => img(path)
+                .w_full()
+                .h(px(preview_height))
+                .object_fit(gpui_kit::ObjectFit::Contain)
+                .into_any_element(),
             None => v_flex()
                 .w_full()
                 .h(px(120.))
@@ -489,14 +443,13 @@ impl Render for InspectorPanel {
             .gap_2()
             .w_full()
             .child(
-                // Preview fills the full panel width.
+                // Preview: dynamic height based on aspect ratio, fills width.
                 div()
                     .w_full()
-                    .max_h(px(240.))
+                    .h(px(preview_height))
                     .flex()
                     .items_center()
                     .justify_center()
-                    .bg(cx.theme().secondary.alpha(0.3))
                     .rounded(cx.theme().radius)
                     .overflow_hidden()
                     .child(preview),
@@ -639,6 +592,7 @@ impl Render for InspectorPanel {
             .size_full()
             .flex_1() // ← 填满 Dock 分配的垂直空间
             .gap_0() // ← 子元素之间无间距，内容紧贴
+            .bg(cx.theme().background) // ← 设置背景色，填满整个面板
             .child(
                 div()
                     .flex_1()
