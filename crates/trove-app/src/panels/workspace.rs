@@ -17,9 +17,8 @@ use gpui_kit::component::Sizable;
 use gpui_kit::component::WindowExt as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::dock::{BasePanel, Panel as DockPanel, PanelControl, PanelEvent};
-use gpui_kit::component::input::{Input, InputEvent, InputState};
+use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::component::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenuItem};
-use gpui_kit::component::popover::Popover;
 use gpui_kit::component::{ActiveTheme, Icon, IconName};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -30,6 +29,8 @@ use gpui_kit::*;
 use gpui_kit::list as list_element;
 use gpui_kit::{Anchor, Bounds, Pixels};
 use gpui_kit::{ListAlignment, ListState};
+
+use super::search_box::SearchBox;
 
 use serde_json::json;
 use trove_core::layout::{
@@ -140,11 +141,8 @@ enum Direction {
 pub struct WorkspacePanel {
     focus_handle: FocusHandle,
     controller: Entity<LibraryController>,
-    search_input: Entity<InputState>,
-    /// Whether the search popover is shown. Shared as `Rc<Cell<bool>>`
-    /// because the ✕ button inside the popover content (which runs with a
-    /// popover context) must be able to close it too.
-    search_open: Rc<CellFlag<bool>>,
+    /// Self-contained floating search (trigger + popover + input).
+    search_box: Entity<SearchBox>,
     /// Measured available width of the scroll container, updated each
     /// prepaint so the layout tracks the real panel width.
     available_width: Entity<Pixels>,
@@ -218,7 +216,6 @@ impl DockPanel for WorkspacePanel {
             } else {
                 rust_i18n::t!("workspace.items_many", count = total).to_string()
             });
-        let input = self.search_input.clone();
         let controller = self.controller.clone();
         Some(
             h_flex()
@@ -226,100 +223,10 @@ impl DockPanel for WorkspacePanel {
                 .gap_1()
                 .child(count_label)
                 .when(!in_trash, |this| {
-                    this.child(filter_controls(&controller, cx)).child({
-                        // Floating search: click the magnifier to open the
-                        // popover; ✕ appears inside once there is text and
-                        // closes the popover when clicked. The open flag is
-                        // shared so the ✕ (running with a popover context)
-                        // can dismiss it.
-                        let search_open = self.search_open.clone();
-                        Popover::new("search-popover")
-                            .anchor(Anchor::TopRight)
-                            .open(search_open.get())
-                            .on_open_change({
-                                let search_open = search_open.clone();
-                                move |open: &bool, _, cx| {
-                                    search_open.set(*open);
-                                    cx.refresh_windows();
-                                }
-                            })
-                            // The pill-shaped search input IS the surface:
-                            // strip the popover's own bg/border/shadow/padding
-                            // (our style is refined after the default) while
-                            // keeping the default overlay-click-to-close.
-                            .bg(gpui::transparent_black())
-                            .border_0()
-                            .shadow_none()
-                            .p_0()
-                            .trigger(
-                                Button::new("search")
-                                    .ghost()
-                                    .xsmall()
-                                    .icon(IconName::Search)
-                                    .when(search_active, |b| b.primary())
-                                    .tooltip(
-                                        rust_i18n::t!("workspace.search").to_string(),
-                                    ),
-                            )
-                            .content({
-                                let input = input.clone();
-                                let ctl = controller.clone();
-                                let search_open = search_open.clone();
-                                move |_, _, cx| {
-                                    let has_text =
-                                        !input.read(cx).value().trim().is_empty();
-                                    h_flex()
-                                        .w(px(260.))
-                                        .h_7()
-                                        .items_center()
-                                        .rounded_full()
-                                        .border_1()
-                                        .border_color(cx.theme().input)
-                                        .bg(cx.theme().background)
-                                        .px_3()
-                                        .gap_1()
-                                        .shadow_sm()
-                                        .child(
-                                            Input::new(&input)
-                                                .appearance(false)
-                                                .small()
-                                                .w_full(),
-                                        )
-                                        .when(has_text, |row| {
-                                            row.child(
-                                                Button::new("clear-search")
-                                                    .ghost()
-                                                    .xsmall()
-                                                    .icon(IconName::Close)
-                                                    .tooltip(rust_i18n::t!(
-                                                        "workspace.clear_search"
-                                                    )
-                                                    .to_string())
-                                                    .on_click({
-                                                        let input = input.clone();
-                                                        let ctl = ctl.clone();
-                                                        let search_open =
-                                                            search_open.clone();
-                                                        move |_, window, cx| {
-                                                            input.update(cx, |state, cx| {
-                                                                state.set_value(
-                                                                    "", window, cx,
-                                                                )
-                                                            });
-                                                            ctl.update(cx, |ctl, _| {
-                                                                ctl.set_search(String::new())
-                                                            });
-                                                            search_open.set(false);
-                                                            cx.refresh_windows();
-                                                        }
-                                                    }),
-                                            )
-                                        })
-                                        .into_any_element()
-                                }
-                            })
-                            .into_any_element()
-                    })
+                    // Self-contained floating search: trigger + popover +
+                    // input + inline ✕ all live in `SearchBox`.
+                    this.child(filter_controls(&controller, cx))
+                        .child(self.search_box.clone())
                 })
                 .when(in_trash, |this| {
                     this.child(
@@ -360,17 +267,13 @@ impl WorkspacePanel {
         cx: &mut Context<Self>,
         controller: Entity<LibraryController>,
     ) -> Self {
-        let search_input = cx.new(|cx| {
-            InputState::new(window, cx)
-                .placeholder(rust_i18n::t!("workspace.search_placeholder").to_string())
-        });
+        let search_box = cx.new(|cx| SearchBox::new(window, cx, controller.clone()));
         let available_width = cx.new(|_| px(0.));
         let list_state = ListState::new(0, ListAlignment::Top, px(LIST_OVERDRAW_PX));
         let this = Self {
             focus_handle: cx.focus_handle(),
             controller,
-            search_input,
-            search_open: Rc::new(CellFlag::new(false)),
+            search_box,
             available_width,
             rows: Rc::new(Vec::new()),
             list_state,
@@ -381,19 +284,6 @@ impl WorkspacePanel {
             debounce_timer: None,
         };
         observe_controller(cx, &this.controller);
-
-        let input = this.search_input.clone();
-        let ctl = this.controller.clone();
-        cx.subscribe_in(&input, window, move |this, _, event, _window, cx| {
-            if matches!(event, InputEvent::PressEnter { .. }) {
-                let text: String = this.search_input.read(cx).value().to_string();
-                ctl.update(cx, |ctl, _| ctl.set_search(text));
-            } else if matches!(event, InputEvent::Change) {
-                // Re-render so the ✕ inside the popover tracks the text.
-                cx.notify();
-            }
-        })
-        .detach();
         this
     }
 
