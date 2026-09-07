@@ -23,10 +23,7 @@ pub fn execute_transactional_batch(conn: &Connection, sql: &str) -> Result<()> {
 
 /// Run `f` inside a `BEGIN … COMMIT` transaction on `conn`. On error the work
 /// is rolled back and the error returned. Statements run after.
-pub fn transaction<T>(
-    conn: &Connection,
-    f: impl FnOnce(&Connection) -> Result<T>,
-) -> Result<T> {
+pub fn transaction<T>(conn: &Connection, f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
     execute(conn, "BEGIN", vec![])?;
     match f(conn) {
         Ok(v) => {
@@ -75,8 +72,7 @@ pub fn query_one<T>(
 
 /// Run a `SELECT` whose first column is a single integer (`COUNT(*)`, ...).
 pub fn query_count(conn: &Connection, sql: &str, params: Vec<Value>) -> Result<i64> {
-    Ok(query_one(conn, sql, params, |row| int(row, 0))?
-        .unwrap_or(0))
+    Ok(query_one(conn, sql, params, |row| int(row, 0))?.unwrap_or(0))
 }
 
 /// Read a nullable `TEXT` column as `Option<String>`.

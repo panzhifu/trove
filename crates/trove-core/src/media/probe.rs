@@ -28,14 +28,12 @@ pub fn normalize_ext(raw: &str) -> String {
 /// Classify a file from its normalized extension.
 pub fn probe(ext: &str) -> Probe {
     let kind = match ext {
-        "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "ico" | "tiff" | "tif"
-        | "avif" | "heic" | "heif" | "svg" => AssetKind::Image,
-        "mp4" | "mov" | "mkv" | "webm" | "avi" | "m4v" | "mpg" | "mpeg" | "wmv" => {
-            AssetKind::Video
-        }
+        "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "ico" | "tiff" | "tif" | "avif"
+        | "heic" | "heif" | "svg" => AssetKind::Image,
+        "mp4" | "mov" | "mkv" | "webm" | "avi" | "m4v" | "mpg" | "mpeg" | "wmv" => AssetKind::Video,
         "mp3" | "wav" | "flac" | "m4a" | "aac" | "ogg" | "opus" | "wma" => AssetKind::Audio,
-        "pdf" | "doc" | "docx" | "xls" | "xlsx" | "ppt" | "pptx" | "txt" | "md" | "rtf"
-        | "odt" | "ods" | "odp" | "csv" => AssetKind::Document,
+        "pdf" | "doc" | "docx" | "xls" | "xlsx" | "ppt" | "pptx" | "txt" | "md" | "rtf" | "odt"
+        | "ods" | "odp" | "csv" => AssetKind::Document,
         "zip" | "rar" | "7z" | "tar" | "gz" | "bz2" | "xz" | "iso" => AssetKind::Archive,
         "ttf" | "otf" | "ttc" | "woff" | "woff2" => AssetKind::Font,
         _ => AssetKind::Other,

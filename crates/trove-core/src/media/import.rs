@@ -109,10 +109,16 @@ pub fn import_files_assigned(
     auto: Option<AutoCollection>,
 ) -> Result<ImportReport> {
     if let Some(cid) = into_collection
-        && collections::get(store.conn(), cid)?.is_none() {
-            return Err(Error::NotFound("collection"));
-        }
-    Ok(commit_staged_all(store, into_collection, auto, stage_all(root, sources)))
+        && collections::get(store.conn(), cid)?.is_none()
+    {
+        return Err(Error::NotFound("collection"));
+    }
+    Ok(commit_staged_all(
+        store,
+        into_collection,
+        auto,
+        stage_all(root, sources),
+    ))
 }
 
 /// Phase one for a batch: stage every source file (copy + hash + probe + thumbnail).
@@ -163,8 +169,7 @@ pub fn commit_staged_all(
 pub fn stage_source(root: &Path, src: &Path) -> Result<StagedFile> {
     let file_name = file_name_of(src)?;
     let ext = probe::normalize_ext(
-        &src
-            .extension()
+        &src.extension()
             .map(|e| e.to_string_lossy().to_string())
             .unwrap_or_default(),
     );
@@ -180,11 +185,7 @@ pub fn stage_source(root: &Path, src: &Path) -> Result<StagedFile> {
         // MP4-family containers carry track dimensions + duration in the moov
         // box (pure-Rust read); other containers stay empty until probed.
         AssetKind::Video => match probe::video_facts(&blob_path) {
-            Some(f) => (
-                Some(f.width),
-                Some(f.height),
-                f.duration_ms,
-            ),
+            Some(f) => (Some(f.width), Some(f.height), f.duration_ms),
             None => (None, None, None),
         },
         _ => (None, None, None),
@@ -342,16 +343,15 @@ mod tests {
 
     /// A minimal valid 1x1 PNG.
     const PNG_1X1: &[u8] = &[
-        0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48,
-        0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00,
-        0x00, 0x1F, 0x15, 0xC4, 0x89, 0x00, 0x00, 0x00, 0x0A, 0x49, 0x44, 0x41, 0x54, 0x78,
-        0x9C, 0x63, 0x00, 0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0D, 0x0A, 0x2D, 0xB4, 0x00,
-        0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+        0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44,
+        0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1F,
+        0x15, 0xC4, 0x89, 0x00, 0x00, 0x00, 0x0A, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9C, 0x63, 0x00,
+        0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0D, 0x0A, 0x2D, 0xB4, 0x00, 0x00, 0x00, 0x00, 0x49,
+        0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
     ];
 
     fn temp_root(name: &str) -> PathBuf {
-        let root =
-            std::env::temp_dir().join(format!("trove-import-{name}-{}", Uuid::new_v4()));
+        let root = std::env::temp_dir().join(format!("trove-import-{name}-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&root).unwrap();
         root
     }
@@ -372,12 +372,7 @@ mod tests {
         assert!(staged[1].is_err());
 
         // Phase two: the commit loop turns everything into an ImportReport.
-        let report = commit_staged_all(
-            &store,
-            None,
-            Some(AutoCollection::SourceFolder),
-            staged,
-        );
+        let report = commit_staged_all(&store, None, Some(AutoCollection::SourceFolder), staged);
         assert_eq!(report.imported_count(), 1);
         assert_eq!(report.skipped_count(), 1);
         assert_eq!(report.skipped[0].path, missing);
@@ -386,17 +381,15 @@ mod tests {
         // The auto collection named after the source folder exists.
         let conn = store.conn();
         let roots = collections::roots(conn).unwrap();
-        assert!(roots.iter().any(|c| c.name == "trove-import-batch"
-            || c.name.starts_with("trove-import-")));
+        assert!(
+            roots
+                .iter()
+                .any(|c| c.name == "trove-import-batch" || c.name.starts_with("trove-import-"))
+        );
 
         // Re-importing identical content dedupes (reused = true).
         let staged2 = stage_all(&root, &[good]);
-        let report2 = commit_staged_all(
-            &store,
-            None,
-            Some(AutoCollection::SourceFolder),
-            staged2,
-        );
+        let report2 = commit_staged_all(&store, None, Some(AutoCollection::SourceFolder), staged2);
         assert_eq!(report2.imported_count(), 1);
         assert!(report2.imported[0].reused);
 

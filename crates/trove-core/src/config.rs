@@ -80,7 +80,9 @@ impl AppConfig {
         if let Ok(dir) = std::env::var("TROVE_LIBRARY_DIR") {
             return PathBuf::from(dir);
         }
-        self.library_path.clone().unwrap_or_else(default_library_path)
+        self.library_path
+            .clone()
+            .unwrap_or_else(default_library_path)
     }
 }
 

@@ -1,11 +1,11 @@
 //! Shared helpers for the dock panels.
 
-use uuid::Uuid;
 use gpui_kit::base::h_flex;
-use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::component::menu::{ContextMenuExt as _, PopupMenu};
 use gpui_kit::component::{ActiveTheme, IconName};
+use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
+use uuid::Uuid;
 
 use trove_core::model::{Asset, AssetKind, AssetQuery};
 use trove_core::store::assets;
@@ -56,21 +56,20 @@ pub(crate) fn observe_controller<V: Render + 'static>(
 }
 
 pub(crate) fn separator_label(cx: &Context<impl Render>, text: impl Into<String>) -> Div {
-    h_flex()
-        .px_1()
-        .pt_1()
-        .child(
-            div()
-                .text_xs()
-                .font_weight(FontWeight::SEMIBOLD)
-                .text_color(cx.theme().muted_foreground)
-                .child(text.into()),
-        )
+    h_flex().px_1().pt_1().child(
+        div()
+            .text_xs()
+            .font_weight(FontWeight::SEMIBOLD)
+            .text_color(cx.theme().muted_foreground)
+            .child(text.into()),
+    )
 }
 
 pub(crate) fn live_count(controller: &LibraryController) -> u64 {
     let conn = controller.library.store().conn();
-    assets::query(conn, &AssetQuery::default()).map(|(total, _)| total).unwrap_or(0)
+    assets::query(conn, &AssetQuery::default())
+        .map(|(total, _)| total)
+        .unwrap_or(0)
 }
 
 pub(crate) fn trash_count(controller: &LibraryController) -> u64 {
@@ -85,8 +84,6 @@ pub(crate) fn trash_count(controller: &LibraryController) -> u64 {
     .map(|(total, _)| total)
     .unwrap_or(0)
 }
-
-
 
 /// Parse a `#rrggbb` hex (leading `#` optional, case-insensitive) into an
 /// opaque `u32` value usable with `gpui::rgb(0xRRGGBB)`. `None` if malformed.
@@ -130,8 +127,7 @@ pub(crate) fn color_swatch(
 /// `on_click` and `context_menu` each receive the full window/cx so they can
 /// update entities; capture owned clones for `'static` closures.
 type RowClick = Box<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static>;
-type RowMenu =
-    Box<dyn Fn(PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu + 'static>;
+type RowMenu = Box<dyn Fn(PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu + 'static>;
 
 pub(crate) fn selectable_row(
     cx: &Context<impl Render>,

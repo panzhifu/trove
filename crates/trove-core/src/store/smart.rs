@@ -65,13 +65,20 @@ fn join(sep: &str, children: &[SmartNode]) -> Result<(String, Vec<Value>)> {
     Ok((parts.join(sep), args))
 }
 
-fn compile_match(field: SmartField, op: SmartCompare, value: &Json) -> Result<(String, Vec<Value>)> {
+fn compile_match(
+    field: SmartField,
+    op: SmartCompare,
+    value: &Json,
+) -> Result<(String, Vec<Value>)> {
     match field {
         SmartField::Kind => {
             require_eq_ne(op)?;
             let kind: AssetKind = serde_json::from_value(value.clone())
                 .map_err(|_| Error::Validation("kind must be a valid asset kind".into()))?;
-            Ok((format!("assets.kind {} ?", op_sql(op)), vec![kind_sql(kind).into()]))
+            Ok((
+                format!("assets.kind {} ?", op_sql(op)),
+                vec![kind_sql(kind).into()],
+            ))
         }
         SmartField::IsFavorite => {
             require_eq_ne(op)?;
@@ -85,7 +92,10 @@ fn compile_match(field: SmartField, op: SmartCompare, value: &Json) -> Result<(S
         }
         SmartField::Rating => {
             let n = number_value(value, "rating")?;
-            Ok((format!("assets.rating {} ?", op_sql(op)), vec![Value::Integer(n)]))
+            Ok((
+                format!("assets.rating {} ?", op_sql(op)),
+                vec![Value::Integer(n)],
+            ))
         }
         SmartField::SizeBytes => {
             let n = number_value(value, "size_bytes")?;
@@ -198,7 +208,9 @@ fn require_eq_ne(op: SmartCompare) -> Result<()> {
     if matches!(op, SmartCompare::Eq | SmartCompare::Ne) {
         Ok(())
     } else {
-        Err(Error::Validation("this field only supports == or !=".into()))
+        Err(Error::Validation(
+            "this field only supports == or !=".into(),
+        ))
     }
 }
 

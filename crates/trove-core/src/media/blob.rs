@@ -96,7 +96,8 @@ pub fn rel_path(sha256: &str, ext: &str) -> String {
 }
 
 fn tmp_path(root: &Path) -> PathBuf {
-    root.join("media").join(format!(".tmp-{}", uuid::Uuid::new_v4()))
+    root.join("media")
+        .join(format!(".tmp-{}", uuid::Uuid::new_v4()))
 }
 
 fn hex(bytes: &[u8]) -> String {

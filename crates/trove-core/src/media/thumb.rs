@@ -62,16 +62,14 @@ fn write_video_thumb(blob_path: &Path, out: &Path) -> Option<PathBuf> {
     // temp file is `<stem>.tmp.jpg`, renamed onto `<stem>.jpg` on success.
     let tmp = out.with_extension("tmp.jpg");
     let output = std::process::Command::new("ffmpeg")
-        .args([
-            "-y",
-            "-loglevel",
-            "error",
-            "-ss",
-            "1",
-            "-i",
-        ])
+        .args(["-y", "-loglevel", "error", "-ss", "1", "-i"])
         .arg(blob_path)
-        .args(["-frames:v", "1", "-vf", &format!("scale='min({THUMB_MAX},iw)':-2")])
+        .args([
+            "-frames:v",
+            "1",
+            "-vf",
+            &format!("scale='min({THUMB_MAX},iw)':-2"),
+        ])
         .arg(&tmp)
         .output()
         .ok()?;
@@ -140,7 +138,15 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let video = dir.join("clip.mp4");
         let status = std::process::Command::new("ffmpeg")
-            .args(["-y", "-loglevel", "error", "-f", "lavfi", "-i", "color=c=red:size=64x48:rate=1:duration=2"])
+            .args([
+                "-y",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=red:size=64x48:rate=1:duration=2",
+            ])
             .arg(&video)
             .status()
             .unwrap();

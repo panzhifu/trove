@@ -12,10 +12,10 @@
 //! dialog recomputes the live match count whenever the revision moved.
 
 use gpui_kit::base::{h_flex, v_flex};
+use gpui_kit::component::WindowExt as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
-use gpui_kit::component::WindowExt as _;
 use gpui_kit::component::slider::{Slider, SliderEvent, SliderState};
 use gpui_kit::component::{ActiveTheme, IconName, Sizable};
 use gpui_kit::prelude::FluentBuilder as _;
@@ -178,10 +178,7 @@ impl RuleDraft {
     /// sliders to the new value.
     fn set_color(&mut self, color: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
         self.color = color.clone();
-        self.pick = color
-            .as_deref()
-            .and_then(hex_to_hsl)
-            .unwrap_or(self.pick);
+        self.pick = color.as_deref().and_then(hex_to_hsl).unwrap_or(self.pick);
         let (h, sat, lig) = self.pick;
         self.hue.update(cx, |st, cx| st.set_value(h, window, cx));
         self.sat.update(cx, |st, cx| st.set_value(sat, window, cx));
@@ -215,9 +212,9 @@ impl RuleDraft {
             }
             node["value"] = match row.field {
                 SmartField::Text => serde_json::json!(row.text.read(cx).value().trim()),
-                SmartField::Extension => serde_json::json!(normalize_extension(
-                    row.text.read(cx).value().trim()
-                )),
+                SmartField::Extension => {
+                    serde_json::json!(normalize_extension(row.text.read(cx).value().trim()))
+                }
                 SmartField::Color => match normalize_color(&row.text.read(cx).value()) {
                     Some(hex) => serde_json::json!(hex),
                     None => return Err(t("rules.invalid_color")),
@@ -325,7 +322,11 @@ fn hex_to_hsl(hex: &str) -> Option<(f32, f32, f32)> {
         return Some((0., 0., l * 100.));
     }
     let d = max - min;
-    let s = if l > 0.5 { d / (2. - max - min) } else { d / (max + min) };
+    let s = if l > 0.5 {
+        d / (2. - max - min)
+    } else {
+        d / (max + min)
+    };
     let h = if max == r {
         (g - b) / d + if g < b { 6. } else { 0. }
     } else if max == g {
@@ -375,7 +376,9 @@ fn load_rows(
     window: &mut Window,
     cx: &mut App,
 ) -> (bool, Vec<ConditionRow>) {
-    let node = smart::node_from_json(json).unwrap_or(SmartNode::And { children: Vec::new() });
+    let node = smart::node_from_json(json).unwrap_or(SmartNode::And {
+        children: Vec::new(),
+    });
     let (and_mode, matches) = match node {
         SmartNode::And { children } => (true, children),
         SmartNode::Or { children } => (false, children),
@@ -392,11 +395,13 @@ fn load_rows(
         match field {
             SmartField::Text | SmartField::Extension | SmartField::Color => {
                 let s = value.as_str().unwrap_or_default().to_string();
-                row.text.update(cx, |state, cx| state.set_value(s, window, cx));
+                row.text
+                    .update(cx, |state, cx| state.set_value(s, window, cx));
             }
             SmartField::SizeBytes => {
                 let s = value.as_i64().map(|n| n.to_string()).unwrap_or_default();
-                row.text.update(cx, |state, cx| state.set_value(s, window, cx));
+                row.text
+                    .update(cx, |state, cx| state.set_value(s, window, cx));
             }
             SmartField::Rating => {
                 row.rating = value.as_u64().map(|n| n.clamp(0, 5) as u8).unwrap_or(3);
@@ -428,7 +433,8 @@ pub fn open_rule_editor(
 ) {
     let is_edit = editing.is_some();
     let name_input = cx.new(|cx| {
-        InputState::new(window, cx).placeholder(rust_i18n::t!("explorer.name_placeholder").to_string())
+        InputState::new(window, cx)
+            .placeholder(rust_i18n::t!("explorer.name_placeholder").to_string())
     });
     if let Some(name) = editing.as_ref().map(|sc| sc.name.clone()) {
         name_input.update(cx, |state, cx| state.set_value(name, window, cx));
@@ -489,19 +495,21 @@ pub fn open_rule_editor(
     for (slider, channel) in &sliders {
         let channel = *channel;
         let d = draft.clone();
-        subs.push(cx.subscribe(slider, move |_slider, event: &SliderEvent, cx| {
-            let value = match event {
-                SliderEvent::Change(v) | SliderEvent::Release(v) => v.start(),
-            };
-            d.update(cx, |d, cx| {
-                let (h, s, l) = d.pick;
-                match channel {
-                    Channel::H => d.set_pick(value.clamp(0., 360.), s, l, cx),
-                    Channel::S => d.set_pick(h, value.clamp(0., 100.), l, cx),
-                    Channel::L => d.set_pick(h, s, value.clamp(0., 100.), cx),
-                }
-            });
-        }));
+        subs.push(
+            cx.subscribe(slider, move |_slider, event: &SliderEvent, cx| {
+                let value = match event {
+                    SliderEvent::Change(v) | SliderEvent::Release(v) => v.start(),
+                };
+                d.update(cx, |d, cx| {
+                    let (h, s, l) = d.pick;
+                    match channel {
+                        Channel::H => d.set_pick(value.clamp(0., 360.), s, l, cx),
+                        Channel::S => d.set_pick(h, value.clamp(0., 100.), l, cx),
+                        Channel::L => d.set_pick(h, s, value.clamp(0., 100.), cx),
+                    }
+                });
+            }),
+        );
     }
     draft.update(cx, |d, _| d._subs = subs);
 
@@ -568,12 +576,9 @@ fn save_draft(draft: &Entity<RuleDraft>, cx: &mut App) -> bool {
                     name: name.clone(),
                     query: json,
                     color: d.color.clone(),
-                    position: smart_collections::list(conn).map(|l| l.len()).unwrap_or(0)
-                        as i64,
+                    position: smart_collections::list(conn).map(|l| l.len()).unwrap_or(0) as i64,
                 };
-                input
-                    .validate()
-                    .map_err(|e| e.to_string())?;
+                input.validate().map_err(|e| e.to_string())?;
                 smart_collections::create(conn, &input)
                     .map(|created| created.id)
                     .map_err(|e| e.to_string())
@@ -657,21 +662,17 @@ fn render_body(
                         .items_center()
                         .gap_1p5()
                         .child(match &color {
-                            Some(hex) => color_swatch(
-                                cx,
-                                "pick-preview".into(),
-                                hex,
-                                false,
-                                |_, _, _| {},
-                            )
-                            .on_mouse_down(gpui::MouseButton::Right, {
-                                let hex = hex.clone();
-                                move |_, _, cx| {
-                                    cx.write_to_clipboard(
-                                        gpui::ClipboardItem::new_string(hex.clone()),
-                                    );
-                                }
-                            }),
+                            Some(hex) => {
+                                color_swatch(cx, "pick-preview".into(), hex, false, |_, _, _| {})
+                                    .on_mouse_down(gpui::MouseButton::Right, {
+                                        let hex = hex.clone();
+                                        move |_, _, cx| {
+                                            cx.write_to_clipboard(gpui::ClipboardItem::new_string(
+                                                hex.clone(),
+                                            ));
+                                        }
+                                    })
+                            }
                             None => div()
                                 .id("pick-none")
                                 .size_5()
@@ -725,10 +726,7 @@ fn render_body(
                     .text_xs()
                     .text_color(cx.theme().muted_foreground)
                     .child(rust_i18n::t!("rules.match_count", count = total).to_string()),
-                (_, Some(err)) => div()
-                    .text_xs()
-                    .text_color(cx.theme().danger)
-                    .child(err),
+                (_, Some(err)) => div().text_xs().text_color(cx.theme().danger).child(err),
                 (None, None) => div(),
             }),
     );
@@ -799,9 +797,7 @@ fn render_row(
         row_el = row_el.child(dropdown_button(
             format!("row-{ix}-op"),
             t(op_key(field, op)),
-            ops.iter()
-                .map(|&op| (op, t(op_key(field, op))))
-                .collect(),
+            ops.iter().map(|&op| (op, t(op_key(field, op)))).collect(),
             op,
             {
                 let d = draft.clone();
@@ -892,11 +888,7 @@ const COLOR_PALETTE: &[&str] = &[
     "#6366f1", "#a855f7", "#ec4899", "#f43f5e", "#78716c", "#57534e", "#1f2937", "#0f172a",
 ];
 
-fn slider_row(
-    label_key: &'static str,
-    state: &Entity<SliderState>,
-    cx: &App,
-) -> Div {
+fn slider_row(label_key: &'static str, state: &Entity<SliderState>, cx: &App) -> Div {
     h_flex()
         .items_center()
         .gap_2()

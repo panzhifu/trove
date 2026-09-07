@@ -69,7 +69,13 @@ pub fn ensure_named(conn: &Connection, name: &str) -> Result<Tag> {
     if let Some(tag) = get_by_name(conn, name)? {
         return Ok(tag);
     }
-    create(conn, &NewTag { name: name.into(), color: None })
+    create(
+        conn,
+        &NewTag {
+            name: name.into(),
+            color: None,
+        },
+    )
 }
 
 /// All tags ordered by name.
@@ -174,11 +180,10 @@ pub fn rename(conn: &Connection, tag_id: Uuid, name: &str) -> Result<()> {
         return Err(Error::Validation("tag name must not be empty".into()));
     }
     if let Some(existing) = get_by_name(conn, name)?
-        && existing.id != tag_id {
-            return Err(Error::Validation(format!(
-                "tag `{name}` already exists"
-            )));
-        }
+        && existing.id != tag_id
+    {
+        return Err(Error::Validation(format!("tag `{name}` already exists")));
+    }
     rows::execute(
         conn,
         "UPDATE tags SET name = ?1 WHERE id = ?2",

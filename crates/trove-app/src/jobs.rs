@@ -7,8 +7,8 @@
 
 use std::path::PathBuf;
 
-use gpui_kit::component::notification::Notification;
 use gpui_kit::component::WindowExt as _;
+use gpui_kit::component::notification::Notification;
 use gpui_kit::*;
 
 use trove_core::media::import;
@@ -99,12 +99,8 @@ pub fn import_paths_app(
             let _ = handle.update(cx, |_view, window, cx| {
                 window.push_notification(
                     Notification::info(
-                        rust_i18n::t!(
-                            "notice.import_running",
-                            done = done + 1,
-                            total = total
-                        )
-                        .to_string(),
+                        rust_i18n::t!("notice.import_running", done = done + 1, total = total)
+                            .to_string(),
                     )
                     .id1::<ImportNotice>("import-progress"),
                     cx,
@@ -124,8 +120,7 @@ pub fn import_paths_app(
 
         let note = if report.skipped.is_empty() {
             Notification::success(
-                rust_i18n::t!("notice.import_done", imported = report.imported_count())
-                    .to_string(),
+                rust_i18n::t!("notice.import_done", imported = report.imported_count()).to_string(),
             )
         } else {
             Notification::warning(

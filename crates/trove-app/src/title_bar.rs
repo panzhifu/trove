@@ -6,8 +6,8 @@
 //! this module only supplies the bar's contents.
 
 use gpui_kit::base::h_flex;
-use gpui_kit::component::menu::AppMenuBar;
 use gpui_kit::component::TitleBar;
+use gpui_kit::component::menu::AppMenuBar;
 use gpui_kit::*;
 
 use crate::state::LibraryController;
@@ -53,7 +53,11 @@ impl TitleBarView {
         // `AppMenuBar::new` already returns an `Entity<AppMenuBar>`.
         let menu_bar = AppMenuBar::new(cx);
         let menu_signature = menu_signature(cx);
-        Self { controller, menu_bar, menu_signature }
+        Self {
+            controller,
+            menu_bar,
+            menu_signature,
+        }
     }
 }
 

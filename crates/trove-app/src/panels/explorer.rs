@@ -12,8 +12,8 @@ use gpui_kit::component::dock::{BasePanel, Panel as DockPanel, PanelControl, Pan
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::menu::{ContextMenuExt as _, PopupMenu, PopupMenuItem};
 use gpui_kit::component::{ActiveTheme, Icon, IconName, Sizable};
-use gpui_kit::*;
 use gpui_kit::prelude::FluentBuilder as _;
+use gpui_kit::*;
 
 use trove_core::model::NewCollection;
 use trove_core::store::{collections, smart_collections};
@@ -22,8 +22,8 @@ use uuid::Uuid;
 use crate::state::LibraryController;
 
 use super::common::{
-    hex_to_rgb, live_count, observe_controller, selectable_row, separator_label, trash_count,
-    AssetsDrag, CollectionDrag,
+    AssetsDrag, CollectionDrag, hex_to_rgb, live_count, observe_controller, selectable_row,
+    separator_label, trash_count,
 };
 
 /// What the single inline editor is doing right now.
@@ -32,7 +32,9 @@ enum EditorMode {
     None,
     /// New collection. `parent`: browse a folder? + adds under it; a
     /// right-click "New collection inside" sets it to that folder.
-    Adding { parent: Option<Uuid> },
+    Adding {
+        parent: Option<Uuid>,
+    },
     Renaming(Uuid),
     RenamingSmart(Uuid),
 }
@@ -51,7 +53,10 @@ impl ExplorerPanel {
         cx: &mut Context<Self>,
         controller: Entity<LibraryController>,
     ) -> Self {
-        let editor_input = cx.new(|cx| InputState::new(window, cx).placeholder(rust_i18n::t!("explorer.name_placeholder").to_string()));
+        let editor_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder(rust_i18n::t!("explorer.name_placeholder").to_string())
+        });
         let this = Self {
             focus_handle: cx.focus_handle(),
             controller,
@@ -74,12 +79,7 @@ impl ExplorerPanel {
     }
 
     /// Open the editor, cleared and focused, for a fresh collection.
-    fn open_add(
-        &mut self,
-        parent: Option<Uuid>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    fn open_add(&mut self, parent: Option<Uuid>, window: &mut Window, cx: &mut Context<Self>) {
         self.editor_input.update(cx, |state, cx| {
             state.set_value("", window, cx);
         });
@@ -116,7 +116,13 @@ impl ExplorerPanel {
     }
 
     /// Right-click → Rename: the row becomes a prefilled, focused editor.
-    fn begin_rename(&mut self, id: Uuid, name: String, window: &mut Window, cx: &mut Context<Self>) {
+    fn begin_rename(
+        &mut self,
+        id: Uuid,
+        name: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.editor_input.update(cx, |state, cx| {
             state.set_value(name, window, cx);
         });
@@ -153,7 +159,11 @@ impl ExplorerPanel {
                     };
                     if let Ok(c) = collections::create(
                         conn,
-                        &NewCollection { parent_id: parent, name, position },
+                        &NewCollection {
+                            parent_id: parent,
+                            name,
+                            position,
+                        },
                     ) {
                         ctl.select_collection(Some(c.id));
                     }
@@ -275,11 +285,21 @@ impl Render for ExplorerPanel {
             if let Ok(roots) = collections::roots(conn) {
                 for root in roots {
                     let count = collections::count_assets(conn, root.id).unwrap_or(0);
-                    rows.push(Row { id: root.id, name: root.name.clone(), is_root: true, count });
+                    rows.push(Row {
+                        id: root.id,
+                        name: root.name.clone(),
+                        is_root: true,
+                        count,
+                    });
                     if let Ok(children) = collections::children_of(conn, Some(root.id)) {
                         for child in children {
                             let count = collections::count_assets(conn, child.id).unwrap_or(0);
-                            rows.push(Row { id: child.id, name: child.name.clone(), is_root: false, count });
+                            rows.push(Row {
+                                id: child.id,
+                                name: child.name.clone(),
+                                is_root: false,
+                                count,
+                            });
                         }
                     }
                 }
@@ -289,10 +309,7 @@ impl Render for ExplorerPanel {
                 smart_rows = list
                     .into_iter()
                     .map(|sc| {
-                        let accent = sc
-                            .color
-                            .as_deref()
-                            .and_then(hex_to_rgb);
+                        let accent = sc.color.as_deref().and_then(hex_to_rgb);
                         (sc.id, sc.name, accent)
                     })
                     .collect();
@@ -419,7 +436,10 @@ impl Render for ExplorerPanel {
                     .w_full()
                     .items_center()
                     .justify_between()
-                    .child(separator_label(cx, rust_i18n::t!("panel.smart").to_string()))
+                    .child(separator_label(
+                        cx,
+                        rust_i18n::t!("panel.smart").to_string(),
+                    ))
                     .child(
                         Button::new("add-smart-title")
                             .ghost()
@@ -427,7 +447,12 @@ impl Render for ExplorerPanel {
                             .label("+")
                             .tooltip(rust_i18n::t!("rules.title_new").to_string())
                             .on_click(move |_, window, cx| {
-                                crate::rules::open_rule_editor(window, cx, controller.clone(), None);
+                                crate::rules::open_rule_editor(
+                                    window,
+                                    cx,
+                                    controller.clone(),
+                                    None,
+                                );
                             }),
                     )
                     .into_any_element(),
@@ -452,7 +477,15 @@ impl Render for ExplorerPanel {
                         let explorer = cx.entity();
                         let menu_name = menu_name.clone();
                         Box::new(move |menu, window, cx| {
-                            smart_menu(menu, window, cx, &controller, &explorer, sid, menu_name.clone())
+                            smart_menu(
+                                menu,
+                                window,
+                                cx,
+                                &controller,
+                                &explorer,
+                                sid,
+                                menu_name.clone(),
+                            )
                         })
                     }),
                 )
@@ -460,11 +493,11 @@ impl Render for ExplorerPanel {
             );
         }
 
-        v_flex()
-            .size_full()
-            .gap_1()
-            .p_1()
-            .child(div().flex_1().child(v_flex().gap_0p5().children(items).w_full()))
+        v_flex().size_full().gap_1().p_1().child(
+            div()
+                .flex_1()
+                .child(v_flex().gap_0p5().children(items).w_full()),
+        )
     }
 }
 
@@ -489,7 +522,9 @@ fn collection_row(
     selected: bool,
     is_root: bool,
 ) -> Stateful<Div> {
-    let row_id = id.map(|v| v.to_string()).unwrap_or_else(|| "all".to_string());
+    let row_id = id
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "all".to_string());
 
     let mut row = div()
         .id(format!("collection-row-{row_id}"))
@@ -646,16 +681,18 @@ fn smart_menu(
             ),
         )
         .item(
-            PopupMenuItem::new(rust_i18n::t!("explorer.delete").to_string()).on_click(move |_, _, cx| {
-                ctl_delete.update(cx, move |ctl, cx| {
-                    let _ = smart_collections::delete(ctl.library.store().conn(), id);
-                    if ctl.active_smart == Some(id) {
-                        ctl.select_smart(None);
-                    }
-                    ctl.generation += 1;
-                    cx.notify();
-                });
-            }),
+            PopupMenuItem::new(rust_i18n::t!("explorer.delete").to_string()).on_click(
+                move |_, _, cx| {
+                    ctl_delete.update(cx, move |ctl, cx| {
+                        let _ = smart_collections::delete(ctl.library.store().conn(), id);
+                        if ctl.active_smart == Some(id) {
+                            ctl.select_smart(None);
+                        }
+                        ctl.generation += 1;
+                        cx.notify();
+                    });
+                },
+            ),
         )
 }
 
@@ -674,33 +711,38 @@ fn collection_menu(
 
     menu.min_w(px(180.))
         .item(
-            PopupMenuItem::new(rust_i18n::t!("explorer.new_collection_inside").to_string()).on_click(move |_, window, cx| {
-                explorer_new.update(cx, |this, cx| this.add_inside(id, window, cx));
-            }),
+            PopupMenuItem::new(rust_i18n::t!("explorer.new_collection_inside").to_string())
+                .on_click(move |_, window, cx| {
+                    explorer_new.update(cx, |this, cx| this.add_inside(id, window, cx));
+                }),
         )
         .item(
-            PopupMenuItem::new(rust_i18n::t!("explorer.rename").to_string()).on_click(move |_, window, cx| {
-                explorer_rename.update(cx, |this, cx| {
-                    this.begin_rename(id, name.clone(), window, cx);
-                });
-            }),
+            PopupMenuItem::new(rust_i18n::t!("explorer.rename").to_string()).on_click(
+                move |_, window, cx| {
+                    explorer_rename.update(cx, |this, cx| {
+                        this.begin_rename(id, name.clone(), window, cx);
+                    });
+                },
+            ),
         )
         .separator()
         .item(
-            PopupMenuItem::new(rust_i18n::t!("explorer.delete").to_string()).on_click(move |_, _, cx| {
-                explorer_delete.update(cx, |this, cx| {
-                    let ctl = this.controller.clone();
-                    ctl.update(cx, |ctl, cx| {
-                        let conn = ctl.library.store().conn();
-                        let _ = collections::delete(conn, id);
-                        if ctl.current_collection == Some(id) {
-                            ctl.select_collection(None);
-                        }
-                        ctl.generation += 1;
+            PopupMenuItem::new(rust_i18n::t!("explorer.delete").to_string()).on_click(
+                move |_, _, cx| {
+                    explorer_delete.update(cx, |this, cx| {
+                        let ctl = this.controller.clone();
+                        ctl.update(cx, |ctl, cx| {
+                            let conn = ctl.library.store().conn();
+                            let _ = collections::delete(conn, id);
+                            if ctl.current_collection == Some(id) {
+                                ctl.select_collection(None);
+                            }
+                            ctl.generation += 1;
+                            cx.notify();
+                        });
                         cx.notify();
                     });
-                    cx.notify();
-                });
-            }),
+                },
+            ),
         )
 }

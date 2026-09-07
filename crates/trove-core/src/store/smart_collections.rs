@@ -124,9 +124,8 @@ pub fn delete(conn: &Connection, id: Uuid) -> Result<()> {
 
 fn collection_from_row(row: &libsql::Row) -> Result<SmartCollection> {
     let query_json = rows::req_str(row, 2)?;
-    let query = serde_json::from_str(&query_json).map_err(|e| {
-        Error::Db(format!("smart_collections: bad query json: {e}"))
-    })?;
+    let query = serde_json::from_str(&query_json)
+        .map_err(|e| Error::Db(format!("smart_collections: bad query json: {e}")))?;
     Ok(SmartCollection {
         id: req_uuid(row, 0)?,
         name: rows::req_str(row, 1)?,
