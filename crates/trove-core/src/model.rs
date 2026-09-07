@@ -370,3 +370,37 @@ pub struct AssetQuery {
     pub limit: Option<u32>,
     pub offset: u64,
 }
+
+#[cfg(test)]
+pub fn test_asset(name: &str, kind: AssetKind, id: Uuid) -> Asset {
+    Asset {
+        id,
+        origin: Origin::Stored,
+        rel_path: Some(format!("media/{}/{}", &id.to_string()[..2], name)),
+        file_name: name.into(),
+        ext: name.split('.').last().unwrap_or("").into(),
+        mime: match kind {
+            AssetKind::Image => "image/png",
+            AssetKind::Video => "video/mp4",
+            AssetKind::Audio => "audio/mpeg",
+            _ => "application/octet-stream",
+        }
+        .into(),
+        size_bytes: 128,
+        sha256: Some("a".repeat(64)),
+        kind,
+        width: Some(800),
+        height: Some(600),
+        duration_ms: None,
+        captured_at: None,
+        title: None,
+        description: None,
+        rating: None,
+        is_favorite: false,
+        source_url: None,
+        extra: Default::default(),
+        created_at: now(),
+        updated_at: now(),
+        trashed_at: None,
+    }
+}

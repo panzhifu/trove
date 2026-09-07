@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 
 use uuid::Uuid;
 
-use super::{blob, metadata, probe, thumb};
+use super::{blob, metadata, probe, search, thumb};
 use crate::error::{Error, Result};
 use crate::model::{Asset, AssetKind, Origin, now};
 use crate::store::{Store, assets, collections};
@@ -252,6 +252,14 @@ pub fn commit_staged(
     let mined = &staged.mined;
     let mut extra = std::collections::BTreeMap::new();
     extra.extend(mined.extra.clone());
+
+    // Compute visual signature for images (pHash + color histogram).
+    // This powers "search by image" and is cheap to compute at import.
+    // We use the source path since the file may not be copied yet.
+    if staged.kind == AssetKind::Image {
+        let sig = search::VisualSignature::from_image(&staged.path);
+        sig.apply_to_extra(&mut extra);
+    }
 
     let asset = Asset {
         id: Uuid::new_v4(),

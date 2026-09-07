@@ -8,6 +8,7 @@ pub mod schema;
 pub mod smart;
 pub mod smart_collections;
 pub mod tags;
+pub mod visual_search;
 
 use std::cell::RefCell;
 use std::path::Path;
