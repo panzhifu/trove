@@ -141,3 +141,36 @@ pub struct AssetsDrag(pub Vec<Uuid>);
 /// Payload for dragging a collection row (reparent / reorder in the tree).
 #[derive(Debug, Clone)]
 pub struct CollectionDrag(pub Uuid);
+
+/// Reveal a file or directory in the platform file manager. Where the
+/// platform supports it the file is selected (Windows/macOS); on Linux the
+/// containing directory opens instead.
+pub(crate) fn reveal_path(path: &std::path::Path) {
+    let is_file = path.is_file();
+    let _ = if cfg!(target_os = "windows") {
+        if is_file {
+            std::process::Command::new("explorer")
+                .arg("/select,")
+                .arg(path)
+                .spawn()
+        } else {
+            std::process::Command::new("explorer").arg(path).spawn()
+        }
+    } else if cfg!(target_os = "macos") {
+        if is_file {
+            std::process::Command::new("open")
+                .arg("-R")
+                .arg(path)
+                .spawn()
+        } else {
+            std::process::Command::new("open").arg(path).spawn()
+        }
+    } else {
+        let dir = if is_file {
+            path.parent().unwrap_or(path)
+        } else {
+            path
+        };
+        std::process::Command::new("xdg-open").arg(dir).spawn()
+    };
+}

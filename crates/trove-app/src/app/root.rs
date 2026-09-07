@@ -89,10 +89,38 @@ impl AppView {
         // Redraw the status bar whenever the controller state changes.
         cx.observe(&controller, |_, _, cx| cx.notify()).detach();
 
+        spawn_folder_watcher(controller.clone(), window.window_handle(), cx);
+
         Self {
             controller,
             dock,
             title_bar,
+        }
+    }
+
+    /// Edit ▸ Paste Import: bring the clipboard image into the library. Text
+    /// entries are ignored for now (URL import is on the roadmap).
+    fn paste_import(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(item) = cx.read_from_clipboard() else {
+            return;
+        };
+        let Some(gpui::ClipboardEntry::Image(image)) = item.entries().first() else {
+            return;
+        };
+        let ext = match image.format {
+            gpui::ImageFormat::Png => "png",
+            gpui::ImageFormat::Jpeg => "jpg",
+            gpui::ImageFormat::Gif => "gif",
+            gpui::ImageFormat::Webp => "webp",
+            _ => "png",
+        };
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let path = std::env::temp_dir().join(format!("trove-paste-{nanos}.{ext}"));
+        if std::fs::write(&path, &image.bytes).is_ok() {
+            jobs::import_paths_app(&self.controller, vec![path], window, cx);
         }
     }
 
@@ -291,6 +319,9 @@ impl Render for AppView {
                     cx.notify();
                 });
             }))
+            .on_action(cx.listener(|this, _: &PasteImport, window, cx| {
+                this.paste_import(window, cx);
+            }))
             .on_action(cx.listener(|this, _: &SelectAll, _, cx| {
                 this.controller
                     .update(cx, |ctl, _cx| ctl.select_all_visible());
@@ -336,4 +367,63 @@ impl Render for AppView {
             .children(sheet_layer)
             .children(notification_layer)
     }
+}
+
+/// Background loop for watched folders: every [`WATCH_POLL_INTERVAL`] the
+/// configured roots are re-scanned and new files import into the library
+/// (unfiled). A root is baselined on first sight, so attaching a watch never
+/// retro-imports what is already there; the config is re-read every cycle, so
+/// changes in Settings apply without a restart.
+const WATCH_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+
+fn spawn_folder_watcher(
+    controller: Entity<LibraryController>,
+    handle: AnyWindowHandle,
+    cx: &mut Context<AppView>,
+) {
+    cx.spawn(async move |_, cx| {
+        let mut seen: std::collections::HashSet<PathBuf> = Default::default();
+        let mut baselined: std::collections::HashSet<PathBuf> = Default::default();
+        loop {
+            cx.background_executor().timer(WATCH_POLL_INTERVAL).await;
+            let config = AppConfig::load();
+            if !config.watch_folders_enabled() {
+                continue;
+            }
+            let roots = config.watched_folders.clone();
+            if roots.is_empty() {
+                continue;
+            }
+            let files = crate::library::watcher::all_files(&roots);
+            for root in &roots {
+                if baselined.insert(root.clone()) {
+                    for file in &files {
+                        if file.starts_with(root) {
+                            seen.insert(file.clone());
+                        }
+                    }
+                }
+            }
+            let fresh: Vec<PathBuf> = files
+                .into_iter()
+                .filter(|file| !seen.contains(file))
+                .collect();
+            if fresh.is_empty() {
+                continue;
+            }
+            // Mark seen only after the batch was accepted; a refusal (e.g. a
+            // manual import still running) retries on the next cycle.
+            let accepted = handle
+                .update(cx, |_view, window, cx| {
+                    jobs::import_paths_app_into(&controller, fresh.clone(), None, window, cx)
+                })
+                .unwrap_or(false);
+            if accepted {
+                for file in &fresh {
+                    seen.insert(file.clone());
+                }
+            }
+        }
+    })
+    .detach();
 }

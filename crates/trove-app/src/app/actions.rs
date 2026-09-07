@@ -15,6 +15,7 @@ gpui_kit::actions!(
         FindDuplicates,
         OpenSettings,
         // -- Edit menu / grid shortcuts ------------------------------------
+        PasteImport,
         SelectAll,
         ClearSelection,
         TrashSelected,
