@@ -82,6 +82,7 @@ fn general_page(controller: &Entity<LibraryController>) -> SettingPage {
                 ),
         )
         .group(recent_libraries_group(&controller))
+        .group(watch_folders_group())
         .group(stats_group(&controller))
 }
 
@@ -161,6 +162,104 @@ fn recent_library_row(
                     cx.refresh_windows();
                 }),
         )
+}
+
+// ============================ watched folders ================================
+
+/// General ▸ Watched folders: folders scanned for new files, which import
+/// automatically (unfiled). The list re-reads the config on every settings
+/// render, so add/remove applies immediately.
+fn watch_folders_group() -> SettingGroup {
+    let mut group = SettingGroup::new().title(rust_i18n::t!("settings.watch_folders").to_string());
+    let config = AppConfig::load();
+    let enabled = config.watch_folders_enabled();
+
+    group = group.item(SettingItem::new(
+        rust_i18n::t!("settings.watch_enabled").to_string(),
+        SettingField::render(move |_, _, cx| watch_toggle_row(enabled, cx)),
+    ));
+
+    for path in config.watched_folders.clone() {
+        group = group.item(SettingItem::new(
+            path.display().to_string(),
+            SettingField::render(move |_, _, cx| watch_folder_row(path.clone(), cx)),
+        ));
+    }
+    group.item(SettingItem::new(
+        rust_i18n::t!("settings.add_watch_folder").to_string(),
+        SettingField::render(|_, _, cx| add_watch_folder_row(cx)),
+    ))
+}
+
+/// The master-switch row: one button flipping `watch_folders_enabled`.
+fn watch_toggle_row(enabled: bool, _cx: &mut App) -> Div {
+    h_flex().w_full().justify_end().child(
+        Button::new("watch-toggle")
+            .outline()
+            .small()
+            .label(if enabled {
+                rust_i18n::t!("settings.watch_on").to_string()
+            } else {
+                rust_i18n::t!("settings.watch_off").to_string()
+            })
+            .on_click(|_, _, cx| {
+                let mut config = AppConfig::load();
+                config.watch_folders_enabled = Some(!config.watch_folders_enabled());
+                let _ = config.save();
+                cx.refresh_windows();
+            }),
+    )
+}
+
+/// One watched-folder row: stop watching.
+fn watch_folder_row(path: PathBuf, _cx: &mut App) -> Div {
+    h_flex().w_full().justify_end().child(
+        Button::new(format!("watch-remove-{}", path.display()))
+            .ghost()
+            .small()
+            .icon(IconName::Close)
+            .tooltip(rust_i18n::t!("settings.remove_watch_folder").to_string())
+            .on_click(move |_, _, cx| {
+                let mut config = AppConfig::load();
+                let _ = config.remove_watched_folder(&path);
+                cx.refresh_windows();
+            }),
+    )
+}
+
+/// The add-row: pick a folder to watch.
+fn add_watch_folder_row(_cx: &mut App) -> Div {
+    h_flex().w_full().justify_end().child(
+        Button::new("watch-add")
+            .outline()
+            .small()
+            .label(rust_i18n::t!("settings.add_watch_folder").to_string())
+            .on_click(|_, _, cx| {
+                let rx = cx.prompt_for_paths(PathPromptOptions {
+                    files: false,
+                    directories: true,
+                    multiple: false,
+                    prompt: Some(
+                        rust_i18n::t!("settings.select_watch_folder")
+                            .into_owned()
+                            .into(),
+                    ),
+                });
+                cx.spawn(async move |cx| {
+                    if let Ok(Ok(Some(paths))) = rx.await
+                        && let Some(path) = paths.first()
+                    {
+                        let path = path.to_path_buf();
+                        cx.update(|cx| {
+                            let mut config = AppConfig::load();
+                            let _ = config.add_watched_folder(path);
+                            cx.refresh_windows();
+                        });
+                    }
+                })
+                .detach();
+            }),
+    )
 }
 
 // ============================== statistics ===================================
@@ -421,7 +520,7 @@ fn backup_row(controller: &Entity<LibraryController>, cx: &mut App) -> Div {
                 .icon(IconName::Folder)
                 .tooltip(rust_i18n::t!("settings.open_backups_dir").to_string())
                 .on_click(move |_, _, _cx| {
-                    reveal_in_file_manager(&backups_dir);
+                    crate::panels::common::reveal_path(&backups_dir);
                 }),
         )
         .child(
@@ -1033,7 +1132,7 @@ fn clip_model_file_row(controller: &Entity<LibraryController>, cx: &mut App) -> 
                 .tooltip(rust_i18n::t!("settings.open_model_dir").to_string())
                 .on_click(move |_, _, _cx| {
                     let dir = config.clip_model_dir().unwrap_or_else(std::env::temp_dir);
-                    reveal_in_file_manager(&dir);
+                    crate::panels::common::reveal_path(&dir);
                 }),
         )
         .child(
@@ -1049,18 +1148,6 @@ fn clip_model_file_row(controller: &Entity<LibraryController>, cx: &mut App) -> 
 }
 
 /// Pick the single CLIP ONNX model file via the system dialog and persist it.
-/// Reveal a directory in the system file manager (cross-platform).
-fn reveal_in_file_manager(path: &std::path::Path) {
-    let path = path.to_string_lossy().to_string();
-    let _ = if cfg!(target_os = "windows") {
-        std::process::Command::new("explorer").arg(&path).spawn()
-    } else if cfg!(target_os = "macos") {
-        std::process::Command::new("open").arg(&path).spawn()
-    } else {
-        // Linux: try xdg-open, then fall back to common file managers.
-        std::process::Command::new("xdg-open").arg(&path).spawn()
-    };
-}
 
 fn prompt_model_file(controller: &Entity<LibraryController>, cx: &mut App) {
     let rx = cx.prompt_for_paths(PathPromptOptions {

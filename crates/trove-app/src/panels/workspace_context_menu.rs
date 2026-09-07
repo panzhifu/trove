@@ -48,6 +48,15 @@ pub(crate) fn asset_context_menu(
         build_color_label_submenu(menu, &c_label, asset_id, current_label.as_deref())
     });
 
+    let disk_path = {
+        let ctl = controller.read(cx);
+        assets::get(ctl.library.store().conn(), asset_id)
+            .ok()
+            .flatten()
+            .and_then(|a| a.rel_path)
+            .map(|rel| ctl.library.root().join(rel))
+    };
+
     let mut menu =
         menu.min_w(px(200.))
             .item(
@@ -82,12 +91,22 @@ pub(crate) fn asset_context_menu(
                         }
                     }),
             )
-            .separator()
-            .item(PopupMenuItem::submenu(
-                rust_i18n::t!("workspace.add_to_collection").to_string(),
-                add_submenu,
-            ))
             .separator();
+    if let Some(path) = disk_path {
+        menu = menu.item(
+            PopupMenuItem::new(rust_i18n::t!("workspace.reveal_in_file_manager").to_string())
+                .on_click(move |_, _, _cx| {
+                    crate::panels::common::reveal_path(&path);
+                }),
+        );
+        menu = menu.separator();
+    }
+    let mut menu = menu
+        .item(PopupMenuItem::submenu(
+            rust_i18n::t!("workspace.add_to_collection").to_string(),
+            add_submenu,
+        ))
+        .separator();
     if browsed_collection.is_some() {
         menu = menu.item(
             PopupMenuItem::new(rust_i18n::t!("workspace.remove_from_collection").to_string())

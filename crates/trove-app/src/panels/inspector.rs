@@ -367,6 +367,10 @@ impl Render for InspectorPanel {
             .into_iter()
             .filter_map(|s| hex_to_rgb(&s).map(|rgb| (rgb, s)))
             .collect();
+        let disk_path: Option<std::path::PathBuf> = asset
+            .rel_path
+            .as_ref()
+            .map(|rel| ctl.library.root().join(rel));
         let kind = asset.kind;
         let rating = asset.rating;
         let added = asset.created_at.format("%Y-%m-%d %H:%M").to_string();
@@ -523,7 +527,33 @@ impl Render for InspectorPanel {
             })
             .child(property_row(cx, "inspector.dimensions", dims))
             .child(property_row(cx, "inspector.added", added))
-            .child(property_row(cx, "inspector.sha256", hash));
+            .child(property_row(cx, "inspector.sha256", hash))
+            .when_some(disk_path, |row, path| {
+                row.child(
+                    h_flex()
+                        .w_full()
+                        .justify_between()
+                        .gap_2()
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(rust_i18n::t!("inspector.location").to_string()),
+                        )
+                        .child(
+                            Button::new(format!("reveal-{asset_id}"))
+                                .ghost()
+                                .xsmall()
+                                .icon(IconName::Folder)
+                                .tooltip(
+                                    rust_i18n::t!("workspace.reveal_in_file_manager").to_string(),
+                                )
+                                .on_click(move |_, _, _cx| {
+                                    crate::panels::common::reveal_path(&path);
+                                }),
+                        ),
+                )
+            });
 
         let mut content = v_flex()
             .p_3()
