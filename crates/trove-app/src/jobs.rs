@@ -44,9 +44,8 @@ async fn embed_imported_images(
             .await;
     }
     controller.update(cx, |ctl, cx| {
-        ctl.notice = Some(
-            rust_i18n::t!("notice.embedded_done", done = done, total = total).to_string(),
-        );
+        ctl.notice =
+            Some(rust_i18n::t!("notice.embedded_done", done = done, total = total).to_string());
         cx.notify();
     });
 }
@@ -97,12 +96,10 @@ pub fn import_paths_app(
 
     let controller = controller.clone();
     let handle = window.window_handle();
-    let task = cx
-        .background_executor()
-        .spawn({
-            let library_root = library_root.clone();
-            async move { import::stage_all(&library_root, &paths) }
-        });
+    let task = cx.background_executor().spawn({
+        let library_root = library_root.clone();
+        async move { import::stage_all(&library_root, &paths) }
+    });
 
     cx.spawn(async move |cx| {
         let staged = task.await;
@@ -159,8 +156,7 @@ pub fn import_paths_app(
         // Embed newly imported images in the background (one per frame).
         if !imported_ids.is_empty() {
             let store = controller.update(cx, |ctl, _| ctl.library.store().clone());
-            embed_imported_images(controller.clone(), store, library_root, imported_ids, cx)
-                .await;
+            embed_imported_images(controller.clone(), store, library_root, imported_ids, cx).await;
         }
 
         let note = if report.skipped.is_empty() {

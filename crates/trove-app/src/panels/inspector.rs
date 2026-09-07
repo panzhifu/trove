@@ -449,8 +449,10 @@ impl Render for InspectorPanel {
             .child(edit_label("inspector.rating"))
             .child(self.rating_row(rating));
 
-        let tag_chips = h_flex().flex_wrap().gap_1p5().children(
-            asset_tags.iter().map(|tag| {
+        let tag_chips = h_flex()
+            .flex_wrap()
+            .gap_1p5()
+            .children(asset_tags.iter().map(|tag| {
                 let id = tag.id;
                 let controller = self.controller.clone();
                 let tag_color = tag.color.as_deref().and_then(hex_to_rgb);
@@ -477,8 +479,7 @@ impl Render for InspectorPanel {
                                     .label("×")
                                     .on_click(move |_, _, cx| {
                                         controller.update(cx, move |ctl, cx| {
-                                            let _ =
-                                                ctl.library.tag_assets(&[asset_id], id, false);
+                                            let _ = ctl.library.tag_assets(&[asset_id], id, false);
                                             ctl.generation += 1;
                                             cx.notify();
                                         });
@@ -486,8 +487,7 @@ impl Render for InspectorPanel {
                             ),
                     )
                     .into_any_element()
-            }),
-        );
+            }));
 
         let tag_input_row = h_flex()
             .gap_1()
@@ -509,7 +509,11 @@ impl Render for InspectorPanel {
         let props_content = v_flex()
             .gap_1()
             .child(property_row(cx, "inspector.mime_type", mime))
-            .child(property_row(cx, "inspector.size", human_bytes(asset.size_bytes)))
+            .child(property_row(
+                cx,
+                "inspector.size",
+                human_bytes(asset.size_bytes),
+            ))
             .when_some(asset.duration_ms, |this, ms| {
                 this.child(property_row(cx, "inspector.duration", format_duration(ms)))
             })
@@ -553,22 +557,25 @@ impl Render for InspectorPanel {
             ));
 
         if !swatches.is_empty() {
-            let colors_content = h_flex().flex_wrap().gap_1p5().px_1().children(
-                swatches.iter().map(|(_rgb, hex)| {
-                    let hex = hex.clone();
-                    // Right-click copies the hex value straight to the
-                    // clipboard — the palette doubles as a picker.
-                    color_swatch(cx, format!("swatch-{hex}"), &hex, false, |_, _, _| {})
-                        .on_mouse_down(gpui::MouseButton::Right, {
-                            let hex = hex.clone();
-                            move |_, _, cx| {
-                                cx.write_to_clipboard(gpui::ClipboardItem::new_string(
-                                    hex.clone(),
-                                ));
-                            }
-                        })
-                }),
-            );
+            let colors_content =
+                h_flex()
+                    .flex_wrap()
+                    .gap_1p5()
+                    .px_1()
+                    .children(swatches.iter().map(|(_rgb, hex)| {
+                        let hex = hex.clone();
+                        // Right-click copies the hex value straight to the
+                        // clipboard — the palette doubles as a picker.
+                        color_swatch(cx, format!("swatch-{hex}"), &hex, false, |_, _, _| {})
+                            .on_mouse_down(gpui::MouseButton::Right, {
+                                let hex = hex.clone();
+                                move |_, _, cx| {
+                                    cx.write_to_clipboard(gpui::ClipboardItem::new_string(
+                                        hex.clone(),
+                                    ));
+                                }
+                            })
+                    }));
             content = content.child(self.collapsible_section(
                 "colors",
                 rust_i18n::t!("inspector.colors").to_string(),
@@ -657,7 +664,10 @@ impl InspectorPanel {
                     .text_color(cx.theme().muted_foreground)
                     .rotate(gpui::percentage(if open { 0. } else { 0.75 })),
             );
-        div().w_full().child(header).when(open, |this| this.child(content))
+        div()
+            .w_full()
+            .child(header)
+            .when(open, |this| this.child(content))
     }
 
     /// One small button per [`AssetKind`]; the active kind is highlighted.

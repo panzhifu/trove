@@ -9,10 +9,10 @@ use std::cell::Cell;
 use std::rc::Rc;
 
 use gpui_kit::base::h_flex;
+use gpui_kit::component::Sizable;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::popover::Popover;
-use gpui_kit::component::Sizable;
 use gpui_kit::component::{ActiveTheme, IconName};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;

@@ -274,7 +274,6 @@ impl LibraryController {
         self.generation += 1;
     }
 
-
     /// Record an error notice. Returns `true` only when the message is new,
     /// so render-path callers can notify safely without re-render loops.
     pub fn report_error(&mut self, msg: String) -> bool {

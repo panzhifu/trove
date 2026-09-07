@@ -105,22 +105,23 @@ fn semantic_search(
     // The whole pipeline (query embedding + cosine ranking + asset fetch)
     // lives behind the Library facade; the threshold comes from config.
     let threshold = trove_core::config::AppConfig::load().semantic_min_similarity();
-    let hits = match controller.read(cx).library.semantic_image_search(
-        query_path,
-        threshold,
-        Some(50),
-    ) {
-        Ok(hits) => hits,
-        Err(e) => {
-            controller.update(cx, |ctl, _| {
-                ctl.notice = Some(
-                    rust_i18n::t!("workspace.embed_failed_with", error = e.to_string())
-                        .to_string(),
-                );
-            });
-            return Vec::new();
-        }
-    };
+    let hits =
+        match controller
+            .read(cx)
+            .library
+            .semantic_image_search(query_path, threshold, Some(50))
+        {
+            Ok(hits) => hits,
+            Err(e) => {
+                controller.update(cx, |ctl, _| {
+                    ctl.notice = Some(
+                        rust_i18n::t!("workspace.embed_failed_with", error = e.to_string())
+                            .to_string(),
+                    );
+                });
+                return Vec::new();
+            }
+        };
     hits.into_iter()
         .map(|(a, score)| SearchResult {
             name: a.file_name,

@@ -791,9 +791,7 @@ fn clip_model_file_row(controller: &Entity<LibraryController>, cx: &mut App) -> 
                 .icon(IconName::Folder)
                 .tooltip(rust_i18n::t!("settings.open_model_dir").to_string())
                 .on_click(move |_, _, _cx| {
-                    let dir = config
-                        .clip_model_dir()
-                        .unwrap_or_else(std::env::temp_dir);
+                    let dir = config.clip_model_dir().unwrap_or_else(std::env::temp_dir);
                     reveal_in_file_manager(&dir);
                 }),
         )
@@ -874,7 +872,10 @@ fn semantic_status_row(cx: &mut App) -> Div {
                 cx.theme().danger,
             )
         } else {
-            (rust_i18n::t!("settings.status_ready").to_string(), cx.theme().success)
+            (
+                rust_i18n::t!("settings.status_ready").to_string(),
+                cx.theme().success,
+            )
         }
     } else if let Some(rest) = status.strip_prefix("failed:") {
         // Show the actual error (missing lib, missing file, load failure).
@@ -919,9 +920,7 @@ fn embed_coverage_row(controller: &Entity<LibraryController>, cx: &mut App) -> D
                 .mt_1()
                 .text_sm()
                 .text_color(cx.theme().danger)
-                .child(
-                    rust_i18n::t!("settings.dim_mismatch", count = mismatched).to_string(),
-                ),
+                .child(rust_i18n::t!("settings.dim_mismatch", count = mismatched).to_string()),
         );
     }
     row
@@ -972,12 +971,8 @@ fn embed_all_row(controller: Entity<LibraryController>, cx: &mut App) -> Div {
                     ctl.update(cx, |ctl, cx| {
                         ctl.busy = false;
                         ctl.notice = Some(
-                            rust_i18n::t!(
-                                "settings.embed_done",
-                                done = done,
-                                skipped = skipped
-                            )
-                            .to_string(),
+                            rust_i18n::t!("settings.embed_done", done = done, skipped = skipped)
+                                .to_string(),
                         );
                         cx.notify();
                     });
