@@ -183,7 +183,7 @@ Test status: `trove-core` compiles and all **75** tests pass. `trove-app` compil
 
 ## Status
 
-- **trove-core** — feature-complete for the above list; tested (75 tests).
+- **trove-core** — feature-complete for the above list; tested (83 tests).
 - **trove-app** — compiles and runs: dock layout, custom title bar, justified thumbnail grid, drag & drop, multi-select, context menus, settings dialog, inspector, visual + semantic search, and import with progress are all wired.
 
 ---
