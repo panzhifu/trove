@@ -395,6 +395,9 @@ pub struct AssetQuery {
     pub is_favorite: Option<bool>,
     /// Only assets flagged with this color label.
     pub color_label: Option<String>,
+    /// Only assets whose recorded source path starts with this prefix
+    /// (folders panel). Escaped LIKE match.
+    pub source_path_prefix: Option<String>,
     pub is_trashed: bool,
     /// Sort key of the listing (default: import time).
     pub sort: AssetSort,

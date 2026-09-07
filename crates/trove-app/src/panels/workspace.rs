@@ -119,6 +119,7 @@ struct ViewKey {
     in_trash: bool,
     smart: Option<Uuid>,
     tag: Option<Uuid>,
+    folder: Option<String>,
     search: String,
     filter_kind: Option<AssetKind>,
     filter_favorite: bool,
@@ -692,6 +693,7 @@ impl Render for WorkspacePanel {
             view_mode,
             sort,
             sort_desc,
+            active_folder,
         ) = {
             let ctl = self.controller.read(cx);
             (
@@ -707,6 +709,7 @@ impl Render for WorkspacePanel {
                 ctl.view_mode,
                 ctl.sort,
                 ctl.sort_desc,
+                ctl.active_folder.clone(),
             )
         };
         let library_root = self.controller.read(cx).library.root().to_path_buf();
@@ -720,6 +723,7 @@ impl Render for WorkspacePanel {
                 tag_ids: active_tag.map(|t| vec![t]).unwrap_or_default(),
                 kind: filter_kind,
                 is_favorite: filter_favorite.then_some(true),
+                source_path_prefix: active_folder.clone(),
                 is_trashed: false,
                 text: None,
                 limit,
@@ -763,6 +767,11 @@ impl Render for WorkspacePanel {
                     // ignores the grid filters entirely.
                     kind: if in_trash { None } else { filter_kind },
                     is_favorite: (!in_trash && filter_favorite).then_some(true),
+                    source_path_prefix: if in_trash {
+                        None
+                    } else {
+                        active_folder.clone()
+                    },
                     is_trashed: in_trash,
                     sort,
                     sort_desc,
@@ -846,6 +855,7 @@ impl Render for WorkspacePanel {
                 || k.in_trash != in_trash
                 || k.smart != smart
                 || k.tag != active_tag
+                || k.folder != active_folder
                 || k.search != search
                 || k.filter_kind != filter_kind
                 || k.filter_favorite != filter_favorite
@@ -880,6 +890,7 @@ impl Render for WorkspacePanel {
             in_trash,
             smart,
             tag: active_tag,
+            folder: active_folder.clone(),
             search: search.clone(),
             filter_kind,
             filter_favorite,

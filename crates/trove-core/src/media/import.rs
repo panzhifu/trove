@@ -225,6 +225,11 @@ pub fn commit_staged(
     let mined = &staged.mined;
     let mut extra = std::collections::BTreeMap::new();
     extra.extend(mined.extra.clone());
+    // Remember where the file came from: the folders panel browses by it.
+    extra.insert(
+        "source_path".into(),
+        serde_json::Value::String(staged.path.display().to_string()),
+    );
 
     // Note: visual signature is computed in background after import to keep
     // the import pipeline fast. See `compute_visual_signature_background()`.
