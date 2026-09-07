@@ -15,6 +15,42 @@ use trove_core::media::import;
 
 use crate::state::LibraryController;
 
+/// Embed freshly imported images, one per main-thread turn with a short
+/// yield in between, so the UI stays responsive. `Store` is thread-confined
+/// (`Rc<RefCell<Connection>>`), so this must run on the foreground executor;
+/// only the model inference blocks, and only for one image at a time.
+/// Per-asset logic lives in `clip::embed_asset` (core).
+async fn embed_imported_images(
+    controller: Entity<LibraryController>,
+    store: trove_core::store::Store,
+    root: PathBuf,
+    imported_ids: Vec<uuid::Uuid>,
+    cx: &mut AsyncApp,
+) {
+    use trove_core::media::clip;
+    if !clip::semantic_ready() || imported_ids.is_empty() {
+        return;
+    }
+    let total = imported_ids.len();
+    let mut done = 0usize;
+    for id in imported_ids {
+        // Persistent per-file failures are counted, not spammed; the user can
+        // see them via Settings ▸ Search ▸ embed-all (which reports skipped).
+        if matches!(clip::embed_asset(&store, &root, id), Ok(true)) {
+            done += 1;
+        }
+        cx.background_executor()
+            .timer(std::time::Duration::from_millis(50))
+            .await;
+    }
+    let _ = controller.update(cx, |ctl, cx| {
+        ctl.notice = Some(
+            rust_i18n::t!("notice.embedded_done", done = done, total = total).to_string(),
+        );
+        cx.notify();
+    });
+}
+
 /// Marker type for the import progress toast: pushing with the same id
 /// replaces the previous toast instead of stacking a new one.
 pub struct ImportNotice;
@@ -63,11 +99,15 @@ pub fn import_paths_app(
     let handle = window.window_handle();
     let task = cx
         .background_executor()
-        .spawn(async move { import::stage_all(&library_root, &paths) });
+        .spawn({
+            let library_root = library_root.clone();
+            async move { import::stage_all(&library_root, &paths) }
+        });
 
     cx.spawn(async move |cx| {
         let staged = task.await;
         let mut report = import::ImportReport::default();
+        let mut imported_ids: Vec<uuid::Uuid> = Vec::new();
 
         // Commit one file per main-thread turn, yielding in between so the
         // UI (status bar + progress toast) repaints with live per-file
@@ -77,7 +117,10 @@ pub fn import_paths_app(
                 match item {
                     Ok(file) => {
                         match import::commit_staged(ctl.library.store(), into_collection, &file) {
-                            Ok(imported) => report.imported.push(imported),
+                            Ok(imported) => {
+                                imported_ids.push(imported.asset_id);
+                                report.imported.push(imported);
+                            }
                             Err(e) => report.skipped.push(import::ImportSkip {
                                 path: file.path,
                                 reason: e.to_string(),
@@ -112,6 +155,13 @@ pub fn import_paths_app(
             ctl.finish_import(report.imported_count(), report.skipped_count());
             cx.notify();
         });
+
+        // Embed newly imported images in the background (one per frame).
+        if !imported_ids.is_empty() {
+            let store = controller.update(cx, |ctl, _| ctl.library.store().clone());
+            embed_imported_images(controller.clone(), store, library_root, imported_ids, cx)
+                .await;
+        }
 
         let note = if report.skipped.is_empty() {
             Notification::success(

@@ -199,6 +199,7 @@ impl DockPanel for WorkspacePanel {
         let ctl = self.controller.read(cx);
         let in_trash = ctl.showing_trash;
         let search_active = !in_trash && !ctl.search_text.trim().is_empty();
+        let semantic = ctl.semantic_search;
         let loaded = ctl.grid_loaded.min(self.last_total);
         let total = self.last_total;
         let _ = ctl;
@@ -270,6 +271,23 @@ impl DockPanel for WorkspacePanel {
                             .label(rust_i18n::t!("workspace.empty_all").to_string())
                             .tooltip(rust_i18n::t!("workspace.empty_all_tooltip").to_string())
                             .on_click(cx.listener(|this, _, _, cx| this.empty_trash(cx))),
+                    )
+                })
+                .when(search_active, |this| {
+                    // Semantic (CLIP) vs FTS toggle for the active search.
+                    this.child(
+                        Button::new("semantic-toggle")
+                            .xsmall()
+                            .when(semantic, |b| b.primary())
+                            .when(!semantic, |b| b.ghost())
+                            .label("CLIP")
+                            .tooltip(rust_i18n::t!("workspace.semantic_toggle").to_string())
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.controller.update(cx, |ctl, cx| {
+                                    ctl.toggle_semantic_search();
+                                    cx.notify();
+                                });
+                            })),
                     )
                 })
                 .when(search_active, |this| {
@@ -756,10 +774,19 @@ impl Render for WorkspacePanel {
         };
         let library_root = self.controller.read(cx).library.root().to_path_buf();
 
-        // --- paged query (three mutually-exclusive view drivers) -----------
+        // --- paged query (four mutually-exclusive view drivers) -----------
         let limit = Some(grid_loaded as u32);
         let search_active = !in_trash && !search.is_empty();
-        let (total, list): (usize, Vec<trove_core::model::Asset>) = if search_active {
+        let semantic = self.controller.read(cx).semantic_search;
+        let (total, list): (usize, Vec<trove_core::model::Asset>) = if search_active && semantic {
+            // Semantic (CLIP) text search: embed the query, rank by cosine.
+            // Errors (engine not configured) surface via Settings; the grid
+            // just shows an empty result set.
+            match self.controller.read(cx).semantic_text_search(&search, limit) {
+                Ok(list) => (list.len(), list),
+                Err(_) => (0, Vec::new()),
+            }
+        } else if search_active {
             let q = AssetQuery {
                 collection_id: collection,
                 tag_ids: active_tag.map(|t| vec![t]).unwrap_or_default(),

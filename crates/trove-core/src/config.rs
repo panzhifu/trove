@@ -37,6 +37,10 @@ pub struct AppConfig {
     /// `ORT_DYLIB_PATH` env var then the executable / config directory.
     #[serde(default)]
     pub ort_lib_path: Option<PathBuf>,
+    /// Minimum cosine similarity for a semantic (CLIP) search hit. Lower =
+    /// more (noisier) results. Clamped to 0.0..1.0; defaults to 0.2.
+    #[serde(default)]
+    pub semantic_min_similarity: Option<f32>,
 }
 
 impl AppConfig {
@@ -94,6 +98,11 @@ impl AppConfig {
     /// Effective search mode ("visual" or "semantic"). Defaults to visual.
     pub fn search_mode(&self) -> String {
         self.search_mode.as_deref().unwrap_or("visual").to_string()
+    }
+
+    /// Effective semantic-search similarity threshold, clamped to 0.0..1.0.
+    pub fn semantic_min_similarity(&self) -> f32 {
+        self.semantic_min_similarity.unwrap_or(0.2).clamp(0.0, 1.0)
     }
 
     /// Directory that should hold the CLIP model file.

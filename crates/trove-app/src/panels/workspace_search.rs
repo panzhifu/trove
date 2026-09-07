@@ -65,7 +65,7 @@ pub(crate) fn open_image_search(
         )
     };
     let results: Vec<SearchResult> = match mode.as_str() {
-        "semantic" => semantic_search(&store, controller, &query_path, cx),
+        "semantic" => semantic_search(controller, &query_path, cx),
         _ => visual_search(&store, &query_path),
     };
 
@@ -92,7 +92,6 @@ fn visual_search(store: &trove_core::store::Store, query_path: &Path) -> Vec<Sea
 
 /// Semantic search: CLIP embedding cosine similarity.
 fn semantic_search(
-    store: &trove_core::store::Store,
     controller: &Entity<LibraryController>,
     query_path: &Path,
     cx: &mut App,
@@ -103,8 +102,15 @@ fn semantic_search(
         });
         return Vec::new();
     }
-    let query_vec = match trove_core::media::clip::image_embedding(query_path) {
-        Ok(v) => v,
+    // The whole pipeline (query embedding + cosine ranking + asset fetch)
+    // lives behind the Library facade; the threshold comes from config.
+    let threshold = trove_core::config::AppConfig::load().semantic_min_similarity();
+    let hits = match controller.read(cx).library.semantic_image_search(
+        query_path,
+        threshold,
+        Some(50),
+    ) {
+        Ok(hits) => hits,
         Err(e) => {
             let _ = controller.update(cx, |ctl, _| {
                 ctl.notice = Some(
@@ -115,19 +121,11 @@ fn semantic_search(
             return Vec::new();
         }
     };
-    let query_emb = trove_core::media::clip::Embedding::new(query_vec);
-    let scored =
-        trove_core::media::clip::semantic_search(store, &query_emb, Some(50)).unwrap_or_default();
-    let conn = store.conn();
-    scored
-        .into_iter()
-        .filter_map(|(id, score)| {
-            let a = trove_core::store::assets::get(conn, id).ok().flatten()?;
-            Some(SearchResult {
-                name: a.file_name,
-                score,
-                sha256: a.sha256,
-            })
+    hits.into_iter()
+        .map(|(a, score)| SearchResult {
+            name: a.file_name,
+            score,
+            sha256: a.sha256,
         })
         .collect()
 }

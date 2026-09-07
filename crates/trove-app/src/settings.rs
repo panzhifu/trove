@@ -695,6 +695,16 @@ fn search_page(controller: &Entity<LibraryController>) -> SettingPage {
                 )
                 .item(
                     SettingItem::new(
+                        rust_i18n::t!("settings.embed_coverage").to_string(),
+                        SettingField::render({
+                            let controller = controller.clone();
+                            move |_, _, cx| embed_coverage_row(&controller, cx)
+                        }),
+                    )
+                    .description(rust_i18n::t!("settings.embed_coverage_desc").to_string()),
+                )
+                .item(
+                    SettingItem::new(
                         rust_i18n::t!("settings.embed_all").to_string(),
                         SettingField::render({
                             let controller = controller.clone();
@@ -855,8 +865,31 @@ fn semantic_status_row(cx: &mut App) -> Div {
     div().text_sm().text_color(color).child(label)
 }
 
-/// Embed-all button: runs `embed_all_missing` on a worker thread and reports
-/// the result via the controller's notice line.
+/// Embedding coverage: how many live images carry a CLIP vector already.
+/// Re-computed on every settings render — two COUNT queries, negligible.
+fn embed_coverage_row(controller: &Entity<LibraryController>, cx: &mut App) -> Div {
+    let (embedded, total) = controller
+        .read(cx)
+        .library
+        .embedding_status()
+        .unwrap_or((0, 0));
+    div()
+        .text_sm()
+        .text_color(cx.theme().muted_foreground)
+        .child(
+            rust_i18n::t!(
+                "settings.embed_coverage_value",
+                embedded = embedded,
+                total = total
+            )
+            .to_string(),
+        )
+}
+
+/// Embed-all button. The Store is thread-confined (`Rc<RefCell>`), so the
+/// batch runs as one asset per main-thread turn with a short yield between —
+/// the UI repaints continuously instead of freezing for the whole batch.
+/// Per-asset work lives in `Library::embed_one` (core).
 fn embed_all_row(controller: Entity<LibraryController>, cx: &mut App) -> Div {
     let busy = controller.read(cx).busy;
     h_flex().w_full().justify_end().child(
@@ -869,8 +902,6 @@ fn embed_all_row(controller: Entity<LibraryController>, cx: &mut App) -> Div {
                 if !trove_core::media::clip::semantic_ready() {
                     return;
                 }
-                let library_root = controller.read(cx).library.root().to_path_buf();
-                let store = controller.read(cx).library.store().clone();
                 let ctl = controller.clone();
                 ctl.update(cx, |ctl, cx| {
                     ctl.busy = true;
@@ -878,26 +909,36 @@ fn embed_all_row(controller: Entity<LibraryController>, cx: &mut App) -> Div {
                     cx.notify();
                 });
                 cx.spawn(async move |cx| {
-                    let res = trove_core::media::clip::embed_all_missing(&store, &library_root);
-                    let _ = cx.update(|cx| {
-                        let _ = ctl.update(cx, |ctl, cx| {
-                            ctl.busy = false;
-                            ctl.notice = match res {
-                                Ok((done, skipped)) => Some(
-                                    rust_i18n::t!(
-                                        "settings.embed_done",
-                                        done = done,
-                                        skipped = skipped
-                                    )
-                                    .to_string(),
-                                ),
-                                Err(e) => Some(
-                                    rust_i18n::t!("settings.job_failed", error = e.to_string())
-                                        .to_string(),
-                                ),
-                            };
-                            cx.notify();
-                        });
+                    // Plan on the main thread (Library is not Send).
+                    let missing: Vec<uuid::Uuid> = ctl.update(cx, |ctl, _| {
+                        trove_core::store::assets::images_missing_embedding(
+                            ctl.library.store().conn(),
+                        )
+                        .map(|v| v.into_iter().map(|(id, _)| id).collect())
+                        .unwrap_or_default()
+                    });
+                    let mut done = 0u64;
+                    let mut skipped = 0u64;
+                    for id in missing {
+                        match ctl.update(cx, |ctl, _| ctl.library.embed_one(id)) {
+                            Ok(true) => done += 1,
+                            _ => skipped += 1,
+                        }
+                        cx.background_executor()
+                            .timer(std::time::Duration::from_millis(20))
+                            .await;
+                    }
+                    let _ = ctl.update(cx, |ctl, cx| {
+                        ctl.busy = false;
+                        ctl.notice = Some(
+                            rust_i18n::t!(
+                                "settings.embed_done",
+                                done = done,
+                                skipped = skipped
+                            )
+                            .to_string(),
+                        );
+                        cx.notify();
                     });
                 })
                 .detach();

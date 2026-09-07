@@ -48,8 +48,14 @@ impl Embedding {
     }
 
     /// Cosine similarity (dot product of normalized vectors, -1.0–1.0).
+    ///
+    /// Returns `0.0` for dimension-mismatched vectors instead of panicking —
+    /// rows written by an older model (different dim) must never crash a
+    /// search. `semantic_search` filters those out explicitly.
     pub fn cosine_similarity(&self, other: &Self) -> f32 {
-        assert_eq!(self.data.len(), other.data.len(), "dimension mismatch");
+        if self.data.len() != other.data.len() {
+            return 0.0;
+        }
         self.data
             .iter()
             .zip(other.data.iter())
@@ -317,58 +323,68 @@ pub fn text_embedding(text: &str) -> Result<Vec<f32>> {
 }
 
 // ---------------------------------------------------------------------------
-// Storage helpers (embedding BLOB on the assets table)
+// Embedding pipeline (compute here; all SQL lives in `store::assets`)
 // ---------------------------------------------------------------------------
 
-use rusqlite::types::Value;
-
-/// Store an embedding for an asset.
-pub fn store_embedding(
+/// Embed a single image asset and store the vector. Skips non-images, assets
+/// without a blob file, and assets that already carry an embedding. Returns
+/// `Ok(true)` when a new embedding was stored, `Ok(false)` when skipped.
+pub fn embed_asset(
     store: &crate::store::Store,
+    library_root: &Path,
     asset_id: uuid::Uuid,
-    emb: &Embedding,
-) -> Result<()> {
+) -> Result<bool> {
+    use crate::store::assets;
     let conn = store.conn();
-    crate::store::rows::execute(
-        conn,
-        "UPDATE assets SET embedding = ?1 WHERE id = ?2",
-        vec![
-            Value::Blob(emb.to_bytes()),
-            crate::store::rows::uuid(asset_id).into(),
-        ],
-    )?;
-    Ok(())
+    let Some(asset) = assets::get(conn, asset_id)? else {
+        return Ok(false);
+    };
+    if asset.kind != crate::model::AssetKind::Image {
+        return Ok(false);
+    }
+    if assets::has_embedding(conn, asset_id)? {
+        return Ok(false);
+    }
+    let Some(rel) = asset.rel_path else {
+        return Ok(false);
+    };
+    let path = library_root.join(rel);
+    if !path.is_file() {
+        return Ok(false);
+    }
+    let vec = image_embedding(&path)?;
+    assets::set_embedding(conn, asset_id, &Embedding::new(vec).to_bytes())?;
+    Ok(true)
 }
 
 /// Embed every image asset that has no embedding yet. Returns (done, skipped).
 pub fn embed_all_missing(store: &crate::store::Store, library_root: &Path) -> Result<(u64, u64)> {
+    use crate::store::assets;
     let conn = store.conn();
-    let assets = crate::store::rows::query_map(
-        conn,
-        "SELECT id, rel_path FROM assets WHERE kind = 'image' AND trashed_at IS NULL AND embedding IS NULL",
-        vec![],
-        |row| {
-            Ok((
-                crate::store::rows::req_uuid(row, 0)?,
-                crate::store::rows::opt_str(row, 1)?,
-            ))
-        },
-    )?;
+    let missing = assets::images_missing_embedding(conn)?;
     let mut done = 0_u64;
     let mut skipped = 0_u64;
-    for (id, rel) in assets {
+    for (id, rel) in missing {
+        match assets::get(conn, id) {
+            // Re-check the blob file here so a missing file counts as skipped
+            // without going through the (expensive) model call.
+            Ok(Some(asset)) if asset.rel_path.is_some() => {}
+            _ => {
+                skipped += 1;
+                continue;
+            }
+        }
         let Some(rel) = rel else {
             skipped += 1;
             continue;
         };
-        let p = library_root.join("media").join(rel);
-        if !p.is_file() {
+        if !library_root.join(&rel).is_file() {
             skipped += 1;
             continue;
         }
-        match image_embedding(&p) {
+        match image_embedding(&library_root.join(rel)) {
             Ok(vec) => {
-                store_embedding(store, id, &Embedding::new(vec))?;
+                assets::set_embedding(conn, id, &Embedding::new(vec).to_bytes())?;
                 done += 1;
             }
             Err(_) => skipped += 1,
@@ -377,31 +393,37 @@ pub fn embed_all_missing(store: &crate::store::Store, library_root: &Path) -> Re
     Ok((done, skipped))
 }
 
-/// Rank assets by cosine similarity against a query embedding.
+/// Rank assets by cosine similarity against a query embedding. Rows whose
+/// dimension differs from the query (e.g. written by an older model) are
+/// ignored. `min_similarity` filters out noise; typical CLIP text-to-image
+/// matches land above 0.2–0.3.
 pub fn semantic_search(
     store: &crate::store::Store,
     query: &Embedding,
+    min_similarity: f32,
     limit: Option<u32>,
 ) -> Result<Vec<(uuid::Uuid, f32)>> {
-    let conn = store.conn();
-    let rows = crate::store::rows::query_map(
-        conn,
-        "SELECT id, embedding FROM assets WHERE embedding IS NOT NULL AND trashed_at IS NULL",
-        vec![],
-        |row| {
-            let id = crate::store::rows::req_uuid(row, 0)?;
-            let bytes: Vec<u8> = row.get(1)?;
-            Ok((id, bytes))
-        },
-    )?;
+    let rows = crate::store::assets::all_embeddings(store.conn(), 500)?;
+    let mut mismatched = 0usize;
     let mut scored = Vec::new();
     for (id, bytes) in rows {
         if let Some(emb) = Embedding::from_bytes(&bytes) {
+            if emb.dim() != query.dim() {
+                mismatched += 1;
+                continue;
+            }
             let sim = query.cosine_similarity(&emb);
-            if sim > 0.2 {
+            if sim > min_similarity {
                 scored.push((id, sim));
             }
         }
+    }
+    if mismatched > 0 {
+        // Surface silently-swallowed rows through stderr; a model change is
+        // the usual cause and users should re-embed (Settings ▸ Search).
+        eprintln!(
+            "[trove] semantic_search: ignored {mismatched} embeddings with a              different dimension — re-run embed-all after a model change"
+        );
     }
     scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     scored.truncate(limit.unwrap_or(50) as usize);
