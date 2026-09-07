@@ -3,8 +3,8 @@
 use std::path::{Path, PathBuf};
 
 use gpui_kit::base::{h_flex, v_flex};
-use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::WindowExt as _;
+use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::{ActiveTheme, Icon, IconName};
 use gpui_kit::*;
 use uuid::Uuid;
@@ -31,7 +31,9 @@ pub(crate) fn open_image_search(
         let ctl = controller.read(cx);
         let conn = ctl.library.store().conn();
         let library_root = ctl.library.root().to_path_buf();
-        let asset = trove_core::store::assets::get(conn, asset_id).ok().flatten();
+        let asset = trove_core::store::assets::get(conn, asset_id)
+            .ok()
+            .flatten();
         let Some(asset) = asset else { return };
         if asset.kind != trove_core::model::AssetKind::Image {
             return;
@@ -108,8 +110,8 @@ fn semantic_search(
         return Vec::new();
     };
     let query_emb = trove_core::media::clip::Embedding::new(query_vec);
-    let scored = trove_core::media::clip::semantic_search(store, &query_emb, Some(50))
-        .unwrap_or_default();
+    let scored =
+        trove_core::media::clip::semantic_search(store, &query_emb, Some(50)).unwrap_or_default();
     let conn = store.conn();
     scored
         .into_iter()

@@ -702,6 +702,18 @@ fn search_page(controller: &Entity<LibraryController>) -> SettingPage {
                         }),
                     )
                     .description(rust_i18n::t!("settings.embed_all_desc").to_string()),
+                )
+                .item(
+                    SettingItem::new(
+                        rust_i18n::t!("settings.model_files_hint").to_string(),
+                        SettingField::render(move |_, _, cx| {
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(rust_i18n::t!("settings.model_files_hint").to_string())
+                        }),
+                    )
+                    .description(rust_i18n::t!("settings.model_files_hint_desc").to_string()),
                 ),
         )
 }
@@ -723,8 +735,9 @@ fn search_mode_options() -> Vec<(SharedString, SharedString)> {
     ]
 }
 
-/// Model-directory row: shows the resolved path and a Browse button that
-/// opens a folder picker and saves the choice.
+/// Model-file row: shows the resolved path, a Browse button (file picker)
+/// and an Open-Directory button (reveals the folder in the file manager so
+/// the user can drop the downloaded model + ONNX Runtime lib there).
 fn clip_model_file_row(controller: &Entity<LibraryController>, cx: &mut App) -> Div {
     let config = AppConfig::load();
     let path = config
@@ -746,6 +759,19 @@ fn clip_model_file_row(controller: &Entity<LibraryController>, cx: &mut App) -> 
                 .child(path),
         )
         .child(
+            Button::new("open-model-dir")
+                .ghost()
+                .xsmall()
+                .label("📁")
+                .tooltip(rust_i18n::t!("settings.open_model_dir").to_string())
+                .on_click(move |_, _, _cx| {
+                    let dir = config
+                        .clip_model_dir()
+                        .unwrap_or_else(|| std::env::temp_dir());
+                    reveal_in_file_manager(&dir);
+                }),
+        )
+        .child(
             Button::new("browse-model-file")
                 .outline()
                 .small()
@@ -758,6 +784,19 @@ fn clip_model_file_row(controller: &Entity<LibraryController>, cx: &mut App) -> 
 }
 
 /// Pick the single CLIP ONNX model file via the system dialog and persist it.
+/// Reveal a directory in the system file manager (cross-platform).
+fn reveal_in_file_manager(path: &std::path::Path) {
+    let path = path.to_string_lossy().to_string();
+    let _ = if cfg!(target_os = "windows") {
+        std::process::Command::new("explorer").arg(&path).spawn()
+    } else if cfg!(target_os = "macos") {
+        std::process::Command::new("open").arg(&path).spawn()
+    } else {
+        // Linux: try xdg-open, then fall back to common file managers.
+        std::process::Command::new("xdg-open").arg(&path).spawn()
+    };
+}
+
 fn prompt_model_file(controller: &Entity<LibraryController>, cx: &mut App) {
     let rx = cx.prompt_for_paths(PathPromptOptions {
         files: true,
@@ -793,7 +832,8 @@ fn prompt_model_file(controller: &Entity<LibraryController>, cx: &mut App) {
     .detach();
 }
 
-/// Shows the live engine status string.
+/// Shows the live engine status string with the concrete failure reason
+/// when initialization failed, so the user knows what to fix.
 fn semantic_status_row(cx: &mut App) -> Div {
     let status = trove_core::media::clip::semantic_status();
     let (label, color) = if status == "ready" {
@@ -802,12 +842,15 @@ fn semantic_status_row(cx: &mut App) -> Div {
             cx.theme().success,
         )
     } else if let Some(rest) = status.strip_prefix("failed:") {
+        // Show the actual error (missing lib, missing file, load failure).
         (rest.to_string(), cx.theme().danger)
     } else {
-        (
+        // Never configured: hint at the two prerequisites.
+        let hint = format!(
+            "{} (model.onnx + libonnxruntime.so)",
             rust_i18n::t!("settings.status_unconfigured").to_string(),
-            cx.theme().muted_foreground,
-        )
+        );
+        (hint, cx.theme().muted_foreground)
     };
     div().text_sm().text_color(color).child(label)
 }
