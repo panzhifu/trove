@@ -84,9 +84,9 @@ impl InspectorPanel {
         observe_controller(cx, &this.controller);
 
         let input = this.tag_input.clone();
-        cx.subscribe_in(&input, window, |this, _, event, _window, cx| {
+        cx.subscribe_in(&input, window, |this, _, event, window, cx| {
             if matches!(event, InputEvent::PressEnter { .. }) {
-                this.add_tag_from_input(cx);
+                this.add_tag_from_input(window, cx);
             }
         })
         .detach();
@@ -107,7 +107,7 @@ impl InspectorPanel {
         this
     }
 
-    fn add_tag_from_input(&mut self, cx: &mut Context<Self>) {
+    fn add_tag_from_input(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let name: String = self.tag_input.read(cx).value().to_string();
         let name = name.trim().to_string();
         if name.is_empty() {
@@ -125,6 +125,9 @@ impl InspectorPanel {
             ctl.generation += 1;
             cx.notify();
         });
+        // Clear the input after adding the tag.
+        self.tag_input
+            .update(cx, |state, cx| state.set_value("", window, cx));
     }
 
     /// Replace the asset's whole tag group with the comma-separated names in
@@ -247,7 +250,7 @@ impl InspectorPanel {
             .flatten()
             .map(|a| {
                 (
-                    a.title.unwrap_or_default(),
+                    a.title.unwrap_or_else(|| a.file_name.clone()),
                     a.description.unwrap_or_default(),
                     a.source_url.unwrap_or_default(),
                 )
@@ -440,37 +443,51 @@ impl Render for InspectorPanel {
                 cx,
                 rust_i18n::t!("inspector.tags").to_string(),
             ))
-            .child(v_flex().gap_1().children(asset_tags.iter().map(|tag| {
-                let id = tag.id;
-                let controller = self.controller.clone();
+            .child(
                 h_flex()
-                    .gap_1()
-                    .items_center()
-                    .child(
+                    .flex_wrap()
+                    .gap_1p5()
+                    .children(asset_tags.iter().map(|tag| {
+                        let id = tag.id;
+                        let controller = self.controller.clone();
+                        let tag_color = tag.color.as_deref().and_then(hex_to_rgb);
                         div()
                             .px_2()
                             .py_0p5()
                             .rounded(cx.theme().radius)
                             .bg(cx.theme().secondary)
                             .text_sm()
-                            .text_color(cx.theme().foreground)
-                            .child(tag.name.clone()),
-                    )
-                    .child(
-                        Button::new(format!("untag-{id}"))
-                            .xsmall()
-                            .ghost()
-                            .label("×")
-                            .on_click(move |_, _, cx| {
-                                controller.update(cx, move |ctl, cx| {
-                                    let _ = ctl.library.tag_assets(&[asset_id], id, false);
-                                    ctl.generation += 1;
-                                    cx.notify();
-                                });
-                            }),
-                    )
-                    .into_any_element()
-            })))
+                            .text_color(
+                                tag_color
+                                    .map(gpui_kit::rgb)
+                                    .unwrap_or_else(|| cx.theme().foreground.into()),
+                            )
+                            .child(
+                                h_flex()
+                                    .gap_0p5()
+                                    .items_center()
+                                    .child(tag.name.clone())
+                                    .child(
+                                        Button::new(format!("untag-{id}"))
+                                            .xsmall()
+                                            .ghost()
+                                            .label("×")
+                                            .on_click(move |_, _, cx| {
+                                                controller.update(cx, move |ctl, cx| {
+                                                    let _ = ctl.library.tag_assets(
+                                                        &[asset_id],
+                                                        id,
+                                                        false,
+                                                    );
+                                                    ctl.generation += 1;
+                                                    cx.notify();
+                                                });
+                                            }),
+                                    ),
+                            )
+                            .into_any_element()
+                    })),
+            )
             .child(
                 h_flex()
                     .gap_1()
