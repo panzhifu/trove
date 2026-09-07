@@ -562,6 +562,7 @@ mod tests {
             &NewTag {
                 name: "landscape".into(),
                 color: None,
+                parent_id: None,
             },
         )
         .unwrap();
@@ -570,6 +571,7 @@ mod tests {
             &NewTag {
                 name: "night".into(),
                 color: None,
+                parent_id: None,
             },
         )
         .unwrap();
@@ -628,6 +630,7 @@ mod tests {
             &NewTag {
                 name: "nature".into(),
                 color: None,
+                parent_id: None,
             },
         )
         .unwrap();
@@ -910,7 +913,7 @@ mod tests {
         let bad = smart_node(serde_json::json!({
             "op": "match", "field": "color", "value": "notacolor"
         }));
-        assert!(super::smart::compile(&bad).is_err());
+        assert!(super::smart::compile(None, &bad).is_err());
     }
 
     #[test]
@@ -938,12 +941,12 @@ mod tests {
         let bad_type = smart_node(serde_json::json!({
             "op": "match", "field": "rating", "value": "high"
         }));
-        assert!(super::smart::compile(&bad_type).is_err());
+        assert!(super::smart::compile(None, &bad_type).is_err());
 
         let bad_op = smart_node(serde_json::json!({
             "op": "match", "field": "kind", "compare": "gt", "value": "image"
         }));
-        assert!(super::smart::compile(&bad_op).is_err());
+        assert!(super::smart::compile(None, &bad_op).is_err());
     }
 
     #[test]
@@ -1010,6 +1013,7 @@ mod tests {
             &NewTag {
                 name: "beach".into(),
                 color: None,
+                parent_id: None,
             },
         )
         .unwrap();
@@ -1036,6 +1040,7 @@ mod tests {
             &NewTag {
                 name: "night".into(),
                 color: None,
+                parent_id: None,
             },
         )
         .unwrap();
@@ -1052,6 +1057,7 @@ mod tests {
             &NewTag {
                 name: "t".into(),
                 color: None,
+                parent_id: None,
             },
         )
         .unwrap();
@@ -1149,6 +1155,7 @@ mod tests {
             &NewTag {
                 name: "beach".into(),
                 color: None,
+                parent_id: None,
             },
         )
         .unwrap();

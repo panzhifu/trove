@@ -538,6 +538,40 @@ impl Library {
         tags::delete(self.store.conn(), tag_id)
     }
 
+    /// Create a tag under an optional parent (hierarchical tags).
+    pub fn create_tag(&self, name: &str, parent: Option<Uuid>) -> Result<crate::model::Tag> {
+        if let Some(pid) = parent {
+            let conn = self.store.conn();
+            if tags::get(conn, pid)?.is_none() {
+                return Err(crate::Error::NotFound("parent tag"));
+            }
+        }
+        tags::create(
+            self.store.conn(),
+            &crate::model::NewTag {
+                name: name.to_string(),
+                color: None,
+                parent_id: parent,
+            },
+        )
+    }
+
+    /// Move a tag under `parent` (`None` = root). Undoable; cycles and
+    /// self-parenting are rejected by the store.
+    pub fn set_tag_parent(&self, tag_id: Uuid, parent: Option<Uuid>) -> Result<()> {
+        let conn = self.store.conn();
+        let before = tags::get(conn, tag_id)?
+            .ok_or(crate::Error::NotFound("tag"))?
+            .parent_id;
+        tags::move_to(conn, tag_id, parent)?;
+        self.undo.record(Op::TagParent {
+            id: tag_id,
+            before,
+            after: parent,
+        });
+        Ok(())
+    }
+
     /// Attach (`add = true`) or detach one tag on many assets, recording the
     /// per-asset tag-group delta.
     pub fn tag_assets(&self, asset_ids: &[Uuid], tag_id: Uuid, add: bool) -> Result<()> {
@@ -759,15 +793,39 @@ impl Library {
         let conn = self.store.conn();
 
         // Tags: names are unique (case-insensitive), so an existing tag with
-        // the same name is reused instead of duplicated.
+        // the same name is reused instead of duplicated. Hierarchy is
+        // restored in a second pass, and only onto newly created tags so a
+        // restore never reshuffles an existing tag tree.
         let mut tag_map: std::collections::HashMap<Uuid, Uuid> = Default::default();
+        let mut created_tags: Vec<(Uuid, Option<Uuid>)> = Vec::new();
         for tag in file.tags {
-            match tags::ensure_named(conn, &tag.name) {
-                Ok(existing) => {
+            match tags::get_by_name(conn, &tag.name) {
+                Ok(Some(existing)) => {
                     tag_map.insert(tag.id, existing.id);
-                    report.tags += 1;
                 }
+                Ok(None) => match tags::create(
+                    conn,
+                    &crate::model::NewTag {
+                        name: tag.name.clone(),
+                        color: tag.color.clone(),
+                        parent_id: None,
+                    },
+                ) {
+                    Ok(created) => {
+                        tag_map.insert(tag.id, created.id);
+                        created_tags.push((created.id, tag.parent_id));
+                        report.tags += 1;
+                    }
+                    Err(_) => report.skipped += 1,
+                },
                 Err(_) => report.skipped += 1,
+            }
+        }
+        for (tag_id, exported_parent) in created_tags {
+            if let Some(old_parent) = exported_parent
+                && let Some(new_parent) = tag_map.get(&old_parent)
+            {
+                let _ = tags::move_to(conn, tag_id, Some(*new_parent));
             }
         }
 
@@ -1279,6 +1337,7 @@ mod tests {
             &crate::model::NewTag {
                 name: "landscape".into(),
                 color: None,
+                parent_id: None,
             },
         )
         .unwrap();
@@ -1572,5 +1631,93 @@ mod tests {
         assert!(healed.rel_path.is_some());
         let (total, _) = assets::query(conn, &AssetQuery::default()).unwrap();
         assert_eq!(total, 1);
+    }
+    #[test]
+    fn hierarchical_tags_filter_include_subtree() {
+        use crate::model::AssetPatch;
+        use crate::model::NewTag;
+        use crate::store::collections;
+
+        let (lib, dir) = temp_library("hier-tags");
+        let a = write_source(&dir, "alpha.png", PNG_1X1);
+        let b = write_source(&dir, "beta.txt", b"beta");
+        let ra = lib.import_files(std::slice::from_ref(&a), None).unwrap();
+        let rb = lib.import_files(std::slice::from_ref(&b), None).unwrap();
+        let (ia, ib) = (ra.imported[0].asset_id, rb.imported[0].asset_id);
+        let conn = lib.store().conn();
+
+        // animal > cat; animal > dog
+        let animal = tags::create(
+            conn,
+            &NewTag {
+                name: "animal".into(),
+                color: None,
+                parent_id: None,
+            },
+        )
+        .unwrap();
+        let cat = tags::create(
+            conn,
+            &NewTag {
+                name: "cat".into(),
+                color: None,
+                parent_id: Some(animal.id),
+            },
+        )
+        .unwrap();
+        tags::create(
+            conn,
+            &NewTag {
+                name: "dog".into(),
+                color: None,
+                parent_id: Some(animal.id),
+            },
+        )
+        .unwrap();
+
+        tags::add_to_asset(conn, ia, cat.id).unwrap();
+        lib.patch_asset(
+            ib,
+            &AssetPatch {
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        // Filtering by the parent finds assets tagged with the child.
+        let q = AssetQuery {
+            tag_ids: vec![animal.id],
+            ..Default::default()
+        };
+        let (total, page) = assets::query(conn, &q).unwrap();
+        assert_eq!((total, page.len()), (1, 1));
+        assert_eq!(page[0].id, ia);
+
+        // The subtree count matches the filter.
+        assert_eq!(tags::count_assets(conn, animal.id).unwrap(), 1);
+
+        // Smart collection by tag name includes the subtree.
+        let node = crate::store::smart::node_from_json(&serde_json::json!({
+            "op": "match", "field": "tag", "value": "animal"
+        }))
+        .unwrap();
+        let (n, ids) = crate::store::smart::evaluate(conn, &node, None, 0).unwrap();
+        assert_eq!((n, ids.as_slice()), (1, &[ia][..]));
+
+        // Moving `animal` under `cat` would create a cycle: rejected.
+        assert!(lib.set_tag_parent(animal.id, Some(cat.id)).is_err());
+        // A legal move is undoable.
+        lib.set_tag_parent(cat.id, None).unwrap();
+        lib.undo().unwrap();
+        assert_eq!(
+            tags::get(conn, cat.id).unwrap().unwrap().parent_id,
+            Some(animal.id)
+        );
+
+        // Deleting the parent promotes the children.
+        lib.delete_tag(animal.id).unwrap();
+        let cat_after = tags::get(conn, cat.id).unwrap().unwrap();
+        assert_eq!(cat_after.parent_id, None);
+        let _ = collections::roots(conn);
     }
 }

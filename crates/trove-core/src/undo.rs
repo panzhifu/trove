@@ -62,6 +62,11 @@ pub enum Op {
         before: Option<String>,
         after: Option<String>,
     },
+    TagParent {
+        id: Uuid,
+        before: Option<Uuid>,
+        after: Option<Uuid>,
+    },
     CollectionRename {
         id: Uuid,
         before: String,
@@ -126,6 +131,9 @@ impl Op {
             Op::TagColor { id, after, .. } => {
                 tags::set_color(conn, *id, after.as_deref())?;
             }
+            Op::TagParent { id, after, .. } => {
+                tags::move_to(conn, *id, *after)?;
+            }
             Op::CollectionRename { id, after, .. } => {
                 collections::rename(conn, *id, after)?;
             }
@@ -188,6 +196,11 @@ impl Op {
                 id: *id,
                 before: after.clone(),
                 after: before.clone(),
+            },
+            Op::TagParent { id, before, after } => Op::TagParent {
+                id: *id,
+                before: *after,
+                after: *before,
             },
             Op::CollectionRename { id, before, after } => Op::CollectionRename {
                 id: *id,
@@ -384,6 +397,7 @@ mod tests {
             &NewTag {
                 name: "one".into(),
                 color: None,
+                parent_id: None,
             },
         )
         .unwrap();
@@ -392,6 +406,7 @@ mod tests {
             &NewTag {
                 name: "two".into(),
                 color: None,
+                parent_id: None,
             },
         )
         .unwrap();
@@ -500,6 +515,7 @@ mod tests {
             &NewTag {
                 name: "beach".into(),
                 color: None,
+                parent_id: None,
             },
         )
         .unwrap();

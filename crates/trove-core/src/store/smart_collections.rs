@@ -93,7 +93,7 @@ pub fn update_query(
 ) -> Result<()> {
     // Validate up front: an uncompilable tree must not land in the store.
     let node = super::smart::node_from_json(query)?;
-    super::smart::compile(&node)?;
+    super::smart::compile(None, &node)?;
     let changed = rows::execute(
         conn,
         "UPDATE smart_collections SET query = ?1, color = ?2, updated_at = ?3 WHERE id = ?4",
