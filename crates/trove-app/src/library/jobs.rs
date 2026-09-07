@@ -196,3 +196,179 @@ pub fn import_paths_app_into(
 
     true
 }
+
+/// Drain the collect-service inbox: import every waiting file (unfiled),
+/// write its sidecar `source_url` into the asset, then delete the file and
+/// sidecar. Returns `false` when the inbox was empty or an import is
+/// already running (retry on the next watcher cycle).
+pub fn collect_inbox_app(
+    controller: &Entity<LibraryController>,
+    window: &mut Window,
+    cx: &mut App,
+) -> bool {
+    let inbox = trove_core::collect::inbox_dir();
+    let Ok(entries) = std::fs::read_dir(&inbox) else {
+        return false;
+    };
+    // Files with an optional sidecar; sidecars themselves are not imports.
+    let mut items: Vec<(PathBuf, Option<PathBuf>)> = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_file()
+            || path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .map(|n| n.ends_with(".meta.json"))
+                .unwrap_or(true)
+        {
+            continue;
+        }
+        let sidecar = {
+            let name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
+            inbox.join(format!("{name}.meta.json"))
+        };
+        items.push((path, sidecar.is_file().then_some(sidecar)));
+    }
+    if items.is_empty() {
+        return false;
+    }
+    if controller.read(cx).is_importing() {
+        return false;
+    }
+
+    let total = items.len();
+    let library_root = controller.read(cx).library.root().to_path_buf();
+    controller.update(cx, |ctl, _| ctl.begin_import(total));
+    window.push_notification(
+        Notification::info(rust_i18n::t!("notice.collect_started", count = total).to_string())
+            .id1::<ImportNotice>("collect-progress"),
+        cx,
+    );
+
+    let controller = controller.clone();
+    let handle = window.window_handle();
+    let paths: Vec<PathBuf> = items.iter().map(|(p, _)| p.clone()).collect();
+    let cleanup = cleanup_names(&paths);
+    let stage_root = library_root.clone();
+    let stage_paths = paths.clone();
+    let task = cx
+        .background_executor()
+        .spawn(async move { import::stage_all(&stage_root, &stage_paths) });
+
+    cx.spawn(async move |cx| {
+        let staged = task.await;
+        let mut report = import::ImportReport::default();
+        let mut imported_ids: Vec<uuid::Uuid> = Vec::new();
+
+        for (done, (item, (_path, sidecar))) in staged.into_iter().zip(items).enumerate() {
+            controller.update(cx, |ctl, cx| {
+                match item {
+                    Ok(file) => match import::commit_staged(ctl.library.store(), None, &file) {
+                        Ok(imported) => {
+                            imported_ids.push(imported.asset_id);
+                            report.imported.push(imported);
+                        }
+                        Err(e) => report.skipped.push(import::ImportSkip {
+                            path: file.path,
+                            reason: e.to_string(),
+                        }),
+                    },
+                    Err(skip) => report.skipped.push(skip),
+                }
+                ctl.import_progress(done + 1);
+                cx.notify();
+            });
+            let _ = handle.update(cx, |_view, window, cx| {
+                window.push_notification(
+                    Notification::info(
+                        rust_i18n::t!("notice.import_running", done = done + 1, total = total)
+                            .to_string(),
+                    )
+                    .id1::<ImportNotice>("collect-progress"),
+                    cx,
+                );
+            });
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(1))
+                .await;
+
+            // Record the source URL and clean up the inbox entry.
+            if let Some(sidecar) = sidecar
+                && let Ok(meta) = std::fs::read_to_string(&sidecar)
+                && let Ok(meta) = serde_json::from_str::<serde_json::Value>(&meta)
+                && let Some(url) = meta.get("source_url").and_then(|v| v.as_str())
+            {
+                controller.update(cx, |ctl, cx| {
+                    if let Some(asset_id) = imported_ids.last().copied() {
+                        let patch = trove_core::model::AssetPatch {
+                            source_url: Some(Some(url.to_string())),
+                            ..Default::default()
+                        };
+                        let _ = ctl.library.patch_asset(asset_id, &patch);
+                        cx.notify();
+                    }
+                });
+            }
+        }
+
+        controller.update(cx, |ctl, cx| {
+            ctl.finish_import(report.imported_count(), report.skipped_count());
+            cx.notify();
+        });
+
+        if !imported_ids.is_empty() {
+            let store = controller.update(cx, |ctl, _| ctl.library.store().clone());
+            embed_imported_images(controller.clone(), store, library_root, imported_ids, cx).await;
+        }
+
+        // Remove the processed inbox files (blobs were copied by staging).
+        let inbox_dir = trove_core::collect::inbox_dir();
+        for (name, sidecar) in cleanup {
+            let _ = std::fs::remove_file(inbox_dir.join(&name));
+            if let Some(sidecar) = sidecar {
+                let _ = std::fs::remove_file(inbox_dir.join(sidecar));
+            }
+        }
+
+        let note = if report.skipped.is_empty() {
+            Notification::success(
+                rust_i18n::t!("notice.collect_done", imported = report.imported_count())
+                    .to_string(),
+            )
+        } else {
+            Notification::warning(
+                rust_i18n::t!(
+                    "notice.import_done_skipped",
+                    imported = report.imported_count(),
+                    skipped = report.skipped_count()
+                )
+                .to_string(),
+            )
+        };
+        let _ = handle.update(cx, |_view, window, cx| {
+            window.push_notification(note, cx);
+        });
+    })
+    .detach();
+    true
+}
+
+/// File names (plus sidecar names when present) to delete after import.
+fn cleanup_names(paths: &[PathBuf]) -> Vec<(String, Option<String>)> {
+    let inbox = trove_core::collect::inbox_dir();
+    paths
+        .iter()
+        .map(|p| {
+            let name = p
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
+            let sidecar = inbox.join(format!("{name}.meta.json"));
+            let sidecar_name = sidecar.is_file().then(|| format!("{name}.meta.json"));
+            (name, sidecar_name)
+        })
+        .collect()
+}

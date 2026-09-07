@@ -33,6 +33,9 @@ dirs = "5"
 ttf-parser = "0.25"
 mp4 = "0.14"
 
+# Local collect service: URL fetching for the inbox (extension / curl)
+ureq = "3"
+
 # i18n
 rust-i18n = "4.2"
 sys-locale = "0.3"
