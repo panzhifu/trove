@@ -12,7 +12,7 @@ use crate::error::{Error, Result};
 use crate::model::{Asset, AssetKind, AssetPatch, AssetQuery, Origin, now};
 
 /// Column list shared by every read; index order matches `asset_from_row`.
-const COLS: &str = "id, origin, rel_path, file_name, ext, mime, size_bytes, sha256, \
+pub(crate) const COLS: &str = "id, origin, rel_path, file_name, ext, mime, size_bytes, sha256, \
                     kind, width, height, duration_ms, captured_at, title, description, \
                     rating, is_favorite, source_url, extra, created_at, updated_at, trashed_at";
 
@@ -345,6 +345,22 @@ pub fn update(conn: &Connection, id: Uuid, patch: &AssetPatch) -> Result<Option<
     Ok(updated)
 }
 
+/// Replace the `extra` JSON column (used for visual signature backfill).
+pub fn update_extra(
+    conn: &Connection,
+    id: Uuid,
+    extra: &std::collections::BTreeMap<String, serde_json::Value>,
+) -> Result<()> {
+    let json = serde_json::to_string(extra)
+        .map_err(|e| crate::Error::Db(format!("serialize extra: {e}")))?;
+    rows::execute(
+        conn,
+        "UPDATE assets SET extra = ?1 WHERE id = ?2",
+        vec![json.into(), rows::uuid(id).into()],
+    )?;
+    Ok(())
+}
+
 /// Move an asset into (or out of) the trash.
 pub fn set_trashed(conn: &Connection, id: Uuid, trashed: bool) -> Result<bool> {
     let changed = rows::execute(
@@ -380,7 +396,7 @@ pub fn delete(conn: &Connection, id: Uuid) -> Result<()> {
 
 // -- row mapping -------------------------------------------------------------
 
-fn asset_from_row(row: &rusqlite::Row) -> Result<Asset> {
+pub(crate) fn asset_from_row(row: &rusqlite::Row) -> Result<Asset> {
     Ok(Asset {
         id: rows::req_uuid(row, 0)?,
         origin: match rows::req_str(row, 1)?.as_str() {

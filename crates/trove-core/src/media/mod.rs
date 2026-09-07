@@ -6,4 +6,5 @@ pub mod color;
 pub mod import;
 pub mod metadata;
 pub mod probe;
+pub mod search;
 pub mod thumb;
