@@ -13,6 +13,7 @@ gpui-kit = "0.6"
 # ML inference (uncomment when ready to use CLIP)
 # ort = { version = "2.0.0-rc.13", features = ["load-dynamic"] }
 ndarray = "0.15"
+rayon = "1"
 
 # Serialization
 serde = { version = "1", features = ["derive"] }

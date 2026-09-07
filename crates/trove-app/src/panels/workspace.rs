@@ -152,6 +152,10 @@ pub struct WorkspacePanel {
     /// Total asset count of the current view, captured by the last render and
     /// displayed next to the title-bar buttons.
     last_total: usize,
+    /// Pending width change for debouncing (None = no pending change).
+    pending_width: Option<f32>,
+    /// Debounce timer handle.
+    debounce_timer: Option<gpui::Task<()>>,
 }
 
 impl BasePanel for WorkspacePanel {
@@ -319,6 +323,8 @@ impl WorkspacePanel {
             view_key: None,
             covered: 0,
             last_total: 0,
+            pending_width: None,
+            debounce_timer: None,
         };
         observe_controller(cx, &this.controller);
 
@@ -826,11 +832,54 @@ impl Render for WorkspacePanel {
 
         // --- measured width --------------------------------------------------
         let measured = f32::from(*self.available_width.read(cx));
-        let content_width = if measured > 0. {
+        let raw_width = if measured > 0. {
             (measured - H_PADDING).max(160.)
         } else {
             FALLBACK_WIDTH
         };
+        // Round to 10px to avoid recalculating on sub-pixel changes.
+        let content_width = (raw_width / 10.0).round() * 10.0;
+
+        // --- debounce width changes -----------------------------------------
+        // Only recalculate layout when width changes, and debounce to avoid
+        // recalculating on every frame during resize.
+        let width_changed = self
+            .view_key
+            .as_ref()
+            .map_or(true, |k| k.content_width != content_width);
+        let other_changed = self.view_key.as_ref().map_or(true, |k| {
+            k.collection != collection
+                || k.in_trash != in_trash
+                || k.smart != smart
+                || k.tag != active_tag
+                || k.search != search
+                || k.filter_kind != filter_kind
+                || k.filter_favorite != filter_favorite
+                || k.view_mode != view_mode
+                || k.sort != sort
+                || k.sort_desc != sort_desc
+        });
+
+        // If only width changed, debounce. If other things changed, immediate.
+        if width_changed && !other_changed {
+            // Check if we have a pending debounce for this width.
+            if self.pending_width == Some(content_width) {
+                // Already debouncing this width, skip.
+            } else {
+                // Start a new debounce timer.
+                self.pending_width = Some(content_width);
+                let controller = self.controller.clone();
+                self.debounce_timer = Some(cx.spawn(async move |_, cx| {
+                    // Wait 150ms before recalculating.
+                    cx.background_executor()
+                        .timer(std::time::Duration::from_millis(150))
+                        .await;
+                    let _ = controller.update(cx, |_, cx| cx.notify());
+                }));
+            }
+            // Return early — don't recalculate yet.
+            // But we still need to render with current rows.
+        }
 
         // --- row (re)layout ----------------------------------------------------
         let key = ViewKey {
@@ -846,7 +895,7 @@ impl Render for WorkspacePanel {
             sort_desc,
             content_width,
         };
-        if self.view_key.as_ref() != Some(&key) {
+        if self.view_key.as_ref() != Some(&key) && !(width_changed && !other_changed) {
             // View or width changed: full layout, scroll resets to top.
             let rows = if view_mode == ViewMode::List {
                 // List mode: one full-width row per asset, no justification.
