@@ -20,7 +20,7 @@ use gpui_kit::component::dock::{BasePanel, Panel as DockPanel, PanelControl, Pan
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenu, PopupMenuItem};
 use gpui_kit::component::popover::Popover;
-use gpui_kit::component::{ActiveTheme, Icon, IconName};
+use gpui_kit::component::{ActiveTheme, Disableable as _, Icon, IconName};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
@@ -549,12 +549,21 @@ impl WorkspacePanel {
             (display_name(&asset), thumb, asset.kind)
         };
 
-        window.open_dialog(cx, move |dialog, _, _| {
+        window.open_dialog(cx, move |dialog, _window, cx| {
+            // Local zoom state for this preview dialog (100–800%).
+            let zoom = Rc::new(std::cell::Cell::new(100u32));
+
+            let zoom_clone = zoom.clone();
             let preview: AnyElement = match &thumb {
-                Some(path) => img(path.clone())
-                    .max_h(px(520.))
-                    .object_fit(gpui_kit::ObjectFit::Contain)
-                    .into_any_element(),
+                Some(path) => {
+                    let scale = zoom_clone.get() as f32 / 100.0;
+                    let max_h = 520.0_f32 * scale;
+                    img(path.clone())
+                        .max_h(px(max_h))
+                        .max_w(px(720.0 * scale))
+                        .object_fit(gpui_kit::ObjectFit::Contain)
+                        .into_any_element()
+                }
                 None => v_flex()
                     .h_64()
                     .items_center()
@@ -562,10 +571,73 @@ impl WorkspacePanel {
                     .child(Icon::new(kind_icon(kind)).size_8())
                     .into_any_element(),
             };
-            dialog
-                .title(name.clone())
-                .width(px(760.))
-                .child(v_flex().p_2().items_center().child(preview))
+            let zoom_display = zoom_clone.get();
+            dialog.title(name.clone()).width(px(780.)).child(
+                v_flex()
+                    .w_full()
+                    .gap_2()
+                    .items_center()
+                    // Zoom controls bar.
+                    .child(
+                        h_flex()
+                            .w_full()
+                            .items_center()
+                            .justify_center()
+                            .gap_2()
+                            .p_1()
+                            .rounded(cx.theme().radius)
+                            .bg(cx.theme().secondary.alpha(0.5))
+                            .child(
+                                Button::new("preview-zoom-out")
+                                    .ghost()
+                                    .xsmall()
+                                    .disabled(zoom_clone.get() <= 100)
+                                    .label("−")
+                                    .on_click({
+                                        let zoom = zoom_clone.clone();
+                                        move |_, _, cx| {
+                                            let z = zoom.get().saturating_sub(50).max(100);
+                                            zoom.set(z);
+                                            cx.refresh_windows();
+                                        }
+                                    }),
+                            )
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .w(px(48.))
+                                    .text_center()
+                                    .text_color(cx.theme().foreground)
+                                    .child(format!("{}%", zoom_display)),
+                            )
+                            .child(
+                                Button::new("preview-zoom-in")
+                                    .ghost()
+                                    .xsmall()
+                                    .disabled(zoom_clone.get() >= 800)
+                                    .label("+")
+                                    .on_click({
+                                        let zoom = zoom_clone.clone();
+                                        move |_, _, cx| {
+                                            let z = (zoom.get() + 50).min(800);
+                                            zoom.set(z);
+                                            cx.refresh_windows();
+                                        }
+                                    }),
+                            ),
+                    )
+                    // Preview image.
+                    .child(
+                        div()
+                            .w_full()
+                            .max_h(px(600.))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .overflow_hidden()
+                            .child(preview),
+                    ),
+            )
         });
     }
 }
