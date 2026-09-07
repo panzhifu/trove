@@ -77,7 +77,7 @@ The first launch creates a library under the platform's config directory. Open *
 - Multi-select with Ctrl/Cmd+click; drag moves the whole selection.
 
 ### Context menus
-- Asset: favorite, add to collection, move to trash / restore / delete forever.
+- Asset: favorite, color label, reveal in file manager, add to collection, move to trash / restore / delete forever.
 - Collection: new sub-collection, rename, delete.
 - Tag: filter by tag, delete.
 - Smart collection: delete.
@@ -87,8 +87,20 @@ The first launch creates a library under the platform's config directory. Open *
 - Thumbnail preview with dynamic height based on image aspect ratio.
 - Tags and mined color palette.
 - Inline editing: title, description, source URL, kind, and a 1–5 star rating — committed on blur/Enter or click.
-- Properties: MIME type, size, dimensions, added date, SHA-256.
+- Properties: MIME type, size, dimensions, added date, SHA-256, and a one-click reveal of the underlying file.
 - Add or remove tags directly.
+
+### Collection entry points
+- **Paste & Import** (Ctrl+Shift+V): the clipboard image lands straight in the library.
+- **Watched folders**: Settings ▸ General lists watched roots; anything new under them imports automatically (unfiled). A folder is baselined on first sight — attaching a watch never retro-imports what is already there.
+
+### Color labels & duplicate finder
+- Per-asset **color labels** (red…purple) in the Inspector and the context menu, filterable via a `color_label` smart-collection field (including "no label").
+- **Find Duplicates** (File menu): clusters visually identical images by perceptual hash (distance ≤ 8/64) and offers per-group "keep newest, trash the rest".
+
+### Library safety & management
+- **Automatic backups**: the database is snapshotted with SQLite `VACUUM INTO` into `backups/` at most once a day (on library open), rolling 10 files; Maintenance ▸ Backups snapshots on demand.
+- **Recent libraries** for one-click hot switching, and a live **statistics** block (counts per kind, total size, tags, collections).
 
 ### Interface language
 - English and 简体中文, switchable live in Settings ▸ Language; follows the system language by default.
@@ -127,22 +139,21 @@ crates/
 │   ├── src/
 │   │   ├── model.rs     # Plain data types (Asset, Collection, Tag, …)
 │   │   ├── library.rs   # High-level facade over store + media dir
+│   │   ├── backup.rs    # Database snapshots (VACUUM INTO, rolling prune)
 │   │   ├── layout.rs    # Justified grid layout (dynamic programming)
-│   │   ├── store/       # SQLite layer: schema, CRUD, FTS, smart queries
+│   │   ├── store/       # SQLite layer: schema, CRUD, FTS, smart queries, stats
 │   │   ├── media/       # Import, probing, thumbnails, color, visual + CLIP search
 │   │   ├── maintenance.rs # Rebuild thumbs/index, orphan cleanup
+│   │   ├── undo.rs      # Undo/redo operation log
 │   │   ├── events.rs    # Cross-layer events
 │   │   ├── config.rs    # App config persistence (JSON)
 │   │   └── error.rs     # Error types
-│   └── src/             # inline #[cfg(test)] modules
 └── trove-app/           # gpui-kit desktop UI
     ├── src/
-    │   ├── main.rs       # GPUI bootstrap
-    │   ├── app.rs        # Root view: dock + title bar + drop surface
-    │   ├── state.rs      # LibraryController (selection, browse, import)
-    │   ├── title_bar.rs  # Custom title bar (File / Settings)
-    │   ├── settings.rs   # Settings dialog
-    │   ├── jobs.rs       # Background import with progress
+    │   ├── main.rs       # GPUI bootstrap, menus, keybindings
+    │   ├── app/          # Window shell: root view, title bar, actions, i18n
+    │   ├── library/      # LibraryController, import jobs, folder watcher
+    │   ├── dialogs/      # Settings, smart-collection rule editor, duplicate finder
     │   └── panels/       # Explorer, Workspace, Tags, Inspector
     └── Cargo.toml
 ```
@@ -179,14 +190,16 @@ cargo test -p trove-core
 cargo run -p trove-app
 ```
 
-Test status: `trove-core` compiles and all **75** tests pass. `trove-app` compiles cleanly.
+Test status: `trove-core` compiles and all **88** tests pass. `trove-app` compiles cleanly.
 
 ---
 
 ## Status
 
-- **trove-core** — feature-complete for the above list; tested (83 tests).
+- **trove-core** — feature-complete for the above list; tested (88 tests).
 - **trove-app** — compiles and runs: dock layout, custom title bar, justified thumbnail grid, drag & drop, multi-select, context menus, settings dialog, inspector, visual + semantic search, and import with progress are all wired.
+
+What is still missing (compared with Eagle, Billfish, digiKam, Adobe Bridge & co.) is mapped in [docs/FEATURE-GAPS.md](docs/FEATURE-GAPS.md).
 
 ---
 
