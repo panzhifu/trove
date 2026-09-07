@@ -569,7 +569,7 @@ fn backup_row(controller: &Entity<LibraryController>, cx: &mut App) -> Div {
                     rust_i18n::t!(
                         "settings.backup_count",
                         count = count,
-                        max = trove_core::backup::MAX_BACKUPS
+                        max = trove_core::services::backup::MAX_BACKUPS
                     )
                     .to_string(),
                 ),
@@ -640,7 +640,7 @@ fn finish_job(controller: &Entity<LibraryController>, message: String, cx: &mut 
 /// Thumbnails row: incremental rebuild plus a full "rewrite everything"
 /// pass. The plan (which files need work) is collected on the main thread
 /// because the library handle is not `Send`; the file work runs on the
-/// background executor via the `Send` [`trove_core::maintenance::ThumbPlan`].
+/// background executor via the `Send` [`trove_core::services::maintenance::ThumbPlan`].
 fn thumbs_row(controller: &Entity<LibraryController>, cx: &mut App) -> Div {
     let (busy, controller2) = (controller.read(cx).busy, controller.clone());
     h_flex()
@@ -676,7 +676,7 @@ fn rebuild_thumbs(controller: &Entity<LibraryController>, force: bool, cx: &mut 
     // (pure filesystem work).
     let plan = {
         let library = &controller.read(cx).library;
-        match trove_core::maintenance::plan_thumbnail_rebuild(library, force) {
+        match trove_core::services::maintenance::plan_thumbnail_rebuild(library, force) {
             Ok(plan) => plan,
             Err(e) => {
                 finish_job(
@@ -692,7 +692,7 @@ fn rebuild_thumbs(controller: &Entity<LibraryController>, force: bool, cx: &mut 
 
     let task = cx
         .background_executor()
-        .spawn(async move { trove_core::maintenance::run_thumbnail_plan(&root, plan) });
+        .spawn(async move { trove_core::services::maintenance::run_thumbnail_plan(&root, plan) });
 
     cx.spawn({
         let controller = controller.clone();
@@ -732,7 +732,7 @@ fn index_row(controller: &Entity<LibraryController>, cx: &mut App) -> Div {
                     }
                     let result = {
                         let library = &controller.read(cx).library;
-                        trove_core::maintenance::rebuild_search_index(library)
+                        trove_core::services::maintenance::rebuild_search_index(library)
                     };
                     let message = match result {
                         Ok(count) => {
@@ -766,7 +766,7 @@ fn orphans_row(controller: &Entity<LibraryController>, cx: &mut App) -> Div {
                     }
                     let result = {
                         let library = &controller.read(cx).library;
-                        trove_core::maintenance::clean_orphans(library)
+                        trove_core::services::maintenance::clean_orphans(library)
                     };
                     let message = match result {
                         Ok(report) => rust_i18n::t!(

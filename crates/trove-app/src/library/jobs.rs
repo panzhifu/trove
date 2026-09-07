@@ -206,7 +206,7 @@ pub fn collect_inbox_app(
     window: &mut Window,
     cx: &mut App,
 ) -> bool {
-    let inbox = trove_core::collect::inbox_dir();
+    let inbox = trove_core::services::collect::inbox_dir();
     let Ok(entries) = std::fs::read_dir(&inbox) else {
         return false;
     };
@@ -325,7 +325,7 @@ pub fn collect_inbox_app(
         }
 
         // Remove the processed inbox files (blobs were copied by staging).
-        let inbox_dir = trove_core::collect::inbox_dir();
+        let inbox_dir = trove_core::services::collect::inbox_dir();
         for (name, sidecar) in cleanup {
             let _ = std::fs::remove_file(inbox_dir.join(&name));
             if let Some(sidecar) = sidecar {
@@ -358,7 +358,7 @@ pub fn collect_inbox_app(
 
 /// File names (plus sidecar names when present) to delete after import.
 fn cleanup_names(paths: &[PathBuf]) -> Vec<(String, Option<String>)> {
-    let inbox = trove_core::collect::inbox_dir();
+    let inbox = trove_core::services::collect::inbox_dir();
     paths
         .iter()
         .map(|p| {

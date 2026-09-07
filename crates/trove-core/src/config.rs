@@ -56,7 +56,7 @@ pub struct AppConfig {
     /// Local collect service (127.0.0.1 HTTP inbox). On by default.
     #[serde(default)]
     pub collect_enabled: Option<bool>,
-    /// Collect service port. Defaults to [`crate::collect::DEFAULT_PORT`].
+    /// Collect service port. Defaults to [`crate::services::collect::DEFAULT_PORT`].
     #[serde(default)]
     pub collect_port: Option<u16>,
 }
@@ -137,7 +137,8 @@ impl AppConfig {
 
     /// Effective collect-service port.
     pub fn collect_port(&self) -> u16 {
-        self.collect_port.unwrap_or(crate::collect::DEFAULT_PORT)
+        self.collect_port
+            .unwrap_or(crate::services::collect::DEFAULT_PORT)
     }
 
     /// Add a watched folder (deduplicated) and persist.
