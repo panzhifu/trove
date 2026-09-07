@@ -998,7 +998,7 @@ mod tests {
         // Simulate a wiped index then rebuild it from the rows.
         crate::store::rows::execute(conn, "DELETE FROM asset_fts", vec![]).unwrap();
 
-        let n = crate::maintenance::rebuild_search_index(&lib).unwrap();
+        let n = crate::services::maintenance::rebuild_search_index(&lib).unwrap();
         assert_eq!(n, 2);
         let (total, _) = assets::search(conn, "treasure", &AssetQuery::default()).unwrap();
         assert_eq!(total, 1);

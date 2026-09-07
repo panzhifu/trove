@@ -168,18 +168,18 @@ impl Library {
         lib.backfill_search_on_migration()?;
         // Daily safety snapshot (24h throttle, rolling 10 files). Best-effort:
         // a failed backup never blocks opening the library.
-        crate::backup::maybe_auto_backup(&lib.root, lib.store.conn());
+        crate::services::backup::maybe_auto_backup(&lib.root, lib.store.conn());
         Ok(lib)
     }
 
     /// Write a backup snapshot of the database now (also prunes old ones).
     pub fn create_backup(&self) -> Result<std::path::PathBuf> {
-        crate::backup::create_backup(&self.root, self.store.conn())
+        crate::services::backup::create_backup(&self.root, self.store.conn())
     }
 
     /// Backup snapshots of this library, oldest first.
     pub fn list_backups(&self) -> Vec<std::path::PathBuf> {
-        crate::backup::list_backups(&self.root)
+        crate::services::backup::list_backups(&self.root)
     }
 
     /// Library statistics for the settings dashboard.
@@ -201,7 +201,7 @@ impl Library {
         if asset_count > 0 {
             // Best-effort: a rebuild failure must not prevent the library from
             // opening. Fresh imports re-sync the index via the write path.
-            let _ = crate::maintenance::rebuild_search_index(self);
+            let _ = crate::services::maintenance::rebuild_search_index(self);
         }
         Ok(())
     }
