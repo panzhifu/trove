@@ -1,0 +1,24 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <style>
+    body { font: 13px system-ui, sans-serif; width: 240px; margin: 12px; color: #eee; background: #141414; }
+    h1 { font-size: 14px; margin: 0 0 8px; }
+    .row { display: flex; gap: 6px; margin: 8px 0; align-items: center; }
+    input { flex: 1; background: #1f1f1f; border: 1px solid #333; color: #eee; border-radius: 6px; padding: 4px 8px; }
+    button { background: #2563eb; border: 0; color: white; border-radius: 6px; padding: 5px 10px; cursor: pointer; }
+    #status { min-height: 18px; color: #9a9a9a; }
+  </style>
+</head>
+<body>
+  <h1>Trove Collector</h1>
+  <div class="row">
+    <input id="port" type="number" placeholder="port" />
+    <button id="save">Save</button>
+  </div>
+  <div class="row"><button id="ping">Test connection</button><span id="status"></span></div>
+  <p style="color:#777">Right-click any image → "Save image to Trove". The Trove app must be running.</p>
+  <script src="popup.js"></script>
+</body>
+</html>
