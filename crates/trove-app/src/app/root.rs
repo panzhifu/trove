@@ -508,7 +508,7 @@ fn start_collect_server(_cx: &mut Context<AppView>) {
     if !config.collect_enabled() {
         return;
     }
-    match trove_core::collect::spawn_server(config.collect_port()) {
+    match trove_core::services::collect::spawn_server(config.collect_port()) {
         Some(port) => {
             let _ = port;
         }
