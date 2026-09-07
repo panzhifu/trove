@@ -1744,4 +1744,32 @@ mod tests {
         let thumb = thumb::abs_path(lib.root(), asset.sha256.as_deref().unwrap());
         assert!(thumb.is_file(), "svg thumbnail missing");
     }
+    #[test]
+    fn source_path_recorded_and_filterable() {
+        use crate::store::assets;
+
+        let (lib, dir) = temp_library("folders");
+        let sub = dir.join("vacation");
+        std::fs::create_dir_all(&sub).unwrap();
+        let a = write_source(&dir, "a.png", PNG_1X1);
+        let b = sub.join("b.txt");
+        std::fs::write(&b, b"beta").unwrap();
+
+        lib.import_files(std::slice::from_ref(&a), None).unwrap();
+        lib.import_files(std::slice::from_ref(&b), None).unwrap();
+
+        // Distinct folders include ancestors, sorted.
+        let folders = assets::source_folders(lib.store().conn()).unwrap();
+        assert!(folders.iter().any(|f| f.ends_with("vacation")));
+        assert!(folders.contains(&dir.to_string_lossy().to_string()));
+
+        // Prefix filter narrows to the subtree of that folder.
+        let q = AssetQuery {
+            source_path_prefix: Some(sub.to_string_lossy().to_string()),
+            ..Default::default()
+        };
+        let (total, page) = assets::query(lib.store().conn(), &q).unwrap();
+        assert_eq!((total, page.len()), (1, 1));
+        assert_eq!(page[0].file_name, "b.txt");
+    }
 }
