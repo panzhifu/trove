@@ -205,6 +205,11 @@ pub fn commit_staged(
 
     // Reuse an existing live asset with identical content.
     if let Some(existing) = assets::find_by_sha256(store.conn(), &staged.sha256)? {
+        // A placeholder record (metadata restore without media) becomes a
+        // full asset the moment its content lands in the library.
+        if existing.rel_path.is_none() {
+            assets::set_rel_path(store.conn(), existing.id, &staged.rel_path)?;
+        }
         for cid in &targets {
             collections::add_asset(store.conn(), *cid, existing.id)?;
         }

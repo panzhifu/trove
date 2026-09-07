@@ -366,6 +366,17 @@ pub fn update_extra(
     Ok(())
 }
 
+/// Overwrite an asset's relative blob path (used to link a placeholder
+/// record from a metadata restore to a freshly staged blob).
+pub fn set_rel_path(conn: &Connection, id: Uuid, rel_path: &str) -> Result<()> {
+    rows::execute(
+        conn,
+        "UPDATE assets SET rel_path = ?1 WHERE id = ?2",
+        vec![Value::Text(rel_path.to_string()), rows::uuid(id).into()],
+    )?;
+    Ok(())
+}
+
 /// Move an asset into (or out of) the trash.
 pub fn set_trashed(conn: &Connection, id: Uuid, trashed: bool) -> Result<bool> {
     let changed = rows::execute(

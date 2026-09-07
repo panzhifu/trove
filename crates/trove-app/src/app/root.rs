@@ -239,6 +239,65 @@ impl AppView {
         .detach();
     }
 
+    /// File ▸ Import library… : pick a Trove export JSON and restore its
+    /// metadata into the open library (content matches link, the rest
+    /// become placeholders that self-heal on re-import).
+    fn prompt_import_library(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let ctl = self.controller.clone();
+        let handle = window.window_handle();
+        let rx = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some(
+                rust_i18n::t!("app.import_library_prompt")
+                    .into_owned()
+                    .into(),
+            ),
+        });
+        cx.spawn(async move |_, cx| {
+            if let Ok(Ok(Some(paths))) = rx.await
+                && let Some(path) = paths.first()
+            {
+                let note = match std::fs::read_to_string(path) {
+                    Ok(text) => {
+                        let result = handle
+                            .update(cx, |_, _, cx| ctl.read(cx).library.import_metadata(&text));
+                        match result {
+                            Ok(Ok(report)) => {
+                                let _ = ctl.update(cx, |ctl, cx| {
+                                    ctl.generation += 1;
+                                    cx.notify();
+                                });
+                                Notification::success(
+                                    rust_i18n::t!(
+                                        "app.import_library_done",
+                                        assets = report.assets_linked + report.assets_placeholder,
+                                        collections = report.collections,
+                                        tags = report.tags,
+                                        smart = report.smart_collections,
+                                        skipped = report.skipped
+                                    )
+                                    .to_string(),
+                                )
+                            }
+                            _ => Notification::warning(
+                                rust_i18n::t!("app.import_library_failed").to_string(),
+                            ),
+                        }
+                    }
+                    Err(_) => Notification::warning(
+                        rust_i18n::t!("app.import_library_failed").to_string(),
+                    ),
+                };
+                let _ = handle.update(cx, |_view, window, cx| {
+                    window.push_notification(note, cx);
+                });
+            }
+        })
+        .detach();
+    }
+
     /// Help ▸ About Trove.
     fn show_about(&self, window: &mut Window, cx: &mut Context<Self>) {
         window.open_dialog(cx, |dialog, _, _| {
@@ -295,6 +354,9 @@ impl Render for AppView {
             }))
             .on_action(cx.listener(|this, _: &ExportLibrary, window, cx| {
                 this.prompt_export(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ImportLibrary, window, cx| {
+                this.prompt_import_library(window, cx);
             }))
             .on_action(cx.listener(|this, _: &OpenSettings, window, cx| {
                 crate::dialogs::settings::SettingsDialog::open(window, cx, this.controller.clone());
