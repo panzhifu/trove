@@ -29,7 +29,7 @@ pub fn normalize_ext(raw: &str) -> String {
 pub fn probe(ext: &str) -> Probe {
     let kind = match ext {
         "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "ico" | "tiff" | "tif" | "avif"
-        | "heic" | "heif" | "svg" => AssetKind::Image,
+        | "heic" | "heif" | "svg" | "psd" => AssetKind::Image,
         "mp4" | "mov" | "mkv" | "webm" | "avi" | "m4v" | "mpg" | "mpeg" | "wmv" => AssetKind::Video,
         "mp3" | "wav" | "flac" | "m4a" | "aac" | "ogg" | "opus" | "wma" => AssetKind::Audio,
         "pdf" | "doc" | "docx" | "xls" | "xlsx" | "ppt" | "pptx" | "txt" | "md" | "rtf" | "odt"
@@ -49,6 +49,7 @@ pub fn probe(ext: &str) -> Probe {
         "avif" => "image/avif",
         "heic" | "heif" => "image/heic",
         "svg" => "image/svg+xml",
+        "psd" => "image/vnd.adobe.photoshop",
         "mp4" => "video/mp4",
         "mov" => "video/quicktime",
         "mkv" => "video/x-matroska",
@@ -132,6 +133,17 @@ pub fn video_facts(path: &std::path::Path) -> Option<VideoFacts> {
 ///
 /// Unsupported or corrupt images return `None` — never fail the import.
 pub fn image_dimensions(path: &std::path::Path) -> Option<Dimensions> {
+    // Vector/layer formats carry their intrinsic size in structured headers.
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .unwrap_or_default();
+    match ext.as_str() {
+        "svg" => return svg_dimensions(path),
+        "psd" => return psd_dimensions(path),
+        _ => {}
+    }
     let file = std::fs::File::open(path).ok()?;
     let mut reader = std::io::BufReader::new(file);
     let format = image::ImageReader::new(&mut reader)
@@ -167,4 +179,25 @@ mod tests {
         std::fs::write(&path, b"not an mp4").unwrap();
         assert!(video_facts(&path).is_none());
     }
+}
+
+/// Intrinsic size of an SVG (from its root `<svg width/height/viewBox>`).
+fn svg_dimensions(path: &std::path::Path) -> Option<Dimensions> {
+    let bytes = std::fs::read(path).ok()?;
+    let tree = resvg::usvg::Tree::from_data(&bytes, &resvg::usvg::Options::default()).ok()?;
+    let size = tree.size();
+    Some(Dimensions {
+        width: size.width().ceil() as u32,
+        height: size.height().ceil() as u32,
+    })
+}
+
+/// Size of a PSD's composite canvas.
+fn psd_dimensions(path: &std::path::Path) -> Option<Dimensions> {
+    let bytes = std::fs::read(path).ok()?;
+    let psd = psd::Psd::from_bytes(&bytes).ok()?;
+    Some(Dimensions {
+        width: psd.width(),
+        height: psd.height(),
+    })
 }
