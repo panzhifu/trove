@@ -18,6 +18,7 @@
 | 收藏视图 / 类型过滤 | `AssetQuery.is_favorite` / `kind` | ✅ | 标题栏：类型下拉 + 收藏 toggle + 清除；与集合/搜索/智能集合视图组合（core `evaluate_filtered`）；过滤后无命名视图时标题显示「收藏」 |
 | 维护工具（缩略图重建 / FTS 重建 / 孤儿清理） | `maintenance.rs` | ✅ | Settings ▸ 维护：缩略图增量/全量（后台线程）、索引重建、孤儿清理，结果写入状态行 |
 | 标签重命名 / 颜色 | `NewTag.color`；`tags::rename` / `tags::set_color` | ✅ | 标签面板右键：重命名对话框（rename 后重同步 FTS）+ 预设色板取色 / 清除颜色；行内色点展示 |
+| 标签创建（独立入口） | `Library::ensure_tag` | ✅ | 标签面板「全部标签」节头「+」按钮 → 对话框输入名称创建（同名去重）；与 Inspector 输入框回车创建并存 |
 | 整组替换标签 | `tags::set_for_asset` | ✅ | Inspector 标签输入框 + 替换按钮（逗号/分号分隔，缺失名自动创建） |
 | 导出库 | `Library::export_metadata` | ✅ | File ▸ 导出素材库：另存为 JSON 元数据目录（资产/集合/标签/智能集合，不含媒体文件），结果推 toast |
 | 通知层 | notification_layer 已挂载 | ✅ | 导入开始/完成推键控 toast（同一批次替换）；跳过原因进 `ImportReport.skipped` 并体现在通知 |
@@ -42,6 +43,7 @@
 | 状态栏（选中数 / 库路径 / 导入状态） | ✅ | 底部常驻：选中数 / 库路径 / 导入状态（含逐文件进度）/ 最新 notice（错误在设置页外也可见） |
 | 撤销 / 重做 | ✅ | Ctrl+Z / Ctrl+Shift+Z + Edit 菜单；core `undo` 模块操作日志：资产编辑/收藏/回收站/标签组/标签重命名配色/集合重命名/拖拽改父级/集合成员增删；状态栏显示 ↩n ↪m。不可撤销：purge、清空回收站、导入、删除标签/集合、智能集合编辑 |
 | 界面多语言（中/英，实时切换） | ✅ | rust-i18n + `locales/*.toml`；设置 ▸ 语言，跟随系统 |
+| Inspector 折叠分块 | ✅ | 编辑/标签/属性/颜色/字体五个可折叠节（自绘节头 + chevron 旋转），折叠状态随面板保留；预览图恒置顶 |
 | 库热切换（改 path 后重开） | ✅ | Settings ▸ 通用：浏览选择后立即 `swap_library` 并持久化，失败原地报错，无需重启 |
 
 ## 三、工程性问题
