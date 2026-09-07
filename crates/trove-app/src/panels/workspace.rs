@@ -223,42 +223,88 @@ impl DockPanel for WorkspacePanel {
                 .child(count_label)
                 .when(!in_trash, |this| {
                     this.child(filter_controls(&controller, cx)).child(
-                        Popover::new("search-popover")
-                            .anchor(Anchor::TopRight)
-                            // The pill-shaped search input IS the surface:
-                            // strip the popover's own bg/border/shadow/padding
-                            // (our style is refined after the default) while
-                            // keeping the default overlay-click-to-close.
-                            .bg(gpui::transparent_black())
-                            .border_0()
-                            .shadow_none()
-                            .p_0()
-                            .trigger(
-                                Button::new("search")
-                                    .ghost()
-                                    .xsmall()
-                                    .icon(IconName::Search)
-                                    .tooltip(rust_i18n::t!("workspace.search").to_string()),
-                            )
-                            .content({
-                                let input = input.clone();
-                                move |_, _, cx| {
-                                    h_flex()
-                                        .w(px(260.))
-                                        .h_7()
-                                        .items_center()
-                                        .rounded_full()
-                                        .border_1()
-                                        .border_color(cx.theme().input)
-                                        .bg(cx.theme().background)
-                                        .px_3()
-                                        .shadow_sm()
-                                        .child(
-                                            Input::new(&input).appearance(false).small().w_full(),
+                        if search_active {
+                            // Docked search pill: once a search is committed
+                            // (Enter), the box stays visible in the title bar
+                            // instead of collapsing back to the magnifier; the
+                            // ✕ on the right clears the query and closes it.
+                            let clear_input = input.clone();
+                            let clear_ctl = controller.clone();
+                            h_flex()
+                                .w(px(260.))
+                                .h_7()
+                                .items_center()
+                                .rounded_full()
+                                .border_1()
+                                .border_color(cx.theme().input)
+                                .bg(cx.theme().background)
+                                .px_3()
+                                .gap_1()
+                                .shadow_sm()
+                                .child(
+                                    Input::new(&input).appearance(false).small().w_full(),
+                                )
+                                .child(
+                                    Button::new("clear-search")
+                                        .ghost()
+                                        .xsmall()
+                                        .icon(IconName::Close)
+                                        .tooltip(
+                                            rust_i18n::t!("workspace.clear_search").to_string(),
                                         )
-                                        .into_any_element()
-                                }
-                            }),
+                                        .on_click(move |_, window, cx| {
+                                            clear_ctl
+                                                .update(cx, |ctl, _| ctl.set_search(String::new()));
+                                            clear_input.update(cx, |state, cx| {
+                                                state.set_value("", window, cx)
+                                            });
+                                        }),
+                                )
+                                .into_any_element()
+                        } else {
+                            Popover::new("search-popover")
+                                .anchor(Anchor::TopRight)
+                                // The pill-shaped search input IS the surface:
+                                // strip the popover's own bg/border/shadow/padding
+                                // (our style is refined after the default) while
+                                // keeping the default overlay-click-to-close.
+                                .bg(gpui::transparent_black())
+                                .border_0()
+                                .shadow_none()
+                                .p_0()
+                                .trigger(
+                                    Button::new("search")
+                                        .ghost()
+                                        .xsmall()
+                                        .icon(IconName::Search)
+                                        .tooltip(
+                                            rust_i18n::t!("workspace.search").to_string(),
+                                        ),
+                                )
+                                .content({
+                                    let input = input.clone();
+                                    move |_, _, cx| {
+                                        h_flex()
+                                            .w(px(260.))
+                                            .h_7()
+                                            .items_center()
+                                            .rounded_full()
+                                            .border_1()
+                                            .border_color(cx.theme().input)
+                                            .bg(cx.theme().background)
+                                            .px_3()
+                                            .shadow_sm()
+                                            .child(
+                                                Input::new(&input)
+                                                    .appearance(false)
+                                                    .small()
+                                                    .w_full(),
+                                            )
+                                            .into_any_element()
+                                    }
+                                })
+                                .into_any_element()
+                        },
                     )
                 })
                 .when(in_trash, |this| {
@@ -282,17 +328,6 @@ impl DockPanel for WorkspacePanel {
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.save_search_as_smart(window, cx);
                             })),
-                    )
-                    .child(
-                        Button::new("clear-search")
-                            .ghost()
-                            .xsmall()
-                            .label("×")
-                            .tooltip(rust_i18n::t!("workspace.clear_search").to_string())
-                            .on_click(move |_, window, cx| {
-                                controller.update(cx, |ctl, _| ctl.set_search(String::new()));
-                                input.update(cx, |state, cx| state.set_value("", window, cx));
-                            }),
                     )
                 }),
         )

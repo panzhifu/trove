@@ -20,3 +20,4 @@ uuid = { workspace = true }
 ndarray = { workspace = true }  # 0.17 to match ort
 rayon = { workspace = true }
 ort = { workspace = true }
+regex = "1"
