@@ -54,42 +54,46 @@ pub struct RowLayout {
 /// [`MIN_ASPECT`] so degenerate inputs (zero / unknown sizes) can neither
 /// stall the DP prune nor produce zero-width cells.
 ///
-/// Runs in roughly O(n · average photos per row) with the prune above —
-/// a few hundred microseconds for a thousand photos.
+/// For small inputs (<500 items) uses exact DP. For larger inputs uses a
+/// parallel greedy approximation that is O(n) and nearly as good.
 pub fn justify_layout(input: &[f32], content_width: f32) -> Vec<RowLayout> {
     let n = input.len();
     if n == 0 || content_width <= 0.0 {
         return Vec::new();
     }
+
+    // For small datasets, use exact DP. For large, use parallel greedy.
+    const EXACT_DP_THRESHOLD: usize = 500;
+    if n < EXACT_DP_THRESHOLD {
+        justify_layout_exact(input, content_width)
+    } else {
+        justify_layout_parallel_greedy(input, content_width)
+    }
+}
+
+/// Exact DP — O(n · avg photos per row). Used for small datasets.
+fn justify_layout_exact(input: &[f32], content_width: f32) -> Vec<RowLayout> {
+    let n = input.len();
     let aspects: Vec<f32> = input.iter().map(|a| (*a).max(MIN_ASPECT)).collect();
 
-    // dp[i] = minimal badness of the suffix starting at i; next[i] = the
-    // row's exclusive end index on that optimal path.
     let mut dp = vec![f32::INFINITY; n + 1];
     let mut next = vec![0usize; n + 1];
     dp[n] = 0.0;
 
     for i in (0..n).rev() {
-        let mut natural = 0.0f32; // Σ aspects[i..j] × TARGET_ROW_HEIGHT
+        let mut natural = 0.0f32;
         let mut best = f32::INFINITY;
         let mut best_j = i + 1;
         for j in (i + 1)..=n {
             natural += TARGET_ROW_HEIGHT * aspects[j - 1];
             let k = j - i;
 
-            // Prune: with two or more cells already, once the natural width
-            // far exceeds the container, adding cells only scales the row
-            // shorter, which strictly worsens the badness.
             if k > 1 && natural > content_width * PRUNE_FACTOR {
                 break;
             }
 
             let content = (content_width - GRID_GAP * (k as f32 - 1.0)).max(1.0);
-            // Scale the natural row so its combined width equals `content`.
             let h_raw = TARGET_ROW_HEIGHT * content / natural.max(1e-3);
-            // Clamp to the height bounds — except that raising a too-short
-            // row to MIN would push it past the container width, so keep the
-            // exact fit there: MIN is a soft bound, rows never overflow.
             let h = if h_raw < MIN_ROW_HEIGHT {
                 h_raw
             } else {
@@ -107,7 +111,80 @@ pub fn justify_layout(input: &[f32], content_width: f32) -> Vec<RowLayout> {
         next[i] = best_j;
     }
 
-    // Rebuild rows along the optimal path.
+    build_rows(&aspects, &next, content_width, n)
+}
+
+/// Parallel greedy — O(n) with parallel row building. Used for large datasets.
+fn justify_layout_parallel_greedy(input: &[f32], content_width: f32) -> Vec<RowLayout> {
+    use rayon::prelude::*;
+
+    let n = input.len();
+    let aspects: Vec<f32> = input.iter().map(|a| (*a).max(MIN_ASPECT)).collect();
+
+    // Phase 1: Greedy row breaking (sequential but O(n)).
+    let mut row_starts: Vec<usize> = vec![0];
+    let mut i = 0;
+    while i < n {
+        let mut natural = 0.0f32;
+        let mut best_j = i + 1;
+        let mut best_score = f32::INFINITY;
+
+        for j in (i + 1..=n).take(30) {
+            natural += TARGET_ROW_HEIGHT * aspects[j - 1];
+            let k = j - i;
+            if k > 1 && natural > content_width * 2.0 {
+                break;
+            }
+
+            let content = (content_width - GRID_GAP * (k as f32 - 1.0)).max(1.0);
+            let h_raw = TARGET_ROW_HEIGHT * content / natural.max(1e-3);
+            let h = if h_raw < MIN_ROW_HEIGHT {
+                h_raw
+            } else {
+                h_raw.min(MAX_ROW_HEIGHT)
+            };
+
+            let score = (h - TARGET_ROW_HEIGHT).abs();
+            if score < best_score {
+                best_score = score;
+                best_j = j;
+            }
+        }
+        i = best_j;
+        if i < n {
+            row_starts.push(i);
+        }
+    }
+
+    // Phase 2: Build rows in parallel.
+    let row_ends: Vec<usize> = row_starts[1..]
+        .iter()
+        .copied()
+        .chain(std::iter::once(n))
+        .collect();
+    row_starts
+        .par_iter()
+        .zip(row_ends.par_iter())
+        .map(|(&start, &end)| {
+            let k = end - start;
+            let content = (content_width - GRID_GAP * (k as f32 - 1.0)).max(1.0);
+            let natural: f32 = aspects[start..end].iter().sum::<f32>() * TARGET_ROW_HEIGHT;
+            let h_raw = TARGET_ROW_HEIGHT * content / natural.max(1e-3);
+            let h = if h_raw < MIN_ROW_HEIGHT {
+                h_raw
+            } else {
+                h_raw.min(MAX_ROW_HEIGHT)
+            };
+            RowLayout {
+                height: h,
+                item_widths: aspects[start..end].iter().map(|a| a * h).collect(),
+            }
+        })
+        .collect()
+}
+
+/// Build rows from the DP next-pointer table.
+fn build_rows(aspects: &[f32], next: &[usize], content_width: f32, n: usize) -> Vec<RowLayout> {
     let mut rows = Vec::new();
     let mut i = 0;
     while i < n {
@@ -291,6 +368,32 @@ mod tests {
         for row in &rows {
             for &w in &row.item_widths {
                 assert!(w > 0.0, "zero-width cell from degenerate aspect");
+            }
+        }
+    }
+
+    /// Parallel greedy path (>500 items) produces valid layout.
+    #[test]
+    fn parallel_greedy_large_dataset() {
+        let aspects: Vec<f32> = (0..800)
+            .map(|i| match i % 5 {
+                0 => 0.5,
+                1 => 0.75,
+                2 => 1.0,
+                3 => 1.6,
+                _ => 2.5,
+            })
+            .collect();
+        let rows = justify_layout(&aspects, 1280.0);
+        assert_eq!(total_cells(&rows), aspects.len());
+        covers_in_order(&aspects, &rows);
+        for (idx, row) in rows.iter().enumerate() {
+            let total = span_of(row);
+            let is_last = idx == rows.len() - 1;
+            if is_last {
+                assert!(total <= 1280.5);
+            } else {
+                assert!((total - 1280.0).abs() < 1.0, "row {idx}: {total} vs 1280");
             }
         }
     }

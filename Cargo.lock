@@ -7184,6 +7184,7 @@ dependencies = [
  "lofty",
  "mp4",
  "ndarray",
+ "rayon",
  "rusqlite",
  "serde",
  "serde_json",
