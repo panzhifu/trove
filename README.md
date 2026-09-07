@@ -53,6 +53,13 @@ The first launch creates a library under the platform's config directory. Open *
 - **Search by color**: find images matching a specific hex color (e.g. `#ff8000`).
 - Visual signatures computed in background after import — no slowdown.
 
+### Semantic search (CLIP, optional)
+- Text-to-image search merged into the same search box: keyword (FTS) hits first, CLIP matches appended and deduplicated.
+- Image-to-image search against CLIP embeddings in the visual-search panel.
+- Embeddings are computed automatically after import; "Embed all" backfills existing images (Settings ▸ Search).
+- Requirements (manual download, paths shown in Settings ▸ Search): the ONNX Runtime shared library, the CLIP ViT-B/32 ONNX model (`model.onnx`) and its BPE vocab (`bpe_simple_vocab_16e6.txt`) in the model directory.
+- The model is English-caption trained — English queries match noticeably better than other languages.
+
 ### Smart collections
 - Rule-based virtual folders defined as JSON query trees.
 - Match on rating, kind, text, tag, favorite, color; combine with `and` / `or`.
@@ -120,7 +127,7 @@ crates/
 │   │   ├── library.rs   # High-level facade over store + media dir
 │   │   ├── layout.rs    # Justified grid layout (dynamic programming)
 │   │   ├── store/       # SQLite layer: schema, CRUD, FTS, smart queries
-│   │   ├── media/       # Import, probing, thumbnails, color, visual search
+│   │   ├── media/       # Import, probing, thumbnails, color, visual + CLIP search
 │   │   ├── maintenance.rs # Rebuild thumbs/index, orphan cleanup
 │   │   ├── events.rs    # Cross-layer events
 │   │   ├── config.rs    # App config persistence (JSON)
@@ -177,7 +184,7 @@ Test status: `trove-core` compiles and all **75** tests pass. `trove-app` compil
 ## Status
 
 - **trove-core** — feature-complete for the above list; tested (75 tests).
-- **trove-app** — compiles and runs: dock layout, custom title bar, justified thumbnail grid, drag & drop, multi-select, context menus, settings dialog, inspector, visual search, and import with progress are all wired.
+- **trove-app** — compiles and runs: dock layout, custom title bar, justified thumbnail grid, drag & drop, multi-select, context menus, settings dialog, inspector, visual + semantic search, and import with progress are all wired.
 
 ---
 
