@@ -47,7 +47,10 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libsqlite3-dev libssl-dev pkg-config
+          sudo apt-get install -y \
+            libsqlite3-dev libssl-dev pkg-config \
+            libxau6 libxcb1 libxcb-xkb1 libxdmcp6 \
+            libxkbcommon0 libxkbcommon-x110
 
       - name: cargo fmt --check
         run: cargo fmt --all -- --check
