@@ -13,42 +13,8 @@ env:
   APP_NAME: trove
 
 jobs:
-  create-release:
-    name: Create GitHub Release
-    runs-on: ubuntu-latest
-    outputs:
-      upload_url: ${{ steps.create.outputs.upload_url }}
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Get version from tag
-        id: meta
-        run: |
-          VERSION="${GITHUB_REF_NAME#v}"
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-
-      - name: Create release
-        id: create
-        uses: actions/create-release@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          tag_name: ${{ github.ref_name }}
-          release_name: "Trove v${{ steps.meta.outputs.version }}"
-          draft: false
-          prerelease: ${{ contains(github.ref_name, 'alpha') || contains(github.ref_name, 'beta') || contains(github.ref_name, 'rc') }}
-          body: |
-            ## Trove v${{ steps.meta.outputs.version }}
-
-            ### Downloads
-            See assets below for pre-built binaries.
-
-            ### Changes
-            See [commit history](https://github.com/${{ github.repository }}/commits/${{ github.ref_name }}) for details.
-
   build:
     name: Build (${{ matrix.target }})
-    needs: create-release
     strategy:
       fail-fast: false
       matrix:
@@ -57,14 +23,17 @@ jobs:
           - target: aarch64-apple-darwin
             os: macos-14
             asset_name: trove-aarch64-apple-darwin
+            archive_ext: zip
           # macOS (Intel)
           - target: x86_64-apple-darwin
             os: macos-14
             asset_name: trove-x86_64-apple-darwin
+            archive_ext: zip
           # Linux (x86_64)
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-22.04
             asset_name: trove-x86_64-unknown-linux-gnu
+            archive_ext: tar.gz
 
     runs-on: ${{ matrix.os }}
     steps:
@@ -97,26 +66,48 @@ jobs:
       - name: Build release binary
         run: cargo build --release --target ${{ matrix.target }} -p trove-app
 
-      - name: Package (macOS)
-        if: runner.os == 'macOS'
+      - name: Package (zip)
+        if: matrix.archive_ext == 'zip'
         run: |
           cd target/${{ matrix.target }}/release
           zip -r ../../../${{ matrix.asset_name }}.zip trove-app
           cd -
 
-      - name: Package (Linux)
-        if: runner.os == 'Linux'
+      - name: Package (tar.gz)
+        if: matrix.archive_ext == 'tar.gz'
         run: |
           cd target/${{ matrix.target }}/release
           tar czf ../../../${{ matrix.asset_name }}.tar.gz trove-app
           cd -
 
-      - name: Upload release asset
-        uses: actions/upload-release-asset@v1
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset_name }}
+          path: ${{ matrix.asset_name }}.${{ matrix.archive_ext }}
+          retention-days: 1
+
+  release:
+    name: Create Release & Upload Assets
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: false
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: "Trove ${{ github.ref_name }}"
+          draft: false
+          prerelease: ${{ contains(github.ref_name, 'alpha') || contains(github.ref_name, 'beta') || contains(github.ref_name, 'rc') }}
+          files: artifacts/**/*.{zip,tar.gz}
+          generate_release_notes: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          upload_url: ${{ needs.create-release.outputs.upload_url }}
-          asset_path: ${{ matrix.asset_name }}.${{ runner.os == 'macOS' && 'zip' || 'tar.gz' }}
-          asset_name: ${{ matrix.asset_name }}.${{ runner.os == 'macOS' && 'zip' || 'tar.gz' }}
-          asset_content_type: application/octet-stream
