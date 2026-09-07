@@ -5,4 +5,4 @@ mod controller;
 pub mod jobs;
 pub mod watcher;
 
-pub use controller::{ImportPhase, LibraryController, ViewMode, GRID_PAGE_SIZE};
+pub use controller::{GRID_PAGE_SIZE, ImportPhase, LibraryController, ViewMode};

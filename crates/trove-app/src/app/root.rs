@@ -19,10 +19,10 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use crate::app::actions::*;
-use crate::library::jobs;
-use crate::panels::{ExplorerPanel, InspectorPanel, TagsPanel, WorkspacePanel};
-use crate::library::{ImportPhase, LibraryController};
 use crate::app::title_bar::TitleBarView;
+use crate::library::jobs;
+use crate::library::{ImportPhase, LibraryController};
+use crate::panels::{ExplorerPanel, InspectorPanel, TagsPanel, WorkspacePanel};
 use trove_core::config::AppConfig;
 use trove_core::library::Library;
 

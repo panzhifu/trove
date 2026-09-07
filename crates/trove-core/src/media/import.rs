@@ -243,6 +243,7 @@ pub fn commit_staged(
         rating: None,
         is_favorite: false,
         source_url: None,
+        color_label: None,
         extra,
         created_at: now(),
         updated_at: now(),

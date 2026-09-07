@@ -14,7 +14,8 @@ use crate::model::{Asset, AssetKind, AssetPatch, AssetQuery, Origin, now};
 /// Column list shared by every read; index order matches `asset_from_row`.
 pub(crate) const COLS: &str = "id, origin, rel_path, file_name, ext, mime, size_bytes, sha256, \
                     kind, width, height, duration_ms, captured_at, title, description, \
-                    rating, is_favorite, source_url, extra, created_at, updated_at, trashed_at";
+                    rating, is_favorite, source_url, extra, created_at, updated_at, trashed_at, \
+                    color_label";
 
 /// Insert a fully-populated asset.
 pub fn insert(conn: &Connection, asset: &Asset) -> Result<()> {
@@ -22,7 +23,7 @@ pub fn insert(conn: &Connection, asset: &Asset) -> Result<()> {
         conn,
         &format!(
             "INSERT INTO assets ({COLS}) VALUES \
-             (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22)"
+             (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23)"
         ),
         asset_values(asset),
     )?;
@@ -323,6 +324,10 @@ pub fn update(conn: &Connection, id: Uuid, patch: &AssetPatch) -> Result<Option<
         sets.push(format!("source_url = ?{}", args.len() + 1));
         args.push(bind_opt_str(v.as_deref()));
     }
+    if let Some(v) = &patch.color_label {
+        sets.push(format!("color_label = ?{}", args.len() + 1));
+        args.push(bind_opt_str(v.as_deref()));
+    }
     if let Some(extra) = &patch.extra {
         sets.push(format!("extra = ?{}", args.len() + 1));
         args.push(serde_json::to_string(extra)?.into());
@@ -427,6 +432,7 @@ pub(crate) fn asset_from_row(row: &rusqlite::Row) -> Result<Asset> {
         created_at: rows::req_ts(row, 19)?,
         updated_at: rows::req_ts(row, 20)?,
         trashed_at: rows::opt_ts(row, 21)?,
+        color_label: rows::opt_str(row, 22)?,
     })
 }
 
@@ -467,6 +473,7 @@ fn asset_values(a: &Asset) -> Vec<Value> {
         rows::ts(a.created_at).into(),
         rows::ts(a.updated_at).into(),
         bind_opt_ts(a.trashed_at),
+        bind_opt_str(a.color_label.as_deref()),
     ]
 }
 
@@ -518,6 +525,10 @@ fn build_where(q: &AssetQuery) -> (String, Vec<Value>) {
     if let Some(fav) = q.is_favorite {
         conds.push(format!("is_favorite = ?{}", args.len() + 1));
         args.push(Value::Integer(fav as i64));
+    }
+    if let Some(label) = &q.color_label {
+        conds.push(format!("color_label = ?{}", args.len() + 1));
+        args.push(Value::Text(label.clone()));
     }
     if q.is_trashed {
         conds.push("trashed_at IS NOT NULL".into());
