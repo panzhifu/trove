@@ -47,7 +47,7 @@
 ## 三、工程性问题
 
 - 非图片单元格图标恒为 `FileText`（`panels/common.rs` `kind_icon` 忽略参数）—— ✅ 已按类型映射（含新增字体类型）
-- 大量 `eprintln!` 代替结构化日志 / 通知 —— 🚧 业务错误已全部改为 notice（状态栏可见）/ toast，仅剩 i18n 持久化失败一处 `eprintln!`
+- 大量 `eprintln!` 代替结构化日志 / 通知 —— ✅ 业务错误已全部改为 notice（状态栏可见）/ toast；i18n 持久化失败改为返回 `Result` 上浮到状态栏，CLIP 维度不符改为计数 + Settings 警告（业务代码零 println，仅测试 skip 提示保留一处）
 - 搜索输入框聚焦时全局快捷键仍注册（依赖 key context 隔离，注意回归） —— 🚧
 
 ## 建议优先级
