@@ -80,62 +80,59 @@ fn general_page(controller: &Entity<LibraryController>) -> SettingPage {
 fn library_location_row(controller: &Entity<LibraryController>, cx: &mut App) -> Div {
     let current = AppConfig::load().resolved_library_path();
     let notice = controller.read(cx).notice.clone();
-    h_flex()
-        .flex_1()
-        .items_center()
-        .gap_2()
+    v_flex()
+        .gap_1()
         .child(
             div()
-                .flex_1()
-                .min_w_0()
-                .truncate()
+                .w_full()
                 .text_sm()
-                .text_color(cx.theme().muted_foreground)
+                .text_color(cx.theme().foreground)
                 .child(current.display().to_string()),
         )
-        .when_some(notice, |row, notice| {
-            row.child(
+        .when_some(notice, |col, notice| {
+            col.child(
                 div()
-                    .max_w(px(240.))
-                    .truncate()
+                    .w_full()
                     .text_xs()
                     .text_color(cx.theme().danger)
                     .child(notice),
             )
         })
         .child(
-            Button::new("browse-library")
-                .outline()
-                .small()
-                .label(rust_i18n::t!("settings.browse").to_string())
-                .on_click({
-                    let controller = controller.clone();
-                    move |_, _, cx| {
-                        let rx = cx.prompt_for_paths(PathPromptOptions {
-                            files: false,
-                            directories: true,
-                            multiple: false,
-                            prompt: Some(
-                                rust_i18n::t!("settings.select_folder").into_owned().into(),
-                            ),
-                        });
-                        cx.spawn({
-                            let controller = controller.clone();
-                            async move |cx| {
-                                if let Ok(Ok(Some(paths))) = rx.await
-                                    && let Some(path) = paths.first()
-                                {
-                                    let path: PathBuf = path.to_path_buf();
-                                    cx.update(|cx| {
-                                        switch_library(&controller, path, cx);
-                                        cx.refresh_windows();
-                                    });
+            div().w_full().flex().justify_end().child(
+                Button::new("browse-library")
+                    .outline()
+                    .small()
+                    .label(rust_i18n::t!("settings.browse").to_string())
+                    .on_click({
+                        let controller = controller.clone();
+                        move |_, _, cx| {
+                            let rx = cx.prompt_for_paths(PathPromptOptions {
+                                files: false,
+                                directories: true,
+                                multiple: false,
+                                prompt: Some(
+                                    rust_i18n::t!("settings.select_folder").into_owned().into(),
+                                ),
+                            });
+                            cx.spawn({
+                                let controller = controller.clone();
+                                async move |cx| {
+                                    if let Ok(Ok(Some(paths))) = rx.await
+                                        && let Some(path) = paths.first()
+                                    {
+                                        let path: PathBuf = path.to_path_buf();
+                                        cx.update(|cx| {
+                                            switch_library(&controller, path, cx);
+                                            cx.refresh_windows();
+                                        });
+                                    }
                                 }
-                            }
-                        })
-                        .detach();
-                    }
-                }),
+                            })
+                            .detach();
+                        }
+                    }),
+            ),
         )
 }
 

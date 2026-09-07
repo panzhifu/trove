@@ -22,8 +22,8 @@ use uuid::Uuid;
 use crate::state::LibraryController;
 
 use super::common::{
-    AssetsDrag, CollectionDrag, hex_to_rgb, live_count, observe_controller, selectable_row,
-    separator_label, trash_count,
+    AssetsDrag, CollectionDrag, hex_to_rgb, live_count, observe_controller, separator_label,
+    trash_count,
 };
 
 /// What the single inline editor is doing right now.
@@ -304,13 +304,22 @@ impl Render for ExplorerPanel {
                     }
                 }
             }
-            let mut smart_rows: Vec<(Uuid, String, Option<u32>)> = Vec::new();
+            let mut smart_rows: Vec<(Uuid, String, u64, Option<u32>)> = Vec::new();
             if let Ok(list) = smart_collections::list(conn) {
                 smart_rows = list
                     .into_iter()
                     .map(|sc| {
                         let accent = sc.color.as_deref().and_then(hex_to_rgb);
-                        (sc.id, sc.name, accent)
+                        let node = trove_core::store::smart::node_from_json(&sc.query).ok();
+                        let count = node
+                            .as_ref()
+                            .and_then(|n| {
+                                trove_core::store::smart::evaluate(conn, n, None, 0)
+                                    .ok()
+                                    .map(|(total, _)| total)
+                            })
+                            .unwrap_or(0);
+                        (sc.id, sc.name, count, accent)
                     })
                     .collect();
             }
@@ -458,25 +467,29 @@ impl Render for ExplorerPanel {
                     .into_any_element(),
             );
         }
-        for (sid, sname, accent) in smart_rows {
+        for (sid, sname, count, accent) in smart_rows {
             let menu_name = sname.clone();
             let controller = self.controller.clone();
+            let sid_clone = sid;
             items.push(
-                selectable_row(
-                    cx,
-                    &format!("smart-row-{sid}"),
-                    sname,
-                    active_smart == Some(sid),
-                    px(0.),
-                    accent,
-                    Box::new(move |_ev, _window, cx| {
-                        controller.update(cx, |ctl, _| ctl.select_smart(Some(sid)));
-                    }),
-                    Some({
+                div()
+                    .id(format!("smart-row-{sid}"))
+                    .cursor_pointer()
+                    .w_full()
+                    .px_2()
+                    .py_1()
+                    .rounded(cx.theme().radius)
+                    .when(active_smart == Some(sid), |this| {
+                        this.bg(cx.theme().secondary)
+                    })
+                    .on_click(move |_ev: &ClickEvent, _window, cx| {
+                        controller.update(cx, |ctl, _| ctl.select_smart(Some(sid_clone)));
+                    })
+                    .context_menu({
                         let controller = self.controller.clone();
                         let explorer = cx.entity();
                         let menu_name = menu_name.clone();
-                        Box::new(move |menu, window, cx| {
+                        move |menu, window, cx| {
                             smart_menu(
                                 menu,
                                 window,
@@ -486,10 +499,32 @@ impl Render for ExplorerPanel {
                                 sid,
                                 menu_name.clone(),
                             )
-                        })
-                    }),
-                )
-                .into_any_element(),
+                        }
+                    })
+                    .child(
+                        h_flex()
+                            .w_full()
+                            .items_center()
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_sm()
+                                    .text_color(cx.theme().foreground)
+                                    .when_some(accent, |this, rgb| {
+                                        this.text_color(gpui_kit::rgb(rgb))
+                                    })
+                                    .child(sname),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(count.to_string()),
+                            ),
+                    )
+                    .into_any_element(),
             );
         }
 
