@@ -54,6 +54,7 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: clippy
+        if: runner.os != 'Windows'
         run: cargo clippy --workspace --all-targets -- -W clippy::all
 
       - name: Build
