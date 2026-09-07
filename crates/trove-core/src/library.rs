@@ -1016,4 +1016,44 @@ mod tests {
             .unwrap();
         assert_eq!(total, 1);
     }
+
+    #[test]
+    fn tag_and_smart_collection_facade_methods() {
+        let (lib, root) = temp_library("facade");
+
+        // ensure_tag is idempotent by (trimmed) name.
+        let t1 = lib.ensure_tag("tree").unwrap();
+        let t2 = lib.ensure_tag("  tree  ").unwrap();
+        assert_eq!(t1.id, t2.id);
+        let _ = lib.ensure_tag("park").unwrap();
+        let conn = lib.store().conn();
+        assert_eq!(tags::list(conn).unwrap().len(), 2);
+
+        // Attach the tag to an asset, then delete it via the facade.
+        let src = write_source(&root, "a.png", PNG_1X1);
+        let report = lib.import_files(&[src], None).unwrap();
+        let asset_id = report.imported[0].asset_id;
+        lib.tag_assets(&[asset_id], t1.id, true).unwrap();
+        lib.delete_tag(t1.id).unwrap();
+        assert!(tags::for_asset(conn, asset_id).unwrap().is_empty());
+        assert!(tags::list(conn).unwrap().iter().all(|t| t.id != t1.id));
+
+        // Smart collection rename + delete through the facade.
+        let sc = lib
+            .create_smart_collection(&NewSmartCollection {
+                name: "old".into(),
+                query: serde_json::json!({
+                    "op": "match",
+                    "field": "text",
+                    "value": "x",
+                }),
+                color: None,
+                position: 0,
+            })
+            .unwrap();
+        lib.rename_smart_collection(sc.id, "new").unwrap();
+        assert_eq!(lib.get_smart_collection(sc.id).unwrap().unwrap().name, "new");
+        lib.delete_smart_collection(sc.id).unwrap();
+        assert!(lib.get_smart_collection(sc.id).unwrap().is_none());
+    }
 }
