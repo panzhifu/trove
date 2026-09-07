@@ -580,10 +580,7 @@ pub fn set_embedding(conn: &Connection, asset_id: Uuid, bytes: &[u8]) -> Result<
     rows::execute(
         conn,
         "UPDATE assets SET embedding = ?1 WHERE id = ?2",
-        vec![
-            Value::Blob(bytes.to_vec()),
-            rows::uuid(asset_id).into(),
-        ],
+        vec![Value::Blob(bytes.to_vec()), rows::uuid(asset_id).into()],
     )?;
     Ok(())
 }
@@ -622,12 +619,7 @@ pub fn all_embeddings(conn: &Connection, chunk: usize) -> Result<Vec<(Uuid, Vec<
              WHERE embedding IS NOT NULL AND trashed_at IS NULL
              LIMIT ? OFFSET ?",
             vec![Value::Integer(chunk as i64), Value::Integer(offset)],
-            |row| {
-                Ok((
-                    rows::req_uuid(row, 0)?,
-                    row.get::<_, Vec<u8>>(1)?,
-                ))
-            },
+            |row| Ok((rows::req_uuid(row, 0)?, row.get::<_, Vec<u8>>(1)?)),
         )?;
         let n = batch.len() as i64;
         out.extend(batch);

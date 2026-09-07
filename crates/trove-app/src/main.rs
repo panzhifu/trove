@@ -217,9 +217,7 @@ fn init_semantic_search() {
     // `ort` may panic if the dylib fails to load, so catch it. Failures are
     // recorded in the engine state and shown in Settings ▸ Search; there is
     // no window yet at startup, so nothing else to surface here.
-    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        clip::configure(&model)
-    }));
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| clip::configure(&model)));
 }
 
 fn main() {

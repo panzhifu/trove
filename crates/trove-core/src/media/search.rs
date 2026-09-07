@@ -128,14 +128,14 @@ impl ColorHistogram {
         for chunk in s.as_bytes().chunks(2) {
             if chunk.len() == 2
                 && let Ok(byte) = u8::from_str_radix(std::str::from_utf8(chunk).unwrap_or("00"), 16)
-                {
-                    for i in 0..4 {
-                        if idx < 4096 {
-                            buckets[idx] = ((byte >> (i * 2)) & 0x03) as f32 / 3.0;
-                            idx += 1;
-                        }
+            {
+                for i in 0..4 {
+                    if idx < 4096 {
+                        buckets[idx] = ((byte >> (i * 2)) & 0x03) as f32 / 3.0;
+                        idx += 1;
                     }
                 }
+            }
         }
         let total = if idx > 0 { 1.0 } else { 0.0 };
         let mut hist = Self { buckets, total };
@@ -403,8 +403,7 @@ mod tests {
         assert!(extra.contains_key("visual_phash"));
         assert!(extra.contains_key("visual_color_hist"));
         // Convert BTreeMap to serde_json::Map for from_extra.
-        let extra_json: serde_json::Map<String, serde_json::Value> =
-            extra.into_iter().collect();
+        let extra_json: serde_json::Map<String, serde_json::Value> = extra.into_iter().collect();
         let loaded = VisualSignature::from_extra(&extra_json).unwrap();
         assert_eq!(loaded.phash, sig.phash);
     }

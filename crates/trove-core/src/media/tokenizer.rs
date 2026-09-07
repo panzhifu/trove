@@ -104,7 +104,10 @@ fn bytes_to_unicode() -> HashMap<u8, char> {
             n += 1;
         }
     }
-    bs.into_iter().zip(cs).map(|(b, c)| (b as u8, char::from_u32(c).unwrap())).collect()
+    bs.into_iter()
+        .zip(cs)
+        .map(|(b, c)| (b as u8, char::from_u32(c).unwrap()))
+        .collect()
 }
 
 fn whitespace_clean(text: &str) -> String {
@@ -123,7 +126,9 @@ fn tokenize_regex(text: &str) -> Vec<String> {
         )
         .expect("tokenizer regex")
     });
-    pat.find_iter(text).map(|m| m.as_str().to_string()).collect()
+    pat.find_iter(text)
+        .map(|m| m.as_str().to_string())
+        .collect()
 }
 
 fn bpe(vocab: &Vocab, byte_encoder: &HashMap<u8, char>, token: &str) -> String {
@@ -151,9 +156,10 @@ fn bpe(vocab: &Vocab, byte_encoder: &HashMap<u8, char>, token: &str) -> String {
                 .get(&(word[i].clone(), word[i + 1].clone()))
                 .copied();
             if let Some(r) = rank
-                && (best.is_none() || r < best.unwrap().0) {
-                    best = Some((r, i));
-                }
+                && (best.is_none() || r < best.unwrap().0)
+            {
+                best = Some((r, i));
+            }
         }
         let Some((_, i)) = best else { break };
         let merged = format!("{}{}", word[i], word[i + 1]);
@@ -182,11 +188,7 @@ pub fn encode(text: &str) -> Result<(Vec<i64>, Vec<i64>)> {
     let clean = whitespace_clean(&text.to_lowercase());
     let mut ids = vec![SOT];
     for token in tokenize_regex(&clean) {
-        let encoded: String = token
-            .as_bytes()
-            .iter()
-            .map(|b| byte_encoder[b])
-            .collect();
+        let encoded: String = token.as_bytes().iter().map(|b| byte_encoder[b]).collect();
         for piece in bpe(vocab, &byte_encoder, &encoded).split(' ') {
             if piece.is_empty() {
                 continue;
