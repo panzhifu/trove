@@ -52,6 +52,8 @@ pub struct LibraryController {
     pub showing_trash: bool,
     /// When set, only assets carrying this tag are shown.
     pub active_tag: Option<Uuid>,
+    /// When set, only assets imported from this source-path prefix are shown.
+    pub active_folder: Option<String>,
     /// When set, the workspace shows the live results of this smart collection.
     pub active_smart: Option<Uuid>,
     /// Active full-text search term (FTS). Overrides the other views when set.
@@ -92,6 +94,7 @@ impl LibraryController {
             selected_assets: Vec::new(),
             showing_trash: false,
             active_tag: None,
+            active_folder: None,
             active_smart: None,
             search_text: String::new(),
             filter_kind: None,
@@ -351,6 +354,16 @@ impl LibraryController {
         self.active_smart = None;
         self.reset_grid_page();
         self.generation += 1;
+    }
+
+    /// Set the active source-folder filter; `None` clears it. Composes with
+    /// every browse context exactly like the tag filter.
+    pub fn select_folder(&mut self, folder: Option<String>) {
+        if self.active_folder != folder {
+            self.active_folder = folder;
+            self.reset_grid_page();
+            self.generation += 1;
+        }
     }
 
     /// Select every asset currently displayed by the grid.

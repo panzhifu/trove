@@ -22,7 +22,7 @@ use crate::app::actions::*;
 use crate::app::title_bar::TitleBarView;
 use crate::library::jobs;
 use crate::library::{ImportPhase, LibraryController};
-use crate::panels::{ExplorerPanel, InspectorPanel, TagsPanel, WorkspacePanel};
+use crate::panels::{ExplorerPanel, FoldersPanel, InspectorPanel, TagsPanel, WorkspacePanel};
 use trove_core::config::AppConfig;
 use trove_core::library::Library;
 
@@ -51,6 +51,7 @@ impl AppView {
         let title_bar = cx.new(|cx| TitleBarView::new(controller.clone(), cx));
 
         let explorer = cx.new(|cx| ExplorerPanel::new(window, cx, controller.clone()));
+        let folders = cx.new(|cx| FoldersPanel::new(cx, controller.clone()));
         let workspace = cx.new(|cx| WorkspacePanel::new(window, cx, controller.clone()));
         let tags = cx.new(|cx| TagsPanel::new(cx, controller.clone()));
         let inspector = cx.new(|cx| InspectorPanel::new(window, cx, controller.clone()));
@@ -64,7 +65,9 @@ impl AppView {
             // `panel_name`.
             area.set_dock(
                 DockPlacement::Left,
-                DockLayout::tabs().panel_view(panel_handle(explorer), cx),
+                DockLayout::tabs()
+                    .panel_view(panel_handle(explorer), cx)
+                    .panel_view(panel_handle(folders), cx),
                 window,
                 cx,
             );

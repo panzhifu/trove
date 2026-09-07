@@ -315,6 +315,10 @@ done = "Renamed %{count} assets"
 failed = "Rename failed: %{error}"
 empty_selection = "Select assets to rename first."
 
+[folders]
+title = "Source folders"
+no_folders = "No folders yet. Imported assets remember where they came from."
+
 [duplicates]
 title = "Duplicate Files"
 empty = "No duplicates found. Only images with a visual signature participate; newer imports gain signatures shortly after import."

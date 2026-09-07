@@ -631,6 +631,19 @@ fn build_where(conn: &Connection, q: &AssetQuery) -> Result<(String, Vec<Value>)
         conds.push(format!("color_label = ?{}", args.len() + 1));
         args.push(Value::Text(label.clone()));
     }
+    if let Some(prefix) = &q.source_path_prefix {
+        conds.push(format!(
+            "json_extract(assets.extra, '$.source_path') LIKE ?{} ESCAPE '\\'",
+            args.len() + 1
+        ));
+        // Escape LIKE metacharacters so path separators and underscores in
+        // real file names match literally.
+        let escaped = prefix
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_");
+        args.push(Value::Text(format!("{escaped}%")));
+    }
     if q.is_trashed {
         conds.push("trashed_at IS NOT NULL".into());
     } else {
@@ -643,6 +656,33 @@ fn build_where(conn: &Connection, q: &AssetQuery) -> Result<(String, Vec<Value>)
         format!("WHERE {}", conds.join(" AND "))
     };
     Ok((where_sql, args))
+}
+
+/// Distinct folders that imported assets came from, including every
+/// ancestor directory (so the panel can render a tree), sorted.
+pub fn source_folders(conn: &Connection) -> Result<Vec<String>> {
+    let paths: Vec<String> = rows::query_map(
+        conn,
+        "SELECT DISTINCT json_extract(extra, '$.source_path') FROM assets \
+         WHERE trashed_at IS NULL AND json_extract(extra, '$.source_path') IS NOT NULL",
+        vec![],
+        |row| row.get::<_, String>(0).map_err(Error::from),
+    )?;
+    let mut dirs: std::collections::BTreeSet<String> = Default::default();
+    for path in paths {
+        let mut dir = std::path::Path::new(&path)
+            .parent()
+            .map(|p| p.to_path_buf());
+        while let Some(d) = dir {
+            let text = d.to_string_lossy().to_string();
+            if dirs.insert(text.clone()) {
+                dir = d.parent().map(|p| p.to_path_buf());
+            } else {
+                break; // already walked this branch
+            }
+        }
+    }
+    Ok(dirs.into_iter().collect())
 }
 
 /// `col IN (?, ?, …)` over a uuid list (each id one parameter).

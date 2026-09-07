@@ -311,6 +311,10 @@ done = "已重命名 %{count} 个资产"
 failed = "重命名失败：%{error}"
 empty_selection = "请先选择要重命名的资产。"
 
+[folders]
+title = "来源文件夹"
+no_folders = "暂无文件夹。导入的资产会记住来源路径。"
+
 [duplicates]
 title = "重复文件"
 empty = "未发现重复文件。仅参与对比已生成视觉签名的图片；新导入的图片会在导入后很快生成签名。"
