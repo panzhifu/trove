@@ -26,6 +26,7 @@ use gpui_kit::*;
 use crate::i18n::SUPPORTED;
 use crate::state::LibraryController;
 use trove_core::config::AppConfig;
+use trove_core::keybindings::{self, KeyBindingConfig};
 
 /// Sentinel value for the "follow the system language" choice, which the
 /// config stores as `None`.
@@ -43,7 +44,8 @@ impl SettingsDialog {
                 .sidebar_width(px(170.))
                 .page(general_page(&controller))
                 .page(maintenance_page(&controller))
-                .page(language_page());
+                .page(language_page())
+                .page(shortcuts_page());
 
             dialog
                 .title(rust_i18n::t!("settings.title").to_string())
@@ -447,4 +449,108 @@ fn language_page() -> SettingPage {
                 .description(rust_i18n::t!("settings.language_desc").to_string()),
             ),
         )
+}
+
+// ============================ shortcuts page ================================
+
+/// Shortcuts ▸ Keyboard: view and customize keybindings.
+fn shortcuts_page() -> SettingPage {
+    let page = SettingPage::new(rust_i18n::t!("settings.shortcuts").to_string())
+        .icon(IconName::Settings)
+        .resettable(false);
+
+    let items = keybinding_items();
+    let mut group = SettingGroup::new();
+    for i in 0..items.len() {
+        let kb = &items[i];
+        let desc = kb.description.clone();
+        let key = kb.key.clone();
+        let ctx = kb.context.clone();
+        let item_key = key.clone();
+        group = group.item(
+            SettingItem::new(
+                desc.clone(),
+                SettingField::render(move |_, _, cx| {
+                    keybinding_row(
+                        &KeyBindingConfig {
+                            key: item_key.clone(),
+                            description: desc.clone(),
+                            context: ctx.clone(),
+                        },
+                        cx,
+                    )
+                }),
+            )
+            .description(key),
+        );
+    }
+
+    // Add reset button at the bottom.
+    group = group.item(
+        SettingItem::new(
+            rust_i18n::t!("shortcuts.shortcut_reset").to_string(),
+            SettingField::render(move |_, _, _cx| {
+                h_flex().w_full().justify_end().child(
+                    Button::new("reset-keybindings")
+                        .outline()
+                        .small()
+                        .label(rust_i18n::t!("shortcuts.shortcut_reset").to_string())
+                        .on_click(move |_, _, cx| {
+                            reset_keybindings(cx);
+                        }),
+                )
+            }),
+        )
+        .description(rust_i18n::t!("shortcuts.shortcut_reset_done").to_string()),
+    );
+
+    page.group(group)
+}
+
+/// Render a single keybinding row: key display + context.
+fn keybinding_row(kb: &KeyBindingConfig, cx: &mut App) -> Div {
+    let config = AppConfig::load();
+    let custom_key = config.keybindings.get(&kb.description).cloned();
+    let display_key = custom_key.unwrap_or_else(|| kb.key.clone());
+    let context_str = kb.context.as_deref().unwrap_or("global");
+
+    h_flex()
+        .w_full()
+        .justify_between()
+        .gap_2()
+        .child(
+            div()
+                .text_sm()
+                .text_color(cx.theme().foreground)
+                .child(kb.description.clone()),
+        )
+        .child(
+            div()
+                .px_2()
+                .py_0p5()
+                .rounded(cx.theme().radius)
+                .bg(cx.theme().secondary)
+                .text_xs()
+                .text_color(cx.theme().foreground)
+                .child(display_key.to_uppercase()),
+        )
+        .child(
+            div()
+                .text_xs()
+                .text_color(cx.theme().muted_foreground)
+                .child(context_str.to_string()),
+        )
+}
+
+/// Reset all keybindings to defaults.
+fn reset_keybindings(cx: &mut App) {
+    let mut config = AppConfig::load();
+    config.keybindings.clear();
+    let _ = config.save();
+    cx.refresh_windows();
+}
+
+/// Get all configurable keybindings.
+fn keybinding_items() -> Vec<KeyBindingConfig> {
+    keybindings::default_keybindings()
 }
