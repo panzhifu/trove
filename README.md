@@ -101,6 +101,8 @@ The first launch creates a library under the platform's config directory. Open *
 
 ## UI layout
 
+![Trove main window](docs/screenshots/main-window.png)
+
 The desktop app uses a dock layout with a custom title bar:
 
 | Dock | Panel | Purpose |
