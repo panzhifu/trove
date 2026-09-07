@@ -21,9 +21,7 @@ use uuid::Uuid;
 
 use crate::state::LibraryController;
 
-use super::common::{
-    color_swatch, hex_to_rgb, human_bytes, kind_icon, observe_controller, separator_label,
-};
+use super::common::{color_swatch, hex_to_rgb, human_bytes, kind_icon, observe_controller};
 
 // ==================== Inspector: details + tags ==============================
 
@@ -48,6 +46,9 @@ pub struct InspectorPanel {
     /// Font families already registered with the text system for previews
     /// (registration is process-global; skip repeats).
     font_previews: std::collections::HashSet<String>,
+    /// Section ids the user collapsed (absent = expanded). Persisted on the
+    /// panel so collapse state survives re-renders and asset switches.
+    collapsed: std::collections::HashSet<&'static str>,
 }
 
 impl InspectorPanel {
@@ -80,6 +81,7 @@ impl InspectorPanel {
             source_input,
             editing_id: None,
             font_previews: std::collections::HashSet::new(),
+            collapsed: std::collections::HashSet::new(),
         };
         observe_controller(cx, &this.controller);
 
@@ -435,8 +437,87 @@ impl Render for InspectorPanel {
 
         // The edit section made the panel taller than its dock slot: the
         // whole content scrolls inside a bounded container (same pattern as
-        // the tags panel).
-        let content = v_flex()
+        // the tags panel). Information is grouped into collapsible sections;
+        // the preview always stays on top.
+        let edit_content = v_flex()
+            .gap_2()
+            .child(Input::new(&self.title_input).small().appearance(true))
+            .child(Input::new(&self.description_input).small().appearance(true))
+            .child(Input::new(&self.source_input).small().appearance(true))
+            .child(edit_label("inspector.kind"))
+            .child(self.kind_row(kind))
+            .child(edit_label("inspector.rating"))
+            .child(self.rating_row(rating));
+
+        let tag_chips = h_flex().flex_wrap().gap_1p5().children(
+            asset_tags.iter().map(|tag| {
+                let id = tag.id;
+                let controller = self.controller.clone();
+                let tag_color = tag.color.as_deref().and_then(hex_to_rgb);
+                div()
+                    .px_2()
+                    .py_0p5()
+                    .rounded(cx.theme().radius)
+                    .bg(cx.theme().secondary)
+                    .text_sm()
+                    .text_color(
+                        tag_color
+                            .map(gpui_kit::rgb)
+                            .unwrap_or_else(|| cx.theme().foreground.into()),
+                    )
+                    .child(
+                        h_flex()
+                            .gap_0p5()
+                            .items_center()
+                            .child(tag.name.clone())
+                            .child(
+                                Button::new(format!("untag-{id}"))
+                                    .xsmall()
+                                    .ghost()
+                                    .label("×")
+                                    .on_click(move |_, _, cx| {
+                                        controller.update(cx, move |ctl, cx| {
+                                            let _ =
+                                                ctl.library.tag_assets(&[asset_id], id, false);
+                                            ctl.generation += 1;
+                                            cx.notify();
+                                        });
+                                    }),
+                            ),
+                    )
+                    .into_any_element()
+            }),
+        );
+
+        let tag_input_row = h_flex()
+            .gap_1()
+            .items_center()
+            .child(Input::new(&self.tag_input).small().flex_1())
+            .child(
+                Button::new("replace-tags")
+                    .xsmall()
+                    .ghost()
+                    .icon(IconName::Replace)
+                    .tooltip(rust_i18n::t!("inspector.replace_tags_hint").to_string())
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.replace_tags_from_input(window, cx);
+                    })),
+            );
+
+        let tags_content = v_flex().gap_2().child(tag_chips).child(tag_input_row);
+
+        let props_content = v_flex()
+            .gap_1()
+            .child(property_row(cx, "inspector.mime_type", mime))
+            .child(property_row(cx, "inspector.size", human_bytes(asset.size_bytes)))
+            .when_some(asset.duration_ms, |this, ms| {
+                this.child(property_row(cx, "inspector.duration", format_duration(ms)))
+            })
+            .child(property_row(cx, "inspector.dimensions", dims))
+            .child(property_row(cx, "inspector.added", added))
+            .child(property_row(cx, "inspector.sha256", hash));
+
+        let mut content = v_flex()
             .p_3()
             .gap_2()
             .w_full()
@@ -452,139 +533,67 @@ impl Render for InspectorPanel {
                     .overflow_hidden()
                     .child(preview),
             )
-            .child(separator_label(
-                cx,
+            .child(self.collapsible_section(
+                "edit",
                 rust_i18n::t!("inspector.edit").to_string(),
-            ))
-            .child(Input::new(&self.title_input).small().appearance(true))
-            .child(Input::new(&self.description_input).small().appearance(true))
-            .child(Input::new(&self.source_input).small().appearance(true))
-            .child(edit_label("inspector.kind"))
-            .child(self.kind_row(kind))
-            .child(edit_label("inspector.rating"))
-            .child(self.rating_row(rating))
-            .child(separator_label(
                 cx,
+                edit_content,
+            ))
+            .child(self.collapsible_section(
+                "tags",
                 rust_i18n::t!("inspector.tags").to_string(),
-            ))
-            .child(
-                h_flex()
-                    .flex_wrap()
-                    .gap_1p5()
-                    .children(asset_tags.iter().map(|tag| {
-                        let id = tag.id;
-                        let controller = self.controller.clone();
-                        let tag_color = tag.color.as_deref().and_then(hex_to_rgb);
-                        div()
-                            .px_2()
-                            .py_0p5()
-                            .rounded(cx.theme().radius)
-                            .bg(cx.theme().secondary)
-                            .text_sm()
-                            .text_color(
-                                tag_color
-                                    .map(gpui_kit::rgb)
-                                    .unwrap_or_else(|| cx.theme().foreground.into()),
-                            )
-                            .child(
-                                h_flex()
-                                    .gap_0p5()
-                                    .items_center()
-                                    .child(tag.name.clone())
-                                    .child(
-                                        Button::new(format!("untag-{id}"))
-                                            .xsmall()
-                                            .ghost()
-                                            .label("×")
-                                            .on_click(move |_, _, cx| {
-                                                controller.update(cx, move |ctl, cx| {
-                                                    let _ = ctl.library.tag_assets(
-                                                        &[asset_id],
-                                                        id,
-                                                        false,
-                                                    );
-                                                    ctl.generation += 1;
-                                                    cx.notify();
-                                                });
-                                            }),
-                                    ),
-                            )
-                            .into_any_element()
-                    })),
-            )
-            .child(
-                h_flex()
-                    .gap_1()
-                    .items_center()
-                    .child(Input::new(&self.tag_input).small().flex_1())
-                    .child(
-                        Button::new("replace-tags")
-                            .xsmall()
-                            .ghost()
-                            .icon(IconName::Replace)
-                            .tooltip(rust_i18n::t!("inspector.replace_tags_hint").to_string())
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.replace_tags_from_input(window, cx);
-                            })),
-                    ),
-            )
-            .when(!swatches.is_empty(), |this| {
-                this.child(separator_label(
-                    cx,
-                    rust_i18n::t!("inspector.colors").to_string(),
-                ))
-                .child(
-                    h_flex()
-                        .flex_wrap()
-                        .gap_1p5()
-                        .px_1()
-                        .children(swatches.iter().map(|(_rgb, hex)| {
-                            let hex = hex.clone();
-                            // Right-click copies the hex value straight to the
-                            // clipboard — the palette doubles as a picker.
-                            color_swatch(cx, format!("swatch-{hex}"), &hex, false, |_, _, _| {})
-                                .on_mouse_down(gpui::MouseButton::Right, {
-                                    let hex = hex.clone();
-                                    move |_, _, cx| {
-                                        cx.write_to_clipboard(gpui::ClipboardItem::new_string(
-                                            hex.clone(),
-                                        ));
-                                    }
-                                })
-                        })),
-                )
-            })
-            .when(kind == AssetKind::Font, |this| {
-                this.child(separator_label(
-                    cx,
-                    rust_i18n::t!("inspector.font").to_string(),
-                ))
-                .child(self.font_section(
-                    cx,
-                    font_family,
-                    font_style,
-                    font_weight,
-                    font_glyphs,
-                    font_italic,
-                    font_blob.as_deref(),
-                ))
-            })
-            .child(separator_label(
                 cx,
+                tags_content,
+            ))
+            .child(self.collapsible_section(
+                "properties",
                 rust_i18n::t!("inspector.properties").to_string(),
-            ))
-            .child(property_row(cx, "inspector.mime_type", mime))
-            .child(property_row(
                 cx,
-                "inspector.size",
-                human_bytes(asset.size_bytes),
-            ))
-            .when_some(asset.duration_ms, |this, ms| {
-                this.child(property_row(cx, "inspector.duration", format_duration(ms)))
-            })
-            .child(property_row(cx, "inspector.dimensions", dims))
-            .child(property_row(cx, "inspector.added", added))
-            .child(property_row(cx, "inspector.sha256", hash));
+                props_content,
+            ));
+
+        if !swatches.is_empty() {
+            let colors_content = h_flex().flex_wrap().gap_1p5().px_1().children(
+                swatches.iter().map(|(_rgb, hex)| {
+                    let hex = hex.clone();
+                    // Right-click copies the hex value straight to the
+                    // clipboard — the palette doubles as a picker.
+                    color_swatch(cx, format!("swatch-{hex}"), &hex, false, |_, _, _| {})
+                        .on_mouse_down(gpui::MouseButton::Right, {
+                            let hex = hex.clone();
+                            move |_, _, cx| {
+                                cx.write_to_clipboard(gpui::ClipboardItem::new_string(
+                                    hex.clone(),
+                                ));
+                            }
+                        })
+                }),
+            );
+            content = content.child(self.collapsible_section(
+                "colors",
+                rust_i18n::t!("inspector.colors").to_string(),
+                cx,
+                colors_content,
+            ));
+        }
+
+        if kind == AssetKind::Font {
+            let font_content = self.font_section(
+                cx,
+                font_family,
+                font_style,
+                font_weight,
+                font_glyphs,
+                font_italic,
+                font_blob.as_deref(),
+            );
+            content = content.child(self.collapsible_section(
+                "font",
+                rust_i18n::t!("inspector.font").to_string(),
+                cx,
+                font_content,
+            ));
+        }
 
         v_flex()
             .size_full()
@@ -604,6 +613,51 @@ impl Render for InspectorPanel {
 }
 
 impl InspectorPanel {
+    /// A titled section whose body can be collapsed. Clicking the header
+    /// toggles the state stored in `self.collapsed` (keyed by `id`), so it
+    /// survives re-renders and asset switches.
+    fn collapsible_section(
+        &self,
+        id: &'static str,
+        title: String,
+        cx: &mut Context<Self>,
+        content: Div,
+    ) -> Div {
+        let open = !self.collapsed.contains(id);
+        let header = h_flex()
+            .id(id)
+            .w_full()
+            .items_center()
+            .justify_between()
+            .px_1()
+            .py_0p5()
+            .rounded(cx.theme().radius)
+            .cursor_pointer()
+            .hover(|s| s.bg(cx.theme().secondary))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                // Toggle: absent → insert (collapse), present → remove.
+                if !this.collapsed.remove(id) {
+                    this.collapsed.insert(id);
+                }
+                cx.notify();
+            }))
+            .child(
+                div()
+                    .text_xs()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(cx.theme().muted_foreground)
+                    .child(title),
+            )
+            .child(
+                // Chevron points down when open, right when collapsed.
+                Icon::new(IconName::ChevronDown)
+                    .size_3()
+                    .text_color(cx.theme().muted_foreground)
+                    .rotate(gpui::percentage(if open { 0. } else { -0.25 })),
+            );
+        div().w_full().child(header).when(open, |this| this.child(content))
+    }
+
     /// One small button per [`AssetKind`]; the active kind is highlighted.
     fn kind_row(&self, active: AssetKind) -> Div {
         fn key(kind: AssetKind) -> &'static str {

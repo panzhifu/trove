@@ -246,7 +246,7 @@ mod tests {
         // Exactly one EOT, followed only by padding zeros.
         let eot_pos = ids.iter().position(|&i| i == EOT).unwrap();
         assert!(ids[eot_pos + 1..].iter().all(|&i| i == 0));
-        assert!(!ids[..eot_pos].iter().any(|&i| i == EOT));
+        assert!(!ids[..eot_pos].contains(&EOT));
         // Mask: 1 on every non-pad slot, 0 from the first pad onwards.
         assert_eq!(mask[0], 1);
         assert_eq!(mask[eot_pos], 1);
@@ -260,7 +260,7 @@ mod tests {
         // Any UTF-8 text (incl. Chinese) must encode without error.
         let (ids, _) = encode("一棵树").unwrap();
         assert_eq!(ids[0], SOT);
-        assert!(ids.iter().any(|&i| i == EOT));
+        assert!(ids.contains(&EOT));
     }
 
     #[test]

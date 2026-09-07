@@ -631,7 +631,6 @@ mod tests {
     use crate::media::thumb;
     use crate::model::{AssetKind, AssetQuery, NewCollection, NewSmartCollection};
     use crate::store::{assets, collections, tags};
-    use chrono::Utc;
     use std::path::{Path, PathBuf};
     use uuid::Uuid;
 

@@ -404,7 +404,7 @@ mod tests {
         assert!(extra.contains_key("visual_color_hist"));
         // Convert BTreeMap to serde_json::Map for from_extra.
         let extra_json: serde_json::Map<String, serde_json::Value> =
-            extra.into_iter().map(|(k, v)| (k, v)).collect();
+            extra.into_iter().collect();
         let loaded = VisualSignature::from_extra(&extra_json).unwrap();
         assert_eq!(loaded.phash, sig.phash);
     }
