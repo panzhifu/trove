@@ -51,12 +51,16 @@ impl SettingsDialog {
             dialog
                 .title(rust_i18n::t!("settings.title").to_string())
                 .width(px(760.))
+                .close_button(false)
                 .button_props(
                     gpui_kit::component::dialog::DialogButtonProps::default()
                         .show_cancel(true)
                         .cancel_text(rust_i18n::t!("settings.close").to_string()),
                 )
-                .child(v_flex().w_full().h(px(520.)).child(settings))
+                .child(super::with_close_x(
+                    "settings-close-x",
+                    v_flex().w_full().h(px(520.)).child(settings),
+                ))
         });
     }
 }
