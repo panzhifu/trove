@@ -8,6 +8,7 @@ view = "View"
 help = "Help"
 import_files = "Import files…"
 export_library = "Export library…"
+find_duplicates = "Find Duplicates…"
 settings = "Settings…"
 select_all = "Select All"
 clear_selection = "Clear Selection"
@@ -257,6 +258,12 @@ embedded_done = "Embedded %{done} of %{total} imported images"
 import_running = "Importing… (%{done}/%{total})"
 import_done = "Import finished: %{imported} files added"
 import_done_skipped = "Import finished: %{imported} added, %{skipped} skipped"
+
+[duplicates]
+title = "Duplicate Files"
+empty = "No duplicates found. Only images with a visual signature participate; newer imports gain signatures shortly after import."
+group_count = "%{count} visually identical files"
+keep_newest = "Keep newest, trash %{count}"
 
 [statusbar]
 selected = "%{count} selected"
