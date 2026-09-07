@@ -3,9 +3,9 @@
 > A local, private asset library — your photos, documents, audio and video in one searchable, taggable place.
 > 一个本地、私有的素材库 —— 把图片、文档、音视频统一收纳，可搜索、可打标签、可智能筛选。数据完全留在本机。
 
-Trove is a desktop asset manager built in Rust. It uses **[gpui-kit]** for the interface and **[libsql]** (a SQLite-compatible embedded database) for single-file persistence. Assets are stored content-addressed on disk, so a file is stored exactly once no matter how it is organized.
+Trove is a desktop asset manager built in Rust. It uses **[gpui-kit]** for the interface and **[rusqlite]** (SQLite) for single-file persistence. Assets are stored content-addressed on disk, so a file is stored exactly once no matter how it is organized.
 
-[Trove 是一个用 Rust 构建的桌面端素材管理工具。界面基于 **[gpui-kit]**，数据持久化使用 **[libsql]**（兼容 SQLite 的嵌入式数据库）。文件以内容寻址方式存储，无论被归入多少个文件夹或标签，同一文件在磁盘上只保存一份。]
+[Trove 是一个用 Rust 构建的桌面端素材管理工具。界面基于 **[gpui-kit]**，数据持久化使用 **[rusqlite]**（SQLite）。文件以内容寻址方式存储，无论被归入多少个文件夹或标签，同一文件在磁盘上只保存一份。]
 
 ---
 
@@ -163,7 +163,7 @@ crates/
 │   │   ├── model.rs     # Plain data types (Asset, Collection, Tag, …)
 │   │   ├── library.rs   # High-level facade over store + media dir
 │   │   ├── layout.rs    # Justified grid layout (dynamic programming)
-│   │   ├── store/       # libsql layer: schema, CRUD, FTS, smart queries
+│   │   ├── store/       # SQLite (rusqlite) layer: schema, CRUD, FTS, smart queries
 │   │   │   ├── schema.rs# Versioned migrations
 │   │   │   ├── smart.rs # Smart collection compilation & evaluation
 │   │   │   └── batch.rs # Atomic batch mutations
@@ -239,4 +239,4 @@ Test status / 测试状态：`trove-core` compiles and all **46** tests pass. `t
 ---
 
 [gpui-kit]: https://github.com/panzhifu/gpui-kit
-[libsql]: https://github.com/tursodatabase/libsql
+[rusqlite]: https://github.com/rusqlite/rusqlite

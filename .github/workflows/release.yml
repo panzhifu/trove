@@ -67,12 +67,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            libsqlite3-dev libssl-dev pkg-config \
             libxcb1-dev libxkbcommon-dev libxkbcommon-x11-dev
-
-      - name: Install build tools (Windows)
-        if: runner.os == 'Windows'
-        run: choco install cmake ninja -y
 
       - name: Build release binary
         run: cargo build --release --target ${{ matrix.target }} -p trove-app
@@ -124,7 +119,6 @@ jobs:
           draft: false
           prerelease: ${{ contains(github.ref_name, 'alpha') || contains(github.ref_name, 'beta') || contains(github.ref_name, 'rc') }}
           files: artifacts/**/*.{zip,tar.gz}
-          fail_on_unmatched_files: false
           generate_release_notes: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
