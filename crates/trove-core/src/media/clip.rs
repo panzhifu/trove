@@ -8,16 +8,16 @@
 //! Runtime prerequisites (manual download — zero build-time network):
 //!   1. ONNX Runtime library. Set `ORT_DYLIB_PATH` to the file, or place the
 //!      platform default next to the executable:
-//!        Linux   → libonnxruntime.so
-//!        macOS   → libonnxruntime.dylib
-//!        Windows → onnxruntime.dll
+//!      Linux   → libonnxruntime.so
+//!      macOS   → libonnxruntime.dylib
+//!      Windows → onnxruntime.dll
 //!      Get it from https://github.com/microsoft/onnxruntime/releases
 //!   2. One CLIP ONNX model file (the image + text encoders share one graph):
-//!        https://huggingface.co/onnx-community/CLIP-ViT-B-32-laion2B-s34B-b79K-ONNX
+//!      https://huggingface.co/onnx-community/CLIP-ViT-B-32-laion2B-s34B-b79K-ONNX
 //!      Download `model.onnx` and put it in the configured model directory
 //!      (default `~/.config/trove/models/`).
 //!   3. The CLIP BPE vocab, next to the model (needed for TEXT search only):
-//!        https://github.com/openai/CLIP/blob/main/clip/bpe_simple_vocab_16e6.txt
+//!      https://github.com/openai/CLIP/blob/main/clip/bpe_simple_vocab_16e6.txt
 //!      Save as `bpe_simple_vocab_16e6.txt` in the same directory.
 //!
 //! Until `configure()` succeeds, the engine is disabled and semantic calls
@@ -74,11 +74,11 @@ impl Embedding {
 
     /// Deserialize from bytes.
     pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
-        if bytes.len() % 4 != 0 || bytes.is_empty() {
+        if !bytes.len().is_multiple_of(4) || bytes.is_empty() {
             return None;
         }
         let data: Vec<f32> = bytes
-            .chunks_exact(4)
+            .as_chunks::<4>().0.iter()
             .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
             .collect();
         Some(Self::new(data))
@@ -194,11 +194,10 @@ pub fn ort_library_hint() -> Option<PathBuf> {
     };
     let mut candidates: Vec<PathBuf> = vec![];
     // Executable directory.
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(dir) = exe.parent() {
             candidates.push(dir.join(name));
         }
-    }
     // Current working directory.
     candidates.push(PathBuf::from(name));
     // Config dir and its models/ subdirectory.
@@ -269,7 +268,7 @@ fn preprocess_image(path: &Path) -> Result<Vec<f32>> {
         .resize_exact(224, 224, image::imageops::FilterType::Lanczos3)
         .to_rgb8();
     let mean = [0.481_454_66_f32, 0.457_827_5, 0.408_210_73];
-    let std = [0.268_629_54_f32, 0.261_302_58, 0.275_777_11];
+    let std = [0.268_629_54_f32, 0.261_302_6, 0.275_777_1];
     let n = 224usize * 224;
     let mut input = vec![0.0_f32; 3 * n];
     for (i, px) in img.pixels().enumerate() {
@@ -284,19 +283,16 @@ fn preprocess_image(path: &Path) -> Result<Vec<f32>> {
 /// requested port name first, then falls back to any float tensor with ≥128
 /// elements — robust across differently-named CLIP exports.
 fn extract_embedding(outputs: &ort::session::SessionOutputs, preferred: &str) -> Result<Vec<f32>> {
-    if let Some(v) = outputs.get(preferred) {
-        if let Ok((_, data)) = v.try_extract_tensor::<f32>() {
-            if !data.is_empty() {
+    if let Some(v) = outputs.get(preferred)
+        && let Ok((_, data)) = v.try_extract_tensor::<f32>()
+            && !data.is_empty() {
                 return Ok(data.to_vec());
             }
-        }
-    }
     for v in outputs.values() {
-        if let Ok((_, data)) = v.try_extract_tensor::<f32>() {
-            if data.len() >= 128 {
+        if let Ok((_, data)) = v.try_extract_tensor::<f32>()
+            && data.len() >= 128 {
                 return Ok(data.to_vec());
             }
-        }
     }
     Err(Error::Db("CLIP model produced no embedding output".into()))
 }
@@ -335,11 +331,10 @@ pub fn text_embedding(text: &str) -> Result<Vec<f32>> {
     // Cache hit: identical query text → reuse the vector, skip inference.
     {
         let cache = TEXT_CACHE.lock().unwrap();
-        if let Some((q, v)) = cache.as_ref() {
-            if q == text {
+        if let Some((q, v)) = cache.as_ref()
+            && q == text {
                 return Ok(v.clone());
             }
-        }
     }
     let vec = text_embedding_uncached(text)?;
     *TEXT_CACHE.lock().unwrap() = Some((text.to_string(), vec.clone()));

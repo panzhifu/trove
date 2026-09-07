@@ -28,11 +28,8 @@ pub fn query_map<T>(
         .query(rusqlite::params_from_iter(params))
         .map_err(Error::from)?;
     let mut out = Vec::new();
-    loop {
-        match rows.next().map_err(Error::from)? {
-            Some(row) => out.push(map(&row)?),
-            None => break,
-        }
+    while let Some(row) = rows.next().map_err(Error::from)? {
+        out.push(map(row)?);
     }
     Ok(out)
 }
@@ -49,7 +46,7 @@ pub fn query_one<T>(
         .query(rusqlite::params_from_iter(params))
         .map_err(Error::from)?;
     match rows.next().map_err(Error::from)? {
-        Some(row) => map(&row).map(Some),
+        Some(row) => map(row).map(Some),
         None => Ok(None),
     }
 }

@@ -43,7 +43,7 @@ async fn embed_imported_images(
             .timer(std::time::Duration::from_millis(50))
             .await;
     }
-    let _ = controller.update(cx, |ctl, cx| {
+    controller.update(cx, |ctl, cx| {
         ctl.notice = Some(
             rust_i18n::t!("notice.embedded_done", done = done, total = total).to_string(),
         );

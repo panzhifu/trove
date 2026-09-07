@@ -150,11 +150,10 @@ fn bpe(vocab: &Vocab, byte_encoder: &HashMap<u8, char>, token: &str) -> String {
                 .ranks
                 .get(&(word[i].clone(), word[i + 1].clone()))
                 .copied();
-            if let Some(r) = rank {
-                if best.is_none() || r < best.unwrap().0 {
+            if let Some(r) = rank
+                && (best.is_none() || r < best.unwrap().0) {
                     best = Some((r, i));
                 }
-            }
         }
         let Some((_, i)) = best else { break };
         let merged = format!("{}{}", word[i], word[i + 1]);

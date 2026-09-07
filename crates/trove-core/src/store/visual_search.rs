@@ -58,10 +58,7 @@ pub fn compute_signatures_batch(
 ) -> Result<u64> {
     let mut updated = 0_u64;
     for id in asset_ids {
-        match compute_and_store_signature(store, library_root, *id) {
-            Ok(true) => updated += 1,
-            _ => {}
-        }
+        if let Ok(true) = compute_and_store_signature(store, library_root, *id) { updated += 1 }
     }
     Ok(updated)
 }
@@ -71,10 +68,8 @@ pub fn assets_needing_signature(store: &crate::store::Store) -> Result<Vec<Uuid>
     let conn = store.conn();
     rows::query_map(
         conn,
-        &format!(
-            "SELECT id FROM assets WHERE kind = 'image' AND trashed_at IS NULL \
-             AND (extra NOT LIKE '%visual_phash%' OR extra IS NULL)"
-        ),
+        "SELECT id FROM assets WHERE kind = 'image' AND trashed_at IS NULL \
+             AND (extra NOT LIKE '%visual_phash%' OR extra IS NULL)",
         vec![],
         |row| rows::req_uuid(row, 0),
     )
@@ -170,22 +165,20 @@ fn collect_and_rank(
 
             // Boost score if a specific color was queried and the asset's
             // dominant colors contain a close match.
-            if let Some(qrgb) = query_rgb {
-                if let Some(colors) = extra_json
+            if let Some(qrgb) = query_rgb
+                && let Some(colors) = extra_json
                     .pointer("/dominant_colors")
                     .and_then(|v| v.as_array())
                 {
                     for c in colors {
-                        if let Some(hex_str) = c.as_str() {
-                            if let Some(crgb) = search::hex_to_rgb(hex_str) {
+                        if let Some(hex_str) = c.as_str()
+                            && let Some(crgb) = search::hex_to_rgb(hex_str) {
                                 let csim =
                                     search::color_similarity(search::rgb_distance(qrgb, crgb));
                                 score = score.max(csim * 0.8);
                             }
-                        }
                     }
                 }
-            }
 
             if score >= min_threshold {
                 scored.push(SimilarAsset { asset, score });

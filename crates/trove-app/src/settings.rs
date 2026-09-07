@@ -483,10 +483,10 @@ fn shortcuts_page() -> SettingPage {
 
     let items = keybinding_items();
     let mut group = SettingGroup::new();
-    for i in 0..items.len() {
-        let action = items[i].action;
-        let default_key = items[i].key;
-        let ctx = items[i].context;
+    for item in &items {
+        let action = item.action;
+        let default_key = item.key;
+        let ctx = item.context;
         let label = action_label(action);
         let ctx_label = ctx
             .map(context_label)
@@ -793,7 +793,7 @@ fn clip_model_file_row(controller: &Entity<LibraryController>, cx: &mut App) -> 
                 .on_click(move |_, _, _cx| {
                     let dir = config
                         .clip_model_dir()
-                        .unwrap_or_else(|| std::env::temp_dir());
+                        .unwrap_or_else(std::env::temp_dir);
                     reveal_in_file_manager(&dir);
                 }),
         )
@@ -841,7 +841,7 @@ fn prompt_model_file(controller: &Entity<LibraryController>, cx: &mut App) {
                 && let Some(path) = paths.first()
             {
                 let path = path.to_path_buf();
-                let _ = cx.update(|cx| {
+                cx.update(|cx| {
                     let mut config = AppConfig::load();
                     config.clip_model_path = Some(path.clone());
                     let res = config.save();
@@ -850,7 +850,7 @@ fn prompt_model_file(controller: &Entity<LibraryController>, cx: &mut App) {
                         let _ = trove_core::media::clip::configure(&path);
                         cx.refresh_windows();
                     }
-                    let _ = controller.update(cx, |_, cx| cx.notify());
+                    controller.update(cx, |_, cx| cx.notify());
                 });
             }
         }
@@ -883,7 +883,7 @@ fn semantic_status_row(cx: &mut App) -> Div {
         // Never configured: hint at the two prerequisites.
         let hint = format!(
             "{} (model.onnx + libonnxruntime.so)",
-            rust_i18n::t!("settings.status_unconfigured").to_string(),
+            rust_i18n::t!("settings.status_unconfigured"),
         );
         (hint, cx.theme().muted_foreground)
     };
@@ -969,7 +969,7 @@ fn embed_all_row(controller: Entity<LibraryController>, cx: &mut App) -> Div {
                             .timer(std::time::Duration::from_millis(20))
                             .await;
                     }
-                    let _ = ctl.update(cx, |ctl, cx| {
+                    ctl.update(cx, |ctl, cx| {
                         ctl.busy = false;
                         ctl.notice = Some(
                             rust_i18n::t!(
