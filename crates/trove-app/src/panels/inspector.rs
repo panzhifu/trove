@@ -650,10 +650,12 @@ impl InspectorPanel {
             )
             .child(
                 // Chevron points down when open, right when collapsed.
+                // percentage() panics on negatives — use 0.75 (270° cw)
+                // rather than -0.25 for the right-pointing state.
                 Icon::new(IconName::ChevronDown)
                     .size_3()
                     .text_color(cx.theme().muted_foreground)
-                    .rotate(gpui::percentage(if open { 0. } else { -0.25 })),
+                    .rotate(gpui::percentage(if open { 0. } else { 0.75 })),
             );
         div().w_full().child(header).when(open, |this| this.child(content))
     }
