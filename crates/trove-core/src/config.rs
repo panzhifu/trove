@@ -41,7 +41,14 @@ pub struct AppConfig {
     /// more (noisier) results. Clamped to 0.0..1.0; defaults to 0.2.
     #[serde(default)]
     pub semantic_min_similarity: Option<f32>,
+    /// Recently opened libraries, newest first (settings ▸ general lists
+    /// these for one-click hot switching). Capped at [`RECENT_LIBRARY_CAP`].
+    #[serde(default)]
+    pub recent_libraries: Vec<PathBuf>,
 }
+
+/// How many recent-library entries to remember.
+pub const RECENT_LIBRARY_CAP: usize = 8;
 
 impl AppConfig {
     /// The directory where the config file lives.
@@ -86,6 +93,21 @@ impl AppConfig {
     /// Set the library path and persist.
     pub fn set_library_path(&mut self, path: PathBuf) -> Result<()> {
         self.library_path = Some(path);
+        self.save()
+    }
+
+    /// Record a library as recently used: moved to the front, deduplicated,
+    /// capped. Persists immediately.
+    pub fn push_recent_library(&mut self, path: PathBuf) -> Result<()> {
+        self.recent_libraries.retain(|p| p != &path);
+        self.recent_libraries.insert(0, path);
+        self.recent_libraries.truncate(RECENT_LIBRARY_CAP);
+        self.save()
+    }
+
+    /// Drop one library from the recent list and persist.
+    pub fn remove_recent_library(&mut self, path: &PathBuf) -> Result<()> {
+        self.recent_libraries.retain(|p| p != path);
         self.save()
     }
 

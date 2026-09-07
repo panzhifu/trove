@@ -248,6 +248,27 @@ embedding = "Embedding images…"
 embed_done = "Embedded %{done} images (%{skipped} skipped)"
 select_model_dir = "Select CLIP model folder"
 
+recent_libraries = "Recent libraries"
+no_recent = "No recent libraries"
+open_library = "Open"
+remove_recent = "Remove from list"
+current_library = "Current"
+stats = "Statistics"
+backups = "Backups"
+backup_now = "Back up now"
+backup_now_desc = "Snapshot the library database into backups/ (max 10 kept). Auto snapshots run daily at library open."
+backup_done = "Backup written: %{path}"
+backup_count = "%{count} snapshots kept (max %{max})"
+open_backups_dir = "Open the backups folder"
+
+[stats]
+assets = "Assets"
+trashed = "In trash"
+total_size = "Total size"
+collections = "Collections"
+smart = "Smart collections"
+tags = "Tags"
+
 [i18n]
 lang_en = "English"
 lang_zh = "简体中文"
