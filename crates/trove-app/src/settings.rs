@@ -762,7 +762,7 @@ fn clip_model_file_row(controller: &Entity<LibraryController>, cx: &mut App) -> 
             Button::new("open-model-dir")
                 .ghost()
                 .xsmall()
-                .label("📁")
+                .icon(IconName::Folder)
                 .tooltip(rust_i18n::t!("settings.open_model_dir").to_string())
                 .on_click(move |_, _, _cx| {
                     let dir = config

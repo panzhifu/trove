@@ -103,11 +103,17 @@ fn semantic_search(
         });
         return Vec::new();
     }
-    let Ok(query_vec) = trove_core::media::clip::image_embedding(query_path) else {
-        let _ = controller.update(cx, |ctl, _| {
-            ctl.notice = Some(rust_i18n::t!("workspace.embed_failed").to_string());
-        });
-        return Vec::new();
+    let query_vec = match trove_core::media::clip::image_embedding(query_path) {
+        Ok(v) => v,
+        Err(e) => {
+            let _ = controller.update(cx, |ctl, _| {
+                ctl.notice = Some(
+                    rust_i18n::t!("workspace.embed_failed_with", error = e.to_string())
+                        .to_string(),
+                );
+            });
+            return Vec::new();
+        }
     };
     let query_emb = trove_core::media::clip::Embedding::new(query_vec);
     let scored =
