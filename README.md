@@ -190,7 +190,7 @@ Test status: `trove-core` compiles and all **75** tests pass. `trove-app` compil
 
 ## License
 
-Apache-2.0
+MIT
 
 [gpui-kit]: https://github.com/panzhifu/gpui-kit
 [rusqlite]: https://github.com/rusqlite/rusqlite

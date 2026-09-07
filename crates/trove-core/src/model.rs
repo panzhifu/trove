@@ -378,7 +378,7 @@ pub fn test_asset(name: &str, kind: AssetKind, id: Uuid) -> Asset {
         origin: Origin::Stored,
         rel_path: Some(format!("media/{}/{}", &id.to_string()[..2], name)),
         file_name: name.into(),
-        ext: name.split('.').last().unwrap_or("").into(),
+        ext: name.split('.').next_back().unwrap_or("").into(),
         mime: match kind {
             AssetKind::Image => "image/png",
             AssetKind::Video => "video/mp4",

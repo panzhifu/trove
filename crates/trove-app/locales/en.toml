@@ -44,6 +44,8 @@ delete = "Delete"
 
 [tags]
 all_tags = "All tags"
+add_tag = "Add tag"
+create_tag = "New tag"
 filter_by_tag = "Filter by tag"
 delete_tag = "Delete tag"
 rename_tag = "Rename"
