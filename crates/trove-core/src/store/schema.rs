@@ -5,7 +5,7 @@
 //! released migration; append a new one.
 
 /// Current schema version, bumped whenever a migration is appended.
-pub const SCHEMA_VERSION: i64 = 3;
+pub const SCHEMA_VERSION: i64 = 4;
 
 /// One migration per version index: `MIGRATIONS[0]` upgrades 0 -> 1, and so on.
 pub const MIGRATIONS: &[&str] = &[
@@ -109,5 +109,10 @@ pub const MIGRATIONS: &[&str] = &[
         file_name, title, description, tags,
         tokenize = 'unicode61'
     );
+    "#,
+    // v4: CLIP embedding column for semantic search. BLOB stores the
+    // 512/768-dim float32 vector (L2-normalized). NULL when not yet computed.
+    r#"
+    ALTER TABLE assets ADD COLUMN embedding BLOB;
     "#,
 ];
