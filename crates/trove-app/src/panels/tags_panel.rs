@@ -226,8 +226,7 @@ fn tag_context_menu(
             PopupMenuItem::new(rust_i18n::t!("tags.delete_tag").to_string()).on_click(
                 move |_, _, cx| {
                     ctl_del.update(cx, move |ctl, cx| {
-                        let conn = ctl.library.store().conn();
-                        let _ = tags::delete(conn, tag_id);
+                        let _ = ctl.library.delete_tag(tag_id);
                         if ctl.active_tag == Some(tag_id) {
                             ctl.select_tag(None);
                         }

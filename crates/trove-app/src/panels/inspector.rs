@@ -118,8 +118,7 @@ impl InspectorPanel {
             return;
         };
         controller.update(cx, |ctl, cx| {
-            let conn = ctl.library.store().conn();
-            if let Ok(tag) = tags::ensure_named(conn, &name) {
+            if let Ok(tag) = ctl.library.ensure_tag(&name) {
                 let _ = ctl.library.tag_assets(&[asset_id], tag.id, true);
             }
             ctl.generation += 1;
@@ -150,10 +149,9 @@ impl InspectorPanel {
         };
         let mut failed: Option<String> = None;
         controller.update(cx, |ctl, cx| {
-            let conn = ctl.library.store().conn();
             let mut ids = Vec::with_capacity(names.len());
             for name in &names {
-                match tags::ensure_named(conn, name) {
+                match ctl.library.ensure_tag(name) {
                     Ok(tag) => ids.push(tag.id),
                     Err(e) => {
                         failed = Some(e.to_string());

@@ -356,6 +356,17 @@ impl Library {
         Ok(())
     }
 
+    /// Create the named tag if missing and return it. The frontend uses this
+    /// to resolve comma-separated tag names before batch attach/replace.
+    pub fn ensure_tag(&self, name: &str) -> Result<crate::model::Tag> {
+        tags::ensure_named(self.store.conn(), name)
+    }
+
+    /// Delete a tag outright, detaching it from every asset. Not undoable.
+    pub fn delete_tag(&self, tag_id: Uuid) -> Result<()> {
+        tags::delete(self.store.conn(), tag_id)
+    }
+
     /// Attach (`add = true`) or detach one tag on many assets, recording the
     /// per-asset tag-group delta.
     pub fn tag_assets(&self, asset_ids: &[Uuid], tag_id: Uuid, add: bool) -> Result<()> {
@@ -467,8 +478,7 @@ impl Library {
     ) -> Result<Vec<crate::model::Asset>> {
         let vec = media::clip::text_embedding(query)?;
         let query_emb = media::clip::Embedding::new(vec);
-        let scored =
-            media::clip::semantic_search(&self.store, &query_emb, min_similarity, limit)?;
+        let scored = media::clip::semantic_search(&self.store, &query_emb, min_similarity, limit)?;
         let ids: Vec<Uuid> = scored.iter().map(|(id, _)| *id).collect();
         assets::by_ids(self.store.conn(), &ids)
     }
@@ -483,8 +493,7 @@ impl Library {
     ) -> Result<Vec<(crate::model::Asset, f32)>> {
         let vec = media::clip::image_embedding(query_path)?;
         let query_emb = media::clip::Embedding::new(vec);
-        let scored =
-            media::clip::semantic_search(&self.store, &query_emb, min_similarity, limit)?;
+        let scored = media::clip::semantic_search(&self.store, &query_emb, min_similarity, limit)?;
         let conn = self.store.conn();
         let ids: Vec<Uuid> = scored.iter().map(|(id, _)| *id).collect();
         let by_id: std::collections::HashMap<Uuid, crate::model::Asset> =
