@@ -31,6 +31,11 @@ use app::AppView;
 /// search input or elsewhere never triggers grid navigation.
 const WORKSPACE_CONTEXT: &str = "Workspace";
 
+/// Key context of the `ExplorerPanel` (collections tree). Its only binding
+/// is Escape: the inline add/rename editor's input lets the key propagate,
+/// so the panel can dismiss the editor.
+const EXPLORER_CONTEXT: &str = "Explorer";
+
 /// (Re)build the application menus from the active locale. Called at startup
 /// and again after a live language switch in Settings.
 ///
@@ -162,6 +167,14 @@ fn register_keys(cx: &mut App) {
     bind!(ClearSelection, "ClearSelection");
     bind!(Undo, "Undo");
     bind!(Redo, "Redo");
+    // Esc dismisses the explorer's inline add/rename editor. The input's own
+    // Escape handler propagates the key, so this fires only while the editor
+    // input holds focus inside the explorer panel.
+    bindings.push(KeyBinding::new(
+        "escape",
+        CancelEditor,
+        Some(EXPLORER_CONTEXT),
+    ));
 
     cx.bind_keys(bindings);
 }
