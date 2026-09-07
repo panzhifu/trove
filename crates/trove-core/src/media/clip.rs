@@ -117,6 +117,13 @@ pub fn dim_mismatches() -> usize {
     DIM_MISMATCHES.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Memoized last text query embedding. The grid re-renders (and re-runs its
+/// search) on every interaction while a search is active; the ONNX inference
+/// is by far the most expensive step, so repeated queries reuse the vector.
+/// One slot is enough — queries change one at a time. Cleared on
+/// `configure()` so a model switch can never serve stale vectors.
+static TEXT_CACHE: Mutex<Option<(String, Vec<f32>)>> = Mutex::new(None);
+
 #[derive(Default, Clone)]
 enum EngineState {
     #[default]
@@ -236,6 +243,9 @@ pub fn configure(model_path: &Path) -> Result<()> {
                 super::tokenizer::load(&vocab)?;
             }
         }
+        // A different model produces a different vector space: drop any
+        // memoized query embedding.
+        *TEXT_CACHE.lock().unwrap() = None;
         let mut eng = engine().lock().unwrap();
         eng.session = Some(session);
         eng.state = EngineState::Ready;
@@ -322,6 +332,22 @@ pub fn image_embedding(path: &Path) -> Result<Vec<f32>> {
 /// Encode a text query into an embedding vector. Requires the CLIP BPE vocab
 /// (loaded by `configure` from the model directory).
 pub fn text_embedding(text: &str) -> Result<Vec<f32>> {
+    // Cache hit: identical query text → reuse the vector, skip inference.
+    {
+        let cache = TEXT_CACHE.lock().unwrap();
+        if let Some((q, v)) = cache.as_ref() {
+            if q == text {
+                return Ok(v.clone());
+            }
+        }
+    }
+    let vec = text_embedding_uncached(text)?;
+    *TEXT_CACHE.lock().unwrap() = Some((text.to_string(), vec.clone()));
+    Ok(vec)
+}
+
+/// The actual inference path (see `text_embedding` for the cached wrapper).
+fn text_embedding_uncached(text: &str) -> Result<Vec<f32>> {
     let mut eng = engine().lock().unwrap();
     let Some(session) = eng.session.as_mut() else {
         return Err(Error::Db(format!(

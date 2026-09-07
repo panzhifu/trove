@@ -914,6 +914,7 @@ impl Render for WorkspacePanel {
                 }
             })
             .collect();
+        let cells_empty = cells.is_empty();
 
         // --- measured width --------------------------------------------------
         let measured = f32::from(*self.available_width.read(cx));
@@ -1114,6 +1115,28 @@ impl Render for WorkspacePanel {
         // nothing. Fill the grid area instead.
         .size_full();
 
+        // --- empty-state hint -------------------------------------------------
+        // An empty grid currently paints nothing at all; tell the user why.
+        // While searching, distinguish "nothing matches" from the actionable
+        // "no embeddings yet" case (text search silently returns nothing).
+        let empty_message = if cells_empty {
+            let (embedded, total) = self
+                .controller
+                .read(cx)
+                .library
+                .embedding_status()
+                .unwrap_or((0, 0));
+            if search_active && total > 0 && embedded == 0 {
+                rust_i18n::t!("workspace.no_embeddings_hint").to_string()
+            } else if search_active {
+                rust_i18n::t!("workspace.no_results", query = search).to_string()
+            } else {
+                rust_i18n::t!("workspace.no_assets_hint").to_string()
+            }
+        } else {
+            String::new()
+        };
+
         v_flex()
             .size_full()
             .gap_1()
@@ -1155,6 +1178,24 @@ impl Render for WorkspacePanel {
                                 }
                             });
                         }
+                    })
+                    // Empty-state hint sits UNDER the grid so the grid keeps
+                    // all mouse handling (deselect on click, etc.).
+                    .when(!empty_message.is_empty(), |area| {
+                        area.child(
+                            div()
+                                .absolute()
+                                .inset_0()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .text_color(cx.theme().muted_foreground)
+                                        .child(empty_message),
+                                ),
+                        )
                     })
                     // The toolbar must come AFTER the grid: later siblings
                     // paint on top, and the bar has to float over the cells.
