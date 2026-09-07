@@ -976,7 +976,7 @@ mod tests {
         crate::store::rows::execute(conn, "DELETE FROM asset_fts", vec![]).unwrap();
         drop(lib);
         let reopened = Library::open(&root).unwrap();
-        let conn = reopened.store().conn();
+        let _conn = reopened.store().conn();
 
         let (total, hits) = reopened
             .search_assets("sunset", &AssetQuery::default())
