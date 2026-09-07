@@ -11,7 +11,7 @@ use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::dock::{BasePanel, Panel as DockPanel, PanelControl, PanelEvent};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::scroll::ScrollableElement as _;
-use gpui_kit::component::{ActiveTheme, Icon, IconName, Sizable};
+use gpui_kit::component::{ActiveTheme, Disableable as _, Icon, IconName, Sizable};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
@@ -48,6 +48,8 @@ pub struct InspectorPanel {
     /// Font families already registered with the text system for previews
     /// (registration is process-global; skip repeats).
     font_previews: std::collections::HashSet<String>,
+    /// Preview zoom level (percent). Persisted per-panel.
+    zoom: u32,
 }
 
 impl InspectorPanel {
@@ -80,6 +82,7 @@ impl InspectorPanel {
             source_input,
             editing_id: None,
             font_previews: std::collections::HashSet::new(),
+            zoom: 100,
         };
         observe_controller(cx, &this.controller);
 
@@ -395,24 +398,34 @@ impl Render for InspectorPanel {
         // Re-populate the edit inputs when the selection changed.
         self.sync_editors(asset_id, window, cx);
 
+        let zoom = self.zoom;
         let preview: AnyElement = match thumb_path {
-            Some(path) => img(path)
-                .max_w(px(220.))
-                .max_h(px(160.))
-                .object_fit(gpui_kit::ObjectFit::Contain)
-                .rounded(cx.theme().radius)
-                .into_any_element(),
+            Some(path) => {
+                let scale = zoom as f32 / 100.0;
+                let base_w = 220.0_f32 * scale;
+                let base_h = 160.0_f32 * scale;
+                img(path)
+                    .w(px(base_w))
+                    .h(px(base_h))
+                    .object_fit(gpui_kit::ObjectFit::Contain)
+                    .rounded(cx.theme().radius)
+                    .into_any_element()
+            }
             None => v_flex()
                 .w(px(120.))
                 .h(px(120.))
                 .items_center()
                 .justify_center()
                 .bg(cx.theme().secondary)
-                .rounded_full()
+                .rounded(cx.theme().radius)
                 .child(Icon::new(kind_icon(kind)).size_10())
                 .into_any_element(),
         };
 
+        // The edit section made the panel taller than its dock slot: the
+        // whole content scrolls inside a bounded container (same pattern as
+        // the tags panel).
+        let zoom_slider = self.zoom_slider(cx);
         let edit_label = |key: &'static str| {
             div()
                 .text_xs()
@@ -420,14 +433,12 @@ impl Render for InspectorPanel {
                 .child(rust_i18n::t!(key).to_string())
         };
 
-        // The edit section made the panel taller than its dock slot: the
-        // whole content scrolls inside a bounded container (same pattern as
-        // the tags panel).
         let content = v_flex()
             .p_3()
             .gap_2()
             .w_full()
             .child(div().flex().w_full().justify_center().child(preview))
+            .child(zoom_slider)
             .child(separator_label(
                 cx,
                 rust_i18n::t!("inspector.edit").to_string(),
@@ -780,4 +791,82 @@ fn property_row(cx: &Context<impl Render>, key: &'static str, value: String) -> 
                 .truncate()
                 .child(value),
         )
+}
+
+/// A zoom slider for the preview image (50%–300%). The preview above
+/// scales accordingly. Uses +/- buttons for simplicity.
+impl InspectorPanel {
+    fn zoom_slider(&self, cx: &mut Context<Self>) -> Div {
+        let zoom = self.zoom;
+        let entity = cx.entity();
+        let min_zoom: u32 = 50;
+        let max_zoom: u32 = 300;
+        let step: u32 = 25;
+
+        h_flex()
+            .w_full()
+            .items_center()
+            .justify_center()
+            .gap_1p5()
+            .child(
+                Button::new("zoom-out")
+                    .xsmall()
+                    .ghost()
+                    .disabled(zoom <= min_zoom)
+                    .label("−")
+                    .on_click({
+                        let entity = entity.clone();
+                        move |_, _, cx| {
+                            entity.update(cx, |this, cx| {
+                                this.zoom = this.zoom.saturating_sub(step).max(min_zoom);
+                                cx.notify();
+                            });
+                        }
+                    }),
+            )
+            .child(
+                div()
+                    .relative()
+                    .w(px(120.))
+                    .h(px(4.))
+                    .bg(cx.theme().secondary)
+                    .rounded(px(2.))
+                    .child(
+                        // Position indicator.
+                        div()
+                            .absolute()
+                            .top(px(-3.))
+                            .left(px(((zoom - min_zoom) as f32
+                                / (max_zoom - min_zoom) as f32
+                                * 114.0_f32)
+                                .clamp(0.0, 114.0)))
+                            .size_3()
+                            .rounded_full()
+                            .bg(cx.theme().primary),
+                    ),
+            )
+            .child(
+                Button::new("zoom-in")
+                    .xsmall()
+                    .ghost()
+                    .disabled(zoom >= max_zoom)
+                    .label("+")
+                    .on_click({
+                        let entity = entity.clone();
+                        move |_, _, cx| {
+                            entity.update(cx, |this, cx| {
+                                this.zoom = (this.zoom + step).min(max_zoom);
+                                cx.notify();
+                            });
+                        }
+                    }),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .w(px(36.))
+                    .text_color(cx.theme().muted_foreground)
+                    .child(format!("{}%", zoom)),
+            )
+    }
 }
