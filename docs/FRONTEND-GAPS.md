@@ -22,7 +22,7 @@
 | 导出库 | `Library::export_metadata` | ✅ | File ▸ 导出素材库：另存为 JSON 元数据目录（资产/集合/标签/智能集合，不含媒体文件），结果推 toast |
 | 通知层 | notification_layer 已挂载 | ✅ | 导入开始/完成推键控 toast（同一批次替换）；跳过原因进 `ImportReport.skipped` 并体现在通知 |
 | 导入进度 | `ImportPhase::Running` / `import_progress` | ✅ | 逐文件提交 + 主线程让帧：状态栏与键控 toast 实时显示 (done/total)；staging 阶段为整批 |
-| 单资产 purge / import / search facade | `Library::purge_asset` 等 | ⬜ | 前端直接调 store 层，语义等价 |
+| 单资产 purge / import / search facade | `Library::purge_asset` 等 | 🚧 | 变更类操作已统一走 `Library` 门面（标签删除/创建、智能集合改名/删除等）；只读查询（网格分页、标题、计数）直接用 store conn，属视图层合理用法；导入逐文件提交仍走 `import::` 以便进度上报 |
 
 ## 二、前端基础功能
 

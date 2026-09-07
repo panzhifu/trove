@@ -178,7 +178,7 @@ impl ExplorerPanel {
             }
             EditorMode::RenamingSmart(id) => {
                 self.controller.update(cx, |ctl, cx| {
-                    let _ = smart_collections::rename(ctl.library.store().conn(), id, &name);
+                    let _ = ctl.library.rename_smart_collection(id, &name);
                     cx.notify();
                 });
             }
@@ -719,7 +719,7 @@ fn smart_menu(
             PopupMenuItem::new(rust_i18n::t!("explorer.delete").to_string()).on_click(
                 move |_, _, cx| {
                     ctl_delete.update(cx, move |ctl, cx| {
-                        let _ = smart_collections::delete(ctl.library.store().conn(), id);
+                        let _ = ctl.library.delete_smart_collection(id);
                         if ctl.active_smart == Some(id) {
                             ctl.select_smart(None);
                         }
