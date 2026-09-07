@@ -7,6 +7,7 @@ view = "视图"
 help = "帮助"
 import_files = "导入文件…"
 export_library = "导出素材库…"
+find_duplicates = "查找重复文件…"
 settings = "设置…"
 select_all = "全选"
 clear_selection = "取消选择"
@@ -254,6 +255,12 @@ embedded_done = "已为 %{done}/%{total} 张新导入图片生成语义向量"
 import_running = "正在导入…（%{done}/%{total}）"
 import_done = "导入完成：已添加 %{imported} 个文件"
 import_done_skipped = "导入完成：%{imported} 个已导入，%{skipped} 个跳过"
+
+[duplicates]
+title = "重复文件"
+empty = "未发现重复文件。仅参与对比已生成视觉签名的图片；新导入的图片会在导入后很快生成签名。"
+group_count = "%{count} 个视觉相同的文件"
+keep_newest = "保留最新，其余 %{count} 个移入回收站"
 
 [statusbar]
 selected = "已选 %{count} 项"

@@ -241,6 +241,12 @@ impl Library {
     // Destructive operations that cannot be inverted — purge, empty trash,
     // imports, tag/collection deletes — are deliberately not recorded.
 
+    /// Group live assets with identical content (SHA-256). The UI offers
+    /// per-group cleanup; trashing one member is ordinary (undoable) trash.
+    pub fn find_duplicates(&self) -> Result<Vec<crate::store::assets::DuplicateGroup>> {
+        crate::store::assets::duplicate_groups(self.store.conn())
+    }
+
     /// Trash many assets (single atomic statement).
     pub fn trash_assets(&self, ids: &[Uuid]) -> Result<u64> {
         self.set_assets_trashed(ids, true)
@@ -1110,5 +1116,63 @@ mod tests {
         lib.undo().unwrap();
         let asset = assets::get(conn, id).unwrap().unwrap();
         assert_eq!(asset.color_label, None);
+    }
+    #[test]
+    fn duplicate_content_import_needs_no_sha_scan() {
+        // The importer deduplicates identical content at the record level,
+        // so two live assets never share a SHA-256 — the duplicate finder
+        // works on perceptual hashes instead.
+        let (lib, dir) = temp_library("duplicates-sha");
+        let src = write_source(&dir, "same.png", PNG_1X1);
+        lib.import_files(std::slice::from_ref(&src), None).unwrap();
+        lib.import_files(std::slice::from_ref(&src), None).unwrap();
+        let (total, _) = assets::query(lib.store().conn(), &AssetQuery::default()).unwrap();
+        assert_eq!(total, 1);
+        assert!(lib.find_duplicates().unwrap().is_empty());
+    }
+
+    #[test]
+    fn duplicate_groups_cluster_by_phash() {
+        use crate::model::{AssetKind, test_asset};
+        use crate::store::Store;
+
+        let store = Store::in_memory().unwrap();
+        let conn = store.conn();
+        let set_phash = |name: &str, hash: u64| {
+            let id = Uuid::new_v4();
+            let mut asset = test_asset(name, AssetKind::Image, id);
+            asset.extra.insert(
+                "visual_phash".into(),
+                serde_json::Value::String(format!("{hash:016x}")),
+            );
+            assets::insert(conn, &asset).unwrap();
+            id
+        };
+        let a = set_phash("a.png", 0x0000_0000_0000_0001);
+        let b = set_phash("b.png", 0x0000_0000_0000_0003); // 1 bit from a
+        let c = set_phash("c.png", 0x0000_0000_0000_0007); // 1 bit from b
+        set_phash("far.png", 0xAAAA_0000_5555_0000); // unrelated
+        set_phash("nosig.png", 0x0); // no usable signature, ignored
+
+        let groups = crate::store::assets::duplicate_groups(conn).unwrap();
+        assert_eq!(groups.len(), 1, "a/b/c form one cluster, the rest none");
+        let ids: Vec<Uuid> = groups[0].assets.iter().map(|x| x.id).collect();
+        assert!(ids.contains(&a) && ids.contains(&b) && ids.contains(&c));
+
+        // Trashing members shrinks then dissolves the cluster.
+        lib_trash(&store, c);
+        let groups = crate::store::assets::duplicate_groups(conn).unwrap();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].assets.len(), 2);
+        lib_trash(&store, b);
+        assert!(
+            crate::store::assets::duplicate_groups(conn)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    fn lib_trash(store: &crate::store::Store, id: Uuid) {
+        crate::store::assets::set_trashed(store.conn(), id, true).unwrap();
     }
 }

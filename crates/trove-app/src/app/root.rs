@@ -268,6 +268,13 @@ impl Render for AppView {
             .on_action(cx.listener(|this, _: &OpenSettings, window, cx| {
                 crate::dialogs::settings::SettingsDialog::open(window, cx, this.controller.clone());
             }))
+            .on_action(cx.listener(|this, _: &FindDuplicates, window, cx| {
+                crate::dialogs::duplicates::DuplicateDialog::open(
+                    window,
+                    cx,
+                    this.controller.clone(),
+                );
+            }))
             .on_action(cx.listener(|this, _: &ShowAllAssets, _, cx| {
                 this.controller
                     .update(cx, |ctl, _cx| ctl.select_collection(None));
