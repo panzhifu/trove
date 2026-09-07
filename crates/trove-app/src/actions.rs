@@ -31,5 +31,7 @@ gpui_kit::actions!(
         MoveUp,
         MoveDown,
         OpenPreview,
+        // -- Inline editor (ExplorerPanel only) ------------------------------
+        CancelEditor,
     ]
 );

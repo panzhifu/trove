@@ -136,6 +136,19 @@ impl ExplorerPanel {
         editor.update(cx, |state, cx| state.focus(window, cx));
     }
 
+    /// Esc in the inline add/rename editor: drop the editor without
+    /// committing. The input's own Escape handler propagates the key, so
+    /// this fires only while the editor holds focus inside this panel.
+    fn cancel_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.mode == EditorMode::None {
+            return;
+        }
+        self.mode = EditorMode::None;
+        self.editor_input
+            .update(cx, |state, cx| state.set_value("", window, cx));
+        cx.notify();
+    }
+
     /// Enter pressed in the editor: create (with its parent) or rename.
     fn submit_editor(&mut self, cx: &mut Context<Self>) {
         let name: String = self.editor_input.read(cx).value().to_string();
@@ -528,11 +541,19 @@ impl Render for ExplorerPanel {
             );
         }
 
-        v_flex().size_full().gap_1().p_1().child(
-            div()
-                .flex_1()
-                .child(v_flex().gap_0p5().children(items).w_full()),
-        )
+        v_flex()
+            .size_full()
+            .gap_1()
+            .p_1()
+            .key_context("Explorer")
+            .on_action(cx.listener(|this, _: &crate::actions::CancelEditor, window, cx| {
+                this.cancel_editor(window, cx);
+            }))
+            .child(
+                div()
+                    .flex_1()
+                    .child(v_flex().gap_0p5().children(items).w_full()),
+            )
     }
 }
 
