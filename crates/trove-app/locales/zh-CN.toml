@@ -175,6 +175,8 @@ no = "否"
 [settings]
 title = "设置"
 general = "通用"
+shortcuts = "快捷键"
+close = "关闭"
 language = "语言"
 library = "素材库"
 library_location = "素材库位置"
