@@ -43,6 +43,11 @@ impl SearchBox {
                 InputEvent::PressEnter { .. } => {
                     let text = this.input.read(cx).value().trim().to_string();
                     this.controller.update(cx, |ctl, _| ctl.set_search(text));
+                    // Committing must NOT close the popover: pin the flag
+                    // open and re-render so the controlled popover stays.
+                    // The ✕ is the only way to close it.
+                    this.open.set(true);
+                    cx.notify();
                 }
                 // Re-render so the ✕ tracks the text while typing. Only this
                 // component re-renders, not the whole workspace panel.
@@ -51,6 +56,8 @@ impl SearchBox {
             }
         })
         .detach();
+        // Keep the trigger tint in sync with committed searches.
+        cx.observe(&controller, |_, _, cx| cx.notify()).detach();
         Self {
             controller,
             input,
@@ -98,7 +105,6 @@ impl Render for SearchBox {
                 let open = open.clone();
                 let this = this.clone();
                 move |_, _, cx| {
-                    let has_text = !input.read(cx).value().trim().is_empty();
                     h_flex()
                         .w(px(260.))
                         .h_7()
@@ -111,33 +117,29 @@ impl Render for SearchBox {
                         .gap_1()
                         .shadow_sm()
                         .child(Input::new(&input).appearance(false).small().w_full())
-                        .when(has_text, |row| {
-                            row.child(
-                                Button::new("clear-search")
-                                    .ghost()
-                                    .xsmall()
-                                    .icon(IconName::Close)
-                                    .tooltip(
-                                        rust_i18n::t!("workspace.clear_search").to_string(),
-                                    )
-                                    .on_click({
-                                        let input = input.clone();
-                                        let ctl = ctl.clone();
-                                        let open = open.clone();
-                                        let this = this.clone();
-                                        move |_, window, cx| {
-                                            input.update(cx, |state, cx| {
-                                                state.set_value("", window, cx)
-                                            });
-                                            ctl.update(cx, |ctl, _| {
-                                                ctl.set_search(String::new())
-                                            });
-                                            open.set(false);
-                                            this.update(cx, |_, cx| cx.notify());
-                                        }
-                                    }),
-                            )
-                        })
+                        .child(
+                            // Always visible: with text it clears + closes,
+                            // when empty it just dismisses the popover.
+                            Button::new("clear-search")
+                                .ghost()
+                                .xsmall()
+                                .icon(IconName::Close)
+                                .tooltip(rust_i18n::t!("workspace.clear_search").to_string())
+                                .on_click({
+                                    let input = input.clone();
+                                    let ctl = ctl.clone();
+                                    let open = open.clone();
+                                    let this = this.clone();
+                                    move |_, window, cx| {
+                                        input.update(cx, |state, cx| {
+                                            state.set_value("", window, cx)
+                                        });
+                                        ctl.update(cx, |ctl, _| ctl.set_search(String::new()));
+                                        open.set(false);
+                                        this.update(cx, |_, cx| cx.notify());
+                                    }
+                                }),
+                        )
                         .into_any_element()
                 }
             })
