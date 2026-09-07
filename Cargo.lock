@@ -9183,6 +9183,6 @@ dependencies = [
 ]
 
 [[patch.unused]]
-name = "libsql"
+name = "libsql-sys"
 version = "0.10.0-pre.4"
 source = "git+https://github.com/tursodatabase/libsql.git?branch=main#d6c75af6353bb1c34985399608e37cd272a35aa1"

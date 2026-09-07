@@ -32,4 +32,4 @@ sys-locale = "0.3"
 gpui-kit = { git = "https://github.com/panzhifu/gpui-kit.git", branch = "feat/optional-ellipsis-menu" }
 gpui-kit-assets = { git = "https://github.com/panzhifu/gpui-kit.git", branch = "feat/optional-ellipsis-menu" }
 # Windows: fix libsql-sys using std::os::unix on Windows (tursodatabase/libsql#1763)
-libsql = { git = "https://github.com/tursodatabase/libsql.git", branch = "main" }
+libsql-sys = { git = "https://github.com/tursodatabase/libsql.git", branch = "main" }
