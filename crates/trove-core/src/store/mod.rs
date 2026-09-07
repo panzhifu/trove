@@ -7,6 +7,7 @@ pub(crate) mod rows;
 pub mod schema;
 pub mod smart;
 pub mod smart_collections;
+pub mod stats;
 pub mod tags;
 pub mod visual_search;
 
