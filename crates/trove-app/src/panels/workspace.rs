@@ -1900,16 +1900,22 @@ fn asset_context_menu(
 }
 
 /// Open image search dialog for the given asset.
+/// One search result row (unified across visual + semantic backends).
+struct SearchResult {
+    id: Uuid,
+    name: String,
+    score: f32,
+    sha256: Option<String>,
+}
+
 fn open_image_search(
     asset_id: Uuid,
     controller: &Entity<LibraryController>,
     window: &mut Window,
     cx: &mut App,
 ) {
-    // Get the asset's query image path: prefer a decoded thumbnail, else the
-    // stored blob itself (search_by_image decodes either). Only images can be
-    // searched visually.
-    let (query_path, title) = {
+    // Resolve the query image + asset, then pick the backend from config.
+    let (query_path, title, mode) = {
         let ctl = controller.read(cx);
         let conn = ctl.library.store().conn();
         let library_root = ctl.library.root().to_path_buf();
@@ -1932,12 +1938,13 @@ fn open_image_search(
                 .map(|rel| library_root.join(rel))
                 .filter(|p| p.is_file())
         });
-        (path, name)
+        let mode = trove_core::config::AppConfig::load().search_mode();
+        (path, name, mode)
     };
 
     let Some(query_path) = query_path else { return };
 
-    // Perform visual search.
+    // Run the selected backend.
     let (store, library_root) = {
         let ctl = controller.read(cx);
         (
@@ -1945,13 +1952,56 @@ fn open_image_search(
             ctl.library.root().to_path_buf(),
         )
     };
-    let results =
-        trove_core::store::visual_search::search_by_image(store.conn(), &query_path, Some(50))
-            .unwrap_or_default();
+    let results: Vec<SearchResult> = match mode.as_str() {
+        "semantic" => {
+            if !trove_core::media::clip::semantic_ready() {
+                let _ = controller.update(cx, |ctl, _| {
+                    ctl.notice = Some(rust_i18n::t!("workspace.semantic_not_ready").to_string());
+                });
+                return;
+            }
+            let Ok(query_vec) = trove_core::media::clip::image_embedding(&query_path) else {
+                let _ = controller.update(cx, |ctl, _| {
+                    ctl.notice = Some(rust_i18n::t!("workspace.embed_failed").to_string());
+                });
+                return;
+            };
+            let query_emb = trove_core::media::clip::Embedding::new(query_vec);
+            let scored = trove_core::media::clip::semantic_search(&store, &query_emb, Some(50))
+                .unwrap_or_default();
+            let conn = store.conn();
+            scored
+                .into_iter()
+                .filter_map(|(id, score)| {
+                    let a = trove_core::store::assets::get(conn, id).ok().flatten()?;
+                    Some(SearchResult {
+                        id,
+                        name: a.file_name,
+                        score,
+                        sha256: a.sha256,
+                    })
+                })
+                .collect()
+        }
+        // Default: visual (pHash + colour histogram).
+        _ => trove_core::store::visual_search::search_by_image(store.conn(), &query_path, Some(50))
+            .unwrap_or_default()
+            .into_iter()
+            .map(|r| SearchResult {
+                id: r.asset.id,
+                name: r.asset.file_name,
+                score: r.score,
+                sha256: r.asset.sha256,
+            })
+            .collect(),
+    };
 
-    // Show results in a dialog.
+    // Show results in a dialog (backend-agnostic).
+    let mode_label = match mode.as_str() {
+        "semantic" => rust_i18n::t!("settings.search_mode_semantic").to_string(),
+        _ => rust_i18n::t!("settings.search_mode_visual").to_string(),
+    };
     window.open_dialog(cx, move |dialog, _, cx| {
-        // Build rows with the thumbnail of each result.
         let thumb_for = |sha: Option<&str>| -> Option<PathBuf> {
             sha.and_then(|s| {
                 let p = trove_core::media::thumb::abs_path(&library_root, s);
@@ -1962,9 +2012,8 @@ fn open_image_search(
             .iter()
             .take(24)
             .map(|r| {
-                let name = r.asset.file_name.clone();
                 let pct = (r.score * 100.0) as u32;
-                let p = thumb_for(r.asset.sha256.as_deref());
+                let p = thumb_for(r.sha256.as_deref());
                 div()
                     .px_1()
                     .py_1()
@@ -1997,7 +2046,7 @@ fn open_image_search(
                                     .truncate()
                                     .text_sm()
                                     .text_color(cx.theme().foreground)
-                                    .child(name),
+                                    .child(r.name.clone()),
                             )
                             .child(
                                 div()
@@ -2013,7 +2062,13 @@ fn open_image_search(
             .collect::<Vec<_>>();
 
         dialog
-            .title(rust_i18n::t!("workspace.search_results").to_string() + ": " + &title)
+            .title(
+                rust_i18n::t!("workspace.search_results").to_string()
+                    + " ["
+                    + &mode_label
+                    + "] "
+                    + &title,
+            )
             .width(px(520.))
             .child(
                 // Fixed-height column: the count line on top, and a flex-1

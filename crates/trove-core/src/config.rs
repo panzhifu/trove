@@ -22,6 +22,19 @@ pub struct AppConfig {
     /// Custom keybindings. Maps action name to key string (e.g. "enter" -> "ctrl-p").
     #[serde(default)]
     pub keybindings: std::collections::HashMap<String, String>,
+    /// Which "search by image" backend to use: "visual" (pHash + colour
+    /// histogram, no model needed) or "semantic" (CLIP embeddings).
+    #[serde(default)]
+    pub search_mode: Option<String>,
+    /// Directory holding the CLIP ONNX models (`clip-image.onnx` +
+    /// `clip-text.onnx`). Used only when `search_mode` is `semantic`.
+    #[serde(default)]
+    pub clip_model_dir: Option<PathBuf>,
+    /// Path to the ONNX Runtime dynamic library (`libonnxruntime.so` /
+    /// `.dylib` / `.dll`). When `None`, the engine falls back to
+    /// `ORT_DYLIB_PATH` env var then the executable directory.
+    #[serde(default)]
+    pub ort_lib_path: Option<PathBuf>,
 }
 
 impl AppConfig {
@@ -74,6 +87,26 @@ impl AppConfig {
     pub fn set_language(&mut self, language: Option<String>) -> Result<()> {
         self.language = language;
         self.save()
+    }
+
+    /// Effective search mode ("visual" or "semantic"). Defaults to visual.
+    pub fn search_mode(&self) -> String {
+        self.search_mode.as_deref().unwrap_or("visual").to_string()
+    }
+
+    /// Directory that should hold the CLIP image/text ONNX models.
+    pub fn clip_model_dir(&self) -> Option<PathBuf> {
+        self.clip_model_dir
+            .clone()
+            .or_else(|| Self::config_dir().map(|d| d.join("models")))
+    }
+
+    /// Effective path to the ONNX Runtime library: explicit config wins,
+    /// then `ORT_DYLIB_PATH` env, then `None` (engine searches cwd/exe dir).
+    pub fn ort_lib_path(&self) -> Option<PathBuf> {
+        self.ort_lib_path
+            .clone()
+            .or_else(|| std::env::var("ORT_DYLIB_PATH").ok().map(PathBuf::from))
     }
 
     /// Resolved library path: the `TROVE_LIBRARY_DIR` override when set,

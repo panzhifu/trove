@@ -43,6 +43,7 @@ impl SettingsDialog {
             let settings = Settings::new("trove-settings")
                 .sidebar_width(px(170.))
                 .page(general_page(&controller))
+                .page(search_page(&controller))
                 .page(maintenance_page(&controller))
                 .page(language_page())
                 .page(shortcuts_page());
@@ -643,4 +644,223 @@ fn reset_keybindings(cx: &mut App) {
 /// Get all configurable keybindings.
 fn keybinding_items() -> Vec<KeyBindingConfig> {
     keybindings::default_keybindings()
+}
+
+// ============================ search page ===================================
+
+/// Search ▸ pick the "search by image" backend and (for the semantic
+/// backend) point at the CLIP models + embed the library.
+fn search_page(controller: &Entity<LibraryController>) -> SettingPage {
+    SettingPage::new(rust_i18n::t!("settings.search").to_string())
+        .icon(IconName::Search)
+        .resettable(false)
+        .group(
+            SettingGroup::new()
+                .item(
+                    SettingItem::new(
+                        rust_i18n::t!("settings.search_mode").to_string(),
+                        SettingField::dropdown(
+                            search_mode_options(),
+                            |_cx| {
+                                let mode = AppConfig::load().search_mode();
+                                SharedString::from(mode)
+                            },
+                            |value, cx| {
+                                let mut config = AppConfig::load();
+                                config.search_mode = Some(value.to_string());
+                                if config.save().is_ok() {
+                                    cx.refresh_windows();
+                                }
+                            },
+                        ),
+                    )
+                    .description(rust_i18n::t!("settings.search_mode_desc").to_string()),
+                )
+                .item(
+                    SettingItem::new(
+                        rust_i18n::t!("settings.clip_model_dir").to_string(),
+                        SettingField::render({
+                            let controller = controller.clone();
+                            move |_, _, cx| clip_model_dir_row(&controller, cx)
+                        }),
+                    )
+                    .description(rust_i18n::t!("settings.clip_model_dir_desc").to_string()),
+                )
+                .item(
+                    SettingItem::new(
+                        rust_i18n::t!("settings.semantic_status").to_string(),
+                        SettingField::render(move |_, _, cx| semantic_status_row(cx)),
+                    )
+                    .description(rust_i18n::t!("settings.semantic_status_desc").to_string()),
+                )
+                .item(
+                    SettingItem::new(
+                        rust_i18n::t!("settings.embed_all").to_string(),
+                        SettingField::render({
+                            let controller = controller.clone();
+                            move |_, _, cx| embed_all_row(controller.clone(), cx)
+                        }),
+                    )
+                    .description(rust_i18n::t!("settings.embed_all_desc").to_string()),
+                ),
+        )
+}
+
+fn search_mode_options() -> Vec<(SharedString, SharedString)> {
+    vec![
+        (
+            SharedString::from("visual"),
+            rust_i18n::t!("settings.search_mode_visual")
+                .into_owned()
+                .into(),
+        ),
+        (
+            SharedString::from("semantic"),
+            rust_i18n::t!("settings.search_mode_semantic")
+                .into_owned()
+                .into(),
+        ),
+    ]
+}
+
+/// Model-directory row: shows the resolved path and a Browse button that
+/// opens a folder picker and saves the choice.
+fn clip_model_dir_row(controller: &Entity<LibraryController>, cx: &mut App) -> Div {
+    let config = AppConfig::load();
+    let dir = config
+        .clip_model_dir()
+        .map(|p| p.display().to_string())
+        .unwrap_or_default();
+    let ctl = controller.clone();
+    h_flex()
+        .w_full()
+        .items_center()
+        .gap_2()
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .truncate()
+                .text_sm()
+                .text_color(cx.theme().muted_foreground)
+                .child(dir),
+        )
+        .child(
+            Button::new("browse-model-dir")
+                .outline()
+                .small()
+                .label(rust_i18n::t!("settings.browse").to_string())
+                .on_click(move |_, _, cx| {
+                    let ctl = ctl.clone();
+                    prompt_model_dir(&ctl, cx);
+                }),
+        )
+}
+
+/// Pick a directory via the system dialog and persist it.
+fn prompt_model_dir(controller: &Entity<LibraryController>, cx: &mut App) {
+    let rx = cx.prompt_for_paths(PathPromptOptions {
+        files: false,
+        directories: true,
+        multiple: false,
+        prompt: Some(
+            rust_i18n::t!("settings.select_model_dir")
+                .into_owned()
+                .into(),
+        ),
+    });
+    cx.spawn({
+        let controller = controller.clone();
+        async move |cx| {
+            if let Ok(Ok(Some(paths))) = rx.await
+                && let Some(path) = paths.first()
+            {
+                let path = path.to_path_buf();
+                let _ = cx.update(|cx| {
+                    let mut config = AppConfig::load();
+                    config.clip_model_dir = Some(path.clone());
+                    if config.save().is_ok() {
+                        // Try to (re)initialise the engine with the new dir.
+                        let image = path.join("clip-image.onnx");
+                        let text = path.join("clip-text.onnx");
+                        let _ = trove_core::media::clip::configure(&image, &text);
+                        cx.refresh_windows();
+                    }
+                    // Surface the outcome on the controller so the status row
+                    // and any open views refresh.
+                    let _ = controller.update(cx, |ctl, cx| cx.notify());
+                });
+            }
+        }
+    })
+    .detach();
+}
+
+/// Shows the live engine status string.
+fn semantic_status_row(cx: &mut App) -> Div {
+    let status = trove_core::media::clip::semantic_status();
+    let (label, color) = if status == "ready" {
+        (
+            rust_i18n::t!("settings.status_ready").to_string(),
+            cx.theme().success,
+        )
+    } else if let Some(rest) = status.strip_prefix("failed:") {
+        (rest.to_string(), cx.theme().danger)
+    } else {
+        (
+            rust_i18n::t!("settings.status_unconfigured").to_string(),
+            cx.theme().muted_foreground,
+        )
+    };
+    div().text_sm().text_color(color).child(label)
+}
+
+/// Embed-all button: runs `embed_all_missing` on a worker thread and reports
+/// the result via the controller's notice line.
+fn embed_all_row(controller: Entity<LibraryController>, cx: &mut App) -> Div {
+    let busy = controller.read(cx).busy;
+    h_flex().w_full().justify_end().child(
+        Button::new("embed-all")
+            .outline()
+            .small()
+            .disabled(busy)
+            .label(rust_i18n::t!("settings.embed_all").to_string())
+            .on_click(move |_, _, cx| {
+                if !trove_core::media::clip::semantic_ready() {
+                    return;
+                }
+                let library_root = controller.read(cx).library.root().to_path_buf();
+                let store = controller.read(cx).library.store().clone();
+                let ctl = controller.clone();
+                ctl.update(cx, |ctl, cx| {
+                    ctl.busy = true;
+                    ctl.notice = Some(rust_i18n::t!("settings.embedding").to_string());
+                    cx.notify();
+                });
+                cx.spawn(async move |cx| {
+                    let res = trove_core::media::clip::embed_all_missing(&store, &library_root);
+                    let _ = cx.update(|cx| {
+                        let _ = ctl.update(cx, |ctl, cx| {
+                            ctl.busy = false;
+                            ctl.notice = match res {
+                                Ok((done, skipped)) => Some(
+                                    rust_i18n::t!(
+                                        "settings.embed_done",
+                                        done = done,
+                                        skipped = skipped
+                                    )
+                                    .to_string(),
+                                ),
+                                Err(e) => Some(
+                                    rust_i18n::t!("settings.job_failed", error = e.to_string())
+                                        .to_string(),
+                                ),
+                            };
+                            cx.notify();
+                        });
+                    });
+                })
+                .detach();
+            }),
+    )
 }
