@@ -101,6 +101,8 @@ cargo run -p trove-app
 
 ## 界面布局
 
+![Trove 主窗口](docs/screenshots/main-window.png)
+
 桌面应用采用停靠栏（dock）布局，配自定义标题栏：
 
 | 停靠位置 | 面板 | 用途 |
