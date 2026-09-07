@@ -322,6 +322,9 @@ impl Render for AppView {
             .on_action(cx.listener(|this, _: &PasteImport, window, cx| {
                 this.paste_import(window, cx);
             }))
+            .on_action(cx.listener(|this, _: &BatchRename, window, cx| {
+                crate::dialogs::rename::RenameDialog::open(window, cx, this.controller.clone());
+            }))
             .on_action(cx.listener(|this, _: &SelectAll, _, cx| {
                 this.controller
                     .update(cx, |ctl, _cx| ctl.select_all_visible());

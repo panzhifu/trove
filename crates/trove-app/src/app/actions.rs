@@ -16,6 +16,7 @@ gpui_kit::actions!(
         OpenSettings,
         // -- Edit menu / grid shortcuts ------------------------------------
         PasteImport,
+        BatchRename,
         SelectAll,
         ClearSelection,
         TrashSelected,

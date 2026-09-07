@@ -286,6 +286,17 @@ import_running = "正在导入…（%{done}/%{total}）"
 import_done = "导入完成：已添加 %{imported} 个文件"
 import_done_skipped = "导入完成：%{imported} 个已导入，%{skipped} 个跳过"
 
+[rename]
+title = "批量重命名"
+pattern = "命名模板"
+pattern_hint = "{n} = 序号 · {name} = 原文件名"
+start = "起始序号"
+preview = "预览"
+apply = "重命名"
+done = "已重命名 %{count} 个资产"
+failed = "重命名失败：%{error}"
+empty_selection = "请先选择要重命名的资产。"
+
 [duplicates]
 title = "重复文件"
 empty = "未发现重复文件。仅参与对比已生成视觉签名的图片；新导入的图片会在导入后很快生成签名。"

@@ -2,5 +2,6 @@
 //! editor and the duplicate finder.
 
 pub mod duplicates;
+pub mod rename;
 pub mod rules;
 pub mod settings;
