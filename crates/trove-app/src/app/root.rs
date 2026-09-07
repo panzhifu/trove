@@ -44,6 +44,9 @@ impl AppView {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let library =
             Library::open(default_library_path()).unwrap_or_else(|e| panic!("open library: {e}"));
+        // Record the library for Settings ▸ recent libraries (best-effort).
+        let mut config = AppConfig::load();
+        let _ = config.push_recent_library(library.root().to_path_buf());
         let controller = cx.new(|_cx| LibraryController::new(library));
         let title_bar = cx.new(|cx| TitleBarView::new(controller.clone(), cx));
 

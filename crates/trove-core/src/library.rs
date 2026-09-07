@@ -70,7 +70,25 @@ impl Library {
         // no search table: without this, `search` silently returns nothing for
         // assets that predate the index.
         lib.backfill_search_on_migration()?;
+        // Daily safety snapshot (24h throttle, rolling 10 files). Best-effort:
+        // a failed backup never blocks opening the library.
+        crate::backup::maybe_auto_backup(&lib.root, lib.store.conn());
         Ok(lib)
+    }
+
+    /// Write a backup snapshot of the database now (also prunes old ones).
+    pub fn create_backup(&self) -> Result<std::path::PathBuf> {
+        crate::backup::create_backup(&self.root, self.store.conn())
+    }
+
+    /// Backup snapshots of this library, oldest first.
+    pub fn list_backups(&self) -> Vec<std::path::PathBuf> {
+        crate::backup::list_backups(&self.root)
+    }
+
+    /// Library statistics for the settings dashboard.
+    pub fn stats(&self) -> Result<crate::store::stats::LibraryStats> {
+        crate::store::stats::library_stats(self.store.conn())
     }
 
     /// The FTS index mirrors the asset rows and is kept in sync on every write,

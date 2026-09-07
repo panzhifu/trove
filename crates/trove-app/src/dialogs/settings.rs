@@ -66,6 +66,7 @@ impl SettingsDialog {
 /// General ▸ Library: where the library lives, hot-switchable.
 fn general_page(controller: &Entity<LibraryController>) -> SettingPage {
     let controller = controller.clone();
+    let location = controller.clone();
     SettingPage::new(rust_i18n::t!("settings.general").to_string())
         .icon(IconName::Settings)
         .resettable(false)
@@ -75,11 +76,172 @@ fn general_page(controller: &Entity<LibraryController>) -> SettingPage {
                 .item(
                     SettingItem::new(
                         rust_i18n::t!("settings.library_location").to_string(),
-                        SettingField::render(move |_, _, cx| library_location_row(&controller, cx)),
+                        SettingField::render(move |_, _, cx| library_location_row(&location, cx)),
                     )
                     .description(rust_i18n::t!("settings.library_location_desc").to_string()),
                 ),
         )
+        .group(recent_libraries_group(&controller))
+        .group(stats_group(&controller))
+}
+
+// ========================= recent libraries ==================================
+
+/// General ▸ Recent libraries: every previously opened library, one click to
+/// hot-switch (excluding the currently open one, which is marked instead).
+fn recent_libraries_group(controller: &Entity<LibraryController>) -> SettingGroup {
+    let controller = controller.clone();
+    let config = AppConfig::load();
+    let current = config.resolved_library_path();
+    let mut group =
+        SettingGroup::new().title(rust_i18n::t!("settings.recent_libraries").to_string());
+    let recent = config.recent_libraries.clone();
+    if recent.is_empty() {
+        group = group.item(SettingItem::new(
+            rust_i18n::t!("settings.no_recent").to_string(),
+            SettingField::render(|_, _, _| div()),
+        ));
+        return group;
+    }
+    for path in recent {
+        let is_current = path == current;
+        group = group.item(SettingItem::new(
+            path.display().to_string(),
+            SettingField::render({
+                let controller = controller.clone();
+                move |_, _, cx| recent_library_row(&controller, path.clone(), is_current, cx)
+            }),
+        ));
+    }
+    group
+}
+
+/// One recent-library row: switch / remove buttons (the current library
+/// cannot be switched to or removed).
+fn recent_library_row(
+    controller: &Entity<LibraryController>,
+    path: PathBuf,
+    is_current: bool,
+    cx: &mut App,
+) -> Div {
+    let row_id = format!("lib-{}", path.display());
+    h_flex()
+        .w_full()
+        .justify_end()
+        .gap_2()
+        .when(is_current, |row| {
+            row.child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().success)
+                    .child(rust_i18n::t!("settings.current_library").to_string()),
+            )
+        })
+        .child(
+            Button::new(format!("{row_id}-open"))
+                .outline()
+                .small()
+                .disabled(is_current)
+                .label(rust_i18n::t!("settings.open_library").to_string())
+                .on_click({
+                    let controller = controller.clone();
+                    let path = path.clone();
+                    move |_, _, cx| switch_library(&controller, path.clone(), cx)
+                }),
+        )
+        .child(
+            Button::new(format!("{row_id}-remove"))
+                .ghost()
+                .small()
+                .icon(IconName::Close)
+                .tooltip(rust_i18n::t!("settings.remove_recent").to_string())
+                .on_click(move |_, _, cx| {
+                    let mut config = AppConfig::load();
+                    let _ = config.remove_recent_library(&path);
+                    cx.refresh_windows();
+                }),
+        )
+}
+
+// ============================== statistics ===================================
+
+/// General ▸ Statistics: a live snapshot of library sizes, recomputed on
+/// every settings render (a handful of COUNT queries).
+fn stats_group(controller: &Entity<LibraryController>) -> SettingGroup {
+    let controller = controller.clone();
+    SettingGroup::new()
+        .title(rust_i18n::t!("settings.stats").to_string())
+        .item(SettingItem::new(
+            rust_i18n::t!("settings.stats").to_string(),
+            SettingField::render(move |_, _, cx| stats_block(&controller, cx)),
+        ))
+}
+
+/// The label/value rows for the statistics item.
+fn stats_block(controller: &Entity<LibraryController>, cx: &mut App) -> Div {
+    let stats = controller.read(cx).library.stats().unwrap_or_default();
+    let kind_label = |kind: &trove_core::model::AssetKind| {
+        let key = match kind {
+            trove_core::model::AssetKind::Image => "asset.kind.image",
+            trove_core::model::AssetKind::Video => "asset.kind.video",
+            trove_core::model::AssetKind::Audio => "asset.kind.audio",
+            trove_core::model::AssetKind::Document => "asset.kind.document",
+            trove_core::model::AssetKind::Archive => "asset.kind.archive",
+            trove_core::model::AssetKind::Font => "asset.kind.font",
+            trove_core::model::AssetKind::Other => "asset.kind.other",
+        };
+        rust_i18n::t!(key).to_string()
+    };
+
+    let mut rows: Vec<(String, String)> = vec![
+        (
+            rust_i18n::t!("stats.assets").to_string(),
+            stats.live.to_string(),
+        ),
+        (
+            rust_i18n::t!("stats.trashed").to_string(),
+            stats.trashed.to_string(),
+        ),
+    ];
+    for (kind, count) in &stats.by_kind {
+        rows.push((kind_label(kind), count.to_string()));
+    }
+    rows.push((
+        rust_i18n::t!("stats.total_size").to_string(),
+        crate::panels::common::human_bytes(stats.total_bytes),
+    ));
+    rows.push((
+        rust_i18n::t!("stats.collections").to_string(),
+        stats.collections.to_string(),
+    ));
+    rows.push((
+        rust_i18n::t!("stats.smart").to_string(),
+        stats.smart_collections.to_string(),
+    ));
+    rows.push((
+        rust_i18n::t!("stats.tags").to_string(),
+        stats.tags.to_string(),
+    ));
+
+    v_flex()
+        .gap_1()
+        .children(rows.into_iter().map(|(label, value)| {
+            h_flex()
+                .justify_between()
+                .gap_2()
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(label),
+                )
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(cx.theme().foreground)
+                        .child(value),
+                )
+        }))
 }
 
 /// The library-location row: the resolved path, the last switch/maintenance
@@ -151,7 +313,8 @@ fn switch_library(controller: &Entity<LibraryController>, path: PathBuf, cx: &mu
     controller.update(cx, |ctl, cx| {
         let outcome = ctl.swap_library(path.clone()).and_then(|()| {
             let mut config = AppConfig::load();
-            config.set_library_path(path.clone())
+            config.set_library_path(path.clone())?;
+            config.push_recent_library(path.clone())
         });
         ctl.notice = match outcome {
             Ok(()) => None,
@@ -205,10 +368,88 @@ fn maintenance_page(controller: &Entity<LibraryController>) -> SettingPage {
                     .description(t("settings.clean_orphans_desc")),
                 ),
         )
+        .group(backups_group(controller))
         .group(SettingGroup::new().item(SettingItem::new(
             t("settings.status"),
             SettingField::render(move |_, _, cx| status_row(&status, cx)),
         )))
+}
+
+// =============================== backups =====================================
+
+/// Maintenance ▸ Backups: snapshot the database on demand and reveal the
+/// snapshot folder. Auto-backups run at library open (daily throttle).
+fn backups_group(controller: &Entity<LibraryController>) -> SettingGroup {
+    let controller = controller.clone();
+    SettingGroup::new()
+        .title(rust_i18n::t!("settings.backups").to_string())
+        .item(SettingItem::new(
+            rust_i18n::t!("settings.backup_now").to_string(),
+            SettingField::render(move |_, _, cx| backup_row(&controller, cx)),
+        ))
+}
+
+/// The backups row: snapshot count, a "back up now" button and a reveal
+/// button for the backups folder.
+fn backup_row(controller: &Entity<LibraryController>, cx: &mut App) -> Div {
+    let (busy, count) = {
+        let ctl = controller.read(cx);
+        (ctl.busy, ctl.library.list_backups().len())
+    };
+    let backups_dir = controller.read(cx).library.root().join("backups");
+    h_flex()
+        .w_full()
+        .justify_end()
+        .gap_2()
+        .child(
+            div()
+                .text_xs()
+                .text_color(cx.theme().muted_foreground)
+                .child(
+                    rust_i18n::t!(
+                        "settings.backup_count",
+                        count = count,
+                        max = trove_core::backup::MAX_BACKUPS
+                    )
+                    .to_string(),
+                ),
+        )
+        .child(
+            Button::new("open-backups-dir")
+                .ghost()
+                .small()
+                .icon(IconName::Folder)
+                .tooltip(rust_i18n::t!("settings.open_backups_dir").to_string())
+                .on_click(move |_, _, _cx| {
+                    reveal_in_file_manager(&backups_dir);
+                }),
+        )
+        .child(
+            Button::new("backup-now")
+                .outline()
+                .small()
+                .disabled(busy)
+                .label(rust_i18n::t!("settings.backup_now").to_string())
+                .on_click({
+                    let controller = controller.clone();
+                    move |_, _, cx| {
+                        let result = {
+                            let library = &controller.read(cx).library;
+                            library.create_backup()
+                        };
+                        let message = match result {
+                            Ok(path) => rust_i18n::t!(
+                                "settings.backup_done",
+                                path = path.display().to_string()
+                            )
+                            .to_string(),
+                            Err(e) => rust_i18n::t!("settings.job_failed", error = e.to_string())
+                                .to_string(),
+                        };
+                        finish_job(&controller, message, cx);
+                    }
+                }),
+        )
 }
 
 /// Mark the controller busy (unless a job is already running). Returns
