@@ -10,6 +10,75 @@ use super::rows;
 use crate::error::Result;
 use crate::media::search::{self, ColorHistogram, PHash, VisualSignature};
 use crate::model::Asset;
+use std::path::Path;
+use uuid::Uuid;
+
+/// Compute and store visual signature for a single asset (background task).
+pub fn compute_and_store_signature(
+    store: &crate::store::Store,
+    library_root: &Path,
+    asset_id: Uuid,
+) -> Result<bool> {
+    let conn = store.conn();
+    let assets_list = rows::query_map(
+        conn,
+        &format!("SELECT {COLS} FROM assets WHERE id = ?1"),
+        vec![rows::uuid(asset_id).into()],
+        assets::asset_from_row,
+    )?;
+
+    let asset = match assets_list.into_iter().next() {
+        Some(a) => a,
+        None => return Ok(false),
+    };
+
+    if asset.kind != crate::model::AssetKind::Image {
+        return Ok(false);
+    }
+
+    if let Some(ref rel) = asset.rel_path {
+        let path = library_root.join("media").join(rel);
+        let sig = VisualSignature::from_image(&path);
+        if sig.phash != PHash(0) {
+            let mut extra = asset.extra.clone();
+            sig.apply_to_extra(&mut extra);
+            assets::update_extra(conn, asset.id, &extra)?;
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Batch compute visual signatures for assets (background processing).
+/// Returns the number of assets updated.
+pub fn compute_signatures_batch(
+    store: &crate::store::Store,
+    library_root: &Path,
+    asset_ids: &[Uuid],
+) -> Result<u64> {
+    let mut updated = 0_u64;
+    for id in asset_ids {
+        match compute_and_store_signature(store, library_root, *id) {
+            Ok(true) => updated += 1,
+            _ => {}
+        }
+    }
+    Ok(updated)
+}
+
+/// Get IDs of image assets that don't have a visual signature yet.
+pub fn assets_needing_signature(store: &crate::store::Store) -> Result<Vec<Uuid>> {
+    let conn = store.conn();
+    rows::query_map(
+        conn,
+        &format!(
+            "SELECT id FROM assets WHERE kind = 'image' AND trashed_at IS NULL \
+             AND (extra NOT LIKE '%visual_phash%' OR extra IS NULL)"
+        ),
+        vec![],
+        |row| rows::req_uuid(row, 0),
+    )
+}
 
 /// Search results with similarity scores.
 #[derive(Debug, Clone)]

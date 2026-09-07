@@ -2,6 +2,7 @@
 //! the file import pipeline.
 
 pub mod blob;
+pub mod clip;
 pub mod color;
 pub mod import;
 pub mod metadata;

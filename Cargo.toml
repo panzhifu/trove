@@ -10,6 +10,10 @@ lto = "thin"
 # UI
 gpui-kit = "0.6"
 
+# ML inference (uncomment when ready to use CLIP)
+# ort = { version = "2.0.0-rc.13", features = ["load-dynamic"] }
+ndarray = "0.15"
+
 # Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
