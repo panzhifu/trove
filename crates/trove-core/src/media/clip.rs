@@ -104,6 +104,16 @@ struct EngineInner {
     session: Option<ort::session::Session>,
 }
 
+/// Number of stored embeddings skipped by the last `semantic_search` call
+/// because their dimension differs from the loaded model (the usual cause:
+/// the model was changed without re-embedding). Surfaced in Settings.
+static DIM_MISMATCHES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Dimension-mismatch count from the most recent `semantic_search` call.
+pub fn dim_mismatches() -> usize {
+    DIM_MISMATCHES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 #[derive(Default, Clone)]
 enum EngineState {
     #[default]
@@ -418,13 +428,8 @@ pub fn semantic_search(
             }
         }
     }
-    if mismatched > 0 {
-        // Surface silently-swallowed rows through stderr; a model change is
-        // the usual cause and users should re-embed (Settings ▸ Search).
-        eprintln!(
-            "[trove] semantic_search: ignored {mismatched} embeddings with a              different dimension — re-run embed-all after a model change"
-        );
-    }
+    // Record for the Settings coverage row instead of chattering on stderr.
+    DIM_MISMATCHES.store(mismatched, std::sync::atomic::Ordering::Relaxed);
     scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     scored.truncate(limit.unwrap_or(50) as usize);
     Ok(scored)

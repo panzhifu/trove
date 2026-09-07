@@ -344,6 +344,18 @@ impl WorkspacePanel {
         this
     }
 
+    /// Surface a view/query failure in the status bar. `report_error`
+    /// dedupes identical messages so a re-render cannot re-notify in a
+    /// loop when the same query keeps failing.
+    fn report_view_error(&mut self, cx: &mut Context<Self>, error: impl std::fmt::Display) {
+        let msg = rust_i18n::t!("workspace.query_failed", error = error.to_string()).to_string();
+        self.controller.update(cx, |ctl, cx| {
+            if ctl.report_error(msg) {
+                cx.notify();
+            }
+        });
+    }
+
     /// Save the active full-text search as a smart collection. The stored
     /// query tree uses the same `fts_query` the live search runs, so the
     /// saved results match 1:1 and track future imports.
@@ -770,23 +782,32 @@ impl Render for WorkspacePanel {
                 limit,
                 ..Default::default()
             };
-            match assets::search(self.controller.read(cx).library.store().conn(), &search, &q) {
+            let result =
+                assets::search(self.controller.read(cx).library.store().conn(), &search, &q);
+            match result {
                 Ok((t, a)) => (t as usize, a),
-                Err(_) => (0, Vec::new()),
+                Err(e) => {
+                    self.report_view_error(cx, e);
+                    (0, Vec::new())
+                }
             }
         } else if let Some(sid) = smart {
-            match self.controller.read(cx).library.evaluate_smart_collection(
+            let result = self.controller.read(cx).library.evaluate_smart_collection(
                 sid,
                 filter_kind,
                 filter_favorite.then_some(true),
                 limit,
                 0,
-            ) {
+            );
+            match result {
                 Ok((t, a)) => (t as usize, a),
-                Err(_) => (0, Vec::new()),
+                Err(e) => {
+                    self.report_view_error(cx, e);
+                    (0, Vec::new())
+                }
             }
         } else {
-            match assets::query(
+            let result = assets::query(
                 self.controller.read(cx).library.store().conn(),
                 &AssetQuery {
                     collection_id: if in_trash { None } else { collection },
@@ -805,28 +826,34 @@ impl Render for WorkspacePanel {
                     limit,
                     ..Default::default()
                 },
-            ) {
+            );
+            match result {
                 Ok((t, a)) => (t as usize, a),
-                Err(_) => (0, Vec::new()),
+                Err(e) => {
+                    self.report_view_error(cx, e);
+                    (0, Vec::new())
+                }
             }
         };
 
         // One search box, two engines: append CLIP semantic hits (image
         // content) that keyword FTS cannot see, skipping duplicates. Runs
-        // only when the engine is configured; failures degrade silently to
-        // the FTS result set.
+        // only when the engine is configured; failures surface in the
+        // status bar but keep the FTS result set visible.
         if search_active && trove_core::media::clip::semantic_ready() {
             let threshold = trove_core::config::AppConfig::load().semantic_min_similarity();
-            if let Ok(hits) =
-                self.controller
-                    .read(cx)
-                    .library
-                    .semantic_text_search(&search, threshold, limit)
-            {
+            let semantic_result = self
+                .controller
+                .read(cx)
+                .library
+                .semantic_text_search(&search, threshold, limit);
+            if let Ok(hits) = semantic_result {
                 let have: std::collections::HashSet<Uuid> = list.iter().map(|a| a.id).collect();
                 let before = list.len();
                 list.extend(hits.into_iter().filter(|a| !have.contains(&a.id)));
                 total += list.len() - before;
+            } else {
+                self.report_view_error(cx, semantic_result.unwrap_err());
             }
         }
 

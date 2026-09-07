@@ -201,13 +201,12 @@ fn init_semantic_search() {
     let Some(model) = config.clip_model_path() else {
         return;
     };
-    // `ort` may panic if the dylib fails to load, so catch it.
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    // `ort` may panic if the dylib fails to load, so catch it. Failures are
+    // recorded in the engine state and shown in Settings ▸ Search; there is
+    // no window yet at startup, so nothing else to surface here.
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         clip::configure(&model)
     }));
-    if let Ok(Err(e)) = result {
-        eprintln!("[trove] semantic search not available: {e}");
-    }
 }
 
 fn main() {
