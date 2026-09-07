@@ -9,7 +9,7 @@ use uuid::Uuid;
 use trove_core::model::{Asset, AssetKind, AssetQuery};
 use trove_core::store::assets;
 
-use crate::state::LibraryController;
+use crate::library::LibraryController;
 
 /// Distinct icon per asset kind (image cells only fall back to this when no
 /// thumbnail was generated). Icon names resolve to the gpui-kit asset set.

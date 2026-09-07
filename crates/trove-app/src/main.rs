@@ -13,17 +13,12 @@ rust_i18n::i18n!("locales", fallback = "en");
 use gpui_kit::component::Root;
 use gpui_kit::*;
 
-mod actions;
 mod app;
-mod i18n;
-mod jobs;
+mod dialogs;
+mod library;
 mod panels;
-mod rules;
-mod settings;
-mod state;
-mod title_bar;
 
-use actions::*;
+use app::actions::*;
 use app::AppView;
 
 /// Keyboard map for the asset grid. The `Workspace` key context is active
@@ -221,7 +216,7 @@ fn init_semantic_search() {
 }
 
 fn main() {
-    i18n::init_from_config();
+    app::i18n::init_from_config();
     init_semantic_search();
     gpui_kit::application()
         .with_assets(gpui_kit::assets::Assets)
@@ -234,7 +229,7 @@ fn main() {
             cx.spawn(async move |cx| {
                 let options = cx.update(|cx| gpui_kit::WindowOptions {
                     window_bounds: Some(WindowBounds::centered(size(px(1024.), px(720.)), cx)),
-                    ..crate::title_bar::window_options()
+                    ..crate::app::title_bar::window_options()
                 });
                 cx.open_window(options, |window, cx| {
                     let view = cx.new(|cx| AppView::new(window, cx));
