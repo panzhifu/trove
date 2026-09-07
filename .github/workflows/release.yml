@@ -24,16 +24,25 @@ jobs:
             os: macos-14
             asset_name: trove-aarch64-apple-darwin
             archive_ext: zip
+            bin_name: trove-app
           # macOS (Intel)
           - target: x86_64-apple-darwin
             os: macos-14
             asset_name: trove-x86_64-apple-darwin
             archive_ext: zip
+            bin_name: trove-app
           # Linux (x86_64)
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-22.04
             asset_name: trove-x86_64-unknown-linux-gnu
             archive_ext: tar.gz
+            bin_name: trove-app
+          # Windows (x86_64)
+          - target: x86_64-pc-windows-msvc
+            os: windows-2022
+            asset_name: trove-x86_64-pc-windows-msvc
+            archive_ext: zip
+            bin_name: trove-app.exe
 
     runs-on: ${{ matrix.os }}
     steps:
@@ -70,16 +79,17 @@ jobs:
 
       - name: Package (zip)
         if: matrix.archive_ext == 'zip'
+        shell: bash
         run: |
           cd target/${{ matrix.target }}/release
-          zip -r ../../../${{ matrix.asset_name }}.zip trove-app
+          zip -r ../../../${{ matrix.asset_name }}.zip ${{ matrix.bin_name }}
           cd -
 
       - name: Package (tar.gz)
         if: matrix.archive_ext == 'tar.gz'
         run: |
           cd target/${{ matrix.target }}/release
-          tar czf ../../../${{ matrix.asset_name }}.tar.gz trove-app
+          tar czf ../../../${{ matrix.asset_name }}.tar.gz ${{ matrix.bin_name }}
           cd -
 
       - name: Upload artifact
