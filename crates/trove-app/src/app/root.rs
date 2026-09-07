@@ -305,7 +305,9 @@ impl AppView {
             dialog
                 .title(rust_i18n::t!("app.about").to_string())
                 .width(px(360.))
-                .child(
+                .close_button(false)
+                .child(crate::dialogs::with_close_x(
+                    "about-close-x",
                     div()
                         .flex()
                         .flex_col()
@@ -322,7 +324,7 @@ impl AppView {
                         )
                         .child(rust_i18n::t!("app.about_body").to_string())
                         .child(rust_i18n::t!("app.version", version = "0.2.1").to_string()),
-                )
+                ))
         });
     }
 }

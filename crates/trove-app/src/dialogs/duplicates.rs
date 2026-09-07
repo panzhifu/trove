@@ -56,12 +56,13 @@ impl DuplicateDialog {
             dialog
                 .title(rust_i18n::t!("duplicates.title").to_string())
                 .width(px(620.))
+                .close_button(false)
                 .button_props(
                     DialogButtonProps::default()
                         .show_cancel(true)
                         .cancel_text(rust_i18n::t!("settings.close").to_string()),
                 )
-                .child(content)
+                .child(super::with_close_x("duplicates-close-x", content))
         });
     }
 }

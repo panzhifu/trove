@@ -48,7 +48,9 @@ impl RenameDialog {
             dialog
                 .title(rust_i18n::t!("rename.title").to_string())
                 .width(px(460.))
-                .child(
+                .close_button(false)
+                .child(super::with_close_x(
+                    "rename-close-x",
                     v_flex()
                         .gap_2()
                         .p_1()
@@ -72,7 +74,7 @@ impl RenameDialog {
                                 .child(Input::new(&start).small().appearance(true).w(px(90.))),
                         )
                         .child(preview_block(&draft_ok, cx)),
-                )
+                ))
                 .button_props(
                     DialogButtonProps::default()
                         .ok_text(rust_i18n::t!("rename.apply").to_string())
