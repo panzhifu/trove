@@ -6,7 +6,7 @@
 //! ids themselves.
 
 use chrono::Utc;
-use libsql::Connection;
+use rusqlite::Connection;
 use uuid::Uuid;
 
 use super::rows;
@@ -22,7 +22,7 @@ pub fn set_trashed_many(conn: &Connection, ids: &[Uuid], trashed: bool) -> Resul
         if trashed {
             rows::ts(Utc::now()).into()
         } else {
-            libsql::Value::Null
+            rusqlite::types::Value::Null
         },
         rows::ts(Utc::now()).into(),
     ];
@@ -46,7 +46,7 @@ pub fn set_favorite_many(conn: &Connection, ids: &[Uuid], favorite: bool) -> Res
     }
     let mut sql = String::from("UPDATE assets SET is_favorite = ?1, updated_at = ?2 WHERE id IN (");
     let mut args = vec![
-        libsql::Value::Integer(favorite as i64),
+        rusqlite::types::Value::Integer(favorite as i64),
         rows::ts(Utc::now()).into(),
     ];
 

@@ -2,7 +2,7 @@
 //! tree). Evaluation lives in [`super::smart`].
 
 use chrono::Utc;
-use libsql::{Connection, Value};
+use rusqlite::{Connection, types::Value};
 use uuid::Uuid;
 
 use super::rows::{self, bind_opt_str, req_ts, req_uuid};
@@ -122,7 +122,7 @@ pub fn delete(conn: &Connection, id: Uuid) -> Result<()> {
     Ok(())
 }
 
-fn collection_from_row(row: &libsql::Row) -> Result<SmartCollection> {
+fn collection_from_row(row: &rusqlite::Row) -> Result<SmartCollection> {
     let query_json = rows::req_str(row, 2)?;
     let query = serde_json::from_str(&query_json)
         .map_err(|e| Error::Db(format!("smart_collections: bad query json: {e}")))?;

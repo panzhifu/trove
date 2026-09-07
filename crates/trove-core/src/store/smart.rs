@@ -1,7 +1,7 @@
 //! Smart-collection condition tree: compile a [`SmartNode`] tree into a SQL
 //! `WHERE` fragment, and evaluate it live against the library.
 
-use libsql::Value;
+use rusqlite::types::Value;
 use serde_json::Value as Json;
 
 use super::assets;
@@ -77,7 +77,7 @@ fn compile_match(
                 .map_err(|_| Error::Validation("kind must be a valid asset kind".into()))?;
             Ok((
                 format!("assets.kind {} ?", op_sql(op)),
-                vec![kind_sql(kind).into()],
+                vec![Value::from(kind_sql(kind).to_string())],
             ))
         }
         SmartField::IsFavorite => {
@@ -147,7 +147,7 @@ fn compile_match(
 /// Evaluate a condition tree against the live library (trashed assets are
 /// excluded). Returns `(total_matching, matching_ids)`.
 pub fn evaluate(
-    conn: &libsql::Connection,
+    conn: &rusqlite::Connection,
     node: &SmartNode,
     limit: Option<u32>,
     offset: u64,
@@ -159,7 +159,7 @@ pub fn evaluate(
 /// onto the tree — the toolbar filters compose with smart collections the
 /// same way they compose with plain views.
 pub fn evaluate_filtered(
-    conn: &libsql::Connection,
+    conn: &rusqlite::Connection,
     node: &SmartNode,
     kind: Option<AssetKind>,
     favorite: Option<bool>,
@@ -173,7 +173,7 @@ pub fn evaluate_filtered(
     let mut expr = format!("({tree})");
     if let Some(kind) = kind {
         expr.push_str(" AND assets.kind = ?");
-        args.push(kind_sql(kind).into());
+        args.push(Value::from(kind_sql(kind).to_string()));
     }
     if let Some(favorite) = favorite {
         expr.push_str(" AND assets.is_favorite = ?");

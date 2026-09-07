@@ -1,70 +1,52 @@
 //! SQL helpers shared by the stores.
 //!
-//! libsql's public connection API is async even for a local file; these
-//! helpers run each call to completion on the current thread with `pollster`
-//! so the store stays synchronous for the (single-threaded) application.
+//! A thin synchronous wrapper over [`rusqlite`]; the store stays
+//! single-threaded for the UI.
 
 use chrono::{DateTime, Utc};
-use libsql::{Connection, Row, Value};
+use rusqlite::{Connection, Row, types::Value};
 use uuid::Uuid;
 
 use crate::error::{Error, Result};
 
 /// Run an `INSERT`/`UPDATE`/`DELETE`/DDL statement, returning rows changed.
 pub fn execute(conn: &Connection, sql: &str, params: Vec<Value>) -> Result<u64> {
-    pollster::block_on(conn.execute(sql, params)).map_err(Error::from)
+    conn.execute(sql, rusqlite::params_from_iter(params))
+        .map(|n| n as u64)
+        .map_err(Error::from)
 }
 
-/// Run a batch of statements atomically (migrations).
-pub fn execute_transactional_batch(conn: &Connection, sql: &str) -> Result<()> {
-    let _ = pollster::block_on(conn.execute_transactional_batch(sql)).map_err(Error::from)?;
-    Ok(())
-}
-
-/// Run `f` inside a `BEGIN … COMMIT` transaction on `conn`. On error the work
-/// is rolled back and the error returned. Statements run after.
-pub fn transaction<T>(conn: &Connection, f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
-    execute(conn, "BEGIN", vec![])?;
-    match f(conn) {
-        Ok(v) => {
-            execute(conn, "COMMIT", vec![])?;
-            Ok(v)
-        }
-        Err(e) => {
-            let _ = execute(conn, "ROLLBACK", vec![]);
-            Err(e)
-        }
-    }
-}
-
-/// Run a `SELECT`, mapping every row to a value **inside** the fetch loop.
-///
-/// libsql `Row::get` reads lazily from the underlying statement, which is
-/// only valid while the row is current — so rows must be materialized before
-/// the next `next()` advances the cursor.
+/// Run a `SELECT`, mapping every row to a value.
 pub fn query_map<T>(
     conn: &Connection,
     sql: &str,
     params: Vec<Value>,
     mut map: impl FnMut(&Row) -> Result<T>,
 ) -> Result<Vec<T>> {
-    let mut rows = pollster::block_on(conn.query(sql, params)).map_err(Error::from)?;
+    let mut stmt = conn.prepare(sql).map_err(Error::from)?;
+    let mut rows = stmt.query(rusqlite::params_from_iter(params)).map_err(Error::from)?;
     let mut out = Vec::new();
-    while let Some(row) = pollster::block_on(rows.next()).map_err(Error::from)? {
-        out.push(map(&row)?);
+    loop {
+        match rows.next().map_err(Error::from)? {
+            Some(row) => out.push(map(&row)?),
+            None => break,
+        }
     }
     Ok(out)
 }
 
-/// Run a `SELECT` expecting at most one row, materialized immediately.
+/// Run a `SELECT` expecting at most one row.
 pub fn query_one<T>(
     conn: &Connection,
     sql: &str,
     params: Vec<Value>,
     map: impl FnOnce(&Row) -> Result<T>,
 ) -> Result<Option<T>> {
-    let mut rows = pollster::block_on(conn.query(sql, params)).map_err(Error::from)?;
-    match pollster::block_on(rows.next()).map_err(Error::from)? {
+    let mut stmt = conn.prepare(sql).map_err(Error::from)?;
+    let mut rows = stmt
+        .query(rusqlite::params_from_iter(params))
+        .map_err(Error::from)?;
+    match rows.next().map_err(Error::from)? {
         Some(row) => map(&row).map(Some),
         None => Ok(None),
     }
@@ -76,42 +58,42 @@ pub fn query_count(conn: &Connection, sql: &str, params: Vec<Value>) -> Result<i
 }
 
 /// Read a nullable `TEXT` column as `Option<String>`.
-pub fn opt_str(row: &Row, ix: i32) -> Result<Option<String>> {
-    Ok(row.get::<Option<String>>(ix)?)
+pub fn opt_str(row: &Row, ix: usize) -> Result<Option<String>> {
+    row.get::<_, Option<String>>(ix).map_err(Error::from)
 }
 
 /// Read a non-null `TEXT` column.
-pub fn req_str(row: &Row, ix: i32) -> Result<String> {
-    row.get::<String>(ix).map_err(Error::from)
+pub fn req_str(row: &Row, ix: usize) -> Result<String> {
+    row.get::<_, String>(ix).map_err(Error::from)
 }
 
 /// Read an integer column (`INTEGER`/`BOOLEAN`) as `i64`.
-pub fn int(row: &Row, ix: i32) -> Result<i64> {
-    row.get::<i64>(ix).map_err(Error::from)
+pub fn int(row: &Row, ix: usize) -> Result<i64> {
+    row.get::<_, i64>(ix).map_err(Error::from)
 }
 
 /// Read an optional integer column.
-pub fn opt_int(row: &Row, ix: i32) -> Result<Option<i64>> {
-    Ok(row.get::<Option<i64>>(ix)?)
+pub fn opt_int(row: &Row, ix: usize) -> Result<Option<i64>> {
+    row.get::<_, Option<i64>>(ix).map_err(Error::from)
 }
 
 /// Read a boolean column.
-pub fn boolean(row: &Row, ix: i32) -> Result<bool> {
-    row.get::<bool>(ix).map_err(Error::from)
+pub fn boolean(row: &Row, ix: usize) -> Result<bool> {
+    Ok(int(row, ix)? != 0)
 }
 
 /// Read an optional `TEXT` column holding an RFC 3339 timestamp.
-pub fn opt_ts(row: &Row, ix: i32) -> Result<Option<DateTime<Utc>>> {
+pub fn opt_ts(row: &Row, ix: usize) -> Result<Option<DateTime<Utc>>> {
     opt_str(row, ix)?.map(|s| parse_ts(&s)).transpose()
 }
 
 /// Read a required `TEXT` column holding an RFC 3339 timestamp.
-pub fn req_ts(row: &Row, ix: i32) -> Result<DateTime<Utc>> {
+pub fn req_ts(row: &Row, ix: usize) -> Result<DateTime<Utc>> {
     parse_ts(&req_str(row, ix)?)
 }
 
 /// Read a required `TEXT` primary key holding a UUID.
-pub fn req_uuid(row: &Row, ix: i32) -> Result<Uuid> {
+pub fn req_uuid(row: &Row, ix: usize) -> Result<Uuid> {
     parse_uuid(&req_str(row, ix)?)
 }
 
@@ -161,9 +143,9 @@ pub fn parse_uuid(s: &str) -> Result<Uuid> {
     Uuid::parse_str(s).map_err(|e| Error::Validation(format!("bad uuid {s:?}: {e}")))
 }
 
-/// Map a libsql error onto the crate error type.
-impl From<libsql::Error> for Error {
-    fn from(e: libsql::Error) -> Self {
+/// Map a rusqlite error onto the crate error type.
+impl From<rusqlite::Error> for Error {
+    fn from(e: rusqlite::Error) -> Self {
         Error::Db(e.to_string())
     }
 }

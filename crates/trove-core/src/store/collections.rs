@@ -2,7 +2,7 @@
 //! membership.
 
 use chrono::Utc;
-use libsql::{Connection, Value};
+use rusqlite::{Connection, types::Value};
 use uuid::Uuid;
 
 use super::rows::{self, bind_opt_uuid, int, req_str, req_ts, req_uuid};
@@ -218,11 +218,11 @@ pub fn count_assets(conn: &Connection, collection_id: Uuid) -> Result<u64> {
 
 // -- helpers -----------------------------------------------------------------
 
-fn collection_from_row(row: &libsql::Row) -> Result<Collection> {
+fn collection_from_row(row: &rusqlite::Row) -> Result<Collection> {
     Ok(Collection {
         id: req_uuid(row, 0)?,
         parent_id: {
-            let s: Option<String> = row.get::<Option<String>>(1)?;
+            let s: Option<String> = row.get::<_, Option<String>>(1)?;
             match s {
                 Some(v) => Some(rows::parse_uuid(&v)?),
                 None => None,
@@ -256,7 +256,7 @@ fn parent_of(conn: &Connection, id: Uuid) -> Result<Option<Uuid>> {
         conn,
         "SELECT parent_id FROM collections WHERE id = ?1",
         vec![rows::uuid(id).into()],
-        |row| match row.get::<Option<String>>(0)? {
+        |row| match row.get::<_, Option<String>>(0)? {
             Some(v) => Ok(Some(rows::parse_uuid(&v)?)),
             None => Ok(None),
         },

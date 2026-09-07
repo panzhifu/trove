@@ -520,12 +520,12 @@ impl Library {
     /// Permanently delete many assets atomically, freeing any content-addressed
     /// blob (and its thumbnail) once no asset references it left.
     pub fn purge_assets(&self, ids: &[Uuid]) -> Result<PurgeReport> {
-        let conn = self.store.conn();
         // Track (rel, sha) for every content hash left unreferenced by this
         // purge, so the file is deleted exactly once even when several deleted
         // assets shared it.
         let mut freed: Vec<(String, String)> = Vec::new();
-        let purged = rows::transaction(conn, |tx| {
+        let purged = self.store.transaction(|tx| {
+            let tx = &*tx;
             let mut freed_tx: Vec<(String, String)> = Vec::new();
             for id in ids {
                 let Some(asset) = assets::get(tx, *id)? else {
