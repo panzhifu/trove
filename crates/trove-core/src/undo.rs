@@ -41,6 +41,11 @@ pub enum Op {
         before: Vec<(Uuid, bool)>,
         after: Vec<(Uuid, bool)>,
     },
+    /// One batch title rewrite (multi-select rename).
+    SetTitles {
+        before: Vec<(Uuid, Option<String>)>,
+        after: Vec<(Uuid, Option<String>)>,
+    },
     /// Replace one asset's whole tag group.
     SetTags {
         asset: Uuid,
@@ -100,6 +105,18 @@ impl Op {
                     )?;
                 }
             }
+            Op::SetTitles { after, .. } => {
+                for (id, title) in after {
+                    assets::update(
+                        conn,
+                        *id,
+                        &AssetPatch {
+                            title: Some(title.clone()),
+                            ..Default::default()
+                        },
+                    )?;
+                }
+            }
             Op::SetTags { asset, after, .. } => {
                 tags::set_for_asset(conn, *asset, after)?;
             }
@@ -146,6 +163,10 @@ impl Op {
                 after: before.clone(),
             },
             Op::SetFavorite { before, after } => Op::SetFavorite {
+                before: after.clone(),
+                after: before.clone(),
+            },
+            Op::SetTitles { before, after } => Op::SetTitles {
                 before: after.clone(),
                 after: before.clone(),
             },

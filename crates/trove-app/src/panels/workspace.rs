@@ -1458,6 +1458,23 @@ fn selection_toolbar(
     } else {
         bar = bar
             .child(
+                Button::new("sel-rename")
+                    .xsmall()
+                    .ghost()
+                    .icon(IconName::CaseSensitive)
+                    .tooltip(rust_i18n::t!("workspace.batch_rename").to_string())
+                    .on_click({
+                        let controller = controller.clone();
+                        move |_, window, cx| {
+                            crate::dialogs::rename::RenameDialog::open(
+                                window,
+                                cx,
+                                controller.clone(),
+                            );
+                        }
+                    }),
+            )
+            .child(
                 Button::new("sel-fav")
                     .xsmall()
                     .ghost()
