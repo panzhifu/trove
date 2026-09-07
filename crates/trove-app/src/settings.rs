@@ -863,10 +863,19 @@ fn prompt_model_file(controller: &Entity<LibraryController>, cx: &mut App) {
 fn semantic_status_row(cx: &mut App) -> Div {
     let status = trove_core::media::clip::semantic_status();
     let (label, color) = if status == "ready" {
-        (
-            rust_i18n::t!("settings.status_ready").to_string(),
-            cx.theme().success,
-        )
+        if !trove_core::media::clip::text_ready() {
+            // Engine loads fine, but the BPE vocab is missing: image
+            // embedding still works, text search does not.
+            let path = trove_core::media::clip::vocab_expected_path()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| trove_core::media::tokenizer::VOCAB_FILE.into());
+            (
+                rust_i18n::t!("settings.vocab_missing", path = path).to_string(),
+                cx.theme().danger,
+            )
+        } else {
+            (rust_i18n::t!("settings.status_ready").to_string(), cx.theme().success)
+        }
     } else if let Some(rest) = status.strip_prefix("failed:") {
         // Show the actual error (missing lib, missing file, load failure).
         (rest.to_string(), cx.theme().danger)

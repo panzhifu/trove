@@ -16,6 +16,9 @@
 //!        https://huggingface.co/onnx-community/CLIP-ViT-B-32-laion2B-s34B-b79K-ONNX
 //!      Download `model.onnx` and put it in the configured model directory
 //!      (default `~/.config/trove/models/`).
+//!   3. The CLIP BPE vocab, next to the model (needed for TEXT search only):
+//!        https://github.com/openai/CLIP/blob/main/clip/bpe_simple_vocab_16e6.txt
+//!      Save as `bpe_simple_vocab_16e6.txt` in the same directory.
 //!
 //! Until `configure()` succeeds, the engine is disabled and semantic calls
 //! return a descriptive error — no ONNX code is touched, so a missing library
@@ -153,6 +156,20 @@ pub fn semantic_ready() -> bool {
     matches!(engine().lock().unwrap().state, EngineState::Ready)
 }
 
+/// `true` when the BPE vocab is loaded and TEXT search can run (image
+/// embedding does not need the vocab).
+pub fn text_ready() -> bool {
+    super::tokenizer::ready()
+}
+
+/// Where the vocab is expected for the current model directory — used by the
+/// settings page to hint at a missing `bpe_simple_vocab_16e6.txt`.
+pub fn vocab_expected_path() -> Option<PathBuf> {
+    crate::config::AppConfig::load()
+        .clip_model_dir()
+        .map(|d| super::tokenizer::vocab_path(&d))
+}
+
 /// Try to find an ONNX Runtime library that `ort` can dlopen.
 pub fn ort_library_hint() -> Option<PathBuf> {
     if let Ok(p) = std::env::var("ORT_DYLIB_PATH") {
@@ -211,6 +228,14 @@ pub fn configure(model_path: &Path) -> Result<()> {
             .map_err(|e| Error::Db(format!("intra threads: {e}")))?
             .commit_from_file(model_path)
             .map_err(|e| Error::Db(format!("load CLIP model: {e}")))?;
+        // The BPE vocab is only needed for text search; a missing file must
+        // not disable image embedding, so a failure here is not fatal.
+        if let Some(dir) = model_path.parent() {
+            let vocab = super::tokenizer::vocab_path(dir);
+            if vocab.is_file() {
+                super::tokenizer::load(&vocab)?;
+            }
+        }
         let mut eng = engine().lock().unwrap();
         eng.session = Some(session);
         eng.state = EngineState::Ready;
@@ -294,24 +319,8 @@ pub fn image_embedding(path: &Path) -> Result<Vec<f32>> {
     extract_embedding(&outputs, "image_embeds")
 }
 
-/// Trivial deterministic tokeniser: each whitespace token → a stable hash in
-/// the BPE range. Returns `(input_ids, attention_mask)`, both length 77.
-fn tokenize(text: &str) -> (Vec<i64>, Vec<i64>) {
-    let mut ids = vec![0i64; 77];
-    let mut mask = vec![0i64; 77];
-    for (i, tok) in text.split_whitespace().take(77).enumerate() {
-        let mut h = 0x811c9dc5u32;
-        for b in tok.as_bytes() {
-            h ^= *b as u32;
-            h = h.wrapping_mul(0x01000193);
-        }
-        ids[i] = 1 + (h % 49150) as i64;
-        mask[i] = 1;
-    }
-    (ids, mask)
-}
-
-/// Encode a text query into an embedding vector.
+/// Encode a text query into an embedding vector. Requires the CLIP BPE vocab
+/// (loaded by `configure` from the model directory).
 pub fn text_embedding(text: &str) -> Result<Vec<f32>> {
     let mut eng = engine().lock().unwrap();
     let Some(session) = eng.session.as_mut() else {
@@ -320,14 +329,33 @@ pub fn text_embedding(text: &str) -> Result<Vec<f32>> {
             state_label(&eng.state)
         )));
     };
-    // Token ids (Int64) + attention mask. The model exposes both as inputs.
-    let (ids, mask) = tokenize(text);
+    if !super::tokenizer::ready() {
+        return Err(Error::Db(
+            "CLIP BPE vocab not loaded. Place bpe_simple_vocab_16e6.txt next to \
+             model.onnx (see Settings ▸ Search), then reselect the model directory."
+                .into(),
+        ));
+    }
+    // Real CLIP token ids (Int64) + attention mask — the model was trained
+    // with these, so anything else yields meaningless embeddings.
+    let (ids, mask) = super::tokenizer::encode(text)?;
     let id_tensor = ort::value::Tensor::from_array(([1_i64, 77], ids))
         .map_err(|e| Error::Db(format!("text tensor: {e}")))?;
     let mask_tensor = ort::value::Tensor::from_array(([1_i64, 77], mask))
         .map_err(|e| Error::Db(format!("mask tensor: {e}")))?;
+    // The combined CLIP graph expects ALL inputs: without (zeroed)
+    // pixel_values the vision branch's Shape node fails the whole run with
+    // "Missing Input: pixel_values". We read `text_embeds` as output.
+    let dummy_pixels = ort::value::Tensor::from_array(
+        ([1_i64, 3, 224, 224], vec![0_f32; 3 * 224 * 224]),
+    )
+    .map_err(|e| Error::Db(format!("dummy pixels: {e}")))?;
     let outputs = session
-        .run(ort::inputs!["input_ids" => id_tensor, "attention_mask" => mask_tensor])
+        .run(ort::inputs![
+            "pixel_values" => dummy_pixels,
+            "input_ids" => id_tensor,
+            "attention_mask" => mask_tensor,
+        ])
         .map_err(|e| Error::Db(format!("text inference: {e}")))?;
     extract_embedding(&outputs, "text_embeds")
 }
@@ -464,21 +492,6 @@ mod tests {
         }
         assert!(Embedding::from_bytes(&[1, 2, 3]).is_none());
         assert!(Embedding::from_bytes(&[]).is_none());
-    }
-
-    #[test]
-    fn tokenize_is_stable_and_bounded() {
-        let (a, am) = tokenize("a red sunset over the beach");
-        let (b, bm) = tokenize("a red sunset over the beach");
-        assert_eq!(a, b);
-        assert_eq!(am, bm);
-        assert_eq!(a.len(), 77);
-        // The first 6 slots (one per token) are set; the rest stay 0-padded.
-        assert!(a[..6].iter().all(|&x| x >= 1));
-        assert!(a[6..].iter().all(|&x| x == 0));
-        // Attention mask matches: 1 where tokenized, 0 elsewhere.
-        assert!(am[..6].iter().all(|&x| x == 1));
-        assert!(am[6..].iter().all(|&x| x == 0));
     }
 
     #[test]

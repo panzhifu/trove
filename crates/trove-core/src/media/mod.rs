@@ -9,3 +9,4 @@ pub mod metadata;
 pub mod probe;
 pub mod search;
 pub mod thumb;
+pub mod tokenizer;
