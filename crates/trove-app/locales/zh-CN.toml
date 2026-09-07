@@ -43,6 +43,8 @@ delete = "删除"
 
 [tags]
 all_tags = "全部标签"
+add_tag = "添加标签"
+create_tag = "新建标签"
 filter_by_tag = "按标签筛选"
 delete_tag = "删除标签"
 rename_tag = "重命名"

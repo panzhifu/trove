@@ -2,12 +2,13 @@
 //! filter/delete.
 
 use gpui_kit::base::{h_flex, v_flex};
+use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::WindowExt as _;
 use gpui_kit::component::dock::{BasePanel, Panel as DockPanel, PanelEvent};
 use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::component::menu::{ContextMenuExt as _, PopupMenu, PopupMenuItem};
 use gpui_kit::component::scroll::ScrollableElement as _;
-use gpui_kit::component::{ActiveTheme, Sizable as _};
+use gpui_kit::component::{ActiveTheme, IconName, Sizable as _};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
@@ -45,12 +46,31 @@ impl Render for TagsPanel {
             .p_2()
             .gap_1()
             .child(
-                div()
-                    .text_xs()
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(cx.theme().muted_foreground)
-                    .px_1()
-                    .child(rust_i18n::t!("tags.all_tags").to_string()),
+                // Section header: title on the left, "+" to create a tag on
+                // the right (same dialog flow as the rename menu item).
+                h_flex()
+                    .w_full()
+                    .items_center()
+                    .justify_between()
+                    .pr_0p5()
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(cx.theme().muted_foreground)
+                            .px_1()
+                            .child(rust_i18n::t!("tags.all_tags").to_string()),
+                    )
+                    .child(
+                        Button::new("add-tag")
+                            .xsmall()
+                            .ghost()
+                            .icon(IconName::Plus)
+                            .tooltip(rust_i18n::t!("tags.add_tag").to_string())
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                open_create_dialog(window, cx, &this.controller);
+                            })),
+                    ),
             )
             .child(
                 div().flex_1().min_h_0().overflow_y_scrollbar().child(
@@ -243,6 +263,37 @@ fn tag_context_menu(
 const TAG_COLORS: [&str; 8] = [
     "#ef4444", "#f97316", "#eab308", "#22c55e", "#06b6d4", "#3b82f6", "#a855f7", "#ec4899",
 ];
+
+/// Create a tag via a small modal dialog (same flow as the rename one; the
+/// library deduplicates by name through `ensure_tag`).
+fn open_create_dialog(window: &mut Window, cx: &mut App, controller: &Entity<LibraryController>) {
+    let name_input = cx.new(|cx| {
+        InputState::new(window, cx)
+            .placeholder(rust_i18n::t!("explorer.name_placeholder").to_string())
+    });
+    let ctl = controller.clone();
+    window.open_dialog(cx, move |dialog, _, _| {
+        dialog
+            .title(rust_i18n::t!("tags.create_tag").to_string())
+            .width(px(340.))
+            .child(Input::new(&name_input).small().appearance(true))
+            .on_ok({
+                let name_input = name_input.clone();
+                let ctl = ctl.clone();
+                move |_, _, cx| {
+                    let name: String = name_input.read(cx).value().trim().to_string();
+                    if !name.is_empty() {
+                        ctl.update(cx, |ctl, cx| {
+                            let _ = ctl.library.ensure_tag(&name);
+                            ctl.generation += 1;
+                            cx.notify();
+                        });
+                    }
+                    true
+                }
+            })
+    });
+}
 
 /// Rename a tag via a small modal dialog (the tags panel has no inline
 /// editor row like the explorer does).

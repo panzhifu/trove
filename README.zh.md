@@ -190,7 +190,7 @@ cargo run -p trove-app
 
 ## 许可证
 
-Apache-2.0
+MIT
 
 [gpui-kit]: https://github.com/panzhifu/gpui-kit
 [rusqlite]: https://github.com/rusqlite/rusqlite
