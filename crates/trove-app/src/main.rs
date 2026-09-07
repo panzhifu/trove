@@ -59,6 +59,10 @@ fn build_menus() -> Vec<Menu> {
                     ExportLibrary,
                 ),
                 MenuItem::action(
+                    rust_i18n::t!("app.import_library").to_string(),
+                    ImportLibrary,
+                ),
+                MenuItem::action(
                     rust_i18n::t!("app.find_duplicates").to_string(),
                     FindDuplicates,
                 ),
