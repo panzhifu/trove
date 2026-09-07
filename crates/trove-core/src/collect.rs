@@ -71,6 +71,7 @@ fn handle(mut stream: TcpStream, inbox: &Path) -> std::io::Result<()> {
     };
 
     match (request.method.as_str(), request.target.split('?').next()) {
+        ("GET", Some("/") | Some("")) => respond_html(stream, 200, &index_page()),
         ("GET", Some("/ping")) => respond(stream, 200, "trove ok"),
         ("POST", Some("/add")) => {
             let query = parse_query(&request.target);
@@ -308,6 +309,62 @@ fn fetch(url: &str) -> Result<Vec<u8>, String> {
         .map_err(|e| e.to_string())
 }
 
+/// Browser-friendly landing page: someone opening the endpoint in a tab
+/// should see what this is instead of a JSON 404.
+fn index_page() -> String {
+    let port = AppConfig::load().collect_port();
+    format!(
+        r#"<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Trove collect service</title>
+<style>
+  body {{ font-family: system-ui, sans-serif; background: #141414; color: #e6e6e6;
+         max-width: 46rem; margin: 3rem auto; padding: 0 1.5rem; line-height: 1.6; }}
+  code, pre {{ background: #1f1f1f; border: 1px solid #333; border-radius: 6px; }}
+  code {{ padding: .1rem .35rem; }}
+  pre {{ padding: .75rem 1rem; overflow-x: auto; }}
+  h1 {{ font-size: 1.3rem; }} .ok {{ color: #4ade80; }} .dim {{ color: #9a9a9a; }}
+  table {{ border-collapse: collapse; }} td, th {{ border: 1px solid #333; padding: .3rem .6rem;
+         text-align: left; }} th {{ background: #1f1f1f; }}
+</style>
+</head>
+<body>
+<h1><span class="ok">&#9679;</span> Trove collect service is running</h1>
+<p class="dim">本地采集服务已就绪 —— 浏览器扩展 / curl 把文件 POST 到这里，Trove 会自动导入。</p>
+<h3>Endpoints</h3>
+<table>
+<tr><th>Method</th><th>Path</th><th>Purpose</th></tr>
+<tr><td>GET</td><td><code>/ping</code></td><td>health check</td></tr>
+<tr><td>POST</td><td><code>/add?filename=NAME&amp;source=URL</code></td><td>upload raw file bytes</td></tr>
+<tr><td>POST</td><td><code>/fetch</code></td><td>server downloads <code>{{"url": "…"}}</code></td></tr>
+</table>
+<h3>Try it</h3>
+<pre>curl --data-binary @image.png   'http://127.0.0.1:{port}/add?filename=image.png&amp;source=https://example.com/image'</pre>
+<pre>curl -X POST http://127.0.0.1:{port}/fetch   -d '{{"url":"https://example.com/image.png"}}'</pre>
+<p class="dim">Files land in the inbox and import automatically (source URL is kept).
+设置 ▸ 通用 可关闭此服务。</p>
+</body>
+</html>
+"#
+    )
+}
+
+fn respond_html(mut stream: TcpStream, status: u16, body: &str) -> std::io::Result<()> {
+    let head = format!(
+        "HTTP/1.1 {status} OK
+Content-Type: text/html; charset=utf-8
+Content-Length: {}
+Connection: close
+
+",
+        body.len()
+    );
+    stream.write_all(head.as_bytes())?;
+    stream.write_all(body.as_bytes())
+}
+
 fn respond(mut stream: TcpStream, status: u16, body: &str) -> std::io::Result<()> {
     let reason = match status {
         200 => "OK",
@@ -393,5 +450,13 @@ mod tests {
         let mut response = String::new();
         stream.read_to_string(&mut response).unwrap();
         assert!(response.contains("404"));
+
+        // Browsing the root shows the landing page, not a JSON 404.
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        stream.write_all(b"GET / HTTP/1.1\r\n\r\n").unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).unwrap();
+        assert!(response.contains("text/html"));
+        assert!(response.contains("collect service is running"));
     }
 }
