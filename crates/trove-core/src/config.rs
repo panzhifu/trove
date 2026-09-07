@@ -19,6 +19,9 @@ pub struct AppConfig {
     /// `trove-app/src/i18n.rs` for how the code resolves to a catalog.
     #[serde(default)]
     pub language: Option<String>,
+    /// Custom keybindings. Maps action name to key string (e.g. "enter" -> "ctrl-p").
+    #[serde(default)]
+    pub keybindings: std::collections::HashMap<String, String>,
 }
 
 impl AppConfig {
