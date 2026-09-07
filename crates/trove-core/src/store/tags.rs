@@ -1,7 +1,7 @@
 //! Tag store: flat, case-insensitively unique labels and their assets.
 
 use chrono::Utc;
-use libsql::Connection;
+use rusqlite::Connection;
 use uuid::Uuid;
 
 use super::assets;
@@ -9,11 +9,11 @@ use super::rows::{self, req_ts, req_uuid};
 use crate::error::{Error, Result};
 use crate::model::{NewTag, Tag};
 
-fn tag_from_row(row: &libsql::Row) -> Result<Tag> {
+fn tag_from_row(row: &rusqlite::Row) -> Result<Tag> {
     Ok(Tag {
         id: req_uuid(row, 0)?,
-        name: row.get::<String>(1)?,
-        color: row.get::<Option<String>>(2)?,
+        name: row.get::<_, String>(1)?,
+        color: row.get::<_, Option<String>>(2)?,
         created_at: req_ts(row, 3)?,
     })
 }

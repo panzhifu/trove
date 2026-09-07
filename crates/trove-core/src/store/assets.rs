@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use chrono::Utc;
-use libsql::{Connection, Value};
+use rusqlite::{Connection, types::Value};
 use serde_json::Value as Json;
 use uuid::Uuid;
 
@@ -53,7 +53,7 @@ pub fn referenced_shas(conn: &Connection) -> Result<Vec<String>> {
         conn,
         "SELECT DISTINCT sha256 FROM assets WHERE sha256 IS NOT NULL",
         vec![],
-        |row| row.get::<String>(0).map_err(Error::from),
+        |row| row.get::<_, String>(0).map_err(Error::from),
     )
 }
 
@@ -231,7 +231,7 @@ fn tags_for_fts(conn: &Connection, asset_id: Uuid) -> Result<String> {
          JOIN asset_tag at ON at.tag_id = t.id \
          WHERE at.asset_id = ?1 ORDER BY t.name",
         vec![rows::uuid(asset_id).into()],
-        |row| row.get::<String>(0).map_err(Error::from),
+        |row| row.get::<_, String>(0).map_err(Error::from),
     )?;
     Ok(names.join(", "))
 }
@@ -380,7 +380,7 @@ pub fn delete(conn: &Connection, id: Uuid) -> Result<()> {
 
 // -- row mapping -------------------------------------------------------------
 
-fn asset_from_row(row: &libsql::Row) -> Result<Asset> {
+fn asset_from_row(row: &rusqlite::Row) -> Result<Asset> {
     Ok(Asset {
         id: rows::req_uuid(row, 0)?,
         origin: match rows::req_str(row, 1)?.as_str() {

@@ -9,7 +9,7 @@
 
 use std::cell::RefCell;
 
-use libsql::Connection;
+use rusqlite::Connection;
 use uuid::Uuid;
 
 use crate::error::Result;

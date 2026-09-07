@@ -9,20 +9,19 @@ pub mod smart;
 pub mod smart_collections;
 pub mod tags;
 
+use std::cell::RefCell;
 use std::path::Path;
-
-use libsql::Builder;
+use std::rc::Rc;
 
 use crate::error::Result;
 
 /// A local (single-file) Trove library database.
 ///
-/// Cheap to clone. The libsql connection is async internally but every helper
-/// runs it to completion synchronously, so the store is thread-confined and
-/// simple to use from the UI thread.
+/// Cheap to clone. The store is synchronous and thread-confined, simple to
+/// use from the UI thread.
 #[derive(Clone)]
 pub struct Store {
-    conn: libsql::Connection,
+    conn: Rc<RefCell<rusqlite::Connection>>,
 }
 
 impl Store {
@@ -33,9 +32,8 @@ impl Store {
         {
             std::fs::create_dir_all(parent)?;
         }
-        let db = pollster::block_on(Builder::new_local(path).build())?;
-        let conn = db.connect()?;
-        let store = Self { conn };
+        let conn = rusqlite::Connection::open(path)?;
+        let store = Self { conn: Rc::new(RefCell::new(conn)) };
         store.enable_foreign_keys()?;
         store.migrate()?;
         Ok(store)
@@ -43,16 +41,16 @@ impl Store {
 
     /// Open an in-memory library (tests, throwaway sessions).
     pub fn in_memory() -> Result<Self> {
-        let db = pollster::block_on(Builder::new_local(":memory:").build())?;
-        let conn = db.connect()?;
-        let store = Self { conn };
+        let conn = rusqlite::Connection::open_in_memory()?;
+        let store = Self { conn: Rc::new(RefCell::new(conn)) };
         store.enable_foreign_keys()?;
         store.migrate()?;
         Ok(store)
     }
 
     fn enable_foreign_keys(&self) -> Result<()> {
-        rows::execute(&self.conn, "PRAGMA foreign_keys = ON", vec![])?;
+        let conn = self.conn();
+        rows::execute(&conn, "PRAGMA foreign_keys = ON", vec![])?;
         Ok(())
     }
 
@@ -62,28 +60,65 @@ impl Store {
         for (ix, sql) in schema::MIGRATIONS.iter().enumerate() {
             let target = (ix + 1) as i64;
             if current < target {
-                rows::execute_transactional_batch(&self.conn, sql)?;
+                self.migrate_one(sql)?;
                 self.set_user_version(target)?;
             }
         }
         Ok(())
     }
 
+    fn migrate_one(&self, sql: &str) -> Result<()> {
+        let mut mut_borrow = self.conn.borrow_mut();
+        let tx = mut_borrow.transaction()?;
+        tx.execute_batch(sql).map_err(crate::error::Error::from)?;
+        tx.commit().map_err(crate::error::Error::from)?;
+        Ok(())
+    }
+
     fn user_version(&self) -> Result<i64> {
-        rows::query_count(&self.conn, "PRAGMA user_version", vec![])
+        let conn = self.conn();
+        rows::query_count(&conn, "PRAGMA user_version", vec![])
     }
 
     fn set_user_version(&self, version: i64) -> Result<()> {
+        let conn = self.conn();
         rows::execute(
-            &self.conn,
+            &conn,
             &format!("PRAGMA user_version = {version}"),
             vec![],
         )?;
         Ok(())
     }
 
-    pub fn conn(&self) -> &libsql::Connection {
-        &self.conn
+    /// Borrow the underlying SQLite connection.
+    ///
+    /// # Safety
+    ///
+    /// The returned reference is valid for the lifetime of `&self`. The
+    /// `RefCell` enforces at runtime that no mutable borrow exists while
+    /// this reference is in use; the UI is single-threaded, so this is
+    /// always satisfied as long as store functions don't recursively call
+    /// back into the store while holding a borrow.
+    pub fn conn(&self) -> &rusqlite::Connection {
+        unsafe { &*self.conn.as_ptr() }
+    }
+
+    /// Run a closure inside a SQLite transaction. The closure receives a
+    /// `&Transaction` and must return a `Result`. On success the transaction
+    /// commits; on error it rolls back.
+    pub fn transaction<T>(&self, f: impl FnOnce(&rusqlite::Transaction) -> Result<T>) -> Result<T> {
+        let mut conn = self.conn.borrow_mut();
+        let tx = conn.transaction()?;
+        match f(&tx) {
+            Ok(v) => {
+                tx.commit().map_err(crate::error::Error::from)?;
+                Ok(v)
+            }
+            Err(e) => {
+                let _ = tx.rollback();
+                Err(e)
+            }
+        }
     }
 }
 
