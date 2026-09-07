@@ -82,8 +82,11 @@ jobs:
         shell: bash
         run: |
           cd target/${{ matrix.target }}/release
-          BIN_NAME="trove-app$([[ "${{ matrix.target }}" == *"windows"* ]] && echo '.exe')"
-          zip -r ../../../${{ matrix.asset_name }}.zip "$BIN_NAME"
+          if [[ "${{ matrix.target }}" == *windows* ]]; then
+            zip -r ../../../${{ matrix.asset_name }}.zip trove-app.exe
+          else
+            zip -r ../../../${{ matrix.asset_name }}.zip trove-app
+          fi
           cd -
 
       - name: Package (tar.gz)
