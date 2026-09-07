@@ -25,35 +25,55 @@ pub struct ColorHistogram {
     pub total: f32,
 }
 
+impl Default for ColorHistogram {
+    fn default() -> Self {
+        Self {
+            buckets: [0.0_f32; 4096],
+            total: 0.0,
+        }
+    }
+}
+
 impl ColorHistogram {
-    /// Build a histogram from an image file. Best-effort: undecodable images
-    /// yield a zero histogram (which similarity treats as "no color signal").
-    pub fn from_image(path: &Path) -> Self {
+    /// Build a histogram from a pre-decoded RGB image.
+    pub fn from_rgb(image: &image::RgbImage) -> Self {
         let mut buckets = [0.0_f32; 4096];
         let mut total = 0.0_f32;
 
-        if let Ok(img) = image::open(path) {
-            // Downsample to ~256px for a fast, stable signature.
-            let small = img.thumbnail(256, 256).to_rgb8();
-            for px in small.pixels() {
-                let r = (px[0] as usize) >> 4; // top 4 bits
-                let g = (px[1] as usize) >> 4;
-                let b = (px[2] as usize) >> 4;
-                let idx = ((r << 8) | (g << 4) | b) & 0xFFF;
-                buckets[idx] += 1.0;
-                total += 1.0;
-            }
+        // Downsample to ~128px for speed (signature doesn't need high res).
+        let (w, h) = image.dimensions();
+        let max_dim = w.max(h);
+        let scaled = if max_dim > 128 {
+            let scale = 128.0 / max_dim as f32;
+            let nw = (w as f32 * scale).max(1.0) as u32;
+            let nh = (h as f32 * scale).max(1.0) as u32;
+            image::imageops::resize(image, nw, nh, image::imageops::FilterType::Triangle)
+        } else {
+            image.clone()
+        };
+
+        for px in scaled.pixels() {
+            let r = (px[0] as usize) >> 4;
+            let g = (px[1] as usize) >> 4;
+            let b = (px[2] as usize) >> 4;
+            let idx = ((r << 8) | (g << 4) | b) & 0xFFF;
+            buckets[idx] += 1.0;
+            total += 1.0;
         }
 
-        // L2-normalize so cosine distance is just dot-product.
+        let mut hist = Self { buckets, total };
         if total > 0.0 {
-            let norm = buckets.iter().map(|v| v * v).sum::<f32>().sqrt().max(1e-9);
-            for v in &mut buckets {
-                *v /= norm;
-            }
+            hist.normalize();
         }
+        hist
+    }
 
-        Self { buckets, total }
+    /// Build a histogram from an image file.
+    pub fn from_image(path: &Path) -> Self {
+        match image::open(path) {
+            Ok(img) => Self::from_rgb(&img.to_rgb8()),
+            _ => Self::default(),
+        }
     }
 
     /// Cosine similarity to another histogram (1.0 = identical, 0.0 = unrelated).
@@ -137,23 +157,26 @@ impl ColorHistogram {
 pub struct PHash(pub u64);
 
 impl PHash {
-    /// Compute pHash from an image file. Returns a zero hash for undecodable files.
-    pub fn from_image(path: &Path) -> Self {
-        let hash = match image::open(path) {
-            Ok(img) => {
-                // 1. Grayscale + resize to 32×32.
-                let gray = image::imageops::grayscale(&img);
-                let small =
-                    image::imageops::resize(&gray, 32, 32, image::imageops::FilterType::Lanczos3);
-
-                // 2. Compute 2D DCT (simplified: use row/column means as proxy).
-                // For a full DCT we'd use a math crate; instead we use a
-                // difference-hash (dHash) variant that's still robust.
-                Self::dhash(&small)
-            }
-            _ => 0,
+    /// Compute pHash from a pre-decoded grayscale image (9×8 or larger).
+    pub fn from_gray(image: &image::GrayImage) -> Self {
+        let hash = if image.width() >= 9 && image.height() >= 8 {
+            let small = image::imageops::resize(image, 9, 8, image::imageops::FilterType::Triangle);
+            Self::dhash(&small)
+        } else {
+            0
         };
         Self(hash)
+    }
+
+    /// Compute pHash from an image file. Returns a zero hash for undecodable files.
+    pub fn from_image(path: &Path) -> Self {
+        match image::open(path) {
+            Ok(img) => {
+                let gray = image::imageops::grayscale(&img);
+                Self::from_gray(&gray)
+            }
+            _ => Self(0),
+        }
     }
 
     /// Difference hash: compare adjacent pixels in an 9×8 grid (64 bits).
@@ -215,11 +238,38 @@ pub struct VisualSignature {
 }
 
 impl VisualSignature {
+    /// Compute the full visual signature from a decoded RGB image.
+    /// Use this when you already have the image decoded to avoid double decode.
+    pub fn from_rgb(image: &image::RgbImage) -> Self {
+        // Downsample once to a working size for both algorithms.
+        let (w, h) = image.dimensions();
+        let max_dim = w.max(h);
+        // pHash needs only 9×8; histogram ~128px. Use a common working size.
+        let working = if max_dim > 256 {
+            let scale = 256.0 / max_dim as f32;
+            let nw = (w as f32 * scale).max(9.0) as u32;
+            let nh = (h as f32 * scale).max(9.0) as u32;
+            image::imageops::resize(image, nw, nh, image::imageops::FilterType::Triangle)
+        } else {
+            image.clone()
+        };
+
+        // Single decode → compute both from the same buffer.
+        let gray = image::imageops::grayscale(&working);
+        let phash = PHash::from_gray(&gray);
+        let color_hist = ColorHistogram::from_rgb(&working);
+
+        Self { phash, color_hist }
+    }
+
     /// Compute the full visual signature from an image file.
     pub fn from_image(path: &Path) -> Self {
-        Self {
-            phash: PHash::from_image(path),
-            color_hist: ColorHistogram::from_image(path),
+        match image::open(path) {
+            Ok(img) => Self::from_rgb(&img.to_rgb8()),
+            _ => Self {
+                phash: PHash(0),
+                color_hist: ColorHistogram::default(),
+            },
         }
     }
 
