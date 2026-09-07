@@ -180,7 +180,8 @@ pub fn configure(model_path: &Path) -> Result<()> {
     if ort_library_hint().is_none() {
         return Err(Error::Db(
             "ONNX Runtime library not found. Set ORT_DYLIB_PATH or place \
-             libonnxruntime.(so|dylib|dll) next to the app.".into(),
+             libonnxruntime.(so|dylib|dll) next to the app."
+                .into(),
         ));
     }
 
@@ -263,10 +264,7 @@ fn run_encoder(
 /// Pull the embedding out of the model output. Tries the requested port name
 /// first, then falls back to any float tensor of the right size — robust across
 /// differently-named CLIP exports.
-fn extract_embedding(
-    outputs: &ort::session::SessionOutputs,
-    preferred: &str,
-) -> Result<Vec<f32>> {
+fn extract_embedding(outputs: &ort::session::SessionOutputs, preferred: &str) -> Result<Vec<f32>> {
     // Preferred port.
     if let Some(v) = outputs.get(preferred) {
         if let Ok((_, data)) = v.try_extract_tensor::<f32>() {
@@ -318,7 +316,10 @@ pub fn text_embedding(text: &str) -> Result<Vec<f32>> {
             state_label(&eng.state)
         )));
     };
-    let ids = tokenize(text).into_iter().map(|x| x as i32).collect::<Vec<_>>();
+    let ids = tokenize(text)
+        .into_iter()
+        .map(|x| x as i32)
+        .collect::<Vec<_>>();
     let n = ids.len();
     // Build a float tensor holding the int ids (ort needs typed input; we pass
     // f32 and rely on the model's input being int64 — many CLIP exports accept a
@@ -355,12 +356,19 @@ fn run_encoder_f32(
 use rusqlite::types::Value;
 
 /// Store an embedding for an asset.
-pub fn store_embedding(store: &crate::store::Store, asset_id: uuid::Uuid, emb: &Embedding) -> Result<()> {
+pub fn store_embedding(
+    store: &crate::store::Store,
+    asset_id: uuid::Uuid,
+    emb: &Embedding,
+) -> Result<()> {
     let conn = store.conn();
     crate::store::rows::execute(
         conn,
         "UPDATE assets SET embedding = ?1 WHERE id = ?2",
-        vec![Value::Blob(emb.to_bytes()), crate::store::rows::uuid(asset_id).into()],
+        vec![
+            Value::Blob(emb.to_bytes()),
+            crate::store::rows::uuid(asset_id).into(),
+        ],
     )?;
     Ok(())
 }
@@ -382,7 +390,10 @@ pub fn embed_all_missing(store: &crate::store::Store, library_root: &Path) -> Re
     let mut done = 0_u64;
     let mut skipped = 0_u64;
     for (id, rel) in assets {
-        let Some(rel) = rel else { skipped += 1; continue };
+        let Some(rel) = rel else {
+            skipped += 1;
+            continue;
+        };
         let p = library_root.join("media").join(rel);
         if !p.is_file() {
             skipped += 1;

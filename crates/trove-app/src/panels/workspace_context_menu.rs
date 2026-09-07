@@ -1,8 +1,8 @@
 //! Right-click context menu for assets and drag preview.
 
 use gpui_kit::base::h_flex;
-use gpui_kit::component::menu::{PopupMenu, PopupMenuItem};
 use gpui_kit::component::ActiveTheme;
+use gpui_kit::component::menu::{PopupMenu, PopupMenuItem};
 use gpui_kit::*;
 use uuid::Uuid;
 
@@ -41,41 +41,41 @@ pub(crate) fn asset_context_menu(
         build_collection_submenu(menu, &ctl_build, asset_id, cx)
     });
 
-    let mut menu = menu
-        .min_w(px(200.))
-        .item(
-            PopupMenuItem::new(if favorite {
-                rust_i18n::t!("workspace.remove_from_favorites").to_string()
-            } else {
-                rust_i18n::t!("workspace.add_to_favorites").to_string()
-            })
-            .checked(favorite)
-            .on_click(move |_, _, cx| {
-                c_fav.update(cx, move |ctl, cx| {
-                    let ids = ctl.action_targets(asset_id);
-                    let _ = ctl.library.set_assets_favorite(&ids, !favorite);
-                    ctl.generation += 1;
-                    cx.notify();
-                });
-            }),
-        )
-        .separator()
-        .item(
-            PopupMenuItem::new(rust_i18n::t!("workspace.search_by_image").to_string())
-                .on_click(move |_, window, cx| {
-                    let ctl = c_search.clone();
-                    let ids = ctl.read(cx).action_targets(asset_id);
-                    if let Some(id) = ids.first() {
-                        open_image_search(*id, &ctl, window, cx);
-                    }
+    let mut menu =
+        menu.min_w(px(200.))
+            .item(
+                PopupMenuItem::new(if favorite {
+                    rust_i18n::t!("workspace.remove_from_favorites").to_string()
+                } else {
+                    rust_i18n::t!("workspace.add_to_favorites").to_string()
+                })
+                .checked(favorite)
+                .on_click(move |_, _, cx| {
+                    c_fav.update(cx, move |ctl, cx| {
+                        let ids = ctl.action_targets(asset_id);
+                        let _ = ctl.library.set_assets_favorite(&ids, !favorite);
+                        ctl.generation += 1;
+                        cx.notify();
+                    });
                 }),
-        )
-        .separator()
-        .item(PopupMenuItem::submenu(
-            rust_i18n::t!("workspace.add_to_collection").to_string(),
-            add_submenu,
-        ))
-        .separator();
+            )
+            .separator()
+            .item(
+                PopupMenuItem::new(rust_i18n::t!("workspace.search_by_image").to_string())
+                    .on_click(move |_, window, cx| {
+                        let ctl = c_search.clone();
+                        let ids = ctl.read(cx).action_targets(asset_id);
+                        if let Some(id) = ids.first() {
+                            open_image_search(*id, &ctl, window, cx);
+                        }
+                    }),
+            )
+            .separator()
+            .item(PopupMenuItem::submenu(
+                rust_i18n::t!("workspace.add_to_collection").to_string(),
+                add_submenu,
+            ))
+            .separator();
     if browsed_collection.is_some() {
         menu = menu.item(
             PopupMenuItem::new(rust_i18n::t!("workspace.remove_from_collection").to_string())

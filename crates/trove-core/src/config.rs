@@ -107,9 +107,9 @@ impl AppConfig {
 
     /// Full path to the single CLIP ONNX model file.
     pub fn clip_model_path(&self) -> Option<PathBuf> {
-        self.clip_model_path.clone().or_else(|| {
-            Self::config_dir().map(|d| d.join("models").join("model.onnx"))
-        })
+        self.clip_model_path
+            .clone()
+            .or_else(|| Self::config_dir().map(|d| d.join("models").join("model.onnx")))
     }
 
     /// Effective path to the ONNX Runtime library: explicit config wins,
