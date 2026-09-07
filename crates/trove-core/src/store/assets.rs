@@ -399,6 +399,94 @@ pub fn delete(conn: &Connection, id: Uuid) -> Result<()> {
     Ok(())
 }
 
+// -- duplicates ----------------------------------------------------------------
+
+/// Perceptual-hash hamming distance below which two images count as
+/// duplicates (of 64 bits; 8 ≈ ≥87% similar).
+const DUPLICATE_PHASH_DISTANCE: u32 = 8;
+
+/// A cluster of live images that look the same. Exact content duplicates
+/// cannot occur among live assets — the importer deduplicates by SHA-256 at
+/// the record level — so a "duplicate" here is a re-encoded/resized variant
+/// with a different hash but the same picture.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DuplicateGroup {
+    /// Newest import first; the duplicate finder keeps one of these.
+    pub assets: Vec<Asset>,
+}
+
+/// Group live image assets into near-duplicate clusters.
+///
+/// Needs visual signatures (`extra.visual_phash`, computed in background
+/// after import and backfillable via maintenance); unsigned assets are
+/// ignored. Clusters are returned largest first.
+pub fn duplicate_groups(conn: &Connection) -> Result<Vec<DuplicateGroup>> {
+    use crate::media::search::PHash;
+
+    let rows_vec = rows::query_map(
+        conn,
+        &format!(
+            "SELECT {COLS} FROM assets \
+             WHERE kind = 'image' AND trashed_at IS NULL \
+             ORDER BY created_at DESC, id ASC"
+        ),
+        vec![],
+        asset_from_row,
+    )?;
+
+    // Only assets with a usable hash participate.
+    let mut items: Vec<(Asset, PHash)> = Vec::new();
+    for asset in rows_vec {
+        let phash = asset
+            .extra
+            .get("visual_phash")
+            .and_then(|v| v.as_str())
+            .map(PHash::from_hex)
+            .unwrap_or(PHash(0));
+        if phash != PHash(0) {
+            items.push((asset, phash));
+        }
+    }
+
+    // Union-find over matching pairs. The pair scan is O(n²) hamming checks —
+    // trivial for the libraries this desktop app targets.
+    let n = items.len();
+    let mut parent: Vec<usize> = (0..n).collect();
+    fn find(parent: &mut [usize], mut i: usize) -> usize {
+        while parent[i] != i {
+            parent[i] = parent[parent[i]];
+            i = parent[i];
+        }
+        i
+    }
+    for a in 0..n {
+        for b in (a + 1)..n {
+            if items[a].1.hamming(items[b].1) <= DUPLICATE_PHASH_DISTANCE {
+                let (ra, rb) = (find(&mut parent, a), find(&mut parent, b));
+                if ra != rb {
+                    parent[rb.max(ra)] = rb.min(ra);
+                }
+            }
+        }
+    }
+
+    let mut clusters: std::collections::HashMap<usize, Vec<Asset>> =
+        std::collections::HashMap::new();
+    for (i, (asset, _)) in items.into_iter().enumerate() {
+        clusters
+            .entry(find(&mut parent, i))
+            .or_default()
+            .push(asset);
+    }
+    let mut groups: Vec<DuplicateGroup> = clusters
+        .into_values()
+        .filter(|members| members.len() > 1)
+        .map(|assets| DuplicateGroup { assets })
+        .collect();
+    groups.sort_by_key(|g| std::cmp::Reverse(g.assets.len()));
+    Ok(groups)
+}
+
 // -- row mapping -------------------------------------------------------------
 
 pub(crate) fn asset_from_row(row: &rusqlite::Row) -> Result<Asset> {
