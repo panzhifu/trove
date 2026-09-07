@@ -1051,7 +1051,10 @@ mod tests {
             })
             .unwrap();
         lib.rename_smart_collection(sc.id, "new").unwrap();
-        assert_eq!(lib.get_smart_collection(sc.id).unwrap().unwrap().name, "new");
+        assert_eq!(
+            lib.get_smart_collection(sc.id).unwrap().unwrap().name,
+            "new"
+        );
         lib.delete_smart_collection(sc.id).unwrap();
         assert!(lib.get_smart_collection(sc.id).unwrap().is_none());
     }

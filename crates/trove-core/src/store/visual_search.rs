@@ -58,7 +58,9 @@ pub fn compute_signatures_batch(
 ) -> Result<u64> {
     let mut updated = 0_u64;
     for id in asset_ids {
-        if let Ok(true) = compute_and_store_signature(store, library_root, *id) { updated += 1 }
+        if let Ok(true) = compute_and_store_signature(store, library_root, *id) {
+            updated += 1
+        }
     }
     Ok(updated)
 }
@@ -169,16 +171,16 @@ fn collect_and_rank(
                 && let Some(colors) = extra_json
                     .pointer("/dominant_colors")
                     .and_then(|v| v.as_array())
-                {
-                    for c in colors {
-                        if let Some(hex_str) = c.as_str()
-                            && let Some(crgb) = search::hex_to_rgb(hex_str) {
-                                let csim =
-                                    search::color_similarity(search::rgb_distance(qrgb, crgb));
-                                score = score.max(csim * 0.8);
-                            }
+            {
+                for c in colors {
+                    if let Some(hex_str) = c.as_str()
+                        && let Some(crgb) = search::hex_to_rgb(hex_str)
+                    {
+                        let csim = search::color_similarity(search::rgb_distance(qrgb, crgb));
+                        score = score.max(csim * 0.8);
                     }
                 }
+            }
 
             if score >= min_threshold {
                 scored.push(SimilarAsset { asset, score });

@@ -546,9 +546,11 @@ impl Render for ExplorerPanel {
             .gap_1()
             .p_1()
             .key_context("Explorer")
-            .on_action(cx.listener(|this, _: &crate::actions::CancelEditor, window, cx| {
-                this.cancel_editor(window, cx);
-            }))
+            .on_action(
+                cx.listener(|this, _: &crate::actions::CancelEditor, window, cx| {
+                    this.cancel_editor(window, cx);
+                }),
+            )
             .child(
                 div()
                     .flex_1()

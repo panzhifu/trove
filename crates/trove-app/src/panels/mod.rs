@@ -39,8 +39,8 @@ macro_rules! panel {
 
 pub mod common;
 mod explorer;
-pub mod search_box;
 mod inspector;
+pub mod search_box;
 mod tags_panel;
 pub mod workspace;
 mod workspace_context_menu;

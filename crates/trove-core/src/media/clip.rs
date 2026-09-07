@@ -78,7 +78,9 @@ impl Embedding {
             return None;
         }
         let data: Vec<f32> = bytes
-            .as_chunks::<4>().0.iter()
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
             .collect();
         Some(Self::new(data))
@@ -195,9 +197,10 @@ pub fn ort_library_hint() -> Option<PathBuf> {
     let mut candidates: Vec<PathBuf> = vec![];
     // Executable directory.
     if let Ok(exe) = std::env::current_exe()
-        && let Some(dir) = exe.parent() {
-            candidates.push(dir.join(name));
-        }
+        && let Some(dir) = exe.parent()
+    {
+        candidates.push(dir.join(name));
+    }
     // Current working directory.
     candidates.push(PathBuf::from(name));
     // Config dir and its models/ subdirectory.
@@ -285,14 +288,16 @@ fn preprocess_image(path: &Path) -> Result<Vec<f32>> {
 fn extract_embedding(outputs: &ort::session::SessionOutputs, preferred: &str) -> Result<Vec<f32>> {
     if let Some(v) = outputs.get(preferred)
         && let Ok((_, data)) = v.try_extract_tensor::<f32>()
-            && !data.is_empty() {
-                return Ok(data.to_vec());
-            }
+        && !data.is_empty()
+    {
+        return Ok(data.to_vec());
+    }
     for v in outputs.values() {
         if let Ok((_, data)) = v.try_extract_tensor::<f32>()
-            && data.len() >= 128 {
-                return Ok(data.to_vec());
-            }
+            && data.len() >= 128
+        {
+            return Ok(data.to_vec());
+        }
     }
     Err(Error::Db("CLIP model produced no embedding output".into()))
 }
@@ -332,9 +337,10 @@ pub fn text_embedding(text: &str) -> Result<Vec<f32>> {
     {
         let cache = TEXT_CACHE.lock().unwrap();
         if let Some((q, v)) = cache.as_ref()
-            && q == text {
-                return Ok(v.clone());
-            }
+            && q == text
+        {
+            return Ok(v.clone());
+        }
     }
     let vec = text_embedding_uncached(text)?;
     *TEXT_CACHE.lock().unwrap() = Some((text.to_string(), vec.clone()));
@@ -367,10 +373,9 @@ fn text_embedding_uncached(text: &str) -> Result<Vec<f32>> {
     // The combined CLIP graph expects ALL inputs: without (zeroed)
     // pixel_values the vision branch's Shape node fails the whole run with
     // "Missing Input: pixel_values". We read `text_embeds` as output.
-    let dummy_pixels = ort::value::Tensor::from_array(
-        ([1_i64, 3, 224, 224], vec![0_f32; 3 * 224 * 224]),
-    )
-    .map_err(|e| Error::Db(format!("dummy pixels: {e}")))?;
+    let dummy_pixels =
+        ort::value::Tensor::from_array(([1_i64, 3, 224, 224], vec![0_f32; 3 * 224 * 224]))
+            .map_err(|e| Error::Db(format!("dummy pixels: {e}")))?;
     let outputs = session
         .run(ort::inputs![
             "pixel_values" => dummy_pixels,
