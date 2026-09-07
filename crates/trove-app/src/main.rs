@@ -83,6 +83,8 @@ fn build_menus() -> Vec<Menu> {
                 MenuItem::separator(),
                 MenuItem::action(rust_i18n::t!("app.undo").to_string(), Undo),
                 MenuItem::action(rust_i18n::t!("app.redo").to_string(), Redo),
+                MenuItem::separator(),
+                MenuItem::action(rust_i18n::t!("app.paste_import").to_string(), PasteImport),
             ],
             disabled: false,
         },
@@ -166,6 +168,8 @@ fn register_keys(cx: &mut App) {
     bind!(ClearSelection, "ClearSelection");
     bind!(Undo, "Undo");
     bind!(Redo, "Redo");
+    // Paste import is global (works wherever focus is).
+    bindings.push(KeyBinding::new("ctrl-shift-v", PasteImport, None));
     // Esc dismisses the explorer's inline add/rename editor. The input's own
     // Escape handler propagates the key, so this fires only while the editor
     // input holds focus inside the explorer panel.

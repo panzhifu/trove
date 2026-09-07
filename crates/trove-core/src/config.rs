@@ -45,6 +45,14 @@ pub struct AppConfig {
     /// these for one-click hot switching). Capped at [`RECENT_LIBRARY_CAP`].
     #[serde(default)]
     pub recent_libraries: Vec<PathBuf>,
+    /// Folders watched for new files; anything that appears under them is
+    /// imported automatically (unfiled). Empty = no watching.
+    #[serde(default)]
+    pub watched_folders: Vec<PathBuf>,
+    /// Master switch for folder watching. Defaults to on once folders are
+    /// configured; `false` pauses the watcher without losing the list.
+    #[serde(default)]
+    pub watch_folders_enabled: Option<bool>,
 }
 
 /// How many recent-library entries to remember.
@@ -108,6 +116,25 @@ impl AppConfig {
     /// Drop one library from the recent list and persist.
     pub fn remove_recent_library(&mut self, path: &PathBuf) -> Result<()> {
         self.recent_libraries.retain(|p| p != path);
+        self.save()
+    }
+
+    /// Whether the folder watcher should run (on by default).
+    pub fn watch_folders_enabled(&self) -> bool {
+        self.watch_folders_enabled.unwrap_or(true)
+    }
+
+    /// Add a watched folder (deduplicated) and persist.
+    pub fn add_watched_folder(&mut self, path: PathBuf) -> Result<()> {
+        if !self.watched_folders.contains(&path) {
+            self.watched_folders.push(path);
+        }
+        self.save()
+    }
+
+    /// Stop watching a folder and persist.
+    pub fn remove_watched_folder(&mut self, path: &PathBuf) -> Result<()> {
+        self.watched_folders.retain(|p| p != path);
         self.save()
     }
 

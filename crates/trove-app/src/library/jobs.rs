@@ -54,7 +54,8 @@ async fn embed_imported_images(
 /// replaces the previous toast instead of stacking a new one.
 pub struct ImportNotice;
 
-/// Start an import from a set of file paths.
+/// Start an import from a set of file paths into the currently browsed
+/// collection. See [`import_paths_app_into`].
 ///
 /// Works from any entry point that holds an `App` (button, file drop, ...):
 /// the heavy staging is scheduled on the background executor and the database
@@ -65,12 +66,26 @@ pub fn import_paths_app(
     window: &mut Window,
     cx: &mut App,
 ) {
+    let into_collection = controller.read(cx).current_collection;
+    import_paths_app_into(controller, paths, into_collection, window, cx);
+}
+
+/// Start an import into an explicit collection (`None` = unfiled). Returns
+/// `false` when the batch was refused (already importing, empty list or a
+/// dead target collection) so callers can retry later — the folder watcher
+/// relies on this to keep new files pending.
+pub fn import_paths_app_into(
+    controller: &Entity<LibraryController>,
+    paths: Vec<PathBuf>,
+    into_collection: Option<uuid::Uuid>,
+    window: &mut Window,
+    cx: &mut App,
+) -> bool {
     if paths.is_empty() || controller.read(cx).is_importing() {
-        return;
+        return false;
     }
 
     // Fail fast when the target collection does not exist.
-    let into_collection = controller.read(cx).current_collection;
     if let Some(cid) = into_collection {
         let conn = controller.read(cx).library.store().conn();
         if trove_core::store::collections::get(conn, cid)
@@ -78,7 +93,7 @@ pub fn import_paths_app(
             .flatten()
             .is_none()
         {
-            return;
+            return false;
         }
     }
 
@@ -178,4 +193,6 @@ pub fn import_paths_app(
         });
     })
     .detach();
+
+    true
 }
