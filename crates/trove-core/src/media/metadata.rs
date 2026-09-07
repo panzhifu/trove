@@ -196,9 +196,7 @@ fn mine_image(path: &Path) -> MinedMetadata {
 /// First value of an EXIF rational field as a plain float.
 fn first_ratio(value: &Value) -> Option<f64> {
     match value {
-        Value::Rational(ratios) => ratios
-            .first()
-            .map(|r| div(r.num, r.denom)),
+        Value::Rational(ratios) => ratios.first().map(|r| div(r.num, r.denom)),
         Value::SRational(ratios) => ratios
             .first()
             .map(|r| div(r.num.unsigned_abs(), r.denom.unsigned_abs())),
@@ -247,7 +245,8 @@ fn dms_to_decimal(value: &Value) -> Option<f64> {
     if ratios.len() < 2 {
         return None;
     }
-    let mut decimal = div(ratios[0].num, ratios[0].denom) + div(ratios[1].num, ratios[1].denom) / 60.0;
+    let mut decimal =
+        div(ratios[0].num, ratios[0].denom) + div(ratios[1].num, ratios[1].denom) / 60.0;
     if let Some(sec) = ratios.get(2) {
         decimal += div(sec.num, sec.denom) / 3600.0;
     }
@@ -258,10 +257,7 @@ fn dms_to_decimal(value: &Value) -> Option<f64> {
 fn gps_ref(field: Option<&Field>, bad: u8) -> bool {
     match field {
         Some(f) => match &f.value {
-            Value::Ascii(v) => v
-                .first()
-                .and_then(|s| s.first())
-                .is_some_and(|&b| b == bad),
+            Value::Ascii(v) => v.first().and_then(|s| s.first()).is_some_and(|&b| b == bad),
             _ => false,
         },
         None => false,
@@ -293,7 +289,11 @@ fn mine_audio(path: &Path) -> Option<MinedMetadata> {
     let mut m = MinedMetadata::default();
 
     // Prefer a title from any tag present. Accessor values are `Cow<str>`.
-    if let Some(title) = tagged.tags().iter().find_map(|t| t.title().map(|s| s.into_owned())) {
+    if let Some(title) = tagged
+        .tags()
+        .iter()
+        .find_map(|t| t.title().map(|s| s.into_owned()))
+    {
         m.title = Some(title.clone());
         m.insert("title", title);
     }
@@ -326,11 +326,11 @@ mod tests {
     use std::io::Write as _;
 
     const PNG_1X1: &[u8] = &[
-        0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48,
-        0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00,
-        0x00, 0x1F, 0x15, 0xC4, 0x89, 0x00, 0x00, 0x00, 0x0A, 0x49, 0x44, 0x41, 0x54, 0x78,
-        0x9C, 0x63, 0x00, 0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0D, 0x0A, 0x2D, 0xB4, 0x00,
-        0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+        0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44,
+        0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1F,
+        0x15, 0xC4, 0x89, 0x00, 0x00, 0x00, 0x0A, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9C, 0x63, 0x00,
+        0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0D, 0x0A, 0x2D, 0xB4, 0x00, 0x00, 0x00, 0x00, 0x49,
+        0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
     ];
 
     fn tmp(name: &str, bytes: &[u8]) -> std::path::PathBuf {
@@ -358,7 +358,13 @@ mod tests {
         let m = mine(&g, AssetKind::Audio);
         assert!(m.duration_ms.is_none());
         assert!(m.extra.is_empty());
-        for kind in [AssetKind::Video, AssetKind::Document, AssetKind::Archive, AssetKind::Font, AssetKind::Other] {
+        for kind in [
+            AssetKind::Video,
+            AssetKind::Document,
+            AssetKind::Archive,
+            AssetKind::Font,
+            AssetKind::Other,
+        ] {
             assert_eq!(mine(&g, kind), MinedMetadata::default());
         }
     }
@@ -371,7 +377,9 @@ mod tests {
         let Some(path) = face else { return };
         let m = mine(&path, AssetKind::Font);
         assert!(
-            m.extra.get("font_family").is_some_and(|v| v.as_str().is_some_and(|s| !s.is_empty())),
+            m.extra
+                .get("font_family")
+                .is_some_and(|v| v.as_str().is_some_and(|s| !s.is_empty())),
             "family missing for {}",
             path.display()
         );

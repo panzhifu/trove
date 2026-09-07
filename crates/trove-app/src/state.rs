@@ -12,8 +12,14 @@ use trove_core::model::{AssetKind, AssetSort};
 pub enum ImportPhase {
     #[default]
     Idle,
-    Running { total: usize, done: usize },
-    Done { imported: usize, skipped: usize },
+    Running {
+        total: usize,
+        done: usize,
+    },
+    Done {
+        imported: usize,
+        skipped: usize,
+    },
 }
 
 /// Presentation of the workspace asset area.
@@ -110,7 +116,10 @@ impl LibraryController {
     /// Called by the import job on the main thread after committing one file.
     pub fn import_progress(&mut self, done: usize) {
         if let ImportPhase::Running { total, .. } = &mut self.import_phase {
-            self.import_phase = ImportPhase::Running { total: *total, done };
+            self.import_phase = ImportPhase::Running {
+                total: *total,
+                done,
+            };
             self.generation += 1;
         }
     }
@@ -236,9 +245,7 @@ impl LibraryController {
     /// job cannot keep writing into the previous store.
     pub fn swap_library(&mut self, path: PathBuf) -> Result<(), trove_core::Error> {
         if self.is_importing() {
-            return Err(trove_core::Error::Validation(
-                "import in progress".into(),
-            ));
+            return Err(trove_core::Error::Validation("import in progress".into()));
         }
         let library = Library::open(path)?;
         self.library = library;
@@ -284,7 +291,9 @@ impl LibraryController {
     /// (or when either end is off-view) this degrades to a single select.
     pub fn select_range_to(&mut self, id: Uuid) {
         let anchor = self.selection_anchor;
-        let Some(start) = anchor.or(Some(id)) else { return };
+        let Some(start) = anchor.or(Some(id)) else {
+            return;
+        };
         let flat = &self.visible_assets;
         let (a, b) = (
             flat.iter().position(|&x| x == start),
@@ -361,9 +370,8 @@ impl LibraryController {
             self.library.trash_assets(&ids)
         };
         if let Err(e) = result {
-            self.notice = Some(
-                rust_i18n::t!("workspace.trash_failed", error = e.to_string()).to_string(),
-            );
+            self.notice =
+                Some(rust_i18n::t!("workspace.trash_failed", error = e.to_string()).to_string());
         }
         self.generation += 1;
         ids.len()

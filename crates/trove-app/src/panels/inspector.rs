@@ -12,8 +12,8 @@ use gpui_kit::component::dock::{BasePanel, Panel as DockPanel, PanelControl, Pan
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::{ActiveTheme, Icon, IconName, Sizable};
-use gpui_kit::*;
 use gpui_kit::prelude::FluentBuilder as _;
+use gpui_kit::*;
 
 use trove_core::model::{AssetKind, AssetPatch, MAX_RATING};
 use trove_core::store::{assets, tags};
@@ -64,10 +64,12 @@ impl InspectorPanel {
             InputState::new(window, cx).placeholder(rust_i18n::t!("inspector.title").to_string())
         });
         let description_input = cx.new(|cx| {
-            InputState::new(window, cx).placeholder(rust_i18n::t!("inspector.description").to_string())
+            InputState::new(window, cx)
+                .placeholder(rust_i18n::t!("inspector.description").to_string())
         });
         let source_input = cx.new(|cx| {
-            InputState::new(window, cx).placeholder(rust_i18n::t!("inspector.source_url").to_string())
+            InputState::new(window, cx)
+                .placeholder(rust_i18n::t!("inspector.source_url").to_string())
         });
         let this = Self {
             focus_handle: cx.focus_handle(),
@@ -159,15 +161,15 @@ impl InspectorPanel {
             if failed.is_none() {
                 let _ = ctl.library.set_asset_tags(asset_id, &ids);
             } else if let Some(e) = failed.clone() {
-                ctl.notice = Some(
-                    rust_i18n::t!("inspector.replace_tags_failed", error = e).to_string(),
-                );
+                ctl.notice =
+                    Some(rust_i18n::t!("inspector.replace_tags_failed", error = e).to_string());
             }
             ctl.generation += 1;
             cx.notify();
         });
         if failed.is_none() {
-            self.tag_input.update(cx, |state, cx| state.set_value("", window, cx));
+            self.tag_input
+                .update(cx, |state, cx| state.set_value("", window, cx));
         }
     }
 
@@ -360,14 +362,29 @@ impl Render for InspectorPanel {
         let added = asset.created_at.format("%Y-%m-%d %H:%M").to_string();
         let mime = asset.mime.clone();
         let (font_family, font_style, font_weight, font_glyphs, font_italic) = (
-            asset.extra.get("font_family").and_then(|v| v.as_str()).map(str::to_string),
-            asset.extra.get("font_style").and_then(|v| v.as_str()).map(str::to_string),
+            asset
+                .extra
+                .get("font_family")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+            asset
+                .extra
+                .get("font_style")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
             asset.extra.get("font_weight").and_then(|v| v.as_u64()),
             asset.extra.get("font_glyphs").and_then(|v| v.as_u64()),
-            asset.extra.get("font_italic").and_then(|v| v.as_bool()).unwrap_or(false),
+            asset
+                .extra
+                .get("font_italic")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
         );
         let font_blob = if kind == AssetKind::Font {
-            asset.rel_path.as_ref().map(|rel| ctl.library.root().join(rel))
+            asset
+                .rel_path
+                .as_ref()
+                .map(|rel| ctl.library.root().join(rel))
         } else {
             None
         };
@@ -407,14 +424,11 @@ impl Render for InspectorPanel {
             .p_3()
             .gap_2()
             .w_full()
-            .child(
-                div()
-                    .flex()
-                    .w_full()
-                    .justify_center()
-                    .child(preview),
-            )
-            .child(separator_label(cx, rust_i18n::t!("inspector.edit").to_string()))
+            .child(div().flex().w_full().justify_center().child(preview))
+            .child(separator_label(
+                cx,
+                rust_i18n::t!("inspector.edit").to_string(),
+            ))
             .child(Input::new(&self.title_input).small().appearance(true))
             .child(Input::new(&self.description_input).small().appearance(true))
             .child(Input::new(&self.source_input).small().appearance(true))
@@ -422,42 +436,41 @@ impl Render for InspectorPanel {
             .child(self.kind_row(kind))
             .child(edit_label("inspector.rating"))
             .child(self.rating_row(rating))
-            .child(separator_label(cx, rust_i18n::t!("inspector.tags").to_string()))
-            .child(
-                v_flex()
+            .child(separator_label(
+                cx,
+                rust_i18n::t!("inspector.tags").to_string(),
+            ))
+            .child(v_flex().gap_1().children(asset_tags.iter().map(|tag| {
+                let id = tag.id;
+                let controller = self.controller.clone();
+                h_flex()
                     .gap_1()
-                    .children(asset_tags.iter().map(|tag| {
-                        let id = tag.id;
-                        let controller = self.controller.clone();
-                        h_flex()
-                            .gap_1()
-                            .items_center()
-                            .child(
-                                div()
-                                    .px_2()
-                                    .py_0p5()
-                                    .rounded(cx.theme().radius)
-                                    .bg(cx.theme().secondary)
-                                    .text_sm()
-                                    .text_color(cx.theme().foreground)
-                                    .child(tag.name.clone()),
-                            )
-                            .child(
-                                Button::new(format!("untag-{id}"))
-                                    .xsmall()
-                                    .ghost()
-                                    .label("×")
-                                    .on_click(move |_, _, cx| {
-                                        controller.update(cx, move |ctl, cx| {
-                                            let _ = ctl.library.tag_assets(&[asset_id], id, false);
-                                            ctl.generation += 1;
-                                            cx.notify();
-                                        });
-                                    }),
-                            )
-                            .into_any_element()
-                    })),
-            )
+                    .items_center()
+                    .child(
+                        div()
+                            .px_2()
+                            .py_0p5()
+                            .rounded(cx.theme().radius)
+                            .bg(cx.theme().secondary)
+                            .text_sm()
+                            .text_color(cx.theme().foreground)
+                            .child(tag.name.clone()),
+                    )
+                    .child(
+                        Button::new(format!("untag-{id}"))
+                            .xsmall()
+                            .ghost()
+                            .label("×")
+                            .on_click(move |_, _, cx| {
+                                controller.update(cx, move |ctl, cx| {
+                                    let _ = ctl.library.tag_assets(&[asset_id], id, false);
+                                    ctl.generation += 1;
+                                    cx.notify();
+                                });
+                            }),
+                    )
+                    .into_any_element()
+            })))
             .child(
                 h_flex()
                     .gap_1()
@@ -475,12 +488,16 @@ impl Render for InspectorPanel {
                     ),
             )
             .when(!swatches.is_empty(), |this| {
-                this.child(
-                    separator_label(cx, rust_i18n::t!("inspector.colors").to_string()),
-                )
+                this.child(separator_label(
+                    cx,
+                    rust_i18n::t!("inspector.colors").to_string(),
+                ))
                 .child(
-                    h_flex().flex_wrap().gap_1p5().px_1().children(
-                        swatches.iter().map(|(_rgb, hex)| {
+                    h_flex()
+                        .flex_wrap()
+                        .gap_1p5()
+                        .px_1()
+                        .children(swatches.iter().map(|(_rgb, hex)| {
                             let hex = hex.clone();
                             // Right-click copies the hex value straight to the
                             // clipboard — the palette doubles as a picker.
@@ -488,30 +505,39 @@ impl Render for InspectorPanel {
                                 .on_mouse_down(gpui::MouseButton::Right, {
                                     let hex = hex.clone();
                                     move |_, _, cx| {
-                                        cx.write_to_clipboard(
-                                            gpui::ClipboardItem::new_string(hex.clone()),
-                                        );
+                                        cx.write_to_clipboard(gpui::ClipboardItem::new_string(
+                                            hex.clone(),
+                                        ));
                                     }
                                 })
-                        }),
-                    ),
+                        })),
                 )
             })
             .when(kind == AssetKind::Font, |this| {
-                this.child(separator_label(cx, rust_i18n::t!("inspector.font").to_string()))
-                    .child(self.font_section(
-                        cx,
-                        font_family,
-                        font_style,
-                        font_weight,
-                        font_glyphs,
-                        font_italic,
-                        font_blob.as_deref(),
-                    ))
+                this.child(separator_label(
+                    cx,
+                    rust_i18n::t!("inspector.font").to_string(),
+                ))
+                .child(self.font_section(
+                    cx,
+                    font_family,
+                    font_style,
+                    font_weight,
+                    font_glyphs,
+                    font_italic,
+                    font_blob.as_deref(),
+                ))
             })
-            .child(separator_label(cx, rust_i18n::t!("inspector.properties").to_string()))
+            .child(separator_label(
+                cx,
+                rust_i18n::t!("inspector.properties").to_string(),
+            ))
             .child(property_row(cx, "inspector.mime_type", mime))
-            .child(property_row(cx, "inspector.size", human_bytes(asset.size_bytes)))
+            .child(property_row(
+                cx,
+                "inspector.size",
+                human_bytes(asset.size_bytes),
+            ))
             .when_some(asset.duration_ms, |this, ms| {
                 this.child(property_row(cx, "inspector.duration", format_duration(ms)))
             })

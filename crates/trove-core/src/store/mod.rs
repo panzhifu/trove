@@ -3,11 +3,11 @@
 pub mod assets;
 pub mod batch;
 pub mod collections;
+pub(crate) mod rows;
+pub mod schema;
 pub mod smart;
 pub mod smart_collections;
 pub mod tags;
-pub(crate) mod rows;
-pub mod schema;
 
 use std::path::Path;
 
@@ -29,9 +29,10 @@ impl Store {
     /// Open (or create) the library at `path`, applying pending migrations.
     pub fn open(path: &Path) -> Result<Self> {
         if let Some(parent) = path.parent()
-            && !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent)?;
-            }
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent)?;
+        }
         let db = pollster::block_on(Builder::new_local(path).build())?;
         let conn = db.connect()?;
         let store = Self { conn };
@@ -88,7 +89,7 @@ impl Store {
 
 #[cfg(test)]
 mod tests {
-    use super::{schema, Store};
+    use super::{Store, schema};
     use crate::model::{
         Asset, AssetKind, AssetPatch, AssetQuery, NewCollection, NewTag, Origin, now,
     };
@@ -185,7 +186,9 @@ mod tests {
             ]
         });
         smart_collections::update_query(store.conn(), sc.id, &tree, Some("#3b82f6")).unwrap();
-        let stored = smart_collections::get(store.conn(), sc.id).unwrap().unwrap();
+        let stored = smart_collections::get(store.conn(), sc.id)
+            .unwrap()
+            .unwrap();
         assert_eq!(stored.query, tree);
         assert_eq!(stored.color.as_deref(), Some("#3b82f6"));
 
@@ -198,10 +201,15 @@ mod tests {
         )
         .is_err());
         assert_eq!(
-            smart_collections::get(store.conn(), sc.id).unwrap().unwrap().query,
+            smart_collections::get(store.conn(), sc.id)
+                .unwrap()
+                .unwrap()
+                .query,
             tree
         );
-        assert!(smart_collections::update_query(store.conn(), Uuid::new_v4(), &tree, None).is_err());
+        assert!(
+            smart_collections::update_query(store.conn(), Uuid::new_v4(), &tree, None).is_err()
+        );
     }
 
     #[test]
@@ -215,20 +223,29 @@ mod tests {
     #[test]
     fn collection_tree_crud_and_cycle_refusal() {
         let store = Store::in_memory().unwrap();
-        let root = collections::create(store.conn(), &NewCollection {
-            parent_id: None,
-            name: "root".into(),
-            position: 0,
-        })
+        let root = collections::create(
+            store.conn(),
+            &NewCollection {
+                parent_id: None,
+                name: "root".into(),
+                position: 0,
+            },
+        )
         .unwrap();
-        let child = collections::create(store.conn(), &NewCollection {
-            parent_id: Some(root.id),
-            name: "child".into(),
-            position: 0,
-        })
+        let child = collections::create(
+            store.conn(),
+            &NewCollection {
+                parent_id: Some(root.id),
+                name: "child".into(),
+                position: 0,
+            },
+        )
         .unwrap();
 
-        assert_eq!(collections::children_of(store.conn(), None).unwrap().len(), 1);
+        assert_eq!(
+            collections::children_of(store.conn(), None).unwrap().len(),
+            1
+        );
         assert_eq!(
             collections::children_of(store.conn(), Some(root.id)).unwrap()[0].id,
             child.id
@@ -240,11 +257,14 @@ mod tests {
 
         // Rename + re-root under a fresh parent.
         collections::rename(store.conn(), child.id, "renamed").unwrap();
-        let orphan_parent = collections::create(store.conn(), &NewCollection {
-            parent_id: None,
-            name: "other".into(),
-            position: 1,
-        })
+        let orphan_parent = collections::create(
+            store.conn(),
+            &NewCollection {
+                parent_id: None,
+                name: "other".into(),
+                position: 1,
+            },
+        )
         .unwrap();
         collections::move_to(store.conn(), child.id, Some(orphan_parent.id), 5).unwrap();
         let moved = collections::get(store.conn(), child.id).unwrap().unwrap();
@@ -301,17 +321,23 @@ mod tests {
         assert_eq!(favs.len(), 1);
 
         // Collection membership is many-to-many.
-        let c1 = collections::create(store.conn(), &NewCollection {
-            parent_id: None,
-            name: "album".into(),
-            position: 0,
-        })
+        let c1 = collections::create(
+            store.conn(),
+            &NewCollection {
+                parent_id: None,
+                name: "album".into(),
+                position: 0,
+            },
+        )
         .unwrap();
-        let c2 = collections::create(store.conn(), &NewCollection {
-            parent_id: None,
-            name: "work".into(),
-            position: 1,
-        })
+        let c2 = collections::create(
+            store.conn(),
+            &NewCollection {
+                parent_id: None,
+                name: "work".into(),
+                position: 1,
+            },
+        )
         .unwrap();
         collections::add_asset(store.conn(), c1.id, img.id).unwrap();
         collections::add_asset(store.conn(), c1.id, doc.id).unwrap();
@@ -346,7 +372,6 @@ mod tests {
         .unwrap();
         assert_eq!(trash.len(), 1);
 
-
         let (_, live) = assets::query(store.conn(), &AssetQuery::default()).unwrap();
         assert_eq!(live.len(), 1);
         let (_, trash) = assets::query(
@@ -370,14 +395,21 @@ mod tests {
         let path = dir.join("library.db");
         {
             let store = Store::open(&path).unwrap();
-            let c = collections::create(store.conn(), &NewCollection {
-                parent_id: None,
-                name: "kept".into(),
-                position: 0,
-            })
+            let c = collections::create(
+                store.conn(),
+                &NewCollection {
+                    parent_id: None,
+                    name: "kept".into(),
+                    position: 0,
+                },
+            )
             .unwrap();
-            collections::add_asset(store.conn(), c.id, sample_asset("kept.png", AssetKind::Image).id)
-                .unwrap_err(); // not inserted yet — ok, ignore for roundtrip of collection
+            collections::add_asset(
+                store.conn(),
+                c.id,
+                sample_asset("kept.png", AssetKind::Image).id,
+            )
+            .unwrap_err(); // not inserted yet — ok, ignore for roundtrip of collection
             let _ = c;
         }
         {
@@ -429,7 +461,8 @@ mod tests {
         assert_eq!(total, 1);
 
         // Special characters never panic and are treated literally.
-        let (total, hits) = assets::search(store.conn(), "\" * NEAR", &AssetQuery::default()).unwrap();
+        let (total, hits) =
+            assets::search(store.conn(), "\" * NEAR", &AssetQuery::default()).unwrap();
         assert_eq!(total, 0);
         let _ = hits;
     }
@@ -486,8 +519,22 @@ mod tests {
         photo.title = Some("Unrelated title".into());
         assets::insert(conn, &photo).unwrap();
 
-        let tag = tags::create(conn, &NewTag { name: "landscape".into(), color: None }).unwrap();
-        let other = tags::create(conn, &NewTag { name: "night".into(), color: None }).unwrap();
+        let tag = tags::create(
+            conn,
+            &NewTag {
+                name: "landscape".into(),
+                color: None,
+            },
+        )
+        .unwrap();
+        let other = tags::create(
+            conn,
+            &NewTag {
+                name: "night".into(),
+                color: None,
+            },
+        )
+        .unwrap();
 
         // No tag attached yet: not found.
         let (total, _) = assets::search(conn, "landscape", &AssetQuery::default()).unwrap();
@@ -508,8 +555,7 @@ mod tests {
 
         // Batch replace syncs once and carries every new tag name.
         tags::set_for_asset(conn, photo.id, &[tag.id, other.id]).unwrap();
-        let (total, _) =
-            assets::search(conn, "landscape night", &AssetQuery::default()).unwrap();
+        let (total, _) = assets::search(conn, "landscape night", &AssetQuery::default()).unwrap();
         assert_eq!(total, 1);
 
         // Deleting a tag removes it from every indexed asset.
@@ -531,17 +577,30 @@ mod tests {
 
         let (total, _) = assets::query(
             conn,
-            &AssetQuery { text: Some("nature".into()), ..Default::default() },
+            &AssetQuery {
+                text: Some("nature".into()),
+                ..Default::default()
+            },
         )
         .unwrap();
         assert_eq!(total, 0);
 
-        let tag = tags::create(conn, &NewTag { name: "nature".into(), color: None }).unwrap();
+        let tag = tags::create(
+            conn,
+            &NewTag {
+                name: "nature".into(),
+                color: None,
+            },
+        )
+        .unwrap();
         tags::add_to_asset(conn, photo.id, tag.id).unwrap();
 
         let (total, hits) = assets::query(
             conn,
-            &AssetQuery { text: Some("nature".into()), ..Default::default() },
+            &AssetQuery {
+                text: Some("nature".into()),
+                ..Default::default()
+            },
         )
         .unwrap();
         assert_eq!(total, 1);
@@ -550,7 +609,10 @@ mod tests {
         tags::remove_from_asset(conn, photo.id, tag.id).unwrap();
         let (total, _) = assets::query(
             conn,
-            &AssetQuery { text: Some("nature".into()), ..Default::default() },
+            &AssetQuery {
+                text: Some("nature".into()),
+                ..Default::default()
+            },
         )
         .unwrap();
         assert_eq!(total, 0);
@@ -566,7 +628,16 @@ mod tests {
 
         // FTS5 operators and syntax characters are matched literally, never
         // parsed: these inputs must not error or widen the match.
-        for q in ["c*", "\"c*\"", "NEAR", "c AND tips", "c OR (tips)", "\"", "*", "--"] {
+        for q in [
+            "c*",
+            "\"c*\"",
+            "NEAR",
+            "c AND tips",
+            "c OR (tips)",
+            "\"",
+            "*",
+            "--",
+        ] {
             let result = assets::search(conn, q, &AssetQuery::default());
             assert!(result.is_ok(), "search panicked on query {q:?}");
         }
@@ -590,7 +661,10 @@ mod tests {
         assets::insert(store.conn(), &c).unwrap();
 
         let ordered = assets::by_ids(store.conn(), &[c.id, a.id, b.id]).unwrap();
-        assert_eq!(ordered.iter().map(|x| x.id).collect::<Vec<_>>(), vec![c.id, a.id, b.id]);
+        assert_eq!(
+            ordered.iter().map(|x| x.id).collect::<Vec<_>>(),
+            vec![c.id, a.id, b.id]
+        );
     }
 
     // -- smart collections -----------------------------------------------
@@ -659,10 +733,12 @@ mod tests {
         assert_eq!(ids, vec![a.id]);
 
         // A truly malformed tree (no field either) is still an error.
-        assert!(super::smart::node_from_json(&serde_json::json!({
-            "op": "and", "children": [{ "value": 1 }]
-        }))
-        .is_err());
+        assert!(
+            super::smart::node_from_json(&serde_json::json!({
+                "op": "and", "children": [{ "value": 1 }]
+            }))
+            .is_err()
+        );
     }
 
     #[test]
@@ -699,15 +775,9 @@ mod tests {
         assert_eq!(ids, vec![img.id]);
 
         // favorite filter narrows to the two favorites (img + vid).
-        let (total, _) = super::smart::evaluate_filtered(
-            store.conn(),
-            &node,
-            None,
-            Some(true),
-            None,
-            0,
-        )
-        .unwrap();
+        let (total, _) =
+            super::smart::evaluate_filtered(store.conn(), &node, None, Some(true), None, 0)
+                .unwrap();
         assert_eq!(total, 2);
 
         // Both compose with AND.
@@ -742,7 +812,14 @@ mod tests {
 
         // tag match is case-insensitive.
         super::tags::ensure_named(store.conn(), "Travel").unwrap();
-        super::tags::add_to_asset(store.conn(), a.id, super::tags::ensure_named(store.conn(), "travel").unwrap().id).unwrap();
+        super::tags::add_to_asset(
+            store.conn(),
+            a.id,
+            super::tags::ensure_named(store.conn(), "travel")
+                .unwrap()
+                .id,
+        )
+        .unwrap();
         let tree = smart_node(serde_json::json!({
             "op": "match", "field": "tag", "value": "TRAVEL"
         }));
@@ -766,9 +843,13 @@ mod tests {
         let store = Store::in_memory().unwrap();
         // Color lives in `extra.dominant_color` (as mined by color::dominant_colors).
         let mut red = sample_asset("red.png", AssetKind::Image);
-        red.extra = [("dominant_color".into(), serde_json::json!("#d01010"))].into_iter().collect();
+        red.extra = [("dominant_color".into(), serde_json::json!("#d01010"))]
+            .into_iter()
+            .collect();
         let mut blue = sample_asset("blue.png", AssetKind::Image);
-        blue.extra = [("dominant_color".into(), serde_json::json!("#1a5cff"))].into_iter().collect();
+        blue.extra = [("dominant_color".into(), serde_json::json!("#1a5cff"))]
+            .into_iter()
+            .collect();
         assets::insert(store.conn(), &red).unwrap();
         assets::insert(store.conn(), &blue).unwrap();
 
@@ -839,18 +920,27 @@ mod tests {
             position: 0,
         };
         let created = super::smart_collections::create(store.conn(), &input).unwrap();
-        let fetched = super::smart_collections::get(store.conn(), created.id).unwrap().unwrap();
+        let fetched = super::smart_collections::get(store.conn(), created.id)
+            .unwrap()
+            .unwrap();
         assert_eq!(fetched.name, "Favorites");
         assert_eq!(fetched.query, input.query);
         let listed = super::smart_collections::list(store.conn()).unwrap();
         assert_eq!(listed.len(), 1);
         super::smart_collections::rename(store.conn(), created.id, "Renamed").unwrap();
         assert_eq!(
-            super::smart_collections::get(store.conn(), created.id).unwrap().unwrap().name,
+            super::smart_collections::get(store.conn(), created.id)
+                .unwrap()
+                .unwrap()
+                .name,
             "Renamed"
         );
         super::smart_collections::delete(store.conn(), created.id).unwrap();
-        assert!(super::smart_collections::get(store.conn(), created.id).unwrap().is_none());
+        assert!(
+            super::smart_collections::get(store.conn(), created.id)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -877,7 +967,14 @@ mod tests {
     fn tag_rename_updates_fts_and_rejects_duplicates() {
         let store = Store::in_memory().unwrap();
         let conn = store.conn();
-        let tag = tags::create(conn, &NewTag { name: "beach".into(), color: None }).unwrap();
+        let tag = tags::create(
+            conn,
+            &NewTag {
+                name: "beach".into(),
+                color: None,
+            },
+        )
+        .unwrap();
         let mut a = sample_asset("a.png", AssetKind::Image);
         a.title = Some("sunset".into());
         assets::insert(conn, &a).unwrap();
@@ -896,7 +993,14 @@ mod tests {
         assert_eq!(total, 0);
 
         // Renaming onto an existing name (case-insensitive) fails.
-        let other = tags::create(conn, &NewTag { name: "night".into(), color: None }).unwrap();
+        let other = tags::create(
+            conn,
+            &NewTag {
+                name: "night".into(),
+                color: None,
+            },
+        )
+        .unwrap();
         assert!(tags::rename(conn, tag.id, "NIGHT").is_err());
         let _ = other;
     }
@@ -905,9 +1009,19 @@ mod tests {
     fn tag_color_validates_and_persists() {
         let store = Store::in_memory().unwrap();
         let conn = store.conn();
-        let tag = tags::create(conn, &NewTag { name: "t".into(), color: None }).unwrap();
+        let tag = tags::create(
+            conn,
+            &NewTag {
+                name: "t".into(),
+                color: None,
+            },
+        )
+        .unwrap();
         tags::set_color(conn, tag.id, Some("FF00AA")).unwrap();
-        assert_eq!(tags::get(conn, tag.id).unwrap().unwrap().color, Some("#ff00aa".into()));
+        assert_eq!(
+            tags::get(conn, tag.id).unwrap().unwrap().color,
+            Some("#ff00aa".into())
+        );
         tags::set_color(conn, tag.id, None).unwrap();
         assert_eq!(tags::get(conn, tag.id).unwrap().unwrap().color, None);
         assert!(tags::set_color(conn, tag.id, Some("nothex")).is_err());
@@ -935,21 +1049,41 @@ mod tests {
         assets::insert(conn, &c).unwrap();
 
         let names = |q: AssetQuery| -> Vec<String> {
-            assets::query(conn, &q).unwrap().1.iter().map(|x| x.file_name.clone()).collect()
+            assets::query(conn, &q)
+                .unwrap()
+                .1
+                .iter()
+                .map(|x| x.file_name.clone())
+                .collect()
         };
         // Default: newest first (insert order C, B, A).
-        assert_eq!(names(AssetQuery::default()), vec!["mmm.png", "zzz.png", "aaa.png"]);
         assert_eq!(
-            names(AssetQuery { sort: AssetSort::Name, sort_desc: false, ..Default::default() }),
+            names(AssetQuery::default()),
+            vec!["mmm.png", "zzz.png", "aaa.png"]
+        );
+        assert_eq!(
+            names(AssetQuery {
+                sort: AssetSort::Name,
+                sort_desc: false,
+                ..Default::default()
+            }),
             vec!["aaa.png", "mmm.png", "zzz.png"]
         );
         assert_eq!(
-            names(AssetQuery { sort: AssetSort::SizeBytes, sort_desc: true, ..Default::default() }),
+            names(AssetQuery {
+                sort: AssetSort::SizeBytes,
+                sort_desc: true,
+                ..Default::default()
+            }),
             vec!["aaa.png", "mmm.png", "zzz.png"]
         );
         // Un-rated assets come last in a descending rating sort.
         assert_eq!(
-            names(AssetQuery { sort: AssetSort::Rating, sort_desc: true, ..Default::default() }),
+            names(AssetQuery {
+                sort: AssetSort::Rating,
+                sort_desc: true,
+                ..Default::default()
+            }),
             vec!["zzz.png", "aaa.png", "mmm.png"]
         );
     }
@@ -964,11 +1098,22 @@ mod tests {
         assets::insert(conn, &a).unwrap();
         let coll = collections::create(
             conn,
-            &NewCollection { parent_id: None, name: "trip".into(), position: 0 },
+            &NewCollection {
+                parent_id: None,
+                name: "trip".into(),
+                position: 0,
+            },
         )
         .unwrap();
         collections::add_asset(conn, coll.id, a.id).unwrap();
-        let tag = tags::create(conn, &NewTag { name: "beach".into(), color: None }).unwrap();
+        let tag = tags::create(
+            conn,
+            &NewTag {
+                name: "beach".into(),
+                color: None,
+            },
+        )
+        .unwrap();
         tags::add_to_asset(conn, a.id, tag.id).unwrap();
         smart_collections::create(
             conn,
@@ -993,4 +1138,3 @@ mod tests {
         assert_eq!(value["smart_collections"][0]["name"], "fav");
     }
 }
-

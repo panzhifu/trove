@@ -17,8 +17,7 @@ pub fn set_trashed_many(conn: &Connection, ids: &[Uuid], trashed: bool) -> Resul
     if ids.is_empty() {
         return Ok(0);
     }
-    let mut sql =
-        String::from("UPDATE assets SET trashed_at = ?1, updated_at = ?2 WHERE id IN (");
+    let mut sql = String::from("UPDATE assets SET trashed_at = ?1, updated_at = ?2 WHERE id IN (");
     let mut args = vec![
         if trashed {
             rows::ts(Utc::now()).into()
@@ -45,8 +44,7 @@ pub fn set_favorite_many(conn: &Connection, ids: &[Uuid], favorite: bool) -> Res
     if ids.is_empty() {
         return Ok(0);
     }
-    let mut sql =
-        String::from("UPDATE assets SET is_favorite = ?1, updated_at = ?2 WHERE id IN (");
+    let mut sql = String::from("UPDATE assets SET is_favorite = ?1, updated_at = ?2 WHERE id IN (");
     let mut args = vec![
         libsql::Value::Integer(favorite as i64),
         rows::ts(Utc::now()).into(),
@@ -65,11 +63,7 @@ pub fn set_favorite_many(conn: &Connection, ids: &[Uuid], favorite: bool) -> Res
 
 /// Attach many assets to a collection. Idempotent (`INSERT OR IGNORE`); returns
 /// the number of ids processed.
-pub fn add_to_collection_many(
-    conn: &Connection,
-    collection_id: Uuid,
-    ids: &[Uuid],
-) -> Result<u64> {
+pub fn add_to_collection_many(conn: &Connection, collection_id: Uuid, ids: &[Uuid]) -> Result<u64> {
     for id in ids {
         super::collections::add_asset(conn, collection_id, *id)?;
     }
@@ -132,11 +126,9 @@ mod tests {
 
         // Restore only one.
         assert_eq!(set_trashed_many(store.conn(), &[a], false).unwrap(), 1);
-        let (_, live) = crate::store::assets::query(
-            store.conn(),
-            &crate::model::AssetQuery::default(),
-        )
-        .unwrap();
+        let (_, live) =
+            crate::store::assets::query(store.conn(), &crate::model::AssetQuery::default())
+                .unwrap();
         assert_eq!(live.len(), 1);
 
         // Bring `b` back so both are live, then favorite both in one statement.
@@ -168,7 +160,13 @@ mod tests {
         .unwrap();
 
         assert_eq!(add_to_collection_many(store.conn(), c.id, &[a]).unwrap(), 1);
-        assert_eq!(add_to_collection_many(store.conn(), c.id, &[a, a]).unwrap(), 2);
-        assert_eq!(crate::store::collections::count_assets(store.conn(), c.id).unwrap(), 1);
+        assert_eq!(
+            add_to_collection_many(store.conn(), c.id, &[a, a]).unwrap(),
+            2
+        );
+        assert_eq!(
+            crate::store::collections::count_assets(store.conn(), c.id).unwrap(),
+            1
+        );
     }
 }

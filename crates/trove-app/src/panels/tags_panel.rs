@@ -2,11 +2,11 @@
 //! filter/delete.
 
 use gpui_kit::base::{h_flex, v_flex};
+use gpui_kit::component::WindowExt as _;
 use gpui_kit::component::dock::{BasePanel, Panel as DockPanel, PanelEvent};
 use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::component::menu::{ContextMenuExt as _, PopupMenu, PopupMenuItem};
 use gpui_kit::component::scroll::ScrollableElement as _;
-use gpui_kit::component::WindowExt as _;
 use gpui_kit::component::{ActiveTheme, Sizable as _};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -17,7 +17,6 @@ use uuid::Uuid;
 use crate::state::LibraryController;
 
 use super::common::{AssetsDrag, hex_to_rgb, observe_controller};
-
 
 // =========================== Tags panel ======================================
 
@@ -54,93 +53,96 @@ impl Render for TagsPanel {
                     .child(rust_i18n::t!("tags.all_tags").to_string()),
             )
             .child(
-                div()
-                    .flex_1()
-                    .min_h_0()
-                    .overflow_y_scrollbar()
-                    .child(
-                        v_flex()
-                            .gap_0p5()
-                            .w_full()
-                            .children(all_tags.into_iter().map(|tag| {
-                                let id = tag.id;
-                                let count = tags::count_assets(conn, id).unwrap_or(0);
-                                let color = tag.color.clone();
-                                let name = tag.name.clone();
-                                let name_for_menu = name.clone();
-                                let controller = self.controller.clone();
-                                let mut row = div()
-                                    .id(format!("tag-row-{id}"))
-                                    .cursor_pointer()
-                                    .w_full()
-                                    .px_2()
-                                    .py_1()
-                                    .rounded(cx.theme().radius)
-                                    .on_click(move |_ev: &ClickEvent, _window, cx| {
-                                        controller.update(cx, move |ctl, cx| {
-                                            if ctl.active_tag == Some(id) {
-                                                ctl.select_tag(None);
-                                            } else {
-                                                ctl.select_tag(Some(id));
-                                            }
-                                            cx.notify();
-                                        });
-                                    })
-                                    .child(
-                                        h_flex()
-                                            .w_full()
-                                            .items_center()
-                                            .gap_1p5()
-                                            .when_some(color, |row, hex| {
-                                                // Small color dot when the tag has one.
-                                                let rgb = hex_to_rgb(&hex);
-                                                row.child(
-                                                    div()
-                                                        .size_2()
-                                                        .rounded_full()
-                                                        .when_some(rgb, |dot, rgb| {
-                                                            dot.bg(gpui::rgb(rgb))
-                                                        }),
-                                                )
-                                            })
-                                            .child(
-                                                div()
-                                                    .flex_1()
-                                                    .min_w_0()
-                                                    .truncate()
-                                                    .text_sm()
-                                                    .text_color(cx.theme().foreground)
-                                                    .child(name),
-                                            )
-                                            .child(
-                                                div()
-                                                    .text_xs()
-                                                    .text_color(cx.theme().muted_foreground)
-                                                    .child(count.to_string()),
-                                            ),
-                                    );
-                                if active == Some(id) {
-                                    row = row.bg(cx.theme().secondary);
-                                }
-                                let ctl_tag = self.controller.clone();
-                                row = row
-                                    .drag_over::<AssetsDrag>(|this, _, _, cx| {
-                                        this.bg(cx.theme().secondary)
-                                    })
-                                    .on_drop(move |payload: &AssetsDrag, _window, cx| {
-                                        ctl_tag.update(cx, move |ctl, cx| {
-                                            let _ = ctl.library.tag_assets(&payload.0, id, true);
-                                            ctl.generation += 1;
-                                            cx.notify();
-                                        });
+                div().flex_1().min_h_0().overflow_y_scrollbar().child(
+                    v_flex()
+                        .gap_0p5()
+                        .w_full()
+                        .children(all_tags.into_iter().map(|tag| {
+                            let id = tag.id;
+                            let count = tags::count_assets(conn, id).unwrap_or(0);
+                            let color = tag.color.clone();
+                            let name = tag.name.clone();
+                            let name_for_menu = name.clone();
+                            let controller = self.controller.clone();
+                            let mut row = div()
+                                .id(format!("tag-row-{id}"))
+                                .cursor_pointer()
+                                .w_full()
+                                .px_2()
+                                .py_1()
+                                .rounded(cx.theme().radius)
+                                .on_click(move |_ev: &ClickEvent, _window, cx| {
+                                    controller.update(cx, move |ctl, cx| {
+                                        if ctl.active_tag == Some(id) {
+                                            ctl.select_tag(None);
+                                        } else {
+                                            ctl.select_tag(Some(id));
+                                        }
+                                        cx.notify();
                                     });
-                                let controller = self.controller.clone();
-                                row.context_menu(move |menu, _window, cx| {
-                                    tag_context_menu(menu, _window, cx, &controller, id, name_for_menu.clone())
                                 })
-                                .into_any_element()
-                            })),
-                    ),
+                                .child(
+                                    h_flex()
+                                        .w_full()
+                                        .items_center()
+                                        .gap_1p5()
+                                        .when_some(color, |row, hex| {
+                                            // Small color dot when the tag has one.
+                                            let rgb = hex_to_rgb(&hex);
+                                            row.child(
+                                                div()
+                                                    .size_2()
+                                                    .rounded_full()
+                                                    .when_some(rgb, |dot, rgb| {
+                                                        dot.bg(gpui::rgb(rgb))
+                                                    }),
+                                            )
+                                        })
+                                        .child(
+                                            div()
+                                                .flex_1()
+                                                .min_w_0()
+                                                .truncate()
+                                                .text_sm()
+                                                .text_color(cx.theme().foreground)
+                                                .child(name),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(cx.theme().muted_foreground)
+                                                .child(count.to_string()),
+                                        ),
+                                );
+                            if active == Some(id) {
+                                row = row.bg(cx.theme().secondary);
+                            }
+                            let ctl_tag = self.controller.clone();
+                            row = row
+                                .drag_over::<AssetsDrag>(|this, _, _, cx| {
+                                    this.bg(cx.theme().secondary)
+                                })
+                                .on_drop(move |payload: &AssetsDrag, _window, cx| {
+                                    ctl_tag.update(cx, move |ctl, cx| {
+                                        let _ = ctl.library.tag_assets(&payload.0, id, true);
+                                        ctl.generation += 1;
+                                        cx.notify();
+                                    });
+                                });
+                            let controller = self.controller.clone();
+                            row.context_menu(move |menu, _window, cx| {
+                                tag_context_menu(
+                                    menu,
+                                    _window,
+                                    cx,
+                                    &controller,
+                                    id,
+                                    name_for_menu.clone(),
+                                )
+                            })
+                            .into_any_element()
+                        })),
+                ),
             )
     }
 }
@@ -191,16 +193,14 @@ fn tag_context_menu(
             let ctl = ctl_color.clone();
             let label = hex.to_string();
             let value = hex.to_string();
-            menu = menu.item(
-                PopupMenuItem::new(label).on_click(move |_, _, cx| {
-                    let value = value.clone();
-                    ctl.update(cx, move |ctl, cx| {
-                        let _ = ctl.library.set_tag_color(tag_id, Some(&value));
-                        ctl.generation += 1;
-                        cx.notify();
-                    });
-                }),
-            );
+            menu = menu.item(PopupMenuItem::new(label).on_click(move |_, _, cx| {
+                let value = value.clone();
+                ctl.update(cx, move |ctl, cx| {
+                    let _ = ctl.library.set_tag_color(tag_id, Some(&value));
+                    ctl.generation += 1;
+                    cx.notify();
+                });
+            }));
         }
         let ctl_clear = ctl_color.clone();
         menu.item(
@@ -258,7 +258,9 @@ fn open_rename_dialog(
         InputState::new(window, cx)
             .placeholder(rust_i18n::t!("explorer.name_placeholder").to_string())
     });
-    name_input.update(cx, |state, cx| state.set_value(current_name.clone(), window, cx));
+    name_input.update(cx, |state, cx| {
+        state.set_value(current_name.clone(), window, cx)
+    });
     let ctl = controller.clone();
     window.open_dialog(cx, move |dialog, _, _| {
         dialog
@@ -282,4 +284,3 @@ fn open_rename_dialog(
             })
     });
 }
-

@@ -72,7 +72,10 @@ fn build_menus() -> Vec<Menu> {
                     ClearSelection,
                 ),
                 MenuItem::separator(),
-                MenuItem::action(rust_i18n::t!("app.move_to_trash").to_string(), TrashSelected),
+                MenuItem::action(
+                    rust_i18n::t!("app.move_to_trash").to_string(),
+                    TrashSelected,
+                ),
                 MenuItem::separator(),
                 MenuItem::action(rust_i18n::t!("app.undo").to_string(), Undo),
                 MenuItem::action(rust_i18n::t!("app.redo").to_string(), Redo),
@@ -151,19 +154,13 @@ fn main() {
 
             cx.spawn(async move |cx| {
                 let options = cx.update(|cx| gpui_kit::WindowOptions {
-                    window_bounds: Some(WindowBounds::centered(
-                        size(px(1024.), px(720.)),
-                        cx,
-                    )),
+                    window_bounds: Some(WindowBounds::centered(size(px(1024.), px(720.)), cx)),
                     ..crate::title_bar::window_options()
                 });
-                cx.open_window(
-                    options,
-                    |window, cx| {
-                        let view = cx.new(|cx| AppView::new(window, cx));
-                        cx.new(|cx| Root::new(view, window, cx))
-                    },
-                )
+                cx.open_window(options, |window, cx| {
+                    let view = cx.new(|cx| AppView::new(window, cx));
+                    cx.new(|cx| Root::new(view, window, cx))
+                })
                 .expect("failed to open window");
             })
             .detach();

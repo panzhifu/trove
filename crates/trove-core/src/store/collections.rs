@@ -87,7 +87,9 @@ pub fn children_of(conn: &Connection, parent: Option<Uuid>) -> Result<Vec<Collec
 pub fn ensure_root_named(conn: &Connection, name: &str) -> Result<Collection> {
     let name = name.trim();
     if name.is_empty() {
-        return Err(Error::Validation("collection name must not be empty".into()));
+        return Err(Error::Validation(
+            "collection name must not be empty".into(),
+        ));
     }
     let existing = children_of(conn, None)?;
     let existing_len = existing.len();
@@ -129,21 +131,19 @@ pub fn rename(conn: &Connection, id: Uuid, name: &str) -> Result<()> {
 }
 
 /// Move a collection under `new_parent` at `position`, refusing cycles.
-pub fn move_to(
-    conn: &Connection,
-    id: Uuid,
-    new_parent: Option<Uuid>,
-    position: i64,
-) -> Result<()> {
+pub fn move_to(conn: &Connection, id: Uuid, new_parent: Option<Uuid>, position: i64) -> Result<()> {
     if new_parent == Some(id) {
-        return Err(Error::Validation("a collection cannot be its own parent".into()));
+        return Err(Error::Validation(
+            "a collection cannot be its own parent".into(),
+        ));
     }
     if let Some(parent) = new_parent
-        && is_descendant(conn, parent, id)? {
-            return Err(Error::Validation(
-                "cannot move a collection under its own descendant".into(),
-            ));
-        }
+        && is_descendant(conn, parent, id)?
+    {
+        return Err(Error::Validation(
+            "cannot move a collection under its own descendant".into(),
+        ));
+    }
     rows::execute(
         conn,
         "UPDATE collections SET parent_id = ?1, position = ?2, updated_at = ?3 WHERE id = ?4",
@@ -188,7 +188,10 @@ pub fn remove_asset(conn: &Connection, collection_id: Uuid, asset_id: Uuid) -> R
     rows::execute(
         conn,
         "DELETE FROM asset_collection WHERE collection_id = ?1 AND asset_id = ?2",
-        vec![rows::uuid(collection_id).into(), rows::uuid(asset_id).into()],
+        vec![
+            rows::uuid(collection_id).into(),
+            rows::uuid(asset_id).into(),
+        ],
     )?;
     Ok(())
 }

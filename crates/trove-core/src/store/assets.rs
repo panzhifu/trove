@@ -9,9 +9,7 @@ use uuid::Uuid;
 
 use super::rows::{self, bind_opt_int, bind_opt_str, bind_opt_ts};
 use crate::error::{Error, Result};
-use crate::model::{
-    Asset, AssetKind, AssetPatch, AssetQuery, Origin, now,
-};
+use crate::model::{Asset, AssetKind, AssetPatch, AssetQuery, Origin, now};
 
 /// Column list shared by every read; index order matches `asset_from_row`.
 const COLS: &str = "id, origin, rel_path, file_name, ext, mime, size_bytes, sha256, \
@@ -163,7 +161,11 @@ fn rank_intersect(
         .into_iter()
         .collect();
 
-    let filtered: Vec<Uuid> = ranked.iter().filter(|id| live.contains(id)).copied().collect();
+    let filtered: Vec<Uuid> = ranked
+        .iter()
+        .filter(|id| live.contains(id))
+        .copied()
+        .collect();
     let total = filtered.len() as u64;
     Ok((total, filtered))
 }
@@ -171,7 +173,10 @@ fn rank_intersect(
 /// Slice a full ranked id list per `q.limit`/`q.offset` and materialise.
 fn page_assets(ids: &[Uuid], q: &AssetQuery, conn: &Connection) -> Result<Vec<Asset>> {
     let start = q.offset as usize;
-    let end = q.limit.map(|l| start.saturating_add(l as usize)).unwrap_or(ids.len());
+    let end = q
+        .limit
+        .map(|l| start.saturating_add(l as usize))
+        .unwrap_or(ids.len());
     let end = end.min(ids.len());
     if start >= ids.len() {
         return Ok(Vec::new());
@@ -423,16 +428,26 @@ fn asset_values(a: &Asset) -> Vec<Value> {
         Value::Integer(a.size_bytes as i64),
         bind_opt_str(a.sha256.as_deref()),
         kind_str(a.kind).into(),
-        a.width.map(|v| Value::Integer(v as i64)).unwrap_or(Value::Null),
-        a.height.map(|v| Value::Integer(v as i64)).unwrap_or(Value::Null),
-        a.duration_ms.map(|v| Value::Integer(v as i64)).unwrap_or(Value::Null),
+        a.width
+            .map(|v| Value::Integer(v as i64))
+            .unwrap_or(Value::Null),
+        a.height
+            .map(|v| Value::Integer(v as i64))
+            .unwrap_or(Value::Null),
+        a.duration_ms
+            .map(|v| Value::Integer(v as i64))
+            .unwrap_or(Value::Null),
         bind_opt_ts(a.captured_at),
         bind_opt_str(a.title.as_deref()),
         bind_opt_str(a.description.as_deref()),
-        a.rating.map(|v| Value::Integer(v as i64)).unwrap_or(Value::Null),
+        a.rating
+            .map(|v| Value::Integer(v as i64))
+            .unwrap_or(Value::Null),
         Value::Integer(a.is_favorite as i64),
         bind_opt_str(a.source_url.as_deref()),
-        serde_json::to_string(&a.extra).unwrap_or_else(|_| "{}".into()).into(),
+        serde_json::to_string(&a.extra)
+            .unwrap_or_else(|_| "{}".into())
+            .into(),
         rows::ts(a.created_at).into(),
         rows::ts(a.updated_at).into(),
         bind_opt_ts(a.trashed_at),

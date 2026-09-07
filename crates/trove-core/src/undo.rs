@@ -68,10 +68,7 @@ pub enum Op {
         after: (Option<Uuid>, i64),
     },
     /// Assets newly added to a collection (only the actual delta is recorded).
-    MembershipAdd {
-        collection: Uuid,
-        added: Vec<Uuid>,
-    },
+    MembershipAdd { collection: Uuid, added: Vec<Uuid> },
     /// Assets removed from a collection.
     MembershipRemove {
         collection: Uuid,
@@ -93,10 +90,14 @@ impl Op {
             }
             Op::SetFavorite { after, .. } => {
                 for (id, favorite) in after {
-                    assets::update(conn, *id, &AssetPatch {
-                        is_favorite: Some(*favorite),
-                        ..Default::default()
-                    })?;
+                    assets::update(
+                        conn,
+                        *id,
+                        &AssetPatch {
+                            is_favorite: Some(*favorite),
+                            ..Default::default()
+                        },
+                    )?;
                 }
             }
             Op::SetTags { asset, after, .. } => {
@@ -120,7 +121,10 @@ impl Op {
                     collections::add_asset(conn, *collection, *id)?;
                 }
             }
-            Op::MembershipRemove { collection, removed } => {
+            Op::MembershipRemove {
+                collection,
+                removed,
+            } => {
                 for id in removed {
                     let _ = collections::remove_asset(conn, *collection, *id);
                 }
@@ -145,7 +149,11 @@ impl Op {
                 before: after.clone(),
                 after: before.clone(),
             },
-            Op::SetTags { asset, before, after } => Op::SetTags {
+            Op::SetTags {
+                asset,
+                before,
+                after,
+            } => Op::SetTags {
                 asset: *asset,
                 before: after.clone(),
                 after: before.clone(),
@@ -174,7 +182,10 @@ impl Op {
                 collection: *collection,
                 removed: added.clone(),
             },
-            Op::MembershipRemove { collection, removed } => Op::MembershipAdd {
+            Op::MembershipRemove {
+                collection,
+                removed,
+            } => Op::MembershipAdd {
                 collection: *collection,
                 added: removed.clone(),
             },
@@ -345,8 +356,22 @@ mod tests {
         assert!(assets::get(conn, a.id).unwrap().unwrap().is_favorite);
 
         // Forward: tag group replace.
-        let t1 = tags::create(conn, &NewTag { name: "one".into(), color: None }).unwrap();
-        let t2 = tags::create(conn, &NewTag { name: "two".into(), color: None }).unwrap();
+        let t1 = tags::create(
+            conn,
+            &NewTag {
+                name: "one".into(),
+                color: None,
+            },
+        )
+        .unwrap();
+        let t2 = tags::create(
+            conn,
+            &NewTag {
+                name: "two".into(),
+                color: None,
+            },
+        )
+        .unwrap();
         tags::add_to_asset(conn, a.id, t1.id).unwrap();
         stack.record(Op::SetTags {
             asset: a.id,
@@ -378,12 +403,20 @@ mod tests {
         assets::insert(conn, &a).unwrap();
         let c1 = collections::create(
             conn,
-            &NewCollection { parent_id: None, name: "one".into(), position: 0 },
+            &NewCollection {
+                parent_id: None,
+                name: "one".into(),
+                position: 0,
+            },
         )
         .unwrap();
         let c2 = collections::create(
             conn,
-            &NewCollection { parent_id: None, name: "two".into(), position: 1 },
+            &NewCollection {
+                parent_id: None,
+                name: "two".into(),
+                position: 1,
+            },
         )
         .unwrap();
 
@@ -409,17 +442,22 @@ mod tests {
         };
         op.apply(conn).unwrap();
         stack.record(op);
-        assert_eq!(collections::get(conn, c2.id).unwrap().unwrap().parent_id, Some(c1.id));
+        assert_eq!(
+            collections::get(conn, c2.id).unwrap().unwrap().parent_id,
+            Some(c1.id)
+        );
         stack.undo(conn).unwrap();
-        assert_eq!(collections::get(conn, c2.id).unwrap().unwrap().parent_id, None);
+        assert_eq!(
+            collections::get(conn, c2.id).unwrap().unwrap().parent_id,
+            None
+        );
     }
 
     #[test]
     fn library_facade_records_and_replays() {
-        let lib = Library::open_in_memory(std::env::temp_dir().join(format!(
-            "trove-undo-{}",
-            Uuid::new_v4()
-        )))
+        let lib = Library::open_in_memory(
+            std::env::temp_dir().join(format!("trove-undo-{}", Uuid::new_v4())),
+        )
         .unwrap();
         let conn = lib.store().conn();
         let a = sample_asset("a.png", AssetKind::Image);
@@ -434,7 +472,14 @@ mod tests {
         assert!(assets::get(conn, a.id).unwrap().unwrap().is_favorite);
 
         // Tag rename through the facade keeps FTS in sync both ways.
-        let tag = tags::create(conn, &NewTag { name: "beach".into(), color: None }).unwrap();
+        let tag = tags::create(
+            conn,
+            &NewTag {
+                name: "beach".into(),
+                color: None,
+            },
+        )
+        .unwrap();
         tags::add_to_asset(conn, a.id, tag.id).unwrap();
         lib.rename_tag(tag.id, "coastline").unwrap();
         assert_eq!(tags::get(conn, tag.id).unwrap().unwrap().name, "coastline");

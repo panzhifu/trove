@@ -8,11 +8,11 @@
 use std::path::PathBuf;
 
 use gpui_kit::base::h_flex;
-use gpui_kit::component::notification::Notification;
-use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::component::WindowExt as _;
 use gpui_kit::component::dock::{DockLayout, DockPlacement, DockSkin, panel_handle};
+use gpui_kit::component::notification::Notification;
+use gpui_kit::prelude::FluentBuilder as _;
 
 // Re-export gpui's `Widget`/styled-building names (div, Window, Context,
 // Render, IntoElement, ExternalPaths, …) plus gpui-kit's styling extensions.
@@ -42,8 +42,8 @@ pub struct AppView {
 
 impl AppView {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let library = Library::open(default_library_path())
-            .unwrap_or_else(|e| panic!("open library: {e}"));
+        let library =
+            Library::open(default_library_path()).unwrap_or_else(|e| panic!("open library: {e}"));
         let controller = cx.new(|_cx| LibraryController::new(library));
         let title_bar = cx.new(|cx| TitleBarView::new(controller.clone(), cx));
 
@@ -86,7 +86,11 @@ impl AppView {
         // Redraw the status bar whenever the controller state changes.
         cx.observe(&controller, |_, _, cx| cx.notify()).detach();
 
-        Self { controller, dock, title_bar }
+        Self {
+            controller,
+            dock,
+            title_bar,
+        }
     }
 
     /// File ▸ Export library… : save-dialog, then write the metadata catalog
@@ -102,9 +106,7 @@ impl AppView {
                 let _ = handle.update(cx, |_, window, cx| {
                     let outcome = ctl
                         .update(cx, |ctl, _| ctl.library.export_metadata())
-                        .and_then(|json| {
-                            std::fs::write(&path, json).map_err(|e| e.into())
-                        });
+                        .and_then(|json| std::fs::write(&path, json).map_err(|e| e.into()));
                     let note = match outcome {
                         Ok(()) => Notification::success(
                             rust_i18n::t!("app.export_done", path = path.display().to_string())
@@ -129,12 +131,9 @@ impl AppView {
         let root = ctl.library.root().display().to_string();
         let import = match &ctl.import_phase {
             ImportPhase::Idle => rust_i18n::t!("statusbar.import_idle").to_string(),
-            ImportPhase::Running { total, done } => rust_i18n::t!(
-                "statusbar.import_running",
-                done = done,
-                total = total
-            )
-            .to_string(),
+            ImportPhase::Running { total, done } => {
+                rust_i18n::t!("statusbar.import_running", done = done, total = total).to_string()
+            }
             ImportPhase::Done { imported, skipped } => rust_i18n::t!(
                 "statusbar.import_done",
                 imported = imported,
@@ -256,12 +255,7 @@ impl Render for AppView {
             .flex_col()
             // Whole-window file drop surface.
             .on_drop::<ExternalPaths>(move |paths, window, cx| {
-                jobs::import_paths_app(
-                    &controller,
-                    paths.0.iter().cloned().collect(),
-                    window,
-                    cx,
-                );
+                jobs::import_paths_app(&controller, paths.0.iter().cloned().collect(), window, cx);
             })
             // Menu-bar actions: handled here so they work wherever the focus
             // is (the menu bar itself never holds the grid's focus).
@@ -275,7 +269,8 @@ impl Render for AppView {
                 crate::settings::SettingsDialog::open(window, cx, this.controller.clone());
             }))
             .on_action(cx.listener(|this, _: &ShowAllAssets, _, cx| {
-                this.controller.update(cx, |ctl, _cx| ctl.select_collection(None));
+                this.controller
+                    .update(cx, |ctl, _cx| ctl.select_collection(None));
             }))
             .on_action(cx.listener(|this, _: &ShowTrash, _, cx| {
                 this.controller.update(cx, |ctl, _cx| ctl.select_trash());
@@ -287,7 +282,8 @@ impl Render for AppView {
                 });
             }))
             .on_action(cx.listener(|this, _: &SelectAll, _, cx| {
-                this.controller.update(cx, |ctl, _cx| ctl.select_all_visible());
+                this.controller
+                    .update(cx, |ctl, _cx| ctl.select_all_visible());
             }))
             .on_action(cx.listener(|this, _: &ClearSelection, _, cx| {
                 this.controller.update(cx, |ctl, _cx| ctl.clear_selection());
@@ -324,12 +320,7 @@ impl Render for AppView {
                 this.show_about(window, cx);
             }))
             .child(self.title_bar.clone())
-            .child(
-                div()
-                    .flex_1()
-                    .min_h_0()
-                    .child(self.dock.clone()),
-            )
+            .child(div().flex_1().min_h_0().child(self.dock.clone()))
             .child(self.status_bar(cx))
             .children(dialog_layer)
             .children(sheet_layer)

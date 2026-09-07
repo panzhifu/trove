@@ -8,42 +8,42 @@
 //! asset set grows/shrinks — so appending a page never reshuffles rows the
 //! user has already scrolled past.
 
+use std::cell::Cell as CellFlag;
 use std::path::PathBuf;
 use std::rc::Rc;
-use std::cell::Cell as CellFlag;
 
-use gpui_kit::base::{h_flex, v_flex, ElementExt as _};
+use gpui_kit::base::{ElementExt as _, h_flex, v_flex};
+use gpui_kit::component::Sizable;
+use gpui_kit::component::WindowExt as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::dock::{BasePanel, Panel as DockPanel, PanelControl, PanelEvent};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
-use gpui_kit::component::WindowExt as _;
-use gpui_kit::component::Sizable;
 use gpui_kit::component::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenu, PopupMenuItem};
 use gpui_kit::component::popover::Popover;
 use gpui_kit::component::{ActiveTheme, Icon, IconName};
-use gpui_kit::*;
 use gpui_kit::prelude::FluentBuilder as _;
+use gpui_kit::*;
 
 // The `gpui_kit::*` glob above re-exports everything from gpui, but the grid
 // needs the virtualized `list` element under a distinct name: a local
 // `Vec<Asset>` variable called `list` would otherwise shadow it.
-use gpui_kit::{ListAlignment, ListState};
 use gpui_kit::list as list_element;
 use gpui_kit::{Anchor, Bounds, Pixels};
+use gpui_kit::{ListAlignment, ListState};
 
+use serde_json::json;
 use trove_core::layout::{
-    GRID_GAP, MAX_ROW_HEIGHT, MIN_ASPECT, MIN_ROW_HEIGHT, TARGET_ROW_HEIGHT, RowLayout,
+    GRID_GAP, MAX_ROW_HEIGHT, MIN_ASPECT, MIN_ROW_HEIGHT, RowLayout, TARGET_ROW_HEIGHT,
     justify_layout,
 };
 use trove_core::model::{AssetKind, AssetQuery, AssetSort, NewSmartCollection};
-use serde_json::json;
 use trove_core::store::{assets, collections, smart_collections};
 use uuid::Uuid;
 
 use crate::actions::{MoveDown, MoveLeft, MoveRight, MoveUp, OpenPreview};
 use crate::state::{GRID_PAGE_SIZE, LibraryController, ViewMode};
 
-use super::common::{display_name, kind_icon, observe_controller, AssetsDrag};
+use super::common::{AssetsDrag, display_name, kind_icon, observe_controller};
 
 /// Left+right padding of the grid container plus scrollbar allowance,
 /// subtracted from the measured width before laying rows out.
@@ -214,9 +214,8 @@ impl DockPanel for WorkspacePanel {
                 .gap_1()
                 .child(count_label)
                 .when(!in_trash, |this| {
-                    this.child(filter_controls(&controller, cx))
-                        .child(
-                            Popover::new("search-popover")
+                    this.child(filter_controls(&controller, cx)).child(
+                        Popover::new("search-popover")
                             .anchor(Anchor::TopRight)
                             // The pill-shaped search input IS the surface:
                             // strip the popover's own bg/border/shadow/padding
@@ -247,10 +246,7 @@ impl DockPanel for WorkspacePanel {
                                         .px_3()
                                         .shadow_sm()
                                         .child(
-                                            Input::new(&input)
-                                                .appearance(false)
-                                                .small()
-                                                .w_full(),
+                                            Input::new(&input).appearance(false).small().w_full(),
                                         )
                                         .into_any_element()
                                 }
@@ -288,9 +284,9 @@ impl DockPanel for WorkspacePanel {
                             .on_click(move |_, window, cx| {
                                 controller.update(cx, |ctl, _| ctl.set_search(String::new()));
                                 input.update(cx, |state, cx| state.set_value("", window, cx));
-                            })
+                            }),
                     )
-                })
+                }),
         )
     }
 }
@@ -307,7 +303,10 @@ impl WorkspacePanel {
         cx: &mut Context<Self>,
         controller: Entity<LibraryController>,
     ) -> Self {
-        let search_input = cx.new(|cx| InputState::new(window, cx).placeholder(rust_i18n::t!("workspace.search_placeholder").to_string()));
+        let search_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder(rust_i18n::t!("workspace.search_placeholder").to_string())
+        });
         let available_width = cx.new(|_| px(0.));
         let list_state = ListState::new(0, ListAlignment::Top, px(LIST_OVERDRAW_PX));
         let this = Self {
@@ -377,8 +376,13 @@ impl WorkspacePanel {
                                         cx.notify();
                                     }
                                     Err(e) => {
-                                        ctl.notice =
-                                            Some(rust_i18n::t!("workspace.smart_create_failed", error = e.to_string()).to_string());
+                                        ctl.notice = Some(
+                                            rust_i18n::t!(
+                                                "workspace.smart_create_failed",
+                                                error = e.to_string()
+                                            )
+                                            .to_string(),
+                                        );
                                         cx.notify();
                                     }
                                 }
@@ -395,7 +399,10 @@ impl WorkspacePanel {
         controller.update(cx, |ctl, cx| {
             ctl.notice = match ctl.library.empty_trash() {
                 Ok(n) => Some(rust_i18n::t!("workspace.trash_emptied", count = n).to_string()),
-                Err(e) => Some(rust_i18n::t!("workspace.trash_empty_failed", error = e.to_string()).to_string()),
+                Err(e) => Some(
+                    rust_i18n::t!("workspace.trash_empty_failed", error = e.to_string())
+                        .to_string(),
+                ),
             };
             ctl.selected_assets.clear();
             ctl.generation += 1;
@@ -530,7 +537,9 @@ impl WorkspacePanel {
             let Some(id) = ctl.primary() else { return };
             let library_root = ctl.library.root().to_path_buf();
             let conn = ctl.library.store().conn();
-            let Some(asset) = assets::get(conn, id).ok().flatten() else { return };
+            let Some(asset) = assets::get(conn, id).ok().flatten() else {
+                return;
+            };
 
             let thumb = asset
                 .sha256
@@ -564,7 +573,20 @@ impl WorkspacePanel {
 impl Render for WorkspacePanel {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // --- context snapshot (drop the controller borrow early) -----------
-        let (collection, active_tag, in_trash, search, smart, grid_loaded, selected, filter_kind, filter_favorite, view_mode, sort, sort_desc) = {
+        let (
+            collection,
+            active_tag,
+            in_trash,
+            search,
+            smart,
+            grid_loaded,
+            selected,
+            filter_kind,
+            filter_favorite,
+            view_mode,
+            sort,
+            sort_desc,
+        ) = {
             let ctl = self.controller.read(cx);
             (
                 ctl.current_collection,
@@ -733,7 +755,8 @@ impl Render for WorkspacePanel {
             // layout).
             let new_count = self.rows.len();
             if new_count >= old_rows {
-                self.list_state.splice(old_rows..old_rows, new_count - old_rows);
+                self.list_state
+                    .splice(old_rows..old_rows, new_count - old_rows);
             } else {
                 self.list_state.splice(new_count..old_rows, 0);
             }
@@ -764,53 +787,47 @@ impl Render for WorkspacePanel {
         let page_guard = Rc::new(CellFlag::new(false));
         let total_for_trigger = total;
 
-        let grid = list_element(
-            list_state,
-            move |ix, _window, cx: &mut App| {
-                // Infinite scroll: near the end, request the next page.
-                if ix + PAGE_TRIGGER_ROWS >= rows_len && !page_guard.get() {
-                    page_guard.set(true);
-                    controller.update(cx, |ctl, cx| {
-                        if ctl.grid_loaded < total_for_trigger {
-                            ctl.grid_loaded =
-                                (ctl.grid_loaded + GRID_PAGE_SIZE).min(total_for_trigger);
-                            cx.notify();
-                        }
-                    });
-                }
-                let Some(row) = rows_for_render.get(ix) else {
-                    return v_flex().into_any_element();
-                };
-                let widths = row.widths.clone();
-                let height = row.height;
-                let cells = row.cells.clone();
-                if list_mode {
-                    // One full-width info row per asset.
-                    return build_list_row_element(
-                        cx,
-                        &controller,
-                        &focus_handle,
-                        &cells[0],
-                        widths[0],
-                    );
-                }
-                h_flex()
-                    .w_full()
-                    .gap(px(GRID_GAP))
-                    .children(
-                        cells
-                            .iter()
-                            .zip(widths)
-                            .map(|(cell, w)| {
-                                build_cell_element(
-                                    cx, &controller, &focus_handle, cell, w, height,
-                                )
-                            })
-                            .collect::<Vec<_>>(),
-                    )
-                    .into_any_element()
-            },
-        )
+        let grid = list_element(list_state, move |ix, _window, cx: &mut App| {
+            // Infinite scroll: near the end, request the next page.
+            if ix + PAGE_TRIGGER_ROWS >= rows_len && !page_guard.get() {
+                page_guard.set(true);
+                controller.update(cx, |ctl, cx| {
+                    if ctl.grid_loaded < total_for_trigger {
+                        ctl.grid_loaded = (ctl.grid_loaded + GRID_PAGE_SIZE).min(total_for_trigger);
+                        cx.notify();
+                    }
+                });
+            }
+            let Some(row) = rows_for_render.get(ix) else {
+                return v_flex().into_any_element();
+            };
+            let widths = row.widths.clone();
+            let height = row.height;
+            let cells = row.cells.clone();
+            if list_mode {
+                // One full-width info row per asset.
+                return build_list_row_element(
+                    cx,
+                    &controller,
+                    &focus_handle,
+                    &cells[0],
+                    widths[0],
+                );
+            }
+            h_flex()
+                .w_full()
+                .gap(px(GRID_GAP))
+                .children(
+                    cells
+                        .iter()
+                        .zip(widths)
+                        .map(|(cell, w)| {
+                            build_cell_element(cx, &controller, &focus_handle, cell, w, height)
+                        })
+                        .collect::<Vec<_>>(),
+                )
+                .into_any_element()
+        })
         // The list's default sizing behavior is `Auto` (no content-based
         // height): without an explicit size it measures 0px tall and paints
         // nothing. Fill the grid area instead.
@@ -878,7 +895,13 @@ impl Render for WorkspacePanel {
 fn filter_controls(controller: &Entity<LibraryController>, cx: &App) -> Div {
     let (kind, favorite, view_mode, sort, sort_desc) = {
         let ctl = controller.read(cx);
-        (ctl.filter_kind, ctl.filter_favorite, ctl.view_mode, ctl.sort, ctl.sort_desc)
+        (
+            ctl.filter_kind,
+            ctl.filter_favorite,
+            ctl.view_mode,
+            ctl.sort,
+            ctl.sort_desc,
+        )
     };
     let t = |k: &str| rust_i18n::t!(k).to_string();
 
@@ -887,7 +910,11 @@ fn filter_controls(controller: &Entity<LibraryController>, cx: &App) -> Div {
     // View toggle: grid ⇄ list presentation.
     let (next_mode, toggle_icon, toggle_tip) = match view_mode {
         ViewMode::Grid => (ViewMode::List, IconName::Menu, "workspace.view_list"),
-        ViewMode::List => (ViewMode::Grid, IconName::GalleryVerticalEnd, "workspace.view_grid"),
+        ViewMode::List => (
+            ViewMode::Grid,
+            IconName::GalleryVerticalEnd,
+            "workspace.view_grid",
+        ),
     };
     bar = bar.child(
         Button::new("view-toggle")
@@ -934,16 +961,15 @@ fn filter_controls(controller: &Entity<LibraryController>, cx: &App) -> Div {
                         let checked = *value == sort && *desc == sort_desc;
                         let (value, desc) = (*value, *desc);
                         let controller = controller.clone();
-                        menu = menu.item(
-                            PopupMenuItem::new(label.clone())
-                                .checked(checked)
-                                .on_click(move |_, _, cx| {
+                        menu =
+                            menu.item(PopupMenuItem::new(label.clone()).checked(checked).on_click(
+                                move |_, _, cx| {
                                     controller.update(cx, |ctl, cx| {
                                         ctl.set_sort(value, desc);
                                         cx.notify();
                                     });
-                                }),
-                        );
+                                },
+                            ));
                     }
                     menu
                 }
@@ -955,21 +981,22 @@ fn filter_controls(controller: &Entity<LibraryController>, cx: &App) -> Div {
         Some(k) => t(kind_key(k)),
         None => t("workspace.filter_all_kinds"),
     };
-    let options: Vec<(Option<AssetKind>, String)> = std::iter::once((None, t("workspace.filter_all_kinds")))
-        .chain(
-            [
-                AssetKind::Image,
-                AssetKind::Video,
-                AssetKind::Audio,
-                AssetKind::Document,
-                AssetKind::Archive,
-                AssetKind::Font,
-                AssetKind::Other,
-            ]
-            .into_iter()
-            .map(|k| (Some(k), t(kind_key(k)))),
-        )
-        .collect();
+    let options: Vec<(Option<AssetKind>, String)> =
+        std::iter::once((None, t("workspace.filter_all_kinds")))
+            .chain(
+                [
+                    AssetKind::Image,
+                    AssetKind::Video,
+                    AssetKind::Audio,
+                    AssetKind::Document,
+                    AssetKind::Archive,
+                    AssetKind::Font,
+                    AssetKind::Other,
+                ]
+                .into_iter()
+                .map(|k| (Some(k), t(kind_key(k)))),
+            )
+            .collect();
     bar = bar.child(
         Button::new("filter-kind")
             .xsmall()
@@ -983,16 +1010,15 @@ fn filter_controls(controller: &Entity<LibraryController>, cx: &App) -> Div {
                         let checked = *value == kind;
                         let value = *value;
                         let controller = controller.clone();
-                        menu = menu.item(
-                            PopupMenuItem::new(label.clone())
-                                .checked(checked)
-                                .on_click(move |_, _, cx| {
+                        menu =
+                            menu.item(PopupMenuItem::new(label.clone()).checked(checked).on_click(
+                                move |_, _, cx| {
                                     controller.update(cx, |ctl, cx| {
                                         ctl.set_filter_kind(value);
                                         cx.notify();
                                     });
-                                }),
-                        );
+                                },
+                            ));
                     }
                     menu
                 }
@@ -1189,7 +1215,8 @@ fn selection_toolbar(
                             let ids = std::mem::take(&mut ctl.selected_assets);
                             if let Err(e) = ctl.library.purge_assets(&ids) {
                                 ctl.notice = Some(
-                                    rust_i18n::t!("workspace.purge_failed", error = e.to_string()).to_string(),
+                                    rust_i18n::t!("workspace.purge_failed", error = e.to_string())
+                                        .to_string(),
                                 );
                             }
                             ctl.selection_anchor = None;
@@ -1209,11 +1236,14 @@ fn selection_toolbar(
                     } else {
                         IconName::Heart
                     })
-                    .tooltip(rust_i18n::t!(if all_favorite {
-                        "workspace.remove_from_favorites"
-                    } else {
-                        "workspace.add_to_favorites"
-                    }).to_string())
+                    .tooltip(
+                        rust_i18n::t!(if all_favorite {
+                            "workspace.remove_from_favorites"
+                        } else {
+                            "workspace.add_to_favorites"
+                        })
+                        .to_string(),
+                    )
                     .on_click(move |_, _, cx| {
                         ctl_fav.update(cx, |ctl, cx| {
                             let ids = ctl.selected_assets.clone();
@@ -1235,7 +1265,8 @@ fn selection_toolbar(
                         if let Ok(roots) = collections::roots(conn) {
                             for root in roots {
                                 items.push((root.id, root.name.clone()));
-                                if let Ok(children) = collections::children_of(conn, Some(root.id)) {
+                                if let Ok(children) = collections::children_of(conn, Some(root.id))
+                                {
                                     for child in children {
                                         items.push((child.id, child.name.clone()));
                                     }
@@ -1250,14 +1281,15 @@ fn selection_toolbar(
                         }
                         for (cid, cname) in items {
                             let ctl = ctl_add.clone();
-                            menu = menu.item(PopupMenuItem::new(cname).on_click(move |_, _, cx| {
-                                ctl.update(cx, |ctl, cx| {
-                                    let ids = ctl.selected_assets.clone();
-                                    let _ = ctl.library.add_assets_to_collection(cid, &ids);
-                                    ctl.generation += 1;
-                                    cx.notify();
-                                });
-                            }));
+                            menu =
+                                menu.item(PopupMenuItem::new(cname).on_click(move |_, _, cx| {
+                                    ctl.update(cx, |ctl, cx| {
+                                        let ids = ctl.selected_assets.clone();
+                                        let _ = ctl.library.add_assets_to_collection(cid, &ids);
+                                        ctl.generation += 1;
+                                        cx.notify();
+                                    });
+                                }));
                         }
                         menu
                     }),
@@ -1376,14 +1408,11 @@ fn build_cell_element(
     } else {
         vec![id]
     };
-    let base = base.on_drag(
-        AssetsDrag(ids_for_drag),
-        move |payload, _offset, _, cx| {
-            cx.new(|_cx| AssetsDragPreview {
-                count: payload.0.len(),
-            })
-        },
-    );
+    let base = base.on_drag(AssetsDrag(ids_for_drag), move |payload, _offset, _, cx| {
+        cx.new(|_cx| AssetsDragPreview {
+            count: payload.0.len(),
+        })
+    });
 
     let ctl_menu = controller.clone();
     base.context_menu(move |menu, window, cx| {
@@ -1501,14 +1530,11 @@ fn build_list_row_element(
     } else {
         vec![id]
     };
-    let base = base.on_drag(
-        AssetsDrag(ids_for_drag),
-        move |payload, _offset, _, cx| {
-            cx.new(|_cx| AssetsDragPreview {
-                count: payload.0.len(),
-            })
-        },
-    );
+    let base = base.on_drag(AssetsDrag(ids_for_drag), move |payload, _offset, _, cx| {
+        cx.new(|_cx| AssetsDragPreview {
+            count: payload.0.len(),
+        })
+    });
 
     let ctl_menu = controller.clone();
     base.context_menu(move |menu, window, cx| {
@@ -1518,7 +1544,8 @@ fn build_list_row_element(
 }
 
 /// Right-click menu on an asset thumbnail.
-fn asset_context_menu(    menu: PopupMenu,
+fn asset_context_menu(
+    menu: PopupMenu,
     _window: &mut Window,
     cx: &mut Context<PopupMenu>,
     controller: &Entity<LibraryController>,
@@ -1531,29 +1558,34 @@ fn asset_context_menu(    menu: PopupMenu,
         return menu
             .min_w(px(180.))
             .item(
-                PopupMenuItem::new(rust_i18n::t!("workspace.restore").to_string()).on_click(move |_, _, cx| {
-                    ctl_restore.update(cx, move |ctl, cx| {
-                        let ids = ctl.action_targets(asset_id);
-                        let _ = ctl.library.restore_assets(&ids);
-                        ctl.deselect(&ids);
-                        cx.notify();
-                    });
-                }),
+                PopupMenuItem::new(rust_i18n::t!("workspace.restore").to_string()).on_click(
+                    move |_, _, cx| {
+                        ctl_restore.update(cx, move |ctl, cx| {
+                            let ids = ctl.action_targets(asset_id);
+                            let _ = ctl.library.restore_assets(&ids);
+                            ctl.deselect(&ids);
+                            cx.notify();
+                        });
+                    },
+                ),
             )
             .separator()
             .item(
-                PopupMenuItem::new(rust_i18n::t!("workspace.delete_forever").to_string()).on_click(move |_, _, cx| {
-                    ctl_purge.update(cx, move |ctl, cx| {
-                        let ids = ctl.action_targets(asset_id);
-                        if let Err(e) = ctl.library.purge_assets(&ids) {
-                            ctl.notice = Some(
-                                rust_i18n::t!("workspace.purge_failed", error = e.to_string()).to_string(),
-                            );
-                        }
-                        ctl.deselect(&ids);
-                        cx.notify();
-                    });
-                }),
+                PopupMenuItem::new(rust_i18n::t!("workspace.delete_forever").to_string()).on_click(
+                    move |_, _, cx| {
+                        ctl_purge.update(cx, move |ctl, cx| {
+                            let ids = ctl.action_targets(asset_id);
+                            if let Err(e) = ctl.library.purge_assets(&ids) {
+                                ctl.notice = Some(
+                                    rust_i18n::t!("workspace.purge_failed", error = e.to_string())
+                                        .to_string(),
+                                );
+                            }
+                            ctl.deselect(&ids);
+                            cx.notify();
+                        });
+                    },
+                ),
             );
     }
 
@@ -1587,20 +1619,20 @@ fn asset_context_menu(    menu: PopupMenu,
         }
         let mut menu = menu;
         if items.is_empty() {
-            menu = menu.item(PopupMenuItem::label(rust_i18n::t!("workspace.no_collections").to_string()));
+            menu = menu.item(PopupMenuItem::label(
+                rust_i18n::t!("workspace.no_collections").to_string(),
+            ));
         }
         for (cid, cname) in items {
             let controller = controller.clone();
-            menu = menu.item(
-                PopupMenuItem::new(cname).on_click(move |_, _, cx| {
-                    controller.update(cx, move |ctl, cx| {
-                        let ids = ctl.action_targets(asset_id);
-                        let _ = ctl.library.add_assets_to_collection(cid, &ids);
-                        ctl.generation += 1;
-                        cx.notify();
-                    });
-                }),
-            );
+            menu = menu.item(PopupMenuItem::new(cname).on_click(move |_, _, cx| {
+                controller.update(cx, move |ctl, cx| {
+                    let ids = ctl.action_targets(asset_id);
+                    let _ = ctl.library.add_assets_to_collection(cid, &ids);
+                    ctl.generation += 1;
+                    cx.notify();
+                });
+            }));
         }
         menu
     });
@@ -1624,7 +1656,10 @@ fn asset_context_menu(    menu: PopupMenu,
             }),
         )
         .separator()
-        .item(PopupMenuItem::submenu(rust_i18n::t!("workspace.add_to_collection").to_string(), add_submenu))
+        .item(PopupMenuItem::submenu(
+            rust_i18n::t!("workspace.add_to_collection").to_string(),
+            add_submenu,
+        ))
         .separator();
     if browsed_collection.is_some() {
         menu = menu.item(
@@ -1641,14 +1676,16 @@ fn asset_context_menu(    menu: PopupMenu,
         menu = menu.separator();
     }
     menu.item(
-        PopupMenuItem::new(rust_i18n::t!("app.move_to_trash").to_string()).on_click(move |_, _, cx| {
-            c_trash.update(cx, move |ctl, cx| {
-                let ids = ctl.action_targets(asset_id);
-                let _ = ctl.library.trash_assets(&ids);
-                ctl.deselect(&ids);
-                cx.notify();
-            });
-        }),
+        PopupMenuItem::new(rust_i18n::t!("app.move_to_trash").to_string()).on_click(
+            move |_, _, cx| {
+                c_trash.update(cx, move |ctl, cx| {
+                    let ids = ctl.action_targets(asset_id);
+                    let _ = ctl.library.trash_assets(&ids);
+                    ctl.deselect(&ids);
+                    cx.notify();
+                });
+            },
+        ),
     )
 }
 

@@ -178,8 +178,7 @@ mod tests {
                 2 => 1.5,  // landscape 3:2
                 _ => 2.2,  // wide panorama
             };
-            let jitter =
-                ((seed >> 40) as f32 / (1u64 << 24) as f32) * 0.25 - 0.125;
+            let jitter = ((seed >> 40) as f32 / (1u64 << 24) as f32) * 0.25 - 0.125;
             aspects.push((base + jitter).clamp(0.3, 3.2));
         }
 
@@ -197,7 +196,10 @@ mod tests {
                 let total = span_of(row);
                 let is_last = idx == rows.len() - 1;
                 if is_last {
-                    assert!(total <= width + 0.5, "tail must never overflow: {total} > {width}");
+                    assert!(
+                        total <= width + 0.5,
+                        "tail must never overflow: {total} > {width}"
+                    );
                 } else {
                     assert!(
                         (total - width).abs() < 0.5,

@@ -39,7 +39,11 @@ pub fn dominant_colors(path: &Path) -> Vec<String> {
 
     let mut ranked: Vec<(u32, u64)> = counts.into_iter().collect();
     ranked.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
-    ranked.into_iter().take(MAX_COLORS).map(|(key, _)| bucket_hex(key)).collect()
+    ranked
+        .into_iter()
+        .take(MAX_COLORS)
+        .map(|(key, _)| bucket_hex(key))
+        .collect()
 }
 
 /// Map a quantized bucket key back to the midpoint of its RGB channel ranges.
@@ -85,7 +89,12 @@ mod tests {
 
     #[test]
     fn jpeg_and_png_both_yield_palette() {
-        assert_eq!(dominant_colors(&solid_png([0, 0, 0])).first().map(String::as_str), Some("#101010"));
+        assert_eq!(
+            dominant_colors(&solid_png([0, 0, 0]))
+                .first()
+                .map(String::as_str),
+            Some("#101010")
+        );
         assert!(!dominant_colors(&solid_jpeg([255, 255, 255])).is_empty());
     }
 
@@ -102,7 +111,8 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let p = dir.join("garbage.png");
         let mut f = std::fs::File::create(&p).unwrap();
-        f.write_all(b"not an image at all, definitely not decodable").unwrap();
+        f.write_all(b"not an image at all, definitely not decodable")
+            .unwrap();
         assert!(dominant_colors(&p).is_empty());
     }
 }

@@ -151,8 +151,7 @@ fn switch_library(controller: &Entity<LibraryController>, path: PathBuf, cx: &mu
         ctl.notice = match outcome {
             Ok(()) => None,
             Err(e) => Some(
-                rust_i18n::t!("settings.library_switch_failed", error = e.to_string())
-                    .to_string(),
+                rust_i18n::t!("settings.library_switch_failed", error = e.to_string()).to_string(),
             ),
         };
         cx.notify();
@@ -313,85 +312,73 @@ fn rebuild_thumbs(controller: &Entity<LibraryController>, force: bool, cx: &mut 
 /// Search-index row: a synchronous rebuild (database-bound, quick).
 fn index_row(controller: &Entity<LibraryController>, cx: &mut App) -> Div {
     let busy = controller.read(cx).busy;
-    h_flex()
-        .flex_1()
-        .justify_end()
-        .child(
-            Button::new("rebuild-index")
-                .outline()
-                .small()
-                .disabled(busy)
-                .label(rust_i18n::t!("settings.rebuild_index").to_string())
-                .on_click({
-                    let controller = controller.clone();
-                    move |_, _, cx| {
-                        if !start_job(&controller, cx) {
-                            return;
-                        }
-                        let result = {
-                            let library = &controller.read(cx).library;
-                            trove_core::maintenance::rebuild_search_index(library)
-                        };
-                        let message = match result {
-                            Ok(count) => rust_i18n::t!(
-                                "settings.rebuild_index_done",
-                                count = count
-                            )
-                            .to_string(),
-                            Err(e) => rust_i18n::t!(
-                                "settings.job_failed",
-                                error = e.to_string()
-                            )
-                            .to_string(),
-                        };
-                        finish_job(&controller, message, cx);
+    h_flex().flex_1().justify_end().child(
+        Button::new("rebuild-index")
+            .outline()
+            .small()
+            .disabled(busy)
+            .label(rust_i18n::t!("settings.rebuild_index").to_string())
+            .on_click({
+                let controller = controller.clone();
+                move |_, _, cx| {
+                    if !start_job(&controller, cx) {
+                        return;
                     }
-                }),
-        )
+                    let result = {
+                        let library = &controller.read(cx).library;
+                        trove_core::maintenance::rebuild_search_index(library)
+                    };
+                    let message = match result {
+                        Ok(count) => {
+                            rust_i18n::t!("settings.rebuild_index_done", count = count).to_string()
+                        }
+                        Err(e) => {
+                            rust_i18n::t!("settings.job_failed", error = e.to_string()).to_string()
+                        }
+                    };
+                    finish_job(&controller, message, cx);
+                }
+            }),
+    )
 }
 
 /// Orphan-sweep row: synchronous (one filesystem walk over `media/` +
 /// `thumbs/`).
 fn orphans_row(controller: &Entity<LibraryController>, cx: &mut App) -> Div {
     let busy = controller.read(cx).busy;
-    h_flex()
-        .flex_1()
-        .justify_end()
-        .child(
-            Button::new("clean-orphans")
-                .outline()
-                .small()
-                .disabled(busy)
-                .label(rust_i18n::t!("settings.clean_orphans").to_string())
-                .on_click({
-                    let controller = controller.clone();
-                    move |_, _, cx| {
-                        if !start_job(&controller, cx) {
-                            return;
-                        }
-                        let result = {
-                            let library = &controller.read(cx).library;
-                            trove_core::maintenance::clean_orphans(library)
-                        };
-                        let message = match result {
-                            Ok(report) => rust_i18n::t!(
-                                "settings.clean_orphans_done",
-                                blobs = report.blobs_removed,
-                                thumbs = report.thumbs_removed,
-                                trashed = report.files_trashed,
-                                dirs = report.empty_dirs_removed,
-                            )
-                            .to_string(),
-                            Err(e) => rust_i18n::t!(
-                                "settings.job_failed",
-                                error = e.to_string()
-                            )
-                            .to_string(),
-                        };
-                        finish_job(&controller, message, cx);
+    h_flex().flex_1().justify_end().child(
+        Button::new("clean-orphans")
+            .outline()
+            .small()
+            .disabled(busy)
+            .label(rust_i18n::t!("settings.clean_orphans").to_string())
+            .on_click({
+                let controller = controller.clone();
+                move |_, _, cx| {
+                    if !start_job(&controller, cx) {
+                        return;
                     }
-                }),
-        )
+                    let result = {
+                        let library = &controller.read(cx).library;
+                        trove_core::maintenance::clean_orphans(library)
+                    };
+                    let message = match result {
+                        Ok(report) => rust_i18n::t!(
+                            "settings.clean_orphans_done",
+                            blobs = report.blobs_removed,
+                            thumbs = report.thumbs_removed,
+                            trashed = report.files_trashed,
+                            dirs = report.empty_dirs_removed,
+                        )
+                        .to_string(),
+                        Err(e) => {
+                            rust_i18n::t!("settings.job_failed", error = e.to_string()).to_string()
+                        }
+                    };
+                    finish_job(&controller, message, cx);
+                }
+            }),
+    )
 }
 
 /// The shared status line: the notice of the last finished job, danger
@@ -431,33 +418,36 @@ fn language_page() -> SettingPage {
         SharedString::from(SYSTEM_LANGUAGE),
         rust_i18n::t!("settings.follow_system").into_owned().into(),
     )];
-    options.extend(SUPPORTED.iter().map(|(code, name)| {
-        (SharedString::from(*code), SharedString::from(*name))
-    }));
+    options.extend(
+        SUPPORTED
+            .iter()
+            .map(|(code, name)| (SharedString::from(*code), SharedString::from(*name))),
+    );
 
     SettingPage::new(rust_i18n::t!("settings.language").to_string())
         .icon(IconName::Globe)
         .resettable(false)
-        .group(SettingGroup::new().item(
-            SettingItem::new(
-                rust_i18n::t!("settings.language").to_string(),
-                SettingField::dropdown(
-                    options,
-                    |_cx| {
-                        let lang = AppConfig::load().language;
-                        SharedString::from(lang.unwrap_or_else(|| SYSTEM_LANGUAGE.into()))
-                    },
-                    |value, cx| {
-                        let language =
-                            (&*value != SYSTEM_LANGUAGE).then(|| value.to_string());
-                        crate::i18n::set_language(language);
-                        // The locale is a process global: repaint every open
-                        // window and rebuild the (already localized) menus.
-                        cx.refresh_windows();
-                        crate::apply_menus(cx);
-                    },
-                ),
-            )
-            .description(rust_i18n::t!("settings.language_desc").to_string()),
-        ))
+        .group(
+            SettingGroup::new().item(
+                SettingItem::new(
+                    rust_i18n::t!("settings.language").to_string(),
+                    SettingField::dropdown(
+                        options,
+                        |_cx| {
+                            let lang = AppConfig::load().language;
+                            SharedString::from(lang.unwrap_or_else(|| SYSTEM_LANGUAGE.into()))
+                        },
+                        |value, cx| {
+                            let language = (&*value != SYSTEM_LANGUAGE).then(|| value.to_string());
+                            crate::i18n::set_language(language);
+                            // The locale is a process global: repaint every open
+                            // window and rebuild the (already localized) menus.
+                            cx.refresh_windows();
+                            crate::apply_menus(cx);
+                        },
+                    ),
+                )
+                .description(rust_i18n::t!("settings.language_desc").to_string()),
+            ),
+        )
 }

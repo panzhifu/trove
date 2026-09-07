@@ -137,17 +137,19 @@ impl AssetPatch {
     /// Validate against a rule set; applies `rating` bounds.
     pub fn validate(&self) -> Result<(), crate::error::Error> {
         if let Some(Some(rating)) = self.rating
-            && rating > MAX_RATING {
-                return Err(crate::error::Error::Validation(format!(
-                    "rating must be 0..={MAX_RATING}, got {rating}"
-                )));
-            }
+            && rating > MAX_RATING
+        {
+            return Err(crate::error::Error::Validation(format!(
+                "rating must be 0..={MAX_RATING}, got {rating}"
+            )));
+        }
         if let Some(Some(desc)) = &self.description
-            && desc.len() > MAX_DESCRIPTION_LEN {
-                return Err(crate::error::Error::Validation(
-                    "description too long".into(),
-                ));
-            }
+            && desc.len() > MAX_DESCRIPTION_LEN
+        {
+            return Err(crate::error::Error::Validation(
+                "description too long".into(),
+            ));
+        }
         Ok(())
     }
 }
@@ -283,8 +285,12 @@ impl NewSmartCollection {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "lowercase")]
 pub enum SmartNode {
-    And { children: Vec<SmartNode> },
-    Or { children: Vec<SmartNode> },
+    And {
+        children: Vec<SmartNode>,
+    },
+    Or {
+        children: Vec<SmartNode>,
+    },
     #[serde(rename = "match")]
     Match {
         field: SmartField,

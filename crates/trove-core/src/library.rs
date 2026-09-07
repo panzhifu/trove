@@ -7,7 +7,7 @@ use uuid::Uuid;
 
 use crate::error::Result;
 use crate::media;
-use crate::store::{assets, batch, collections, rows, smart, smart_collections, tags, Store};
+use crate::store::{Store, assets, batch, collections, rows, smart, smart_collections, tags};
 use crate::undo::{self, Op, SharedUndoStack};
 
 /// Serialize the whole metadata catalog of `store` (assets, collections,
@@ -61,7 +61,11 @@ impl Library {
         let root = root.as_ref().to_path_buf();
         std::fs::create_dir_all(&root)?;
         let store = Store::open(&root.join("library.db"))?;
-        let lib = Self { store, root, undo: SharedUndoStack::default() };
+        let lib = Self {
+            store,
+            root,
+            undo: SharedUndoStack::default(),
+        };
         // Backfill the FTS index for a library migrated from a schema that had
         // no search table: without this, `search` silently returns nothing for
         // assets that predate the index.
@@ -93,7 +97,11 @@ impl Library {
         let root = root.as_ref().to_path_buf();
         std::fs::create_dir_all(&root)?;
         let store = Store::in_memory()?;
-        Ok(Self { store, root, undo: SharedUndoStack::default() })
+        Ok(Self {
+            store,
+            root,
+            undo: SharedUndoStack::default(),
+        })
     }
 
     pub fn store(&self) -> &Store {
@@ -162,10 +170,7 @@ impl Library {
         smart_collections::list(self.store.conn())
     }
 
-    pub fn get_smart_collection(
-        &self,
-        id: Uuid,
-    ) -> Result<Option<crate::model::SmartCollection>> {
+    pub fn get_smart_collection(&self, id: Uuid) -> Result<Option<crate::model::SmartCollection>> {
         smart_collections::get(self.store.conn(), id)
     }
 
@@ -211,9 +216,10 @@ impl Library {
         let rel = asset.rel_path.clone();
         assets::delete(conn, asset_id)?;
         if let (Some(sha), Some(rel)) = (sha, rel)
-            && assets::count_by_sha256(conn, &sha)? == 0 {
-                self.remove_blob_files(&rel, &sha);
-            }
+            && assets::count_by_sha256(conn, &sha)? == 0
+        {
+            self.remove_blob_files(&rel, &sha);
+        }
         Ok(())
     }
 
@@ -234,9 +240,10 @@ impl Library {
             let rel = asset.rel_path.clone();
             assets::delete(conn, id)?;
             if let (Some(sha), Some(rel)) = (sha, rel)
-                && assets::count_by_sha256(conn, &sha)? == 0 {
-                    self.remove_blob_files(&rel, &sha);
-                }
+                && assets::count_by_sha256(conn, &sha)? == 0
+            {
+                self.remove_blob_files(&rel, &sha);
+            }
             removed += 1;
         }
         Ok(removed)
@@ -266,7 +273,9 @@ impl Library {
             .map(|id| {
                 Ok((
                     *id,
-                    assets::get(conn, *id)?.map(|a| a.is_favorite).unwrap_or(false),
+                    assets::get(conn, *id)?
+                        .map(|a| a.is_favorite)
+                        .unwrap_or(false),
                 ))
             })
             .collect::<Result<Vec<_>>>()?;
@@ -447,8 +456,8 @@ impl Library {
         position: i64,
     ) -> Result<()> {
         let conn = self.store.conn();
-        let c = collections::get(conn, collection_id)?
-            .ok_or(crate::Error::NotFound("collection"))?;
+        let c =
+            collections::get(conn, collection_id)?.ok_or(crate::Error::NotFound("collection"))?;
         collections::move_to(conn, collection_id, new_parent, position)?;
         self.undo.record(Op::CollectionMove {
             id: collection_id,
@@ -485,7 +494,9 @@ impl Library {
             .map(|id| {
                 Ok((
                     *id,
-                    assets::get(conn, *id)?.map(|a| a.trashed_at.is_some()).unwrap_or(false),
+                    assets::get(conn, *id)?
+                        .map(|a| a.trashed_at.is_some())
+                        .unwrap_or(false),
                 ))
             })
             .collect::<Result<Vec<_>>>()?;
@@ -561,20 +572,20 @@ impl Library {
 #[cfg(test)]
 mod tests {
     use super::Library;
-    use chrono::Utc;
     use crate::media::thumb;
     use crate::model::{AssetKind, AssetQuery, NewCollection, NewSmartCollection};
     use crate::store::{assets, collections, tags};
+    use chrono::Utc;
     use std::path::{Path, PathBuf};
     use uuid::Uuid;
 
     /// A minimal valid 1x1 PNG.
     const PNG_1X1: &[u8] = &[
-        0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48,
-        0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00,
-        0x00, 0x1F, 0x15, 0xC4, 0x89, 0x00, 0x00, 0x00, 0x0A, 0x49, 0x44, 0x41, 0x54, 0x78,
-        0x9C, 0x63, 0x00, 0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0D, 0x0A, 0x2D, 0xB4, 0x00,
-        0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+        0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44,
+        0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1F,
+        0x15, 0xC4, 0x89, 0x00, 0x00, 0x00, 0x0A, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9C, 0x63, 0x00,
+        0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0D, 0x0A, 0x2D, 0xB4, 0x00, 0x00, 0x00, 0x00, 0x49,
+        0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
     ];
 
     fn temp_library(name: &str) -> (Library, PathBuf) {
@@ -598,7 +609,11 @@ mod tests {
         let src = write_source(&folder, "photo.png", PNG_1X1);
 
         let report = lib
-            .import_files_auto(std::slice::from_ref(&src), None, crate::media::import::AutoCollection::SourceFolder)
+            .import_files_auto(
+                std::slice::from_ref(&src),
+                None,
+                crate::media::import::AutoCollection::SourceFolder,
+            )
             .unwrap();
         assert_eq!(report.imported_count(), 1);
         let _item = &report.imported[0];
@@ -606,23 +621,37 @@ mod tests {
         let roots = collections::roots(lib.store().conn()).unwrap();
         assert_eq!(roots.len(), 1);
         assert_eq!(roots[0].name, "Vacation");
-        assert_eq!(collections::count_assets(lib.store().conn(), roots[0].id).unwrap(), 1);
+        assert_eq!(
+            collections::count_assets(lib.store().conn(), roots[0].id).unwrap(),
+            1
+        );
 
         // Re-importing a *different* file into the same folder reuses the bucket.
         let mut other = PNG_1X1.to_vec();
         other.push(0); // distinct content, so it is not a dedup of photo.png
         let src2 = write_source(&folder, "photo2.png", &other);
-        lib.import_files_auto(&[src2], None, crate::media::import::AutoCollection::SourceFolder).unwrap();
-        assert_eq!(collections::count_assets(lib.store().conn(), roots[0].id).unwrap(), 2);
+        lib.import_files_auto(
+            &[src2],
+            None,
+            crate::media::import::AutoCollection::SourceFolder,
+        )
+        .unwrap();
+        assert_eq!(
+            collections::count_assets(lib.store().conn(), roots[0].id).unwrap(),
+            2
+        );
 
         // Month bucketing creates a collection named after the import month.
         let (lib2, root2) = temp_library("auto-month");
         let plain = root2.join("plain");
         std::fs::create_dir_all(&plain).unwrap();
         let s = write_source(&plain, "a.png", PNG_1X1);
-        lib2
-            .import_files_auto(&[s], None, crate::media::import::AutoCollection::ImportYearMonth)
-            .unwrap();
+        lib2.import_files_auto(
+            &[s],
+            None,
+            crate::media::import::AutoCollection::ImportYearMonth,
+        )
+        .unwrap();
         let month = Utc::now().format("%Y-%m").to_string();
         let roots = collections::roots(lib2.store().conn()).unwrap();
         assert_eq!(roots.len(), 1);
@@ -656,7 +685,11 @@ mod tests {
 
         // A JPEG thumbnail was generated next to it.
         let thumb_path = thumb::abs_path(lib.root(), asset.sha256.as_deref().unwrap());
-        assert!(thumb_path.is_file(), "thumbnail missing at {}", thumb_path.display());
+        assert!(
+            thumb_path.is_file(),
+            "thumbnail missing at {}",
+            thumb_path.display()
+        );
     }
 
     #[test]
@@ -696,7 +729,9 @@ mod tests {
         );
 
         // Importing into a missing collection fails up front.
-        let err = lib.import_files(&[root.join("nope.png")], Some(Uuid::new_v4())).unwrap_err();
+        let err = lib
+            .import_files(&[root.join("nope.png")], Some(Uuid::new_v4()))
+            .unwrap_err();
         assert!(err.to_string().contains("collection"));
     }
 
@@ -710,7 +745,9 @@ mod tests {
 
         // A non-existent path is reported, not fatal.
         let missing = root.join("missing.bin");
-        let report = lib.import_files(std::slice::from_ref(&missing), None).unwrap();
+        let report = lib
+            .import_files(std::slice::from_ref(&missing), None)
+            .unwrap();
         assert_eq!(report.imported_count(), 0);
         assert_eq!(report.skipped_count(), 1);
         assert_eq!(report.skipped[0].path, missing);
@@ -733,16 +770,25 @@ mod tests {
         let b = write_source(&root, "b.png", PNG_1X1);
         let report2 = lib.import_files(&[b], None).unwrap();
         assert_eq!(report2.imported_count(), 1);
-        assert!(!report2.imported[0].reused, "trashed content is re-imported fresh");
+        assert!(
+            !report2.imported[0].reused,
+            "trashed content is re-imported fresh"
+        );
         let second_id = report2.imported[0].asset_id;
 
         // Purging the live record keeps the blob (trashed record references it).
         lib.purge_asset(second_id).unwrap();
-        assert!(blob.is_file(), "blob must survive while a trashed record exists");
+        assert!(
+            blob.is_file(),
+            "blob must survive while a trashed record exists"
+        );
 
         // Purging the trashed record removes blob and thumbnail.
         lib.purge_asset(first_id).unwrap();
-        assert!(!blob.exists(), "blob removed after last reference is purged");
+        assert!(
+            !blob.exists(),
+            "blob removed after last reference is purged"
+        );
         let sha = stored.sha256.unwrap();
         assert!(!thumb::abs_path(lib.root(), &sha).exists());
     }
@@ -879,8 +925,9 @@ mod tests {
             })
             .unwrap();
         assert_eq!(lib.list_smart_collections().unwrap().len(), 1);
-        let (total, assets) =
-            lib.evaluate_smart_collection(sc.id, None, None, None, 0).unwrap();
+        let (total, assets) = lib
+            .evaluate_smart_collection(sc.id, None, None, None, 0)
+            .unwrap();
         assert_eq!(total, 1);
         assert_eq!(assets[0].id, photo_id);
 
@@ -917,7 +964,10 @@ mod tests {
         .unwrap();
         let tag = tags::create(
             conn,
-            &crate::model::NewTag { name: "landscape".into(), color: None },
+            &crate::model::NewTag {
+                name: "landscape".into(),
+                color: None,
+            },
         )
         .unwrap();
         tags::add_to_asset(conn, photo_id, tag.id).unwrap();
@@ -928,13 +978,16 @@ mod tests {
         let reopened = Library::open(&root).unwrap();
         let conn = reopened.store().conn();
 
-        let (total, hits) = reopened.search_assets("sunset", &AssetQuery::default()).unwrap();
+        let (total, hits) = reopened
+            .search_assets("sunset", &AssetQuery::default())
+            .unwrap();
         assert_eq!(total, 1);
         assert_eq!(hits[0].id, photo_id);
 
         // The rebuilt index carries tag names too.
-        let (total, _) = reopened.search_assets("landscape", &AssetQuery::default()).unwrap();
+        let (total, _) = reopened
+            .search_assets("landscape", &AssetQuery::default())
+            .unwrap();
         assert_eq!(total, 1);
     }
 }
-
