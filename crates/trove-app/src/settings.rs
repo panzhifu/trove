@@ -45,7 +45,7 @@ impl SettingsDialog {
                 .page(general_page(&controller))
                 .page(search_page(&controller))
                 .page(maintenance_page(&controller))
-                .page(language_page())
+                .page(language_page(&controller))
                 .page(shortcuts_page());
 
             dialog
@@ -418,7 +418,10 @@ fn status_row(controller: &Entity<LibraryController>, cx: &mut App) -> Div {
 
 /// Language ▸ Interface: a dropdown of supported catalogs plus the
 /// "follow system" sentinel. Switching applies the locale immediately.
-fn language_page() -> SettingPage {
+fn language_page(controller: &Entity<LibraryController>) -> SettingPage {
+    // Own the handle: the dropdown callback is an `Fn` that outlives this
+    // frame, so it must capture a clone instead of borrowing the argument.
+    let controller = controller.clone();
     let mut options: Vec<(SharedString, SharedString)> = vec![(
         SharedString::from(SYSTEM_LANGUAGE),
         rust_i18n::t!("settings.follow_system").into_owned().into(),
@@ -442,9 +445,22 @@ fn language_page() -> SettingPage {
                             let lang = AppConfig::load().language;
                             SharedString::from(lang.unwrap_or_else(|| SYSTEM_LANGUAGE.into()))
                         },
-                        |value, cx| {
+                        move |value, cx| {
                             let language = (&*value != SYSTEM_LANGUAGE).then(|| value.to_string());
-                            crate::i18n::set_language(language);
+                            // The locale switch applies regardless; persist
+                            // failures (rare: full disk, ...) surface here.
+                            if let Err(e) = crate::i18n::set_language(language) {
+                                controller.update(cx, |ctl, cx| {
+                                    ctl.notice = Some(
+                                        rust_i18n::t!(
+                                            "settings.language_save_failed",
+                                            error = e.to_string()
+                                        )
+                                        .to_string(),
+                                    );
+                                    cx.notify();
+                                });
+                            }
                             // The locale is a process global: repaint every open
                             // window and rebuild the (already localized) menus.
                             cx.refresh_windows();
@@ -873,7 +889,7 @@ fn embed_coverage_row(controller: &Entity<LibraryController>, cx: &mut App) -> D
         .library
         .embedding_status()
         .unwrap_or((0, 0));
-    div()
+    let mut row = div()
         .text_sm()
         .text_color(cx.theme().muted_foreground)
         .child(
@@ -883,7 +899,23 @@ fn embed_coverage_row(controller: &Entity<LibraryController>, cx: &mut App) -> D
                 total = total
             )
             .to_string(),
-        )
+        );
+    // Vectors written by a previous model cannot be matched against the
+    // current one — tell the user to re-embed instead of silently ranking
+    // a shrunken result set.
+    let mismatched = trove_core::media::clip::dim_mismatches();
+    if mismatched > 0 {
+        row = row.child(
+            div()
+                .mt_1()
+                .text_sm()
+                .text_color(cx.theme().danger)
+                .child(
+                    rust_i18n::t!("settings.dim_mismatch", count = mismatched).to_string(),
+                ),
+        );
+    }
+    row
 }
 
 /// Embed-all button. The Store is thread-confined (`Rc<RefCell>`), so the

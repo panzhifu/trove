@@ -275,6 +275,17 @@ impl LibraryController {
     }
 
 
+    /// Record an error notice. Returns `true` only when the message is new,
+    /// so render-path callers can notify safely without re-render loops.
+    pub fn report_error(&mut self, msg: String) -> bool {
+        if self.notice.as_deref() != Some(msg.as_str()) {
+            self.notice = Some(msg);
+            true
+        } else {
+            false
+        }
+    }
+
     /// The primary (last-clicked) selected asset.
     pub fn primary(&self) -> Option<Uuid> {
         self.selected_assets.last().copied()

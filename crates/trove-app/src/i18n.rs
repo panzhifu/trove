@@ -44,13 +44,14 @@ pub fn init_from_config() {
 }
 
 /// Switch the live locale (None = follow system) and persist the choice.
-/// The caller repaints open windows and rebuilds menus afterwards.
-pub fn set_language(language: Option<String>) {
+/// The locale switch always applies; a persist failure is returned to the
+/// caller (which can surface it in the UI) — the choice just won't survive
+/// a restart. The caller repaints open windows and rebuilds menus afterwards.
+pub fn set_language(language: Option<String>) -> trove_core::error::Result<()> {
     let mut config = AppConfig::load();
-    if let Err(e) = config.set_language(language) {
-        eprintln!("save language setting: {e}");
-    }
+    let result = config.set_language(language);
     rust_i18n::set_locale(effective(config.language.as_deref()));
+    result
 }
 
 #[cfg(test)]
