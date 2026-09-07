@@ -18,20 +18,6 @@ use crate::error::{Error, Result};
 use crate::model::{Asset, AssetKind, Origin, now};
 use crate::store::{Store, assets, collections};
 
-/// How an import batch is automatically grouped into (auto-created) root
-/// collections, independent of any explicit `into_collection`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AutoCollection {
-    /// Each file joins a collection named after its source directory, e.g.
-    /// `~/Photos/Holiday/IMG_01.jpg` -> "Holiday".
-    SourceFolder,
-    /// Each file joins `YYYY-MM` named after its EXIF capture date (falling
-    /// back to the import date when unknown).
-    CaptureYearMonth,
-    /// Each file joins `YYYY-MM` named after the day it was imported.
-    ImportYearMonth,
-}
-
 /// One successfully imported (or deduplicated) file.
 #[derive(Debug, Clone)]
 pub struct ImportItem {
@@ -89,24 +75,13 @@ pub struct StagedFile {
 }
 
 /// Synchronous all-in-one import (tests, small batches). Equivalent to
-/// `stage_source` + `commit_staged` per file, without auto-categorization.
+/// `stage_source` + `commit_staged` per file.
+/// Imported assets go directly to "All Assets" unless `into_collection` is set.
 pub fn import_files(
     store: &Store,
     root: &Path,
     sources: &[PathBuf],
     into_collection: Option<Uuid>,
-) -> Result<ImportReport> {
-    import_files_assigned(store, root, sources, into_collection, None)
-}
-
-/// As [`import_files`], but with an [`AutoCollection`] strategy that groups the
-/// batch into auto-created root collections (in addition to any fixed target).
-pub fn import_files_assigned(
-    store: &Store,
-    root: &Path,
-    sources: &[PathBuf],
-    into_collection: Option<Uuid>,
-    auto: Option<AutoCollection>,
 ) -> Result<ImportReport> {
     if let Some(cid) = into_collection
         && collections::get(store.conn(), cid)?.is_none()
@@ -116,7 +91,6 @@ pub fn import_files_assigned(
     Ok(commit_staged_all(
         store,
         into_collection,
-        auto,
         stage_all(root, sources),
     ))
 }
@@ -146,13 +120,12 @@ pub fn stage_all(
 pub fn commit_staged_all(
     store: &Store,
     into_collection: Option<Uuid>,
-    auto: Option<AutoCollection>,
     staged: Vec<std::result::Result<StagedFile, ImportSkip>>,
 ) -> ImportReport {
     let mut report = ImportReport::default();
     for item in staged {
         match item {
-            Ok(file) => match commit_staged(store, into_collection, auto, &file) {
+            Ok(file) => match commit_staged(store, into_collection, &file) {
                 Ok(item) => report.imported.push(item),
                 Err(e) => report.skipped.push(ImportSkip {
                     path: file.path,
@@ -221,7 +194,6 @@ pub fn stage_source(root: &Path, src: &Path) -> Result<StagedFile> {
 pub fn commit_staged(
     store: &Store,
     into_collection: Option<Uuid>,
-    auto: Option<AutoCollection>,
     staged: &StagedFile,
 ) -> Result<ImportItem> {
     // Resolve the fixed target (if any) plus the auto-created collection, so
@@ -229,10 +201,6 @@ pub fn commit_staged(
     let mut targets: Vec<Uuid> = Vec::new();
     if let Some(cid) = into_collection {
         targets.push(cid);
-    }
-    if let Some(auto) = auto {
-        let name = auto_collection_name(auto, staged);
-        targets.push(collections::ensure_root_named(store.conn(), &name)?.id);
     }
 
     // Reuse an existing live asset with identical content.
@@ -294,37 +262,6 @@ pub fn commit_staged(
     })
 }
 
-/// Derive the auto-collection name for a staged file under a strategy. Result
-/// is always a non-empty, name-length-safe string so `ensure_root_named` never
-/// rejects it.
-fn auto_collection_name(auto: AutoCollection, staged: &StagedFile) -> String {
-    let raw = match auto {
-        AutoCollection::SourceFolder => staged
-            .path
-            .parent()
-            .and_then(Path::file_name)
-            .map(|n| n.to_string_lossy().to_string())
-            .filter(|s| !s.is_empty() && s != "." && s != "/")
-            .unwrap_or_else(|| "Miscellaneous".to_string()),
-        AutoCollection::CaptureYearMonth => staged
-            .mined
-            .captured_at
-            .map(|dt| dt.format("%Y-%m").to_string())
-            .unwrap_or_else(utc_now_month),
-        AutoCollection::ImportYearMonth => utc_now_month(),
-    };
-    let mut name = raw.trim().to_string();
-    if name.is_empty() {
-        name = "Miscellaneous".to_string();
-    }
-    name.truncate(crate::model::MAX_NAME_LEN);
-    name
-}
-
-fn utc_now_month() -> String {
-    chrono::Utc::now().format("%Y-%m").to_string()
-}
-
 fn file_name_of(src: &Path) -> Result<String> {
     let name = src
         .file_name()
@@ -375,24 +312,20 @@ mod tests {
         assert!(staged[1].is_err());
 
         // Phase two: the commit loop turns everything into an ImportReport.
-        let report = commit_staged_all(&store, None, Some(AutoCollection::SourceFolder), staged);
+        let report = commit_staged_all(&store, None, staged);
         assert_eq!(report.imported_count(), 1);
         assert_eq!(report.skipped_count(), 1);
         assert_eq!(report.skipped[0].path, missing);
         assert!(!report.skipped[0].reason.is_empty());
 
-        // The auto collection named after the source folder exists.
+        // No auto-collection is created; asset goes directly to "All Assets".
         let conn = store.conn();
         let roots = collections::roots(conn).unwrap();
-        assert!(
-            roots
-                .iter()
-                .any(|c| c.name == "trove-import-batch" || c.name.starts_with("trove-import-"))
-        );
+        assert_eq!(roots.len(), 0, "no auto-collection should be created");
 
         // Re-importing identical content dedupes (reused = true).
         let staged2 = stage_all(&root, &[good]);
-        let report2 = commit_staged_all(&store, None, Some(AutoCollection::SourceFolder), staged2);
+        let report2 = commit_staged_all(&store, None, staged2);
         assert_eq!(report2.imported_count(), 1);
         assert!(report2.imported[0].reused);
 

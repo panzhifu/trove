@@ -76,12 +76,7 @@ pub fn import_paths_app(
             controller.update(cx, |ctl, cx| {
                 match item {
                     Ok(file) => {
-                        match import::commit_staged(
-                            ctl.library.store(),
-                            into_collection,
-                            Some(import::AutoCollection::SourceFolder),
-                            &file,
-                        ) {
+                        match import::commit_staged(ctl.library.store(), into_collection, &file) {
                             Ok(imported) => report.imported.push(imported),
                             Err(e) => report.skipped.push(import::ImportSkip {
                                 path: file.path,

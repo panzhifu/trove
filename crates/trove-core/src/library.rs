@@ -119,29 +119,15 @@ impl Library {
 
     /// Import files, optionally into a collection. See
     /// [`media::import::import_files`] for semantics.
+    /// Imported assets are added directly to "All Assets" unless a target
+    /// collection is specified. Smart collections automatically capture
+    /// matching assets via their rules.
     pub fn import_files(
         &self,
         sources: &[PathBuf],
         into_collection: Option<Uuid>,
     ) -> Result<media::import::ImportReport> {
         media::import::import_files(&self.store, &self.root, sources, into_collection)
-    }
-
-    /// Import files into a fixed collection (optional) while auto-grouping
-    /// each file into an auto-created root collection by `auto`.
-    pub fn import_files_auto(
-        &self,
-        sources: &[PathBuf],
-        into_collection: Option<Uuid>,
-        auto: media::import::AutoCollection,
-    ) -> Result<media::import::ImportReport> {
-        media::import::import_files_assigned(
-            &self.store,
-            &self.root,
-            sources,
-            into_collection,
-            Some(auto),
-        )
     }
 
     /// Full-text search across live assets, ordered by relevance. `q` narrows
@@ -601,63 +587,33 @@ mod tests {
     }
 
     #[test]
+
     fn auto_import_groups_into_collections() {
-        // Source-folder bucketing creates a root collection named after the dir.
+        // Imports go directly to "All Assets" without creating collections.
         let (lib, root) = temp_library("auto-source");
         let folder = root.join("Vacation");
         std::fs::create_dir_all(&folder).unwrap();
         let src = write_source(&folder, "photo.png", PNG_1X1);
 
-        let report = lib
-            .import_files_auto(
-                std::slice::from_ref(&src),
-                None,
-                crate::media::import::AutoCollection::SourceFolder,
-            )
-            .unwrap();
+        let report = lib.import_files(std::slice::from_ref(&src), None).unwrap();
         assert_eq!(report.imported_count(), 1);
         let _item = &report.imported[0];
 
+        // No auto-created collections — asset goes to "All Assets".
         let roots = collections::roots(lib.store().conn()).unwrap();
-        assert_eq!(roots.len(), 1);
-        assert_eq!(roots[0].name, "Vacation");
-        assert_eq!(
-            collections::count_assets(lib.store().conn(), roots[0].id).unwrap(),
-            1
-        );
+        assert_eq!(roots.len(), 0);
 
-        // Re-importing a *different* file into the same folder reuses the bucket.
-        let mut other = PNG_1X1.to_vec();
-        other.push(0); // distinct content, so it is not a dedup of photo.png
-        let src2 = write_source(&folder, "photo2.png", &other);
-        lib.import_files_auto(
-            &[src2],
-            None,
-            crate::media::import::AutoCollection::SourceFolder,
-        )
-        .unwrap();
-        assert_eq!(
-            collections::count_assets(lib.store().conn(), roots[0].id).unwrap(),
-            2
-        );
+        // Total asset count is 1.
+        let total = assets::query(lib.store().conn(), &crate::model::AssetQuery::default())
+            .unwrap()
+            .0;
+        assert_eq!(total, 1);
 
-        // Month bucketing creates a collection named after the import month.
-        let (lib2, root2) = temp_library("auto-month");
-        let plain = root2.join("plain");
-        std::fs::create_dir_all(&plain).unwrap();
-        let s = write_source(&plain, "a.png", PNG_1X1);
-        lib2.import_files_auto(
-            &[s],
-            None,
-            crate::media::import::AutoCollection::ImportYearMonth,
-        )
-        .unwrap();
-        let month = Utc::now().format("%Y-%m").to_string();
-        let roots = collections::roots(lib2.store().conn()).unwrap();
-        assert_eq!(roots.len(), 1);
-        assert_eq!(roots[0].name, month);
+        // Re-importing identical content dedupes.
+        let report2 = lib.import_files(std::slice::from_ref(&src), None).unwrap();
+        assert_eq!(report2.imported_count(), 1);
+        assert!(report2.imported[0].reused);
     }
-
     #[test]
     fn imports_png_and_generates_thumbnail() {
         let (lib, root) = temp_library("png");
