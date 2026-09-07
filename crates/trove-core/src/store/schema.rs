@@ -5,7 +5,7 @@
 //! released migration; append a new one.
 
 /// Current schema version, bumped whenever a migration is appended.
-pub const SCHEMA_VERSION: i64 = 5;
+pub const SCHEMA_VERSION: i64 = 6;
 
 /// One migration per version index: `MIGRATIONS[0]` upgrades 0 -> 1, and so on.
 pub const MIGRATIONS: &[&str] = &[
@@ -119,5 +119,10 @@ pub const MIGRATIONS: &[&str] = &[
     // `model::COLOR_LABELS` ("red" … "purple"); NULL = unlabeled.
     r#"
     ALTER TABLE assets ADD COLUMN color_label TEXT;
+    "#,
+    // v6: hierarchical tags. Deleting a parent promotes its children
+    // (ON DELETE SET NULL) so a subtree is never lost by one click.
+    r#"
+    ALTER TABLE tags ADD COLUMN parent_id TEXT REFERENCES tags(id) ON DELETE SET NULL;
     "#,
 ];

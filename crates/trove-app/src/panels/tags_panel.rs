@@ -41,6 +41,39 @@ impl Render for TagsPanel {
         let active = ctl.active_tag;
         let all_tags = tags::list(conn).unwrap_or_default();
 
+        // Build the hierarchy: roots first, children nested under parents
+        // (sorted by name at every level).
+        let children_of: std::collections::HashMap<Uuid, Vec<&trove_core::model::Tag>> = {
+            let mut map: std::collections::HashMap<Uuid, Vec<&trove_core::model::Tag>> =
+                Default::default();
+            let mut roots: Vec<&trove_core::model::Tag> = Vec::new();
+            for tag in &all_tags {
+                match tag.parent_id {
+                    Some(pid) => map.entry(pid).or_default().push(tag),
+                    None => roots.push(tag),
+                }
+            }
+            map.insert(Uuid::nil(), roots);
+            map
+        };
+        fn tag_rows<'a>(
+            parent: Uuid,
+            children_of: &'a std::collections::HashMap<Uuid, Vec<&'a trove_core::model::Tag>>,
+            depth: usize,
+            out: &mut Vec<(&'a trove_core::model::Tag, usize)>,
+        ) {
+            if let Some(children) = children_of.get(&parent) {
+                let mut children = children.clone();
+                children.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+                for tag in children {
+                    out.push((tag, depth));
+                    tag_rows(tag.id, children_of, depth + 1, out);
+                }
+            }
+        }
+        let mut flat: Vec<(&trove_core::model::Tag, usize)> = Vec::new();
+        tag_rows(Uuid::nil(), &children_of, 0, &mut flat);
+
         v_flex()
             .size_full()
             .p_2()
@@ -68,7 +101,7 @@ impl Render for TagsPanel {
                             .icon(IconName::Plus)
                             .tooltip(rust_i18n::t!("tags.add_tag").to_string())
                             .on_click(cx.listener(|this, _, window, cx| {
-                                open_create_dialog(window, cx, &this.controller);
+                                open_create_dialog(window, cx, &this.controller, None);
                             })),
                     ),
             )
@@ -77,7 +110,7 @@ impl Render for TagsPanel {
                     v_flex()
                         .gap_0p5()
                         .w_full()
-                        .children(all_tags.into_iter().map(|tag| {
+                        .children(flat.into_iter().map(|(tag, depth)| {
                             let id = tag.id;
                             let count = tags::count_assets(conn, id).unwrap_or(0);
                             let color = tag.color.clone();
@@ -86,6 +119,7 @@ impl Render for TagsPanel {
                             let controller = self.controller.clone();
                             let mut row = div()
                                 .id(format!("tag-row-{id}"))
+                                .ml(px(14. * depth as f32))
                                 .cursor_pointer()
                                 .w_full()
                                 .px_2()
@@ -181,6 +215,7 @@ fn tag_context_menu(
     let ctl_del = controller.clone();
     let ctl_rename = controller.clone();
     let ctl_color = controller.clone();
+    let ctl_child = controller.clone();
     let rename_name = tag_name.clone();
     let mut m = menu
         .min_w(px(160.))
@@ -195,6 +230,13 @@ fn tag_context_menu(
                         }
                         cx.notify();
                     });
+                },
+            ),
+        )
+        .item(
+            PopupMenuItem::new(rust_i18n::t!("tags.new_child_tag").to_string()).on_click(
+                move |_, window, cx| {
+                    open_create_dialog(window, cx, &ctl_child, Some(tag_id));
                 },
             ),
         )
@@ -266,7 +308,12 @@ const TAG_COLORS: [&str; 8] = [
 
 /// Create a tag via a small modal dialog (same flow as the rename one; the
 /// library deduplicates by name through `ensure_tag`).
-fn open_create_dialog(window: &mut Window, cx: &mut App, controller: &Entity<LibraryController>) {
+fn open_create_dialog(
+    window: &mut Window,
+    cx: &mut App,
+    controller: &Entity<LibraryController>,
+    parent: Option<Uuid>,
+) {
     let name_input = cx.new(|cx| {
         InputState::new(window, cx)
             .placeholder(rust_i18n::t!("explorer.name_placeholder").to_string())
@@ -284,7 +331,10 @@ fn open_create_dialog(window: &mut Window, cx: &mut App, controller: &Entity<Lib
                     let name: String = name_input.read(cx).value().trim().to_string();
                     if !name.is_empty() {
                         ctl.update(cx, |ctl, cx| {
-                            let _ = ctl.library.ensure_tag(&name);
+                            // Same name under a different parent is still the
+                            // same tag (names stay globally unique); the
+                            // library layer dedupes.
+                            let _ = ctl.library.create_tag(&name, parent);
                             ctl.generation += 1;
                             cx.notify();
                         });

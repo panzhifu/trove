@@ -1,4 +1,5 @@
-//! Tag store: flat, case-insensitively unique labels and their assets.
+//! Tag store: case-insensitively unique labels, nestable via `parent_id`
+//! (a filter on a tag implicitly includes its whole subtree).
 
 use chrono::Utc;
 use rusqlite::Connection;
@@ -9,12 +10,17 @@ use super::rows::{self, req_ts, req_uuid};
 use crate::error::{Error, Result};
 use crate::model::{NewTag, Tag};
 
+/// Column list shared by every tag read; order matches `tag_from_row`.
+const COLS: &str = "id, name, color, created_at, parent_id";
+
 fn tag_from_row(row: &rusqlite::Row) -> Result<Tag> {
     Ok(Tag {
         id: req_uuid(row, 0)?,
         name: row.get::<_, String>(1)?,
         color: row.get::<_, Option<String>>(2)?,
         created_at: req_ts(row, 3)?,
+        // UUIDs are stored as TEXT; parse after reading.
+        parent_id: rows::opt_str(row, 4)?.and_then(|s| Uuid::parse_str(&s).ok()),
     })
 }
 
@@ -24,18 +30,23 @@ pub fn create(conn: &Connection, input: &NewTag) -> Result<Tag> {
     let now = Utc::now();
     rows::execute(
         conn,
-        "INSERT INTO tags (id, name, color, created_at) VALUES (?1, ?2, ?3, ?4)",
+        "INSERT INTO tags (id, name, color, created_at, parent_id) VALUES (?1, ?2, ?3, ?4, ?5)",
         vec![
             rows::uuid(id).into(),
             input.name.trim().to_string().into(),
             rows::bind_opt_str(input.color.as_deref()),
             rows::ts(now).into(),
+            input
+                .parent_id
+                .map(|u| rows::uuid(u).into())
+                .unwrap_or(rusqlite::types::Value::Null),
         ],
     )?;
     Ok(Tag {
         id,
         name: input.name.trim().to_string(),
         color: input.color.clone(),
+        parent_id: input.parent_id,
         created_at: now,
     })
 }
@@ -44,7 +55,7 @@ pub fn create(conn: &Connection, input: &NewTag) -> Result<Tag> {
 pub fn get(conn: &Connection, id: Uuid) -> Result<Option<Tag>> {
     rows::query_one(
         conn,
-        "SELECT id, name, color, created_at FROM tags WHERE id = ?1",
+        &format!("SELECT {COLS} FROM tags WHERE id = ?1"),
         vec![rows::uuid(id).into()],
         tag_from_row,
     )
@@ -54,10 +65,51 @@ pub fn get(conn: &Connection, id: Uuid) -> Result<Option<Tag>> {
 pub fn get_by_name(conn: &Connection, name: &str) -> Result<Option<Tag>> {
     rows::query_one(
         conn,
-        "SELECT id, name, color, created_at FROM tags WHERE name = ?1 COLLATE NOCASE",
+        &format!("SELECT {COLS} FROM tags WHERE name = ?1 COLLATE NOCASE"),
         vec![name.trim().to_string().into()],
         tag_from_row,
     )
+}
+
+/// `id` plus every tag below it (recursive CTE). Filtering or counting a
+/// tag always operates on this subtree.
+pub fn subtree_ids(conn: &Connection, tag_id: Uuid) -> Result<Vec<Uuid>> {
+    rows::query_map(
+        conn,
+        "WITH RECURSIVE sub(id) AS ( \
+             SELECT id FROM tags WHERE id = ?1 \
+             UNION ALL \
+             SELECT t.id FROM tags t JOIN sub s ON t.parent_id = s.id \
+         ) SELECT id FROM sub",
+        vec![rows::uuid(tag_id).into()],
+        |row| req_uuid(row, 0),
+    )
+}
+
+/// Move a tag under `parent` (`None` = root level). Rejects moving a tag
+/// into its own subtree (that would orphan the rest of the tree).
+pub fn move_to(conn: &Connection, tag_id: Uuid, parent: Option<Uuid>) -> Result<()> {
+    if Some(tag_id) == parent {
+        return Err(Error::Validation("a tag cannot be its own parent".into()));
+    }
+    if let Some(pid) = parent
+        && subtree_ids(conn, tag_id)?.contains(&pid)
+    {
+        return Err(Error::Validation(
+            "cannot move a tag under its own descendant".into(),
+        ));
+    }
+    rows::execute(
+        conn,
+        "UPDATE tags SET parent_id = ?1 WHERE id = ?2",
+        vec![
+            parent
+                .map(|u| rows::uuid(u).into())
+                .unwrap_or(rusqlite::types::Value::Null),
+            rows::uuid(tag_id).into(),
+        ],
+    )?;
+    Ok(())
 }
 
 /// Find or create a tag by name, preserving the caller's casing for display.
@@ -74,6 +126,7 @@ pub fn ensure_named(conn: &Connection, name: &str) -> Result<Tag> {
         &NewTag {
             name: name.into(),
             color: None,
+            parent_id: None,
         },
     )
 }
@@ -82,7 +135,7 @@ pub fn ensure_named(conn: &Connection, name: &str) -> Result<Tag> {
 pub fn list(conn: &Connection) -> Result<Vec<Tag>> {
     rows::query_map(
         conn,
-        "SELECT id, name, color, created_at FROM tags ORDER BY name COLLATE NOCASE ASC",
+        &format!("SELECT {COLS} FROM tags ORDER BY name COLLATE NOCASE ASC"),
         vec![],
         tag_from_row,
     )
@@ -92,7 +145,7 @@ pub fn list(conn: &Connection) -> Result<Vec<Tag>> {
 pub fn for_asset(conn: &Connection, asset_id: Uuid) -> Result<Vec<Tag>> {
     rows::query_map(
         conn,
-        "SELECT t.id, t.name, t.color, t.created_at
+        "SELECT t.id, t.name, t.color, t.created_at, t.parent_id
          FROM tags t
          JOIN asset_tag at ON at.tag_id = t.id
          WHERE at.asset_id = ?1
@@ -102,12 +155,23 @@ pub fn for_asset(conn: &Connection, asset_id: Uuid) -> Result<Vec<Tag>> {
     )
 }
 
-/// Number of assets carrying a tag.
+/// Number of assets carrying the tag or any of its descendants (matches
+/// the hierarchical filter semantics).
 pub fn count_assets(conn: &Connection, tag_id: Uuid) -> Result<u64> {
+    let ids = subtree_ids(conn, tag_id)?;
+    if ids.is_empty() {
+        return Ok(0);
+    }
+    // Uuids are hex-only, so quoting is safe.
+    let list = ids
+        .iter()
+        .map(|id| format!("'{}'", id))
+        .collect::<Vec<_>>()
+        .join(",");
     Ok(rows::query_count(
         conn,
-        "SELECT COUNT(*) FROM asset_tag WHERE tag_id = ?1",
-        vec![rows::uuid(tag_id).into()],
+        &format!("SELECT COUNT(DISTINCT asset_id) FROM asset_tag WHERE tag_id IN ({list})"),
+        vec![],
     )? as u64)
 }
 

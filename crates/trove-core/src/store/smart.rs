@@ -3,6 +3,7 @@
 
 use rusqlite::types::Value;
 use serde_json::Value as Json;
+use uuid::Uuid;
 
 use super::assets;
 use super::rows;
@@ -43,22 +44,32 @@ fn compat_insert_match_tag(json: Json) -> Json {
 /// Compile a condition tree into a boolean `WHERE` fragment (no leading
 /// `WHERE`) and its positional parameters. Used both at save time (validation)
 /// and at query time (evaluation).
-pub fn compile(node: &SmartNode) -> Result<(String, Vec<Value>)> {
+/// `conn = None` compiles a validation-only shape (tag matches fall back to
+/// name equality); query evaluation passes the connection so tag matches
+/// can expand to the whole subtree.
+pub fn compile(
+    conn: Option<&rusqlite::Connection>,
+    node: &SmartNode,
+) -> Result<(String, Vec<Value>)> {
     match node {
-        SmartNode::And { children } => join(" AND ", children),
-        SmartNode::Or { children } => join(" OR ", children),
-        SmartNode::Match { field, op, value } => compile_match(*field, *op, value),
+        SmartNode::And { children } => join(conn, " AND ", children),
+        SmartNode::Or { children } => join(conn, " OR ", children),
+        SmartNode::Match { field, op, value } => compile_match(conn, *field, *op, value),
     }
 }
 
-fn join(sep: &str, children: &[SmartNode]) -> Result<(String, Vec<Value>)> {
+fn join(
+    conn: Option<&rusqlite::Connection>,
+    sep: &str,
+    children: &[SmartNode],
+) -> Result<(String, Vec<Value>)> {
     if children.is_empty() {
         return Err(Error::Validation("condition tree must not be empty".into()));
     }
     let mut parts = Vec::new();
     let mut args: Vec<Value> = Vec::new();
     for child in children {
-        let (sql, mut child_args) = compile(child)?;
+        let (sql, mut child_args) = compile(conn, child)?;
         parts.push(format!("({sql})"));
         args.append(&mut child_args);
     }
@@ -66,6 +77,7 @@ fn join(sep: &str, children: &[SmartNode]) -> Result<(String, Vec<Value>)> {
 }
 
 fn compile_match(
+    conn: Option<&rusqlite::Connection>,
     field: SmartField,
     op: SmartCompare,
     value: &Json,
@@ -112,13 +124,39 @@ fn compile_match(
         SmartField::Tag => {
             let s = string_value(value, "tag")?;
             let operator = if op == SmartCompare::Eq { "" } else { "NOT " };
-            Ok((
-                format!(
-                    "{operator}EXISTS (SELECT 1 FROM asset_tag at JOIN tags t ON t.id = at.tag_id \
-                     WHERE at.asset_id = assets.id AND t.name = ? COLLATE NOCASE)"
-                ),
-                vec![s.into()],
-            ))
+            // Hierarchical: matching a tag includes its whole subtree. With
+            // no connection (validation) fall back to name equality.
+            let ids: Vec<Uuid> = match conn {
+                Some(conn) => super::tags::get_by_name(conn, &s)?
+                    .and_then(|t| super::tags::subtree_ids(conn, t.id).ok())
+                    .unwrap_or_default(),
+                None => Vec::new(),
+            };
+            if ids.is_empty() {
+                Ok((
+                    format!(
+                        "{operator}EXISTS (SELECT 1 FROM asset_tag at JOIN tags t ON t.id = at.tag_id \
+                         WHERE at.asset_id = assets.id AND t.name = ? COLLATE NOCASE)"
+                    ),
+                    vec![s.into()],
+                ))
+            } else {
+                // Anonymous `?` placeholders: SQLite numbers them after the
+                // largest explicit index compiled so far, matching the order
+                // the args are appended by `join`.
+                let placeholders = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+                let args: Vec<Value> = ids
+                    .into_iter()
+                    .map(|id| Value::Text(id.to_string()))
+                    .collect();
+                Ok((
+                    format!(
+                        "{operator}EXISTS (SELECT 1 FROM asset_tag at \
+                         WHERE at.asset_id = assets.id AND at.tag_id IN ({placeholders}))"
+                    ),
+                    args,
+                ))
+            }
         }
         SmartField::Text => {
             require_eq(op)?;
@@ -180,7 +218,7 @@ pub fn evaluate_filtered(
     limit: Option<u32>,
     offset: u64,
 ) -> Result<(u64, Vec<uuid::Uuid>)> {
-    let (tree, mut args) = compile(node)?;
+    let (tree, mut args) = compile(Some(conn), node)?;
     // Parenthesize the tree before appending: a compiled `or` group is a
     // bare `a OR b`, and `a OR b AND kind = ?` would let the AND bind to
     // only the last branch.
