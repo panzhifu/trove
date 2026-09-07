@@ -24,7 +24,9 @@ pub fn query_map<T>(
     mut map: impl FnMut(&Row) -> Result<T>,
 ) -> Result<Vec<T>> {
     let mut stmt = conn.prepare(sql).map_err(Error::from)?;
-    let mut rows = stmt.query(rusqlite::params_from_iter(params)).map_err(Error::from)?;
+    let mut rows = stmt
+        .query(rusqlite::params_from_iter(params))
+        .map_err(Error::from)?;
     let mut out = Vec::new();
     loop {
         match rows.next().map_err(Error::from)? {

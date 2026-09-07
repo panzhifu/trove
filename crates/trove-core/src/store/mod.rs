@@ -33,7 +33,9 @@ impl Store {
             std::fs::create_dir_all(parent)?;
         }
         let conn = rusqlite::Connection::open(path)?;
-        let store = Self { conn: Rc::new(RefCell::new(conn)) };
+        let store = Self {
+            conn: Rc::new(RefCell::new(conn)),
+        };
         store.enable_foreign_keys()?;
         store.migrate()?;
         Ok(store)
@@ -42,7 +44,9 @@ impl Store {
     /// Open an in-memory library (tests, throwaway sessions).
     pub fn in_memory() -> Result<Self> {
         let conn = rusqlite::Connection::open_in_memory()?;
-        let store = Self { conn: Rc::new(RefCell::new(conn)) };
+        let store = Self {
+            conn: Rc::new(RefCell::new(conn)),
+        };
         store.enable_foreign_keys()?;
         store.migrate()?;
         Ok(store)
@@ -82,11 +86,7 @@ impl Store {
 
     fn set_user_version(&self, version: i64) -> Result<()> {
         let conn = self.conn();
-        rows::execute(
-            &conn,
-            &format!("PRAGMA user_version = {version}"),
-            vec![],
-        )?;
+        rows::execute(&conn, &format!("PRAGMA user_version = {version}"), vec![])?;
         Ok(())
     }
 
