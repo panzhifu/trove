@@ -186,8 +186,31 @@ fn slim_scrollbars(cx: &mut App) {
     );
 }
 
+/// Initialise the CLIP semantic-search engine from the persisted config.
+/// Best-effort: on any failure (missing model files, missing ONNX Runtime
+/// library) the engine simply stays disabled and the status string reports
+/// why, so the app keeps working with the visual-only backend.
+fn init_semantic_search() {
+    use trove_core::config::AppConfig;
+    use trove_core::media::clip;
+
+    let config = AppConfig::load();
+    if config.search_mode() != "semantic" {
+        return;
+    }
+    let Some(dir) = config.clip_model_dir() else {
+        return;
+    };
+    let image = dir.join("clip-image.onnx");
+    let text = dir.join("clip-text.onnx");
+    if let Err(e) = clip::configure(&image, &text) {
+        eprintln!("[trove] semantic search not available: {e}");
+    }
+}
+
 fn main() {
     i18n::init_from_config();
+    init_semantic_search();
     gpui_kit::application()
         .with_assets(gpui_kit::assets::Assets)
         .run(|cx| {
