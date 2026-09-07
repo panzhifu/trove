@@ -85,6 +85,10 @@ fn build_menus() -> Vec<Menu> {
                 MenuItem::action(rust_i18n::t!("app.redo").to_string(), Redo),
                 MenuItem::separator(),
                 MenuItem::action(rust_i18n::t!("app.paste_import").to_string(), PasteImport),
+                MenuItem::action(
+                    rust_i18n::t!("workspace.batch_rename").to_string(),
+                    BatchRename,
+                ),
             ],
             disabled: false,
         },

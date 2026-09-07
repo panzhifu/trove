@@ -290,6 +290,17 @@ import_running = "Importing… (%{done}/%{total})"
 import_done = "Import finished: %{imported} files added"
 import_done_skipped = "Import finished: %{imported} added, %{skipped} skipped"
 
+[rename]
+title = "Batch Rename"
+pattern = "Pattern"
+pattern_hint = "{n} = number · {name} = original file name"
+start = "Start at"
+preview = "Preview"
+apply = "Rename"
+done = "Renamed %{count} assets"
+failed = "Rename failed: %{error}"
+empty_selection = "Select assets to rename first."
+
 [duplicates]
 title = "Duplicate Files"
 empty = "No duplicates found. Only images with a visual signature participate; newer imports gain signatures shortly after import."

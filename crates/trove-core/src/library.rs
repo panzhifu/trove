@@ -259,6 +259,56 @@ impl Library {
     // Destructive operations that cannot be inverted — purge, empty trash,
     // imports, tag/collection deletes — are deliberately not recorded.
 
+    /// Batch-rename the titles of `ids` (in display order).
+    ///
+    /// `{n}` in `pattern` expands to the running index starting at
+    /// `start_number`; `{name}` expands to the original file stem. Recorded
+    /// as one undoable operation.
+    pub fn batch_rename(&self, ids: &[Uuid], pattern: &str, start_number: u32) -> Result<u64> {
+        let pattern = pattern.trim();
+        if pattern.is_empty() {
+            return Err(crate::Error::Validation(
+                "rename pattern must not be empty".into(),
+            ));
+        }
+        let conn = self.store.conn();
+        let mut before: Vec<(Uuid, Option<String>)> = Vec::with_capacity(ids.len());
+        let mut after: Vec<(Uuid, Option<String>)> = Vec::with_capacity(ids.len());
+        let mut n = start_number;
+        for id in ids {
+            let Some(asset) = assets::get(conn, *id)? else {
+                continue;
+            };
+            let stem = std::path::Path::new(&asset.file_name)
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or(&asset.file_name)
+                .to_string();
+            let title = pattern
+                .replace("{n}", &n.to_string())
+                .replace("{name}", &stem);
+            before.push((*id, asset.title.clone()));
+            after.push((*id, Some(title)));
+            n += 1;
+        }
+        let count = after.len() as u64;
+        if count == 0 {
+            return Ok(0);
+        }
+        for (id, title) in &after {
+            assets::update(
+                conn,
+                *id,
+                &crate::model::AssetPatch {
+                    title: Some(title.clone()),
+                    ..Default::default()
+                },
+            )?;
+        }
+        self.undo.record(Op::SetTitles { before, after });
+        Ok(count)
+    }
+
     /// Group live assets with identical content (SHA-256). The UI offers
     /// per-group cleanup; trashing one member is ordinary (undoable) trash.
     pub fn find_duplicates(&self) -> Result<Vec<crate::store::assets::DuplicateGroup>> {
@@ -654,7 +704,7 @@ impl Library {
 mod tests {
     use super::Library;
     use crate::media::thumb;
-    use crate::model::{AssetKind, AssetQuery, NewCollection, NewSmartCollection};
+    use crate::model::{AssetKind, AssetPatch, AssetQuery, NewCollection, NewSmartCollection};
     use crate::store::{assets, collections, tags};
     use std::path::{Path, PathBuf};
     use uuid::Uuid;
@@ -1192,5 +1242,40 @@ mod tests {
 
     fn lib_trash(store: &crate::store::Store, id: Uuid) {
         crate::store::assets::set_trashed(store.conn(), id, true).unwrap();
+    }
+    #[test]
+    fn batch_rename_rewrites_titles_and_undoes_once() {
+        let (lib, dir) = temp_library("batch-rename");
+        let a = write_source(&dir, "alpha.png", PNG_1X1);
+        // Different content: identical imports dedup to one record.
+        let b = write_source(&dir, "beta.txt", b"beta");
+        let ra = lib.import_files(std::slice::from_ref(&a), None).unwrap();
+        let rb = lib.import_files(std::slice::from_ref(&b), None).unwrap();
+        let ids = [ra.imported[0].asset_id, rb.imported[0].asset_id];
+
+        let count = lib.batch_rename(&ids, "trip-{n} {name}", 2).unwrap();
+        assert_eq!(count, 2);
+        let conn = lib.store().conn();
+        assert_eq!(
+            assets::get(conn, ids[0]).unwrap().unwrap().title.as_deref(),
+            Some("trip-2 alpha")
+        );
+        assert_eq!(
+            assets::get(conn, ids[1]).unwrap().unwrap().title.as_deref(),
+            Some("trip-3 beta")
+        );
+
+        // One undo restores both original titles.
+        lib.undo().unwrap();
+        assert_eq!(
+            assets::get(conn, ids[0]).unwrap().unwrap().title.as_deref(),
+            None
+        );
+        assert_eq!(
+            assets::get(conn, ids[1]).unwrap().unwrap().title.as_deref(),
+            None
+        );
+        // Empty pattern is rejected.
+        assert!(lib.batch_rename(&ids, "  ", 1).is_err());
     }
 }
