@@ -41,16 +41,9 @@ pub fn load(path: &Path) -> Result<()> {
     let text = std::fs::read_to_string(path)
         .map_err(|e| Error::Db(format!("read vocab {}: {e}", path.display())))?;
     let mut lines = text.lines();
-    // First line is a "#version: ..." header.
-    match lines.next() {
-        Some(l) if l.starts_with("#version") => {}
-        _ => {
-            return Err(Error::Db(format!(
-                "vocab {}: missing #version header",
-                path.display()
-            )))
-        }
-    }
+    // Skip the header line unconditionally — the published file embeds the
+    // filename before "#version", and OpenAI's own loader never validates it.
+    lines.next();
     // CLIP reads merges[1 : 49156 - 256 - 2 + 1] of the raw split (the header
     // line included), i.e. the first 48 896 merge lines.
     let merges: Vec<(String, String)> = lines
@@ -278,5 +271,32 @@ mod tests {
         assert_eq!((ids[0], ids[1], ids[2]), (SOT, EOT, 0));
         assert_eq!(mask[1], 1);
         assert_eq!(mask[2], 0);
+    }
+
+    /// Sanity check against the REAL CLIP vocab when it is installed in the
+    /// default model directory (skipped elsewhere). Verifies the published
+    /// file's odd header line parses and classic tokens get stable ids.
+    #[test]
+    fn real_vocab_if_present() {
+        let Some(dir) = crate::config::AppConfig::config_dir() else {
+            return;
+        };
+        let path = vocab_path(&dir.join("models"));
+        if !path.is_file() {
+            return; // vocab not installed on this machine — skip quietly
+        }
+        load(&path).unwrap();
+        for text in ["a photo of a tree", "tree", "一棵树"] {
+            let (ids, mask) = encode(text).unwrap();
+            assert_eq!(ids[0], SOT, "{text}");
+            assert_eq!(mask[0], 1, "{text}");
+            let eot = ids.iter().position(|&i| i == EOT).unwrap();
+            assert!(eot > 1, "{text}: expected at least one content token");
+            assert!(ids[eot + 1..].iter().all(|&i| i == 0), "{text}");
+        }
+        // Stability: identical text → identical ids (classic CLIP anchors).
+        let (a, _) = encode("a photo of a tree").unwrap();
+        let (b, _) = encode("a photo of a tree").unwrap();
+        assert_eq!(a, b);
     }
 }
