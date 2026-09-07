@@ -67,6 +67,11 @@ fn build_menus() -> Vec<Menu> {
                     FindDuplicates,
                 ),
                 MenuItem::separator(),
+                MenuItem::action(
+                    rust_i18n::t!("app.export_media_package").to_string(),
+                    ExportMediaPackage,
+                ),
+                MenuItem::separator(),
                 MenuItem::action(rust_i18n::t!("app.settings").to_string(), OpenSettings),
             ],
             disabled: false,

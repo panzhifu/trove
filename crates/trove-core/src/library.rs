@@ -72,6 +72,27 @@ pub struct MetadataImportReport {
     pub skipped: u64,
 }
 
+/// Outcome of [`Library::export_media_package`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct MediaExportReport {
+    /// The package directory written.
+    pub path: PathBuf,
+    /// Blobs copied.
+    pub files: u64,
+    /// Sum of copied blob sizes.
+    pub bytes: u64,
+}
+
+/// Outcome of [`Library::import_media_package`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MediaImportReport {
+    pub metadata: MetadataImportReport,
+    /// Media files imported through the regular importer.
+    pub imported: u64,
+    /// Media files skipped by the importer (e.g. duplicates).
+    pub skipped: u64,
+}
+
 #[derive(serde::Deserialize)]
 struct ExportFile {
     #[serde(default)]
@@ -126,6 +147,21 @@ fn insert_collection_tree(
     map.insert(coll.id, created.id);
     report.collections += 1;
     Some(created.id)
+}
+
+/// Recursively collect files below `dir`.
+fn collect_files(dir: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_files(&path, out);
+        } else if path.is_file() {
+            out.push(path);
+        }
+    }
 }
 
 /// Outcome of permanently deleting a batch of assets.
@@ -403,6 +439,69 @@ impl Library {
         }
         self.undo.record(Op::SetTitles { before, after });
         Ok(count)
+    }
+
+    /// Export a portable *media package*: `trove-export.json` (full
+    /// metadata) plus a `media/` tree with every live blob. The package is a
+    /// plain directory — copyable, zip-able, restorable via
+    /// [`Self::import_media_package`].
+    pub fn export_media_package(&self, dest_parent: &Path) -> Result<MediaExportReport> {
+        let stamp = chrono::Utc::now().format("%Y%m%d-%H%M%S");
+        let pkg = dest_parent.join(format!("trove-media-{stamp}"));
+        std::fs::create_dir_all(pkg.join("media"))?;
+
+        let json = self.export_metadata()?;
+        std::fs::write(pkg.join("trove-export.json"), json)?;
+
+        let conn = self.store.conn();
+        let (_, live) = assets::query(conn, &crate::model::AssetQuery::default())?;
+        let mut files = 0u64;
+        let mut bytes = 0u64;
+        for asset in &live {
+            let Some(rel) = &asset.rel_path else { continue };
+            let src = self.root.join(rel);
+            if !src.is_file() {
+                continue;
+            }
+            let dst = pkg.join(rel);
+            if let Some(parent) = dst.parent() {
+                std::fs::create_dir_all(parent).ok();
+            }
+            std::fs::copy(&src, &dst)?;
+            files += 1;
+            bytes += asset.size_bytes;
+        }
+        Ok(MediaExportReport {
+            path: pkg,
+            files,
+            bytes,
+        })
+    }
+
+    /// Restore a media package created by [`Self::export_media_package`]:
+    /// the metadata first (placeholders + organization), then the media
+    /// files through the regular importer — content addressing matches each
+    /// blob to its placeholder record, so records heal automatically.
+    pub fn import_media_package(&self, pkg: &Path) -> Result<MediaImportReport> {
+        let json = std::fs::read_to_string(pkg.join("trove-export.json")).map_err(|_| {
+            crate::Error::Validation("not a media package (trove-export.json missing)".into())
+        })?;
+        let metadata = self.import_metadata(&json)?;
+
+        let mut files: Vec<PathBuf> = Vec::new();
+        collect_files(&pkg.join("media"), &mut files);
+        let mut imported = 0u64;
+        let mut skipped = 0u64;
+        if !files.is_empty() {
+            let report = self.import_files(&files, None)?;
+            imported = report.imported_count() as u64;
+            skipped = report.skipped_count() as u64;
+        }
+        Ok(MediaImportReport {
+            metadata,
+            imported,
+            skipped,
+        })
     }
 
     /// Group live assets with identical content (SHA-256). The UI offers
@@ -1771,5 +1870,64 @@ mod tests {
         let (total, page) = assets::query(lib.store().conn(), &q).unwrap();
         assert_eq!((total, page.len()), (1, 1));
         assert_eq!(page[0].file_name, "b.txt");
+    }
+    #[test]
+    fn media_package_roundtrip() {
+        let (lib, dir) = temp_library("pkg-export");
+        let a = write_source(&dir, "alpha.png", PNG_1X1);
+        let b = write_source(&dir, "beta.txt", b"beta");
+        let ra = lib.import_files(std::slice::from_ref(&a), None).unwrap();
+        let rb = lib.import_files(std::slice::from_ref(&b), None).unwrap();
+        let (ia, ib) = (ra.imported[0].asset_id, rb.imported[0].asset_id);
+        let coll = collections::create(
+            lib.store().conn(),
+            &crate::model::NewCollection {
+                parent_id: None,
+                name: "Trip".into(),
+                position: 0,
+            },
+        )
+        .unwrap();
+        lib.add_assets_to_collection(coll.id, &[ia, ib]).unwrap();
+        let tag = lib.ensure_tag("sunset").unwrap();
+        lib.tag_assets(&[ia], tag.id, true).unwrap();
+
+        // Export the package.
+        let dest = dir.join("packages");
+        let report = lib.export_media_package(&dest).unwrap();
+        assert_eq!(report.files, 2);
+        assert!(report.path.join("trove-export.json").is_file());
+        let media_root = report.path.join("media");
+        assert!(media_root.is_dir());
+        let mut blob_count = 0;
+        for entry in walk_media(&media_root) {
+            if entry.is_file() {
+                blob_count += 1;
+            }
+        }
+        assert_eq!(blob_count, 2);
+
+        // Restore into a fresh library: real blobs, not placeholders.
+        let (other, _) = temp_library("pkg-import");
+        let imported = other.import_media_package(&report.path).unwrap();
+        assert_eq!(imported.metadata.assets_placeholder, 2);
+        assert_eq!(imported.imported, 2);
+        let conn = other.store().conn();
+        let (_, restored) = assets::query(conn, &AssetQuery::default()).unwrap();
+        assert_eq!(restored.len(), 2);
+        assert!(restored.iter().all(|x| x.rel_path.is_some()));
+        // Membership + tags survived.
+        let image = restored
+            .iter()
+            .find(|x| x.kind == AssetKind::Image)
+            .unwrap();
+        assert_eq!(tags::for_asset(conn, image.id).unwrap().len(), 1);
+        let _ = (ia, ib);
+    }
+
+    fn walk_media(dir: &Path) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        super::collect_files(dir, &mut out);
+        out
     }
 }
