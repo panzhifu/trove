@@ -81,9 +81,6 @@ pub struct LibraryController {
     /// A maintenance / library job is running; Settings buttons refuse to
     /// start a second one until it finishes.
     pub busy: bool,
-    /// When true, the workspace search box performs semantic (CLIP) search
-    /// instead of FTS over titles/descriptions/tags.
-    pub semantic_search: bool,
 }
 
 impl LibraryController {
@@ -108,7 +105,6 @@ impl LibraryController {
             grid_loaded: GRID_PAGE_SIZE,
             notice: None,
             busy: false,
-            semantic_search: false,
         }
     }
 
@@ -278,24 +274,6 @@ impl LibraryController {
         self.generation += 1;
     }
 
-    /// Toggle semantic (CLIP) search on/off for the workspace search box.
-    pub fn toggle_semantic_search(&mut self) {
-        self.semantic_search = !self.semantic_search;
-        self.generation += 1;
-    }
-
-    /// Run a semantic (CLIP) text query against stored image embeddings.
-    /// Returns the matching assets best-first, or an error (engine not
-    /// configured, model failure, ...). The similarity threshold comes from
-    /// the persisted config.
-    pub fn semantic_text_search(
-        &self,
-        query: &str,
-        limit: Option<u32>,
-    ) -> std::result::Result<Vec<trove_core::model::Asset>, trove_core::error::Error> {
-        let threshold = trove_core::config::AppConfig::load().semantic_min_similarity();
-        self.library.semantic_text_search(query, threshold, limit)
-    }
 
     /// The primary (last-clicked) selected asset.
     pub fn primary(&self) -> Option<Uuid> {
