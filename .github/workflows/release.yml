@@ -78,7 +78,7 @@ jobs:
         run: |
           cd target/${{ matrix.target }}/release
           if [[ "${{ matrix.target }}" == *windows* ]]; then
-            zip -r ../../../${{ matrix.asset_name }}.zip trove-app.exe
+            7z a ../../../${{ matrix.asset_name }}.zip trove-app.exe
           else
             zip -r ../../../${{ matrix.asset_name }}.zip trove-app
           fi
