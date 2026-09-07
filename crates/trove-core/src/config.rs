@@ -53,6 +53,12 @@ pub struct AppConfig {
     /// configured; `false` pauses the watcher without losing the list.
     #[serde(default)]
     pub watch_folders_enabled: Option<bool>,
+    /// Local collect service (127.0.0.1 HTTP inbox). On by default.
+    #[serde(default)]
+    pub collect_enabled: Option<bool>,
+    /// Collect service port. Defaults to [`crate::collect::DEFAULT_PORT`].
+    #[serde(default)]
+    pub collect_port: Option<u16>,
 }
 
 /// How many recent-library entries to remember.
@@ -122,6 +128,16 @@ impl AppConfig {
     /// Whether the folder watcher should run (on by default).
     pub fn watch_folders_enabled(&self) -> bool {
         self.watch_folders_enabled.unwrap_or(true)
+    }
+
+    /// Whether the local collect service should listen (on by default).
+    pub fn collect_enabled(&self) -> bool {
+        self.collect_enabled.unwrap_or(true)
+    }
+
+    /// Effective collect-service port.
+    pub fn collect_port(&self) -> u16 {
+        self.collect_port.unwrap_or(crate::collect::DEFAULT_PORT)
     }
 
     /// Add a watched folder (deduplicated) and persist.

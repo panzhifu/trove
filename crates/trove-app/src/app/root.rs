@@ -90,6 +90,7 @@ impl AppView {
         cx.observe(&controller, |_, _, cx| cx.notify()).detach();
 
         spawn_folder_watcher(controller.clone(), window.window_handle(), cx);
+        start_collect_server(cx);
 
         Self {
             controller,
@@ -452,6 +453,11 @@ fn spawn_folder_watcher(
         loop {
             cx.background_executor().timer(WATCH_POLL_INTERVAL).await;
             let config = AppConfig::load();
+            // Collect-service inbox first: files land there from the local
+            // HTTP server (extension / curl) and import with their source.
+            let _ = handle.update(cx, |_view, window, cx| {
+                crate::library::jobs::collect_inbox_app(&controller, window, cx)
+            });
             if !config.watch_folders_enabled() {
                 continue;
             }
@@ -491,4 +497,23 @@ fn spawn_folder_watcher(
         }
     })
     .detach();
+}
+
+/// Boot the local collect service (127.0.0.1). The server thread only
+/// writes files into the inbox dir; the watcher loop imports them.
+fn start_collect_server(_cx: &mut Context<AppView>) {
+    let config = AppConfig::load();
+    if !config.collect_enabled() {
+        return;
+    }
+    match trove_core::collect::spawn_server(config.collect_port()) {
+        Some(port) => {
+            let _ = port;
+        }
+        None => {
+            // Port taken (another instance?) — surfacing it would block
+            // startup on a non-fatal condition; the next watcher cycle
+            // still drains any inbox files the other instance wrote.
+        }
+    }
 }

@@ -83,6 +83,7 @@ fn general_page(controller: &Entity<LibraryController>) -> SettingPage {
         )
         .group(recent_libraries_group(&controller))
         .group(watch_folders_group())
+        .group(collect_group())
         .group(stats_group(&controller))
 }
 
@@ -258,6 +259,62 @@ fn add_watch_folder_row(_cx: &mut App) -> Div {
                     }
                 })
                 .detach();
+            }),
+    )
+}
+
+// ============================ collect service ================================
+
+/// General ▸ Collect service: the local HTTP endpoint a browser extension
+/// (or curl) posts files to; they import automatically via the inbox.
+fn collect_group() -> SettingGroup {
+    let config = AppConfig::load();
+    let enabled = config.collect_enabled();
+    let port = config.collect_port();
+    SettingGroup::new()
+        .title(rust_i18n::t!("settings.collect").to_string())
+        .item(SettingItem::new(
+            rust_i18n::t!("settings.collect_enabled").to_string(),
+            SettingField::render(move |_, _, cx| collect_toggle_row(enabled, cx)),
+        ))
+        .item(SettingItem::new(
+            rust_i18n::t!("settings.collect_endpoint").to_string(),
+            SettingField::render(move |_, _, cx| {
+                div()
+                    .text_sm()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(format!("http://127.0.0.1:{port}"))
+            }),
+        ))
+        .item(SettingItem::new(
+            rust_i18n::t!("settings.collect_example").to_string(),
+            SettingField::render(|_, _, cx| {
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(rust_i18n::t!("settings.collect_example_cmd").to_string())
+            }),
+        ))
+}
+
+/// The collect master-switch row.
+fn collect_toggle_row(enabled: bool, _cx: &mut App) -> Div {
+    h_flex().w_full().justify_end().child(
+        Button::new("collect-toggle")
+            .outline()
+            .small()
+            .label(if enabled {
+                rust_i18n::t!("settings.collect_on").to_string()
+            } else {
+                rust_i18n::t!("settings.collect_off").to_string()
+            })
+            .on_click(|_, _, cx| {
+                let mut config = AppConfig::load();
+                config.collect_enabled = Some(!config.collect_enabled());
+                let _ = config.save();
+                // The server thread and watcher re-read the config each
+                // cycle; toggling needs a restart to (un)bind the port.
+                cx.refresh_windows();
             }),
     )
 }
