@@ -2016,7 +2016,12 @@ fn open_image_search(
             .title(rust_i18n::t!("workspace.search_results").to_string() + ": " + &title)
             .width(px(520.))
             .child(
+                // Fixed-height column: the count line on top, and a flex-1
+                // scrollable list below (the scroll container must be height
+                // bounded for `overflow_y_scrollbar` to engage).
                 v_flex()
+                    .w_full()
+                    .h(px(440.))
                     .gap_2()
                     .child(
                         div()
@@ -2032,7 +2037,8 @@ fn open_image_search(
                     )
                     .child(
                         div()
-                            .max_h(px(420.))
+                            .flex_1()
+                            .min_h_0()
                             .overflow_y_scrollbar()
                             .child(v_flex().gap_0p5().children(rows)),
                     ),
