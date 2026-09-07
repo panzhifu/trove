@@ -198,12 +198,10 @@ fn init_semantic_search() {
     if config.search_mode() != "semantic" {
         return;
     }
-    let Some(dir) = config.clip_model_dir() else {
+    let Some(model) = config.clip_model_path() else {
         return;
     };
-    let image = dir.join("clip-image.onnx");
-    let text = dir.join("clip-text.onnx");
-    if let Err(e) = clip::configure(&image, &text) {
+    if let Err(e) = clip::configure(&model) {
         eprintln!("[trove] semantic search not available: {e}");
     }
 }

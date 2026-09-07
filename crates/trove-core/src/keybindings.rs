@@ -117,7 +117,7 @@ mod tests {
         let defaults = default_keybindings();
         assert!(!defaults.is_empty());
         // Each action should be unique.
-        let mut actions: Vec<&str> = defaults.iter().map(|d| d.action).collect();
+        let actions: Vec<&str> = defaults.iter().map(|d| d.action).collect();
         let mut dedup = actions.clone();
         dedup.sort();
         dedup.dedup();
