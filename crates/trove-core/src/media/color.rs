@@ -14,7 +14,7 @@ use image::GenericImageView;
 const GRID: u32 = 24;
 
 /// How many entries a returned palette may have.
-pub const MAX_COLORS: usize = 8;
+pub const MAX_COLORS: usize = 12;
 
 /// Return the most common colors of the image at `path`, most->least frequent,
 /// as `#rrggbb` hex strings (quantized to 3 bits per channel). Empty when the
