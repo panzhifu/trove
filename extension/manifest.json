@@ -1,0 +1,11 @@
+{
+  "manifest_version": 3,
+  "name": "Trove Collector",
+  "version": "1.0.0",
+  "description": "Save images from any website straight into your local Trove asset library.",
+  "permissions": ["contextMenus", "storage", "notifications"],
+  "host_permissions": ["<all_urls>"],
+  "background": { "service_worker": "background.js" },
+  "action": { "default_popup": "popup.html", "default_title": "Trove Collector" },
+  "icons": {}
+}
