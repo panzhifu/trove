@@ -47,18 +47,12 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            libsqlite3-dev libssl-dev pkg-config \
             libxcb1-dev libxkbcommon-dev libxkbcommon-x11-dev
 
       - name: cargo fmt --check
         run: cargo fmt --all -- --check
 
-      - name: Install build tools (Windows)
-        if: runner.os == 'Windows'
-        run: choco install cmake ninja -y
-
       - name: clippy
-        if: runner.os != 'Windows'
         run: cargo clippy --workspace --all-targets
 
       - name: Build
