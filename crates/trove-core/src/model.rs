@@ -227,12 +227,14 @@ impl NewCollection {
 // Tag
 // ---------------------------------------------------------------------------
 
-/// A flat, deduplicated (case-insensitive) descriptive label.
+/// A case-insensitively unique descriptive label. Tags may nest
+/// (`parent_id`): filtering by a tag implicitly includes its whole subtree.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Tag {
     pub id: Uuid,
     pub name: String,
     pub color: Option<String>,
+    pub parent_id: Option<Uuid>,
     pub created_at: DateTime<Utc>,
 }
 
@@ -240,6 +242,7 @@ pub struct Tag {
 pub struct NewTag {
     pub name: String,
     pub color: Option<String>,
+    pub parent_id: Option<Uuid>,
 }
 
 impl NewTag {
@@ -300,7 +303,7 @@ impl NewSmartCollection {
                 "smart collection name exceeds {MAX_NAME_LEN} characters"
             )));
         }
-        crate::store::smart::compile(&crate::store::smart::node_from_json(&self.query)?)?;
+        crate::store::smart::compile(None, &crate::store::smart::node_from_json(&self.query)?)?;
         Ok(())
     }
 }

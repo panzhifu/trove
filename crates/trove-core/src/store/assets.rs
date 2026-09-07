@@ -120,7 +120,7 @@ pub fn search(conn: &Connection, text: &str, q: &AssetQuery) -> Result<(u64, Vec
     // LIKE clause from the compound filters.
     let mut filtered = q.clone();
     filtered.text = None;
-    let (where_sql, args) = build_where(&filtered);
+    let (where_sql, args) = build_where(conn, &filtered)?;
 
     // Exclude assets the compound filters reject by intersecting with the
     // ranked id set, then slice.
@@ -259,7 +259,7 @@ fn nullable_or_empty(v: Option<&str>) -> Value {
 
 /// List assets matching `query`. Returns `(total_matching, page)`.
 pub fn query(conn: &Connection, q: &AssetQuery) -> Result<(u64, Vec<Asset>)> {
-    let (where_sql, mut args) = build_where(q);
+    let (where_sql, mut args) = build_where(conn, q)?;
     let total = rows::query_count(
         conn,
         &format!("SELECT COUNT(*) FROM assets {where_sql}"),
@@ -576,7 +576,7 @@ fn asset_values(a: &Asset) -> Vec<Value> {
     ]
 }
 
-fn build_where(q: &AssetQuery) -> (String, Vec<Value>) {
+fn build_where(conn: &Connection, q: &AssetQuery) -> Result<(String, Vec<Value>)> {
     let mut conds: Vec<String> = Vec::new();
     let mut args: Vec<Value> = Vec::new();
 
@@ -612,13 +612,15 @@ fn build_where(q: &AssetQuery) -> (String, Vec<Value>) {
         args.push(rows::uuid(cid).into());
     }
     if !q.tag_ids.is_empty() {
-        // The asset must carry every requested tag.
+        // The asset must carry every requested tag; a tag implicitly
+        // includes its whole subtree (hierarchical tags).
         for tag in &q.tag_ids {
-            let ix = args.len() + 1;
+            let subtree = crate::store::tags::subtree_ids(conn, *tag)?;
+            let (in_sql, mut in_args) = id_list("t.tag_id", &subtree);
             conds.push(format!(
-                "EXISTS (SELECT 1 FROM asset_tag t WHERE t.asset_id = assets.id AND t.tag_id = ?{ix})"
+                "EXISTS (SELECT 1 FROM asset_tag t WHERE t.asset_id = assets.id AND {in_sql})"
             ));
-            args.push(rows::uuid(*tag).into());
+            args.append(&mut in_args);
         }
     }
     if let Some(fav) = q.is_favorite {
@@ -640,7 +642,16 @@ fn build_where(q: &AssetQuery) -> (String, Vec<Value>) {
     } else {
         format!("WHERE {}", conds.join(" AND "))
     };
-    (where_sql, args)
+    Ok((where_sql, args))
+}
+
+/// `col IN (?, ?, …)` over a uuid list (each id one parameter).
+fn id_list(col: &str, ids: &[Uuid]) -> (String, Vec<Value>) {
+    let placeholders: Vec<String> = (1..=ids.len()).map(|ix| format!("?{ix}")).collect();
+    (
+        format!("{col} IN ({})", placeholders.join(",")),
+        ids.iter().map(|id| rows::uuid(*id).into()).collect(),
+    )
 }
 
 fn parse_extra(s: &str) -> Result<BTreeMap<String, Json>> {
