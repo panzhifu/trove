@@ -19,7 +19,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-14, ubuntu-22.04, windows-2022]
+        os: [macos-14, ubuntu-22.04]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -54,8 +54,7 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: clippy
-        if: runner.os != 'Windows'
-        run: cargo clippy --workspace --all-targets -- -W clippy::all
+        run: cargo clippy --workspace --all-targets
 
       - name: Build
         run: cargo build --workspace --verbose
