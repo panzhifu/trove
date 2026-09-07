@@ -23,3 +23,5 @@ rayon = { workspace = true }
 ort = { workspace = true }
 regex = "1"
 ureq = { workspace = true }
+resvg = { workspace = true }
+psd = { workspace = true }

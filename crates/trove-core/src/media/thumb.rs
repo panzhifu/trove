@@ -81,11 +81,65 @@ fn write_video_thumb(blob_path: &Path, out: &Path) -> Option<PathBuf> {
     Some(out.to_path_buf())
 }
 
+/// Decode an image blob: the `image` crate handles raster formats; SVG is
+/// rendered via resvg and PSD composites via the psd crate (both store
+/// vector/layer data the raster decoder cannot read).
+fn decode_image(blob_path: &Path) -> Option<image::DynamicImage> {
+    let ext = blob_path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .unwrap_or_default();
+    match ext.as_str() {
+        "svg" => render_svg(blob_path),
+        "psd" => render_psd(blob_path),
+        _ => image::open(blob_path).ok(),
+    }
+}
+
+/// Rasterize an SVG at its intrinsic size, capped at [`THUMB_MAX`].
+fn render_svg(path: &Path) -> Option<image::DynamicImage> {
+    let bytes = std::fs::read(path).ok()?;
+    let mut options = resvg::usvg::Options::default();
+    let mut fontdb = resvg::usvg::fontdb::Database::new();
+    fontdb.load_system_fonts();
+    options.fontdb = std::sync::Arc::new(fontdb);
+    let tree = resvg::usvg::Tree::from_data(&bytes, &options).ok()?;
+    let size = tree.size();
+    let (w, h) = (size.width().ceil() as f32, size.height().ceil() as f32);
+    if w <= 0.0 || h <= 0.0 {
+        return None;
+    }
+    let scale = (THUMB_MAX as f32 / w.max(h)).min(1.0);
+    let (tw, th) = ((w * scale).max(1.0) as u32, (h * scale).max(1.0) as u32);
+    let mut pixmap = resvg::tiny_skia::Pixmap::new(tw, th)?;
+    resvg::render(
+        &tree,
+        resvg::tiny_skia::Transform::from_scale(tw as f32 / w, th as f32 / h),
+        &mut pixmap.as_mut(),
+    );
+    let png = pixmap.encode_png().ok()?;
+    image::load_from_memory(&png).ok()
+}
+
+/// Composite a PSD to RGBA (uses the embedded flattened preview, which
+/// Photoshop and GIMP write by default; falls back to compositing layers).
+fn render_psd(path: &Path) -> Option<image::DynamicImage> {
+    let bytes = std::fs::read(path).ok()?;
+    let psd = psd::Psd::from_bytes(&bytes).ok()?;
+    let rgba = if psd.layers().is_empty() {
+        psd.rgba()
+    } else {
+        psd.flatten_layers_rgba(&|_| true).ok()?
+    };
+    image::RgbaImage::from_raw(psd.width(), psd.height(), rgba).map(image::DynamicImage::ImageRgba8)
+}
+
 /// Decode `blob_path` and atomically write its downscaled JPEG to `out`
 /// (via a temporary file + rename). Missing/corrupt thumbs never fail the
 /// caller — they mean "no thumbnail yet".
 fn write_thumb(blob_path: &Path, out: &Path) -> Option<PathBuf> {
-    let image = image::open(blob_path).ok()?;
+    let image = decode_image(blob_path)?;
     let (w, h) = image.dimensions();
     if w == 0 || h == 0 {
         return None;

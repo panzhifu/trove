@@ -1720,4 +1720,28 @@ mod tests {
         assert_eq!(cat_after.parent_id, None);
         let _ = collections::roots(conn);
     }
+    #[test]
+    fn svg_import_mines_dims_and_thumbnail() {
+        let (lib, dir) = temp_library("svg");
+        let svg = write_source(
+            &dir,
+            "vector.svg",
+            br##"<svg xmlns="http://www.w3.org/2000/svg" width="640" height="480" viewBox="0 0 640 480">
+                   <rect width="640" height="480" fill="#ff8000"/>
+                 </svg>"##,
+        );
+        let report = lib.import_files(std::slice::from_ref(&svg), None).unwrap();
+        let asset = {
+            let conn = lib.store().conn();
+            assets::get(conn, report.imported[0].asset_id)
+                .unwrap()
+                .unwrap()
+        };
+        assert_eq!(asset.kind, AssetKind::Image);
+        assert_eq!(asset.width, Some(640));
+        assert_eq!(asset.height, Some(480));
+        // The rendered thumbnail is on disk.
+        let thumb = thumb::abs_path(lib.root(), asset.sha256.as_deref().unwrap());
+        assert!(thumb.is_file(), "svg thumbnail missing");
+    }
 }
