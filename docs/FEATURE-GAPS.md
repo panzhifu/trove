@@ -60,8 +60,8 @@
 
 | # | 功能 | 现状 | 竞品参照 | 优先级 |
 |---|---|---|---|---|
-| 1 | RAW（CR2/NEF/ARW/DNG）、HEIC/HEIF、AVIF、JPEG-XL 缩略图 | 无 | XnView 500+、digiKam 全流程 | **P1** |
-| 2 | SVG/PSD/AI/EPS/CDR 等设计格式预览 | SVG 走浏览器能力未做，PSD 系列无 | Eagle/Billfish 核心格式 | **P1** |
+| 1 | RAW（CR2/NEF/ARW/DNG）、HEIC/HEIF、AVIF、JPEG-XL 缩略图 | 无 | XnView 500+、digiKam 全流程 | P2（RAW 建议 rawler，HEIC 需 C 库 libheif，工程量大） |
+| 2 | SVG/PSD/AI/EPS/CDR 等设计格式预览 | **SVG/PSD 已实现**（resvg 渲染 + psd 合成，导入即生成缩略图与尺寸） | Eagle/Billfish 核心格式 | ✅（AI/EPS/CDR 仍缺 → P2） |
 | 3 | 视频播放/逐帧/音频波形预览 | 仅静态海报 | Eagle/Billfish | P2 |
 | 4 | GIF/WebP/APNG 动图播放 | 静态首帧 | TagStudio/XnView | P2 |
 | 5 | 3D 模型查看（OBJ/FBX/GLB） | 无 | Eagle 4 内置查看器 | P3 |
@@ -77,7 +77,7 @@
 | 3 | 对比视图（Light Table，2–4 图并排挑图） | 无 | digiKam/XnView 4 图对比 | P2 |
 | 4 | 地图/地理位置（EXIF GPS 反查地名） | 无 | digiKam/PhotoPrism/Immich | P3 |
 | 5 | 时刻/回忆自动聚合（按日期地点分组） | 无 | PhotoPrism Moments/Immich | P3 |
-| 6 | 文件夹面板（按来源目录浏览） | 无 | Eagle/Billfish/TagStudio | P1 |
+| 6 | 文件夹面板（按来源目录浏览） | **已实现**（导入记录来源路径；左栏 Folders 树形浏览，点击筛选子树） | Eagle/Billfish/TagStudio | ✅ |
 | 7 | 智能集合支持更多字段（捕获日期、宽高比、方向） | 已有 8 种字段 | Bridge/IMatch | P2 |
 | 8 | 搜索语法（path:/filetype: 等操作符） | 纯 FTS | TagStudio | P3 |
 | 9 | 最近查看历史 | 无 | Eagle | P3 |
@@ -173,8 +173,18 @@
 | 层级标签 | 标签父子树（schema v6）：面板树形展示 + 新建子标签；筛选/计数/智能集合自动包含子树；环检测；删除父标签子级晋升；撤销支持 |
 | 本地采集服务 | `http://127.0.0.1:23916`：`POST /add`（字节+来源）、`POST /fetch`（服务端抓取 URL）；文件落 inbox 自动入库并回填 `source_url`，为浏览器扩展铺路 |
 
+## 四点八、第三批实现（2026-09-08 续）
+
+| 功能 | 说明 |
+|---|---|
+| 设置对话框关闭修复 | gpui-kit 浮层 X 的点击被 backdrop 拖拽区/动作路由吞掉；自绘面板内 X + 命令式 `window.close_dialog`（所有对话框） |
+| SVG / PSD 缩略图 | resvg 渲染 SVG（含系统字体文本）、psd 合成复合图；导入时挖掘 SVG viewBox / PSD 画布尺寸 |
+| 来源文件夹面板 | 导入记录 `extra.source_path`；左栏新增 Folders 标签页，树形浏览 + 前缀筛选（可撤销语义无关，纯过滤） |
+| 媒体打包导出/还原 | File ▸ 导出媒体包…：目录包（trove-export.json + media/ blobs）；导入素材库… 同时接受 JSON 导出与目录包，还原时按内容寻址自愈 |
+| 浏览器扩展 | `extension/`：MV3 右键「Save image to Trove」/ 链接保存，直连本地采集服务；弹出页可改端口、测试连接 |
+
 ## 五、路线图建议
 
-- **下一迭代**：RAW/HEIC/SVG/PSD 缩略图 → OCR（复用 ONNX 栈）→ 文件夹面板 → 浏览器扩展（对接已就绪的本地采集服务）→ 媒体文件打包导出
+- **下一迭代**：OCR（复用 ONNX 栈，需用户下载识别模型）→ RAW 缩略图（rawler）→ 时间线/对比视图 → 层级标签别名与自动补全 → XMP 写回
 - **中期（P2）**：时间线/对比视图、视频/动图预览、批量转换、XMP 写回、物体自动打标、人脸聚类、亮色主题、元数据模板
 - **远期（P3）**：地图、3D/标注/水印、插件系统、协作同步、CLI

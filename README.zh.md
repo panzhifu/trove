@@ -108,6 +108,12 @@ cargo run -p trove-app
 - **库还原**：文件 ▸ 导入素材库… 从导出 JSON 重建收藏夹/标签/智能收藏夹；资产按内容哈希回链，缺媒体的成为占位、重导入时自动补全。
 - **本地采集服务**：`http://127.0.0.1:23916` 接收 `POST /add`（原始字节）与 `POST /fetch`（服务端抓取），采集文件自动入库并记录来源 URL（浏览器扩展可直连）。
 
+### 设计格式、文件夹与可移植性
+- **SVG 与 PSD 缩略图**：SVG 按矢量渲染（系统字体可显示文字），PSD 合成内嵌预览；导入时挖掘尺寸。
+- **文件夹面板**：导入记录来源路径，左栏可按文件夹树浏览并筛选任意子树。
+- **媒体包**：文件 ▸ 导出媒体包… 输出可移植目录（元数据 + blob）；导入素材库… 同时接受 JSON 导出与目录包，按内容哈希自动回链。
+- **浏览器扩展**：`extension/` 内置 MV3 扩展，右键即可把网页图片发送到运行中的 Trove。
+
 ### 界面语言
 - 支持英文与简体中文，设置 ▸ 语言实时切换；默认跟随系统语言。
 
@@ -145,7 +151,7 @@ crates/
 │   ├── src/
 │   │   ├── model.rs     # 纯数据类型 (Asset, Collection, Tag, …)
 │   │   ├── library.rs   # 对 store + 媒体目录的高级封装
-│   │   ├── backup.rs    # 数据库快照（VACUUM INTO，滚动清理）
+│   │   ├── services/    # 备份（VACUUM INTO）、维护任务、采集服务
 │   │   ├── layout.rs    # 对齐网格布局（动态规划）
 │   │   ├── store/       # SQLite 层：schema, CRUD, FTS, 智能查询, 统计
 │   │   ├── media/       # 导入、探测、缩略图、颜色、视觉/CLIP 语义搜索
@@ -159,8 +165,8 @@ crates/
     │   ├── main.rs       # GPUI 引导、菜单、快捷键
     │   ├── app/          # 窗口壳层：根视图、标题栏、动作、i18n
     │   ├── library/      # LibraryController、导入任务、文件夹监听
-    │   ├── dialogs/      # 设置、智能收藏夹规则编辑器、重复文件查找
-    │   └── panels/       # 资源管理器、工作区、标签、检查器
+    │   ├── dialogs/      # 设置、规则编辑器、重复文件查找、批量重命名
+    │   └── panels/       # 资源管理器、文件夹、工作区、标签、检查器
     └── Cargo.toml
 ```
 
@@ -196,7 +202,7 @@ cargo test -p trove-core
 cargo run -p trove-app
 ```
 
-测试状态：`trove-core` 编译通过，**94** 个测试全部通过。`trove-app` 编译通过。
+测试状态：`trove-core` 编译通过，**97** 个测试全部通过。`trove-app` 编译通过。
 
 ---
 
@@ -204,7 +210,7 @@ cargo run -p trove-app
 
 对标 Eagle、Billfish、digiKam、Adobe Bridge 等软件的功能差距与路线图见 [docs/FEATURE-GAPS.md](docs/FEATURE-GAPS.md)。
 
-- **trove-core** — 上述核心功能已齐并有测试覆盖（94 个测试）。
+- **trove-core** — 上述核心功能已齐并有测试覆盖（97 个测试）。
 - **trove-app** — 已编译可运行：停靠布局、自定义标题栏、对齐缩略图网格、拖放、多选、右键菜单、设置对话框、检查器、视觉/语义搜索、带进度导入均已接通。
 
 ---
