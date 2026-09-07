@@ -15,7 +15,7 @@ use gpui_kit::*;
 use trove_core::store::tags;
 use uuid::Uuid;
 
-use crate::state::LibraryController;
+use crate::library::LibraryController;
 
 use super::common::{AssetsDrag, hex_to_rgb, observe_controller};
 

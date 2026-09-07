@@ -19,7 +19,7 @@ use trove_core::model::NewCollection;
 use trove_core::store::{collections, smart_collections};
 use uuid::Uuid;
 
-use crate::state::LibraryController;
+use crate::library::LibraryController;
 
 use super::common::{
     AssetsDrag, CollectionDrag, hex_to_rgb, live_count, observe_controller, separator_label,
@@ -469,7 +469,7 @@ impl Render for ExplorerPanel {
                             .label("+")
                             .tooltip(rust_i18n::t!("rules.title_new").to_string())
                             .on_click(move |_, window, cx| {
-                                crate::rules::open_rule_editor(
+                                crate::dialogs::rules::open_rule_editor(
                                     window,
                                     cx,
                                     controller.clone(),
@@ -547,7 +547,7 @@ impl Render for ExplorerPanel {
             .p_1()
             .key_context("Explorer")
             .on_action(
-                cx.listener(|this, _: &crate::actions::CancelEditor, window, cx| {
+                cx.listener(|this, _: &crate::app::actions::CancelEditor, window, cx| {
                     this.cancel_editor(window, cx);
                 }),
             )
@@ -734,7 +734,7 @@ fn smart_menu(
                 move |_, window, cx| {
                     let editing = ctl_edit.read(cx).library.store().conn();
                     let editing = smart_collections::get(editing, id).ok().flatten();
-                    crate::rules::open_rule_editor(window, cx, ctl_edit.clone(), editing);
+                    crate::dialogs::rules::open_rule_editor(window, cx, ctl_edit.clone(), editing);
                 },
             ),
         )

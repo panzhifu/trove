@@ -26,7 +26,7 @@ use trove_core::store::{smart, smart_collections, tags};
 use uuid::Uuid;
 
 use crate::panels::common::color_swatch;
-use crate::state::LibraryController;
+use crate::library::LibraryController;
 
 // ============================ draft state ====================================
 

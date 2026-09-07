@@ -19,7 +19,7 @@ use trove_core::model::{AssetKind, AssetPatch, MAX_RATING};
 use trove_core::store::{assets, tags};
 use uuid::Uuid;
 
-use crate::state::LibraryController;
+use crate::library::LibraryController;
 
 use super::common::{color_swatch, hex_to_rgb, human_bytes, kind_icon, observe_controller};
 

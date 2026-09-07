@@ -41,8 +41,8 @@ use trove_core::model::{AssetKind, AssetQuery, AssetSort, NewSmartCollection};
 use trove_core::store::{assets, collections, smart_collections};
 use uuid::Uuid;
 
-use crate::actions::{MoveDown, MoveLeft, MoveRight, MoveUp, OpenPreview};
-use crate::state::{GRID_PAGE_SIZE, LibraryController, ViewMode};
+use crate::app::actions::{MoveDown, MoveLeft, MoveRight, MoveUp, OpenPreview};
+use crate::library::{GRID_PAGE_SIZE, LibraryController, ViewMode};
 
 use crate::panels::workspace_context_menu::AssetsDragPreview;
 use crate::panels::workspace_context_menu::asset_context_menu;
