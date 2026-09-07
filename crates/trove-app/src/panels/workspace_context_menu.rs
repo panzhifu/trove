@@ -6,9 +6,12 @@ use gpui_kit::component::menu::{PopupMenu, PopupMenuItem};
 use gpui_kit::*;
 use uuid::Uuid;
 
-use crate::panels::workspace_search::open_image_search;
 use crate::library::LibraryController;
+use crate::panels::workspace_search::open_image_search;
+use trove_core::model::AssetPatch;
 use trove_core::store::{assets, collections};
+
+use super::common::COLOR_LABEL_SWATCHES;
 
 /// Build the right-click context menu for an asset cell.
 pub(crate) fn asset_context_menu(
@@ -24,11 +27,11 @@ pub(crate) fn asset_context_menu(
     }
 
     let conn = controller.read(cx).library.store().conn();
-    let favorite = assets::get(conn, asset_id)
+    let (favorite, current_label) = assets::get(conn, asset_id)
         .ok()
         .flatten()
-        .map(|a| a.is_favorite)
-        .unwrap_or(false);
+        .map(|a| (a.is_favorite, a.color_label))
+        .unwrap_or((false, None));
     let browsed_collection = controller.read(cx).current_collection;
 
     let ctl_build = controller.clone();
@@ -36,9 +39,13 @@ pub(crate) fn asset_context_menu(
     let c_trash = controller.clone();
     let c_remove = controller.clone();
     let c_search = controller.clone();
+    let c_label = controller.clone();
 
     let add_submenu = PopupMenu::build(_window, cx, move |menu, _window, cx| {
         build_collection_submenu(menu, &ctl_build, asset_id, cx)
+    });
+    let label_submenu = PopupMenu::build(_window, cx, move |menu, _window, _cx| {
+        build_color_label_submenu(menu, &c_label, asset_id, current_label.as_deref())
     });
 
     let mut menu =
@@ -59,6 +66,11 @@ pub(crate) fn asset_context_menu(
                     });
                 }),
             )
+            .separator()
+            .item(PopupMenuItem::submenu(
+                rust_i18n::t!("workspace.color_label").to_string(),
+                label_submenu,
+            ))
             .separator()
             .item(
                 PopupMenuItem::new(rust_i18n::t!("workspace.search_by_image").to_string())
@@ -143,6 +155,59 @@ fn trash_menu(
                 },
             ),
         )
+}
+
+/// "Color label" submenu: one checked entry per palette color plus a clear
+/// action. Applies to the whole selection (or just the clicked asset).
+fn build_color_label_submenu(
+    mut menu: PopupMenu,
+    controller: &Entity<LibraryController>,
+    asset_id: Uuid,
+    current: Option<&str>,
+) -> PopupMenu {
+    for (name, _hex) in COLOR_LABEL_SWATCHES {
+        let controller = controller.clone();
+        let selected = current == Some(*name);
+        let label = rust_i18n::t!(format!("workspace.label_{name}")).to_string();
+        let name = name.to_string();
+        menu = menu.item(
+            PopupMenuItem::new(label)
+                .checked(selected)
+                .on_click(move |_, _, cx| {
+                    controller.update(cx, |ctl, cx| {
+                        let ids = ctl.action_targets(asset_id);
+                        for id in &ids {
+                            let patch = AssetPatch {
+                                color_label: Some(Some(name.clone())),
+                                ..Default::default()
+                            };
+                            let _ = ctl.library.patch_asset(*id, &patch);
+                        }
+                        ctl.generation += 1;
+                        cx.notify();
+                    });
+                }),
+        );
+    }
+    let controller = controller.clone();
+    menu.separator().item(
+        PopupMenuItem::new(rust_i18n::t!("workspace.clear_color_label").to_string()).on_click(
+            move |_, _, cx| {
+                controller.update(cx, move |ctl, cx| {
+                    let ids = ctl.action_targets(asset_id);
+                    for id in &ids {
+                        let patch = AssetPatch {
+                            color_label: Some(None),
+                            ..Default::default()
+                        };
+                        let _ = ctl.library.patch_asset(*id, &patch);
+                    }
+                    ctl.generation += 1;
+                    cx.notify();
+                });
+            },
+        ),
+    )
 }
 
 /// "Add to collection" submenu listing every root + nested collection.

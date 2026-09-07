@@ -15,6 +15,26 @@ pub const MAX_NAME_LEN: usize = 255;
 pub const MAX_DESCRIPTION_LEN: usize = 8_000;
 pub const MAX_RATING: u8 = 5;
 
+/// The palette of per-asset color labels (Lightroom/Bridge-style flags).
+/// Stored lowercase in `assets.color_label`; `None` / empty = unlabeled.
+pub const COLOR_LABELS: &[&str] = &["red", "orange", "yellow", "green", "blue", "purple"];
+
+/// Validate a color-label input: lowercase, must be one of [`COLOR_LABELS`].
+/// An empty/whitespace string maps to `None` (no label).
+pub fn normalize_color_label(v: &str) -> Result<Option<String>, crate::error::Error> {
+    let v = v.trim().to_lowercase();
+    if v.is_empty() {
+        return Ok(None);
+    }
+    if COLOR_LABELS.contains(&v.as_str()) {
+        Ok(Some(v))
+    } else {
+        Err(crate::error::Error::Validation(format!(
+            "color label must be one of {COLOR_LABELS:?}"
+        )))
+    }
+}
+
 /// Create a fresh id.
 pub fn new_id() -> Uuid {
     Uuid::new_v4()
@@ -82,6 +102,8 @@ pub struct Asset {
     pub is_favorite: bool,
     /// Where the asset was collected from, when applicable.
     pub source_url: Option<String>,
+    /// Color flag for visual triage (one of [`COLOR_LABELS`]).
+    pub color_label: Option<String>,
     /// Free-form custom fields, e.g. `{"aperture": "f/2.8"}`.
     pub extra: BTreeMap<String, serde_json::Value>,
     pub created_at: DateTime<Utc>,
@@ -129,6 +151,8 @@ pub struct AssetPatch {
     pub rating: Option<Option<u8>>,
     pub is_favorite: Option<bool>,
     pub source_url: Option<Option<String>>,
+    /// Set/clear the color flag. `Some(None)` clears.
+    pub color_label: Option<Option<String>>,
     /// Replace the whole `extra` map when `Some`.
     pub extra: Option<BTreeMap<String, serde_json::Value>>,
 }
@@ -149,6 +173,9 @@ impl AssetPatch {
             return Err(crate::error::Error::Validation(
                 "description too long".into(),
             ));
+        }
+        if let Some(Some(label)) = &self.color_label {
+            normalize_color_label(label)?;
         }
         Ok(())
     }
@@ -317,6 +344,8 @@ pub enum SmartField {
     /// The mined dominant color (`#rrggbb`), matched against the asset's
     /// `extra.dominant_color`.
     Color,
+    /// The user-assigned color label (`model::COLOR_LABELS`).
+    ColorLabel,
 }
 
 /// Comparison operators for a smart-collection condition.
@@ -361,6 +390,8 @@ pub struct AssetQuery {
     /// Limit to assets carrying *all* these tags.
     pub tag_ids: Vec<Uuid>,
     pub is_favorite: Option<bool>,
+    /// Only assets flagged with this color label.
+    pub color_label: Option<String>,
     pub is_trashed: bool,
     /// Sort key of the listing (default: import time).
     pub sort: AssetSort,
@@ -398,6 +429,7 @@ pub fn test_asset(name: &str, kind: AssetKind, id: Uuid) -> Asset {
         rating: None,
         is_favorite: false,
         source_url: None,
+        color_label: None,
         extra: Default::default(),
         created_at: now(),
         updated_at: now(),

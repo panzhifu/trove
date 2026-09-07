@@ -21,7 +21,9 @@ use uuid::Uuid;
 
 use crate::library::LibraryController;
 
-use super::common::{color_swatch, hex_to_rgb, human_bytes, kind_icon, observe_controller};
+use super::common::{
+    COLOR_LABEL_SWATCHES, color_swatch, hex_to_rgb, human_bytes, kind_icon, observe_controller,
+};
 
 // ==================== Inspector: details + tags ==============================
 
@@ -447,7 +449,9 @@ impl Render for InspectorPanel {
             .child(edit_label("inspector.kind"))
             .child(self.kind_row(kind))
             .child(edit_label("inspector.rating"))
-            .child(self.rating_row(rating));
+            .child(self.rating_row(rating))
+            .child(edit_label("inspector.color_label"))
+            .child(self.color_label_row(cx, asset.color_label.as_deref()));
 
         let tag_chips = h_flex()
             .flex_wrap()
@@ -801,6 +805,41 @@ impl InspectorPanel {
             self.font_previews.insert(family.to_string());
         }
         ok
+    }
+
+    /// Color-label palette row: one chip per [`COLOR_LABEL_SWATCHES`] entry;
+    /// clicking the active chip clears the label.
+    fn color_label_row(&self, cx: &App, current: Option<&str>) -> Div {
+        h_flex()
+            .gap_1p5()
+            .children(COLOR_LABEL_SWATCHES.iter().map(|(name, hex)| {
+                let controller = self.controller.clone();
+                let selected = current == Some(*name);
+                let name = name.to_string();
+                color_swatch(
+                    cx,
+                    format!("label-{name}"),
+                    hex,
+                    selected,
+                    move |_, _, cx| {
+                        controller.update(cx, |ctl, cx| {
+                            let Some(id) = ctl.primary() else { return };
+                            let patch = AssetPatch {
+                                color_label: Some(if selected { None } else { Some(name.clone()) }),
+                                ..Default::default()
+                            };
+                            if let Err(e) = ctl.library.patch_asset(id, &patch) {
+                                ctl.notice = Some(
+                                    rust_i18n::t!("inspector.update_failed", error = e.to_string())
+                                        .to_string(),
+                                );
+                            }
+                            ctl.generation += 1;
+                            cx.notify();
+                        });
+                    },
+                )
+            }))
     }
 
     /// Five star toggles; clicking the current top star clears the rating.

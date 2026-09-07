@@ -141,6 +141,20 @@ fn compile_match(
                 vec![s.into()],
             ))
         }
+        SmartField::ColorLabel => {
+            require_eq_ne(op)?;
+            let s = string_value(value, "color_label")?;
+            let label = crate::model::normalize_color_label(&s)?;
+            Ok(match label {
+                // "no label" is a real filter dimension: unlabeled = NULL.
+                None if op == SmartCompare::Eq => ("assets.color_label IS NULL".into(), vec![]),
+                None => ("assets.color_label IS NOT NULL".into(), vec![]),
+                Some(l) => (
+                    format!("assets.color_label {} ?", op_sql(op)),
+                    vec![l.into()],
+                ),
+            })
+        }
     }
 }
 

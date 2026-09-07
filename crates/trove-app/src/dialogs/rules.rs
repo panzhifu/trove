@@ -25,8 +25,8 @@ use trove_core::model::{AssetKind, SmartCollection, SmartCompare, SmartField, Sm
 use trove_core::store::{smart, smart_collections, tags};
 use uuid::Uuid;
 
-use crate::panels::common::color_swatch;
 use crate::library::LibraryController;
+use crate::panels::common::{COLOR_LABEL_SWATCHES, color_swatch};
 
 // ============================ draft state ====================================
 
@@ -40,6 +40,7 @@ struct ConditionRow {
     favorite: bool,
     tag: String,
     rating: u8,
+    label: String,
 }
 
 impl ConditionRow {
@@ -58,6 +59,7 @@ impl ConditionRow {
             favorite: true,
             tag: String::new(),
             rating: 3,
+            label: String::new(),
         }
     }
 
@@ -69,7 +71,10 @@ impl ConditionRow {
             | SmartField::Color
             | SmartField::SizeBytes => !self.text.read(cx).value().trim().is_empty(),
             SmartField::Tag => !self.tag.is_empty(),
-            SmartField::Kind | SmartField::IsFavorite | SmartField::Rating => true,
+            SmartField::Kind
+            | SmartField::IsFavorite
+            | SmartField::Rating
+            | SmartField::ColorLabel => true,
         }
     }
 }
@@ -169,6 +174,13 @@ impl RuleDraft {
         self.touch(cx);
     }
 
+    fn set_label(&mut self, ix: usize, label: String, cx: &mut Context<Self>) {
+        if let Some(row) = self.rows.get_mut(ix) {
+            row.label = label;
+        }
+        self.touch(cx);
+    }
+
     fn set_and_mode(&mut self, and_mode: bool, cx: &mut Context<Self>) {
         self.and_mode = and_mode;
         self.touch(cx);
@@ -227,6 +239,7 @@ impl RuleDraft {
                 SmartField::Rating => serde_json::json!(row.rating),
                 SmartField::Kind => serde_json::json!(row.kind),
                 SmartField::IsFavorite => serde_json::json!(row.favorite),
+                SmartField::ColorLabel => serde_json::json!(row.label),
             };
             children.push(node);
         }
@@ -354,6 +367,7 @@ fn field_json(field: SmartField) -> &'static str {
         SmartField::Extension => "extension",
         SmartField::SizeBytes => "size_bytes",
         SmartField::Color => "color",
+        SmartField::ColorLabel => "color_label",
     }
 }
 
@@ -414,6 +428,9 @@ fn load_rows(
             }
             SmartField::Tag => {
                 row.tag = value.as_str().unwrap_or_default().to_string();
+            }
+            SmartField::ColorLabel => {
+                row.label = value.as_str().unwrap_or_default().to_string();
             }
         }
         rows.push(row);
@@ -742,7 +759,7 @@ fn render_row(
     cx: &mut App,
 ) -> Div {
     let t = |k: &str| rust_i18n::t!(k).to_string();
-    let (kind, favorite, tag, rating, tag_names, text_input) = {
+    let (kind, favorite, tag, rating, label, tag_names, text_input) = {
         let d = draft.read(cx);
         let row = &d.rows[ix];
         (
@@ -750,6 +767,7 @@ fn render_row(
             row.favorite,
             row.tag.clone(),
             row.rating,
+            row.label.clone(),
             d.tag_names.clone(),
             row.text.clone(),
         )
@@ -771,6 +789,7 @@ fn render_row(
                 (SmartField::Extension, "rules.f_extension"),
                 (SmartField::SizeBytes, "rules.f_size"),
                 (SmartField::Color, "rules.f_color"),
+                (SmartField::ColorLabel, "rules.f_label"),
             ]
             .map(|(f, key)| (f, t(key)))
             .into_iter()
@@ -857,6 +876,27 @@ fn render_row(
             {
                 let d = draft.clone();
                 move |picked: String, cx| d.update(cx, |d, cx| d.set_tag(ix, picked, cx))
+            },
+        )),
+        SmartField::ColorLabel => h_flex().flex_1().min_w_0().child(dropdown_button(
+            format!("row-{ix}-label"),
+            if label.is_empty() {
+                t("rules.no_label")
+            } else {
+                rust_i18n::t!(format!("workspace.label_{label}")).to_string()
+            },
+            std::iter::once((String::new(), rust_i18n::t!("rules.no_label").to_string()))
+                .chain(COLOR_LABEL_SWATCHES.iter().map(|(name, _)| {
+                    (
+                        name.to_string(),
+                        rust_i18n::t!(format!("workspace.label_{name}")).to_string(),
+                    )
+                }))
+                .collect(),
+            label,
+            {
+                let d = draft.clone();
+                move |picked: String, cx| d.update(cx, |d, cx| d.set_label(ix, picked, cx))
             },
         )),
         SmartField::Rating => h_flex().flex_1().min_w_0().child(dropdown_button(
@@ -991,6 +1031,7 @@ fn field_key(field: SmartField) -> &'static str {
         SmartField::Extension => "rules.f_extension",
         SmartField::SizeBytes => "rules.f_size",
         SmartField::Color => "rules.f_color",
+        SmartField::ColorLabel => "rules.f_label",
     }
 }
 
@@ -1027,6 +1068,7 @@ fn allowed_ops(field: SmartField) -> &'static [SmartCompare] {
         | SmartField::Kind
         | SmartField::IsFavorite
         | SmartField::Color
+        | SmartField::ColorLabel
         | SmartField::Extension => &[SmartCompare::Eq, SmartCompare::Ne],
         SmartField::Rating | SmartField::SizeBytes => &[
             SmartCompare::Eq,

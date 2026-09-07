@@ -326,6 +326,7 @@ impl Library {
     /// undo restores every editable column (title/description edits also
     /// re-sync the FTS index through `assets::update`).
     pub fn patch_asset(&self, asset_id: Uuid, patch: &crate::model::AssetPatch) -> Result<()> {
+        patch.validate()?;
         let conn = self.store.conn();
         let before = assets::get(conn, asset_id)?
             .map(|asset| undo::restore_patch(&asset))
@@ -1057,5 +1058,57 @@ mod tests {
         );
         lib.delete_smart_collection(sc.id).unwrap();
         assert!(lib.get_smart_collection(sc.id).unwrap().is_none());
+    }
+    #[test]
+    fn color_label_patch_query_smart_and_undo() {
+        use crate::model::{AssetPatch, SmartCompare, SmartField, SmartNode};
+        use crate::store::smart;
+
+        let (lib, dir) = temp_library("color-label");
+        let src = write_source(&dir, "a.png", PNG_1X1);
+        let report = lib.import_files(&[src], None).unwrap();
+        let id = report.imported[0].asset_id;
+        let conn = lib.store().conn();
+
+        // Set a label; the query filter and the smart field both see it.
+        lib.patch_asset(
+            id,
+            &AssetPatch {
+                color_label: Some(Some("red".into())),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let q = AssetQuery {
+            color_label: Some("red".into()),
+            ..Default::default()
+        };
+        let (total, page) = assets::query(conn, &q).unwrap();
+        assert_eq!((total, page.len()), (1, 1));
+
+        let node = SmartNode::Match {
+            field: SmartField::ColorLabel,
+            op: SmartCompare::Eq,
+            value: serde_json::json!("red"),
+        };
+        let (n, ids) = smart::evaluate(conn, &node, None, 0).unwrap();
+        assert_eq!((n, ids.as_slice()), (1, &[id][..]));
+
+        // Unknown palette names are rejected and change nothing.
+        assert!(
+            lib.patch_asset(
+                id,
+                &AssetPatch {
+                    color_label: Some(Some("magenta".into())),
+                    ..Default::default()
+                },
+            )
+            .is_err()
+        );
+
+        // Undo restores the unlabeled state.
+        lib.undo().unwrap();
+        let asset = assets::get(conn, id).unwrap().unwrap();
+        assert_eq!(asset.color_label, None);
     }
 }

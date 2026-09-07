@@ -277,6 +277,7 @@ pub(crate) fn restore_patch(asset: &crate::model::Asset) -> AssetPatch {
         rating: Some(asset.rating),
         is_favorite: Some(asset.is_favorite),
         source_url: Some(asset.source_url.clone()),
+        color_label: Some(asset.color_label.clone()),
         extra: Some(asset.extra.clone()),
     }
 }
@@ -309,6 +310,7 @@ mod tests {
             rating: None,
             is_favorite: false,
             source_url: None,
+            color_label: None,
             extra: Default::default(),
             created_at: now(),
             updated_at: now(),
