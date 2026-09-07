@@ -2,6 +2,7 @@
 //! asset library. Contains no UI code.
 
 pub mod backup;
+pub mod collect;
 pub mod config;
 pub mod error;
 pub mod events;
