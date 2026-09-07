@@ -20,6 +20,7 @@ use gpui_kit::component::dock::{BasePanel, Panel as DockPanel, PanelControl, Pan
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenu, PopupMenuItem};
 use gpui_kit::component::popover::Popover;
+use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::{ActiveTheme, Icon, IconName};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -1792,6 +1793,7 @@ fn asset_context_menu(
     let c_fav = controller.clone();
     let c_trash = controller.clone();
     let c_remove = controller.clone();
+    let c_search_image = controller.clone();
 
     let add_submenu = PopupMenu::build(_window, cx, move |menu, _window, cx| {
         let controller = ctl_build;
@@ -1827,30 +1829,41 @@ fn asset_context_menu(
         menu
     });
 
-    let mut menu = menu
-        .min_w(px(200.))
-        .item(
-            PopupMenuItem::new(if favorite {
-                rust_i18n::t!("workspace.remove_from_favorites").to_string()
-            } else {
-                rust_i18n::t!("workspace.add_to_favorites").to_string()
-            })
-            .checked(favorite)
-            .on_click(move |_, _, cx| {
-                c_fav.update(cx, move |ctl, cx| {
-                    let ids = ctl.action_targets(asset_id);
-                    let _ = ctl.library.set_assets_favorite(&ids, !favorite);
-                    ctl.generation += 1;
-                    cx.notify();
-                });
-            }),
-        )
-        .separator()
-        .item(PopupMenuItem::submenu(
-            rust_i18n::t!("workspace.add_to_collection").to_string(),
-            add_submenu,
-        ))
-        .separator();
+    let mut menu =
+        menu.min_w(px(200.))
+            .item(
+                PopupMenuItem::new(if favorite {
+                    rust_i18n::t!("workspace.remove_from_favorites").to_string()
+                } else {
+                    rust_i18n::t!("workspace.add_to_favorites").to_string()
+                })
+                .checked(favorite)
+                .on_click(move |_, _, cx| {
+                    c_fav.update(cx, move |ctl, cx| {
+                        let ids = ctl.action_targets(asset_id);
+                        let _ = ctl.library.set_assets_favorite(&ids, !favorite);
+                        ctl.generation += 1;
+                        cx.notify();
+                    });
+                }),
+            )
+            .separator()
+            .item(
+                PopupMenuItem::new(rust_i18n::t!("workspace.search_by_image").to_string())
+                    .on_click(move |_, window, cx| {
+                        let ctl = c_search_image.clone();
+                        let ids = ctl.read(cx).action_targets(asset_id);
+                        if let Some(id) = ids.first() {
+                            open_image_search(*id, &ctl, window, cx);
+                        }
+                    }),
+            )
+            .separator()
+            .item(PopupMenuItem::submenu(
+                rust_i18n::t!("workspace.add_to_collection").to_string(),
+                add_submenu,
+            ))
+            .separator();
     if browsed_collection.is_some() {
         menu = menu.item(
             PopupMenuItem::new(rust_i18n::t!("workspace.remove_from_collection").to_string())
@@ -1877,6 +1890,147 @@ fn asset_context_menu(
             },
         ),
     )
+}
+
+/// Open image search dialog for the given asset.
+fn open_image_search(
+    asset_id: Uuid,
+    controller: &Entity<LibraryController>,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    // Get the asset's query image path: prefer a decoded thumbnail, else the
+    // stored blob itself (search_by_image decodes either). Only images can be
+    // searched visually.
+    let (query_path, title) = {
+        let ctl = controller.read(cx);
+        let conn = ctl.library.store().conn();
+        let library_root = ctl.library.root().to_path_buf();
+        let asset = trove_core::store::assets::get(conn, asset_id)
+            .ok()
+            .flatten();
+        let Some(asset) = asset else { return };
+        if asset.kind != trove_core::model::AssetKind::Image {
+            return;
+        }
+        let name = asset.file_name.clone();
+        let thumb = asset
+            .sha256
+            .as_deref()
+            .map(|sha| trove_core::media::thumb::abs_path(&library_root, sha));
+        let path = thumb.filter(|p| p.is_file()).or_else(|| {
+            asset
+                .rel_path
+                .as_ref()
+                .map(|rel| library_root.join(rel))
+                .filter(|p| p.is_file())
+        });
+        (path, name)
+    };
+
+    let Some(query_path) = query_path else { return };
+
+    // Perform visual search.
+    let (store, library_root) = {
+        let ctl = controller.read(cx);
+        (
+            ctl.library.store().clone(),
+            ctl.library.root().to_path_buf(),
+        )
+    };
+    let results =
+        trove_core::store::visual_search::search_by_image(store.conn(), &query_path, Some(50))
+            .unwrap_or_default();
+
+    // Show results in a dialog.
+    window.open_dialog(cx, move |dialog, _, cx| {
+        // Build rows with the thumbnail of each result.
+        let thumb_for = |sha: Option<&str>| -> Option<PathBuf> {
+            sha.and_then(|s| {
+                let p = trove_core::media::thumb::abs_path(&library_root, s);
+                p.is_file().then_some(p)
+            })
+        };
+        let rows = results
+            .iter()
+            .take(24)
+            .map(|r| {
+                let name = r.asset.file_name.clone();
+                let pct = (r.score * 100.0) as u32;
+                let p = thumb_for(r.asset.sha256.as_deref());
+                div()
+                    .px_1()
+                    .py_1()
+                    .rounded(cx.theme().radius)
+                    .hover(|this| this.bg(cx.theme().secondary))
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .items_center()
+                            .child(match &p {
+                                Some(path) => img(path.clone())
+                                    .w(px(48.))
+                                    .h(px(36.))
+                                    .object_fit(gpui_kit::ObjectFit::Cover)
+                                    .rounded(px(4.))
+                                    .into_any_element(),
+                                None => div()
+                                    .w(px(48.))
+                                    .h(px(36.))
+                                    .items_center()
+                                    .justify_center()
+                                    .bg(cx.theme().secondary)
+                                    .child(Icon::new(IconName::File).size_3())
+                                    .into_any_element(),
+                            })
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_sm()
+                                    .text_color(cx.theme().foreground)
+                                    .child(name),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .w(px(44.))
+                                    .text_right()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(format!("{pct}%")),
+                            ),
+                    )
+                    .into_any_element()
+            })
+            .collect::<Vec<_>>();
+
+        dialog
+            .title(rust_i18n::t!("workspace.search_results").to_string() + ": " + &title)
+            .width(px(520.))
+            .child(
+                v_flex()
+                    .gap_2()
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(
+                                rust_i18n::t!(
+                                    "workspace.search_results_count",
+                                    count = results.len()
+                                )
+                                .to_string(),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .max_h(px(420.))
+                            .overflow_y_scrollbar()
+                            .child(v_flex().gap_0p5().children(rows)),
+                    ),
+            )
+    });
 }
 
 /// Drag preview shown while dragging assets.

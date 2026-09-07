@@ -1,28 +1,22 @@
 //! Custom keybinding configuration.
 //!
 //! Users can customize keyboard shortcuts via the Settings ▸ Shortcuts page.
-//! Custom keybindings are persisted in `AppConfig.keybindings` and override
-//! defaults at startup.
+//! Custom keybindings are persisted in `AppConfig.keybindings` (mapping an
+//! action id to a key string) and override defaults at startup.
 
 use std::collections::HashMap;
 
-/// A keybinding entry: maps a key string to an action name.
-///
-/// Example: `"enter" => "OpenPreview"`, `"ctrl-p" => "OpenPreview"`.
-///
-/// The key string follows gpui-kit's `KeyBinding` format:
-/// - Modifier prefixes: `ctrl-`, `shift-`, `alt-`, `cmd-` (order doesn't matter)
-/// - Key name: `enter`, `delete`, `backspace`, `escape`, `tab`, `space`,
-///   `left`, `right`, `up`, `down`, `home`, `end`, `page-up`, `page-down`,
-///   `f1`-`f12`, or a single character (`a`-`z`, `0`-`9`, etc.)
-#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+/// A keybinding entry. `action` is the stable id used as the config key and
+/// to resolve the concrete `Action`; `description` is a canonical (English)
+/// label used as fallback text.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct KeyBindingConfig {
-    /// The key string (e.g. `"enter"`, `"ctrl-shift-z"`).
-    pub key: String,
-    /// Human-readable description of the action.
-    pub description: String,
-    /// The context in which this binding is active (`None` = global).
-    pub context: Option<String>,
+    /// Stable action id (e.g. `"MoveLeft"`).
+    pub action: &'static str,
+    /// Default key string (e.g. `"enter"`, `"ctrl-shift-z"`).
+    pub key: &'static str,
+    /// Context in which this binding is active (`None` = global).
+    pub context: Option<&'static str>,
 }
 
 /// All configurable keybindings with their default values.
@@ -32,99 +26,86 @@ pub struct KeyBindingConfig {
 pub fn default_keybindings() -> Vec<KeyBindingConfig> {
     vec![
         KeyBindingConfig {
-            key: "left".into(),
-            description: "Move selection left".into(),
-            context: Some("Workspace".into()),
+            action: "MoveLeft",
+            key: "left",
+            context: Some("Workspace"),
         },
         KeyBindingConfig {
-            key: "right".into(),
-            description: "Move selection right".into(),
-            context: Some("Workspace".into()),
+            action: "MoveRight",
+            key: "right",
+            context: Some("Workspace"),
         },
         KeyBindingConfig {
-            key: "up".into(),
-            description: "Move selection up".into(),
-            context: Some("Workspace".into()),
+            action: "MoveUp",
+            key: "up",
+            context: Some("Workspace"),
         },
         KeyBindingConfig {
-            key: "down".into(),
-            description: "Move selection down".into(),
-            context: Some("Workspace".into()),
+            action: "MoveDown",
+            key: "down",
+            context: Some("Workspace"),
         },
         KeyBindingConfig {
-            key: "enter".into(),
-            description: "Open preview".into(),
-            context: Some("Workspace".into()),
+            action: "OpenPreview",
+            key: "enter",
+            context: Some("Workspace"),
         },
         KeyBindingConfig {
-            key: "delete".into(),
-            description: "Move to trash".into(),
-            context: Some("Workspace".into()),
+            action: "TrashSelected",
+            key: "delete",
+            context: Some("Workspace"),
         },
         KeyBindingConfig {
-            key: "backspace".into(),
-            description: "Move to trash".into(),
-            context: Some("Workspace".into()),
+            action: "SelectAll",
+            key: "ctrl-a",
+            context: Some("Workspace"),
         },
         KeyBindingConfig {
-            key: "ctrl-a".into(),
-            description: "Select all".into(),
-            context: Some("Workspace".into()),
+            action: "ClearSelection",
+            key: "escape",
+            context: Some("Workspace"),
         },
         KeyBindingConfig {
-            key: "escape".into(),
-            description: "Clear selection".into(),
-            context: Some("Workspace".into()),
+            action: "Undo",
+            key: "ctrl-z",
+            context: Some("Workspace"),
         },
         KeyBindingConfig {
-            key: "ctrl-z".into(),
-            description: "Undo".into(),
-            context: Some("Workspace".into()),
+            action: "Redo",
+            key: "ctrl-shift-z",
+            context: Some("Workspace"),
         },
         KeyBindingConfig {
-            key: "ctrl-shift-z".into(),
-            description: "Redo".into(),
-            context: Some("Workspace".into()),
-        },
-        KeyBindingConfig {
-            key: "i".into(),
-            description: "Import files".into(),
+            action: "ImportFiles",
+            key: "ctrl-o",
             context: None,
         },
         KeyBindingConfig {
-            key: "ctrl-comma".into(),
-            description: "Open settings".into(),
+            action: "OpenSettings",
+            key: "ctrl-comma",
             context: None,
         },
         KeyBindingConfig {
-            key: "ctrl-f".into(),
-            description: "Search".into(),
-            context: Some("Workspace".into()),
-        },
-        KeyBindingConfig {
-            key: "?".into(),
-            description: "Show shortcuts help".into(),
+            action: "RefreshLibrary",
+            key: "f5",
             context: None,
         },
     ]
 }
 
-/// Resolve the effective key string for an action.
-///
-/// Returns the custom binding from `overrides` if present, otherwise falls back
-/// to the default.
+/// Resolve the effective key string for an action id.
 pub fn resolve_key(
-    action_name: &str,
+    action: &str,
     overrides: &HashMap<String, String>,
     defaults: &[KeyBindingConfig],
 ) -> Option<String> {
-    if let Some(custom) = overrides.get(action_name) {
+    if let Some(custom) = overrides.get(action) {
         return Some(custom.clone());
     }
     defaults
         .iter()
-        .find(|d| d.description == action_name || d.key == action_name)
-        .map(|d| d.key.clone())
+        .find(|d| d.action == action)
+        .map(|d| d.key.to_string())
 }
 
 #[cfg(test)]
@@ -135,12 +116,12 @@ mod tests {
     fn default_keybindings_not_empty() {
         let defaults = default_keybindings();
         assert!(!defaults.is_empty());
-        // Each key should be unique.
-        let mut keys: Vec<&str> = defaults.iter().map(|d| d.key.as_str()).collect();
-        let keys_clone = keys.clone();
-        keys.sort();
-        keys.dedup();
-        assert_eq!(keys.len(), keys_clone.len(), "duplicate keys in defaults");
+        // Each action should be unique.
+        let mut actions: Vec<&str> = defaults.iter().map(|d| d.action).collect();
+        let mut dedup = actions.clone();
+        dedup.sort();
+        dedup.dedup();
+        assert_eq!(dedup.len(), actions.len(), "duplicate actions in defaults");
     }
 
     #[test]
@@ -159,7 +140,7 @@ mod tests {
         let defaults = default_keybindings();
         let overrides = HashMap::new();
         assert_eq!(
-            resolve_key("left", &overrides, &defaults),
+            resolve_key("MoveLeft", &overrides, &defaults),
             Some("left".into())
         );
     }
