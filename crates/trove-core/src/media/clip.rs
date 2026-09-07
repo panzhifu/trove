@@ -161,9 +161,10 @@ pub fn ort_library_hint() -> Option<PathBuf> {
     }
     // Current working directory.
     candidates.push(PathBuf::from(name));
-    // Config dir.
+    // Config dir and its models/ subdirectory.
     if let Some(dir) = crate::config::AppConfig::config_dir() {
         candidates.push(dir.join(name));
+        candidates.push(dir.join("models").join(name));
     }
     candidates.into_iter().find(|p| p.is_file())
 }
@@ -228,44 +229,10 @@ fn preprocess_image(path: &Path) -> Result<Vec<f32>> {
     Ok(input)
 }
 
-/// Trivial deterministic tokeniser: each whitespace token → a stable hash in
-/// the BPE range. Good enough for search-by-text demos; production use should
-/// ship the real CLIP tokenizer alongside the ONNX file.
-fn tokenize(text: &str) -> Vec<i64> {
-    let mut ids = vec![0_i64; 77];
-    for (i, tok) in text.split_whitespace().take(77).enumerate() {
-        let mut h = 0x811c9dc5u32;
-        for b in tok.as_bytes() {
-            h ^= *b as u32;
-            h = h.wrapping_mul(0x01000193);
-        }
-        ids[i] = 1 + (h % 49150) as i64;
-    }
-    ids
-}
-
-/// Run one encoder pass. `input_name`/`output_name` are the graph I/O ports;
-/// the single ONNX file exposes both encoders under different port names.
-fn run_encoder(
-    session: &mut ort::session::Session,
-    input_name: &str,
-    output_name: &str,
-    data: Vec<f32>,
-    shape: Vec<i64>,
-) -> Result<Vec<f32>> {
-    let tensor = ort::value::Tensor::from_array((shape, data))
-        .map_err(|e| Error::Db(format!("tensor: {e}")))?;
-    let outputs = session
-        .run(ort::inputs![input_name => tensor])
-        .map_err(|e| Error::Db(format!("inference: {e}")))?;
-    extract_embedding(&outputs, output_name)
-}
-
-/// Pull the embedding out of the model output. Tries the requested port name
-/// first, then falls back to any float tensor of the right size — robust across
-/// differently-named CLIP exports.
+/// Pull the first usable float embedding out of the model output. Tries the
+/// requested port name first, then falls back to any float tensor with ≥128
+/// elements — robust across differently-named CLIP exports.
 fn extract_embedding(outputs: &ort::session::SessionOutputs, preferred: &str) -> Result<Vec<f32>> {
-    // Preferred port.
     if let Some(v) = outputs.get(preferred) {
         if let Ok((_, data)) = v.try_extract_tensor::<f32>() {
             if !data.is_empty() {
@@ -273,7 +240,6 @@ fn extract_embedding(outputs: &ort::session::SessionOutputs, preferred: &str) ->
             }
         }
     }
-    // Fallback: first float tensor with at least 128 elements.
     for v in outputs.values() {
         if let Ok((_, data)) = v.try_extract_tensor::<f32>() {
             if data.len() >= 128 {
@@ -298,13 +264,35 @@ pub fn image_embedding(path: &Path) -> Result<Vec<f32>> {
         )));
     };
     let input = preprocess_image(path)?;
-    run_encoder(
-        session,
-        "pixel_values",
-        "image_embeds",
-        input,
-        vec![1, 3, 224, 224],
-    )
+    let pixel_tensor = ort::value::Tensor::from_array(([1_i64, 3, 224, 224], input))
+        .map_err(|e| Error::Db(format!("image tensor: {e}")))?;
+    // The combined CLIP graph expects ALL inputs. Provide dummy text inputs
+    // (zeros) so the image encoder runs; we read `image_embeds` as output.
+    let dummy_ids = ort::value::Tensor::from_array(([1_i64, 77], vec![0i64; 77]))
+        .map_err(|e| Error::Db(format!("dummy ids: {e}")))?;
+    let dummy_mask = ort::value::Tensor::from_array(([1_i64, 77], vec![0i64; 77]))
+        .map_err(|e| Error::Db(format!("dummy mask: {e}")))?;
+    let outputs = session
+        .run(ort::inputs!["pixel_values" => pixel_tensor, "input_ids" => dummy_ids, "attention_mask" => dummy_mask])
+        .map_err(|e| Error::Db(format!("image inference: {e}")))?;
+    extract_embedding(&outputs, "image_embeds")
+}
+
+/// Trivial deterministic tokeniser: each whitespace token → a stable hash in
+/// the BPE range. Returns `(input_ids, attention_mask)`, both length 77.
+fn tokenize(text: &str) -> (Vec<i64>, Vec<i64>) {
+    let mut ids = vec![0i64; 77];
+    let mut mask = vec![0i64; 77];
+    for (i, tok) in text.split_whitespace().take(77).enumerate() {
+        let mut h = 0x811c9dc5u32;
+        for b in tok.as_bytes() {
+            h ^= *b as u32;
+            h = h.wrapping_mul(0x01000193);
+        }
+        ids[i] = 1 + (h % 49150) as i64;
+        mask[i] = 1;
+    }
+    (ids, mask)
 }
 
 /// Encode a text query into an embedding vector.
@@ -316,37 +304,16 @@ pub fn text_embedding(text: &str) -> Result<Vec<f32>> {
             state_label(&eng.state)
         )));
     };
-    let ids = tokenize(text)
-        .into_iter()
-        .map(|x| x as i32)
-        .collect::<Vec<_>>();
-    let n = ids.len();
-    // Build a float tensor holding the int ids (ort needs typed input; we pass
-    // f32 and rely on the model's input being int64 — many CLIP exports accept a
-    // float-cast; the fallback output scan makes this robust).
-    run_encoder_f32(
-        session,
-        "input_ids",
-        "text_embeds",
-        ids.into_iter().map(|x| x as f32).collect(),
-        vec![1, n as i64],
-    )
-}
-
-/// Variant of `run_encoder` for integer-like inputs carried as f32.
-fn run_encoder_f32(
-    session: &mut ort::session::Session,
-    input_name: &str,
-    output_name: &str,
-    data: Vec<f32>,
-    shape: Vec<i64>,
-) -> Result<Vec<f32>> {
-    let tensor = ort::value::Tensor::from_array((shape, data))
-        .map_err(|e| Error::Db(format!("tensor: {e}")))?;
+    // Token ids (Int64) + attention mask. The model exposes both as inputs.
+    let (ids, mask) = tokenize(text);
+    let id_tensor = ort::value::Tensor::from_array(([1_i64, 77], ids))
+        .map_err(|e| Error::Db(format!("text tensor: {e}")))?;
+    let mask_tensor = ort::value::Tensor::from_array(([1_i64, 77], mask))
+        .map_err(|e| Error::Db(format!("mask tensor: {e}")))?;
     let outputs = session
-        .run(ort::inputs![input_name => tensor])
-        .map_err(|e| Error::Db(format!("inference: {e}")))?;
-    extract_embedding(&outputs, output_name)
+        .run(ort::inputs!["input_ids" => id_tensor, "attention_mask" => mask_tensor])
+        .map_err(|e| Error::Db(format!("text inference: {e}")))?;
+    extract_embedding(&outputs, "text_embeds")
 }
 
 // ---------------------------------------------------------------------------
@@ -474,13 +441,17 @@ mod tests {
 
     #[test]
     fn tokenize_is_stable_and_bounded() {
-        let a = tokenize("a red sunset over the beach");
-        let b = tokenize("a red sunset over the beach");
+        let (a, am) = tokenize("a red sunset over the beach");
+        let (b, bm) = tokenize("a red sunset over the beach");
         assert_eq!(a, b);
+        assert_eq!(am, bm);
         assert_eq!(a.len(), 77);
         // The first 6 slots (one per token) are set; the rest stay 0-padded.
         assert!(a[..6].iter().all(|&x| x >= 1));
         assert!(a[6..].iter().all(|&x| x == 0));
+        // Attention mask matches: 1 where tokenized, 0 elsewhere.
+        assert!(am[..6].iter().all(|&x| x == 1));
+        assert!(am[6..].iter().all(|&x| x == 0));
     }
 
     #[test]
