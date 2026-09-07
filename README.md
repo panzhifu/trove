@@ -108,6 +108,12 @@ The first launch creates a library under the platform's config directory. Open *
 - **Library restore**: File ▸ Import library… rebuilds collections/tags/smart collections from an export; assets link by content hash or wait as placeholders that self-heal when the media is re-imported.
 - **Local collect service**: `http://127.0.0.1:23916` accepts `POST /add` (raw bytes) and `POST /fetch` (server-side download) — collected files import automatically with their source URL (browser-extension ready).
 
+### Design formats, folders & portability
+- **SVG & PSD thumbnails**: SVGs rasterize (with text, via system fonts), PSDs composite their embedded preview — dimensions are mined at import.
+- **Folders panel**: imports remember their source path; browse a folder tree in the left dock and filter the grid to any subtree.
+- **Media packages**: File ▸ Export Media Package… writes a portable folder (metadata + blobs); Import library… accepts both bare JSON exports and packages, healing records by content hash.
+- **Browser extension**: `extension/` ships an MV3 addon — right-click any image to send it into your running Trove.
+
 ### Interface language
 - English and 简体中文, switchable live in Settings ▸ Language; follows the system language by default.
 
@@ -145,10 +151,10 @@ crates/
 │   ├── src/
 │   │   ├── model.rs     # Plain data types (Asset, Collection, Tag, …)
 │   │   ├── library.rs   # High-level facade over store + media dir
-│   │   ├── backup.rs    # Database snapshots (VACUUM INTO, rolling prune)
+│   │   ├── services/    # backup (VACUUM INTO), maintenance jobs, collect server
 │   │   ├── layout.rs    # Justified grid layout (dynamic programming)
 │   │   ├── store/       # SQLite layer: schema, CRUD, FTS, smart queries, stats
-│   │   ├── media/       # Import, probing, thumbnails, color, visual + CLIP search
+│   │   ├── media/       # Import, probing, thumbnails (incl. SVG/PSD), CLIP search
 │   │   ├── maintenance.rs # Rebuild thumbs/index, orphan cleanup
 │   │   ├── undo.rs      # Undo/redo operation log
 │   │   ├── events.rs    # Cross-layer events
@@ -159,8 +165,8 @@ crates/
     │   ├── main.rs       # GPUI bootstrap, menus, keybindings
     │   ├── app/          # Window shell: root view, title bar, actions, i18n
     │   ├── library/      # LibraryController, import jobs, folder watcher
-    │   ├── dialogs/      # Settings, smart-collection rule editor, duplicate finder
-    │   └── panels/       # Explorer, Workspace, Tags, Inspector
+    │   ├── dialogs/      # Settings, rule editor, duplicate finder, batch rename
+    │   └── panels/       # Explorer, Folders, Workspace, Tags, Inspector
     └── Cargo.toml
 ```
 
@@ -196,13 +202,13 @@ cargo test -p trove-core
 cargo run -p trove-app
 ```
 
-Test status: `trove-core` compiles and all **94** tests pass. `trove-app` compiles cleanly.
+Test status: `trove-core` compiles and all **97** tests pass. `trove-app` compiles cleanly.
 
 ---
 
 ## Status
 
-- **trove-core** — feature-complete for the above list; tested (94 tests).
+- **trove-core** — feature-complete for the above list; tested (97 tests).
 - **trove-app** — compiles and runs: dock layout, custom title bar, justified thumbnail grid, drag & drop, multi-select, context menus, settings dialog, inspector, visual + semantic search, and import with progress are all wired.
 
 What is still missing (compared with Eagle, Billfish, digiKam, Adobe Bridge & co.) is mapped in [docs/FEATURE-GAPS.md](docs/FEATURE-GAPS.md).
