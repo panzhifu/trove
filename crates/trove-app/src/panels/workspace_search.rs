@@ -97,7 +97,7 @@ fn semantic_search(
     cx: &mut App,
 ) -> Vec<SearchResult> {
     if !trove_core::media::clip::semantic_ready() {
-        let _ = controller.update(cx, |ctl, _| {
+        controller.update(cx, |ctl, _| {
             ctl.notice = Some(rust_i18n::t!("workspace.semantic_not_ready").to_string());
         });
         return Vec::new();
@@ -112,7 +112,7 @@ fn semantic_search(
     ) {
         Ok(hits) => hits,
         Err(e) => {
-            let _ = controller.update(cx, |ctl, _| {
+            controller.update(cx, |ctl, _| {
                 ctl.notice = Some(
                     rust_i18n::t!("workspace.embed_failed_with", error = e.to_string())
                         .to_string(),

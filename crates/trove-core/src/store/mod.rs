@@ -55,7 +55,7 @@ impl Store {
 
     fn enable_foreign_keys(&self) -> Result<()> {
         let conn = self.conn();
-        rows::execute(&conn, "PRAGMA foreign_keys = ON", vec![])?;
+        rows::execute(conn, "PRAGMA foreign_keys = ON", vec![])?;
         Ok(())
     }
 
@@ -82,12 +82,12 @@ impl Store {
 
     fn user_version(&self) -> Result<i64> {
         let conn = self.conn();
-        rows::query_count(&conn, "PRAGMA user_version", vec![])
+        rows::query_count(conn, "PRAGMA user_version", vec![])
     }
 
     fn set_user_version(&self, version: i64) -> Result<()> {
         let conn = self.conn();
-        rows::execute(&conn, &format!("PRAGMA user_version = {version}"), vec![])?;
+        rows::execute(conn, &format!("PRAGMA user_version = {version}"), vec![])?;
         Ok(())
     }
 

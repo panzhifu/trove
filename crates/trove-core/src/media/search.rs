@@ -126,8 +126,8 @@ impl ColorHistogram {
         let mut buckets = [0.0_f32; 4096];
         let mut idx = 0;
         for chunk in s.as_bytes().chunks(2) {
-            if chunk.len() == 2 {
-                if let Ok(byte) = u8::from_str_radix(std::str::from_utf8(chunk).unwrap_or("00"), 16)
+            if chunk.len() == 2
+                && let Ok(byte) = u8::from_str_radix(std::str::from_utf8(chunk).unwrap_or("00"), 16)
                 {
                     for i in 0..4 {
                         if idx < 4096 {
@@ -136,7 +136,6 @@ impl ColorHistogram {
                         }
                     }
                 }
-            }
         }
         let total = if idx > 0 { 1.0 } else { 0.0 };
         let mut hist = Self { buckets, total };

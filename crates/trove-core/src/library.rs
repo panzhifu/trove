@@ -582,7 +582,6 @@ impl Library {
         // assets shared it.
         let mut freed: Vec<(String, String)> = Vec::new();
         let purged = self.store.transaction(|tx| {
-            let tx = &*tx;
             let mut freed_tx: Vec<(String, String)> = Vec::new();
             for id in ids {
                 let Some(asset) = assets::get(tx, *id)? else {

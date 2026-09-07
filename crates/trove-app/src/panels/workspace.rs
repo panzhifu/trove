@@ -866,7 +866,7 @@ impl Render for WorkspacePanel {
                 cx.background_executor()
                     .timer(std::time::Duration::from_millis(150))
                     .await;
-                let _ = panel.update(cx, |this, cx| {
+                panel.update(cx, |this, cx| {
                     this.relayout_pending = true;
                     this.debounce_timer = None;
                     cx.notify();
