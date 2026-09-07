@@ -15,7 +15,7 @@
 use std::path::PathBuf;
 
 use gpui_kit::base::{h_flex, v_flex};
-use gpui_kit::component::button::Button;
+use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::setting::{
     SettingField, SettingGroup, SettingItem, SettingPage, Settings,
 };
@@ -462,27 +462,23 @@ fn shortcuts_page() -> SettingPage {
     let items = keybinding_items();
     let mut group = SettingGroup::new();
     for i in 0..items.len() {
-        let kb = &items[i];
-        let desc = kb.description.clone();
-        let key = kb.key.clone();
-        let ctx = kb.context.clone();
-        let item_key = key.clone();
-        group = group.item(
-            SettingItem::new(
-                desc.clone(),
-                SettingField::render(move |_, _, cx| {
-                    keybinding_row(
-                        &KeyBindingConfig {
-                            key: item_key.clone(),
-                            description: desc.clone(),
-                            context: ctx.clone(),
-                        },
-                        cx,
-                    )
-                }),
-            )
-            .description(key),
-        );
+        let action = items[i].action;
+        let default_key = items[i].key;
+        let ctx = items[i].context;
+        let label = action_label(action);
+        let ctx_label = ctx
+            .map(context_label)
+            .unwrap_or_else(|| context_label("global"));
+
+        let action_row = action.to_string();
+        let key_row = default_key.to_string();
+        let ctx_row = ctx_label.clone();
+        group = group.item(SettingItem::new(
+            label.clone(),
+            SettingField::render(move |_, _, cx| {
+                keybinding_row(&action_row, &key_row, &ctx_row, cx)
+            }),
+        ));
     }
 
     // Add reset button at the bottom.
@@ -507,12 +503,17 @@ fn shortcuts_page() -> SettingPage {
     page.group(group)
 }
 
-/// Render a single keybinding row: key display + context.
-fn keybinding_row(kb: &KeyBindingConfig, cx: &mut App) -> Div {
+/// Render a single keybinding row: description + clickable key + context.
+fn keybinding_row(action: &str, default_key: &str, context_label: &str, cx: &mut App) -> Div {
     let config = AppConfig::load();
-    let custom_key = config.keybindings.get(&kb.description).cloned();
-    let display_key = custom_key.unwrap_or_else(|| kb.key.clone());
-    let context_str = kb.context.as_deref().unwrap_or("global");
+    let display_key = config
+        .keybindings
+        .get(action)
+        .cloned()
+        .unwrap_or_else(|| default_key.to_string());
+    let label = action_label(action);
+    let action_owned = action.to_string();
+    let default_owned = default_key.to_string();
 
     h_flex()
         .w_full()
@@ -520,26 +521,110 @@ fn keybinding_row(kb: &KeyBindingConfig, cx: &mut App) -> Div {
         .gap_2()
         .child(
             div()
+                .flex_1()
                 .text_sm()
                 .text_color(cx.theme().foreground)
-                .child(kb.description.clone()),
+                .child(label),
+        )
+        .child(
+            Button::new(format!("key-{action}"))
+                .ghost()
+                .xsmall()
+                .label(display_key.to_uppercase())
+                .on_click(move |_, window, cx| {
+                    prompt_keybinding_change(&action_owned, &default_owned, window, cx);
+                }),
         )
         .child(
             div()
-                .px_2()
-                .py_0p5()
-                .rounded(cx.theme().radius)
-                .bg(cx.theme().secondary)
                 .text_xs()
-                .text_color(cx.theme().foreground)
-                .child(display_key.to_uppercase()),
-        )
-        .child(
-            div()
-                .text_xs()
+                .w(px(60.))
+                .text_right()
                 .text_color(cx.theme().muted_foreground)
-                .child(context_str.to_string()),
+                .child(context_label.to_string()),
         )
+}
+
+/// Localized label for an action id.
+fn action_label(action: &str) -> String {
+    match action {
+        "MoveLeft" => rust_i18n::t!("shortcuts.actions.MoveLeft").to_string(),
+        "MoveRight" => rust_i18n::t!("shortcuts.actions.MoveRight").to_string(),
+        "MoveUp" => rust_i18n::t!("shortcuts.actions.MoveUp").to_string(),
+        "MoveDown" => rust_i18n::t!("shortcuts.actions.MoveDown").to_string(),
+        "OpenPreview" => rust_i18n::t!("shortcuts.actions.OpenPreview").to_string(),
+        "TrashSelected" => rust_i18n::t!("shortcuts.actions.TrashSelected").to_string(),
+        "SelectAll" => rust_i18n::t!("shortcuts.actions.SelectAll").to_string(),
+        "ClearSelection" => rust_i18n::t!("shortcuts.actions.ClearSelection").to_string(),
+        "Undo" => rust_i18n::t!("shortcuts.actions.Undo").to_string(),
+        "Redo" => rust_i18n::t!("shortcuts.actions.Redo").to_string(),
+        "ImportFiles" => rust_i18n::t!("shortcuts.actions.ImportFiles").to_string(),
+        "OpenSettings" => rust_i18n::t!("shortcuts.actions.OpenSettings").to_string(),
+        "RefreshLibrary" => rust_i18n::t!("shortcuts.actions.RefreshLibrary").to_string(),
+        other => other.to_string(),
+    }
+}
+
+/// Localized context label.
+fn context_label(context: &str) -> String {
+    match context {
+        "Workspace" => rust_i18n::t!("shortcuts.context.Workspace").to_string(),
+        _ => rust_i18n::t!("shortcuts.context.global").to_string(),
+    }
+}
+
+/// Prompt the user for a new keybinding via keyboard capture dialog.
+fn prompt_keybinding_change(action_id: &str, default_key: &str, window: &mut Window, cx: &mut App) {
+    use gpui_kit::component::dialog::DialogButtonProps;
+    use gpui_kit::component::input::{Input, InputState};
+
+    let action_id = action_id.to_string();
+    let default = default_key.to_string();
+    let action_label_disp = action_label(&action_id);
+    window.open_dialog(cx, move |dialog, window, cx| {
+        let input_state = cx.new(|cx| InputState::new(window, cx).placeholder(default.clone()));
+        let input_clone = input_state.clone();
+        let action_ok = action_id.clone();
+        dialog
+            .title(rust_i18n::t!("shortcuts.shortcut_prompt").to_string())
+            .child(
+                v_flex()
+                    .gap_2()
+                    .child(
+                        div().text_sm().text_color(cx.theme().foreground).child(
+                            rust_i18n::t!(
+                                "shortcuts.shortcut_prompt_hint",
+                                action = action_label_disp.clone(),
+                                default = default.clone()
+                            )
+                            .to_string(),
+                        ),
+                    )
+                    .child(Input::new(&input_clone).small())
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(rust_i18n::t!("shortcuts.shortcut_prompt_note").to_string()),
+                    ),
+            )
+            .button_props(
+                DialogButtonProps::default()
+                    .ok_text(rust_i18n::t!("settings.change").to_string())
+                    .show_cancel(true),
+            )
+            .on_ok(move |_, _, cx| {
+                let value: String = input_clone.read(cx).value().to_string();
+                let trimmed = value.trim().to_lowercase();
+                if !trimmed.is_empty() {
+                    let mut config = AppConfig::load();
+                    config.keybindings.insert(action_ok.clone(), trimmed);
+                    let _ = config.save();
+                    cx.refresh_windows();
+                }
+                true
+            })
+    });
 }
 
 /// Reset all keybindings to defaults.

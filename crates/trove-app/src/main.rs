@@ -104,22 +104,66 @@ fn build_menus() -> Vec<Menu> {
 }
 
 fn register_keys(cx: &mut App) {
-    cx.bind_keys([
-        KeyBinding::new("left", MoveLeft, Some(WORKSPACE_CONTEXT)),
-        KeyBinding::new("right", MoveRight, Some(WORKSPACE_CONTEXT)),
-        KeyBinding::new("up", MoveUp, Some(WORKSPACE_CONTEXT)),
-        KeyBinding::new("down", MoveDown, Some(WORKSPACE_CONTEXT)),
-        KeyBinding::new("enter", OpenPreview, Some(WORKSPACE_CONTEXT)),
-        KeyBinding::new("delete", TrashSelected, Some(WORKSPACE_CONTEXT)),
-        KeyBinding::new("backspace", TrashSelected, Some(WORKSPACE_CONTEXT)),
-        KeyBinding::new("ctrl-a", SelectAll, Some(WORKSPACE_CONTEXT)),
-        KeyBinding::new("escape", ClearSelection, Some(WORKSPACE_CONTEXT)),
-        // Undo/redo keys live in the Workspace context so typing in the search
-        // input or editors keeps its own text-level undo. The Edit menu items
-        // dispatch anywhere.
-        KeyBinding::new("ctrl-z", Undo, Some(WORKSPACE_CONTEXT)),
-        KeyBinding::new("ctrl-shift-z", Redo, Some(WORKSPACE_CONTEXT)),
-    ]);
+    use trove_core::config::AppConfig;
+    use trove_core::keybindings::default_keybindings;
+
+    let config = AppConfig::load();
+    let defaults = default_keybindings();
+
+    // Resolve effective key for an action (custom override > default).
+    let key_for = |action: &str, fallback: &str| -> String {
+        config
+            .keybindings
+            .get(action)
+            .cloned()
+            .unwrap_or_else(|| fallback.to_string())
+    };
+
+    let mut bindings = vec![];
+    // Look up the default key for an action from `defaults` (primary source).
+    let default_key = |action: &str| -> Option<String> {
+        defaults
+            .iter()
+            .find(|d| d.action == action)
+            .map(|d| d.key.to_string())
+    };
+
+    macro_rules! bind {
+        ($action:ident, $action_name:literal) => {
+            if let Some(k) = default_key($action_name) {
+                let k = key_for($action_name, &k);
+                if !k.is_empty() {
+                    bindings.push(KeyBinding::new(&k, $action, Some(WORKSPACE_CONTEXT)));
+                }
+            }
+        };
+    }
+
+    bind!(MoveLeft, "MoveLeft");
+    bind!(MoveRight, "MoveRight");
+    bind!(MoveUp, "MoveUp");
+    bind!(MoveDown, "MoveDown");
+    bind!(OpenPreview, "OpenPreview");
+    // Backspace stays a fixed alias for TrashSelected.
+    let trash_key = key_for("TrashSelected", "delete");
+    if !trash_key.is_empty() {
+        bindings.push(KeyBinding::new(
+            &trash_key,
+            TrashSelected,
+            Some(WORKSPACE_CONTEXT),
+        ));
+    }
+    bindings.push(KeyBinding::new(
+        "backspace",
+        TrashSelected,
+        Some(WORKSPACE_CONTEXT),
+    ));
+    bind!(SelectAll, "SelectAll");
+    bind!(ClearSelection, "ClearSelection");
+    bind!(Undo, "Undo");
+    bind!(Redo, "Redo");
+
+    cx.bind_keys(bindings);
 }
 
 /// Slim the global scrollbar theme: a hairline thumb that widens slightly on
