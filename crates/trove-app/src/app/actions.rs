@@ -13,6 +13,7 @@ gpui_kit::actions!(
         ImportFiles,
         ExportLibrary,
         ImportLibrary,
+        ExportMediaPackage,
         FindDuplicates,
         OpenSettings,
         // -- Edit menu / grid shortcuts ------------------------------------

@@ -302,6 +302,60 @@ impl AppView {
         .detach();
     }
 
+    /// File ▸ Export media package… : pick a destination directory, then
+    /// write a portable package (trove-export.json + media/ blobs).
+    fn prompt_export_media_package(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let ctl = self.controller.clone();
+        let handle = window.window_handle();
+        let rx = cx.prompt_for_paths(PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some(
+                rust_i18n::t!("app.export_media_package_prompt")
+                    .into_owned()
+                    .into(),
+            ),
+        });
+        cx.spawn(async move |_, cx| {
+            if let Ok(Ok(Some(paths))) = rx.await
+                && let Some(dir) = paths.first()
+            {
+                let result = handle.update(cx, |_, _, cx| {
+                    ctl.read(cx)
+                        .library
+                        .export_media_package(&dir.to_path_buf())
+                });
+                let note = match result {
+                    Ok(Ok(report)) => {
+                        let _ = ctl.update(cx, |ctl, cx| {
+                            ctl.generation += 1;
+                            cx.notify();
+                        });
+                        Notification::success(
+                            rust_i18n::t!(
+                                "app.export_media_package_done",
+                                files = report.files,
+                                path = report.path.display().to_string()
+                            )
+                            .to_string(),
+                        )
+                    }
+                    Ok(Err(e)) => Notification::warning(
+                        rust_i18n::t!("app.export_failed", error = e.to_string()).to_string(),
+                    ),
+                    Err(e) => Notification::warning(
+                        rust_i18n::t!("app.export_failed", error = e.to_string()).to_string(),
+                    ),
+                };
+                let _ = handle.update(cx, |_view, window, cx| {
+                    window.push_notification(note, cx);
+                });
+            }
+        })
+        .detach();
+    }
+
     /// Help ▸ About Trove.
     fn show_about(&self, window: &mut Window, cx: &mut Context<Self>) {
         window.open_dialog(cx, |dialog, _, _| {
@@ -363,6 +417,9 @@ impl Render for AppView {
             }))
             .on_action(cx.listener(|this, _: &ImportLibrary, window, cx| {
                 this.prompt_import_library(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ExportMediaPackage, window, cx| {
+                this.prompt_export_media_package(window, cx);
             }))
             .on_action(cx.listener(|this, _: &OpenSettings, window, cx| {
                 crate::dialogs::settings::SettingsDialog::open(window, cx, this.controller.clone());
