@@ -63,8 +63,8 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y \
             libsqlite3-dev libssl-dev pkg-config \
-            libxau6 libxcb1 libxcb-xkb1 libxdmcp6 \
-            libxkbcommon0 libxkbcommon-x110
+            libxau-dev libxcb1-dev libxcb-xkb1-dev libxdmcp-dev \
+            libxkbcommon-dev libxkbcommon-x11-dev
 
       - name: Build release binary
         run: cargo build --release --target ${{ matrix.target }} -p trove-app
