@@ -98,9 +98,10 @@ fn mine_font(path: &Path) -> Option<MinedMetadata> {
 /// in `probe::video_facts` because they belong on the asset row).
 fn mine_video(path: &Path) -> Option<MinedMetadata> {
     let facts = super::probe::video_facts(path)?;
-    let mut m = MinedMetadata::default();
-    m.duration_ms = facts.duration_ms;
-    Some(m)
+    Some(MinedMetadata {
+        duration_ms: facts.duration_ms,
+        ..Default::default()
+    })
 }
 
 // -- image -------------------------------------------------------------------

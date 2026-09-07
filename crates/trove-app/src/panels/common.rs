@@ -129,6 +129,7 @@ pub(crate) fn color_swatch(
 type RowClick = Box<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static>;
 type RowMenu = Box<dyn Fn(PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu + 'static>;
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn selectable_row(
     cx: &Context<impl Render>,
     id: &str,

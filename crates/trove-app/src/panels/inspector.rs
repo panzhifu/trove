@@ -735,7 +735,7 @@ fn format_duration(ms: u64) -> String {
     let s = secs % 60;
     if h > 0 {
         format!("{h}:{m:02}:{s:02}")
-    } else if ms % 1000 != 0 {
+    } else if !ms.is_multiple_of(1000) {
         format!("{m}:{s:02}.{:.2}", (ms % 1000) / 10)
     } else {
         format!("{m}:{s:02}")

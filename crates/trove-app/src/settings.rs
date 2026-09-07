@@ -126,7 +126,7 @@ fn library_location_row(controller: &Entity<LibraryController>, cx: &mut App) ->
                                     && let Some(path) = paths.first()
                                 {
                                     let path: PathBuf = path.to_path_buf();
-                                    let _ = cx.update(|cx| {
+                                    cx.update(|cx| {
                                         switch_library(&controller, path, cx);
                                         cx.refresh_windows();
                                     });
@@ -292,7 +292,7 @@ fn rebuild_thumbs(controller: &Entity<LibraryController>, force: bool, cx: &mut 
         let controller = controller.clone();
         async move |cx| {
             let report = task.await;
-            let _ = cx.update(|cx| {
+            cx.update(|cx| {
                 finish_job(
                     &controller,
                     rust_i18n::t!(

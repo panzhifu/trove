@@ -197,20 +197,20 @@ impl ExplorerPanel {
         if ctl.showing_trash {
             return rust_i18n::t!("app.trash").to_string();
         }
-        if let Some(sid) = ctl.active_smart {
-            if let Ok(Some(sc)) = smart_collections::get(conn, sid) {
-                return sc.name;
-            }
+        if let Some(sid) = ctl.active_smart
+            && let Ok(Some(sc)) = smart_collections::get(conn, sid)
+        {
+            return sc.name;
         }
-        if let Some(cid) = ctl.current_collection {
-            if let Ok(Some(c)) = collections::get(conn, cid) {
-                if let Some(pid) = c.parent_id {
-                    if let Ok(Some(p)) = collections::get(conn, pid) {
-                        return format!("{} / {}", p.name, c.name);
-                    }
-                }
-                return c.name;
+        if let Some(cid) = ctl.current_collection
+            && let Ok(Some(c)) = collections::get(conn, cid)
+        {
+            if let Some(pid) = c.parent_id
+                && let Ok(Some(p)) = collections::get(conn, pid)
+            {
+                return format!("{} / {}", p.name, c.name);
             }
+            return c.name;
         }
         // The favorites toggle turns the "all assets" view into the
         // favorites view; named views keep their names.

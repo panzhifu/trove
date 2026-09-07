@@ -197,12 +197,12 @@ impl AppView {
             prompt: Some(rust_i18n::t!("app.import_prompt").into_owned().into()),
         });
         cx.spawn(async move |_, cx| {
-            if let Ok(result) = rx.await {
-                if let Ok(Some(paths)) = result {
-                    let _ = handle.update(cx, |_view, window, cx| {
-                        jobs::import_paths_app(&ctl, paths, window, cx);
-                    });
-                }
+            if let Ok(result) = rx.await
+                && let Ok(Some(paths)) = result
+            {
+                let _ = handle.update(cx, |_view, window, cx| {
+                    jobs::import_paths_app(&ctl, paths, window, cx);
+                });
             }
         })
         .detach();

@@ -121,15 +121,15 @@ impl RuleDraft {
     }
 
     fn set_field(&mut self, ix: usize, field: SmartField, cx: &mut Context<Self>) {
-        if let Some(row) = self.rows.get_mut(ix) {
-            if row.field != field {
-                row.field = field;
-                row.op = SmartCompare::Eq;
-                row.kind = AssetKind::Image;
-                row.favorite = true;
-                row.tag = self.tag_names.first().cloned().unwrap_or_default();
-                row.rating = 3;
-            }
+        if let Some(row) = self.rows.get_mut(ix)
+            && row.field != field
+        {
+            row.field = field;
+            row.op = SmartCompare::Eq;
+            row.kind = AssetKind::Image;
+            row.favorite = true;
+            row.tag = self.tag_names.first().cloned().unwrap_or_default();
+            row.rating = 3;
         }
         self.touch(cx);
     }
