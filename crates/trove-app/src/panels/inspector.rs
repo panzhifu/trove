@@ -637,10 +637,13 @@ impl Render for InspectorPanel {
 
         v_flex()
             .size_full()
+            .flex_1() // ← 填满 Dock 分配的垂直空间
+            .gap_0() // ← 子元素之间无间距，内容紧贴
             .child(
                 div()
                     .flex_1()
                     .min_h_0()
+                    .size_full() // ← 水平方向也填满
                     .overflow_y_scrollbar()
                     .child(content),
             )
