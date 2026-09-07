@@ -153,6 +153,7 @@ mod tests {
             rating: None,
             is_favorite: false,
             source_url: None,
+            color_label: None,
             extra: Default::default(),
             created_at: now(),
             updated_at: now(),

@@ -70,7 +70,13 @@ mod tests {
     fn finds_files_skips_hidden_and_respects_depth() {
         let root = std::env::temp_dir().join(format!("trove-watcher-test-{}", std::process::id()));
         let sub = root.join("nested");
-        let deep = sub.join("a").join("b").join("c").join("d").join("e").join("f");
+        let deep = sub
+            .join("a")
+            .join("b")
+            .join("c")
+            .join("d")
+            .join("e")
+            .join("f");
         std::fs::create_dir_all(&deep).unwrap();
         std::fs::write(root.join("top.png"), b"x").unwrap();
         std::fs::write(root.join(".hidden.png"), b"x").unwrap();

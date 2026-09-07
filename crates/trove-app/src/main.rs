@@ -18,8 +18,8 @@ mod dialogs;
 mod library;
 mod panels;
 
-use app::actions::*;
 use app::AppView;
+use app::actions::*;
 
 /// Keyboard map for the asset grid. The `Workspace` key context is active
 /// only while the grid (or one of its cells) holds focus, so typing in the
