@@ -15,6 +15,7 @@ use gpui_kit::*;
 
 mod app;
 mod dialogs;
+mod fonts;
 mod library;
 mod panels;
 

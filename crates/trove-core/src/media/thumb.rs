@@ -36,6 +36,7 @@ pub fn ensure(root: &Path, sha: &str, kind: AssetKind, blob_path: &Path) -> Opti
     match kind {
         AssetKind::Image => write_thumb(blob_path, &out),
         AssetKind::Video => write_video_thumb(blob_path, &out),
+        AssetKind::Font => write_font_card(blob_path, &out),
         _ => None,
     }
 }
@@ -48,7 +49,88 @@ pub fn regenerate(root: &Path, sha: &str, kind: AssetKind, blob_path: &Path) -> 
     match kind {
         AssetKind::Image => write_thumb(blob_path, &out),
         AssetKind::Video => write_video_thumb(blob_path, &out),
+        AssetKind::Font => write_font_card(blob_path, &out),
         _ => None,
+    }
+}
+
+/// Size of the font-specimen card, in pixels (landscape, thumbnail-scale).
+const FONT_CARD_SIZE: (u32, u32) = (512, 256);
+/// Pixel size used to rasterize the sample text on the card.
+const FONT_CARD_PX: f32 = 88.0;
+
+/// Render a "font specimen card" for a font blob: the configured sample text
+/// (Settings ▸ General) set in the font itself on a light card. Characters
+/// the font does not cover are skipped, so CJK fonts show the CJK sample
+/// glyph and Latin-only fonts fall back to "Aa 123". Returns `None` when the
+/// bytes are not a parseable TTF/OTF (the asset keeps its icon).
+fn write_font_card(blob_path: &Path, out: &Path) -> Option<PathBuf> {
+    let bytes = std::fs::read(blob_path).ok()?;
+    let font = fontdue::Font::from_bytes(bytes, fontdue::FontSettings::default()).ok()?;
+    let sample = crate::config::AppConfig::load().font_sample_text();
+
+    let (w, h) = FONT_CARD_SIZE;
+    let mut card = image::RgbaImage::from_pixel(w, h, image::Rgba([0xF7, 0xF6, 0xF3, 0xFF]));
+    let ink = [0x20_u8, 0x21, 0x24];
+    let mut pen_x = 28.0_f32;
+    let baseline = 152.0_f32;
+
+    for ch in sample.chars() {
+        if pen_x + FONT_CARD_PX > w as f32 {
+            break;
+        }
+        if font.lookup_glyph_index(ch) == 0 {
+            // Glyph missing from this font; keep word gaps sensible.
+            if ch == ' ' {
+                pen_x += FONT_CARD_PX * 0.35;
+            }
+            continue;
+        }
+        let (metrics, bitmap) = font.rasterize(ch, FONT_CARD_PX);
+        if metrics.width == 0 || metrics.height == 0 {
+            pen_x += metrics.advance_width;
+            continue;
+        }
+        // fontdue works y-up; the bitmap's top row is the glyph's ymax.
+        let left = (pen_x + metrics.xmin as f32).round() as i32;
+        let top = (baseline - (metrics.ymin as f32 + metrics.height as f32)).round() as i32;
+        for row in 0..metrics.height {
+            for col in 0..metrics.width {
+                let a = bitmap[row * metrics.width + col] as u32;
+                if a == 0 {
+                    continue;
+                }
+                let x = left + col as i32;
+                let y = top + row as i32;
+                if x < 0 || y < 0 || x >= w as i32 || y >= h as i32 {
+                    continue;
+                }
+                let p = card.get_pixel_mut(x as u32, y as u32);
+                let blend = |c: u8, ink: u8| ((ink as u32 * a + c as u32 * (255 - a)) / 255) as u8;
+                *p = image::Rgba([
+                    blend(p[0], ink[0]),
+                    blend(p[1], ink[1]),
+                    blend(p[2], ink[2]),
+                    255,
+                ]);
+            }
+        }
+        pen_x += metrics.advance_width;
+    }
+
+    if let Some(parent) = out.parent() {
+        std::fs::create_dir_all(parent).ok()?;
+    }
+    let tmp = out.with_extension("tmp.jpg");
+    match image::DynamicImage::ImageRgba8(card).save_with_format(&tmp, image::ImageFormat::Jpeg) {
+        Ok(()) => {
+            std::fs::rename(&tmp, out).ok()?;
+            Some(out.to_path_buf())
+        }
+        Err(_) => {
+            let _ = std::fs::remove_file(&tmp);
+            None
+        }
     }
 }
 
@@ -274,5 +356,50 @@ mod tests {
 
         let out = ensure(&dir, "a".repeat(64).as_str(), AssetKind::Video, &video);
         assert!(out.is_some_and(|p| p.is_file()));
+    }
+
+    /// Font-card generation against a system font, skipped when none can be
+    /// found (keep the suite independent of installed fonts).
+    #[test]
+    fn font_card_generated_from_system_font() {
+        let font_path = ["usr/share/fonts"]
+            .iter()
+            .flat_map(|d| walkdir_candidates(std::path::Path::new(d)))
+            .find(|p| {
+                matches!(
+                    p.extension().and_then(|e| e.to_str()),
+                    Some("ttf") | Some("otf")
+                )
+            });
+        let Some(font_path) = font_path else {
+            eprintln!("skipping: no system ttf/otf font found");
+            return;
+        };
+
+        let dir = std::env::temp_dir().join(format!("trove-fontcard-{}", uuid::Uuid::new_v4()));
+        let out = ensure(&dir, "b".repeat(64).as_str(), AssetKind::Font, &font_path);
+        assert!(out.as_ref().is_some_and(|p| p.is_file()));
+        // The card decodes back and has the expected card dimensions.
+        let img = image::open(out.expect("card")).unwrap();
+        let (w, _) = img.dimensions();
+        assert_eq!(w, FONT_CARD_SIZE.0);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    fn walkdir_candidates(dir: &Path) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return out;
+        };
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                out.extend(walkdir_candidates(&p));
+            } else {
+                out.push(p);
+            }
+        }
+        out
     }
 }

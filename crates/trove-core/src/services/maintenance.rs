@@ -31,8 +31,9 @@ pub struct ThumbRebuildReport {
 /// gathered where the non-`Send` [`Library`] lives.
 #[derive(Debug, Clone, Default)]
 pub struct ThumbPlan {
-    /// `(blob path, sha256)` pairs whose thumbnail should be regenerated.
-    pub items: Vec<(PathBuf, String)>,
+    /// `(blob path, sha256, kind)` triples whose thumbnail should be
+    /// regenerated.
+    pub items: Vec<(PathBuf, String, AssetKind)>,
     /// Image assets whose stored blob file is missing on disk.
     pub missing_blobs: u64,
 }
@@ -41,32 +42,35 @@ pub struct ThumbPlan {
 ///
 /// `force = false` only plans gaps (missing thumbnails); `force = true`
 /// plans a rewrite of every thumbnail, repairing corrupt cache entries.
+/// Covers both image and font assets (fonts get a specimen-card thumbnail).
 pub fn plan_thumbnail_rebuild(lib: &Library, force: bool) -> Result<ThumbPlan> {
     let conn = lib.store().conn();
     let root = lib.root();
-    let (_, images) = assets::query(
-        conn,
-        &AssetQuery {
-            kind: Some(AssetKind::Image),
-            is_trashed: false,
-            ..Default::default()
-        },
-    )?;
 
     let mut plan = ThumbPlan::default();
-    for asset in images {
-        let Some(sha) = asset.sha256 else { continue };
-        let Some(rel) = asset.rel_path else { continue };
-        let blob = root.join(&rel);
-        if !blob.is_file() {
-            plan.missing_blobs += 1;
-            continue;
+    for kind in [AssetKind::Image, AssetKind::Font] {
+        let (_, assets) = assets::query(
+            conn,
+            &AssetQuery {
+                kind: Some(kind),
+                is_trashed: false,
+                ..Default::default()
+            },
+        )?;
+        for asset in assets {
+            let Some(sha) = asset.sha256 else { continue };
+            let Some(rel) = asset.rel_path else { continue };
+            let blob = root.join(&rel);
+            if !blob.is_file() {
+                plan.missing_blobs += 1;
+                continue;
+            }
+            // Skip existing thumbnails unless a full rewrite was requested.
+            if !force && thumb::abs_path(root, &sha).is_file() {
+                continue;
+            }
+            plan.items.push((blob, sha, kind));
         }
-        // Skip existing thumbnails unless a full rewrite was requested.
-        if !force && thumb::abs_path(root, &sha).is_file() {
-            continue;
-        }
-        plan.items.push((blob, sha));
     }
     Ok(plan)
 }
@@ -78,8 +82,8 @@ pub fn run_thumbnail_plan(root: &Path, plan: ThumbPlan) -> ThumbRebuildReport {
         regenerated: 0,
         missing_blobs: plan.missing_blobs,
     };
-    for (blob, sha) in plan.items {
-        if thumb::regenerate(root, &sha, AssetKind::Image, &blob).is_some() {
+    for (blob, sha, kind) in plan.items {
+        if thumb::regenerate(root, &sha, kind, &blob).is_some() {
             report.regenerated += 1;
         }
     }
