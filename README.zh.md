@@ -110,6 +110,7 @@ cargo run -p trove-app
 
 ### 设计格式、文件夹与可移植性
 - **SVG 与 PSD 缩略图**：SVG 按矢量渲染（系统字体可显示文字），PSD 合成内嵌预览；导入时挖掘尺寸。
+- **相机 RAW 与 HEIC**：CR2/CR3/NEF/ARW/DNG/RAF/ORF/RW2 等经 rawler 管线解码（去马赛克 → 白平衡 → sRGB，自动校正方向）；HEIC/HEIF 在系统装有 heif-dec 时自动转换。
 - **文件夹面板**：导入记录来源路径，左栏可按文件夹树浏览并筛选任意子树。
 - **媒体包**：文件 ▸ 导出媒体包… 输出可移植目录（元数据 + blob）；导入素材库… 同时接受 JSON 导出与目录包，按内容哈希自动回链。
 - **浏览器扩展**：`extension/` 内置 MV3 扩展，右键即可把网页图片发送到运行中的 Trove。
@@ -202,7 +203,7 @@ cargo test -p trove-core
 cargo run -p trove-app
 ```
 
-测试状态：`trove-core` 编译通过，**97** 个测试全部通过。`trove-app` 编译通过。
+测试状态：`trove-core` 编译通过，**99** 个测试全部通过。`trove-app` 编译通过。
 
 ---
 
@@ -210,7 +211,7 @@ cargo run -p trove-app
 
 对标 Eagle、Billfish、digiKam、Adobe Bridge 等软件的功能差距与路线图见 [docs/FEATURE-GAPS.md](docs/FEATURE-GAPS.md)。
 
-- **trove-core** — 上述核心功能已齐并有测试覆盖（97 个测试）。
+- **trove-core** — 上述核心功能已齐并有测试覆盖（99 个测试）。
 - **trove-app** — 已编译可运行：停靠布局、自定义标题栏、对齐缩略图网格、拖放、多选、右键菜单、设置对话框、检查器、视觉/语义搜索、带进度导入均已接通。
 
 ---
