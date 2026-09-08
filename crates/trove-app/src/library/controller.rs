@@ -88,6 +88,10 @@ pub struct LibraryController {
     /// Status line surfaced by the Settings dialog (maintenance jobs,
     /// library switches). Set by whichever action ran last.
     pub notice: Option<String>,
+    /// Result of the last integrity check (Settings ▸ Maintenance). `None`
+    /// until the first run; cleared when the library is swapped so a report
+    /// never outlives its library.
+    pub integrity_report: Option<trove_core::services::maintenance::IntegrityReport>,
     /// A maintenance / library job is running; Settings buttons refuse to
     /// start a second one until it finishes.
     pub busy: bool,
@@ -122,6 +126,7 @@ impl LibraryController {
             last_view_record: None,
             grid_loaded: GRID_PAGE_SIZE,
             notice: None,
+            integrity_report: None,
             busy: false,
         }
     }
@@ -309,6 +314,7 @@ impl LibraryController {
         self.filter_kind = None;
         self.filter_favorite = false;
         self.import_phase = ImportPhase::Idle;
+        self.integrity_report = None;
         self.visible_assets.clear();
         self.reset_grid_page();
         self.generation += 1;
