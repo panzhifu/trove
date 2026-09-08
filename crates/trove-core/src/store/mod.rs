@@ -9,6 +9,7 @@ pub mod smart;
 pub mod smart_collections;
 pub mod stats;
 pub mod tags;
+pub mod view_history;
 pub mod visual_search;
 
 use std::cell::RefCell;
@@ -1256,5 +1257,68 @@ mod tests {
         assert_eq!(value["collections"][0]["name"], "trip");
         assert_eq!(value["tags"][0]["name"], "beach");
         assert_eq!(value["smart_collections"][0]["name"], "fav");
+    }
+
+    #[test]
+    fn view_history_records_prunes_and_hides_trashed() {
+        use crate::store::view_history;
+        let store = Store::in_memory().unwrap();
+        let conn = store.conn();
+        let a = sample_asset("a.png", AssetKind::Image);
+        let b = sample_asset("b.png", AssetKind::Image);
+        let c = sample_asset("c.png", AssetKind::Image);
+        assets::insert(conn, &a).unwrap();
+        assets::insert(conn, &b).unwrap();
+        assets::insert(conn, &c).unwrap();
+
+        // View order b, a, c -> newest first is c, a, b.
+        view_history::record(conn, b.id).unwrap();
+        view_history::record(conn, a.id).unwrap();
+        view_history::record(conn, c.id).unwrap();
+        assert_eq!(
+            view_history::recent_ids(conn, 10).unwrap(),
+            vec![c.id, a.id, b.id]
+        );
+        assert_eq!(view_history::live_count(conn).unwrap(), 3);
+
+        // Re-viewing bumps the asset back to the top (upsert, no duplicate).
+        view_history::record(conn, b.id).unwrap();
+        assert_eq!(
+            view_history::recent_ids(conn, 10).unwrap(),
+            vec![b.id, c.id, a.id]
+        );
+        assert_eq!(view_history::live_count(conn).unwrap(), 3);
+
+        // Trashed assets drop out of the view but keep their row, so a
+        // restore brings the entry back.
+        assets::set_trashed(conn, c.id, true).unwrap();
+        assert_eq!(
+            view_history::recent_ids(conn, 10).unwrap(),
+            vec![b.id, a.id]
+        );
+        assert_eq!(view_history::live_count(conn).unwrap(), 2);
+
+        // Purging an asset cascades its history row away.
+        super::rows::execute(
+            conn,
+            "DELETE FROM assets WHERE id = ?1",
+            vec![super::rows::uuid(c.id).into()],
+        )
+        .unwrap();
+        assert_eq!(
+            view_history::recent_ids(conn, 10).unwrap(),
+            vec![b.id, a.id]
+        );
+
+        // The cap prunes the oldest entries.
+        view_history::prune(conn, 2).unwrap();
+        assert_eq!(
+            view_history::recent_ids(conn, 10).unwrap(),
+            vec![b.id, a.id]
+        );
+
+        // Clear wipes everything.
+        view_history::clear(conn).unwrap();
+        assert_eq!(view_history::live_count(conn).unwrap(), 0);
     }
 }

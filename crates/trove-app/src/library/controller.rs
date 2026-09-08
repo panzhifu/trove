@@ -1,11 +1,13 @@
 //! Application-level library state shared by the dock panels.
 
 use std::path::PathBuf;
+use std::time::Instant;
 
 use uuid::Uuid;
 
 use trove_core::library::Library;
 use trove_core::model::{AssetKind, AssetSort};
+use trove_core::store::view_history;
 
 /// Current import activity, shown by the Explorer panel.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -50,6 +52,8 @@ pub struct LibraryController {
     pub selected_assets: Vec<Uuid>,
     /// When set, the workspace browses the trash instead of a collection.
     pub showing_trash: bool,
+    /// When set, the workspace browses the recently-viewed history.
+    pub showing_recent: bool,
     /// When set, only assets carrying this tag are shown.
     pub active_tag: Option<Uuid>,
     /// When set, only assets imported from this source-path prefix are shown.
@@ -75,6 +79,10 @@ pub struct LibraryController {
     /// The last clicked asset in the grid: the fixed end of a Shift range
     /// selection. Cleared whenever the selection is cleared.
     pub selection_anchor: Option<Uuid>,
+    /// Debounce guard for view recording: the asset id and the instant its
+    /// view was last written. A repeat selection of the same asset within
+    /// [`VIEW_DEBOUNCE`] does not touch the database again.
+    last_view_record: Option<(Uuid, Instant)>,
     /// How many assets the grid has loaded so far (pagination cursor).
     pub grid_loaded: usize,
     /// Status line surfaced by the Settings dialog (maintenance jobs,
@@ -85,6 +93,11 @@ pub struct LibraryController {
     pub busy: bool,
 }
 
+/// Minimum delay between two view-history writes for the same asset.
+/// Rapid clicks / arrow-key walks do not spam the database; every distinct
+/// selection is recorded immediately.
+const VIEW_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(1500);
+
 impl LibraryController {
     pub fn new(library: Library) -> Self {
         Self {
@@ -93,6 +106,7 @@ impl LibraryController {
             current_collection: None,
             selected_assets: Vec::new(),
             showing_trash: false,
+            showing_recent: false,
             active_tag: None,
             active_folder: None,
             active_smart: None,
@@ -105,6 +119,7 @@ impl LibraryController {
             import_phase: ImportPhase::Idle,
             visible_assets: Vec::new(),
             selection_anchor: None,
+            last_view_record: None,
             grid_loaded: GRID_PAGE_SIZE,
             notice: None,
             busy: false,
@@ -146,6 +161,7 @@ impl LibraryController {
     pub fn select_collection(&mut self, collection: Option<Uuid>) {
         self.current_collection = collection;
         self.showing_trash = false;
+        self.showing_recent = false;
         self.active_smart = None;
         self.selected_assets.clear();
         self.reset_grid_page();
@@ -155,10 +171,39 @@ impl LibraryController {
     pub fn select_trash(&mut self) {
         self.current_collection = None;
         self.showing_trash = true;
+        self.showing_recent = false;
         self.active_smart = None;
         self.selected_assets.clear();
         self.reset_grid_page();
         self.generation += 1;
+    }
+
+    /// Browse the recently-viewed history view.
+    pub fn select_recent(&mut self) {
+        self.current_collection = None;
+        self.showing_trash = false;
+        self.showing_recent = true;
+        self.active_smart = None;
+        self.selected_assets.clear();
+        self.reset_grid_page();
+        self.generation += 1;
+    }
+
+    /// Record `asset` as viewed in the history table. Debounced per asset:
+    /// a repeated selection of the same asset within [`VIEW_DEBOUNCE`] is
+    /// ignored, anything else is written immediately. Failures are silent —
+    /// history is a convenience, not a workflow step.
+    fn record_view(&mut self, asset: Uuid) {
+        if let Some((id, at)) = self.last_view_record
+            && id == asset
+            && at.elapsed() < VIEW_DEBOUNCE
+        {
+            return;
+        }
+        let conn = self.library.store().conn();
+        if view_history::record(conn, asset).is_ok() {
+            self.last_view_record = Some((asset, Instant::now()));
+        }
     }
 
     /// Set the active smart collection; `None` returns to "All assets".
@@ -168,6 +213,7 @@ impl LibraryController {
         self.current_collection = None;
         self.active_tag = None;
         self.showing_trash = false;
+        self.showing_recent = false;
         self.selected_assets.clear();
         self.reset_grid_page();
         self.generation += 1;
@@ -254,6 +300,7 @@ impl LibraryController {
         self.library = library;
         self.current_collection = None;
         self.showing_trash = false;
+        self.showing_recent = false;
         self.active_smart = None;
         self.active_tag = None;
         self.selected_assets.clear();
@@ -297,6 +344,9 @@ impl LibraryController {
     pub fn select_asset(&mut self, asset: Option<Uuid>) {
         self.selected_assets = asset.into_iter().collect();
         self.selection_anchor = asset;
+        if let Some(id) = asset {
+            self.record_view(id);
+        }
         self.generation += 1;
     }
 
@@ -319,6 +369,7 @@ impl LibraryController {
             _ => vec![id],
         };
         self.selection_anchor = Some(id);
+        self.record_view(id);
         self.generation += 1;
     }
 
@@ -330,6 +381,9 @@ impl LibraryController {
             self.selected_assets.push(id);
         }
         self.selection_anchor = Some(id);
+        if let Some(primary) = self.selected_assets.last().copied() {
+            self.record_view(primary);
+        }
         self.generation += 1;
     }
 

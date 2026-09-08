@@ -117,6 +117,7 @@ impl Row {
 struct ViewKey {
     collection: Option<Uuid>,
     in_trash: bool,
+    in_recent: bool,
     smart: Option<Uuid>,
     tag: Option<Uuid>,
     folder: Option<String>,
@@ -201,7 +202,8 @@ impl DockPanel for WorkspacePanel {
     ) -> Option<impl IntoElement> {
         let ctl = self.controller.read(cx);
         let in_trash = ctl.showing_trash;
-        let search_active = !in_trash && !ctl.search_text.trim().is_empty();
+        let in_recent = ctl.showing_recent;
+        let search_active = !in_trash && !in_recent && !ctl.search_text.trim().is_empty();
         let loaded = ctl.grid_loaded.min(self.last_total);
         let total = self.last_total;
         let _ = ctl;
@@ -223,7 +225,7 @@ impl DockPanel for WorkspacePanel {
                 .items_center()
                 .gap_1()
                 .child(count_label)
-                .when(!in_trash, |this| {
+                .when(!in_trash && !in_recent, |this| {
                     // Self-contained floating search: trigger + popover +
                     // input + inline ✕ all live in `SearchBox`.
                     this.child(filter_controls(&controller, cx))
@@ -238,6 +240,19 @@ impl DockPanel for WorkspacePanel {
                             .label(rust_i18n::t!("workspace.empty_all").to_string())
                             .tooltip(rust_i18n::t!("workspace.empty_all_tooltip").to_string())
                             .on_click(cx.listener(|this, _, _, cx| this.empty_trash(cx))),
+                    )
+                })
+                .when(in_recent, |this| {
+                    this.child(
+                        Button::new("clear-history")
+                            .ghost()
+                            .danger()
+                            .xsmall()
+                            .label(rust_i18n::t!("workspace.clear_history").to_string())
+                            .tooltip(rust_i18n::t!("workspace.clear_history_tooltip").to_string())
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.clear_view_history(cx);
+                            })),
                     )
                 })
                 .when(search_active, |this| {
@@ -376,15 +391,37 @@ impl WorkspacePanel {
         });
     }
 
+    /// Wipe the recently-viewed history (title-bar button of that view).
+    fn clear_view_history(&mut self, cx: &mut Context<Self>) {
+        let controller = self.controller.clone();
+        controller.update(cx, |ctl, cx| {
+            let conn = ctl.library.store().conn();
+            ctl.notice = match trove_core::store::view_history::clear(conn) {
+                Ok(_) => Some(rust_i18n::t!("workspace.history_cleared").to_string()),
+                Err(e) => Some(
+                    rust_i18n::t!("workspace.history_clear_failed", error = e.to_string())
+                        .to_string(),
+                ),
+            };
+            ctl.selected_assets.clear();
+            ctl.generation += 1;
+            cx.notify();
+        });
+    }
+
     /// Title-bar label: the name of whatever the library is currently
     /// browsed through — smart collection, collection (with its parent
-    /// prefix when nested), trash, or the all-assets fallback.
+    /// prefix when nested), trash, recently viewed, or the all-assets
+    /// fallback.
     fn title_label(&self, cx: &Context<Self>) -> String {
         let ctl = self.controller.read(cx);
         let conn = ctl.library.store().conn();
 
         if ctl.showing_trash {
             return rust_i18n::t!("app.trash").to_string();
+        }
+        if ctl.showing_recent {
+            return rust_i18n::t!("app.recent_viewed").to_string();
         }
         if let Some(sid) = ctl.active_smart
             && let Ok(Some(sc)) = smart_collections::get(conn, sid)
@@ -684,6 +721,7 @@ impl Render for WorkspacePanel {
             collection,
             active_tag,
             in_trash,
+            in_recent,
             search,
             smart,
             grid_loaded,
@@ -700,6 +738,7 @@ impl Render for WorkspacePanel {
                 ctl.current_collection,
                 ctl.active_tag,
                 ctl.showing_trash,
+                ctl.showing_recent,
                 ctl.search_text.trim().to_string(),
                 ctl.active_smart,
                 ctl.grid_loaded,
@@ -714,10 +753,25 @@ impl Render for WorkspacePanel {
         };
         let library_root = self.controller.read(cx).library.root().to_path_buf();
 
-        // --- paged query (four mutually-exclusive view drivers) -----------
+        // --- paged query (five mutually-exclusive view drivers) -----------
         let limit = Some(grid_loaded as u32);
-        let search_active = !in_trash && !search.is_empty();
-        let (mut total, mut list): (usize, Vec<trove_core::model::Asset>) = if search_active {
+        let search_active = !in_trash && !in_recent && !search.is_empty();
+        let (mut total, mut list): (usize, Vec<trove_core::model::Asset>) = if in_recent {
+            // Recently viewed: ids ordered by last view time, materialised
+            // in that order (missing / trashed ids are dropped by the
+            // query). History is capped at 200, so one page covers it all.
+            let conn = self.controller.read(cx).library.store().conn();
+            match trove_core::store::view_history::recent_ids(conn, grid_loaded).and_then(|ids| {
+                let n = ids.len();
+                assets::by_ids(conn, &ids).map(|a| (n, a))
+            }) {
+                Ok((t, a)) => (t, a),
+                Err(e) => {
+                    self.report_view_error(cx, e);
+                    (0, Vec::new())
+                }
+            }
+        } else if search_active {
             let q = AssetQuery {
                 collection_id: collection,
                 tag_ids: active_tag.map(|t| vec![t]).unwrap_or_default(),
@@ -853,6 +907,7 @@ impl Render for WorkspacePanel {
         let other_changed = self.view_key.as_ref().is_none_or(|k| {
             k.collection != collection
                 || k.in_trash != in_trash
+                || k.in_recent != in_recent
                 || k.smart != smart
                 || k.tag != active_tag
                 || k.folder != active_folder
@@ -888,6 +943,7 @@ impl Render for WorkspacePanel {
         let key = ViewKey {
             collection,
             in_trash,
+            in_recent,
             smart,
             tag: active_tag,
             folder: active_folder.clone(),
