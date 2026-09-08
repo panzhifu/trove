@@ -7545,7 +7545,7 @@ dependencies = [
 
 [[package]]
 name = "trove-app"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "gpui-kit",
  "rust-i18n",
@@ -7557,7 +7557,7 @@ dependencies = [
 
 [[package]]
 name = "trove-core"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "chrono",
  "dirs 5.0.1",
