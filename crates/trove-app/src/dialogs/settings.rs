@@ -1209,7 +1209,6 @@ fn clip_model_file_row(controller: &Entity<LibraryController>, cx: &mut App) -> 
 }
 
 /// Pick the single CLIP ONNX model file via the system dialog and persist it.
-
 fn prompt_model_file(controller: &Entity<LibraryController>, cx: &mut App) {
     let rx = cx.prompt_for_paths(PathPromptOptions {
         files: true,

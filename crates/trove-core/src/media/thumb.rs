@@ -170,49 +170,6 @@ fn write_thumb(blob_path: &Path, out: &Path) -> Option<PathBuf> {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn ffmpeg_available() -> bool {
-        std::process::Command::new("ffmpeg")
-            .arg("-version")
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
-    }
-
-    /// End-to-end poster-frame extraction, skipped when the optional ffmpeg
-    /// dependency is not installed.
-    #[test]
-    fn video_thumb_extracted_when_ffmpeg_present() {
-        if !ffmpeg_available() {
-            eprintln!("skipping: ffmpeg not on PATH");
-            return;
-        }
-        let dir = std::env::temp_dir().join(format!("trove-thumb-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let video = dir.join("clip.mp4");
-        let status = std::process::Command::new("ffmpeg")
-            .args([
-                "-y",
-                "-loglevel",
-                "error",
-                "-f",
-                "lavfi",
-                "-i",
-                "color=c=red:size=64x48:rate=1:duration=2",
-            ])
-            .arg(&video)
-            .status()
-            .unwrap();
-        assert!(status.success());
-
-        let out = ensure(&dir, "a".repeat(64).as_str(), AssetKind::Video, &video);
-        assert!(out.is_some_and(|p| p.is_file()));
-    }
-}
-
 /// Decode and develop a camera-RAW file with rawler: demosaic, white
 /// balance, color calibration and sRGB gamma in one pass, then clamp into
 /// an 8-bit RGB(A) image (EXIF orientation applied).
@@ -225,8 +182,8 @@ fn render_raw(path: &Path) -> Option<image::DynamicImage> {
         rawler::imgop::develop::Intermediate::Monochrome(pix) => {
             let mut gray = image::GrayImage::new(pix.width as u32, pix.height as u32);
             for (x, y, pixel) in gray.enumerate_pixels_mut() {
-                let value = (pix.data[y as usize * pix.width as usize + x as usize] * 255.0)
-                    .clamp(0.0, 255.0) as u8;
+                let value =
+                    (pix.data[y as usize * pix.width + x as usize] * 255.0).clamp(0.0, 255.0) as u8;
                 *pixel = image::Luma([value]);
             }
             image::DynamicImage::ImageLuma8(gray)
@@ -274,5 +231,48 @@ fn apply_orientation(
         O::Rotate90 => image.rotate90(),
         O::Transverse => image.rotate270().fliph(),
         O::Rotate270 => image.rotate270(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ffmpeg_available() -> bool {
+        std::process::Command::new("ffmpeg")
+            .arg("-version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    /// End-to-end poster-frame extraction, skipped when the optional ffmpeg
+    /// dependency is not installed.
+    #[test]
+    fn video_thumb_extracted_when_ffmpeg_present() {
+        if !ffmpeg_available() {
+            eprintln!("skipping: ffmpeg not on PATH");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("trove-thumb-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let video = dir.join("clip.mp4");
+        let status = std::process::Command::new("ffmpeg")
+            .args([
+                "-y",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=red:size=64x48:rate=1:duration=2",
+            ])
+            .arg(&video)
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        let out = ensure(&dir, "a".repeat(64).as_str(), AssetKind::Video, &video);
+        assert!(out.is_some_and(|p| p.is_file()));
     }
 }
