@@ -77,6 +77,10 @@ struct Cell {
     name: String,
     size_bytes: u64,
     added: String,
+    /// Live font preview: family + the font file to register, set only for
+    /// Font assets so cells can render the sample text in the actual font.
+    font_family: Option<String>,
+    font_blob: Option<PathBuf>,
 }
 
 impl Cell {
@@ -768,6 +772,28 @@ impl Render for WorkspacePanel {
                     .as_deref()
                     .map(|sha| trove_core::media::thumb::abs_path(&library_root, sha))
                     .filter(|p| p.is_file());
+                // Live font preview inputs: family (probed at import) plus
+                // the font file to register (blob or linked source).
+                let (font_family, font_blob) = if a.kind == AssetKind::Font {
+                    let blob = if a.origin == trove_core::model::Origin::Linked {
+                        a.extra
+                            .get("source_path")
+                            .and_then(|v| v.as_str())
+                            .map(PathBuf::from)
+                    } else {
+                        a.rel_path.as_ref().map(|rel| library_root.join(rel))
+                    }
+                    .filter(|p| p.is_file());
+                    (
+                        a.extra
+                            .get("font_family")
+                            .and_then(|v| v.as_str())
+                            .map(str::to_string),
+                        blob,
+                    )
+                } else {
+                    (None, None)
+                };
                 Cell {
                     id: a.id,
                     kind: a.kind,
@@ -778,6 +804,8 @@ impl Render for WorkspacePanel {
                     name: display_name(a),
                     size_bytes: a.size_bytes,
                     added: a.created_at.format("%Y-%m-%d %H:%M").to_string(),
+                    font_family,
+                    font_blob,
                 }
             })
             .collect();
@@ -1561,17 +1589,38 @@ fn build_cell_element(
     let (kind, thumb, id, trashed) = (cell.kind, cell.thumb.clone(), cell.id, cell.trashed);
     let is_sel = controller.read(cx).selected_assets.contains(&id);
 
-    let preview: AnyElement = match &thumb {
-        Some(path) => img(path.clone())
-            .size_full()
-            .object_fit(gpui_kit::ObjectFit::Contain)
-            .into_any_element(),
-        None => v_flex()
-            .size_full()
-            .items_center()
-            .justify_center()
-            .child(Icon::new(kind_icon(kind)).size_8())
-            .into_any_element(),
+    // Fonts render live — the sample text set in the font itself, one row —
+    // with the static specimen card as fallback (unparseable font / no
+    // metadata).
+    let live_font: Option<AnyElement> = if kind == AssetKind::Font {
+        cell.font_family.as_ref().and_then(|family| {
+            super::common::ensure_font_registered(family, cell.font_blob.as_deref(), cx).then(
+                || {
+                    super::common::font_live_preview(family, cx)
+                        .size_full()
+                        .text_size(px((h * 0.42).clamp(16.0, 72.0)))
+                        .into_any_element()
+                },
+            )
+        })
+    } else {
+        None
+    };
+    let preview: AnyElement = if let Some(live) = live_font {
+        live
+    } else {
+        match &thumb {
+            Some(path) => img(path.clone())
+                .size_full()
+                .object_fit(gpui_kit::ObjectFit::Contain)
+                .into_any_element(),
+            None => v_flex()
+                .size_full()
+                .items_center()
+                .justify_center()
+                .child(Icon::new(kind_icon(kind)).size_8())
+                .into_any_element(),
+        }
     };
     let base = div()
         .id(format!("cell-{id}"))
@@ -1634,18 +1683,10 @@ fn build_cell_element(
 /// One full-width info row for list view: small thumbnail (or kind icon),
 /// name, kind label, size and import date, with the same click / drag /
 /// context-menu behavior as the grid cells.
-fn build_list_row_element(
-    cx: &mut App,
-    controller: &Entity<LibraryController>,
-    focus_handle: &FocusHandle,
-    cell: &Cell,
-    w: f32,
-) -> AnyElement {
-    let (kind, thumb, id, trashed) = (cell.kind, cell.thumb.clone(), cell.id, cell.trashed);
-    let (name, size, added) = (cell.name.clone(), cell.size_bytes, cell.added.clone());
-    let is_sel = controller.read(cx).selected_assets.contains(&id);
-
-    let lead: AnyElement = match &thumb {
+/// List-row lead element fallback: thumbnail when one exists, kind icon
+/// otherwise.
+fn list_lead_fallback(cx: &App, kind: AssetKind, thumb: Option<&PathBuf>) -> AnyElement {
+    match thumb {
         Some(path) => img(path.clone())
             .w(px(60.))
             .h(px(36.))
@@ -1661,6 +1702,32 @@ fn build_list_row_element(
             .bg(cx.theme().secondary)
             .child(Icon::new(kind_icon(kind)).size_5())
             .into_any_element(),
+    }
+}
+
+fn build_list_row_element(
+    cx: &mut App,
+    controller: &Entity<LibraryController>,
+    focus_handle: &FocusHandle,
+    cell: &Cell,
+    w: f32,
+) -> AnyElement {
+    let (kind, thumb, id, trashed) = (cell.kind, cell.thumb.clone(), cell.id, cell.trashed);
+    let (name, size, added) = (cell.name.clone(), cell.size_bytes, cell.added.clone());
+    let is_sel = controller.read(cx).selected_assets.contains(&id);
+
+    let lead: AnyElement = if kind == AssetKind::Font
+        && let Some(family) = cell.font_family.as_ref()
+        && super::common::ensure_font_registered(family, cell.font_blob.as_deref(), cx)
+    {
+        super::common::font_live_preview(family, cx)
+            .w(px(60.))
+            .h(px(36.))
+            .text_size(px(18.))
+            .rounded(cx.theme().radius)
+            .into_any_element()
+    } else {
+        list_lead_fallback(cx, kind, thumb.as_ref())
     };
 
     let base = div()

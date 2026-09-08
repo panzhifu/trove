@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::OnceLock;
 use std::sync::{Arc, Mutex};
 
 use gpui_kit::base::h_flex;
@@ -177,6 +178,86 @@ pub(crate) fn reveal_path(path: &std::path::Path) {
         };
         std::process::Command::new("xdg-open").arg(dir).spawn()
     };
+}
+
+// ---------------------------------------------------------------------------
+// Live font previews (grid cells / list rows / inspector)
+// ---------------------------------------------------------------------------
+
+/// Families already registered with the process text system. Registration
+/// is global and permanent for the session, so one shared set serves the
+/// inspector and every grid cell.
+static REGISTERED_FONTS: OnceLock<Mutex<std::collections::HashSet<String>>> = OnceLock::new();
+
+/// Register the font file behind `family` with the process text system so
+/// `.font_family(family)` resolves to it. Best-effort: returns `false` when
+/// the path is missing or unparseable, and callers fall back to the static
+/// specimen card.
+pub(crate) fn ensure_font_registered(
+    family: &str,
+    blob: Option<&std::path::Path>,
+    cx: &mut App,
+) -> bool {
+    let set = REGISTERED_FONTS.get_or_init(|| Mutex::new(std::collections::HashSet::new()));
+    if set.lock().unwrap().contains(family) {
+        return true;
+    }
+    let Some(path) = blob else {
+        return false;
+    };
+    let Ok(bytes) = std::fs::read(path) else {
+        return false;
+    };
+    if cx
+        .text_system()
+        .add_fonts(vec![std::borrow::Cow::Owned(bytes)])
+        .is_ok()
+    {
+        set.lock().unwrap().insert(family.to_string());
+        true
+    } else {
+        false
+    }
+}
+
+/// Cached copy of the user's font sample text (config reads are file I/O,
+/// and every visible font cell asks for it on every render). TTL keeps the
+/// settings change visible without wiring invalidation.
+fn cached_font_sample() -> String {
+    static CACHE: OnceLock<Mutex<(std::time::Instant, String)>> = OnceLock::new();
+    let mut cache = CACHE
+        .get_or_init(|| {
+            Mutex::new((
+                std::time::Instant::now() - std::time::Duration::from_secs(10),
+                String::new(),
+            ))
+        })
+        .lock()
+        .unwrap();
+    if cache.0.elapsed() > std::time::Duration::from_secs(2) {
+        cache.1 = trove_core::config::AppConfig::load().font_sample_text();
+        cache.0 = std::time::Instant::now();
+    }
+    cache.1.clone()
+}
+
+/// One live specimen line for a registered font: the sample text rendered
+/// in the font itself, centered on a soft card background, single row. The
+/// caller sizes it (grid cells stretch, list leads get fixed dims).
+pub(crate) fn font_live_preview(family: &str, cx: &App) -> Div {
+    div()
+        .flex()
+        .items_center()
+        .justify_center()
+        .overflow_hidden()
+        .bg(cx.theme().secondary)
+        .child(
+            div()
+                .font_family(family.to_string())
+                .whitespace_nowrap()
+                .text_color(cx.theme().foreground)
+                .child(cached_font_sample()),
+        )
 }
 
 // ---------------------------------------------------------------------------
