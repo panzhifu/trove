@@ -1073,7 +1073,7 @@ impl Library {
 mod tests {
     use super::Library;
     use crate::media::thumb;
-    use crate::model::{AssetKind, AssetPatch, AssetQuery, NewCollection, NewSmartCollection};
+    use crate::model::{AssetKind, AssetQuery, NewCollection, NewSmartCollection};
     use crate::store::{assets, collections, tags};
     use std::path::{Path, PathBuf};
     use uuid::Uuid;
@@ -1691,7 +1691,7 @@ mod tests {
             .map(|c| c.name)
             .collect();
         assert_eq!(names, vec!["Trip".to_string()]);
-        let tagged = tags::for_asset(conn, restored_ids[0]).unwrap();
+        let _tagged = tags::for_asset(conn, restored_ids[0]).unwrap();
         // The image asset (first import) carries the tag.
         let image = restored
             .iter()
