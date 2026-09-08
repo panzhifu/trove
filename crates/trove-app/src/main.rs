@@ -54,6 +54,7 @@ fn build_menus() -> Vec<Menu> {
             name: rust_i18n::t!("app.file").into_owned().into(),
             items: vec![
                 MenuItem::action(rust_i18n::t!("app.import_files").to_string(), ImportFiles),
+                MenuItem::action(rust_i18n::t!("app.import_url").to_string(), ImportUrl),
                 MenuItem::action(
                     rust_i18n::t!("app.export_library").to_string(),
                     ExportLibrary,
