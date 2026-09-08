@@ -59,4 +59,15 @@ jobs:
         run: cargo build --workspace --verbose
 
       - name: Test
-        run: cargo test --workspace --verbose
+        run: |
+          set -o pipefail
+          cargo test --workspace --verbose 2>&1 | tee test-output.txt
+        shell: bash
+
+      - name: Emit test failures as annotations
+        if: failure()
+        run: |
+          grep -E "panicked at|test result: FAILED|^failures:" test-output.txt | tr -d '\r' | cut -c1-380 | while IFS= read -r line; do
+            echo "::error::$line"
+          done
+        shell: bash
