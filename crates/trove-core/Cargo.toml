@@ -12,6 +12,7 @@ kamadak-exif = "0.5"
 lofty = "0.21"
 mp4 = { workspace = true }
 ttf-parser = { workspace = true }
+fontdue = { workspace = true }
 rusqlite = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

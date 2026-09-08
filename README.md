@@ -105,6 +105,8 @@ The first launch creates a library under the platform's config directory. Open *
 - **Integrity check** (Settings ▸ Maintenance): recomputes the SHA-256 of every stored file and compares it with the record — flags missing and corrupted files, each with a one-click move-to-trash.
 - **Smart collection fields**: captured date, aspect ratio and orientation join the rule builder alongside rating/kind/text/tag/size/color.
 - **Animated images**: GIF / animated WebP / APNG play frame-by-frame in the preview dialog and the Inspector (APNG is decoded manually and cached); grid thumbnails stay static for performance.
+- **Font grid live previews**: a specimen-card thumbnail (sample text rendered in the font itself, missing glyphs skipped) is rasterized at import; the sample text is customizable in Settings.
+- **Font collection & system install**: a Fonts system view lists every font in the library; the Inspector can **install** a font for the current user (Linux/macOS, font cache refreshed) or uninstall it, with an installed badge.
 
 ### Library safety & management
 - **Automatic backups**: the database is snapshotted with SQLite `VACUUM INTO` into `backups/` at most once a day (on library open), rolling 10 files; Maintenance ▸ Backups snapshots on demand.
@@ -212,13 +214,13 @@ cargo test -p trove-core
 cargo run -p trove-app
 ```
 
-Test status: `trove-core` compiles and all **105** tests pass. `trove-app` compiles cleanly (2 tests).
+Test status: `trove-core` compiles and all **106** tests pass. `trove-app` compiles cleanly (2 tests).
 
 ---
 
 ## Status
 
-- **trove-core** — feature-complete for the above list; tested (105 tests).
+- **trove-core** — feature-complete for the above list; tested (106 tests).
 - **trove-app** — compiles and runs: dock layout, custom title bar, justified thumbnail grid, drag & drop, multi-select, context menus, settings dialog, inspector, visual + semantic search, and import with progress are all wired.
 
 What is still missing (compared with Eagle, Billfish, digiKam, Adobe Bridge & co.) is mapped in [docs/FEATURE-GAPS.md](docs/FEATURE-GAPS.md).
