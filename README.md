@@ -94,16 +94,17 @@ The first launch creates a library under the platform's config directory. Open *
 - **Paste & Import** (Ctrl+Shift+V): the clipboard image lands straight in the library.
 - **Import from URL**: File ▸ Import from URL… downloads the file in the background and imports it, recording the source URL.
 - **Watched folders**: Settings ▸ General lists watched roots; anything new under them imports automatically (unfiled). A folder is baselined on first sight — attaching a watch never retro-imports what is already there.
-- **Import mode**: Settings ▸ General chooses between *copy into library* (default) and *link to original files* — linked assets stay where they are, keep a "Linked" badge in the Inspector and are revealed at their original path.
+- **Import mode**: Settings ▸ General chooses between *copy into library* (default) and *link to original files* — linked assets stay where they are, keep a "Linked" badge in the Inspector and are revealed at their original path. If the original file is moved or deleted, the Inspector shows a "File missing" badge and a one-click **relink** to its new location (SHA-256 verified).
 
 ### Color labels & duplicate finder
-- Per-asset **color labels** (red…purple) via the shared color-label widget: Inspector swatch row, grid context menu, and a **filter-by-color** dropdown in the grid toolbar; smart collections can match `color_label` too (including "no label").
+- Per-asset **color labels** (red…purple) via the shared color-label widget: Inspector swatch row and grid context menu; smart collections can match `color_label` too (including "no label"). Right-clicking an Inspector mined-color swatch searches images with the same color or copies the hex.
 - **Find Duplicates** (File menu): clusters visually identical images by perceptual hash (distance ≤ 8/64) and offers per-group "keep newest, trash the rest".
 
 ### Recently viewed & library health (0.3)
 - **Recently viewed** system view (explorer sidebar): the last 200 assets you selected, most recent first; trashed assets drop out until restored; clear from the title bar.
 - **Integrity check** (Settings ▸ Maintenance): recomputes the SHA-256 of every stored file and compares it with the record — flags missing and corrupted files, each with a one-click move-to-trash.
 - **Smart collection fields**: captured date, aspect ratio and orientation join the rule builder alongside rating/kind/text/tag/size/color.
+- **Animated images**: GIF / animated WebP / APNG play frame-by-frame in the preview dialog and the Inspector (APNG is decoded manually and cached); grid thumbnails stay static for performance.
 
 ### Library safety & management
 - **Automatic backups**: the database is snapshotted with SQLite `VACUUM INTO` into `backups/` at most once a day (on library open), rolling 10 files; Maintenance ▸ Backups snapshots on demand.
@@ -211,13 +212,13 @@ cargo test -p trove-core
 cargo run -p trove-app
 ```
 
-Test status: `trove-core` compiles and all **104** tests pass. `trove-app` compiles cleanly (2 tests).
+Test status: `trove-core` compiles and all **105** tests pass. `trove-app` compiles cleanly (2 tests).
 
 ---
 
 ## Status
 
-- **trove-core** — feature-complete for the above list; tested (104 tests).
+- **trove-core** — feature-complete for the above list; tested (105 tests).
 - **trove-app** — compiles and runs: dock layout, custom title bar, justified thumbnail grid, drag & drop, multi-select, context menus, settings dialog, inspector, visual + semantic search, and import with progress are all wired.
 
 What is still missing (compared with Eagle, Billfish, digiKam, Adobe Bridge & co.) is mapped in [docs/FEATURE-GAPS.md](docs/FEATURE-GAPS.md).

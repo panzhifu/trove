@@ -432,21 +432,33 @@ impl Render for InspectorPanel {
             _ => 200.0,
         };
 
-        let preview: AnyElement = match thumb_path {
-            Some(path) => img(path)
+        // Animated images (GIF / animated WebP / APNG) play from the
+        // original file; everything else uses the static thumbnail.
+        let animated =
+            super::common::animated_preview_source(Some(asset.mime.as_str()), disk_path.as_deref());
+        let preview: AnyElement = if let Some(source) = animated {
+            img(source)
                 .w_full()
                 .h(px(preview_height))
                 .object_fit(gpui_kit::ObjectFit::Contain)
-                .into_any_element(),
-            None => v_flex()
-                .w_full()
-                .h(px(120.))
-                .items_center()
-                .justify_center()
-                .bg(cx.theme().secondary)
-                .rounded(cx.theme().radius)
-                .child(Icon::new(kind_icon(kind)).size_10())
-                .into_any_element(),
+                .into_any_element()
+        } else {
+            match thumb_path {
+                Some(path) => img(path)
+                    .w_full()
+                    .h(px(preview_height))
+                    .object_fit(gpui_kit::ObjectFit::Contain)
+                    .into_any_element(),
+                None => v_flex()
+                    .w_full()
+                    .h(px(120.))
+                    .items_center()
+                    .justify_center()
+                    .bg(cx.theme().secondary)
+                    .rounded(cx.theme().radius)
+                    .child(Icon::new(kind_icon(kind)).size_10())
+                    .into_any_element(),
+            }
         };
 
         let edit_label = |key: &'static str| {
@@ -544,6 +556,9 @@ impl Render for InspectorPanel {
             .child(property_row(cx, "inspector.added", added))
             .child(property_row(cx, "inspector.sha256", hash))
             .when_some(disk_path, |row, path| {
+                // Linked files can go missing (moved / deleted on disk);
+                // surface that and offer a relink pick.
+                let missing = !path.is_file();
                 row.child(
                     h_flex()
                         .w_full()
@@ -565,19 +580,45 @@ impl Render for InspectorPanel {
                                             .text_color(cx.theme().warning)
                                             .child(rust_i18n::t!("inspector.linked").to_string()),
                                     )
+                                })
+                                .when(linked && missing, |row| {
+                                    row.child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(cx.theme().danger)
+                                            .child(rust_i18n::t!("inspector.missing").to_string()),
+                                    )
                                 }),
                         )
                         .child(
-                            Button::new(format!("reveal-{asset_id}"))
-                                .ghost()
-                                .xsmall()
-                                .icon(IconName::Folder)
-                                .tooltip(
-                                    rust_i18n::t!("workspace.reveal_in_file_manager").to_string(),
-                                )
-                                .on_click(move |_, _, _cx| {
-                                    crate::panels::common::reveal_path(&path);
-                                }),
+                            h_flex()
+                                .gap_1()
+                                .when(linked, |row| {
+                                    let controller = self.controller.clone();
+                                    row.child(
+                                        Button::new(format!("relink-{asset_id}"))
+                                            .ghost()
+                                            .xsmall()
+                                            .icon(IconName::RotateCw)
+                                            .tooltip(rust_i18n::t!("inspector.relink").to_string())
+                                            .on_click(move |_, _, cx| {
+                                                prompt_relink(&controller, asset_id, cx);
+                                            }),
+                                    )
+                                })
+                                .child(
+                                    Button::new(format!("reveal-{asset_id}"))
+                                        .ghost()
+                                        .xsmall()
+                                        .icon(IconName::Folder)
+                                        .tooltip(
+                                            rust_i18n::t!("workspace.reveal_in_file_manager")
+                                                .to_string(),
+                                        )
+                                        .on_click(move |_, _, _cx| {
+                                            crate::panels::common::reveal_path(&path);
+                                        }),
+                                ),
                         ),
                 )
             });
@@ -979,4 +1020,41 @@ fn property_row(cx: &Context<impl Render>, key: &'static str, value: String) -> 
                 .truncate()
                 .child(value),
         )
+}
+
+/// Pick a new location for a linked asset whose file moved on disk, then
+/// re-point the record (the core verifies the content hash still matches).
+fn prompt_relink(controller: &Entity<LibraryController>, asset_id: Uuid, cx: &mut App) {
+    let rx = cx.prompt_for_paths(PathPromptOptions {
+        files: true,
+        directories: false,
+        multiple: false,
+        prompt: Some(rust_i18n::t!("inspector.relink_prompt").into_owned().into()),
+    });
+    let controller = controller.clone();
+    cx.spawn(async move |cx| {
+        if let Ok(Ok(Some(paths))) = rx.await
+            && let Some(path) = paths.into_iter().next()
+        {
+            cx.update(|cx| {
+                controller.update(cx, |ctl, cx| {
+                    match ctl.library.relink_asset(asset_id, &path) {
+                        Ok(()) => {
+                            ctl.notice = Some(rust_i18n::t!("notice.relink_done").to_string());
+                            ctl.generation += 1;
+                            cx.notify();
+                        }
+                        Err(e) => {
+                            ctl.notice = Some(
+                                rust_i18n::t!("notice.relink_failed", error = e.to_string())
+                                    .to_string(),
+                            );
+                            cx.notify();
+                        }
+                    }
+                });
+            });
+        }
+    })
+    .detach();
 }

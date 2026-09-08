@@ -535,7 +535,7 @@ impl WorkspacePanel {
     fn open_preview(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         // Extract everything needed while borrowing the controller, so no
         // borrow crosses into the dialog-capture path below.
-        let (name, thumb, kind) = {
+        let (name, thumb, kind, animated) = {
             let ctl = self.controller.read(cx);
             let Some(id) = ctl.primary() else { return };
             let library_root = ctl.library.root().to_path_buf();
@@ -549,22 +549,44 @@ impl WorkspacePanel {
                 .as_deref()
                 .map(|sha| trove_core::media::thumb::abs_path(&library_root, sha))
                 .filter(|p| p.is_file());
-            (display_name(&asset), thumb, asset.kind)
+            // Full-size original: the library blob, or the linked source.
+            let original = if asset.origin == trove_core::model::Origin::Linked {
+                asset
+                    .extra
+                    .get("source_path")
+                    .and_then(|v| v.as_str())
+                    .map(std::path::PathBuf::from)
+            } else {
+                asset.rel_path.as_ref().map(|rel| library_root.join(rel))
+            };
+            let animated = super::common::animated_preview_source(
+                Some(asset.mime.as_str()),
+                original.as_deref(),
+            );
+            (display_name(&asset), thumb, asset.kind, animated)
         };
 
         window.open_dialog(cx, move |dialog, _window, _cx| {
-            let preview: AnyElement = match &thumb {
-                Some(path) => img(path.clone())
+            let preview: AnyElement = if let Some(source) = animated.clone() {
+                img(source)
                     .max_h(px(520.0))
                     .max_w(px(720.0))
                     .object_fit(gpui_kit::ObjectFit::Contain)
-                    .into_any_element(),
-                None => v_flex()
-                    .h_64()
-                    .items_center()
-                    .justify_center()
-                    .child(Icon::new(kind_icon(kind)).size_8())
-                    .into_any_element(),
+                    .into_any_element()
+            } else {
+                match &thumb {
+                    Some(path) => img(path.clone())
+                        .max_h(px(520.0))
+                        .max_w(px(720.0))
+                        .object_fit(gpui_kit::ObjectFit::Contain)
+                        .into_any_element(),
+                    None => v_flex()
+                        .h_64()
+                        .items_center()
+                        .justify_center()
+                        .child(Icon::new(kind_icon(kind)).size_8())
+                        .into_any_element(),
+                }
             };
 
             dialog.title(name.clone()).width(px(780.)).child(

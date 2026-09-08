@@ -32,6 +32,8 @@ dirs = "5"
 # Media probing
 ttf-parser = "0.25"
 mp4 = "0.14"
+image = { version = "0.25", default-features = false, features = ["png"] }
+smallvec = "1"
 
 # Local collect service: URL fetching for the inbox (extension / curl)
 ureq = "3"

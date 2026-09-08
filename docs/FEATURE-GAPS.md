@@ -1,6 +1,6 @@
 # Trove 功能差距分析（对标同类软件）
 
-> 调研日期：2026-09-08 ｜ 最近更新：2026-09-08（标记第五批已实现项）｜ 适用版本：Trove 0.3.0
+> 调研日期：2026-09-08 ｜ 最近更新：2026-09-08（标记第六批已实现项）｜ 适用版本：Trove 0.3.0
 >
 > 本文取代已删除的 `FRONTEND-GAPS.md`（前后端对照清单）。它回答一个问题：
 > **与市面上的素材管理软件相比，Trove 还缺什么。**
@@ -51,7 +51,7 @@
 | 4 | 浏览器扩展 / 网页采集 | **本地采集服务已实现**（127.0.0.1 HTTP inbox：POST /add 收字节、POST /fetch 抓 URL，扩展直接对接） | Eagle 扩展（批量/自动识别高清）、Billfish 1000+ 站点、Allusion Web Clipper | P1（剩余工作 = 浏览器扩展本体） |
 | 5 | URL 导入（粘贴链接抓取文件） | **已实现**（文件 ▸ 从 URL 导入…：后台下载进采集 inbox，自动入库并记录 `source_url`；512MB 上限/60s 超时/仅 http(s)） | Eagle/Billfish | ✅ |
 | 6 | 链接原文件（Linked origin，文件留原地不复制） | **已实现（基础版）**（设置 ▸ 通用选「复制入库/链接原文件」；链接模式就地哈希不复制、缩略图仍生成、Inspector 带「链接」徽标并可定位原文件、来源记录于 `extra.source_path`） | TagStudio/Allusion 核心卖点 | ✅（重连/移动跟随见 #7） |
-| 7 | 移动/删除文件重连（Unlinked Entries） | 无 | TagStudio Search & Relink | P1（链接导入的后续：检测原文件丢失并引导重连） |
+| 7 | 移动/删除文件重连（Unlinked Entries） | **已实现**（链接资产原文件丢失时 Inspector 位置行显示「文件丢失」徽标 + 重新链接按钮：选择移动后的新路径，核心校验 SHA-256 与记录一致后重写 `extra.source_path`；内容不符 / 非链接资产 / 文件不存在均拒绝） | TagStudio Search & Relink | ✅ |
 | 8 | 相机/手机/扫描仪导入 | 无 | digiKam | P3 |
 | 9 | 导入预设（自动打标签/目标集合） | 无 | Eagle/Billfish 导入规则 | P2 |
 | 10 | 压缩包解包导入 | 无 | Eagle | P3 |
@@ -63,7 +63,7 @@
 | 1 | RAW（CR2/NEF/ARW/DNG）、HEIC/HEIF、AVIF、JPEG-XL 缩略图 | **RAW/HEIC 已实现**（RAW 走 rawler 完整解码管线含去马赛克/白平衡/sRGB，HEIC 用系统 heif-dec，缺工具时优雅降级） | XnView 500+、digiKam 全流程 | ✅（AVIF/JPEG-XL 仍缺 → P2） |
 | 2 | SVG/PSD/AI/EPS/CDR 等设计格式预览 | **SVG/PSD 已实现**（resvg 渲染 + psd 合成，导入即生成缩略图与尺寸） | Eagle/Billfish 核心格式 | ✅（AI/EPS/CDR 仍缺 → P2） |
 | 3 | 视频播放/逐帧/音频波形预览 | 仅静态海报 | Eagle/Billfish | P2 |
-| 4 | GIF/WebP/APNG 动图播放 | 静态首帧 | TagStudio/XnView | P2 |
+| 4 | GIF/WebP/APNG 动图播放 | **已实现**（详细查看弹窗与 Inspector 预览：GIF/动态 WebP 由 gpui 从原文件直接解码全部帧并原生播放；APNG 用 image 拆帧转 BGRA 构建多帧 RenderImage（带 256MB 帧预算护栏），结果全局缓存避免重复解码；网格/列表仍用静态缩略图保证性能） | TagStudio/XnView | ✅ |
 | 5 | 3D 模型查看（OBJ/FBX/GLB） | 无 | Eagle 4 内置查看器 | P3 |
 | 6 | 字体网格实况预览（用样张文本渲染单元格） | Inspector 内预览，网格仍是图标 | Eagle/Billfish | P2 |
 | 7 | 悬停放大/快速查看（空格预览增强） | Enter 大图弹窗 | XnView 胶片条 | P2 |
@@ -72,7 +72,7 @@
 
 | # | 功能 | 现状 | 竞品参照 | 优先级 |
 |---|---|---|---|---|
-| 1 | **资产色标**（Lightroom/Bridge 式彩色标签，可筛选） | **已实现**（独立色标组件：Inspector 色板 + 右键菜单 + 网格工具栏**按颜色筛选**；智能集合 `color_label` 字段） | Bridge/ACDSee/digiKam 标配 | ✅ |
+| 1 | **资产色标**（Lightroom/Bridge 式彩色标签，可筛选） | **已实现**（独立色标组件：Inspector 色板 + 右键菜单 + 网格右键菜单；智能集合 `color_label` 字段；Inspector 挖掘主色色卡右键可「搜索相同颜色的图片」/「复制色值」） | Bridge/ACDSee/digiKam 标配 | ✅ |
 | 2 | 日历/时间线视图（按拍摄/导入日期） | 无 | digiKam/ACDSee/PhotoPrism | P2 |
 | 3 | 对比视图（Light Table，2–4 图并排挑图） | 无 | digiKam/XnView 4 图对比 | P2 |
 | 4 | 地图/地理位置（EXIF GPS 反查地名） | 无 | digiKam/PhotoPrism/Immich | P3 |
@@ -200,7 +200,14 @@
 | URL 导入 | 文件 ▸ 从 URL 导入…：输入链接后台下载（512MB 上限、60s 超时、仅 http/https、URL 路径推导文件名并净化），走采集 inbox 管线自动入库并记录 `source_url`；正在导入时自动排队 |
 | 链接原文件 | 设置 ▸ 通用 ▸ 导入方式（复制入库 / 链接原文件）：链接模式就地哈希探测、不复制文件，`origin=linked` + 原始路径记入 `extra.source_path`，缩略图仍生成；Inspector 显示「链接」徽标与原文件位置、链接字体直接读原文件预览；对手动导入（选择/粘贴/拖放/监视文件夹）生效 |
 | 智能集合新字段 | CapturedAt（拍摄日期，RFC3339 前缀比较）、AspectRatio（宽高比，NULLIF 防除零）、Orientation（横图/竖图/方图）；规则编辑器全套接入 |
-| 色标组件化 | 新模块 `panels/color_label.rs`：独立色板组件（Inspector 色板行 + 右键功能菜单）、网格右键菜单共用同一实现、网格工具栏新增**按颜色筛选**下拉（SQL 层 `color_label` 过滤） |
+| 色标组件化 | 新模块 `panels/color_label.rs`：独立色板组件（Inspector 色板行 + 右键功能菜单）、网格右键菜单共用同一实现（SQL 层 `color_label` 过滤） |
+
+## 四点六、第六批实现（2026-09-08 夜）
+
+| 功能 | 说明 |
+|---|---|
+| 链接文件重连 | 链接资产原文件被移动/删除后：Inspector 位置行显示红色「文件丢失」徽标 + 重新链接按钮（RotateCw 图标）→ 系统文件选择器选新路径 → 核心校验（必须是链接资产、路径存在、SHA-256 与导入记录一致）→ 重写 `extra.source_path`；内容不符（想换文件请重新导入）、非链接资产、路径无效都会被拒绝并提示 |
+| 动图播放 | GIF / 动态 WebP：gpui 资产系统从原文件解码全部帧原生播放（详细查看弹窗 + Inspector 预览）；APNG：gpui 只渲染 PNG 首帧，故用 image `PngDecoder::apng()` 拆帧 → RGBA→BGRA → 多帧 `RenderImage`（解码带 256MB 帧预算，超限回退静态），按路径全局缓存（含负缓存、容量上限 16）；缩略图仍静态，网格/列表性能不受影响 |
 
 ## 五、路线图建议
 
