@@ -349,6 +349,12 @@ pub enum SmartField {
     Color,
     /// The user-assigned color label (`model::COLOR_LABELS`).
     ColorLabel,
+    /// The EXIF capture date, compared as a `YYYY-MM-DD` day.
+    CapturedAt,
+    /// The image aspect ratio (`width / height`).
+    AspectRatio,
+    /// Orientation derived from width vs height (landscape/portrait/square).
+    Orientation,
 }
 
 /// Comparison operators for a smart-collection condition.
