@@ -44,9 +44,6 @@ pub struct InspectorPanel {
     /// The asset the edit inputs currently hold. Refills happen only when
     /// the selection changes.
     editing_id: Option<Uuid>,
-    /// Font families already registered with the text system for previews
-    /// (registration is process-global; skip repeats).
-    font_previews: std::collections::HashSet<String>,
     /// Section ids the user collapsed (absent = expanded). Persisted on the
     /// panel so collapse state survives re-renders and asset switches.
     collapsed: std::collections::HashSet<&'static str>,
@@ -81,7 +78,6 @@ impl InspectorPanel {
             description_input,
             source_input,
             editing_id: None,
-            font_previews: std::collections::HashSet::new(),
             collapsed: std::collections::HashSet::new(),
         };
         observe_controller(cx, &this.controller);
@@ -993,23 +989,8 @@ impl InspectorPanel {
         blob: Option<&std::path::Path>,
         cx: &mut Context<Self>,
     ) -> bool {
-        if self.font_previews.contains(family) {
-            return true;
-        }
-        let Some(path) = blob else {
-            return false;
-        };
-        let Ok(bytes) = std::fs::read(path) else {
-            return false;
-        };
-        let ok = cx
-            .text_system()
-            .add_fonts(vec![std::borrow::Cow::Owned(bytes)])
-            .is_ok();
-        if ok {
-            self.font_previews.insert(family.to_string());
-        }
-        ok
+        // Delegates to the shared live-font registry (grid cells use it too).
+        super::common::ensure_font_registered(family, blob, cx)
     }
 
     /// Color-label palette row — the shared [`super::color_label`] widget.
