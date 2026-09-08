@@ -37,6 +37,7 @@ macro_rules! panel {
     };
 }
 
+pub mod color_label;
 pub mod common;
 mod explorer;
 mod folders;

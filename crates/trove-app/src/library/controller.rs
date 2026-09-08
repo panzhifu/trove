@@ -65,6 +65,8 @@ pub struct LibraryController {
     /// Grid filters (compose with any view; cleared on library swap).
     pub filter_kind: Option<AssetKind>,
     pub filter_favorite: bool,
+    /// When set, only assets carrying this color label are shown.
+    pub filter_color: Option<String>,
     /// Grid or list presentation of the asset area.
     pub view_mode: ViewMode,
     /// Listing sort (ignored by the live FTS search, which sorts by
@@ -117,6 +119,7 @@ impl LibraryController {
             search_text: String::new(),
             filter_kind: None,
             filter_favorite: false,
+            filter_color: None,
             view_mode: ViewMode::default(),
             sort: AssetSort::default(),
             sort_desc: true,
@@ -243,10 +246,21 @@ impl LibraryController {
         }
     }
 
+    /// Set the active color-label filter; `None` clears it.
+    pub fn set_filter_color(&mut self, color: Option<String>) {
+        if self.filter_color != color {
+            self.filter_color = color;
+            self.reset_grid_page();
+            self.generation += 1;
+        }
+    }
+
     pub fn clear_filters(&mut self) {
-        let changed = self.filter_kind.is_some() || self.filter_favorite;
+        let changed =
+            self.filter_kind.is_some() || self.filter_favorite || self.filter_color.is_some();
         self.filter_kind = None;
         self.filter_favorite = false;
+        self.filter_color = None;
         if changed {
             self.reset_grid_page();
             self.generation += 1;
@@ -313,6 +327,7 @@ impl LibraryController {
         self.search_text.clear();
         self.filter_kind = None;
         self.filter_favorite = false;
+        self.filter_color = None;
         self.import_phase = ImportPhase::Idle;
         self.integrity_report = None;
         self.visible_assets.clear();
