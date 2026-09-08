@@ -552,25 +552,11 @@ impl WorkspacePanel {
             (display_name(&asset), thumb, asset.kind)
         };
 
-        window.open_dialog(cx, move |dialog, _window, cx| {
-            let min_zoom: f32 = 100.0;
-            let max_zoom: f32 = 800.0;
-            let track_width = px(240.0);
-
-            // Shared zoom state (entity persists across dialog refreshes).
-            let zoom_state = cx.new(|_cx| ZoomSliderState {
-                value: 100,
-                drag: DragData::default(),
-            });
-
-            let zoom_val = zoom_state.read(cx).value;
-            let scale = zoom_val as f32 / 100.0;
-            let max_h = 520.0_f32 * scale;
-
+        window.open_dialog(cx, move |dialog, _window, _cx| {
             let preview: AnyElement = match &thumb {
                 Some(path) => img(path.clone())
-                    .max_h(px(max_h))
-                    .max_w(px(720.0 * scale))
+                    .max_h(px(520.0))
+                    .max_w(px(720.0))
                     .object_fit(gpui_kit::ObjectFit::Contain)
                     .into_any_element(),
                 None => v_flex()
@@ -581,108 +567,11 @@ impl WorkspacePanel {
                     .into_any_element(),
             };
 
-            let handle_pos = ((zoom_val as f32 - min_zoom) / (max_zoom - min_zoom)).clamp(0.0, 1.0);
-            let handle_x = handle_pos * 240.0_f32;
-            let zs = zoom_state.clone();
-            let slider = div()
-                .id("zoom-slider-track")
-                .relative()
-                .h(px(28.))
-                .w(track_width)
-                .cursor_pointer()
-                // Mouse down on track: jump to position and begin drag.
-                .on_mouse_down(
-                    gpui::MouseButton::Left,
-                    move |ev: &gpui::MouseDownEvent, _, cx| {
-                        let ratio = (ev.position.x / track_width).clamp(0.0, 1.0);
-                        let new_val = (min_zoom + ratio * (max_zoom - min_zoom)).round() as u32;
-                        zs.update(cx, |state, cx| {
-                            state.value = new_val;
-                            state.drag.dragging = true;
-                            state.drag.start_x = ev.position.x.into();
-                            state.drag.start_value = new_val;
-                            cx.refresh_windows();
-                        });
-                    },
-                )
-                // Mouse move: update zoom while dragging.
-                .on_mouse_move({
-                    let zs = zoom_state.clone();
-                    move |ev: &gpui::MouseMoveEvent, _, cx| {
-                        let dragging = zs.read(cx).drag.dragging;
-                        if dragging {
-                            let start_x: gpui_kit::Pixels = zs.read(cx).drag.start_x.into();
-                            let start_val = zs.read(cx).drag.start_value;
-                            let dx: f32 = (ev.position.x - start_x).into();
-                            let ratio = (dx / 240.0_f32).clamp(-1.0, 1.0);
-                            let new_val = (start_val as f32 + ratio * (max_zoom - min_zoom))
-                                .clamp(min_zoom, max_zoom)
-                                as u32;
-                            zs.update(cx, |state, cx| {
-                                state.value = new_val;
-                                cx.refresh_windows();
-                            });
-                        }
-                    }
-                })
-                // Track background.
-                .child(
-                    div()
-                        .absolute()
-                        .top(px(12.))
-                        .left(px(0.))
-                        .h(px(4.))
-                        .w(track_width)
-                        .bg(cx.theme().secondary)
-                        .rounded(px(2.)),
-                )
-                // Filled portion.
-                .child(
-                    div()
-                        .absolute()
-                        .top(px(12.))
-                        .left(px(0.))
-                        .h(px(4.))
-                        .w(px(handle_x))
-                        .bg(cx.theme().primary)
-                        .rounded(px(2.)),
-                )
-                // Draggable handle.
-                .child(
-                    div()
-                        .absolute()
-                        .top(px(6.))
-                        .left(px(handle_x - 8.))
-                        .size(px(16.))
-                        .rounded_full()
-                        .bg(cx.theme().primary)
-                        .border_2()
-                        .border_color(cx.theme().background)
-                        .shadow_sm()
-                        .cursor_grab(),
-                );
-
             dialog.title(name.clone()).width(px(780.)).child(
                 v_flex()
                     .w_full()
                     .gap_2()
                     .items_center()
-                    // Zoom slider bar.
-                    .child(
-                        h_flex()
-                            .w_full()
-                            .items_center()
-                            .justify_center()
-                            .gap_2()
-                            .child(slider)
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .w(px(40.))
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child(format!("{}%", zoom_val)),
-                            ),
-                    )
                     // Preview image.
                     .child(
                         div()
@@ -697,21 +586,6 @@ impl WorkspacePanel {
             )
         });
     }
-}
-
-/// Zoom slider state for the preview dialog.
-struct ZoomSliderState {
-    /// Current zoom value (100–800).
-    value: u32,
-    /// Drag tracking data.
-    drag: DragData,
-}
-
-#[derive(Clone, Copy, Default)]
-struct DragData {
-    dragging: bool,
-    start_x: f32,
-    start_value: u32,
 }
 
 impl Render for WorkspacePanel {
