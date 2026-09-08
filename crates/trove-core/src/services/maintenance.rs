@@ -3,14 +3,18 @@
 //! background thread, exposed here as plain synchronous functions the caller
 //! decides where to run.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
+
+use sha2::{Digest, Sha256};
 
 use crate::error::Result;
 use crate::library::Library;
-use crate::media::thumb;
+use crate::media::{blob, thumb};
 use crate::model::{AssetKind, AssetQuery};
 use crate::store::{assets, rows};
+use uuid::Uuid;
 
 /// Outcome of a thumbnail rebuild.
 #[derive(Debug, Clone, Default)]
@@ -208,6 +212,130 @@ pub fn clean_orphans(lib: &Library) -> Result<OrphanReport> {
 
     report.empty_dirs_removed = remove_empty_dirs(&media_dir) + remove_empty_dirs(&thumbs_dir);
     Ok(report)
+}
+
+// -- integrity check ---------------------------------------------------------
+
+/// What is wrong with an asset found by the integrity check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IntegrityIssue {
+    /// The blob file the record points at does not exist on disk.
+    MissingBlob,
+    /// The blob exists, but its content hash differs from the recorded
+    /// SHA-256 — the file was modified or corrupted after import.
+    HashMismatch,
+}
+
+/// One problem found by the integrity check.
+#[derive(Debug, Clone)]
+pub struct IntegrityEntry {
+    pub asset_id: Uuid,
+    pub file_name: String,
+    pub issue: IntegrityIssue,
+}
+
+/// Outcome of an integrity check.
+#[derive(Debug, Clone, Default)]
+pub struct IntegrityReport {
+    /// Records whose blob was read and hashed successfully (matched or not).
+    pub checked: u64,
+    /// Records with a problem, in query order.
+    pub entries: Vec<IntegrityEntry>,
+}
+
+/// Work plan for an integrity check, collected by [`plan_integrity`]. Plain
+/// data (`Send`), so the hashing ([`run_integrity_plan`]) can run on a
+/// background thread while the plan is gathered where the non-`Send`
+/// [`Library`] lives.
+#[derive(Debug, Clone, Default)]
+pub struct IntegrityPlan {
+    /// `(asset id, file name, blob path, expected sha256)` tuples.
+    pub items: Vec<(Uuid, String, PathBuf, String)>,
+}
+
+/// Collect the work for an integrity check without doing any of it: every
+/// record (live and trashed) that has both a stored hash and a blob path.
+pub fn plan_integrity(lib: &Library) -> Result<IntegrityPlan> {
+    let conn = lib.store().conn();
+    let root = lib.root();
+    let mut plan = IntegrityPlan::default();
+    for trashed in [false, true] {
+        let (_, list) = assets::query(
+            conn,
+            &AssetQuery {
+                is_trashed: trashed,
+                ..Default::default()
+            },
+        )?;
+        for asset in list {
+            let (Some(sha), Some(rel)) = (asset.sha256.clone(), asset.rel_path.clone()) else {
+                continue;
+            };
+            plan.items
+                .push((asset.id, asset.file_name, root.join(rel), sha));
+        }
+    }
+    Ok(plan)
+}
+
+/// Execute an [`IntegrityPlan`]: pure filesystem work with no database
+/// access. Each distinct blob file is hashed once even when several records
+/// share it (deduplicated imports).
+pub fn run_integrity_plan(plan: IntegrityPlan) -> IntegrityReport {
+    let mut report = IntegrityReport::default();
+    // `Err(())` = unreadable (missing blob); stored per path so shared blobs
+    // are hashed exactly once.
+    let mut hashed: HashMap<PathBuf, std::result::Result<String, ()>> = HashMap::new();
+    for (asset_id, file_name, blob_path, expected) in plan.items {
+        let actual = match hashed.get(&blob_path) {
+            Some(cached) => cached.clone(),
+            None => {
+                let result = hash_file(&blob_path).map_err(|_| ());
+                hashed.insert(blob_path, result.clone());
+                result
+            }
+        };
+        match actual {
+            Ok(actual) => {
+                report.checked += 1;
+                if actual != expected {
+                    report.entries.push(IntegrityEntry {
+                        asset_id,
+                        file_name,
+                        issue: IntegrityIssue::HashMismatch,
+                    });
+                }
+            }
+            Err(_) => report.entries.push(IntegrityEntry {
+                asset_id,
+                file_name,
+                issue: IntegrityIssue::MissingBlob,
+            }),
+        }
+    }
+    report
+}
+
+/// Verify every stored blob against its recorded SHA-256 (plan + run on the
+/// current thread; prefer the split API for UI usage).
+pub fn verify_integrity(lib: &Library) -> Result<IntegrityReport> {
+    let plan = plan_integrity(lib)?;
+    Ok(run_integrity_plan(plan))
+}
+
+/// Streaming SHA-256 of a file; fails when the file cannot be read.
+fn hash_file(path: &Path) -> std::io::Result<String> {
+    let mut file = std::fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 256 * 1024];
+    loop {
+        let n = file.read(&mut buffer)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buffer[..n]);
+    }
+    Ok(blob::hex(&hasher.finalize()))
 }
 
 // -- filesystem helpers ------------------------------------------------------
@@ -415,5 +543,44 @@ mod tests {
             collections::count_assets(lib.store().conn(), c.id).unwrap(),
             1
         );
+    }
+
+    #[test]
+    fn integrity_check_detects_missing_and_corrupted_blobs() {
+        let (lib, root) = temp_lib("integrity");
+        import_png(&lib, &root, "ok.png");
+
+        // Look the asset up (id + stored blob path).
+        let (_, all) =
+            crate::store::assets::query(lib.store().conn(), &AssetQuery::default()).unwrap();
+        let asset = &all[0];
+        let blob_path = root.join(asset.rel_path.as_deref().unwrap());
+        let expected = asset.sha256.clone().unwrap();
+
+        // Healthy library: the blob is read and matches the record.
+        let report = verify_integrity(&lib).unwrap();
+        assert_eq!(report.checked, 1);
+        assert!(report.entries.is_empty());
+
+        // Corrupted content: readable, but the hash no longer matches.
+        std::fs::write(&blob_path, b"corrupted payload").unwrap();
+        let report = verify_integrity(&lib).unwrap();
+        assert_eq!(report.checked, 1);
+        assert_eq!(report.entries.len(), 1);
+        assert_eq!(report.entries[0].asset_id, asset.id);
+        assert_eq!(report.entries[0].issue, IntegrityIssue::HashMismatch);
+        assert_eq!(report.entries[0].file_name, asset.file_name);
+
+        // Missing blob: unreadable, so it is not counted as checked.
+        std::fs::remove_file(&blob_path).unwrap();
+        let report = verify_integrity(&lib).unwrap();
+        assert_eq!(report.checked, 0);
+        assert_eq!(report.entries.len(), 1);
+        assert_eq!(report.entries[0].issue, IntegrityIssue::MissingBlob);
+
+        // The plan carries the recorded hash for context.
+        let plan = plan_integrity(&lib).unwrap();
+        assert_eq!(plan.items.len(), 1);
+        assert_eq!(plan.items[0].3, expected);
     }
 }

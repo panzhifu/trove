@@ -100,7 +100,7 @@ fn tmp_path(root: &Path) -> PathBuf {
         .join(format!(".tmp-{}", uuid::Uuid::new_v4()))
 }
 
-fn hex(bytes: &[u8]) -> String {
+pub(crate) fn hex(bytes: &[u8]) -> String {
     use std::fmt::Write as _;
     let mut s = String::with_capacity(bytes.len() * 2);
     for b in bytes {
