@@ -26,6 +26,11 @@ use super::common::{
     trash_count,
 };
 
+/// Live (non-trashed) entry count of the recently-viewed history.
+fn recent_count(ctl: &LibraryController) -> u64 {
+    trove_core::store::view_history::live_count(ctl.library.store().conn()).unwrap_or(0)
+}
+
 /// What the single inline editor is doing right now.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EditorMode {
@@ -202,13 +207,17 @@ impl ExplorerPanel {
 
     /// Title-bar label: the name of whatever the library is currently
     /// browsed through — smart collection, collection (with its parent
-    /// prefix when nested), trash, or the all-assets fallback.
+    /// prefix when nested), trash, recently viewed, or the all-assets
+    /// fallback.
     fn title_label(&self, cx: &Context<Self>) -> String {
         let ctl = self.controller.read(cx);
         let conn = ctl.library.store().conn();
 
         if ctl.showing_trash {
             return rust_i18n::t!("app.trash").to_string();
+        }
+        if ctl.showing_recent {
+            return rust_i18n::t!("app.recent_viewed").to_string();
         }
         if let Some(sid) = ctl.active_smart
             && let Ok(Some(sc)) = smart_collections::get(conn, sid)
@@ -291,7 +300,17 @@ impl Render for ExplorerPanel {
             is_root: bool,
             count: u64,
         }
-        let (current, showing_trash, active_smart, all_count, trash_total, rows, smart_rows) = {
+        let (
+            current,
+            showing_trash,
+            showing_recent,
+            active_smart,
+            all_count,
+            trash_total,
+            recent_total,
+            rows,
+            smart_rows,
+        ) = {
             let ctl = self.controller.read(cx);
             let conn = ctl.library.store().conn();
             let mut rows: Vec<Row> = Vec::new();
@@ -339,9 +358,11 @@ impl Render for ExplorerPanel {
             (
                 ctl.current_collection,
                 ctl.showing_trash,
+                ctl.showing_recent,
                 ctl.active_smart,
                 live_count(ctl),
                 trash_count(ctl),
+                recent_count(ctl),
                 rows,
                 smart_rows,
             )
@@ -349,9 +370,11 @@ impl Render for ExplorerPanel {
 
         let mut items: Vec<AnyElement> = Vec::new();
 
-        // Pseudo rows: All assets and Trash. Same shape, no management menu.
+        // Pseudo rows: All assets, Recently viewed, Trash. Same shape, no
+        // management menu.
         let trash_selected = showing_trash;
-        let all_selected = current.is_none() && !showing_trash;
+        let recent_selected = showing_recent;
+        let all_selected = current.is_none() && !showing_trash && !showing_recent;
         items.push(
             collection_row(
                 cx,
@@ -367,6 +390,52 @@ impl Render for ExplorerPanel {
         let trash_count = trash_total;
         let controller_trash_click = self.controller.clone();
         let controller_trash = self.controller.clone();
+        // Recently viewed: history count, click browses the view. Dropping
+        // assets here sends them to the trash like any other view.
+        let controller_recent_click = self.controller.clone();
+        let controller_recent = self.controller.clone();
+        items.push(
+            div()
+                .id("collection-row-recent")
+                .cursor_pointer()
+                .w_full()
+                .px_2()
+                .py_1()
+                .rounded(cx.theme().radius)
+                .when(recent_selected, |this| this.bg(cx.theme().secondary))
+                .on_click(move |_ev: &ClickEvent, _window, cx| {
+                    controller_recent_click.update(cx, |ctl, _| ctl.select_recent());
+                })
+                .drag_over::<AssetsDrag>(|this, _, _, cx| this.bg(cx.theme().secondary))
+                .on_drop(move |payload: &AssetsDrag, _window, cx| {
+                    controller_recent.update(cx, move |ctl, cx| {
+                        let _ = ctl.library.trash_assets(&payload.0);
+                        ctl.deselect(&payload.0);
+                        cx.notify();
+                    });
+                })
+                .child(
+                    h_flex()
+                        .w_full()
+                        .items_center()
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .truncate()
+                                .text_sm()
+                                .text_color(cx.theme().foreground)
+                                .child(rust_i18n::t!("app.recent_viewed").to_string()),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(recent_total.to_string()),
+                        ),
+                )
+                .into_any_element(),
+        );
         items.push(
             div()
                 .id("collection-row-trash")

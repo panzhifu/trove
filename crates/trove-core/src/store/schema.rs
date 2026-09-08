@@ -5,7 +5,7 @@
 //! released migration; append a new one.
 
 /// Current schema version, bumped whenever a migration is appended.
-pub const SCHEMA_VERSION: i64 = 6;
+pub const SCHEMA_VERSION: i64 = 7;
 
 /// One migration per version index: `MIGRATIONS[0]` upgrades 0 -> 1, and so on.
 pub const MIGRATIONS: &[&str] = &[
@@ -124,5 +124,17 @@ pub const MIGRATIONS: &[&str] = &[
     // (ON DELETE SET NULL) so a subtree is never lost by one click.
     r#"
     ALTER TABLE tags ADD COLUMN parent_id TEXT REFERENCES tags(id) ON DELETE SET NULL;
+    "#,
+    // v7: recently-viewed history. One row per asset with the last time it
+    // was selected; `record` upserts so re-viewing bumps `viewed_at`, and a
+    // cap prunes the table to the most recent entries. Rows vanish with
+    // their asset (ON DELETE CASCADE).
+    r#"
+    CREATE TABLE view_history (
+        asset_id  TEXT PRIMARY KEY REFERENCES assets(id) ON DELETE CASCADE,
+        viewed_at TEXT NOT NULL
+    );
+
+    CREATE INDEX idx_view_history_viewed ON view_history(viewed_at);
     "#,
 ];
