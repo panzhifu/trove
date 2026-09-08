@@ -1,5 +1,9 @@
 //! Shared helpers for the dock panels.
 
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+
 use gpui_kit::base::h_flex;
 use gpui_kit::component::{ActiveTheme, IconName};
 use gpui_kit::prelude::FluentBuilder as _;
@@ -173,4 +177,92 @@ pub(crate) fn reveal_path(path: &std::path::Path) {
         };
         std::process::Command::new("xdg-open").arg(dir).spawn()
     };
+}
+
+// ---------------------------------------------------------------------------
+// Animated image playback (GIF / animated WebP / APNG)
+// ---------------------------------------------------------------------------
+
+/// Decoded APNG previews, keyed by source path. Both hits and misses are
+/// cached so repeated renders (and re-opens of the preview dialog) never
+/// re-decode; the map is capped and wholesale-cleared when it overflows.
+static APNG_CACHE: std::sync::OnceLock<
+    Mutex<HashMap<PathBuf, Option<Arc<gpui_kit::RenderImage>>>>,
+> = std::sync::OnceLock::new();
+
+/// Pick the image source for a preview of a *potentially animated* image:
+///
+/// - GIF / animated WebP — hand the original file to gpui, which decodes
+///   all frames through the asset system and plays them natively.
+/// - APNG — gpui only renders the first PNG frame, so decode the animation
+///   ourselves into a multi-frame [`gpui_kit::RenderImage`] (cached).
+///
+/// `mime` is the asset's MIME type, `original` the full-size file (blob or
+/// linked source path). Returns `None` when the file is not animated (or
+/// missing), so callers fall back to the static thumbnail.
+pub(crate) fn animated_preview_source(
+    mime: Option<&str>,
+    original: Option<&std::path::Path>,
+) -> Option<gpui_kit::ImageSource> {
+    use gpui_kit::ImageSource;
+
+    let path = original?;
+    if !path.is_file() {
+        return None;
+    }
+    match mime {
+        // gpui plays these natively from a file source.
+        Some("image/gif") | Some("image/webp") => Some(ImageSource::from(path.to_path_buf())),
+        // APNG needs manual frame extraction (mime for PNG is image/png).
+        Some("image/png") => {
+            let cache = APNG_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+            let mut cache = cache.lock().unwrap();
+            if let Some(hit) = cache.get(path) {
+                return hit.clone().map(ImageSource::Render);
+            }
+            if cache.len() >= 16 {
+                cache.clear();
+            }
+            let decoded = decode_apng(path);
+            cache.insert(path.to_path_buf(), decoded.clone());
+            decoded.map(ImageSource::Render)
+        }
+        _ => None,
+    }
+}
+
+/// Decode every APNG frame into BGRA [`image::Frame`]s. Gives up (returns
+/// `None`, i.e. "show static") on any decode error, single-frame files, or
+/// when the animation would exceed a 256 MB RGBA budget.
+fn decode_apng(path: &std::path::Path) -> Option<Arc<gpui_kit::RenderImage>> {
+    use image::AnimationDecoder as _;
+    use image::ImageDecoder as _;
+
+    const FRAME_BUDGET: u64 = 256 * 1024 * 1024 / 4; // 256 MB worth of RGBA
+
+    let file = std::fs::File::open(path).ok()?;
+    let decoder = image::codecs::png::PngDecoder::new(std::io::BufReader::new(file)).ok()?;
+    if !decoder.is_apng().ok()? {
+        return None;
+    }
+    let (w, h) = decoder.dimensions();
+    let frame_px = u64::from(w) * u64::from(h);
+    let mut frames = smallvec::SmallVec::new();
+    let mut total = 0u64;
+    for frame in decoder.apng().ok()?.into_frames() {
+        let mut frame = frame.ok()?;
+        total += frame_px;
+        if total > FRAME_BUDGET {
+            return None;
+        }
+        // RGBA -> BGRA, the layout gpui's renderer expects.
+        for pixel in frame.buffer_mut().as_chunks_mut::<4>().0 {
+            pixel.swap(0, 2);
+        }
+        frames.push(frame);
+    }
+    if frames.len() <= 1 {
+        return None;
+    }
+    Some(Arc::new(gpui_kit::RenderImage::new(frames)))
 }

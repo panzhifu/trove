@@ -7548,8 +7548,10 @@ name = "trove-app"
 version = "0.3.0"
 dependencies = [
  "gpui-kit",
+ "image",
  "rust-i18n",
  "serde_json",
+ "smallvec",
  "sys-locale",
  "trove-core",
  "uuid",
