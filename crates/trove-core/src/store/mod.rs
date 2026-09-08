@@ -950,6 +950,81 @@ mod tests {
     }
 
     #[test]
+    fn smart_collection_date_aspect_orientation() {
+        let store = Store::in_memory().unwrap();
+        let parse = |s: &str| {
+            chrono::DateTime::parse_from_rfc3339(s)
+                .unwrap()
+                .with_timezone(&chrono::Utc)
+        };
+        // sample_asset is 800x600 (landscape).
+        let mut landscape = sample_asset("land.png", AssetKind::Image);
+        landscape.captured_at = Some(parse("2024-06-15T10:00:00Z"));
+        let mut portrait = sample_asset("port.png", AssetKind::Image);
+        (portrait.width, portrait.height) = (Some(600), Some(800));
+        portrait.captured_at = Some(parse("2025-01-02T08:30:00Z"));
+        let mut square = sample_asset("sq.png", AssetKind::Image);
+        (square.width, square.height) = (Some(500), Some(500));
+        let mut audio = sample_asset("song.mp3", AssetKind::Audio);
+        (audio.width, audio.height) = (None, None);
+        for a in [&landscape, &portrait, &square, &audio] {
+            assets::insert(store.conn(), a).unwrap();
+        }
+
+        // Captured date: day equality via the RFC 3339 prefix.
+        let tree = smart_node(serde_json::json!({
+            "op": "match", "field": "captured_at", "value": "2024-06-15"
+        }));
+        let (total, ids) = super::smart::evaluate(store.conn(), &tree, None, 0).unwrap();
+        assert_eq!((total, ids.len()), (1, 1));
+        assert_eq!(ids[0], landscape.id);
+
+        // A date range (gte + lt in an `and` group).
+        let tree = smart_node(serde_json::json!({
+            "op": "and",
+            "children": [
+                { "op": "match", "field": "captured_at", "compare": "gte", "value": "2024-01-01" },
+                { "op": "match", "field": "captured_at", "compare": "lt", "value": "2025-01-01" },
+            ]
+        }));
+        let (total, _) = super::smart::evaluate(store.conn(), &tree, None, 0).unwrap();
+        assert_eq!(total, 1);
+
+        // Orientation splits the three images; assets without dimensions
+        // (the audio file) never match.
+        for (orientation, expected) in [("landscape", 1), ("portrait", 1), ("square", 1)] {
+            let tree = smart_node(serde_json::json!({
+                "op": "match", "field": "orientation", "value": orientation
+            }));
+            let (total, _) = super::smart::evaluate(store.conn(), &tree, None, 0).unwrap();
+            assert_eq!(total, expected, "{orientation}");
+        }
+        let tree = smart_node(serde_json::json!({
+            "op": "match", "field": "orientation", "compare": "ne", "value": "landscape"
+        }));
+        let (total, _) = super::smart::evaluate(store.conn(), &tree, None, 0).unwrap();
+        assert_eq!(total, 2);
+
+        // Aspect ratio: 800/600 ≈ 1.33 matches the > 1.2 bucket.
+        let tree = smart_node(serde_json::json!({
+            "op": "match", "field": "aspect_ratio", "compare": "gt", "value": 1.2
+        }));
+        let (total, ids) = super::smart::evaluate(store.conn(), &tree, None, 0).unwrap();
+        assert_eq!((total, ids.len()), (1, 1));
+        assert_eq!(ids[0], landscape.id);
+
+        // A malformed date is rejected at compile time.
+        let bad = smart_node(serde_json::json!({
+            "op": "match", "field": "captured_at", "value": "June 2024"
+        }));
+        assert!(super::smart::compile(None, &bad).is_err());
+        let bad_orientation = smart_node(serde_json::json!({
+            "op": "match", "field": "orientation", "value": "diagonal"
+        }));
+        assert!(super::smart::compile(None, &bad_orientation).is_err());
+    }
+
+    #[test]
     fn smart_collection_crud_roundtrip() {
         let store = Store::in_memory().unwrap();
         let input = crate::model::NewSmartCollection {

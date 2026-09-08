@@ -41,6 +41,7 @@ struct ConditionRow {
     tag: String,
     rating: u8,
     label: String,
+    orientation: String,
 }
 
 impl ConditionRow {
@@ -49,6 +50,8 @@ impl ConditionRow {
             SmartField::Color => rust_i18n::t!("rules.value_color_hint").to_string(),
             SmartField::SizeBytes => rust_i18n::t!("rules.value_bytes").to_string(),
             SmartField::Extension => "jpg, png…".to_string(),
+            SmartField::CapturedAt => rust_i18n::t!("rules.value_date_hint").to_string(),
+            SmartField::AspectRatio => rust_i18n::t!("rules.value_aspect_hint").to_string(),
             _ => String::new(),
         };
         Self {
@@ -60,6 +63,7 @@ impl ConditionRow {
             tag: String::new(),
             rating: 3,
             label: String::new(),
+            orientation: String::new(),
         }
     }
 
@@ -69,8 +73,11 @@ impl ConditionRow {
             SmartField::Text
             | SmartField::Extension
             | SmartField::Color
-            | SmartField::SizeBytes => !self.text.read(cx).value().trim().is_empty(),
+            | SmartField::SizeBytes
+            | SmartField::CapturedAt
+            | SmartField::AspectRatio => !self.text.read(cx).value().trim().is_empty(),
             SmartField::Tag => !self.tag.is_empty(),
+            SmartField::Orientation => !self.orientation.is_empty(),
             SmartField::Kind
             | SmartField::IsFavorite
             | SmartField::Rating
@@ -135,6 +142,7 @@ impl RuleDraft {
             row.favorite = true;
             row.tag = self.tag_names.first().cloned().unwrap_or_default();
             row.rating = 3;
+            row.orientation = String::new();
         }
         self.touch(cx);
     }
@@ -177,6 +185,13 @@ impl RuleDraft {
     fn set_label(&mut self, ix: usize, label: String, cx: &mut Context<Self>) {
         if let Some(row) = self.rows.get_mut(ix) {
             row.label = label;
+        }
+        self.touch(cx);
+    }
+
+    fn set_orientation(&mut self, ix: usize, orientation: String, cx: &mut Context<Self>) {
+        if let Some(row) = self.rows.get_mut(ix) {
+            row.orientation = orientation;
         }
         self.touch(cx);
     }
@@ -235,6 +250,19 @@ impl RuleDraft {
                     Ok(n) if n > 0 => serde_json::json!(n),
                     _ => return Err(t("rules.invalid_bytes")),
                 },
+                SmartField::CapturedAt => {
+                    let s = row.text.read(cx).value().trim().to_string();
+                    if smart::valid_date(&s) {
+                        serde_json::json!(s)
+                    } else {
+                        return Err(t("rules.invalid_date"));
+                    }
+                }
+                SmartField::AspectRatio => match row.text.read(cx).value().trim().parse::<f64>() {
+                    Ok(v) if v > 0.0 && v.is_finite() => serde_json::json!(v),
+                    _ => return Err(t("rules.invalid_aspect")),
+                },
+                SmartField::Orientation => serde_json::json!(row.orientation),
                 SmartField::Tag => serde_json::json!(row.tag),
                 SmartField::Rating => serde_json::json!(row.rating),
                 SmartField::Kind => serde_json::json!(row.kind),
@@ -368,6 +396,9 @@ fn field_json(field: SmartField) -> &'static str {
         SmartField::SizeBytes => "size_bytes",
         SmartField::Color => "color",
         SmartField::ColorLabel => "color_label",
+        SmartField::CapturedAt => "captured_at",
+        SmartField::AspectRatio => "aspect_ratio",
+        SmartField::Orientation => "orientation",
     }
 }
 
@@ -416,6 +447,28 @@ fn load_rows(
                 let s = value.as_i64().map(|n| n.to_string()).unwrap_or_default();
                 row.text
                     .update(cx, |state, cx| state.set_value(s, window, cx));
+            }
+            SmartField::CapturedAt => {
+                let s = value.as_str().unwrap_or_default().to_string();
+                row.text
+                    .update(cx, |state, cx| state.set_value(s, window, cx));
+            }
+            SmartField::AspectRatio => {
+                let s = value
+                    .as_f64()
+                    .map(|v| {
+                        if v.fract() == 0.0 {
+                            format!("{v:.0}")
+                        } else {
+                            format!("{v}")
+                        }
+                    })
+                    .unwrap_or_default();
+                row.text
+                    .update(cx, |state, cx| state.set_value(s, window, cx));
+            }
+            SmartField::Orientation => {
+                row.orientation = value.as_str().unwrap_or_default().to_string();
             }
             SmartField::Rating => {
                 row.rating = value.as_u64().map(|n| n.clamp(0, 5) as u8).unwrap_or(3);
@@ -759,7 +812,7 @@ fn render_row(
     cx: &mut App,
 ) -> Div {
     let t = |k: &str| rust_i18n::t!(k).to_string();
-    let (kind, favorite, tag, rating, label, tag_names, text_input) = {
+    let (kind, favorite, tag, rating, label, orientation, tag_names, text_input) = {
         let d = draft.read(cx);
         let row = &d.rows[ix];
         (
@@ -768,6 +821,7 @@ fn render_row(
             row.tag.clone(),
             row.rating,
             row.label.clone(),
+            row.orientation.clone(),
             d.tag_names.clone(),
             row.text.clone(),
         )
@@ -790,6 +844,9 @@ fn render_row(
                 (SmartField::SizeBytes, "rules.f_size"),
                 (SmartField::Color, "rules.f_color"),
                 (SmartField::ColorLabel, "rules.f_label"),
+                (SmartField::CapturedAt, "rules.f_captured"),
+                (SmartField::AspectRatio, "rules.f_aspect"),
+                (SmartField::Orientation, "rules.f_orientation"),
             ]
             .map(|(f, key)| (f, t(key)))
             .into_iter()
@@ -827,12 +884,15 @@ fn render_row(
 
     // Value widget per field.
     let value: Div = match field {
-        SmartField::Text | SmartField::Extension | SmartField::Color | SmartField::SizeBytes => {
-            h_flex()
-                .flex_1()
-                .min_w_0()
-                .child(Input::new(&text_input).small().appearance(true))
-        }
+        SmartField::Text
+        | SmartField::Extension
+        | SmartField::Color
+        | SmartField::SizeBytes
+        | SmartField::CapturedAt
+        | SmartField::AspectRatio => h_flex()
+            .flex_1()
+            .min_w_0()
+            .child(Input::new(&text_input).small().appearance(true)),
         SmartField::Kind => h_flex().flex_1().min_w_0().child(dropdown_button(
             format!("row-{ix}-kind"),
             t(kind_key(kind)),
@@ -897,6 +957,28 @@ fn render_row(
             {
                 let d = draft.clone();
                 move |picked: String, cx| d.update(cx, |d, cx| d.set_label(ix, picked, cx))
+            },
+        )),
+        SmartField::Orientation => h_flex().flex_1().min_w_0().child(dropdown_button(
+            format!("row-{ix}-orientation"),
+            if orientation.is_empty() {
+                t("rules.f_orientation")
+            } else {
+                rust_i18n::t!(format!("rules.orient_{orientation}")).to_string()
+            },
+            ["landscape", "portrait", "square"]
+                .iter()
+                .map(|o| {
+                    (
+                        o.to_string(),
+                        rust_i18n::t!(format!("rules.orient_{o}")).to_string(),
+                    )
+                })
+                .collect(),
+            orientation,
+            {
+                let d = draft.clone();
+                move |picked: String, cx| d.update(cx, |d, cx| d.set_orientation(ix, picked, cx))
             },
         )),
         SmartField::Rating => h_flex().flex_1().min_w_0().child(dropdown_button(
@@ -1032,6 +1114,9 @@ fn field_key(field: SmartField) -> &'static str {
         SmartField::SizeBytes => "rules.f_size",
         SmartField::Color => "rules.f_color",
         SmartField::ColorLabel => "rules.f_label",
+        SmartField::CapturedAt => "rules.f_captured",
+        SmartField::AspectRatio => "rules.f_aspect",
+        SmartField::Orientation => "rules.f_orientation",
     }
 }
 
@@ -1069,8 +1154,12 @@ fn allowed_ops(field: SmartField) -> &'static [SmartCompare] {
         | SmartField::IsFavorite
         | SmartField::Color
         | SmartField::ColorLabel
+        | SmartField::Orientation
         | SmartField::Extension => &[SmartCompare::Eq, SmartCompare::Ne],
-        SmartField::Rating | SmartField::SizeBytes => &[
+        SmartField::Rating
+        | SmartField::SizeBytes
+        | SmartField::CapturedAt
+        | SmartField::AspectRatio => &[
             SmartCompare::Eq,
             SmartCompare::Ne,
             SmartCompare::Gt,
