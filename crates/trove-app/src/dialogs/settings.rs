@@ -16,6 +16,7 @@ use std::path::PathBuf;
 
 use gpui_kit::base::{h_flex, v_flex};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::setting::{
     SettingField, SettingGroup, SettingItem, SettingPage, Settings,
 };
@@ -526,6 +527,16 @@ fn maintenance_page(controller: &Entity<LibraryController>) -> SettingPage {
                         }),
                     )
                     .description(t("settings.clean_orphans_desc")),
+                )
+                .item(
+                    SettingItem::new(
+                        t("settings.verify_integrity"),
+                        SettingField::render({
+                            let controller = controller.clone();
+                            move |_, _, cx| integrity_row(&controller, cx)
+                        }),
+                    )
+                    .description(t("settings.verify_integrity_desc")),
                 ),
         )
         .group(backups_group(controller))
@@ -785,6 +796,198 @@ fn orphans_row(controller: &Entity<LibraryController>, cx: &mut App) -> Div {
                 }
             }),
     )
+}
+
+/// Integrity-check row: a "verify" button; once a report exists, a summary
+/// line and one row per problem asset with a trash action. Like thumbnails,
+/// the plan is collected on the main thread (the library is not `Send`) and
+/// the hashing runs on the background executor.
+fn integrity_row(controller: &Entity<LibraryController>, cx: &mut App) -> Div {
+    let busy = controller.read(cx).busy;
+    let report = controller.read(cx).integrity_report.clone();
+
+    let mut bar = h_flex().w_full().justify_end().gap_2();
+    if let Some(report) = &report {
+        let clean = report.entries.is_empty();
+        bar = bar.child(
+            div()
+                .min_w_0()
+                .truncate()
+                .text_xs()
+                .text_color(if clean {
+                    cx.theme().muted_foreground
+                } else {
+                    cx.theme().danger
+                })
+                .child(if clean {
+                    rust_i18n::t!("settings.verify_done_clean", count = report.checked).to_string()
+                } else {
+                    rust_i18n::t!(
+                        "settings.verify_done_issues",
+                        count = report.checked,
+                        issues = report.entries.len()
+                    )
+                    .to_string()
+                }),
+        );
+    }
+    bar = bar.child(
+        Button::new("verify-integrity")
+            .outline()
+            .small()
+            .disabled(busy)
+            .label(rust_i18n::t!("settings.verify_start").to_string())
+            .on_click({
+                let controller = controller.clone();
+                move |_, _, cx| run_integrity_check(&controller, cx)
+            }),
+    );
+
+    let mut col = v_flex().flex_1().gap_1().child(bar);
+    if let Some(report) = report.filter(|r| !r.entries.is_empty()) {
+        let mut list = v_flex().w_full().gap_1();
+        for entry in &report.entries {
+            list = list.child(integrity_entry_row(controller.clone(), entry.clone(), cx));
+        }
+        col = col.child(
+            div()
+                .w_full()
+                .max_h(px(220.))
+                .overflow_y_scrollbar()
+                .child(list),
+        );
+    }
+    col
+}
+
+/// One problem asset: file name, issue tag, and a move-to-trash action that
+/// drops the entry from the report when it succeeds.
+fn integrity_entry_row(
+    controller: Entity<LibraryController>,
+    entry: trove_core::services::maintenance::IntegrityEntry,
+    cx: &App,
+) -> Div {
+    use trove_core::services::maintenance::IntegrityIssue as Issue;
+    let (tag, tag_color) = match entry.issue {
+        Issue::MissingBlob => (
+            rust_i18n::t!("settings.verify_missing").to_string(),
+            cx.theme().danger,
+        ),
+        Issue::HashMismatch => (
+            rust_i18n::t!("settings.verify_corrupted").to_string(),
+            cx.theme().warning,
+        ),
+    };
+    let asset_id = entry.asset_id;
+    h_flex()
+        .w_full()
+        .items_center()
+        .justify_between()
+        .gap_2()
+        .px_2()
+        .py_1()
+        .rounded(cx.theme().radius)
+        .border_1()
+        .border_color(cx.theme().border)
+        .child(
+            h_flex()
+                .min_w_0()
+                .flex_1()
+                .items_center()
+                .gap_2()
+                .child(
+                    div()
+                        .min_w_0()
+                        .flex_1()
+                        .truncate()
+                        .text_sm()
+                        .text_color(cx.theme().foreground)
+                        .child(entry.file_name),
+                )
+                .child(
+                    div()
+                        .flex_shrink_0()
+                        .text_xs()
+                        .text_color(tag_color)
+                        .child(tag),
+                ),
+        )
+        .child(
+            Button::new(format!("integrity-trash-{asset_id}"))
+                .outline()
+                .xsmall()
+                .label(rust_i18n::t!("app.move_to_trash").to_string())
+                .on_click(move |_, _, cx| {
+                    controller.update(cx, |ctl, cx| {
+                        let ids = [asset_id];
+                        if let Err(e) = ctl.library.trash_assets(&ids) {
+                            ctl.notice = Some(
+                                rust_i18n::t!("workspace.trash_failed", error = e.to_string())
+                                    .to_string(),
+                            );
+                        } else if let Some(report) = ctl.integrity_report.as_mut() {
+                            report.entries.retain(|e| e.asset_id != asset_id);
+                        }
+                        ctl.deselect(&ids);
+                        ctl.generation += 1;
+                        cx.notify();
+                    });
+                }),
+        )
+}
+
+/// Run the integrity check: plan on the main thread, hash blobs on the
+/// background executor, publish the report into the controller.
+fn run_integrity_check(controller: &Entity<LibraryController>, cx: &mut App) {
+    if !start_job(controller, cx) {
+        return;
+    }
+    let plan = {
+        let library = &controller.read(cx).library;
+        match trove_core::services::maintenance::plan_integrity(library) {
+            Ok(plan) => plan,
+            Err(e) => {
+                finish_job(
+                    controller,
+                    rust_i18n::t!("settings.job_failed", error = e.to_string()).to_string(),
+                    cx,
+                );
+                return;
+            }
+        }
+    };
+
+    let task = cx
+        .background_executor()
+        .spawn(async move { trove_core::services::maintenance::run_integrity_plan(plan) });
+
+    cx.spawn({
+        let controller = controller.clone();
+        async move |cx| {
+            let report = task.await;
+            cx.update(|cx| {
+                let issues = report.entries.len();
+                let message = if issues == 0 {
+                    rust_i18n::t!("settings.verify_done_clean", count = report.checked).to_string()
+                } else {
+                    rust_i18n::t!(
+                        "settings.verify_done_issues",
+                        count = report.checked,
+                        issues = issues
+                    )
+                    .to_string()
+                };
+                controller.update(cx, |ctl, cx| {
+                    ctl.busy = false;
+                    ctl.notice = Some(message);
+                    ctl.integrity_report = Some(report);
+                    cx.notify();
+                });
+                cx.refresh_windows();
+            });
+        }
+    })
+    .detach();
 }
 
 /// The shared status line: the notice of the last finished job, danger

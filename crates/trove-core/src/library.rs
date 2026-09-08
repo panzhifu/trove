@@ -603,8 +603,8 @@ impl Library {
         assets::update(conn, asset_id, patch)?;
         self.undo.record(Op::PatchAsset {
             id: asset_id,
-            before,
-            after: patch.clone(),
+            before: Box::new(before),
+            after: Box::new(patch.clone()),
         });
         Ok(())
     }
