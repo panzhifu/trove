@@ -291,6 +291,15 @@ fn save(
         .unwrap_or_default())
 }
 
+/// In-app URL import: download `url` (http/https only) into the inbox with
+/// a source-URL sidecar, so the next inbox drain imports it and records the
+/// source on the asset. Returns the saved file name.
+pub fn fetch_to_inbox(url: &str) -> Result<String, String> {
+    let bytes = fetch(url)?;
+    let name = suggested_name(url).unwrap_or_else(|| "collected.bin".to_string());
+    save(&inbox_dir(), &name, Some(url.to_string()), &bytes)
+}
+
 fn fetch(url: &str) -> Result<Vec<u8>, String> {
     if !url.starts_with("http://") && !url.starts_with("https://") {
         return Err("only http(s) URLs are supported".into());
@@ -384,6 +393,13 @@ fn respond(mut stream: TcpStream, status: u16, body: &str) -> std::io::Result<()
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fetch_to_inbox_rejects_non_http_urls() {
+        assert!(fetch_to_inbox("ftp://example.com/a.png").is_err());
+        assert!(fetch_to_inbox("file:///etc/passwd").is_err());
+        assert!(fetch_to_inbox("data:text/plain,hi").is_err());
+    }
 
     #[test]
     fn server_saves_upload_with_sidecar() {

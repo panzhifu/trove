@@ -9,8 +9,10 @@ use std::path::PathBuf;
 
 use gpui_kit::base::h_flex;
 use gpui_kit::component::ActiveTheme as _;
+use gpui_kit::component::Sizable as _;
 use gpui_kit::component::WindowExt as _;
 use gpui_kit::component::dock::{DockLayout, DockPlacement, DockSkin, panel_handle};
+use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::component::notification::Notification;
 use gpui_kit::prelude::FluentBuilder as _;
 
@@ -302,6 +304,74 @@ impl AppView {
         .detach();
     }
 
+    /// File ▸ Import from URL… : prompt for a link, download it in the
+    /// background into the collect inbox, then run the standard inbox drain
+    /// (import + record the source URL on the asset).
+    fn prompt_import_url(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let url_input = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(
+                rust_i18n::t!("app.import_url_placeholder")
+                    .into_owned()
+                    .to_string(),
+            )
+        });
+        let ctl = self.controller.clone();
+        let handle = window.window_handle();
+        window.open_dialog(cx, move |dialog, _, _| {
+            let url_input = url_input.clone();
+            let ctl = ctl.clone();
+            // `handle` is `AnyWindowHandle` (Copy): each `move` closure below
+            // captures its own copy, no explicit clone needed.
+            dialog
+                .title(rust_i18n::t!("app.import_url").to_string())
+                .width(px(460.))
+                .child(Input::new(&url_input).small().appearance(true))
+                .on_ok(move |_, _, cx| {
+                    let url: String = url_input.read(cx).value().trim().to_string();
+                    if !url.is_empty() {
+                        let ctl = ctl.clone();
+                        let task = cx.background_executor().spawn(async move {
+                            trove_core::services::collect::fetch_to_inbox(&url)
+                        });
+                        cx.spawn(async move |cx| {
+                            let result = task.await;
+                            let _ = handle.update(cx, |_view, window, cx| match result {
+                                Ok(name) => {
+                                    // Drain the inbox right away; when an
+                                    // import is already running the file
+                                    // stays queued for the watcher's next
+                                    // sweep.
+                                    if !jobs::collect_inbox_app(&ctl, window, cx) {
+                                        window.push_notification(
+                                            Notification::info(
+                                                rust_i18n::t!(
+                                                    "notice.import_url_queued",
+                                                    name = name
+                                                )
+                                                .to_string(),
+                                            ),
+                                            cx,
+                                        );
+                                    }
+                                }
+                                Err(e) => {
+                                    window.push_notification(
+                                        Notification::warning(
+                                            rust_i18n::t!("notice.download_failed", error = e)
+                                                .to_string(),
+                                        ),
+                                        cx,
+                                    );
+                                }
+                            });
+                        })
+                        .detach();
+                    }
+                    true
+                })
+        });
+    }
+
     /// File ▸ Export media package… : pick a destination directory, then
     /// write a portable package (trove-export.json + media/ blobs).
     fn prompt_export_media_package(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -446,6 +516,9 @@ impl Render for AppView {
             }))
             .on_action(cx.listener(|this, _: &PasteImport, window, cx| {
                 this.paste_import(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ImportUrl, window, cx| {
+                this.prompt_import_url(window, cx);
             }))
             .on_action(cx.listener(|this, _: &BatchRename, window, cx| {
                 crate::dialogs::rename::RenameDialog::open(window, cx, this.controller.clone());

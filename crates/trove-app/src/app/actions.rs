@@ -11,6 +11,7 @@ gpui_kit::actions!(
     [
         // -- File menu ----------------------------------------------------
         ImportFiles,
+        ImportUrl,
         ExportLibrary,
         ImportLibrary,
         ExportMediaPackage,
