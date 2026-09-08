@@ -110,6 +110,7 @@ The first launch creates a library under the platform's config directory. Open *
 
 ### Design formats, folders & portability
 - **SVG & PSD thumbnails**: SVGs rasterize (with text, via system fonts), PSDs composite their embedded preview — dimensions are mined at import.
+- **Camera RAW & HEIC**: CR2/CR3/NEF/ARW/DNG/RAF/ORF/RW2 and friends decode through the rawler pipeline (demosaic → white balance → sRGB, orientation-aware); HEIC/HEIF converts via the system `heif-dec` when present.
 - **Folders panel**: imports remember their source path; browse a folder tree in the left dock and filter the grid to any subtree.
 - **Media packages**: File ▸ Export Media Package… writes a portable folder (metadata + blobs); Import library… accepts both bare JSON exports and packages, healing records by content hash.
 - **Browser extension**: `extension/` ships an MV3 addon — right-click any image to send it into your running Trove.
@@ -202,13 +203,13 @@ cargo test -p trove-core
 cargo run -p trove-app
 ```
 
-Test status: `trove-core` compiles and all **97** tests pass. `trove-app` compiles cleanly.
+Test status: `trove-core` compiles and all **99** tests pass. `trove-app` compiles cleanly.
 
 ---
 
 ## Status
 
-- **trove-core** — feature-complete for the above list; tested (97 tests).
+- **trove-core** — feature-complete for the above list; tested (99 tests).
 - **trove-app** — compiles and runs: dock layout, custom title bar, justified thumbnail grid, drag & drop, multi-select, context menus, settings dialog, inspector, visual + semantic search, and import with progress are all wired.
 
 What is still missing (compared with Eagle, Billfish, digiKam, Adobe Bridge & co.) is mapped in [docs/FEATURE-GAPS.md](docs/FEATURE-GAPS.md).
