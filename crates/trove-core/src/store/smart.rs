@@ -193,6 +193,54 @@ fn compile_match(
                 ),
             })
         }
+        SmartField::CapturedAt => {
+            // `captured_at` stores an RFC 3339 timestamp; comparing the
+            // first ten characters (the calendar day) against a `YYYY-MM-DD`
+            // value works lexicographically for all six operators.
+            let s = string_value(value, "captured_at")?;
+            if !valid_date(&s) {
+                return Err(Error::Validation(
+                    "captured_at must be a YYYY-MM-DD date".into(),
+                ));
+            }
+            Ok((
+                format!("substr(assets.captured_at, 1, 10) {} ?", op_sql(op)),
+                vec![s.into()],
+            ))
+        }
+        SmartField::AspectRatio => {
+            let v = value
+                .as_f64()
+                .ok_or_else(|| Error::Validation("aspect_ratio must be a number".into()))?;
+            // NULL dimensions (non-images) yield NULL and never match.
+            Ok((
+                format!(
+                    "(assets.width * 1.0 / NULLIF(assets.height, 0)) {} ?",
+                    op_sql(op)
+                ),
+                vec![Value::Real(v)],
+            ))
+        }
+        SmartField::Orientation => {
+            require_eq_ne(op)?;
+            let s = string_value(value, "orientation")?;
+            let cond = match s.as_str() {
+                "landscape" => "assets.width > assets.height",
+                "portrait" => "assets.width < assets.height",
+                "square" => "assets.width = assets.height",
+                _ => {
+                    return Err(Error::Validation(
+                        "orientation must be landscape, portrait or square".into(),
+                    ));
+                }
+            };
+            let sql = if op == SmartCompare::Eq {
+                cond.to_string()
+            } else {
+                format!("NOT ({cond})")
+            };
+            Ok((sql, vec![]))
+        }
     }
 }
 
@@ -297,6 +345,23 @@ pub(crate) fn normalize_color(v: &str) -> Result<String> {
     } else {
         Err(Error::Validation("color must be a #rrggbb value".into()))
     }
+}
+
+/// `YYYY-MM-DD` calendar date check (shape only; month/day ranges are not
+/// validated beyond the digit layout — SQLite comparisons are string-based).
+/// Public: the rule editor reuses it for live validation.
+pub fn valid_date(s: &str) -> bool {
+    let b = s.as_bytes();
+    b.len() == 10
+        && b[4] == b'-'
+        && b[7] == b'-'
+        && b.iter().enumerate().all(|(i, c)| {
+            if i == 4 || i == 7 {
+                true
+            } else {
+                c.is_ascii_digit()
+            }
+        })
 }
 
 fn op_sql(op: SmartCompare) -> &'static str {
