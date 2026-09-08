@@ -10,6 +10,7 @@ use gpui_kit::base::{h_flex, v_flex};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::dock::{BasePanel, Panel as DockPanel, PanelControl, PanelEvent};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
+use gpui_kit::component::menu::{ContextMenuExt as _, PopupMenuItem};
 use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::{ActiveTheme, Icon, IconName, Sizable};
 use gpui_kit::prelude::FluentBuilder as _;
@@ -617,6 +618,7 @@ impl Render for InspectorPanel {
             ));
 
         if !swatches.is_empty() {
+            let controller = self.controller.clone();
             let colors_content =
                 h_flex()
                     .flex_wrap()
@@ -624,17 +626,52 @@ impl Render for InspectorPanel {
                     .px_1()
                     .children(swatches.iter().map(|(_rgb, hex)| {
                         let hex = hex.clone();
-                        // Right-click copies the hex value straight to the
-                        // clipboard — the palette doubles as a picker.
-                        color_swatch(cx, format!("swatch-{hex}"), &hex, false, |_, _, _| {})
-                            .on_mouse_down(gpui::MouseButton::Right, {
-                                let hex = hex.clone();
-                                move |_, _, cx| {
-                                    cx.write_to_clipboard(gpui::ClipboardItem::new_string(
-                                        hex.clone(),
-                                    ));
-                                }
+                        let menu_controller = controller.clone();
+                        let menu_hex = hex.clone();
+                        // Right-click opens the swatch menu: search images
+                        // whose palette contains this colour, or copy the hex.
+                        div()
+                            .id(format!("swatch-wrap-{hex}"))
+                            .context_menu(move |menu, _, _| {
+                                menu.item(
+                                    PopupMenuItem::new(
+                                        rust_i18n::t!("inspector.search_same_color").to_string(),
+                                    )
+                                    .on_click({
+                                        let controller = menu_controller.clone();
+                                        let hex = menu_hex.clone();
+                                        move |_, window, cx| {
+                                            super::workspace_search::open_color_search(
+                                                &hex,
+                                                &controller,
+                                                window,
+                                                cx,
+                                            );
+                                        }
+                                    }),
+                                )
+                                .separator()
+                                .item(
+                                    PopupMenuItem::new(
+                                        rust_i18n::t!("inspector.copy_hex").to_string(),
+                                    )
+                                    .on_click({
+                                        let hex = menu_hex.clone();
+                                        move |_, _, cx| {
+                                            cx.write_to_clipboard(gpui::ClipboardItem::new_string(
+                                                hex.clone(),
+                                            ));
+                                        }
+                                    }),
+                                )
                             })
+                            .child(color_swatch(
+                                cx,
+                                format!("swatch-{hex}"),
+                                &hex,
+                                false,
+                                |_, _, _| {},
+                            ))
                     }));
             content = content.child(self.collapsible_section(
                 "colors",
