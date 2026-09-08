@@ -136,6 +136,9 @@ mod tests {
         }
         assert_eq!(list_backups(&root).len(), MAX_BACKUPS);
 
+        // Windows refuses to delete files with open handles — close the
+        // connection before removing the temp tree.
+        drop(conn);
         std::fs::remove_dir_all(&root).unwrap();
     }
 }
