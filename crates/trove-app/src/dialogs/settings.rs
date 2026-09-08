@@ -84,6 +84,26 @@ fn general_page(controller: &Entity<LibraryController>) -> SettingPage {
                         SettingField::render(move |_, _, cx| library_location_row(&location, cx)),
                     )
                     .description(rust_i18n::t!("settings.library_location_desc").to_string()),
+                )
+                .item(
+                    SettingItem::new(
+                        rust_i18n::t!("settings.import_mode").to_string(),
+                        SettingField::dropdown(
+                            import_mode_options(),
+                            |_cx| {
+                                let linked = AppConfig::load().import_linked();
+                                SharedString::from(if linked { "link" } else { "copy" })
+                            },
+                            |value, cx| {
+                                let mut config = AppConfig::load();
+                                config.import_mode = Some(value.to_string());
+                                if config.save().is_ok() {
+                                    cx.refresh_windows();
+                                }
+                            },
+                        ),
+                    )
+                    .description(rust_i18n::t!("settings.import_mode_desc").to_string()),
                 ),
         )
         .group(recent_libraries_group(&controller))
@@ -93,6 +113,25 @@ fn general_page(controller: &Entity<LibraryController>) -> SettingPage {
 }
 
 // ========================= recent libraries ==================================
+
+/// The two import modes: copy the file into the library, or link to it in
+/// place (values match `AppConfig.import_mode`).
+fn import_mode_options() -> Vec<(SharedString, SharedString)> {
+    vec![
+        (
+            SharedString::from("copy"),
+            rust_i18n::t!("settings.import_mode_copy")
+                .into_owned()
+                .into(),
+        ),
+        (
+            SharedString::from("link"),
+            rust_i18n::t!("settings.import_mode_link")
+                .into_owned()
+                .into(),
+        ),
+    ]
+}
 
 /// General ▸ Recent libraries: every previously opened library, one click to
 /// hot-switch (excluding the currently open one, which is marked instead).

@@ -59,6 +59,11 @@ pub struct AppConfig {
     /// Collect service port. Defaults to [`crate::services::collect::DEFAULT_PORT`].
     #[serde(default)]
     pub collect_port: Option<u16>,
+    /// How manual imports treat source files: "copy" (default) stores a copy
+    /// of the file inside the library; "link" keeps the file where it is and
+    /// records the original location instead.
+    #[serde(default)]
+    pub import_mode: Option<String>,
 }
 
 /// How many recent-library entries to remember.
@@ -164,6 +169,12 @@ impl AppConfig {
     /// Effective search mode ("visual" or "semantic"). Defaults to visual.
     pub fn search_mode(&self) -> String {
         self.search_mode.as_deref().unwrap_or("visual").to_string()
+    }
+
+    /// How manual imports treat source files: `true` = link to the original
+    /// location (no copy), `false` = copy into the library (default).
+    pub fn import_linked(&self) -> bool {
+        self.import_mode.as_deref() == Some("link")
     }
 
     /// Effective semantic-search similarity threshold, clamped to 0.0..1.0.
