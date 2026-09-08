@@ -64,6 +64,10 @@ pub struct AppConfig {
     /// records the original location instead.
     #[serde(default)]
     pub import_mode: Option<String>,
+    /// Sample text rendered on font-specimen thumbnails (font cards).
+    /// Characters missing from a given font are skipped while rendering.
+    #[serde(default)]
+    pub font_sample: Option<String>,
 }
 
 /// How many recent-library entries to remember.
@@ -175,6 +179,15 @@ impl AppConfig {
     /// location (no copy), `false` = copy into the library (default).
     pub fn import_linked(&self) -> bool {
         self.import_mode.as_deref() == Some("link")
+    }
+
+    /// Sample text for font-specimen thumbnails (`font_sample` or the
+    /// built-in default).
+    pub fn font_sample_text(&self) -> String {
+        self.font_sample
+            .clone()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| "Aa 允 123".into())
     }
 
     /// Effective semantic-search similarity threshold, clamped to 0.0..1.0.

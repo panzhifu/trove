@@ -15,8 +15,8 @@ use gpui_kit::component::{ActiveTheme, Icon, IconName, Sizable};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
-use trove_core::model::NewCollection;
-use trove_core::store::{collections, smart_collections};
+use trove_core::model::{AssetKind, NewCollection};
+use trove_core::store::{assets, collections, smart_collections};
 use uuid::Uuid;
 
 use crate::library::LibraryController;
@@ -29,6 +29,19 @@ use super::common::{
 /// Live (non-trashed) entry count of the recently-viewed history.
 fn recent_count(ctl: &LibraryController) -> u64 {
     trove_core::store::view_history::live_count(ctl.library.store().conn()).unwrap_or(0)
+}
+
+/// Live (non-trashed) font-asset count for the fonts pseudo-row.
+fn fonts_count(ctl: &LibraryController) -> u64 {
+    assets::query(
+        ctl.library.store().conn(),
+        &trove_core::model::AssetQuery {
+            kind: Some(AssetKind::Font),
+            ..Default::default()
+        },
+    )
+    .map(|(total, _)| total)
+    .unwrap_or(0)
 }
 
 /// What the single inline editor is doing right now.
@@ -219,6 +232,9 @@ impl ExplorerPanel {
         if ctl.showing_recent {
             return rust_i18n::t!("app.recent_viewed").to_string();
         }
+        if ctl.filter_kind == Some(AssetKind::Font) {
+            return rust_i18n::t!("app.fonts_view").to_string();
+        }
         if let Some(sid) = ctl.active_smart
             && let Ok(Some(sc)) = smart_collections::get(conn, sid)
         {
@@ -308,6 +324,7 @@ impl Render for ExplorerPanel {
             all_count,
             trash_total,
             recent_total,
+            ctl_filter_kind,
             rows,
             smart_rows,
         ) = {
@@ -363,6 +380,7 @@ impl Render for ExplorerPanel {
                 live_count(ctl),
                 trash_count(ctl),
                 recent_count(ctl),
+                ctl.filter_kind,
                 rows,
                 smart_rows,
             )
@@ -375,6 +393,7 @@ impl Render for ExplorerPanel {
         let trash_selected = showing_trash;
         let recent_selected = showing_recent;
         let all_selected = current.is_none() && !showing_trash && !showing_recent;
+        let fonts_selected = all_selected && ctl_filter_kind == Some(AssetKind::Font);
         items.push(
             collection_row(
                 cx,
@@ -386,6 +405,44 @@ impl Render for ExplorerPanel {
                 true,
             )
             .into_any_element(),
+        );
+        // Fonts view: every live font asset (a kind-filtered all-assets
+        // browse). Grid cells render live specimen cards.
+        let controller_fonts_click = self.controller.clone();
+        let fonts_total = fonts_count(self.controller.read(cx));
+        items.push(
+            div()
+                .id("collection-row-fonts")
+                .cursor_pointer()
+                .w_full()
+                .px_2()
+                .py_1()
+                .rounded(cx.theme().radius)
+                .when(fonts_selected, |this| this.bg(cx.theme().secondary))
+                .on_click(move |_ev: &ClickEvent, _window, cx| {
+                    controller_fonts_click.update(cx, |ctl, _| ctl.select_fonts());
+                })
+                .child(
+                    h_flex()
+                        .w_full()
+                        .items_center()
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .truncate()
+                                .text_sm()
+                                .text_color(cx.theme().foreground)
+                                .child(rust_i18n::t!("app.fonts_view").to_string()),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(fonts_total.to_string()),
+                        ),
+                )
+                .into_any_element(),
         );
         let trash_count = trash_total;
         let controller_trash_click = self.controller.clone();

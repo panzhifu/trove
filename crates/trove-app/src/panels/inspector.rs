@@ -731,6 +731,7 @@ impl Render for InspectorPanel {
                 font_glyphs,
                 font_italic,
                 font_blob.as_deref(),
+                asset.sha256.clone(),
             );
             content = content.child(self.collapsible_section(
                 "font",
@@ -867,6 +868,7 @@ impl InspectorPanel {
         glyphs: Option<u64>,
         italic: bool,
         blob: Option<&std::path::Path>,
+        sha: Option<String>,
     ) -> Div {
         let registered = family
             .as_ref()
@@ -912,6 +914,74 @@ impl InspectorPanel {
                     .child(meta.join(" · ")),
             );
         }
+
+        // System install: user-level fonts directory, hash-named copy. The
+        // button state re-evaluates on the next render after the action.
+        if let Some(sha) = sha {
+            let installed = crate::fonts::is_installed(&sha);
+            let controller = self.controller.clone();
+            let controller_err = controller.clone();
+            let sha_err = sha.clone();
+            section = section.child(
+                h_flex()
+                    .gap_2()
+                    .items_center()
+                    .when(installed, |row| {
+                        row.child(
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(rust_i18n::t!("inspector.font_installed").to_string()),
+                        )
+                    })
+                    .child(if installed {
+                        Button::new("font-uninstall")
+                            .ghost()
+                            .xsmall()
+                            .label(rust_i18n::t!("inspector.font_uninstall").to_string())
+                            .on_click(move |_, _, cx| {
+                                if let Err(e) = crate::fonts::uninstall(&sha_err) {
+                                    controller_err.update(cx, |ctl, cx| {
+                                        ctl.notice = Some(
+                                            rust_i18n::t!("notice.font_install_failed", error = e)
+                                                .to_string(),
+                                        );
+                                        cx.notify();
+                                    });
+                                }
+                                cx.refresh_windows();
+                            })
+                            .into_any_element()
+                    } else {
+                        let sha_install = sha.clone();
+                        Button::new("font-install")
+                            .ghost()
+                            .xsmall()
+                            .label(rust_i18n::t!("inspector.font_install").to_string())
+                            .on_click({
+                                let blob = blob.map(|p| p.to_path_buf());
+                                move |_, _, cx| {
+                                    let Some(blob) = &blob else { return };
+                                    match crate::fonts::install(blob, &sha_install) {
+                                        Ok(_) => cx.refresh_windows(),
+                                        Err(e) => controller_err.update(cx, |ctl, cx| {
+                                            ctl.notice = Some(
+                                                rust_i18n::t!(
+                                                    "notice.font_install_failed",
+                                                    error = e
+                                                )
+                                                .to_string(),
+                                            );
+                                            cx.notify();
+                                        }),
+                                    }
+                                }
+                            })
+                            .into_any_element()
+                    }),
+            );
+        }
+
         section
     }
 
