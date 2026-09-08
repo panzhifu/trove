@@ -60,7 +60,7 @@
 
 | # | 功能 | 现状 | 竞品参照 | 优先级 |
 |---|---|---|---|---|
-| 1 | RAW（CR2/NEF/ARW/DNG）、HEIC/HEIF、AVIF、JPEG-XL 缩略图 | 无 | XnView 500+、digiKam 全流程 | P2（RAW 建议 rawler，HEIC 需 C 库 libheif，工程量大） |
+| 1 | RAW（CR2/NEF/ARW/DNG）、HEIC/HEIF、AVIF、JPEG-XL 缩略图 | **RAW/HEIC 已实现**（RAW 走 rawler 完整解码管线含去马赛克/白平衡/sRGB，HEIC 用系统 heif-dec，缺工具时优雅降级） | XnView 500+、digiKam 全流程 | ✅（AVIF/JPEG-XL 仍缺 → P2） |
 | 2 | SVG/PSD/AI/EPS/CDR 等设计格式预览 | **SVG/PSD 已实现**（resvg 渲染 + psd 合成，导入即生成缩略图与尺寸） | Eagle/Billfish 核心格式 | ✅（AI/EPS/CDR 仍缺 → P2） |
 | 3 | 视频播放/逐帧/音频波形预览 | 仅静态海报 | Eagle/Billfish | P2 |
 | 4 | GIF/WebP/APNG 动图播放 | 静态首帧 | TagStudio/XnView | P2 |
@@ -173,6 +173,14 @@
 | 层级标签 | 标签父子树（schema v6）：面板树形展示 + 新建子标签；筛选/计数/智能集合自动包含子树；环检测；删除父标签子级晋升；撤销支持 |
 | 本地采集服务 | `http://127.0.0.1:23916`：`POST /add`（字节+来源）、`POST /fetch`（服务端抓取 URL）；文件落 inbox 自动入库并回填 `source_url`，为浏览器扩展铺路 |
 
+## 四点九、第四批实现（RAW / HEIC）
+
+| 功能 | 说明 |
+|---|---|
+| RAW 缩略图 | rawler 完整解码管线（去马赛克、白平衡、色彩校准、sRGB 伽马），EXIF 方向自动校正；支持 CR2/CR3/NEF/ARW/DNG/RAF/ORF/RW2 等主流格式。注：rawler 为 LGPL-2.1，MIT 项目引入时建议后续评估替代或动态链接合规 |
+| HEIC 缩略图 | 系统 heif-dec（libheif 工具）转换，缺工具时优雅降级为图标；与视频海报的 ffmpeg 模式一致 |
+| 测试 | HEIC 用 heif-enc 现场生成样本（无工具自动跳过）；RAW 提供 TROVE_RAW_SAMPLE 环境变量触发的 opt-in 测试 |
+
 ## 四点八、第三批实现（2026-09-08 续）
 
 | 功能 | 说明 |
@@ -185,6 +193,6 @@
 
 ## 五、路线图建议
 
-- **下一迭代**：OCR（复用 ONNX 栈，需用户下载识别模型）→ RAW 缩略图（rawler）→ 时间线/对比视图 → 层级标签别名与自动补全 → XMP 写回
+- **下一迭代**：OCR（复用 ONNX 栈，需用户下载识别模型）→ 时间线/对比视图 → 层级标签别名与自动补全 → XMP 写回 → AVIF/JPEG-XL 缩略图
 - **中期（P2）**：时间线/对比视图、视频/动图预览、批量转换、XMP 写回、物体自动打标、人脸聚类、亮色主题、元数据模板
 - **远期（P3）**：地图、3D/标注/水印、插件系统、协作同步、CLI
