@@ -64,7 +64,7 @@ impl Render for TagsPanel {
         ) {
             if let Some(children) = children_of.get(&parent) {
                 let mut children = children.clone();
-                children.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+                children.sort_by_key(|tag| tag.name.to_lowercase());
                 for tag in children {
                     out.push((tag, depth));
                     tag_rows(tag.id, children_of, depth + 1, out);

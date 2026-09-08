@@ -25,10 +25,11 @@ use crate::store::{assets, collections, tags};
 pub enum Op {
     /// Restore every editable column of one asset from the inverse patch
     /// (both patches are fully populated, so undo and redo are symmetric).
+    /// Patches are boxed: they dominate the enum's size otherwise.
     PatchAsset {
         id: Uuid,
-        before: AssetPatch,
-        after: AssetPatch,
+        before: Box<AssetPatch>,
+        after: Box<AssetPatch>,
     },
     /// Per-asset trash flags around a batch flip (`before`/`after` are
     /// parallel per-id states).
@@ -163,8 +164,8 @@ impl Op {
         match self {
             Op::PatchAsset { id, before, after } => Op::PatchAsset {
                 id: *id,
-                before: after.clone(),
-                after: before.clone(),
+                before: Box::new(after.as_ref().clone()),
+                after: Box::new(before.as_ref().clone()),
             },
             Op::SetTrashed { before, after } => Op::SetTrashed {
                 before: after.clone(),
@@ -369,8 +370,8 @@ mod tests {
         };
         stack.record(Op::PatchAsset {
             id: a.id,
-            before: restore_patch(&a),
-            after: patch,
+            before: Box::new(restore_patch(&a)),
+            after: Box::new(patch),
         });
         stack.undo(conn).unwrap();
         assert_eq!(assets::get(conn, a.id).unwrap().unwrap().title, None);

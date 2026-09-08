@@ -83,7 +83,7 @@ mod tests {
         std::fs::write(sub.join("inner.jpg"), b"x").unwrap();
         std::fs::write(deep.join("too-deep.png"), b"x").unwrap();
 
-        let files = all_files(&[root.clone()]);
+        let files = all_files(std::slice::from_ref(&root));
         let names: Vec<String> = files
             .iter()
             .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
@@ -97,10 +97,10 @@ mod tests {
         let mut seen: HashSet<PathBuf> = files.iter().cloned().collect();
         let fresh = root.join("later.gif");
         std::fs::write(&fresh, b"x").unwrap();
-        let delta = new_files(&[root.clone()], &seen);
+        let delta = new_files(std::slice::from_ref(&root), &seen);
         assert_eq!(delta, vec![fresh.clone()]);
         seen.insert(fresh);
-        assert!(new_files(&[root.clone()], &seen).is_empty());
+        assert!(new_files(std::slice::from_ref(&root), &seen).is_empty());
 
         std::fs::remove_dir_all(&root).unwrap();
     }
