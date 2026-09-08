@@ -65,6 +65,8 @@ pub struct StagedFile {
     pub ext: String,
     pub sha256: String,
     pub size: u64,
+    /// Library-relative blob path; empty when [`StagedFile::linked`] is set
+    /// (the file stays at its original location).
     pub rel_path: String,
     pub kind: AssetKind,
     pub mime: String,
@@ -72,6 +74,9 @@ pub struct StagedFile {
     pub height: Option<u32>,
     /// Extracted EXIF / audio metadata (best-effort).
     pub mined: metadata::MinedMetadata,
+    /// Linked import: the file was not copied; the record points at the
+    /// original location via `extra["source_path"]`.
+    pub linked: bool,
 }
 
 /// Synchronous all-in-one import (tests, small batches). Equivalent to
@@ -91,21 +96,23 @@ pub fn import_files(
     Ok(commit_staged_all(
         store,
         into_collection,
-        stage_all(root, sources),
+        stage_all(root, sources, false),
     ))
 }
 
 /// Phase one for a batch: stage every source file (copy + hash + probe + thumbnail).
 /// Pure filesystem work, safe to run on a background thread. Individual
 /// failures never abort the batch; they are collected as [`ImportSkip`]s.
+/// With `linked = true` the files are hashed + probed but *not* copied.
 pub fn stage_all(
     root: &Path,
     sources: &[PathBuf],
+    linked: bool,
 ) -> Vec<std::result::Result<StagedFile, ImportSkip>> {
     sources
         .iter()
         .map(|src| {
-            stage_source(root, src).map_err(|e| ImportSkip {
+            stage_source(root, src, linked).map_err(|e| ImportSkip {
                 path: src.clone(),
                 reason: e.to_string(),
             })
@@ -138,8 +145,10 @@ pub fn commit_staged_all(
     report
 }
 
-/// Phase one (slow, pure I/O): copy + hash + probe one source file.
-pub fn stage_source(root: &Path, src: &Path) -> Result<StagedFile> {
+/// Phase one (slow, pure I/O): hash + probe one source file, copying it into
+/// the media store unless `linked` is set (then the file stays where it is
+/// and the record points at its original location).
+pub fn stage_source(root: &Path, src: &Path, linked: bool) -> Result<StagedFile> {
     let file_name = file_name_of(src)?;
     let ext = probe::normalize_ext(
         &src.extension()
@@ -147,9 +156,17 @@ pub fn stage_source(root: &Path, src: &Path) -> Result<StagedFile> {
             .unwrap_or_default(),
     );
 
-    let staged = blob::stage(src, root, &ext)?;
+    // Linked mode: hash the source in place; no blob is written. The probe
+    // and thumbnail generation read the original file directly.
+    let (sha256, size, rel_path, blob_path) = if linked {
+        let (sha256, size) = blob::hash_file(src)?;
+        (sha256, size, String::new(), src.to_path_buf())
+    } else {
+        let staged = blob::stage(src, root, &ext)?;
+        let blob_path = root.join(&staged.rel_path);
+        (staged.sha256, staged.size, staged.rel_path, blob_path)
+    };
     let p = probe::probe(&ext);
-    let blob_path = root.join(&staged.rel_path);
     let (width, height, video_duration_ms) = match p.kind {
         AssetKind::Image => match probe::image_dimensions(&blob_path) {
             Some(d) => (Some(d.width), Some(d.height), None),
@@ -164,7 +181,7 @@ pub fn stage_source(root: &Path, src: &Path) -> Result<StagedFile> {
         _ => (None, None, None),
     };
     // Generate (or confirm) the thumbnail cache entry on the background thread.
-    thumb::ensure(root, &staged.sha256, p.kind, &blob_path);
+    thumb::ensure(root, &sha256, p.kind, &blob_path);
     // Mine rich metadata (EXIF camera fields, audio tags/duration, font
     // tables, video container). Best-effort.
     let mut mined = metadata::mine(&blob_path, p.kind);
@@ -176,14 +193,15 @@ pub fn stage_source(root: &Path, src: &Path) -> Result<StagedFile> {
         path: src.to_path_buf(),
         file_name,
         ext,
-        sha256: staged.sha256,
-        size: staged.size,
-        rel_path: staged.rel_path,
+        sha256,
+        size,
+        rel_path,
         kind: p.kind,
         mime: p.mime,
         width,
         height,
         mined,
+        linked,
     })
 }
 
@@ -206,8 +224,9 @@ pub fn commit_staged(
     // Reuse an existing live asset with identical content.
     if let Some(existing) = assets::find_by_sha256(store.conn(), &staged.sha256)? {
         // A placeholder record (metadata restore without media) becomes a
-        // full asset the moment its content lands in the library.
-        if existing.rel_path.is_none() {
+        // full asset the moment its content lands in the library. Linked
+        // records keep pointing at their original location.
+        if existing.rel_path.is_none() && existing.origin == Origin::Stored {
             assets::set_rel_path(store.conn(), existing.id, &staged.rel_path)?;
         }
         for cid in &targets {
@@ -236,8 +255,16 @@ pub fn commit_staged(
 
     let asset = Asset {
         id: Uuid::new_v4(),
-        origin: Origin::Stored,
-        rel_path: Some(staged.rel_path.clone()),
+        origin: if staged.linked {
+            Origin::Linked
+        } else {
+            Origin::Stored
+        },
+        rel_path: if staged.linked {
+            None
+        } else {
+            Some(staged.rel_path.clone())
+        },
         file_name: staged.file_name.clone(),
         ext: staged.ext.clone(),
         mime: staged.mime.clone(),
@@ -290,6 +317,7 @@ fn file_name_of(src: &Path) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::AssetQuery;
     use crate::store::Store;
 
     /// A minimal valid 1x1 PNG.
@@ -317,7 +345,7 @@ mod tests {
         let missing = root.join("nope.png");
 
         // Phase one: staging collects failures instead of aborting the batch.
-        let staged = stage_all(&root, &[good.clone(), missing.clone()]);
+        let staged = stage_all(&root, &[good.clone(), missing.clone()], false);
         assert_eq!(staged.len(), 2);
         assert!(staged[0].is_ok());
         assert!(staged[1].is_err());
@@ -335,11 +363,69 @@ mod tests {
         assert_eq!(roots.len(), 0, "no auto-collection should be created");
 
         // Re-importing identical content dedupes (reused = true).
-        let staged2 = stage_all(&root, &[good]);
+        let staged2 = stage_all(&root, &[good], false);
         let report2 = commit_staged_all(&store, None, staged2);
         assert_eq!(report2.imported_count(), 1);
         assert!(report2.imported[0].reused);
 
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn linked_import_keeps_the_file_in_place() {
+        let root = temp_root("linked");
+        let store = Store::in_memory().unwrap();
+
+        // The source lives OUTSIDE the library root.
+        let outside = std::env::temp_dir().join(format!("trove-src-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&outside).unwrap();
+        let src = outside.join("linked.png");
+        std::fs::write(&src, PNG_1X1).unwrap();
+
+        let staged = stage_all(&root, std::slice::from_ref(&src), true);
+        assert!(staged[0].is_ok(), "{:?}", staged[0].as_ref().err());
+        let report = commit_staged_all(&store, None, staged);
+        assert_eq!(report.imported_count(), 1);
+
+        let conn = store.conn();
+        let (_, all) = assets::query(conn, &AssetQuery::default()).unwrap();
+        let asset = &all[0];
+        // Linked record: no blob copied, origin linked, original location
+        // recorded in extra.
+        assert_eq!(asset.origin, Origin::Linked);
+        assert!(asset.rel_path.is_none());
+        assert!(walk_blobs(&root.join("media")).is_empty());
+        assert_eq!(
+            asset.extra.get("source_path").and_then(|v| v.as_str()),
+            Some(src.display().to_string().as_str())
+        );
+        let (src_sha, _) = super::super::blob::hash_file(&src).unwrap();
+        assert_eq!(asset.sha256.as_deref(), Some(src_sha.as_str()));
+
+        // The thumbnail was generated from the original file.
+        let thumb = super::super::thumb::abs_path(&root, asset.sha256.as_deref().unwrap());
+        assert!(thumb.is_file());
+
+        // The source file was never modified or moved.
+        assert!(src.is_file());
+
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&outside).ok();
+    }
+
+    /// Collect every file under the media store.
+    fn walk_blobs(dir: &Path) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for e in entries.flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    out.extend(walk_blobs(&p));
+                } else {
+                    out.push(p);
+                }
+            }
+        }
+        out
     }
 }

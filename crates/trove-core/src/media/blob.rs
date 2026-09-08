@@ -100,6 +100,23 @@ fn tmp_path(root: &Path) -> PathBuf {
         .join(format!(".tmp-{}", uuid::Uuid::new_v4()))
 }
 
+/// Streaming SHA-256 of an existing file without copying it. Used by the
+/// linked-import mode, where the source file stays where it is.
+pub fn hash_file(path: &Path) -> std::io::Result<(String, u64)> {
+    let mut file = std::fs::File::open(path)?;
+    let meta = file.metadata()?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 256 * 1024];
+    loop {
+        let n = file.read(&mut buffer)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buffer[..n]);
+    }
+    Ok((hex(&hasher.finalize()), meta.len()))
+}
+
 pub(crate) fn hex(bytes: &[u8]) -> String {
     use std::fmt::Write as _;
     let mut s = String::with_capacity(bytes.len() * 2);

@@ -8,10 +8,7 @@ use uuid::Uuid;
 
 use crate::library::LibraryController;
 use crate::panels::workspace_search::open_image_search;
-use trove_core::model::AssetPatch;
 use trove_core::store::{assets, collections};
-
-use super::common::COLOR_LABEL_SWATCHES;
 
 /// Build the right-click context menu for an asset cell.
 pub(crate) fn asset_context_menu(
@@ -176,56 +173,19 @@ fn trash_menu(
         )
 }
 
-/// "Color label" submenu: one checked entry per palette color plus a clear
-/// action. Applies to the whole selection (or just the clicked asset).
+/// "Color label" submenu — delegated to the shared color-label widget.
+/// Applies to the whole selection (or just the clicked asset).
 fn build_color_label_submenu(
-    mut menu: PopupMenu,
+    menu: PopupMenu,
     controller: &Entity<LibraryController>,
     asset_id: Uuid,
     current: Option<&str>,
 ) -> PopupMenu {
-    for (name, _hex) in COLOR_LABEL_SWATCHES {
-        let controller = controller.clone();
-        let selected = current == Some(*name);
-        let label = rust_i18n::t!(format!("workspace.label_{name}")).to_string();
-        let name = name.to_string();
-        menu = menu.item(
-            PopupMenuItem::new(label)
-                .checked(selected)
-                .on_click(move |_, _, cx| {
-                    controller.update(cx, |ctl, cx| {
-                        let ids = ctl.action_targets(asset_id);
-                        for id in &ids {
-                            let patch = AssetPatch {
-                                color_label: Some(Some(name.clone())),
-                                ..Default::default()
-                            };
-                            let _ = ctl.library.patch_asset(*id, &patch);
-                        }
-                        ctl.generation += 1;
-                        cx.notify();
-                    });
-                }),
-        );
-    }
-    let controller = controller.clone();
-    menu.separator().item(
-        PopupMenuItem::new(rust_i18n::t!("workspace.clear_color_label").to_string()).on_click(
-            move |_, _, cx| {
-                controller.update(cx, move |ctl, cx| {
-                    let ids = ctl.action_targets(asset_id);
-                    for id in &ids {
-                        let patch = AssetPatch {
-                            color_label: Some(None),
-                            ..Default::default()
-                        };
-                        let _ = ctl.library.patch_asset(*id, &patch);
-                    }
-                    ctl.generation += 1;
-                    cx.notify();
-                });
-            },
-        ),
+    super::color_label::menu_entries(
+        menu,
+        controller,
+        super::color_label::LabelTarget::Selection(asset_id),
+        current,
     )
 }
 

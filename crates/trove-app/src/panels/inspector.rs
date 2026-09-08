@@ -15,15 +15,13 @@ use gpui_kit::component::{ActiveTheme, Icon, IconName, Sizable};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
-use trove_core::model::{AssetKind, AssetPatch, MAX_RATING};
+use trove_core::model::{AssetKind, AssetPatch, MAX_RATING, Origin};
 use trove_core::store::{assets, tags};
 use uuid::Uuid;
 
 use crate::library::LibraryController;
 
-use super::common::{
-    COLOR_LABEL_SWATCHES, color_swatch, hex_to_rgb, human_bytes, kind_icon, observe_controller,
-};
+use super::common::{color_swatch, hex_to_rgb, human_bytes, kind_icon, observe_controller};
 
 // ==================== Inspector: details + tags ==============================
 
@@ -367,10 +365,21 @@ impl Render for InspectorPanel {
             .into_iter()
             .filter_map(|s| hex_to_rgb(&s).map(|rgb| (rgb, s)))
             .collect();
-        let disk_path: Option<std::path::PathBuf> = asset
-            .rel_path
-            .as_ref()
-            .map(|rel| ctl.library.root().join(rel));
+        // Where the file lives: linked assets point at their original
+        // location (recorded at import), stored assets at the library blob.
+        let linked = asset.origin == Origin::Linked;
+        let disk_path: Option<std::path::PathBuf> = if linked {
+            asset
+                .extra
+                .get("source_path")
+                .and_then(|v| v.as_str())
+                .map(std::path::PathBuf::from)
+        } else {
+            asset
+                .rel_path
+                .as_ref()
+                .map(|rel| ctl.library.root().join(rel))
+        };
         let kind = asset.kind;
         let rating = asset.rating;
         let added = asset.created_at.format("%Y-%m-%d %H:%M").to_string();
@@ -395,10 +404,15 @@ impl Render for InspectorPanel {
                 .unwrap_or(false),
         );
         let font_blob = if kind == AssetKind::Font {
-            asset
-                .rel_path
-                .as_ref()
-                .map(|rel| ctl.library.root().join(rel))
+            if linked {
+                // Linked fonts are read straight from their original file.
+                disk_path.clone()
+            } else {
+                asset
+                    .rel_path
+                    .as_ref()
+                    .map(|rel| ctl.library.root().join(rel))
+            }
         } else {
             None
         };
@@ -535,10 +549,22 @@ impl Render for InspectorPanel {
                         .justify_between()
                         .gap_2()
                         .child(
-                            div()
-                                .text_xs()
-                                .text_color(cx.theme().muted_foreground)
-                                .child(rust_i18n::t!("inspector.location").to_string()),
+                            h_flex()
+                                .gap_1()
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(cx.theme().muted_foreground)
+                                        .child(rust_i18n::t!("inspector.location").to_string()),
+                                )
+                                .when(linked, |row| {
+                                    row.child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(cx.theme().warning)
+                                            .child(rust_i18n::t!("inspector.linked").to_string()),
+                                    )
+                                }),
                         )
                         .child(
                             Button::new(format!("reveal-{asset_id}"))
@@ -724,6 +750,7 @@ impl InspectorPanel {
                 AssetKind::Audio,
                 AssetKind::Document,
                 AssetKind::Archive,
+                AssetKind::Font,
                 AssetKind::Other,
             ]
             .map(|kind| {
@@ -837,39 +864,11 @@ impl InspectorPanel {
         ok
     }
 
-    /// Color-label palette row: one chip per [`COLOR_LABEL_SWATCHES`] entry;
-    /// clicking the active chip clears the label.
-    fn color_label_row(&self, cx: &App, current: Option<&str>) -> Div {
-        h_flex()
-            .gap_1p5()
-            .children(COLOR_LABEL_SWATCHES.iter().map(|(name, hex)| {
-                let controller = self.controller.clone();
-                let selected = current == Some(*name);
-                let name = name.to_string();
-                color_swatch(
-                    cx,
-                    format!("label-{name}"),
-                    hex,
-                    selected,
-                    move |_, _, cx| {
-                        controller.update(cx, |ctl, cx| {
-                            let Some(id) = ctl.primary() else { return };
-                            let patch = AssetPatch {
-                                color_label: Some(if selected { None } else { Some(name.clone()) }),
-                                ..Default::default()
-                            };
-                            if let Err(e) = ctl.library.patch_asset(id, &patch) {
-                                ctl.notice = Some(
-                                    rust_i18n::t!("inspector.update_failed", error = e.to_string())
-                                        .to_string(),
-                                );
-                            }
-                            ctl.generation += 1;
-                            cx.notify();
-                        });
-                    },
-                )
-            }))
+    /// Color-label palette row — the shared [`super::color_label`] widget.
+    /// Left-click applies to the primary asset, right-click opens the
+    /// function menu (set any color / clear).
+    fn color_label_row(&self, cx: &App, current: Option<&str>) -> impl IntoElement {
+        super::color_label::picker(&self.controller, current, cx)
     }
 
     /// Five star toggles; clicking the current top star clears the rating.

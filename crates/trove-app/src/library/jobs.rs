@@ -99,6 +99,8 @@ pub fn import_paths_app_into(
 
     let total = paths.len();
     let library_root = controller.read(cx).library.root().to_path_buf();
+    // The import mode (copy vs link) is read at call time from the config.
+    let linked = trove_core::config::AppConfig::load().import_linked();
     controller.update(cx, |ctl, _| ctl.begin_import(total));
 
     // One keyed toast that tracks the batch: replaced by the completion
@@ -113,7 +115,7 @@ pub fn import_paths_app_into(
     let handle = window.window_handle();
     let task = cx.background_executor().spawn({
         let library_root = library_root.clone();
-        async move { import::stage_all(&library_root, &paths) }
+        async move { import::stage_all(&library_root, &paths, linked) }
     });
 
     cx.spawn(async move |cx| {
@@ -254,9 +256,10 @@ pub fn collect_inbox_app(
     let cleanup = cleanup_names(&paths);
     let stage_root = library_root.clone();
     let stage_paths = paths.clone();
+    // Collect-inbox files are transient copies; they are always stored.
     let task = cx
         .background_executor()
-        .spawn(async move { import::stage_all(&stage_root, &stage_paths) });
+        .spawn(async move { import::stage_all(&stage_root, &stage_paths, false) });
 
     cx.spawn(async move |cx| {
         let staged = task.await;
