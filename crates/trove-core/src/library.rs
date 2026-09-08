@@ -609,6 +609,47 @@ impl Library {
         Ok(())
     }
 
+    /// Re-point a linked asset at a moved file. The chosen file must hash
+    /// to the same SHA-256 as the one recorded at import — relinking
+    /// reconnects a *moved* file, it never swaps content (import the new
+    /// file instead when the original is truly gone).
+    pub fn relink_asset(&self, asset_id: Uuid, new_path: &Path) -> Result<()> {
+        let conn = self.store.conn();
+        let asset = assets::get(conn, asset_id)?.ok_or(crate::Error::NotFound("asset"))?;
+        if asset.origin != crate::model::Origin::Linked || asset.rel_path.is_some() {
+            return Err(crate::Error::Validation(
+                "relink requires a linked asset".into(),
+            ));
+        }
+        if !new_path.is_file() {
+            return Err(crate::Error::Validation(format!(
+                "not a file: {}",
+                new_path.display()
+            )));
+        }
+        let (sha, _) = crate::media::blob::hash_file(new_path)?;
+        let recorded = asset.sha256.as_deref().unwrap_or_default();
+        if !sha.eq_ignore_ascii_case(recorded) {
+            return Err(crate::Error::Validation(format!(
+                "content mismatch: recorded sha256 {recorded}, found {sha}"
+            )));
+        }
+        let mut extra = asset.extra.clone();
+        extra.insert(
+            "source_path".into(),
+            serde_json::Value::String(new_path.to_string_lossy().into_owned()),
+        );
+        assets::update(
+            conn,
+            asset_id,
+            &crate::model::AssetPatch {
+                extra: Some(extra),
+                ..Default::default()
+            },
+        )?;
+        Ok(())
+    }
+
     /// Replace one asset's whole tag group (missing tags must already exist —
     /// use [`tags::ensure_named`] at the call site first).
     pub fn set_asset_tags(&self, asset_id: Uuid, tag_ids: &[Uuid]) -> Result<()> {
@@ -1100,7 +1141,58 @@ mod tests {
     }
 
     #[test]
+    fn relink_asset_repoints_a_moved_file() {
+        use crate::media::import::{commit_staged_all, stage_all};
+        use crate::model::Origin;
 
+        let (lib, root) = temp_library("relink");
+        let outside = std::env::temp_dir().join(format!("trove-relink-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&outside).unwrap();
+        let src = outside.join("linked.png");
+        std::fs::write(&src, PNG_1X1).unwrap();
+
+        // Import as linked (file stays in place).
+        let staged = stage_all(&root, std::slice::from_ref(&src), true);
+        let report = commit_staged_all(lib.store(), None, staged);
+        assert_eq!(report.imported_count(), 1);
+        let conn = lib.store().conn();
+        let (_, all) = assets::query(conn, &AssetQuery::default()).unwrap();
+        let id = all[0].id;
+        assert_eq!(all[0].origin, Origin::Linked);
+
+        // Move the file elsewhere, then reconnect the record to it.
+        let moved = outside.join("moved-elsewhere.png");
+        std::fs::rename(&src, &moved).unwrap();
+        lib.relink_asset(id, &moved).unwrap();
+        let asset = assets::get(conn, id).unwrap().unwrap();
+        assert_eq!(
+            asset.extra.get("source_path").and_then(|v| v.as_str()),
+            Some(moved.display().to_string().as_str())
+        );
+        assert_eq!(asset.sha256.as_deref(), all[0].sha256.as_deref());
+
+        // Different content is rejected — relinking never swaps content.
+        let other = outside.join("other.png");
+        std::fs::write(&other, b"not the same").unwrap();
+        assert!(lib.relink_asset(id, &other).is_err());
+
+        // Stored assets cannot be relinked.
+        let stored = write_source(&root, "stored.txt", b"stored content");
+        lib.import_files(std::slice::from_ref(&stored), None)
+            .unwrap();
+        let (_, all2) = assets::query(conn, &AssetQuery::default()).unwrap();
+        let stored_id = all2
+            .iter()
+            .find(|a| a.origin != Origin::Linked)
+            .expect("stored import")
+            .id;
+        assert!(lib.relink_asset(stored_id, &stored).is_err());
+
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&outside).ok();
+    }
+
+    #[test]
     fn auto_import_groups_into_collections() {
         // Imports go directly to "All Assets" without creating collections.
         let (lib, root) = temp_library("auto-source");
