@@ -77,6 +77,41 @@ pub(crate) fn open_image_search(
     show_results_dialog(results, title, mode_label, library_root, window, cx);
 }
 
+/// Search images whose palette contains a colour close to `hex` (Inspector
+/// swatch right-click) and show the ranked results in the shared dialog.
+pub(crate) fn open_color_search(
+    hex: &str,
+    controller: &Entity<LibraryController>,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let (store, library_root) = {
+        let ctl = controller.read(cx);
+        (
+            ctl.library.store().clone(),
+            ctl.library.root().to_path_buf(),
+        )
+    };
+    let results: Vec<SearchResult> =
+        trove_core::store::visual_search::search_by_color(store.conn(), hex, Some(50))
+            .unwrap_or_default()
+            .into_iter()
+            .map(|r| SearchResult {
+                name: r.asset.file_name,
+                score: r.score,
+                sha256: r.asset.sha256,
+            })
+            .collect();
+    show_results_dialog(
+        results,
+        hex.to_string(),
+        rust_i18n::t!("workspace.color_search").to_string(),
+        library_root,
+        window,
+        cx,
+    );
+}
+
 /// Visual search: pHash + colour histogram (no model needed).
 fn visual_search(store: &trove_core::store::Store, query_path: &Path) -> Vec<SearchResult> {
     trove_core::store::visual_search::search_by_image(store.conn(), query_path, Some(50))

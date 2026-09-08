@@ -47,9 +47,7 @@ use crate::library::{GRID_PAGE_SIZE, LibraryController, ViewMode};
 use crate::panels::workspace_context_menu::AssetsDragPreview;
 use crate::panels::workspace_context_menu::asset_context_menu;
 
-use super::common::{
-    AssetsDrag, COLOR_LABEL_SWATCHES, display_name, kind_icon, observe_controller,
-};
+use super::common::{AssetsDrag, display_name, kind_icon, observe_controller};
 
 /// Left+right padding of the grid container plus scrollbar allowance,
 /// subtracted from the measured width before laying rows out.
@@ -126,7 +124,6 @@ struct ViewKey {
     search: String,
     filter_kind: Option<AssetKind>,
     filter_favorite: bool,
-    filter_color: Option<String>,
     view_mode: ViewMode,
     sort: AssetSort,
     sort_desc: bool,
@@ -605,7 +602,6 @@ impl Render for WorkspacePanel {
             selected,
             filter_kind,
             filter_favorite,
-            filter_color,
             view_mode,
             sort,
             sort_desc,
@@ -623,7 +619,6 @@ impl Render for WorkspacePanel {
                 ctl.selected_assets.clone(),
                 ctl.filter_kind,
                 ctl.filter_favorite,
-                ctl.filter_color.clone(),
                 ctl.view_mode,
                 ctl.sort,
                 ctl.sort_desc,
@@ -656,7 +651,6 @@ impl Render for WorkspacePanel {
                 tag_ids: active_tag.map(|t| vec![t]).unwrap_or_default(),
                 kind: filter_kind,
                 is_favorite: filter_favorite.then_some(true),
-                color_label: filter_color.clone(),
                 source_path_prefix: active_folder.clone(),
                 is_trashed: false,
                 text: None,
@@ -701,7 +695,6 @@ impl Render for WorkspacePanel {
                     // ignores the grid filters entirely.
                     kind: if in_trash { None } else { filter_kind },
                     is_favorite: (!in_trash && filter_favorite).then_some(true),
-                    color_label: if in_trash { None } else { filter_color.clone() },
                     source_path_prefix: if in_trash {
                         None
                     } else {
@@ -795,7 +788,6 @@ impl Render for WorkspacePanel {
                 || k.search != search
                 || k.filter_kind != filter_kind
                 || k.filter_favorite != filter_favorite
-                || k.filter_color != filter_color
                 || k.view_mode != view_mode
                 || k.sort != sort
                 || k.sort_desc != sort_desc
@@ -832,7 +824,6 @@ impl Render for WorkspacePanel {
             search: search.clone(),
             filter_kind,
             filter_favorite,
-            filter_color,
             view_mode,
             sort,
             sort_desc,
@@ -1073,12 +1064,11 @@ impl Render for WorkspacePanel {
 /// compose with every view (collection, search, smart collection) and are
 /// also how the favorites view is entered.
 fn filter_controls(controller: &Entity<LibraryController>, cx: &App) -> Div {
-    let (kind, favorite, color, view_mode, sort, sort_desc) = {
+    let (kind, favorite, view_mode, sort, sort_desc) = {
         let ctl = controller.read(cx);
         (
             ctl.filter_kind,
             ctl.filter_favorite,
-            ctl.filter_color.clone(),
             ctl.view_mode,
             ctl.sort,
             ctl.sort_desc,
@@ -1222,62 +1212,8 @@ fn filter_controls(controller: &Entity<LibraryController>, cx: &App) -> Div {
             }),
     );
 
-    // Color-label filter dropdown: palette colors, active one checked.
-    let color_label_text = match &color {
-        Some(c) => super::color_label::label_name(c),
-        None => t("workspace.filter_color"),
-    };
-    let color_options: Vec<(String, String)> = COLOR_LABEL_SWATCHES
-        .iter()
-        .map(|(name, _)| (name.to_string(), super::color_label::label_name(name)))
-        .collect();
-    bar = bar.child(
-        Button::new("filter-color")
-            .xsmall()
-            .when(color.is_some(), |b| b.primary())
-            .when(color.is_none(), |b| b.ghost())
-            .icon(IconName::Palette)
-            .label(color_label_text)
-            .tooltip(t("workspace.filter_color"))
-            .dropdown_menu_with_anchor(Anchor::TopLeft, {
-                let controller = controller.clone();
-                let color = color.clone();
-                move |menu, _, _| {
-                    let mut menu = menu.min_w(px(140.));
-                    menu = menu.item(
-                        PopupMenuItem::new(t("workspace.filter_all_colors"))
-                            .checked(color.is_none())
-                            .on_click({
-                                let controller = controller.clone();
-                                move |_, _, cx| {
-                                    controller.update(cx, |ctl, cx| {
-                                        ctl.set_filter_color(None);
-                                        cx.notify();
-                                    });
-                                }
-                            }),
-                    );
-                    for (name, label) in &color_options {
-                        let checked = color.as_deref() == Some(name.as_str());
-                        let name = name.clone();
-                        let controller = controller.clone();
-                        menu =
-                            menu.item(PopupMenuItem::new(label.clone()).checked(checked).on_click(
-                                move |_, _, cx| {
-                                    controller.update(cx, |ctl, cx| {
-                                        ctl.set_filter_color(Some(name.clone()));
-                                        cx.notify();
-                                    });
-                                },
-                            ));
-                    }
-                    menu
-                }
-            }),
-    );
-
     // Reset when anything is active.
-    if kind.is_some() || favorite || color.is_some() {
+    if kind.is_some() || favorite {
         bar = bar.child(
             Button::new("clear-filters")
                 .xsmall()

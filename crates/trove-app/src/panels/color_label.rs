@@ -4,8 +4,7 @@
 //! - [`picker`] — the standalone swatch row (Inspector): left-click applies
 //!   the color to the primary asset, right-click opens the function menu.
 //! - [`menu_entries`] — the workspace asset context-menu entries.
-//! - [`label_name`] — localized palette names for the toolbar's
-//!   filter-by-color menu.
+//! - [`label_name`] — localized palette names for the context-menu entries.
 
 use gpui_kit::base::h_flex;
 use gpui_kit::component::menu::{ContextMenu, ContextMenuExt as _, PopupMenu, PopupMenuItem};
