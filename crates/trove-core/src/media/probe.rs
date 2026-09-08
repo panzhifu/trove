@@ -25,11 +25,37 @@ pub fn normalize_ext(raw: &str) -> String {
         .collect()
 }
 
+/// Camera-RAW extensions decoded via `rawler`. `raw` is last so it cannot
+/// shadow a more specific match above.
+pub fn is_raw_ext(ext: &str) -> bool {
+    matches!(
+        ext,
+        "cr2"
+            | "cr3"
+            | "nef"
+            | "arw"
+            | "dng"
+            | "raf"
+            | "orf"
+            | "rw2"
+            | "raw"
+            | "srw"
+            | "pef"
+            | "x3f"
+            | "3fr"
+            | "erf"
+            | "kdc"
+            | "dcr"
+            | "mrw"
+    )
+}
+
 /// Classify a file from its normalized extension.
 pub fn probe(ext: &str) -> Probe {
     let kind = match ext {
         "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "ico" | "tiff" | "tif" | "avif"
         | "heic" | "heif" | "svg" | "psd" => AssetKind::Image,
+        ext if is_raw_ext(ext) => AssetKind::Image,
         "mp4" | "mov" | "mkv" | "webm" | "avi" | "m4v" | "mpg" | "mpeg" | "wmv" => AssetKind::Video,
         "mp3" | "wav" | "flac" | "m4a" | "aac" | "ogg" | "opus" | "wma" => AssetKind::Audio,
         "pdf" | "doc" | "docx" | "xls" | "xlsx" | "ppt" | "pptx" | "txt" | "md" | "rtf" | "odt"
@@ -50,6 +76,15 @@ pub fn probe(ext: &str) -> Probe {
         "heic" | "heif" => "image/heic",
         "svg" => "image/svg+xml",
         "psd" => "image/vnd.adobe.photoshop",
+        "cr2" => "image/x-canon-cr2",
+        "cr3" => "image/x-canon-cr3",
+        "nef" => "image/x-nikon-nef",
+        "arw" => "image/x-sony-arw",
+        "dng" => "image/x-adobe-dng",
+        "raf" => "image/x-fuji-raf",
+        "orf" => "image/x-olympus-orf",
+        "rw2" => "image/x-panasonic-rw2",
+        "pef" => "image/x-pentax-pef",
         "mp4" => "video/mp4",
         "mov" => "video/quicktime",
         "mkv" => "video/x-matroska",
@@ -142,6 +177,8 @@ pub fn image_dimensions(path: &std::path::Path) -> Option<Dimensions> {
     match ext.as_str() {
         "svg" => return svg_dimensions(path),
         "psd" => return psd_dimensions(path),
+        "heic" | "heif" => return heic_dimensions(path),
+        _ if is_raw_ext(&ext) => return raw_dimensions(path),
         _ => {}
     }
     let file = std::fs::File::open(path).ok()?;
@@ -200,4 +237,49 @@ fn psd_dimensions(path: &std::path::Path) -> Option<Dimensions> {
         width: psd.width(),
         height: psd.height(),
     })
+}
+
+/// Sensor dimensions of a camera-RAW file (full decode; the thumbnail
+/// pipeline decodes again — RAW imports are background work, so this stays
+/// simple at the cost of some CPU).
+fn raw_dimensions(path: &std::path::Path) -> Option<Dimensions> {
+    let raw = rawler::decode_file(path).ok()?;
+    Some(Dimensions {
+        width: raw.width.max(1) as u32,
+        height: raw.height.max(1) as u32,
+    })
+}
+
+/// HEIC dimensions need a real decoder; shell out to libheif's `heif-dec`
+/// when present (same opt-in pattern as ffmpeg for video posters) and read
+/// the converted image. `None` when the tool is missing or fails.
+fn heic_dimensions(path: &std::path::Path) -> Option<Dimensions> {
+    let converted = heic_to_image(path)?;
+    Some(Dimensions {
+        width: converted.width(),
+        height: converted.height(),
+    })
+}
+
+/// Convert a HEIC/HEIF blob to a raster image with the system `heif-dec`.
+pub(crate) fn heic_to_image(path: &std::path::Path) -> Option<image::DynamicImage> {
+    let tmp = std::env::temp_dir().join(format!(
+        "trove-heic-{}.png",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?
+            .as_nanos()
+    ));
+    let output = std::process::Command::new("heif-dec")
+        .arg(path)
+        .arg(&tmp)
+        .output()
+        .ok()?;
+    let result = if output.status.success() {
+        image::open(&tmp).ok()
+    } else {
+        None
+    };
+    let _ = std::fs::remove_file(&tmp);
+    result
 }

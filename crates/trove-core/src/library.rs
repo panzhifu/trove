@@ -1930,4 +1930,62 @@ mod tests {
         super::collect_files(dir, &mut out);
         out
     }
+    #[test]
+    fn heic_import_generates_thumbnail() {
+        // Sample generation needs the system heif-enc (libheif tools); the
+        // thumbnail path needs heif-dec. Both are the same opt-in dependency.
+        let dir = std::env::temp_dir().join(format!("trove-heic-src-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let png = dir.join("sample.png");
+        {
+            // A tiny valid PNG: reuse the constant.
+            std::fs::write(&png, PNG_1X1).unwrap();
+        }
+        let heic = dir.join("sample.heic");
+        let enc = std::process::Command::new("heif-enc")
+            .arg(&png)
+            .arg("-o")
+            .arg(&heic)
+            .output();
+        let Ok(enc) = enc else {
+            eprintln!("heif-enc not available, skipping HEIC test");
+            return;
+        };
+        if !enc.status.success() {
+            eprintln!("heif-enc failed, skipping HEIC test");
+            return;
+        }
+
+        let (lib, _) = temp_library("heic");
+        let report = lib.import_files(std::slice::from_ref(&heic), None).unwrap();
+        let asset = {
+            let conn = lib.store().conn();
+            assets::get(conn, report.imported[0].asset_id)
+                .unwrap()
+                .unwrap()
+        };
+        assert_eq!(asset.kind, AssetKind::Image);
+        let thumb = thumb::abs_path(lib.root(), asset.sha256.as_deref().unwrap());
+        assert!(thumb.is_file(), "heic thumbnail missing");
+    }
+
+    #[test]
+    fn raw_sample_import_optin() {
+        let Ok(sample) = std::env::var("TROVE_RAW_SAMPLE") else {
+            eprintln!("set TROVE_RAW_SAMPLE to run the RAW import test");
+            return;
+        };
+        let (lib, _) = temp_library("raw-sample");
+        let path = std::path::PathBuf::from(sample);
+        let report = lib.import_files(std::slice::from_ref(&path), None).unwrap();
+        assert_eq!(report.imported_count(), 1, "skipped: {:?}", report.skipped);
+        let conn = lib.store().conn();
+        let asset = assets::get(conn, report.imported[0].asset_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(asset.kind, AssetKind::Image);
+        assert!(asset.width.unwrap_or(0) > 0);
+        let thumb = thumb::abs_path(lib.root(), asset.sha256.as_deref().unwrap());
+        assert!(thumb.is_file(), "raw thumbnail missing");
+    }
 }

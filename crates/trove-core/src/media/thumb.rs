@@ -93,6 +93,8 @@ fn decode_image(blob_path: &Path) -> Option<image::DynamicImage> {
     match ext.as_str() {
         "svg" => render_svg(blob_path),
         "psd" => render_psd(blob_path),
+        "heic" | "heif" => crate::media::probe::heic_to_image(blob_path),
+        _ if crate::media::probe::is_raw_ext(&ext) => render_raw(blob_path),
         _ => image::open(blob_path).ok(),
     }
 }
@@ -208,5 +210,69 @@ mod tests {
 
         let out = ensure(&dir, "a".repeat(64).as_str(), AssetKind::Video, &video);
         assert!(out.is_some_and(|p| p.is_file()));
+    }
+}
+
+/// Decode and develop a camera-RAW file with rawler: demosaic, white
+/// balance, color calibration and sRGB gamma in one pass, then clamp into
+/// an 8-bit RGB(A) image (EXIF orientation applied).
+fn render_raw(path: &Path) -> Option<image::DynamicImage> {
+    let raw = rawler::decode_file(path).ok()?;
+    let developed = rawler::imgop::develop::RawDevelop::default()
+        .develop_intermediate(&raw)
+        .ok()?;
+    let image = match developed {
+        rawler::imgop::develop::Intermediate::Monochrome(pix) => {
+            let mut gray = image::GrayImage::new(pix.width as u32, pix.height as u32);
+            for (x, y, pixel) in gray.enumerate_pixels_mut() {
+                let value = (pix.data[y as usize * pix.width as usize + x as usize] * 255.0)
+                    .clamp(0.0, 255.0) as u8;
+                *pixel = image::Luma([value]);
+            }
+            image::DynamicImage::ImageLuma8(gray)
+        }
+        rawler::imgop::develop::Intermediate::ThreeColor(pix) => {
+            let mut rgb = image::RgbImage::new(pix.width as u32, pix.height as u32);
+            for (x, y, pixel) in rgb.enumerate_pixels_mut() {
+                let sample = pix.data[y as usize * pix.width + x as usize];
+                *pixel = image::Rgb([
+                    (sample[0] * 255.0).clamp(0.0, 255.0) as u8,
+                    (sample[1] * 255.0).clamp(0.0, 255.0) as u8,
+                    (sample[2] * 255.0).clamp(0.0, 255.0) as u8,
+                ]);
+            }
+            image::DynamicImage::ImageRgb8(rgb)
+        }
+        rawler::imgop::develop::Intermediate::FourColor(pix) => {
+            let mut rgb = image::RgbImage::new(pix.width as u32, pix.height as u32);
+            for (x, y, pixel) in rgb.enumerate_pixels_mut() {
+                let sample = pix.data[y as usize * pix.width + x as usize];
+                *pixel = image::Rgb([
+                    (sample[0] * 255.0).clamp(0.0, 255.0) as u8,
+                    (sample[1] * 255.0).clamp(0.0, 255.0) as u8,
+                    (sample[2] * 255.0).clamp(0.0, 255.0) as u8,
+                ]);
+            }
+            image::DynamicImage::ImageRgb8(rgb)
+        }
+    };
+    Some(apply_orientation(image, raw.orientation))
+}
+
+/// Apply the EXIF orientation a RAW decoder reports.
+fn apply_orientation(
+    image: image::DynamicImage,
+    orientation: rawler::decoders::Orientation,
+) -> image::DynamicImage {
+    use rawler::decoders::Orientation as O;
+    match orientation {
+        O::Normal | O::Unknown => image,
+        O::HorizontalFlip => image.fliph(),
+        O::Rotate180 => image.rotate180(),
+        O::VerticalFlip => image.flipv(),
+        O::Transpose => image.rotate90().fliph(),
+        O::Rotate90 => image.rotate90(),
+        O::Transverse => image.rotate270().fliph(),
+        O::Rotate270 => image.rotate270(),
     }
 }

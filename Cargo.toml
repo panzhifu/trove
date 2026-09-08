@@ -36,9 +36,10 @@ mp4 = "0.14"
 # Local collect service: URL fetching for the inbox (extension / curl)
 ureq = "3"
 
-# Design-format thumbnails (SVG render, PSD composite)
+# Design-format thumbnails (SVG render, PSD composite, RAW decode)
 resvg = "0.45"
 psd = "0.3"
+rawler = "0.8"
 
 # i18n
 rust-i18n = "4.2"
