@@ -392,8 +392,15 @@ impl Render for ExplorerPanel {
         // management menu.
         let trash_selected = showing_trash;
         let recent_selected = showing_recent;
-        let all_selected = current.is_none() && !showing_trash && !showing_recent;
-        let fonts_selected = all_selected && ctl_filter_kind == Some(AssetKind::Font);
+        // The fonts view reuses the all-assets query with a Font kind
+        // filter, so "All assets" must not highlight in that state — only
+        // the fonts row does.
+        let fonts_selected = current.is_none()
+            && !showing_trash
+            && !showing_recent
+            && ctl_filter_kind == Some(AssetKind::Font);
+        let all_selected =
+            current.is_none() && !showing_trash && !showing_recent && !fonts_selected;
         items.push(
             collection_row(
                 cx,
