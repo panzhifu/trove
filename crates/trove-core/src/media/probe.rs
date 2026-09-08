@@ -195,29 +195,6 @@ pub fn image_dimensions(path: &std::path::Path) -> Option<Dimensions> {
     })
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn font_extensions_map_to_font_kind() {
-        for ext in ["ttf", "otf", "ttc", "woff", "woff2", "TTF"] {
-            let p = probe(&normalize_ext(ext));
-            assert_eq!(p.kind, AssetKind::Font, "{ext}");
-            assert!(p.mime.starts_with("font/"), "{ext} mime {}", p.mime);
-        }
-    }
-
-    #[test]
-    fn video_facts_reject_garbage() {
-        let dir = std::env::temp_dir().join(format!("trove-probe-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("bad.mp4");
-        std::fs::write(&path, b"not an mp4").unwrap();
-        assert!(video_facts(&path).is_none());
-    }
-}
-
 /// Intrinsic size of an SVG (from its root `<svg width/height/viewBox>`).
 fn svg_dimensions(path: &std::path::Path) -> Option<Dimensions> {
     let bytes = std::fs::read(path).ok()?;
@@ -282,4 +259,27 @@ pub(crate) fn heic_to_image(path: &std::path::Path) -> Option<image::DynamicImag
     };
     let _ = std::fs::remove_file(&tmp);
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn font_extensions_map_to_font_kind() {
+        for ext in ["ttf", "otf", "ttc", "woff", "woff2", "TTF"] {
+            let p = probe(&normalize_ext(ext));
+            assert_eq!(p.kind, AssetKind::Font, "{ext}");
+            assert!(p.mime.starts_with("font/"), "{ext} mime {}", p.mime);
+        }
+    }
+
+    #[test]
+    fn video_facts_reject_garbage() {
+        let dir = std::env::temp_dir().join(format!("trove-probe-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("bad.mp4");
+        std::fs::write(&path, b"not an mp4").unwrap();
+        assert!(video_facts(&path).is_none());
+    }
 }

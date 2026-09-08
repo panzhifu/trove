@@ -269,7 +269,7 @@ impl AppView {
                             .update(cx, |_, _, cx| ctl.read(cx).library.import_metadata(&text));
                         match result {
                             Ok(Ok(report)) => {
-                                let _ = ctl.update(cx, |ctl, cx| {
+                                ctl.update(cx, |ctl, cx| {
                                     ctl.generation += 1;
                                     cx.notify();
                                 });
@@ -328,7 +328,7 @@ impl AppView {
                 });
                 let note = match result {
                     Ok(Ok(report)) => {
-                        let _ = ctl.update(cx, |ctl, cx| {
+                        ctl.update(cx, |ctl, cx| {
                             ctl.generation += 1;
                             cx.notify();
                         });
