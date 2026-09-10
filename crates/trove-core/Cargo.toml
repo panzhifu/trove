@@ -27,3 +27,4 @@ ureq = { workspace = true }
 resvg = { workspace = true }
 psd = { workspace = true }
 rawler = { workspace = true }
+jxl-oxide = { workspace = true }

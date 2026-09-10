@@ -54,7 +54,7 @@ pub fn is_raw_ext(ext: &str) -> bool {
 pub fn probe(ext: &str) -> Probe {
     let kind = match ext {
         "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "ico" | "tiff" | "tif" | "avif"
-        | "heic" | "heif" | "svg" | "psd" => AssetKind::Image,
+        | "jxl" | "heic" | "heif" | "svg" | "psd" => AssetKind::Image,
         ext if is_raw_ext(ext) => AssetKind::Image,
         "mp4" | "mov" | "mkv" | "webm" | "avi" | "m4v" | "mpg" | "mpeg" | "wmv" => AssetKind::Video,
         "mp3" | "wav" | "flac" | "m4a" | "aac" | "ogg" | "opus" | "wma" => AssetKind::Audio,
@@ -76,6 +76,7 @@ pub fn probe(ext: &str) -> Probe {
         "ico" => "image/x-icon",
         "tif" | "tiff" => "image/tiff",
         "avif" => "image/avif",
+        "jxl" => "image/jxl",
         "heic" | "heif" => "image/heic",
         "svg" => "image/svg+xml",
         "psd" => "image/vnd.adobe.photoshop",
@@ -183,7 +184,10 @@ pub fn image_dimensions(path: &std::path::Path) -> Option<Dimensions> {
     match ext.as_str() {
         "svg" => return svg_dimensions(path),
         "psd" => return psd_dimensions(path),
-        "heic" | "heif" => return heic_dimensions(path),
+        // AVIF is a HEIF container with an AV1 payload, so libheif reads it
+        // whenever it was built with AV1 support; JPEG-XL needs its own crate.
+        "avif" | "heic" | "heif" => return heif_dimensions(path),
+        "jxl" => return jxl_dimensions(path),
         _ if is_raw_ext(&ext) => return raw_dimensions(path),
         _ => {}
     }
@@ -233,21 +237,34 @@ fn raw_dimensions(path: &std::path::Path) -> Option<Dimensions> {
     })
 }
 
-/// HEIC dimensions need a real decoder; shell out to libheif's `heif-dec`
-/// when present (same opt-in pattern as ffmpeg for video posters) and read
-/// the converted image. `None` when the tool is missing or fails.
-fn heic_dimensions(path: &std::path::Path) -> Option<Dimensions> {
-    let converted = heic_to_image(path)?;
+/// Size of a HEIC/HEIF/AVIF file: shell out to libheif's `heif-dec` when
+/// present (same opt-in pattern as ffmpeg for video posters). `None` when the
+/// tool is missing, or when libheif lacks the codec the file needs.
+fn heif_dimensions(path: &std::path::Path) -> Option<Dimensions> {
+    let converted = heif_to_image(path)?;
     Some(Dimensions {
         width: converted.width(),
         height: converted.height(),
     })
 }
 
-/// Convert a HEIC/HEIF blob to a raster image with the system `heif-dec`.
-pub(crate) fn heic_to_image(path: &std::path::Path) -> Option<image::DynamicImage> {
+/// Size of a JPEG-XL file, read straight from its header (no pixel decode).
+fn jxl_dimensions(path: &std::path::Path) -> Option<Dimensions> {
+    let image = jxl_oxide::JxlImage::open_with_defaults(path).ok()?;
+    Some(Dimensions {
+        width: image.width(),
+        height: image.height(),
+    })
+}
+
+/// Convert a HEIC/HEIF/AVIF blob to a raster image with the system `heif-dec`.
+///
+/// AVIF rides along for free: it is the same ISOBMFF container with an AV1
+/// payload, so any libheif built with an AV1 decoder handles it. When libheif
+/// lacks that codec the command fails and we degrade to "no thumbnail".
+pub(crate) fn heif_to_image(path: &std::path::Path) -> Option<image::DynamicImage> {
     let tmp = std::env::temp_dir().join(format!(
-        "trove-heic-{}.png",
+        "trove-heif-{}.png",
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .ok()?
@@ -270,6 +287,15 @@ pub(crate) fn heic_to_image(path: &std::path::Path) -> Option<image::DynamicImag
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn avif_and_jxl_are_first_class_images() {
+        for (ext, mime) in [("avif", "image/avif"), ("jxl", "image/jxl")] {
+            let p = probe(&normalize_ext(ext));
+            assert_eq!(p.kind, AssetKind::Image, "{ext}");
+            assert_eq!(p.mime, mime, "{ext}");
+        }
+    }
 
     #[test]
     fn font_extensions_map_to_font_kind() {

@@ -48,6 +48,10 @@ resvg = "0.45"
 psd = "0.3"
 rawler = "0.8"
 
+# JPEG-XL decode. Pinned to the version rawler already pulls in so the graph
+# keeps a single copy; the `image` feature hands us an `image::ImageDecoder`.
+jxl-oxide = { version = "0.12", features = ["image"] }
+
 # i18n
 rust-i18n = "4.2"
 sys-locale = "0.3"
