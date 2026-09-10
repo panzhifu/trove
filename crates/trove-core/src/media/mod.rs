@@ -11,3 +11,4 @@ pub mod probe;
 pub mod search;
 pub mod thumb;
 pub mod tokenizer;
+pub mod video;

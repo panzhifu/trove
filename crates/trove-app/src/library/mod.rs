@@ -3,6 +3,7 @@
 
 mod controller;
 pub mod jobs;
+pub mod video_player;
 pub mod watcher;
 
 pub use controller::{GRID_PAGE_SIZE, ImportPhase, LibraryController, ViewMode};
