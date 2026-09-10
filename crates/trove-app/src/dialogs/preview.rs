@@ -11,7 +11,10 @@ use uuid::Uuid;
 use crate::library::LibraryController;
 
 use crate::library::video_player::VideoPlayer;
-use crate::panels::common::{animated_preview_source, display_name, kind_icon};
+use crate::panels::common::{
+    animated_preview_source, display_name, ensure_font_registered, font_live_preview, font_sample,
+    kind_icon,
+};
 
 /// Resolve the preview inputs for `asset_id` from the library: display
 /// name, static thumbnail path, kind, the full-size original, and an
@@ -25,6 +28,8 @@ struct PreviewData {
     /// video player.
     original: Option<std::path::PathBuf>,
     animated: Option<gpui_kit::ImageSource>,
+    /// Family name probed at import, set only for fonts gpui can register.
+    font_family: Option<String>,
 }
 
 impl PreviewData {
@@ -55,12 +60,17 @@ impl PreviewData {
             thumb,
             original,
             animated,
+            font_family: asset
+                .extra
+                .get("font_family")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
         })
     }
 
     /// The preview element: a live video player when ffmpeg can decode the
-    /// file, then the animated source, then the static thumbnail, then a
-    /// kind icon.
+    /// file, then a live font specimen, then the animated source, then the
+    /// static thumbnail, then a kind icon.
     fn element(&self, cx: &mut App) -> gpui_kit::AnyElement {
         if self.kind == trove_core::model::AssetKind::Video
             && let Some(path) = &self.original
@@ -68,6 +78,12 @@ impl PreviewData {
             && let Some(player) = VideoPlayer::spawn(path.clone(), cx)
         {
             return player.into_any_element();
+        }
+        if self.kind == trove_core::model::AssetKind::Font
+            && let Some(family) = self.font_family.as_ref()
+            && ensure_font_registered(family, self.original.as_deref(), cx)
+        {
+            return self.specimen(family, cx);
         }
         if let Some(source) = &self.animated {
             return img(source.clone())
@@ -89,6 +105,27 @@ impl PreviewData {
                 .child(Icon::new(kind_icon(self.kind)).size_8())
                 .into_any_element(),
         }
+    }
+
+    /// A font set large. The thumbnail is a 512×256 card, which is a fine
+    /// way to tell two fonts apart in the grid but far too small to judge
+    /// one by; in the preview the sample text is drawn in the font itself at
+    /// whatever size makes the whole sample fit the dialog.
+    fn specimen(&self, family: &str, cx: &mut App) -> gpui_kit::AnyElement {
+        /// Width the dialog leaves for text, inside its own padding.
+        const TEXT_WIDTH: f32 = 700.0;
+        /// Roughly how wide a glyph is relative to its size. Latin faces run
+        /// nearer 0.5 and CJK nearer 1.0, so this splits the difference and
+        /// errs towards not clipping.
+        const GLYPH_RATIO: f32 = 0.62;
+
+        let glyphs = font_sample().chars().count().max(1) as f32;
+        let size = (TEXT_WIDTH / (glyphs * GLYPH_RATIO)).clamp(24.0, 120.0);
+        font_live_preview(family, cx)
+            .w_full()
+            .h(px(size * 2.2))
+            .text_size(px(size))
+            .into_any_element()
     }
 }
 
