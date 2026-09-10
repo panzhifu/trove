@@ -422,6 +422,23 @@ import_idle = "Idle"
 import_running = "Importing… (%{done}/%{total})"
 import_done = "Import done: %{imported} imported, %{skipped} skipped"
 
+[viewport]
+rendering = "Rendering…"
+render_failed = "Could not render this model (%{reason})"
+load_failed = "This file could not be read as a 3D model"
+reason_gpu_lost = "the GPU stopped responding"
+reason_no_frame = "the renderer produced no frame"
+triangles = "%{count} triangles"
+vertices = "%{count} vertices"
+backend_starting = "Starting GPU…"
+backend_gpu = "GPU · %{adapter}"
+backend_cpu = "CPU · %{reason}"
+gpu_no_adapter = "no graphics device available"
+gpu_software = "only a software renderer (%{name})"
+gpu_no_device = "no device from the adapter (%{detail})"
+reset = "Reset view"
+close = "Back to library"
+
 [shortcuts]
 keyboard = "Keyboard Shortcuts"
 shortcut_desc = "Description"
