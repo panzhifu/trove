@@ -3740,6 +3740,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d36c662923f47586880211f3bc7c0d83fb3a9b410d278c7bde93450748abeef3"
 dependencies = [
  "brotli-decompressor",
+ "bytemuck",
+ "image",
  "jxl-bitstream",
  "jxl-color",
  "jxl-frame",
@@ -7580,6 +7582,7 @@ dependencies = [
  "dirs 5.0.1",
  "fontdue",
  "image",
+ "jxl-oxide",
  "kamadak-exif",
  "lofty",
  "mp4",
