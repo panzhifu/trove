@@ -218,10 +218,19 @@ pub fn decode_image(blob_path: &Path) -> Option<image::DynamicImage> {
     match ext.as_str() {
         "svg" => render_svg(blob_path),
         "psd" => render_psd(blob_path),
-        "heic" | "heif" => crate::media::probe::heic_to_image(blob_path),
+        "heic" | "heif" | "avif" => crate::media::probe::heif_to_image(blob_path),
+        "jxl" => render_jxl(blob_path),
         _ if crate::media::probe::is_raw_ext(&ext) => render_raw(blob_path),
         _ => image::open(blob_path).ok(),
     }
+}
+
+/// Decode a JPEG-XL file through `jxl-oxide` (pure Rust; the `image`
+/// integration hands back a plain [`image::DynamicImage`]).
+fn render_jxl(path: &Path) -> Option<image::DynamicImage> {
+    let file = std::fs::File::open(path).ok()?;
+    let decoder = jxl_oxide::integration::JxlDecoder::new(file).ok()?;
+    image::DynamicImage::from_decoder(decoder).ok()
 }
 
 /// Rasterize an SVG at its intrinsic size, capped at [`THUMB_MAX`].
@@ -399,6 +408,95 @@ mod tests {
 
         let out = ensure(&dir, "a".repeat(64).as_str(), AssetKind::Video, &video);
         assert!(out.is_some_and(|p| p.is_file()));
+    }
+
+    /// A tiny solid PNG — the source the two codec tests below encode from.
+    /// Generated rather than committed: neither JPEG-XL nor AVIF has a
+    /// pure-Rust encoder we could ship as a fixture.
+    fn sample_png(dir: &std::path::Path) -> std::path::PathBuf {
+        let path = dir.join("src.png");
+        let mut img = image::RgbImage::new(8, 6);
+        for pixel in img.pixels_mut() {
+            *pixel = image::Rgb([220, 90, 40]);
+        }
+        img.save_with_format(&path, image::ImageFormat::Png)
+            .expect("png written");
+        path
+    }
+
+    /// Encode `src` to `out` with ffmpeg; `false` when ffmpeg is missing or
+    /// was built without the encoder we asked for.
+    fn ffmpeg_encode(src: &std::path::Path, out: &std::path::Path, args: &[&str]) -> bool {
+        std::process::Command::new("ffmpeg")
+            .args(["-y", "-loglevel", "error", "-i"])
+            .arg(src)
+            .args(args)
+            .arg(out)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+
+    fn heif_dec_available() -> bool {
+        std::process::Command::new("heif-dec")
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    /// JPEG-XL decodes through jxl-oxide with no external tool at runtime —
+    /// ffmpeg is only here to build the sample.
+    #[test]
+    fn jxl_thumbnail_decodes_when_a_sample_can_be_built() {
+        if !ffmpeg_available() {
+            eprintln!("skipping: ffmpeg not on PATH");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("trove-jxl-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = sample_png(&dir);
+        let jxl = dir.join("pic.jxl");
+        if !ffmpeg_encode(&src, &jxl, &["-c:v", "libjxl"]) {
+            eprintln!("skipping: ffmpeg has no JPEG-XL encoder");
+            return;
+        }
+
+        let out = ensure(&dir, "a".repeat(64).as_str(), AssetKind::Image, &jxl);
+        assert!(
+            out.is_some_and(|p| p.is_file()),
+            "JPEG-XL should produce a thumbnail"
+        );
+        let dims = crate::media::probe::image_dimensions(&jxl).expect("jxl dimensions");
+        assert_eq!((dims.width, dims.height), (8, 6));
+    }
+
+    /// AVIF rides the libheif path (same container as HEIC, AV1 payload), so
+    /// it only works where libheif was built with an AV1 decoder.
+    #[test]
+    fn avif_thumbnail_decodes_when_libheif_supports_av1() {
+        if !ffmpeg_available() || !heif_dec_available() {
+            eprintln!("skipping: ffmpeg or heif-dec not on PATH");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("trove-avif-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = sample_png(&dir);
+        let avif = dir.join("pic.avif");
+        if !ffmpeg_encode(&src, &avif, &["-c:v", "libaom-av1", "-still-picture", "1"]) {
+            eprintln!("skipping: ffmpeg has no AV1 encoder");
+            return;
+        }
+        if crate::media::probe::heif_to_image(&avif).is_none() {
+            eprintln!("skipping: libheif has no AV1 decoder");
+            return;
+        }
+
+        let out = ensure(&dir, "b".repeat(64).as_str(), AssetKind::Image, &avif);
+        assert!(
+            out.is_some_and(|p| p.is_file()),
+            "AVIF should produce a thumbnail"
+        );
     }
 
     /// Font-card generation against a system font, skipped when none can be
