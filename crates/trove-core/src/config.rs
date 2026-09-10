@@ -68,6 +68,10 @@ pub struct AppConfig {
     /// Characters missing from a given font are skipped while rendering.
     #[serde(default)]
     pub font_sample: Option<String>,
+    /// Custom screenshot command. It receives the output PNG path: either as
+    /// `{file}` inside the command, or as `$1`. Empty = auto-detect.
+    #[serde(default)]
+    pub screenshot_command: Option<String>,
 }
 
 /// How many recent-library entries to remember.
@@ -188,6 +192,11 @@ impl AppConfig {
             .clone()
             .filter(|s| !s.trim().is_empty())
             .unwrap_or_else(|| "Aa 允 123".into())
+    }
+
+    /// The screenshot command as typed by the user (never a fallback).
+    pub fn screenshot_command_text(&self) -> String {
+        self.screenshot_command.clone().unwrap_or_default()
     }
 
     /// Effective semantic-search similarity threshold, clamped to 0.0..1.0.

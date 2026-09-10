@@ -122,6 +122,22 @@ fn general_page(controller: &Entity<LibraryController>) -> SettingPage {
                         ),
                     )
                     .description(rust_i18n::t!("settings.font_sample_desc").to_string()),
+                )
+                .item(
+                    SettingItem::new(
+                        rust_i18n::t!("settings.screenshot_command").to_string(),
+                        SettingField::input(
+                            |_cx| SharedString::from(AppConfig::load().screenshot_command_text()),
+                            |value, _cx| {
+                                let mut config = AppConfig::load();
+                                let value = value.trim().to_string();
+                                config.screenshot_command =
+                                    if value.is_empty() { None } else { Some(value) };
+                                let _ = config.save();
+                            },
+                        ),
+                    )
+                    .description(rust_i18n::t!("settings.screenshot_command_desc").to_string()),
                 ),
         )
         .group(recent_libraries_group(&controller))
@@ -1243,6 +1259,8 @@ fn action_label(action: &str) -> String {
         "Redo" => rust_i18n::t!("shortcuts.actions.Redo").to_string(),
         "ImportFiles" => rust_i18n::t!("shortcuts.actions.ImportFiles").to_string(),
         "OpenSettings" => rust_i18n::t!("shortcuts.actions.OpenSettings").to_string(),
+        "ScreenshotFull" => rust_i18n::t!("shortcuts.actions.ScreenshotFull").to_string(),
+        "ScreenshotRegion" => rust_i18n::t!("shortcuts.actions.ScreenshotRegion").to_string(),
         "RefreshLibrary" => rust_i18n::t!("shortcuts.actions.RefreshLibrary").to_string(),
         "BatchRename" => rust_i18n::t!("shortcuts.actions.BatchRename").to_string(),
         "BatchConvert" => rust_i18n::t!("shortcuts.actions.BatchConvert").to_string(),

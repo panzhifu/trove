@@ -130,6 +130,51 @@ impl AppView {
         }
     }
 
+    /// File ▸ Take Screenshot (full screen / region): run the platform
+    /// capture tool on the background executor, then import the PNG it
+    /// wrote. Region tools are interactive, so the child keeps our stdio.
+    fn take_screenshot(
+        &mut self,
+        mode: trove_core::services::screenshot::ScreenshotMode,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        use trove_core::services::screenshot;
+
+        let config = AppConfig::load();
+        let dir = AppConfig::config_dir().unwrap_or_else(std::env::temp_dir);
+        let dest = screenshot::destination(&dir);
+        let custom = config.screenshot_command.clone();
+        let controller = self.controller.clone();
+        let handle = window.window_handle();
+
+        window.push_notification(
+            Notification::info(rust_i18n::t!("notice.screenshot_started").to_string()),
+            cx,
+        );
+        cx.spawn(async move |_, cx| {
+            let target = dest.clone();
+            let outcome = cx
+                .background_executor()
+                .spawn(async move { screenshot::capture(mode, custom.as_deref(), &target) })
+                .await;
+            let _ = handle.update(cx, |_, window, cx| match outcome {
+                Ok(()) => {
+                    jobs::import_paths_app(&controller, vec![dest], window, cx);
+                }
+                Err(error) => {
+                    window.push_notification(
+                        Notification::warning(
+                            rust_i18n::t!("notice.screenshot_failed", error = error).to_string(),
+                        ),
+                        cx,
+                    );
+                }
+            });
+        })
+        .detach();
+    }
+
     /// File ▸ Export library… : save-dialog, then write the metadata catalog
     /// as pretty JSON (`Library::export_metadata`). Library is not `Send`, so
     /// serialization happens on the main thread inside the window callback.
@@ -519,6 +564,20 @@ impl Render for AppView {
             }))
             .on_action(cx.listener(|this, _: &ImportUrl, window, cx| {
                 this.prompt_import_url(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ScreenshotFull, window, cx| {
+                this.take_screenshot(
+                    trove_core::services::screenshot::ScreenshotMode::Full,
+                    window,
+                    cx,
+                );
+            }))
+            .on_action(cx.listener(|this, _: &ScreenshotRegion, window, cx| {
+                this.take_screenshot(
+                    trove_core::services::screenshot::ScreenshotMode::Region,
+                    window,
+                    cx,
+                );
             }))
             .on_action(cx.listener(|this, _: &BatchRename, window, cx| {
                 crate::dialogs::rename::RenameDialog::open(window, cx, this.controller.clone());
