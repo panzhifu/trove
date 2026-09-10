@@ -10,15 +10,20 @@ use uuid::Uuid;
 
 use crate::library::LibraryController;
 
+use crate::library::video_player::VideoPlayer;
 use crate::panels::common::{animated_preview_source, display_name, kind_icon};
 
 /// Resolve the preview inputs for `asset_id` from the library: display
-/// name, static thumbnail path, kind, and an animated image source (GIF /
-/// animated WebP / APNG) when the original file can play frames.
+/// name, static thumbnail path, kind, the full-size original, and an
+/// animated image source (GIF / animated WebP / APNG) when the original
+/// file can play frames.
 struct PreviewData {
     name: String,
     kind: trove_core::model::AssetKind,
     thumb: Option<std::path::PathBuf>,
+    /// Full-size original (library blob or linked source), kept for the
+    /// video player.
+    original: Option<std::path::PathBuf>,
     animated: Option<gpui_kit::ImageSource>,
 }
 
@@ -48,13 +53,22 @@ impl PreviewData {
             name: display_name(&asset),
             kind: asset.kind,
             thumb,
+            original,
             animated,
         })
     }
 
-    /// The preview element: animated source first, then the static
-    /// thumbnail, then a kind icon.
-    fn element(&self) -> gpui_kit::AnyElement {
+    /// The preview element: a live video player when ffmpeg can decode the
+    /// file, then the animated source, then the static thumbnail, then a
+    /// kind icon.
+    fn element(&self, cx: &mut App) -> gpui_kit::AnyElement {
+        if self.kind == trove_core::model::AssetKind::Video
+            && let Some(path) = &self.original
+            && trove_core::media::video::ffmpeg_available()
+            && let Some(player) = VideoPlayer::spawn(path.clone(), cx)
+        {
+            return player.into_any_element();
+        }
         if let Some(source) = &self.animated {
             return img(source.clone())
                 .max_h(px(520.0))
@@ -89,7 +103,7 @@ pub(crate) fn open_asset_preview(
     let Some(data) = PreviewData::load(controller.read(cx), id) else {
         return;
     };
-    window.open_dialog(cx, move |dialog, _window, _cx| {
+    window.open_dialog(cx, move |dialog, _window, cx| {
         dialog.title(data.name.clone()).width(px(780.)).child(
             v_flex()
                 .w_full()
@@ -104,7 +118,7 @@ pub(crate) fn open_asset_preview(
                         .items_center()
                         .justify_center()
                         .overflow_hidden()
-                        .child(data.element()),
+                        .child(data.element(cx)),
                 ),
         )
     });
