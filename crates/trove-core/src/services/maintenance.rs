@@ -48,7 +48,7 @@ pub fn plan_thumbnail_rebuild(lib: &Library, force: bool) -> Result<ThumbPlan> {
     let root = lib.root();
 
     let mut plan = ThumbPlan::default();
-    for kind in [AssetKind::Image, AssetKind::Font] {
+    for kind in [AssetKind::Image, AssetKind::Font, AssetKind::Model] {
         let (_, assets) = assets::query(
             conn,
             &AssetQuery {

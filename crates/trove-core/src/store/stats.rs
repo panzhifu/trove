@@ -25,7 +25,7 @@ pub struct LibraryStats {
 pub fn library_stats(conn: &rusqlite::Connection) -> Result<LibraryStats> {
     let mut stats = LibraryStats::default();
 
-    let mut counts: [u64; 7] = [0; 7];
+    let mut counts: [u64; 8] = [0; 8];
     {
         let mut stmt = conn.prepare(
             "SELECT kind, COUNT(*) FROM assets \
@@ -48,6 +48,7 @@ pub fn library_stats(conn: &rusqlite::Connection) -> Result<LibraryStats> {
             AssetKind::Document,
             AssetKind::Archive,
             AssetKind::Font,
+            AssetKind::Model,
             AssetKind::Other,
         ])
         .filter(|(count, _)| *count > 0)
@@ -86,6 +87,7 @@ fn parse_kind(s: &str) -> AssetKind {
         "document" => AssetKind::Document,
         "archive" => AssetKind::Archive,
         "font" => AssetKind::Font,
+        "model" => AssetKind::Model,
         _ => AssetKind::Other,
     }
 }
@@ -99,7 +101,8 @@ fn kind_index(kind: &AssetKind) -> usize {
         AssetKind::Document => 3,
         AssetKind::Archive => 4,
         AssetKind::Font => 5,
-        AssetKind::Other => 6,
+        AssetKind::Model => 6,
+        AssetKind::Other => 7,
     }
 }
 

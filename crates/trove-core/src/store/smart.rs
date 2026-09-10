@@ -383,6 +383,7 @@ fn kind_sql(kind: AssetKind) -> &'static str {
         AssetKind::Document => "document",
         AssetKind::Archive => "archive",
         AssetKind::Font => "font",
+        AssetKind::Model => "model",
         AssetKind::Other => "other",
     }
 }

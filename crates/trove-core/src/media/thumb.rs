@@ -37,6 +37,7 @@ pub fn ensure(root: &Path, sha: &str, kind: AssetKind, blob_path: &Path) -> Opti
         AssetKind::Image => write_thumb(blob_path, &out),
         AssetKind::Video => write_video_thumb(blob_path, &out),
         AssetKind::Font => write_font_card(blob_path, &out),
+        AssetKind::Model => write_model_card(blob_path, &out),
         _ => None,
     }
 }
@@ -50,6 +51,7 @@ pub fn regenerate(root: &Path, sha: &str, kind: AssetKind, blob_path: &Path) -> 
         AssetKind::Image => write_thumb(blob_path, &out),
         AssetKind::Video => write_video_thumb(blob_path, &out),
         AssetKind::Font => write_font_card(blob_path, &out),
+        AssetKind::Model => write_model_card(blob_path, &out),
         _ => None,
     }
 }
@@ -123,6 +125,47 @@ fn write_font_card(blob_path: &Path, out: &Path) -> Option<PathBuf> {
     }
     let tmp = out.with_extension("tmp.jpg");
     match image::DynamicImage::ImageRgba8(card).save_with_format(&tmp, image::ImageFormat::Jpeg) {
+        Ok(()) => {
+            std::fs::rename(&tmp, out).ok()?;
+            Some(out.to_path_buf())
+        }
+        Err(_) => {
+            let _ = std::fs::remove_file(&tmp);
+            None
+        }
+    }
+}
+
+/// Landscape size of a model card, in pixels.
+const MODEL_CARD_SIZE: (u32, u32) = (512, 384);
+
+/// Render a "model card" for a mesh blob: the geometry framed from the
+/// default three-quarter camera and shaded by the CPU rasterizer.
+///
+/// Cards are built during import, off the UI thread, where no GPU device is
+/// available — the interactive viewport renders on the GPU instead, and both
+/// paths share the same camera and shading parameters. Returns `None` when
+/// the bytes are not an OBJ/STL/PLY we can parse, so the asset keeps its icon.
+fn write_model_card(blob_path: &Path, out: &Path) -> Option<PathBuf> {
+    use crate::media::{mesh, render3d};
+
+    let mesh = mesh::load(blob_path).ok()?;
+    let (w, h) = MODEL_CARD_SIZE;
+    // Supersample once: this runs a single time per asset, and the grid is
+    // where a jagged silhouette would be most obvious.
+    let frame = render3d::render(&mesh, &render3d::Camera::default(), w, h, 2);
+
+    let mut card = image::RgbImage::new(w, h);
+    for (pixel, src) in card.pixels_mut().zip(frame.bgra.chunks_exact(4)) {
+        // The rasterizer emits BGRA (that is what gpui wants); JPEG wants RGB.
+        *pixel = image::Rgb([src[2], src[1], src[0]]);
+    }
+
+    if let Some(parent) = out.parent() {
+        std::fs::create_dir_all(parent).ok()?;
+    }
+    let tmp = out.with_extension("tmp.jpg");
+    match image::DynamicImage::ImageRgb8(card).save_with_format(&tmp, image::ImageFormat::Jpeg) {
         Ok(()) => {
             std::fs::rename(&tmp, out).ok()?;
             Some(out.to_path_buf())
@@ -383,6 +426,38 @@ mod tests {
         let img = image::open(out.expect("card")).unwrap();
         let (w, _) = img.dimensions();
         assert_eq!(w, FONT_CARD_SIZE.0);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn model_import_gets_a_rendered_card() {
+        let dir = std::env::temp_dir().join(format!("trove-modelcard-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // A tetrahedron, small enough to write inline.
+        let obj = dir.join("tetra.obj");
+        std::fs::write(
+            &obj,
+            "v 0 0 0\nv 1 0 0\nv 0 1 0\nv 0 0 1\n\
+             f 1 2 3\nf 1 2 4\nf 1 3 4\nf 2 3 4\n",
+        )
+        .unwrap();
+
+        let out = ensure(&dir, "c".repeat(64).as_str(), AssetKind::Model, &obj);
+        let card = out.expect("model card written");
+        let img = image::open(&card).unwrap();
+        assert_eq!(img.dimensions(), MODEL_CARD_SIZE);
+        // The card must show geometry, not just the empty backdrop.
+        let pixels: Vec<_> = img.to_rgb8().into_raw();
+        assert!(
+            pixels.chunks_exact(3).any(|p| p[1] < 160),
+            "the card should contain shaded geometry"
+        );
+
+        // A file that is not a mesh leaves the asset without a card.
+        let junk = dir.join("broken.stl");
+        std::fs::write(&junk, b"solid nothing\n").unwrap();
+        assert!(ensure(&dir, "d".repeat(64).as_str(), AssetKind::Model, &junk).is_none());
 
         std::fs::remove_dir_all(&dir).ok();
     }
