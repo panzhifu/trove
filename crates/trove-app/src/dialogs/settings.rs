@@ -1265,6 +1265,7 @@ fn action_label(action: &str) -> String {
         "RefreshLibrary" => rust_i18n::t!("shortcuts.actions.RefreshLibrary").to_string(),
         "BatchRename" => rust_i18n::t!("shortcuts.actions.BatchRename").to_string(),
         "BatchConvert" => rust_i18n::t!("shortcuts.actions.BatchConvert").to_string(),
+        "CopyImage" => rust_i18n::t!("shortcuts.actions.CopyImage").to_string(),
         other => other.to_string(),
     }
 }

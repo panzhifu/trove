@@ -9,6 +9,7 @@ import_files = "导入文件…"
 import_url = "从 URL 导入…"
 import_url_placeholder = "https://example.com/image.png"
 paste_import = "粘贴导入"
+copy_image = "复制图片"
 screenshot = "截取屏幕"
 screenshot_region = "截取区域…"
 export_library = "导出素材库…"
@@ -134,6 +135,7 @@ semantic_not_ready = "语义搜索未就绪，请先在设置 ▸ 搜索 中配�
 embed_failed = "无法编码查询图片。"
 embed_failed_with = "无法编码查询图片：%{error}"
 batch_rename = "批量重命名…"
+copy_image = "复制图片"
 batch_convert = "批量转换格式…"
 
 [inspector]
@@ -363,6 +365,9 @@ relink_failed = "重新链接失败：%{error}"
 font_install_failed = "字体操作失败：%{error}"
 screenshot_started = "正在截取屏幕…"
 screenshot_failed = "截图失败：%{error}"
+copy_image_done = "已复制 %{width}×%{height} 图片到剪贴板"
+copy_image_failed = "复制失败：%{error}"
+copy_image_none = "请先选中一个图片资产"
 
 [rename]
 title = "批量重命名"
@@ -467,6 +472,7 @@ ScreenshotRegion = "截取区域"
 RefreshLibrary = "刷新素材库"
 BatchRename = "批量重命名"
 BatchConvert = "批量转换格式"
+CopyImage = "复制图片到剪贴板"
 
 [shortcuts.context]
 Workspace = "工作区"

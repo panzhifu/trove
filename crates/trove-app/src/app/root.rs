@@ -130,6 +130,46 @@ impl AppView {
         }
     }
 
+    /// Edit ▸ Copy Image: hand the primary selection's pixels to the system
+    /// clipboard. Decoding a large photo can take a moment, so the work runs
+    /// on the background executor and reports through a notification.
+    fn copy_primary_image(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let path = self.controller.read(cx).primary_image_file();
+        let Some(path) = path else {
+            window.push_notification(
+                Notification::warning(rust_i18n::t!("notice.copy_image_none").to_string()),
+                cx,
+            );
+            return;
+        };
+        let handle = window.window_handle();
+        cx.spawn(async move |_, cx| {
+            let target = path.clone();
+            let outcome = cx
+                .background_executor()
+                .spawn(async move { crate::library::clipboard::copy_image(&target) })
+                .await;
+            let _ = handle.update(cx, |_, window, cx| {
+                let note = match outcome {
+                    Ok((w, h)) => Notification::success(
+                        rust_i18n::t!(
+                            "notice.copy_image_done",
+                            width = w.to_string(),
+                            height = h.to_string()
+                        )
+                        .to_string(),
+                    ),
+                    Err(error) => Notification::warning(
+                        rust_i18n::t!("notice.copy_image_failed", error = error.to_string())
+                            .to_string(),
+                    ),
+                };
+                window.push_notification(note, cx);
+            });
+        })
+        .detach();
+    }
+
     /// File ▸ Take Screenshot (full screen / region): run the platform
     /// capture tool on the background executor, then import the PNG it
     /// wrote. Region tools are interactive, so the child keeps our stdio.
@@ -564,6 +604,9 @@ impl Render for AppView {
             }))
             .on_action(cx.listener(|this, _: &PasteImport, window, cx| {
                 this.paste_import(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &CopyImage, window, cx| {
+                this.copy_primary_image(window, cx);
             }))
             .on_action(cx.listener(|this, _: &ImportUrl, window, cx| {
                 this.prompt_import_url(window, cx);

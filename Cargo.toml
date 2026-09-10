@@ -56,6 +56,10 @@ jxl-oxide = { version = "0.12", features = ["image"] }
 rust-i18n = "4.2"
 sys-locale = "0.3"
 
+# Clipboard: image copy. `wayland-data-control` is opt-in upstream and takes
+# priority over the X11 backend when the compositor speaks the protocol.
+arboard = { version = "3", features = ["wayland-data-control"] }
+
 [patch.crates-io]
 gpui-kit = { git = "https://github.com/panzhifu/gpui-kit.git", branch = "feat/optional-ellipsis-menu" }
 gpui-kit-assets = { git = "https://github.com/panzhifu/gpui-kit.git", branch = "feat/optional-ellipsis-menu" }
