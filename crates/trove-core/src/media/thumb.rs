@@ -166,7 +166,7 @@ fn write_video_thumb(blob_path: &Path, out: &Path) -> Option<PathBuf> {
 /// Decode an image blob: the `image` crate handles raster formats; SVG is
 /// rendered via resvg and PSD composites via the psd crate (both store
 /// vector/layer data the raster decoder cannot read).
-fn decode_image(blob_path: &Path) -> Option<image::DynamicImage> {
+pub fn decode_image(blob_path: &Path) -> Option<image::DynamicImage> {
     let ext = blob_path
         .extension()
         .and_then(|e| e.to_str())

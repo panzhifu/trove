@@ -100,6 +100,10 @@ fn build_menus() -> Vec<Menu> {
                     rust_i18n::t!("workspace.batch_rename").to_string(),
                     BatchRename,
                 ),
+                MenuItem::action(
+                    rust_i18n::t!("workspace.batch_convert").to_string(),
+                    BatchConvert,
+                ),
             ],
             disabled: false,
         },
@@ -183,6 +187,9 @@ fn register_keys(cx: &mut App) {
     bind!(ClearSelection, "ClearSelection");
     bind!(Undo, "Undo");
     bind!(Redo, "Redo");
+    // Menu-only until the user binds a key in Settings ▸ Shortcuts.
+    bind!(BatchRename, "BatchRename");
+    bind!(BatchConvert, "BatchConvert");
     // Paste import is global (works wherever focus is).
     bindings.push(KeyBinding::new("ctrl-shift-v", PasteImport, None));
     // Esc dismisses the explorer's inline add/rename editor. The input's own

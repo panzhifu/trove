@@ -20,6 +20,7 @@ gpui_kit::actions!(
         // -- Edit menu / grid shortcuts ------------------------------------
         PasteImport,
         BatchRename,
+        BatchConvert,
         SelectAll,
         ClearSelection,
         TrashSelected,

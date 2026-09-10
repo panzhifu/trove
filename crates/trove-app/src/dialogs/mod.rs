@@ -1,6 +1,7 @@
 //! Modal dialogs layered above the dock: settings, the smart-collection rule
 //! editor and the duplicate finder.
 
+pub mod convert;
 pub mod duplicates;
 pub mod preview;
 pub mod rename;

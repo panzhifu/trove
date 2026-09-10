@@ -90,6 +90,19 @@ pub fn default_keybindings() -> Vec<KeyBindingConfig> {
             key: "f5",
             context: None,
         },
+        // Menu-only actions: an empty default key means "unbound until the
+        // user assigns one" — `register_keys` skips empty keys, so these stay
+        // reachable from the menu while remaining rebindable.
+        KeyBindingConfig {
+            action: "BatchRename",
+            key: "",
+            context: Some("Workspace"),
+        },
+        KeyBindingConfig {
+            action: "BatchConvert",
+            key: "",
+            context: Some("Workspace"),
+        },
     ]
 }
 
