@@ -6,6 +6,7 @@ license = "MIT"
 
 [dependencies]
 gpui-kit = { workspace = true }
+wgpu = { workspace = true }
 trove-core = { path = "../trove-core" }
 dirs = { workspace = true }
 image = { workspace = true }
@@ -14,3 +15,7 @@ serde_json = { workspace = true }
 uuid = { workspace = true }
 rust-i18n = { workspace = true }
 sys-locale = { workspace = true }
+
+[dev-dependencies]
+# Used only to parse and validate `gpu3d.wgsl` on machines without a GPU.
+naga = { version = "29", features = ["wgsl-in"] }

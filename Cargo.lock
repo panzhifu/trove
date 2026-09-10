@@ -7562,12 +7562,14 @@ dependencies = [
  "dirs 5.0.1",
  "gpui-kit",
  "image",
+ "naga",
  "rust-i18n",
  "serde_json",
  "smallvec",
  "sys-locale",
  "trove-core",
  "uuid",
+ "wgpu",
 ]
 
 [[package]]

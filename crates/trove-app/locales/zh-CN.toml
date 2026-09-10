@@ -419,6 +419,23 @@ import_idle = "就绪"
 import_running = "正在导入…（%{done}/%{total}）"
 import_done = "导入完成：%{imported} 个已导入，%{skipped} 个跳过"
 
+[viewport]
+rendering = "正在渲染…"
+render_failed = "无法渲染该模型（%{reason}）"
+load_failed = "无法将该文件解析为三维模型"
+reason_gpu_lost = "GPU 无响应"
+reason_no_frame = "渲染器未输出画面"
+triangles = "%{count} 个三角面"
+vertices = "%{count} 个顶点"
+backend_starting = "正在启动 GPU…"
+backend_gpu = "GPU · %{adapter}"
+backend_cpu = "CPU · %{reason}"
+gpu_no_adapter = "没有可用的图形设备"
+gpu_software = "仅有软件渲染器（%{name}）"
+gpu_no_device = "无法从适配器创建设备（%{detail}）"
+reset = "重置视角"
+close = "返回素材库"
+
 [shortcuts]
 keyboard = "键盘快捷键"
 shortcut_desc = "说明"
