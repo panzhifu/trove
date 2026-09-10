@@ -32,6 +32,8 @@ pub enum ViewMode {
     Grid,
     /// Compact full-width rows (name / kind / size / date).
     List,
+    /// Justified grid split into day sections, newest day first.
+    Timeline,
 }
 
 /// Page size of the workspace asset grid: how many assets one page of the
