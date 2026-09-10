@@ -20,6 +20,22 @@
 - `SliderState::set_value(value, &mut Window, cx)` 是三参 —— 程序化同步滑块值只能放在 render（有 window），后台任务里改不了。
 - `cx.background_executor().spawn(async move { … &var })` 会把 `var` move 进 future；外层还要用就先 `clone()`。
 - `img()` 的 `ImageSource::Render(Arc<RenderImage>)` 可直接喂自建帧；BGRA 字节塞进 `image::RgbaImage::from_raw` 再 `image::Frame::new` 即可（`panels/common.rs` 的 APNG 与 `library/video_player.rs` 都这么做）。
+- `Window::drop_image` **对所有「把自建帧塞进 img」的地方都要做**，不只是逐帧动画：`library/viewport3d.rs` 的视口在关闭/被替换时也必须归还最后一帧（`release(&mut Window)`），否则整屏一帧常驻 atlas。任何「能拿到 `&mut Window` 的退出路径」都要调用。
+- 名字冲突：本项目 `trove_core::media::mesh::Bounds` 会遮住 gpui 的 `Bounds`，同文件里要 `use ... ::Bounds as MeshBounds`。
+- `on_prepaint` 来自 `gpui_kit::base::ElementExt`，只挂在 `Div` 上，必须在 `.id()` **之前**调用（`.id()` 之后变 `Stateful<Div>`，方法不在了）。
+- `CursorStyle` 里的手型是 `ClosedHand`（拖拽中）/ `OpenHand`（可拖拽），没有 `Grabbing`。
+- `ScrollDelta` 两个变体：`Lines(Point<f32>)` 和 `Pixels(Point<Pixels>)`（后者要 `.as_f32()`）。
+- `ClickEvent` 是 enum，双击次数用 `event.click_count()`，不是 `event.up.click_count`。
+
+## 三维模型（Model）资产
+- `AssetKind::Model` 已存在；OBJ/STL/PLY 由 `media::mesh` 解析，缩略图走 `media::render3d`（CPU 光栅化），交互视口走 `library/gpu3d.rs`（自建 wgpu 设备 + 离屏渲染 + readback）。
+- **CPU / GPU 必须共用 `render3d::Framing` 与 `VertexData`**，否则缩略图和视口的取景、着色会不一致。
+- wgpu 29 是直接依赖（与 gpui 内置版本对齐，只有一个版本、一套后端）。`PipelineLayoutDescriptor` 无 `push_constant_ranges`（用 `immediate_size: 0`）、`bind_group_layouts: &[Option<&BindGroupLayout>]`、`DepthStencilState` 的 `depth_write_enabled`/`depth_compare` 是 `Option<_>`。
+- **WGSL 可以在无 GPU 机器上校验**：`naga` 作为 trove-app 的 dev-dependency，测试里 parse + validate，并用 `naga::proc::Layouter` 断言 uniform 各成员 offset 与 Rust `Uniforms::to_bytes` 一致。改 shader 或改 uniform 结构后务必跑（`cargo test -p trove-app`）。
+
+## 拆分脏工作区
+- 通用按 hunk 暂存脚本：`/home/noke/.cache/trove-split/stage_hunks.py`（spec JSON，内部固定 `-U3` + `git apply --cached --recount`）。谓词要写窄，关键字命中的 hunk 常比预期多。
+- ⚠️ `git stash push --keep-index --include-untracked` 遇到被占用文件会「只存不清理且返回非零」，`&&` 链断掉后 pop 不执行，再 drop 就丢文件。**验证中间提交用不带 `--include-untracked` 的版本**。
 
 ## 外部工具集成
 - ffmpeg / ffprobe 是**可选运行时依赖**（不链接，仅执行），缺失时降级：视频缩略图退回图标、预览退回静态海报、视频探测退回 `media::probe::video_facts`（只读 MP4 moov，无帧率）。
