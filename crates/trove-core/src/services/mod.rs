@@ -4,3 +4,4 @@
 pub mod backup;
 pub mod collect;
 pub mod maintenance;
+pub mod screenshot;

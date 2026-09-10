@@ -56,6 +56,12 @@ fn build_menus() -> Vec<Menu> {
             items: vec![
                 MenuItem::action(rust_i18n::t!("app.import_files").to_string(), ImportFiles),
                 MenuItem::action(rust_i18n::t!("app.import_url").to_string(), ImportUrl),
+                MenuItem::action(rust_i18n::t!("app.screenshot").to_string(), ScreenshotFull),
+                MenuItem::action(
+                    rust_i18n::t!("app.screenshot_region").to_string(),
+                    ScreenshotRegion,
+                ),
+                MenuItem::separator(),
                 MenuItem::action(
                     rust_i18n::t!("app.export_library").to_string(),
                     ExportLibrary,
@@ -200,6 +206,20 @@ fn register_keys(cx: &mut App) {
         CancelEditor,
         Some(EXPLORER_CONTEXT),
     ));
+
+    // Screenshots are global (like paste import), not grid-scoped.
+    macro_rules! bind_global {
+        ($action:ident, $action_name:literal) => {
+            if let Some(k) = default_key($action_name) {
+                let k = key_for($action_name, &k);
+                if !k.is_empty() {
+                    bindings.push(KeyBinding::new(&k, $action, None));
+                }
+            }
+        };
+    }
+    bind_global!(ScreenshotFull, "ScreenshotFull");
+    bind_global!(ScreenshotRegion, "ScreenshotRegion");
 
     cx.bind_keys(bindings);
 }

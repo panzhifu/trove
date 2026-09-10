@@ -86,6 +86,16 @@ pub fn default_keybindings() -> Vec<KeyBindingConfig> {
             context: None,
         },
         KeyBindingConfig {
+            action: "ScreenshotFull",
+            key: "",
+            context: None,
+        },
+        KeyBindingConfig {
+            action: "ScreenshotRegion",
+            key: "",
+            context: None,
+        },
+        KeyBindingConfig {
             action: "RefreshLibrary",
             key: "f5",
             context: None,
