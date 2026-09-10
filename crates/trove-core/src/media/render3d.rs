@@ -127,7 +127,7 @@ impl Frame {
     /// The green channel is the discriminator: background green never drops
     /// below 225, while the brightest shaded pixel stays under 216.
     pub fn is_empty_of_geometry(&self) -> bool {
-        self.bgra.chunks_exact(4).all(|p| p[1] >= 220)
+        self.bgra.as_chunks::<4>().0.iter().all(|p| p[1] >= 220)
     }
 }
 
@@ -806,7 +806,13 @@ mod tests {
 
     /// Pixels that are clearly model rather than background.
     fn lit_pixels(frame: &Frame) -> usize {
-        frame.bgra.chunks_exact(4).filter(|p| p[1] < 220).count()
+        frame
+            .bgra
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .filter(|p| p[1] < 220)
+            .count()
     }
 
     fn brightness(p: [u8; 4]) -> u32 {
@@ -819,7 +825,7 @@ mod tests {
         assert_eq!(frame.width, 96);
         assert_eq!(frame.height, 64);
         assert_eq!(frame.bgra.len(), 96 * 64 * 4);
-        assert!(frame.bgra.chunks_exact(4).all(|p| p[3] == 255));
+        assert!(frame.bgra.as_chunks::<4>().0.iter().all(|p| p[3] == 255));
     }
 
     #[test]
@@ -1020,8 +1026,10 @@ mod tests {
         let bounds = cube().bounds;
         let (width, height) = (400.0f32, 300.0f32);
         for zoom in [1.0f32, 2.0, MIN_ZOOM, MAX_ZOOM] {
-            let mut camera = Camera::default();
-            camera.zoom = zoom;
+            let camera = Camera {
+                zoom,
+                ..Camera::default()
+            };
             let framing = camera.framing(bounds, width / height);
             // Every bounding-box corner, projected.
             let (lo, hi) = (bounds.min, bounds.max);
@@ -1062,8 +1070,8 @@ mod tests {
     fn the_eye_round_trips_into_model_space() {
         let framing = Camera::default().framing(cube().bounds, 1.0);
         let back = framing.to_unit(framing.eye_in_model_space());
-        for axis in 0..3 {
-            assert!((back[axis] - framing.eye[axis]).abs() < 1e-4);
+        for (b, e) in back.into_iter().zip(framing.eye) {
+            assert!((b - e).abs() < 1e-4);
         }
     }
 
@@ -1111,7 +1119,7 @@ mod tests {
         assert_eq!(data.triangle_count(), 12);
         // Every corner of a triangle carries the same, unit-length normal,
         // which is perpendicular to the face it belongs to.
-        for triangle in data.vertices.chunks_exact(18) {
+        for triangle in data.vertices.as_chunks::<18>().0.iter() {
             let normal = [triangle[3], triangle[4], triangle[5]];
             assert!((dot(normal, normal) - 1.0).abs() < 1e-4);
             for corner in 1..3 {

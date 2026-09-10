@@ -33,9 +33,9 @@ impl Bounds {
     }
 
     fn extend(&mut self, p: [f32; 3]) {
-        for i in 0..3 {
-            self.min[i] = self.min[i].min(p[i]);
-            self.max[i] = self.max[i].max(p[i]);
+        for ((min, max), v) in self.min.iter_mut().zip(self.max.iter_mut()).zip(p) {
+            *min = (*min).min(v);
+            *max = (*max).max(v);
         }
     }
 
@@ -329,7 +329,7 @@ pub fn load_stl_ascii(text: &str) -> Result<Mesh, String> {
             pending.push([values[0], values[1], values[2]]);
             if pending.len() == 3 {
                 let first = positions.len() as u32;
-                positions.extend(pending.drain(..));
+                positions.append(&mut pending);
                 triangles.push([first, first + 1, first + 2]);
             }
         }

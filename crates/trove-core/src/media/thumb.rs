@@ -156,7 +156,7 @@ fn write_model_card(blob_path: &Path, out: &Path) -> Option<PathBuf> {
     let frame = render3d::render(&mesh, &render3d::Camera::default(), w, h, 2);
 
     let mut card = image::RgbImage::new(w, h);
-    for (pixel, src) in card.pixels_mut().zip(frame.bgra.chunks_exact(4)) {
+    for (pixel, src) in card.pixels_mut().zip(frame.bgra.as_chunks::<4>().0.iter()) {
         // The rasterizer emits BGRA (that is what gpui wants); JPEG wants RGB.
         *pixel = image::Rgb([src[2], src[1], src[0]]);
     }
@@ -450,7 +450,7 @@ mod tests {
         // The card must show geometry, not just the empty backdrop.
         let pixels: Vec<_> = img.to_rgb8().into_raw();
         assert!(
-            pixels.chunks_exact(3).any(|p| p[1] < 160),
+            pixels.as_chunks::<3>().0.iter().any(|p| p[1] < 160),
             "the card should contain shaded geometry"
         );
 
