@@ -41,7 +41,8 @@ use trove_core::model::{AssetKind, AssetQuery, AssetSort, NewSmartCollection};
 use trove_core::store::{assets, collections, smart_collections};
 use uuid::Uuid;
 
-use crate::app::actions::{MoveDown, MoveLeft, MoveRight, MoveUp, OpenPreview};
+use crate::app::actions::{ClearSelection, MoveDown, MoveLeft, MoveRight, MoveUp, OpenPreview};
+use crate::library::viewport3d::{ModelViewport, ModelViewportEvent};
 use crate::library::{GRID_PAGE_SIZE, LibraryController, ViewMode};
 
 use crate::panels::workspace_context_menu::AssetsDragPreview;
@@ -168,6 +169,12 @@ pub struct WorkspacePanel {
     relayout_pending: bool,
     /// Debounce timer handle.
     debounce_timer: Option<gpui::Task<()>>,
+    /// Open 3D viewport. While this is set the main area shows the model and
+    /// the grid is not built at all — the other assets are hidden, which is
+    /// the whole point of previewing one full-size.
+    viewport: Option<Entity<ModelViewport>>,
+    /// Kept so the viewport's close event stops arriving when it is dropped.
+    viewport_subscription: Option<Subscription>,
 }
 
 impl BasePanel for WorkspacePanel {
@@ -302,6 +309,8 @@ impl WorkspacePanel {
             last_total: 0,
             relayout_pending: false,
             debounce_timer: None,
+            viewport: None,
+            viewport_subscription: None,
         };
         observe_controller(cx, &this.controller);
         this
@@ -535,18 +544,109 @@ impl WorkspacePanel {
         self.list_state.scroll_to_reveal_item(row_ix);
     }
 
-    /// Enter: open a large preview of the primary selected asset. The
-    /// dialog itself is the standalone `dialogs::preview` component.
+    /// Enter: open a large preview of the primary selected asset. A 3D model
+    /// takes over the main area with the interactive viewport; everything
+    /// else opens the standalone `dialogs::preview` component.
     fn open_preview(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(id) = self.controller.read(cx).primary() else {
             return;
         };
+        // A mesh is worth more than a picture of a mesh: the viewport lets it
+        // be turned and zoomed, and a dialog is no way to look at one.
+        if let Some((name, path)) = model_source(self.controller.read(cx), id) {
+            self.open_viewport(name, path, window, cx);
+            return;
+        }
         crate::dialogs::preview::open_asset_preview(&self.controller, id, window, cx);
+    }
+
+    /// Show `path` in the main-area viewport, replacing whatever was there.
+    fn open_viewport(
+        &mut self,
+        name: String,
+        path: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(viewport) = ModelViewport::spawn(name, path, cx) else {
+            self.report_view_error(cx, rust_i18n::t!("viewport.load_failed"));
+            return;
+        };
+        let subscription = cx.subscribe(&viewport, |this, _, event: &ModelViewportEvent, cx| {
+            if *event == ModelViewportEvent::Closed {
+                this.forget_viewport(cx);
+            }
+        });
+        // Enter on another model while one is already showing: let the old
+        // viewport hand its frame back before it is dropped.
+        if let Some(previous) = self.viewport.replace(viewport) {
+            previous.update(cx, |viewport, _| viewport.release(window));
+        }
+        self.viewport_subscription = Some(subscription);
+        cx.notify();
+    }
+
+    /// Leave the viewport, giving its frame back to the window first.
+    fn dismiss_viewport(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(viewport) = self.viewport.take() {
+            viewport.update(cx, |viewport, _| viewport.release(window));
+            self.viewport_subscription = None;
+            cx.notify();
+        }
+    }
+
+    /// Drop the panel's handle on the viewport. The viewport itself has
+    /// already released its frame by the time it announces that it closed, so
+    /// this only has to forget it.
+    fn forget_viewport(&mut self, cx: &mut Context<Self>) {
+        if self.viewport.take().is_some() {
+            self.viewport_subscription = None;
+            cx.notify();
+        }
     }
 }
 
 impl Render for WorkspacePanel {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // The action handlers are shared by both modes, so the shell is built
+        // before the branch below picks what goes inside it.
+        let shell = v_flex()
+            .size_full()
+            .gap_1()
+            .key_context("Workspace")
+            .track_focus(&self.focus_handle)
+            .on_action(cx.listener(|this, _: &MoveLeft, _, cx| {
+                this.move_selection(Direction::Left, cx);
+            }))
+            .on_action(cx.listener(|this, _: &MoveRight, _, cx| {
+                this.move_selection(Direction::Right, cx);
+            }))
+            .on_action(cx.listener(|this, _: &MoveUp, _, cx| {
+                this.move_selection(Direction::Up, cx);
+            }))
+            .on_action(cx.listener(|this, _: &MoveDown, _, cx| {
+                this.move_selection(Direction::Down, cx);
+            }))
+            .on_action(cx.listener(|this, _: &OpenPreview, window, cx| {
+                this.open_preview(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ClearSelection, window, cx| {
+                // Escape backs out of the innermost thing: out of the 3D
+                // viewport when one is open, otherwise it falls through to the
+                // app root, which clears the grid selection as before.
+                if this.viewport.is_some() {
+                    this.dismiss_viewport(window, cx);
+                    cx.stop_propagation();
+                }
+            }));
+
+        // The 3D viewport replaces the grid outright: the query and the row
+        // layout are skipped entirely, so hiding the other assets also costs
+        // nothing to keep hidden.
+        if let Some(viewport) = self.viewport.clone() {
+            return shell.child(viewport).into_any_element();
+        }
+
         // --- context snapshot (drop the controller borrow early) -----------
         let (
             collection,
@@ -967,26 +1067,7 @@ impl Render for WorkspacePanel {
             String::new()
         };
 
-        v_flex()
-            .size_full()
-            .gap_1()
-            .key_context("Workspace")
-            .track_focus(&self.focus_handle)
-            .on_action(cx.listener(|this, _: &MoveLeft, _, cx| {
-                this.move_selection(Direction::Left, cx);
-            }))
-            .on_action(cx.listener(|this, _: &MoveRight, _, cx| {
-                this.move_selection(Direction::Right, cx);
-            }))
-            .on_action(cx.listener(|this, _: &MoveUp, _, cx| {
-                this.move_selection(Direction::Up, cx);
-            }))
-            .on_action(cx.listener(|this, _: &MoveDown, _, cx| {
-                this.move_selection(Direction::Down, cx);
-            }))
-            .on_action(cx.listener(|this, _: &OpenPreview, window, cx| {
-                this.open_preview(window, cx);
-            }))
+        shell
             .child(
                 div()
                     .id("assets-grid-area")
@@ -1035,6 +1116,7 @@ impl Render for WorkspacePanel {
                         area.child(selection_toolbar(&toolbar_controller, in_trash, ids, cx))
                     }),
             )
+            .into_any_element()
     }
 }
 
@@ -1577,6 +1659,13 @@ fn build_cell_element(
     let base = base.on_click(move |event: &ClickEvent, window, _cx| {
         // Focus the grid so keyboard navigation applies right away.
         window.focus(&focus, _cx);
+        // A double click on a model is the mouse way of saying "preview this
+        // one"; the grid handles the action, and only opens the viewport for
+        // a mesh.
+        if kind == AssetKind::Model && event.click_count() == 2 {
+            window.dispatch_action(Box::new(OpenPreview), _cx);
+            return;
+        }
         let m = event.modifiers();
         let multi = m.control || m.platform;
         ctl_click.update(_cx, move |ctl, _| {
@@ -1721,6 +1810,13 @@ fn build_list_row_element(
     let focus = focus_handle.clone();
     let base = base.on_click(move |event: &ClickEvent, window, _cx| {
         window.focus(&focus, _cx);
+        // A double click on a model is the mouse way of saying "preview this
+        // one"; the grid handles the action, and only opens the viewport for
+        // a mesh.
+        if kind == AssetKind::Model && event.click_count() == 2 {
+            window.dispatch_action(Box::new(OpenPreview), _cx);
+            return;
+        }
         let m = event.modifiers();
         let multi = m.control || m.platform;
         ctl_click.update(_cx, move |ctl, _| {
@@ -1755,3 +1851,26 @@ fn build_list_row_element(
 
 // asset_context_menu, open_image_search and AssetsDragPreview moved to
 // workspace_context_menu.rs / workspace_search.rs
+
+/// The file a `Model` asset's geometry lives in, with the name to show for it.
+///
+/// `None` for any other kind, for an asset the library no longer has, and for
+/// a linked model whose source has gone missing — in every one of those cases
+/// the caller falls back to the ordinary preview dialog.
+fn model_source(controller: &LibraryController, id: Uuid) -> Option<(String, PathBuf)> {
+    use trove_core::model::Origin;
+
+    let root = controller.library.root().to_path_buf();
+    let conn = controller.library.store().conn();
+    let asset = trove_core::store::assets::get(conn, id).ok().flatten()?;
+    if asset.kind != AssetKind::Model {
+        return None;
+    }
+    // Imported models live in the library as a blob; linked ones stay where
+    // they are and are read in place.
+    let path = match asset.origin {
+        Origin::Linked => PathBuf::from(asset.extra.get("source_path")?.as_str()?),
+        _ => root.join(asset.rel_path.as_ref()?),
+    };
+    path.is_file().then(|| (display_name(&asset), path))
+}
