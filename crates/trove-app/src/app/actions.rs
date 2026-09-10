@@ -12,6 +12,8 @@ gpui_kit::actions!(
         // -- File menu ----------------------------------------------------
         ImportFiles,
         ImportUrl,
+        ScreenshotFull,
+        ScreenshotRegion,
         ExportLibrary,
         ImportLibrary,
         ExportMediaPackage,
