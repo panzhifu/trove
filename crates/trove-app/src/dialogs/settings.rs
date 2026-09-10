@@ -1244,6 +1244,8 @@ fn action_label(action: &str) -> String {
         "ImportFiles" => rust_i18n::t!("shortcuts.actions.ImportFiles").to_string(),
         "OpenSettings" => rust_i18n::t!("shortcuts.actions.OpenSettings").to_string(),
         "RefreshLibrary" => rust_i18n::t!("shortcuts.actions.RefreshLibrary").to_string(),
+        "BatchRename" => rust_i18n::t!("shortcuts.actions.BatchRename").to_string(),
+        "BatchConvert" => rust_i18n::t!("shortcuts.actions.BatchConvert").to_string(),
         other => other.to_string(),
     }
 }
@@ -1293,7 +1295,7 @@ fn prompt_keybinding_change(action_id: &str, default_key: &str, window: &mut Win
             )
             .button_props(
                 DialogButtonProps::default()
-                    .ok_text(rust_i18n::t!("settings.change").to_string())
+                    .ok_text(rust_i18n::t!("shortcuts.change").to_string())
                     .show_cancel(true),
             )
             .on_ok(move |_, _, cx| {
