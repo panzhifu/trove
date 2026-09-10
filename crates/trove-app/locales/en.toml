@@ -10,6 +10,7 @@ import_files = "Import files…"
 import_url = "Import from URL…"
 import_url_placeholder = "https://example.com/image.png"
 paste_import = "Paste & Import"
+copy_image = "Copy Image"
 screenshot = "Take Screenshot"
 screenshot_region = "Take Screenshot (Region…)"
 export_library = "Export library…"
@@ -135,6 +136,7 @@ semantic_not_ready = "Semantic search not ready. Open Settings ▸ Search to con
 embed_failed = "Could not encode the query image."
 embed_failed_with = "Could not encode the query image: %{error}"
 batch_rename = "Batch Rename…"
+copy_image = "Copy Image"
 batch_convert = "Batch Convert…"
 
 [inspector]
@@ -366,6 +368,9 @@ relink_failed = "Relink failed: %{error}"
 font_install_failed = "Font action failed: %{error}"
 screenshot_started = "Taking a screenshot…"
 screenshot_failed = "Screenshot failed: %{error}"
+copy_image_done = "Copied %{width}×%{height} image to the clipboard"
+copy_image_failed = "Copy failed: %{error}"
+copy_image_none = "Select an image asset to copy"
 
 [rename]
 title = "Batch Rename"
@@ -470,6 +475,7 @@ ScreenshotRegion = "Take screenshot (region)"
 RefreshLibrary = "Refresh library"
 BatchRename = "Batch rename"
 BatchConvert = "Batch convert"
+CopyImage = "Copy image to clipboard"
 
 [shortcuts.context]
 Workspace = "Workspace"

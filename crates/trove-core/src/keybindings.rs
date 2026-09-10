@@ -76,6 +76,13 @@ pub fn default_keybindings() -> Vec<KeyBindingConfig> {
             context: Some("Workspace"),
         },
         KeyBindingConfig {
+            // Not plain `ctrl-c`: that would shadow text copy in the search
+            // box and the inline editors, which live in the same context.
+            action: "CopyImage",
+            key: "ctrl-shift-c",
+            context: Some("Workspace"),
+        },
+        KeyBindingConfig {
             action: "ImportFiles",
             key: "ctrl-o",
             context: None,

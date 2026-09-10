@@ -1,6 +1,7 @@
 //! Library state and background work: the [`LibraryController`] every panel
 //! reads, plus the import-job orchestration and folder watching.
 
+pub mod clipboard;
 mod controller;
 pub mod gpu3d;
 pub mod jobs;
