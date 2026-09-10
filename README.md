@@ -108,6 +108,20 @@ The first launch creates a library under the platform's config directory. Open *
 - **Font grid live previews**: a specimen-card thumbnail (sample text rendered in the font itself, missing glyphs skipped) is rasterized at import; the sample text is customizable in Settings.
 - **Font collection & system install**: a Fonts system view lists every font in the library; the Inspector can **install** a font for the current user (Linux/macOS, font cache refreshed) or uninstall it, with an installed badge.
 
+### 3D model preview (0.4)
+- **Model asset kind**: OBJ/STL/PLY files are imported as a first-class asset type with format-specific icons.
+- **GPU viewport**: selecting a model hands the main content area to a wgpu-powered 3D viewport — orbit, zoom, and inspect with two-sided Lambert + Blinn-Phong shading. Falls back to a CPU software rasterizer (same shading model) when no GPU is available (remote session, VM, missing driver).
+- Parsing is pure-Rust, deliberately lenient: unknown lines and extra vertex properties are skipped; only a file yielding no triangle at all fails.
+
+### Video playback (0.4)
+- **Silent preview**: video assets open to a frame-by-frame player in the preview dialog — piped from ffmpeg, single-frame decode loop, transport controls (play/pause, seek, timeline). No audio pipeline; the preview is about looking, not listening.
+
+### Screenshot capture (0.4)
+- **Capture into the library** (File ▸ Screenshot…): grab the full screen or pick a region interactively, import the PNG directly. Platform-native backends (gnome-screenshot, scrot, macOS `screencapture`, Windows `snippingtool`) with a user-overridable custom command.
+
+### Batch format conversion (0.4)
+- **Convert images** (Edit ▸ Convert…): re-encode selected image assets to JPEG/PNG/WebP/BMP/TIFF, into a user-chosen folder, with an optional longest-edge cap. Optionally re-import the converted files.
+
 ### Library safety & management
 - **Automatic backups**: the database is snapshotted with SQLite `VACUUM INTO` into `backups/` at most once a day (on library open), rolling 10 files; Maintenance ▸ Backups snapshots on demand.
 - **Recent libraries** for one-click hot switching, and a live **statistics** block (counts per kind, total size, tags, collections).
@@ -117,6 +131,8 @@ The first launch creates a library under the platform's config directory. Open *
 - **Hierarchical tags**: nest tags, filters/counts/smart collections include the whole subtree, deleting a parent promotes its children.
 - **Library restore**: File ▸ Import library… rebuilds collections/tags/smart collections from an export; assets link by content hash or wait as placeholders that self-heal when the media is re-imported.
 - **Local collect service**: `http://127.0.0.1:23916` accepts `POST /add` (raw bytes) and `POST /fetch` (server-side download) — collected files import automatically with their source URL (browser-extension ready).
+- **Batch format conversion**: as described above, re-encode images to JPEG/PNG/WebP/BMP/TIFF.
+- **Screenshot capture**: as described above, grab the screen directly into the library.
 
 ### Design formats, folders & portability
 - **SVG & PSD thumbnails**: SVGs rasterize (with text, via system fonts), PSDs composite their embedded preview — dimensions are mined at import.
@@ -165,7 +181,7 @@ crates/
 │   │   ├── services/    # backup (VACUUM INTO), maintenance jobs, collect server
 │   │   ├── layout.rs    # Justified grid layout (dynamic programming)
 │   │   ├── store/       # SQLite layer: schema, CRUD, FTS, smart queries, stats
-│   │   ├── media/       # Import, probing, thumbnails (incl. SVG/PSD), CLIP search
+│   │   ├── media/       # Import, probing, thumbnails (incl. SVG/PSD), CLIP search, 3D mesh parsing, GPU structs, video decoding, screenshot
 │   │   ├── maintenance.rs # Rebuild thumbs/index, orphan cleanup
 │   │   ├── undo.rs      # Undo/redo operation log
 │   │   ├── events.rs    # Cross-layer events
@@ -176,7 +192,7 @@ crates/
     │   ├── main.rs       # GPUI bootstrap, menus, keybindings
     │   ├── app/          # Window shell: root view, title bar, actions, i18n
     │   ├── library/      # LibraryController, import jobs, folder watcher
-    │   ├── dialogs/      # Settings, rule editor, duplicate finder, batch rename
+    │   ├── dialogs/      # Settings, rule editor, duplicate finder, batch rename, format conversion
     │   └── panels/       # Explorer, Folders, Workspace, Tags, Inspector
     └── Cargo.toml
 ```
@@ -221,7 +237,7 @@ Test status: `trove-core` compiles and all **106** tests pass. `trove-app` compi
 ## Status
 
 - **trove-core** — feature-complete for the above list; tested (106 tests).
-- **trove-app** — compiles and runs: dock layout, custom title bar, justified thumbnail grid, drag & drop, multi-select, context menus, settings dialog, inspector, visual + semantic search, and import with progress are all wired.
+- **trove-app** — compiles and runs: dock layout, custom title bar, justified thumbnail grid, drag & drop, multi-select, context menus, settings dialog, inspector, visual + semantic search, import with progress, 3D model viewport (GPU + CPU fallback), silent video preview, screenshot capture, and batch format conversion are all wired.
 
 What is still missing (compared with Eagle, Billfish, digiKam, Adobe Bridge & co.) is mapped in [docs/FEATURE-GAPS.md](docs/FEATURE-GAPS.md).
 
