@@ -202,6 +202,41 @@ mod tests {
     }
 
     #[test]
+    fn model_kind_roundtrips_and_filters() {
+        let store = Store::in_memory().unwrap();
+        assets::insert(store.conn(), &sample_asset("dragon.stl", AssetKind::Model)).unwrap();
+        assets::insert(store.conn(), &sample_asset("a.png", AssetKind::Image)).unwrap();
+
+        let (total, list) = assets::query(
+            store.conn(),
+            &AssetQuery {
+                kind: Some(AssetKind::Model),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(total, 1);
+        let id = list[0].id;
+        assert_eq!(list[0].kind, AssetKind::Model);
+
+        // The column holds the wire name a smart rule filters on, and decoding
+        // it back yields the same kind.
+        let tag: String = store
+            .conn()
+            .query_row(
+                "SELECT kind FROM assets WHERE id = ?1",
+                [id.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(tag, "model");
+        assert_eq!(
+            assets::get(store.conn(), id).unwrap().unwrap().kind,
+            AssetKind::Model
+        );
+    }
+
+    #[test]
     fn smart_collection_update_query_validates() {
         use crate::store::smart_collections;
         let store = Store::in_memory().unwrap();

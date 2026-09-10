@@ -710,6 +710,7 @@ fn kind_str(kind: AssetKind) -> String {
         AssetKind::Document => "document",
         AssetKind::Archive => "archive",
         AssetKind::Font => "font",
+        AssetKind::Model => "model",
         AssetKind::Other => "other",
     }
     .to_string()
@@ -723,6 +724,7 @@ fn parse_kind(s: &str) -> Result<AssetKind> {
         "document" => AssetKind::Document,
         "archive" => AssetKind::Archive,
         "font" => AssetKind::Font,
+        "model" => AssetKind::Model,
         "" | "other" => AssetKind::Other,
         other => return Err(Error::Db(format!("bad kind {other}"))),
     })

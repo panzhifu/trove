@@ -69,6 +69,8 @@ pub enum AssetKind {
     Document,
     Archive,
     Font,
+    /// Triangle mesh (OBJ / STL / PLY), previewed in the main-area viewport.
+    Model,
     Other,
 }
 

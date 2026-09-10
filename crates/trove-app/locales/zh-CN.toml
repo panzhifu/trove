@@ -179,6 +179,7 @@ kind.audio = "音频"
 kind.document = "文档"
 kind.archive = "压缩包"
 kind.font = "字体"
+kind.model = "三维模型"
 kind.other = "其他"
 
 [rules]

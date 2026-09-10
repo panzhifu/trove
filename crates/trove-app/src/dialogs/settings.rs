@@ -422,6 +422,7 @@ fn stats_block(controller: &Entity<LibraryController>, cx: &mut App) -> Div {
             trove_core::model::AssetKind::Document => "asset.kind.document",
             trove_core::model::AssetKind::Archive => "asset.kind.archive",
             trove_core::model::AssetKind::Font => "asset.kind.font",
+            trove_core::model::AssetKind::Model => "asset.kind.model",
             trove_core::model::AssetKind::Other => "asset.kind.other",
         };
         rust_i18n::t!(key).to_string()
