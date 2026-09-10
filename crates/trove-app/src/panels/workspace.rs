@@ -78,6 +78,9 @@ struct Cell {
     name: String,
     size_bytes: u64,
     added: String,
+    /// Timeline bucket: the day this asset belongs to as `YYYY-MM-DD`.
+    /// Capture date when the file carries one, import date otherwise.
+    day: String,
     /// Live font preview: family + the font file to register, set only for
     /// Font assets so cells can render the sample text in the actual font.
     font_family: Option<String>,
@@ -94,14 +97,30 @@ impl Cell {
 }
 
 /// One frozen justified row: uniform height, cell widths in display order.
+///
+/// A row may also carry `header` instead of cells: the timeline view inserts
+/// one such row per day section.
 #[derive(Debug, Clone)]
 struct Row {
     height: f32,
     widths: Vec<f32>,
     cells: Vec<Cell>,
+    header: Option<String>,
 }
 
+/// Height of a timeline day header.
+const TIMELINE_HEADER_HEIGHT: f32 = 34.0;
+
 impl Row {
+    /// A timeline section header: no cells, just the label.
+    fn section(label: String) -> Self {
+        Self {
+            height: TIMELINE_HEADER_HEIGHT,
+            widths: Vec::new(),
+            cells: Vec::new(),
+            header: Some(label),
+        }
+    }
     /// Horizontal center of each cell (for up/down nearest-column moves).
     fn centers(&self) -> Vec<f32> {
         let mut x = GRID_GAP / 2.0;
@@ -482,52 +501,62 @@ impl WorkspacePanel {
             })
         };
 
+        // Timeline day headers hold no cells; every step has to land on a row
+        // that does, or the move would silently do nothing.
         let target: (usize, usize) = match locate(primary) {
             // Nothing selected: start from the grid edge in the move's
             // direction.
             None => match toward {
-                Direction::Left | Direction::Up => {
-                    let last = rows.len() - 1;
-                    (last, rows[last].cells.len().saturating_sub(1))
-                }
-                Direction::Right | Direction::Down => (0, 0),
+                Direction::Left | Direction::Up => match prev_cell_row(&rows, rows.len() - 1) {
+                    Some(last) => (last, rows[last].cells.len() - 1),
+                    None => return,
+                },
+                Direction::Right | Direction::Down => match next_cell_row(&rows, 0) {
+                    Some(first) => (first, 0),
+                    None => return,
+                },
             },
             Some((r, c)) => match toward {
                 Direction::Left => {
                     if c > 0 {
                         (r, c - 1)
-                    } else if r > 0 {
-                        (r - 1, rows[r - 1].cells.len() - 1)
                     } else {
-                        (r, c)
+                        match r.checked_sub(1).and_then(|r| prev_cell_row(&rows, r)) {
+                            Some(pr) => (pr, rows[pr].cells.len() - 1),
+                            None => (r, c),
+                        }
                     }
                 }
                 Direction::Right => {
                     if c + 1 < rows[r].cells.len() {
                         (r, c + 1)
-                    } else if r + 1 < rows.len() {
-                        (r + 1, 0)
                     } else {
-                        (r, c)
+                        match next_cell_row(&rows, r + 1) {
+                            Some(nr) => (nr, 0),
+                            None => (r, c),
+                        }
                     }
                 }
                 Direction::Up | Direction::Down => {
-                    let step: i64 = if toward == Direction::Up { -1 } else { 1 };
-                    let nr = r as i64 + step;
-                    if nr < 0 || nr as usize >= rows.len() {
-                        (r, c)
+                    let neighbour = if toward == Direction::Up {
+                        r.checked_sub(1).and_then(|r| prev_cell_row(&rows, r))
                     } else {
-                        let nr = nr as usize;
-                        let centers = rows[r].centers();
-                        let x = centers.get(c).copied().unwrap_or(0.0);
-                        let best = rows[nr]
-                            .centers()
-                            .iter()
-                            .enumerate()
-                            .min_by(|a, b| (a.1 - x).abs().total_cmp(&(b.1 - x).abs()))
-                            .map(|(i, _)| i)
-                            .unwrap_or(0);
-                        (nr, best)
+                        next_cell_row(&rows, r + 1)
+                    };
+                    match neighbour {
+                        None => (r, c),
+                        Some(nr) => {
+                            let centers = rows[r].centers();
+                            let x = centers.get(c).copied().unwrap_or(0.0);
+                            let best = rows[nr]
+                                .centers()
+                                .iter()
+                                .enumerate()
+                                .min_by(|a, b| (a.1 - x).abs().total_cmp(&(b.1 - x).abs()))
+                                .map(|(i, _)| i)
+                                .unwrap_or(0);
+                            (nr, best)
+                        }
                     }
                 }
             },
@@ -835,6 +864,13 @@ impl Render for WorkspacePanel {
                     name: display_name(a),
                     size_bytes: a.size_bytes,
                     added: a.created_at.format("%Y-%m-%d %H:%M").to_string(),
+                    // Capture date is what a timeline is about; files without
+                    // EXIF fall back to the import date so nothing is lost.
+                    day: a
+                        .captured_at
+                        .unwrap_or(a.created_at)
+                        .format("%Y-%m-%d")
+                        .to_string(),
                     font_family,
                     font_blob,
                 }
@@ -919,7 +955,9 @@ impl Render for WorkspacePanel {
         if self.view_key.as_ref() != Some(&key) && !defer_layout {
             // View or width changed: full layout, scroll resets to top.
             self.relayout_pending = false;
-            let rows = if view_mode == ViewMode::List {
+            let rows = if view_mode == ViewMode::Timeline {
+                timeline_rows(cells, content_width)
+            } else if view_mode == ViewMode::List {
                 // List mode: one full-width row per asset, no justification.
                 cells
                     .into_iter()
@@ -927,6 +965,7 @@ impl Render for WorkspacePanel {
                         height: LIST_ROW_HEIGHT,
                         widths: vec![content_width],
                         cells: vec![c],
+                        header: None,
                     })
                     .collect()
             } else {
@@ -943,13 +982,18 @@ impl Render for WorkspacePanel {
             // (cells per row) and refill them, so scrolling stays stable
             // across unrelated mutations. List mode just rebuilds its
             // trivial one-cell rows.
-            let new_rows: Vec<Row> = if view_mode == ViewMode::List {
+            let new_rows: Vec<Row> = if view_mode == ViewMode::Timeline {
+                // Sections move whenever the set does, so there is no frozen
+                // shape worth preserving here.
+                timeline_rows(cells, content_width)
+            } else if view_mode == ViewMode::List {
                 cells
                     .into_iter()
                     .map(|c| Row {
                         height: LIST_ROW_HEIGHT,
                         widths: vec![content_width],
                         cells: vec![c],
+                        header: None,
                     })
                     .collect()
             } else {
@@ -1013,6 +1057,10 @@ impl Render for WorkspacePanel {
             let Some(row) = rows_for_render.get(ix) else {
                 return v_flex().into_any_element();
             };
+            // Timeline day headers are rows without cells.
+            if let Some(label) = row.header.clone() {
+                return timeline_header(label, cx);
+            }
             let widths = row.widths.clone();
             let height = row.height;
             let cells = row.cells.clone();
@@ -1141,10 +1189,15 @@ fn filter_controls(controller: &Entity<LibraryController>, cx: &App) -> Div {
 
     let mut bar = h_flex().items_center().gap_1();
 
-    // View toggle: grid ⇄ list presentation.
+    // View toggle: grid → list → timeline, wrapping back to grid.
     let (next_mode, toggle_icon, toggle_tip) = match view_mode {
         ViewMode::Grid => (ViewMode::List, IconName::Menu, "workspace.view_list"),
         ViewMode::List => (
+            ViewMode::Timeline,
+            IconName::Calendar,
+            "workspace.view_timeline",
+        ),
+        ViewMode::Timeline => (
             ViewMode::Grid,
             IconName::GalleryVerticalEnd,
             "workspace.view_grid",
@@ -1308,6 +1361,26 @@ fn kind_key(kind: AssetKind) -> &'static str {
 
 // ============================ row construction ===============================
 
+/// One timeline day header: the date/count label over a hairline rule.
+fn timeline_header(label: String, cx: &App) -> gpui::AnyElement {
+    h_flex()
+        .h(px(TIMELINE_HEADER_HEIGHT))
+        .w_full()
+        .items_center()
+        .gap_2()
+        .px(px(GRID_GAP))
+        .border_b_1()
+        .border_color(cx.theme().border)
+        .child(
+            div()
+                .text_sm()
+                .font_weight(gpui::FontWeight::SEMIBOLD)
+                .text_color(cx.theme().foreground)
+                .child(label),
+        )
+        .into_any_element()
+}
+
 /// Pair a cell list with DP row layouts into frozen [`Row`]s.
 fn materialize_rows(cells: Vec<Cell>, layouts: &[RowLayout]) -> Vec<Row> {
     let mut cells = cells.into_iter();
@@ -1317,8 +1390,55 @@ fn materialize_rows(cells: Vec<Cell>, layouts: &[RowLayout]) -> Vec<Row> {
             height: layout.height,
             widths: layout.item_widths.clone(),
             cells: (&mut cells).take(layout.item_widths.len()).collect(),
+            header: None,
         })
         .collect()
+}
+
+/// Nearest row at or before `from` that holds cells. Timeline headers are
+/// cell-less, so navigation has to hop over them.
+fn prev_cell_row(rows: &[Row], from: usize) -> Option<usize> {
+    (0..=from.min(rows.len().saturating_sub(1)))
+        .rev()
+        .find(|&r| !rows[r].cells.is_empty())
+}
+
+/// Nearest row at or after `from` that holds cells.
+fn next_cell_row(rows: &[Row], from: usize) -> Option<usize> {
+    (from..rows.len()).find(|&r| !rows[r].cells.is_empty())
+}
+
+/// Group cells into day sections for the timeline view.
+///
+/// The newest day comes first; within a day the order the query returned is
+/// kept. Each section is a header row plus its own justified rows, so a day
+/// never straddles another day's header.
+fn timeline_rows(cells: Vec<Cell>, content_width: f32) -> Vec<Row> {
+    let mut cells = cells;
+    cells.sort_by(|a, b| b.day.cmp(&a.day));
+
+    let mut rows = Vec::new();
+    // `drain` below removes each group in place, so the cursor stays put.
+    let index = 0;
+    while index < cells.len() {
+        let day = cells[index].day.clone();
+        let end = cells[index..]
+            .iter()
+            .position(|c| c.day != day)
+            .map_or(cells.len(), |offset| index + offset);
+        let group: Vec<Cell> = cells.drain(index..end).collect();
+        let label = rust_i18n::t!(
+            "workspace.timeline_day",
+            date = day,
+            count = group.len().to_string()
+        )
+        .to_string();
+        rows.push(Row::section(label));
+        let aspects: Vec<f32> = group.iter().map(|c| c.aspect()).collect();
+        let layouts = justify_layout(&aspects, content_width);
+        rows.extend(materialize_rows(group, &layouts));
+    }
+    rows
 }
 
 /// Refill frozen row *shapes* (cells per row) with a new cell list.
@@ -1340,6 +1460,7 @@ fn refill_rows(cells: Vec<Cell>, counts: &[usize], content_width: f32) -> Vec<Ro
             height: layout.height,
             widths: layout.item_widths,
             cells: chunk,
+            header: None,
         });
     }
     let rest: Vec<Cell> = iter.collect();
@@ -1352,6 +1473,7 @@ fn refill_rows(cells: Vec<Cell>, counts: &[usize], content_width: f32) -> Vec<Ro
                 height: layout.height,
                 widths: layout.item_widths.clone(),
                 cells: (&mut rest).take(layout.item_widths.len()).collect(),
+                header: None,
             });
         }
     }
@@ -1873,4 +1995,90 @@ fn model_source(controller: &LibraryController, id: Uuid) -> Option<(String, Pat
         _ => root.join(asset.rel_path.as_ref()?),
     };
     path.is_file().then(|| (display_name(&asset), path))
+}
+
+#[cfg(test)]
+mod tests {
+    // Explicit imports, not `use super::*`: the glob drags in a `test`
+    // attribute macro from the gpui prelude, which makes expanding `#[test]`
+    // below recurse.
+    use super::{Cell, Row, next_cell_row, prev_cell_row, timeline_rows};
+    use trove_core::model::AssetKind;
+    use uuid::Uuid;
+
+    /// A square image cell on `day`, enough for the layout to work with.
+    fn cell(seed: u8, day: &str) -> Cell {
+        Cell {
+            id: Uuid::from_u128(seed as u128),
+            kind: AssetKind::Image,
+            thumb: None,
+            width: Some(100),
+            height: Some(100),
+            trashed: false,
+            name: String::new(),
+            size_bytes: 0,
+            added: String::new(),
+            day: day.to_string(),
+            font_family: None,
+            font_blob: None,
+        }
+    }
+
+    #[test]
+    fn timeline_splits_days_into_sections_newest_first() {
+        let cells = vec![
+            cell(1, "2026-01-02"),
+            cell(2, "2026-09-10"),
+            cell(3, "2026-01-02"),
+        ];
+        let rows = timeline_rows(cells, 800.0);
+
+        // Header, its rows, next header, its rows.
+        assert!(rows[0].header.is_some(), "first row is a header");
+        assert!(
+            rows[0]
+                .header
+                .as_deref()
+                .is_some_and(|h| h.contains("2026-09-10")),
+            "newest day first: {:?}",
+            rows[0].header
+        );
+        assert_eq!(rows[1].cells.len(), 1, "one asset on the newest day");
+        assert!(rows[2].header.is_some());
+        assert!(
+            rows[2]
+                .header
+                .as_deref()
+                .is_some_and(|h| h.contains("2026-01-02")),
+            "older day second: {:?}",
+            rows[2].header
+        );
+        // Every asset survives the regrouping.
+        assert_eq!(rows.iter().map(|r| r.cells.len()).sum::<usize>(), 3);
+    }
+
+    #[test]
+    fn navigation_hops_over_timeline_headers() {
+        let rows = vec![
+            Row::section("newest".into()),
+            Row {
+                height: 100.0,
+                widths: vec![100.0, 100.0],
+                cells: vec![cell(1, "2026-09-10"), cell(2, "2026-09-10")],
+                header: None,
+            },
+            Row::section("older".into()),
+            Row {
+                height: 100.0,
+                widths: vec![100.0],
+                cells: vec![cell(3, "2026-09-09")],
+                header: None,
+            },
+        ];
+        assert_eq!(next_cell_row(&rows, 0), Some(1));
+        assert_eq!(next_cell_row(&rows, 2), Some(3));
+        assert_eq!(next_cell_row(&rows, 4), None);
+        assert_eq!(prev_cell_row(&rows, 2), Some(1));
+        assert_eq!(prev_cell_row(&rows, 0), None, "a leading header is skipped");
+    }
 }
