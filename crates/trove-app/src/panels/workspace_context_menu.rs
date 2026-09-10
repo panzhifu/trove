@@ -8,6 +8,7 @@ use uuid::Uuid;
 
 use crate::library::LibraryController;
 use crate::panels::workspace_search::open_image_search;
+use trove_core::model::AssetKind;
 use trove_core::store::{assets, collections};
 
 /// Build the right-click context menu for an asset cell.
@@ -24,11 +25,11 @@ pub(crate) fn asset_context_menu(
     }
 
     let conn = controller.read(cx).library.store().conn();
-    let (favorite, current_label) = assets::get(conn, asset_id)
+    let (favorite, current_label, is_image) = assets::get(conn, asset_id)
         .ok()
         .flatten()
-        .map(|a| (a.is_favorite, a.color_label))
-        .unwrap_or((false, None));
+        .map(|a| (a.is_favorite, a.color_label, a.kind == AssetKind::Image))
+        .unwrap_or((false, None, false));
     let browsed_collection = controller.read(cx).current_collection;
 
     let ctl_build = controller.clone();
@@ -89,6 +90,19 @@ pub(crate) fn asset_context_menu(
                     }),
             )
             .separator();
+    // Images are the only kind we can hand over as pixels, so the entry is
+    // hidden for everything else rather than failing after the click.
+    if is_image {
+        menu = menu
+            .item(
+                PopupMenuItem::new(rust_i18n::t!("workspace.copy_image").to_string()).on_click(
+                    move |_, window, cx| {
+                        window.dispatch_action(Box::new(crate::app::actions::CopyImage), cx);
+                    },
+                ),
+            )
+            .separator();
+    }
     if let Some(path) = disk_path {
         menu = menu.item(
             PopupMenuItem::new(rust_i18n::t!("workspace.reveal_in_file_manager").to_string())

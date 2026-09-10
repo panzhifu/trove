@@ -6,7 +6,7 @@ use std::time::Instant;
 use uuid::Uuid;
 
 use trove_core::library::Library;
-use trove_core::model::{AssetKind, AssetSort};
+use trove_core::model::{AssetKind, AssetSort, Origin};
 use trove_core::store::view_history;
 
 /// Current import activity, shown by the Explorer panel.
@@ -356,6 +356,28 @@ impl LibraryController {
     /// The primary (last-clicked) selected asset.
     pub fn primary(&self) -> Option<Uuid> {
         self.selected_assets.last().copied()
+    }
+
+    /// The file behind `id`: the in-library blob for imported assets, the
+    /// original path for linked ones. `None` when the record or the file is
+    /// gone.
+    pub fn asset_file(&self, id: Uuid) -> Option<PathBuf> {
+        let conn = self.library.store().conn();
+        let asset = trove_core::store::assets::get(conn, id).ok().flatten()?;
+        let path = match asset.origin {
+            Origin::Linked => PathBuf::from(asset.extra.get("source_path")?.as_str()?),
+            _ => self.library.root().join(asset.rel_path.as_ref()?),
+        };
+        path.is_file().then_some(path)
+    }
+
+    /// The primary selection's file, but only when that asset is an image —
+    /// the one kind we can hand to the clipboard as pixels.
+    pub fn primary_image_file(&self) -> Option<PathBuf> {
+        let id = self.primary()?;
+        let conn = self.library.store().conn();
+        let asset = trove_core::store::assets::get(conn, id).ok().flatten()?;
+        (asset.kind == AssetKind::Image).then(|| self.asset_file(id))?
     }
 
     /// Single click: select only `id` (`None` clears the selection).
