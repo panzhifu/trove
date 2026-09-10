@@ -242,6 +242,13 @@ fn cached_font_sample() -> String {
     cache.1.clone()
 }
 
+/// The configured font sample text, for callers that have to size it rather
+/// than just draw it — the preview dialog picks a text size that fits its
+/// width, which it can only do knowing how long the sample is.
+pub(crate) fn font_sample() -> String {
+    cached_font_sample()
+}
+
 /// One live specimen line for a registered font: the sample text rendered
 /// in the font itself, centered on a soft card background, single row. The
 /// caller sizes it (grid cells stretch, list leads get fixed dims).
