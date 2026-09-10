@@ -815,6 +815,7 @@ impl InspectorPanel {
                 AssetKind::Document => "asset.kind.document",
                 AssetKind::Archive => "asset.kind.archive",
                 AssetKind::Font => "asset.kind.font",
+                AssetKind::Model => "asset.kind.model",
                 AssetKind::Other => "asset.kind.other",
             }
         }
@@ -826,6 +827,7 @@ impl InspectorPanel {
                 AssetKind::Document,
                 AssetKind::Archive,
                 AssetKind::Font,
+                AssetKind::Model,
                 AssetKind::Other,
             ]
             .map(|kind| {

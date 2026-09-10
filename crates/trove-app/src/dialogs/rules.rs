@@ -903,6 +903,7 @@ fn render_row(
                 AssetKind::Document,
                 AssetKind::Archive,
                 AssetKind::Font,
+                AssetKind::Model,
                 AssetKind::Other,
             ]
             .map(|k| (k, t(kind_key(k))))
@@ -1128,6 +1129,7 @@ fn kind_key(kind: AssetKind) -> &'static str {
         AssetKind::Document => "asset.kind.document",
         AssetKind::Archive => "asset.kind.archive",
         AssetKind::Font => "asset.kind.font",
+        AssetKind::Model => "asset.kind.model",
         AssetKind::Other => "asset.kind.other",
     }
 }

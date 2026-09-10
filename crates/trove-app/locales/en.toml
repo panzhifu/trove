@@ -180,6 +180,7 @@ kind.audio = "Audio"
 kind.document = "Document"
 kind.archive = "Archive"
 kind.font = "Font"
+kind.model = "3D Model"
 kind.other = "Other"
 
 [rules]

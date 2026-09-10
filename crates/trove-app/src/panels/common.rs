@@ -37,6 +37,7 @@ pub(crate) fn kind_icon(kind: AssetKind) -> IconName {
         AssetKind::Document => IconName::FileText,
         AssetKind::Archive => IconName::File,
         AssetKind::Font => IconName::CaseSensitive,
+        AssetKind::Model => IconName::Building2,
         AssetKind::Other => IconName::File,
     }
 }
