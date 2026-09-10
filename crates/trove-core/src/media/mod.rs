@@ -4,6 +4,7 @@
 pub mod blob;
 pub mod clip;
 pub mod color;
+pub mod convert;
 pub mod import;
 pub mod metadata;
 pub mod probe;
