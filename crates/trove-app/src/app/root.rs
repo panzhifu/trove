@@ -495,7 +495,10 @@ impl AppView {
                                 .child("Trove"),
                         )
                         .child(rust_i18n::t!("app.about_body").to_string())
-                        .child(rust_i18n::t!("app.version", version = "0.3.0").to_string()),
+                        .child(
+                            rust_i18n::t!("app.version", version = env!("CARGO_PKG_VERSION"))
+                                .to_string(),
+                        ),
                 ))
         });
     }
