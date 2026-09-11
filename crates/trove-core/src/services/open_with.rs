@@ -380,7 +380,9 @@ fn tokenize(exec: &str) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Application, expand_exec, parse_desktop, rank};
+    #[cfg(target_os = "linux")]
+    use super::parse_desktop;
+    use super::{Application, expand_exec, rank};
     use std::path::Path;
 
     fn app(id: &str, name: &str, exec: &str, mimes: &[&str]) -> Application {
