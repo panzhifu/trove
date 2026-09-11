@@ -2,14 +2,21 @@
 
 use gpui_kit::base::h_flex;
 use gpui_kit::component::ActiveTheme;
+use gpui_kit::component::WindowExt as _;
 use gpui_kit::component::menu::{PopupMenu, PopupMenuItem};
+use gpui_kit::component::notification::Notification;
 use gpui_kit::*;
 use uuid::Uuid;
 
 use crate::library::LibraryController;
 use crate::panels::workspace_search::open_image_search;
 use trove_core::model::AssetKind;
+use trove_core::services::open_with;
 use trove_core::store::{assets, collections};
+
+/// Cap on the "Open with" list. Beyond a handful of entries the submenu
+/// becomes a scrolling search problem; the default handler is always first.
+const MAX_OPEN_WITH_APPS: usize = 10;
 
 /// Build the right-click context menu for an asset cell.
 pub(crate) fn asset_context_menu(
@@ -25,11 +32,18 @@ pub(crate) fn asset_context_menu(
     }
 
     let conn = controller.read(cx).library.store().conn();
-    let (favorite, current_label, is_image) = assets::get(conn, asset_id)
+    let (favorite, current_label, is_image, mime) = assets::get(conn, asset_id)
         .ok()
         .flatten()
-        .map(|a| (a.is_favorite, a.color_label, a.kind == AssetKind::Image))
-        .unwrap_or((false, None, false));
+        .map(|a| {
+            (
+                a.is_favorite,
+                a.color_label,
+                a.kind == AssetKind::Image,
+                a.mime,
+            )
+        })
+        .unwrap_or((false, None, false, String::new()));
     let browsed_collection = controller.read(cx).current_collection;
 
     let ctl_build = controller.clone();
@@ -111,6 +125,22 @@ pub(crate) fn asset_context_menu(
                 }),
         );
         menu = menu.separator();
+    }
+    // "Open with": the installed applications that claim this mime type,
+    // plus the desktop default. Stored assets are handed over as a working
+    // copy so an editor cannot overwrite a content-addressed blob.
+    if let Some(target) = crate::library::open_with::target(controller.read(cx), asset_id) {
+        let apps = open_with::applications_for(&mime);
+        let c_open = controller.clone();
+        let submenu = PopupMenu::build(_window, cx, move |menu, _window, cx| {
+            build_open_with_submenu(menu, &c_open, &target, &apps, asset_id, cx)
+        });
+        menu = menu
+            .item(PopupMenuItem::submenu(
+                rust_i18n::t!("workspace.open_with").to_string(),
+                submenu,
+            ))
+            .separator();
     }
     let mut menu = menu
         .item(PopupMenuItem::submenu(
@@ -201,6 +231,102 @@ fn build_color_label_submenu(
         super::color_label::LabelTarget::Selection(asset_id),
         current,
     )
+}
+
+/// "Open with": the desktop default first, then the applications that
+/// declared this mime type, then the way back for an edited working copy.
+fn build_open_with_submenu(
+    mut menu: PopupMenu,
+    controller: &Entity<LibraryController>,
+    target: &crate::library::open_with::OpenTarget,
+    apps: &[open_with::Application],
+    asset_id: Uuid,
+    cx: &mut Context<PopupMenu>,
+) -> PopupMenu {
+    let default_label = rust_i18n::t!("workspace.open_default_app").to_string();
+    menu = menu
+        .min_w(px(220.))
+        .item(PopupMenuItem::new(default_label.clone()).on_click({
+            let target = target.clone();
+            move |_, window, cx| launch_external(window, cx, target.clone(), None)
+        }));
+
+    if !apps.is_empty() {
+        menu = menu.separator();
+    }
+    for app in apps.iter().take(MAX_OPEN_WITH_APPS) {
+        let label = app.name.clone();
+        menu = menu.item(PopupMenuItem::new(label).on_click({
+            let target = target.clone();
+            let app = app.clone();
+            move |_, window, cx| launch_external(window, cx, target.clone(), Some(app.clone()))
+        }));
+    }
+
+    // Only shown once the working copy actually differs from the library's
+    // file — importing an untouched copy would just duplicate the asset.
+    if let Some(copy) = crate::library::open_with::edited_copy(controller.read(cx), asset_id) {
+        let controller = controller.clone();
+        menu = menu.separator().item(
+            PopupMenuItem::new(rust_i18n::t!("workspace.import_edited_copy").to_string()).on_click(
+                move |_, window, cx| {
+                    crate::library::jobs::import_paths_app(
+                        &controller,
+                        vec![copy.clone()],
+                        window,
+                        cx,
+                    );
+                },
+            ),
+        );
+    }
+    menu
+}
+
+/// Hand the file to `app` (or the desktop default) off the UI thread: a
+/// stored asset is copied into the working directory first, which for a
+/// large file is not something to do inside a click handler.
+fn launch_external(
+    window: &mut Window,
+    cx: &mut App,
+    target: crate::library::open_with::OpenTarget,
+    app: Option<open_with::Application>,
+) {
+    let app_label = app
+        .as_ref()
+        .map(|app| app.name.clone())
+        .unwrap_or_else(|| rust_i18n::t!("workspace.open_default_app").to_string());
+    let name = target.file_name();
+    let working_copy = target.working_copy;
+    let handle = window.window_handle();
+
+    cx.spawn(async move |cx| {
+        let outcome = cx
+            .background_executor()
+            .spawn({
+                let target = target.clone();
+                let app = app.clone();
+                async move { crate::library::open_with::launch(&target, app.as_ref()) }
+            })
+            .await;
+        let _ = handle.update(cx, |_, window, cx| {
+            let note = match outcome {
+                Ok(()) if working_copy => Notification::info(
+                    rust_i18n::t!("notice.open_with_copy", name = name, app = app_label)
+                        .to_string(),
+                ),
+                Ok(()) => Notification::success(
+                    rust_i18n::t!("notice.open_with_done", name = name, app = app_label)
+                        .to_string(),
+                ),
+                Err(error) => Notification::warning(
+                    rust_i18n::t!("notice.open_with_failed", error = error.to_string()).to_string(),
+                ),
+            };
+            window.push_notification(note, cx);
+        });
+    })
+    .detach();
 }
 
 /// "Add to collection" submenu listing every root + nested collection.
