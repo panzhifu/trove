@@ -5,6 +5,7 @@ pub mod clipboard;
 mod controller;
 pub mod gpu3d;
 pub mod jobs;
+pub mod open_with;
 pub mod video_player;
 pub mod viewport3d;
 pub mod watcher;
