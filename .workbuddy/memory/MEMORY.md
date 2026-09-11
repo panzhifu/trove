@@ -11,7 +11,21 @@
 
 ## i18n（rust_i18n）
 - 语言文件：`crates/trove-app/locales/{en,zh-CN}.toml`，**必须同键同序**（文件头注释明写）。
-- 插值用 `%{var}`。新增代码里的 `t!("a.b")` 若没写进两个 toml，界面会原样显示 key —— 提交前务必跑一次键校验（见 2026-09-10 日记录的 python 扫描脚本思路）。
+- 插值用 `%{var}`。新增代码里的 `t!("a.b")` 若没写进两个 toml，界面会原样显示 key —— 提交前务必跑键校验（tomllib 展开成点分扁平键后比对序列，见下）：
+  ```bash
+  python3 - <<'EOF'
+  import tomllib
+  def flat(d,p=""):
+      out=[]
+      for k,v in d.items():
+          key=f"{p}{k}"
+          out+=flat(v,key+".") if isinstance(v,dict) else [key]
+      return out
+  a=flat(tomllib.load(open("crates/trove-app/locales/en.toml","rb")))
+  b=flat(tomllib.load(open("crates/trove-app/locales/zh-CN.toml","rb")))
+  print(len(a),len(b),a==b,[k for k in a if k not in b],[k for k in b if k not in a])
+  EOF
+  ```
 - `shortcuts.actions.<ActionId>` + `settings.rs::action_label` 是快捷键面板显示名的两处来源，新增可绑定 action 时都要加。
 
 ## gpui / gpui-kit 关键坑（本项目实测）
@@ -26,6 +40,17 @@
 - `CursorStyle` 里的手型是 `ClosedHand`（拖拽中）/ `OpenHand`（可拖拽），没有 `Grabbing`。
 - `ScrollDelta` 两个变体：`Lines(Point<f32>)` 和 `Pixels(Point<Pixels>)`（后者要 `.as_f32()`）。
 - `ClickEvent` 是 enum，双击次数用 `event.click_count()`，不是 `event.up.click_count`。
+- **在面板模块里加测试不要 `use super::*`**：面板模块已经 glob 了 gpui prelude，会把 gpui 的 `test` 属性宏一起带进来，与标准 `#[test]` 冲突 → `recursion limit reached while expanding #[test]`。测试模块里显式写 `use super::{Cell, Row, …};`（`gpu3d.rs` 能用 glob 是因为那个模块没引 gpui prelude）。
+
+## 主题与外观（gpui-kit 的 Theme）
+- 主题是框架自己的：`Theme` global 存 `light_theme`/`dark_theme` 两个 `ThemeConfig` + 当前 `ThemeMode`；`ThemeRegistry` global 按名字存所有主题。切换 = 换 config + `Theme::change(mode, window, cx)` + `cx.refresh_windows()`。
+- `crates/trove-app/build.rs` 用 `cargo metadata` 定位 gpui-kit 的 `themes/`，拷进 `OUT_DIR/themes` 并生成 `builtin_themes.rs`（`BUILTIN_THEME_JSON`）——**21 个文件共 36 个主题（25 dark / 11 light）**，框架默认只注册 Default Light/Dark 两个。`TROVE_THEMES_DIR` 可覆盖。
+- 用户偏好存 `AppConfig`：`appearance`(system/light/dark) + `theme_light`/`theme_dark`(名字)；`app/theme.rs::apply_from_settings` 是唯一入口，启动时调一次，`AppView` 用 `window.observe_window_appearance` 订阅系统明暗。用户自定义主题放 `<config>/trove/themes/*.json`（`register_user_themes` 后加载，覆盖同名内置）。
+- ⚠️ `apply_from_settings` 在 appearance 观察者里必须传 `Some(window)`：Linux 上 `cx.window_appearance()` 走的 `RefCell` 正被借用，直接查会 panic。
+
+## 外部应用打开资产（Open With）
+- `services/open_with.rs`：扫 `$XDG_DATA_HOME` + `$XDG_DATA_DIRS` 下所有 `.desktop`（含子目录），只要 `Type=Application`、非 NoDisplay/Hidden/Terminal、`MimeType` 命中就进候选；`Exec` 的字段码（`%f %F %u %U %i %c %k %%`）自己展开，无文件码时按规范补路径。目录里较早的 desktop-file id 优先，结果按「精确 mime 优先于 `type/*` 通配，再按名字」排序，进程内缓存（`reload_catalogue()` 可失效）。
+- **内容寻址的 blob 不能就地编辑**：库内路径就是 SHA-256，就地写会破坏去重与完整性校验。所以 `library/open_with.rs` 对 `Origin::Stored` 先复制一份到 `<config>/edit/<asset_id>/<原文件名>` 再交给外部程序（副本存在就绝不覆盖，否则会吞掉用户的编辑），`edited_copy()` 判定「改过」后才在菜单里出现「导入编辑后的副本」（先比大小，≤32 MiB 才真去 hash，避免右键卡帧）。`Origin::Linked` 是用户自己的文件，直接原地打开。
 
 ## 三维模型（Model）资产
 - `AssetKind::Model` 已存在；OBJ/STL/PLY 由 `media::mesh` 解析，缩略图走 `media::render3d`（CPU 光栅化），交互视口走 `library/gpu3d.rs`（自建 wgpu 设备 + 离屏渲染 + readback）。
