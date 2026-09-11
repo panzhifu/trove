@@ -441,15 +441,15 @@ pub fn vertex_data(mesh: &Mesh) -> VertexData {
 /// points themselves.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PointData {
-    /// Interleaved `[x, y, z, nx, ny, nz]` per point.
+    /// Interleaved `[x, y, z, nx, ny, nz, r, g, b]` per point.
     pub points: Vec<f32>,
-    /// Points in the buffer, i.e. `points.len() / 6`.
+    /// Points in the buffer, i.e. `points.len() / 9`.
     pub count: u32,
 }
 
 impl PointData {
-    /// Bytes of one interleaved point: two `vec3<f32>`.
-    pub const STRIDE: u64 = 24;
+    /// Bytes of one interleaved point: position, normal and base colour.
+    pub const STRIDE: u64 = 3 * 3 * 4;
 
     /// The point array as bytes, ready for `Queue::write_buffer`.
     pub fn bytes(&self) -> Vec<u8> {
@@ -459,9 +459,10 @@ impl PointData {
 
 /// Flatten a point cloud into the instance data its pipeline reads.
 pub fn point_data(mesh: &Mesh) -> PointData {
-    let mut points = Vec::with_capacity(mesh.positions.len() * 6);
+    let mut points = Vec::with_capacity(mesh.positions.len() * 9);
     for (index, position) in mesh.positions.iter().enumerate() {
         let normal = point_normal(mesh, index);
+        let color = base_color(mesh, index);
         points.extend_from_slice(&[
             position[0],
             position[1],
@@ -469,6 +470,9 @@ pub fn point_data(mesh: &Mesh) -> PointData {
             normal[0],
             normal[1],
             normal[2],
+            color[0],
+            color[1],
+            color[2],
         ]);
     }
     PointData {
@@ -599,6 +603,15 @@ fn paint(
     colors
 }
 
+/// The colour to paint one vertex with: the file's own when it carries one,
+/// otherwise the material.
+///
+/// Shared by the CPU splat and the GPU instance buffer, so a cloud's colours
+/// cannot drift between the two renderers.
+pub fn base_color(mesh: &Mesh, index: usize) -> [f32; 3] {
+    mesh.colors.get(index).copied().unwrap_or(MATERIAL)
+}
+
 /// Draw a point cloud: one sprite per vertex, shaded and depth-tested.
 ///
 /// Mirrors `fs_point` in `gpu3d.wgsl` — same normal choice, same lighting
@@ -640,10 +653,11 @@ fn paint_points(
             normal
         };
         let intensity = AMBIENT + DIFFUSE * dot(normal, light).max(0.0);
+        let base = base_color(mesh, index);
         let rgb = [
-            MATERIAL[0] * intensity,
-            MATERIAL[1] * intensity,
-            MATERIAL[2] * intensity,
+            base[0] * intensity,
+            base[1] * intensity,
+            base[2] * intensity,
         ];
         target.point(view, radius, rgb);
     }
@@ -1349,6 +1363,24 @@ mod tests {
         crate::media::mesh::load_ply(ply.as_bytes()).expect("cloud parses")
     }
 
+    /// A cloud whose vertices carry a colour, as a coloured scan arrives.
+    fn colored_cloud(points: &[[f32; 3]], colors: &[[u8; 3]]) -> Mesh {
+        let mut ply = format!(
+            "ply\nformat ascii 1.0\nelement vertex {}\n\
+             property float x\nproperty float y\nproperty float z\n\
+             property uchar red\nproperty uchar green\nproperty uchar blue\n\
+             end_header\n",
+            points.len()
+        );
+        for (point, color) in points.iter().zip(colors) {
+            ply.push_str(&format!(
+                "{} {} {} {} {} {}\n",
+                point[0], point[1], point[2], color[0], color[1], color[2]
+            ));
+        }
+        crate::media::mesh::load_ply(ply.as_bytes()).expect("cloud parses")
+    }
+
     /// Pixels the renderer touched, i.e. everything that left the background.
     fn painted(frame: &Frame) -> usize {
         frame
@@ -1422,14 +1454,63 @@ mod tests {
     }
 
     #[test]
-    fn the_instance_data_carries_a_normal_per_point() {
+    fn the_instance_data_carries_a_normal_and_a_colour_per_point() {
         let mesh = cloud(&[[1.0, 0.0, 0.0], [-1.0, 0.0, 0.0]]);
         let data = point_data(&mesh);
         assert_eq!(data.count, 2);
-        assert_eq!(data.points.len(), 12);
-        assert_eq!(PointData::STRIDE, 2 * 3 * 4);
-        assert_eq!(&data.points[0..6], &[1.0, 0.0, 0.0, 1.0, 0.0, 0.0]);
-        assert_eq!(&data.points[6..12], &[-1.0, 0.0, 0.0, -1.0, 0.0, 0.0]);
+        assert_eq!(data.points.len(), 18);
+        assert_eq!(PointData::STRIDE, 3 * 3 * 4);
+        // The file carries no colour, so both points fall back to the material.
+        assert_eq!(
+            &data.points[0..9],
+            &[
+                1.0,
+                0.0,
+                0.0,
+                1.0,
+                0.0,
+                0.0,
+                MATERIAL[0],
+                MATERIAL[1],
+                MATERIAL[2]
+            ]
+        );
+        assert_eq!(
+            &data.points[9..18],
+            &[
+                -1.0,
+                0.0,
+                0.0,
+                -1.0,
+                0.0,
+                0.0,
+                MATERIAL[0],
+                MATERIAL[1],
+                MATERIAL[2]
+            ]
+        );
+    }
+
+    /// A scan that carries its own colours is painted with them, not with the
+    /// material: the point renders in the file's colour.
+    #[test]
+    fn a_coloured_cloud_paints_with_its_own_colours() {
+        let mesh = colored_cloud(&[[0.0, 0.0, 0.0]], &[[255, 0, 0]]);
+        assert!(mesh.has_vertex_colors());
+        assert_eq!(base_color(&mesh, 0), [1.0, 0.0, 0.0]);
+
+        let frame = render(&mesh, &Camera::default(), 64, 64, 1);
+        // BGRA: a red point leaves the green and blue channels dark, where a
+        // material-shaded one would be a grey-blue.
+        let centre = frame.pixel(32, 32);
+        assert!(
+            centre[2] > 200 && centre[0] < 40 && centre[1] < 40,
+            "expected a red point, got {centre:?}"
+        );
+
+        // The instance data carries the same colour the CPU splat used.
+        let data = point_data(&mesh);
+        assert_eq!(&data.points[6..9], &[1.0, 0.0, 0.0]);
     }
 
     /// A cloud of one repeated point has no extent at all; the framing has to

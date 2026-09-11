@@ -234,7 +234,10 @@ impl GpuRenderer {
         });
 
         // Points: the sprite corners come from the shader's `vertex_index`, so
-        // the only vertex buffer holds one instance per point.
+        // the only vertex buffer holds one instance per point — position,
+        // normal and the point's own colour.
+        let point_attributes =
+            wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x3];
         let point_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("trove-3d-points"),
             layout: Some(&pipeline_layout),
@@ -245,7 +248,7 @@ impl GpuRenderer {
                 buffers: &[wgpu::VertexBufferLayout {
                     array_stride: render3d::PointData::STRIDE,
                     step_mode: wgpu::VertexStepMode::Instance,
-                    attributes: &attributes,
+                    attributes: &point_attributes,
                 }],
             },
             primitive: wgpu::PrimitiveState {
@@ -573,15 +576,15 @@ mod tests {
         );
     }
 
-    /// `vs_model` and `vs_point` must each read position and normal from the
-    /// two locations their pipeline's vertex buffer layout describes, both
-    /// `vec3<f32>`.
+    /// `vs_model` reads position and normal, `vs_point` also reads the point's
+    /// colour — one `vec3<f32>` per location its pipeline's vertex buffer
+    /// layout describes, in the same order and with the same stride.
     #[test]
     fn the_vertex_inputs_match_the_buffer_layouts() {
         let module = module();
-        for (entry_point, stride) in [
-            ("vs_model", render3d::VertexData::STRIDE),
-            ("vs_point", render3d::PointData::STRIDE),
+        for (entry_point, locations, stride) in [
+            ("vs_model", 2, render3d::VertexData::STRIDE),
+            ("vs_point", 3, render3d::PointData::STRIDE),
         ] {
             let entry = module
                 .entry_points
@@ -601,16 +604,18 @@ mod tests {
                 inputs.push((location, scalar.kind, size));
             }
             inputs.sort_by_key(|(location, _, _)| *location);
-            assert_eq!(
-                inputs,
-                vec![
-                    (0, naga::ScalarKind::Float, naga::VectorSize::Tri),
-                    (1, naga::ScalarKind::Float, naga::VectorSize::Tri),
-                ],
-                "{entry_point} inputs"
-            );
-            // Two vec3<f32> per vertex or instance: the stride declared above.
-            assert_eq!(stride, 2 * 3 * 4, "{entry_point} stride");
+            let expected: Vec<_> = (0..locations)
+                .map(|location| {
+                    (
+                        location as u32,
+                        naga::ScalarKind::Float,
+                        naga::VectorSize::Tri,
+                    )
+                })
+                .collect();
+            assert_eq!(inputs, expected, "{entry_point} inputs");
+            // `locations` vec3<f32> per vertex or instance: the declared stride.
+            assert_eq!(stride, locations * 3 * 4, "{entry_point} stride");
         }
     }
 

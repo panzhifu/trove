@@ -10,6 +10,11 @@
 //! without triangles. OBJ and STL stay triangle-only: their stray vertices are
 //! a broken export rather than a cloud.
 //!
+//! A PLY may also carry a colour per vertex. Point clouds are where that
+//! matters (a scan without its colours is grey noise), so the point renderer
+//! uses them; a triangle mesh still shades from the material, because its GPU
+//! layout carries no colour attribute.
+//!
 //! Parsing is deliberately lenient: unknown lines, extra vertex properties
 //! and unsupported primitives are skipped rather than failing the load. Only
 //! a file that yields no usable vertex at all is an error.
@@ -83,6 +88,9 @@ pub struct Mesh {
     /// Per-vertex normals; empty (or a different length than `positions`)
     /// means the file carries none and the renderer shades per face.
     pub normals: Vec<[f32; 3]>,
+    /// Per-vertex colour in 0..=1, empty when the file carries none. Read by
+    /// the point renderer; a triangle mesh shades from the material instead.
+    pub colors: Vec<[f32; 3]>,
     /// Triangles; empty for a point cloud, which is drawn vertex by vertex.
     pub triangles: Vec<[u32; 3]>,
     pub bounds: Bounds,
@@ -126,21 +134,31 @@ impl Mesh {
         self.normals.len() == self.positions.len() && !self.normals.is_empty()
     }
 
+    /// Whether the model has a usable colour per vertex.
+    pub fn has_vertex_colors(&self) -> bool {
+        self.colors.len() == self.positions.len() && !self.colors.is_empty()
+    }
+
     /// Build a mesh from raw positions/triangles, dropping degenerate
     /// triangles and recomputing the bounds. Returns `None` when nothing
     /// usable is left.
     fn finish(
         positions: Vec<[f32; 3]>,
         normals: Vec<[f32; 3]>,
+        colors: Vec<[f32; 3]>,
         triangles: Vec<[u32; 3]>,
     ) -> Option<Self> {
-        let mesh = Self::assemble(positions, normals, triangles)?;
+        let mesh = Self::assemble(positions, normals, colors, triangles)?;
         (!mesh.is_point_cloud()).then_some(mesh)
     }
 
     /// Build a point cloud: positions only, no triangles to filter.
-    fn finish_points(positions: Vec<[f32; 3]>, normals: Vec<[f32; 3]>) -> Option<Self> {
-        Self::assemble(positions, normals, Vec::new())
+    fn finish_points(
+        positions: Vec<[f32; 3]>,
+        normals: Vec<[f32; 3]>,
+        colors: Vec<[f32; 3]>,
+    ) -> Option<Self> {
+        Self::assemble(positions, normals, colors, Vec::new())
     }
 
     /// Shared tail of both constructors: checks the vertices are usable,
@@ -148,6 +166,7 @@ impl Mesh {
     fn assemble(
         positions: Vec<[f32; 3]>,
         normals: Vec<[f32; 3]>,
+        colors: Vec<[f32; 3]>,
         triangles: Vec<[u32; 3]>,
     ) -> Option<Self> {
         if positions.is_empty() {
@@ -171,9 +190,15 @@ impl Mesh {
         } else {
             Vec::new()
         };
+        let colors = if colors.len() == positions.len() {
+            colors
+        } else {
+            Vec::new()
+        };
         Some(Self {
             positions,
             normals,
+            colors,
             triangles,
             bounds,
         })
@@ -279,7 +304,7 @@ pub fn load_obj(text: &str) -> Result<Mesh, String> {
         Vec::new()
     };
 
-    Mesh::finish(positions, vertex_normals, triangles)
+    Mesh::finish(positions, vertex_normals, Vec::new(), triangles)
         .ok_or_else(|| "the OBJ file contains no triangles".to_string())
 }
 
@@ -346,7 +371,7 @@ fn load_stl_binary(bytes: &[u8], count: usize) -> Result<Mesh, String> {
         let first = (i * 3) as u32;
         triangles.push([first, first + 1, first + 2]);
     }
-    Mesh::finish(positions, Vec::new(), triangles)
+    Mesh::finish(positions, Vec::new(), Vec::new(), triangles)
         .ok_or_else(|| "the STL file contains no triangles".to_string())
 }
 
@@ -370,7 +395,7 @@ pub fn load_stl_ascii(text: &str) -> Result<Mesh, String> {
             }
         }
     }
-    Mesh::finish(positions, Vec::new(), triangles)
+    Mesh::finish(positions, Vec::new(), Vec::new(), triangles)
         .ok_or_else(|| "the STL file contains no triangles".to_string())
 }
 
@@ -418,6 +443,13 @@ impl PlyType {
             Self::I32 | Self::U32 | Self::F32 => 4,
             Self::F64 => 8,
         }
+    }
+
+    /// Whether the type holds an integer. Colour channels are 0..=255 in
+    /// every integer flavour but 0..=1 as floats, and the header is what says
+    /// which one a file uses.
+    fn is_integer(self) -> bool {
+        !matches!(self, Self::F32 | Self::F64)
     }
 }
 
@@ -499,6 +531,7 @@ pub fn load_ply(bytes: &[u8]) -> Result<Mesh, String> {
 
     let mut positions = Vec::new();
     let mut normals: Vec<[f32; 3]> = Vec::new();
+    let mut colors: Vec<[f32; 3]> = Vec::new();
     let mut triangles = Vec::new();
     let body = &bytes[header_end..];
     let mut binary_cursor = std::io::Cursor::new(body);
@@ -509,7 +542,10 @@ pub fn load_ply(bytes: &[u8]) -> Result<Mesh, String> {
         let is_vertex = element.name == "vertex";
         let is_face = element.name == "face";
         for _ in 0..element.count {
-            let mut values: Vec<(String, Vec<f64>)> = Vec::with_capacity(element.properties.len());
+            // The declared type travels with the value: a colour channel is
+            // 0..=255 as an integer and 0..=1 as a float.
+            let mut values: Vec<(String, Vec<f64>, PlyType)> =
+                Vec::with_capacity(element.properties.len());
             for property in &element.properties {
                 let mut read = |endian: Option<PlyEndian>| -> Option<Vec<f64>> {
                     match endian {
@@ -552,14 +588,31 @@ pub fn load_ply(bytes: &[u8]) -> Result<Mesh, String> {
                 let Some(v) = read(endian) else {
                     return Err("the PLY body ends early".into());
                 };
-                values.push((property.name.clone(), v));
+                values.push((property.name.clone(), v, property.ty));
             }
             let scalar = |name: &str| -> Option<f32> {
                 values
                     .iter()
-                    .find(|(n, _)| n == name)
-                    .and_then(|(_, v)| v.first())
+                    .find(|(n, _, _)| n == name)
+                    .and_then(|(_, v, _)| v.first())
                     .map(|v| *v as f32)
+            };
+            // A colour channel: 0..=255 in an integer field, 0..=1 as a
+            // float. Values outside the range are clamped rather than
+            // wrapping, so a broken file still renders.
+            let channel = |names: &[&str]| -> Option<f32> {
+                values
+                    .iter()
+                    .find(|(n, _, _)| names.iter().any(|name| n == name))
+                    .and_then(|(_, v, ty)| {
+                        let value = *v.first()?;
+                        Some(if ty.is_integer() {
+                            (value / 255.0) as f32
+                        } else {
+                            value as f32
+                        })
+                    })
+                    .map(|value| value.clamp(0.0, 1.0))
             };
             if is_vertex {
                 if let (Some(x), Some(y), Some(z)) = (scalar("x"), scalar("y"), scalar("z")) {
@@ -569,12 +622,21 @@ pub fn load_ply(bytes: &[u8]) -> Result<Mesh, String> {
                     {
                         normals.push([nx, ny, nz]);
                     }
+                    // `red green blue` is the spec name; MeshLab and
+                    // CloudCompare write `diffuse_*` often enough to take both.
+                    if let (Some(r), Some(g), Some(b)) = (
+                        channel(&["red", "diffuse_red"]),
+                        channel(&["green", "diffuse_green"]),
+                        channel(&["blue", "diffuse_blue"]),
+                    ) {
+                        colors.push([r, g, b]);
+                    }
                 }
             } else if is_face {
                 let indices: Vec<u32> = values
                     .iter()
-                    .filter(|(name, _)| name == "vertex_indices" || name == "vertex_index")
-                    .flat_map(|(_, v)| v.iter().map(|i| *i as u32))
+                    .filter(|(name, _, _)| name == "vertex_indices" || name == "vertex_index")
+                    .flat_map(|(_, v, _)| v.iter().map(|i| *i as u32))
                     .collect();
                 for i in 1..indices.len().saturating_sub(1) {
                     triangles.push([indices[0], indices[i], indices[i + 1]]);
@@ -587,10 +649,10 @@ pub fn load_ply(bytes: &[u8]) -> Result<Mesh, String> {
     // that declares one but yields no usable triangle is still an error.
     let declared_faces = elements.iter().any(|element| element.name == "face");
     if declared_faces {
-        Mesh::finish(positions, normals, triangles)
+        Mesh::finish(positions, normals, colors, triangles)
             .ok_or_else(|| "the PLY file contains no triangles".to_string())
     } else {
-        Mesh::finish_points(positions, normals)
+        Mesh::finish_points(positions, normals, colors)
             .ok_or_else(|| "the PLY file contains no vertices".to_string())
     }
 }
@@ -918,6 +980,130 @@ end_header
 0 0 0
 ";
         assert!(load_ply(ply.as_bytes()).is_err());
+    }
+
+    /// A coloured scan: `red green blue` as `uchar` scales to 0..=1.
+    #[test]
+    fn a_ply_point_cloud_reads_its_vertex_colours() {
+        let ply = "\
+ply
+format ascii 1.0
+element vertex 2
+property float x
+property float y
+property float z
+property uchar red
+property uchar green
+property uchar blue
+end_header
+0 0 0 255 0 0
+1 0 0 0 128 255
+";
+        let mesh = load_ply(ply.as_bytes()).expect("a coloured cloud parses");
+        assert!(mesh.is_point_cloud());
+        assert!(mesh.has_vertex_colors());
+        assert_eq!(
+            mesh.colors,
+            vec![[1.0, 0.0, 0.0], [0.0, 128.0 / 255.0, 1.0]]
+        );
+    }
+
+    /// A file that writes its colours as floats already holds 0..=1: scaling
+    /// them by 255 the way an integer channel is would blow the cloud out to
+    /// white.
+    #[test]
+    fn float_colour_channels_are_taken_as_they_are() {
+        let ply = "\
+ply
+format ascii 1.0
+element vertex 1
+property float x
+property float y
+property float z
+property float red
+property float green
+property float blue
+end_header
+0 0 0 0.25 0.5 1.0
+";
+        let mesh = load_ply(ply.as_bytes()).expect("float colours parse");
+        assert_eq!(mesh.colors, vec![[0.25, 0.5, 1.0]]);
+    }
+
+    /// MeshLab and CloudCompare spell the channels `diffuse_*`; a scan from
+    /// either must still come out coloured.
+    #[test]
+    fn diffuse_colour_channels_are_accepted() {
+        let ply = "\
+ply
+format ascii 1.0
+element vertex 1
+property float x
+property float y
+property float z
+property uchar diffuse_red
+property uchar diffuse_green
+property uchar diffuse_blue
+end_header
+0 0 0 10 20 30
+";
+        let mesh = load_ply(ply.as_bytes()).expect("diffuse colours parse");
+        assert!(mesh.has_vertex_colors());
+        assert_eq!(
+            mesh.colors,
+            vec![[10.0 / 255.0, 20.0 / 255.0, 30.0 / 255.0]]
+        );
+    }
+
+    /// A colour that is present on only some vertices is dropped wholesale:
+    /// half a colour array would shade the wrong point.
+    #[test]
+    fn an_incomplete_colour_array_is_dropped() {
+        let ply = "\
+ply
+format ascii 1.0
+element vertex 2
+property float x
+property float y
+property float z
+property uchar red
+end_header
+0 0 0 255
+1 0 0 0
+";
+        let mesh = load_ply(ply.as_bytes()).expect("a red-only cloud parses");
+        assert!(!mesh.has_vertex_colors());
+        assert!(mesh.colors.is_empty());
+    }
+
+    /// Colours must not disturb the triangle path: a mesh keeps its geometry,
+    /// and the GPU layout for a model still carries no colour attribute.
+    #[test]
+    fn a_coloured_mesh_still_loads_its_triangles() {
+        let ply = "\
+ply
+format ascii 1.0
+element vertex 3
+property float x
+property float y
+property float z
+property uchar red
+property uchar green
+property uchar blue
+element face 1
+property list uchar int vertex_indices
+end_header
+0 0 0 255 0 0
+1 0 0 0 255 0
+0 1 0 0 0 255
+3 0 1 2
+";
+        let mesh = load_ply(ply.as_bytes()).expect("a coloured mesh parses");
+        assert!(!mesh.is_point_cloud());
+        assert_eq!(mesh.triangles.len(), 1);
+        // Read anyway, so a later consumer need not reparse, but the triangle
+        // renderer ignores them.
+        assert!(mesh.has_vertex_colors());
     }
 
     /// OBJ and STL do not get the cloud treatment: a stray vertex there is a
