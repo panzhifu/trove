@@ -149,11 +149,25 @@ const MODEL_CARD_SIZE: (u32, u32) = (512, 384);
 fn write_model_card(blob_path: &Path, out: &Path) -> Option<PathBuf> {
     use crate::media::{mesh, render3d};
 
-    let mesh = mesh::load(blob_path).ok()?;
+    // Large model files go through the chunked/LOD loader so a 500 MB
+    // export does not have to be read whole into memory and fully parsed
+    // just to draw a 512×384 thumbnail.  The card is a preview, not the
+    // interactive viewport, so the subsampled geometry is plenty.
+    let size = std::fs::metadata(blob_path).map(|m| m.len()).unwrap_or(0);
+    const CHUNKED_THRESHOLD: u64 = 64 << 20;
+    let mesh = if size > CHUNKED_THRESHOLD {
+        let config = crate::media::chunked::LodConfig {
+            memory_budget: 32 << 20,
+            max_lod_step: 16,
+        };
+        crate::media::chunked::load_ply_chunked(blob_path, config).ok()?
+    } else {
+        mesh::load(blob_path).ok()?
+    };
     let (w, h) = MODEL_CARD_SIZE;
     // Supersample once: this runs a single time per asset, and the grid is
     // where a jagged silhouette would be most obvious.
-    let frame = render3d::render(&mesh, &render3d::Camera::default(), w, h, 2);
+    let frame = render3d::render(&mesh, &render3d::Camera::default(), w, h, 2, 1.0);
 
     let mut card = image::RgbImage::new(w, h);
     for (pixel, src) in card.pixels_mut().zip(frame.bgra.as_chunks::<4>().0.iter()) {
