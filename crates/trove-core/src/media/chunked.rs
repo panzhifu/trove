@@ -31,7 +31,7 @@ use std::fs::File;
 use std::path::Path;
 
 use super::mesh::{
-    self, Mesh, PlyElement, PlyEndian, PlyProperty, PlyType, VertexColumns, BODY_END,
+    self, BODY_END, Mesh, PlyElement, PlyEndian, PlyProperty, PlyType, VertexColumns,
 };
 
 /// How much RAM the parsed [`Mesh`] is allowed to occupy. The loader picks
@@ -74,16 +74,14 @@ impl MmapFile {
     /// Open `path`, mmap-ing when `threshold` bytes is exceeded, reading
     /// whole otherwise.
     fn open(path: &Path, threshold: u64) -> Result<Self, String> {
-        let size = std::fs::metadata(path)
-            .map_err(|e| e.to_string())?
-            .len();
+        let size = std::fs::metadata(path).map_err(|e| e.to_string())?.len();
         if size > threshold {
             let file = File::open(path).map_err(|e| e.to_string())?;
             // SAFETY: PLY files are read-only once written; we never mmap
             // a file another process is mutating. The mapping stays alive
             // as long as this `MmapFile` does.
-            let mmap = unsafe { memmap2::MmapOptions::new().map(&file) }
-                .map_err(|e| e.to_string())?;
+            let mmap =
+                unsafe { memmap2::MmapOptions::new().map(&file) }.map_err(|e| e.to_string())?;
             Ok(Self::Mmap(mmap))
         } else {
             let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
@@ -197,9 +195,7 @@ pub fn load_ply_chunked(path: &Path, config: LodConfig) -> Result<Mesh, String> 
     let lod_step = choose_lod_step(vertex_count, &elements, config);
 
     let parsed = match endian {
-        Some(order) => {
-            parse_binary_chunked(body, &elements, order, lod_step, declared_faces)?
-        }
+        Some(order) => parse_binary_chunked(body, &elements, order, lod_step, declared_faces)?,
         None => parse_ascii_chunked(body, &elements, lod_step, declared_faces)?,
     };
 
@@ -361,11 +357,15 @@ fn parse_binary_chunked(
         for element in elements {
             if element.name == "vertex" {
                 let fixed = element.properties.iter().all(|p| p.count_ty.is_none());
-                if fixed
-                    && let Some(cols) = vertex_columns(&element.properties)
-                {
+                if fixed && let Some(cols) = vertex_columns(&element.properties) {
                     parse_binary_vertices_remapped(
-                        body, &mut cursor, element, &cols, order, &remap, &mut out,
+                        body,
+                        &mut cursor,
+                        element,
+                        &cols,
+                        order,
+                        &remap,
+                        &mut out,
                     )?;
                     continue;
                 }
@@ -399,11 +399,15 @@ fn parse_binary_chunked(
         for element in elements {
             if element.name == "vertex" {
                 let fixed = element.properties.iter().all(|p| p.count_ty.is_none());
-                if fixed
-                    && let Some(cols) = vertex_columns(&element.properties)
-                {
+                if fixed && let Some(cols) = vertex_columns(&element.properties) {
                     parse_binary_vertices_stride(
-                        body, &mut cursor, element, &cols, order, lod_step, &mut out,
+                        body,
+                        &mut cursor,
+                        element,
+                        &cols,
+                        order,
+                        lod_step,
+                        &mut out,
                     )?;
                     continue;
                 }
@@ -537,7 +541,12 @@ fn parse_binary_vertices_remapped(
         .filter(|end| *end <= body.len())
         .ok_or(BODY_END)?;
 
-    let offset = |col: usize| properties[..col].iter().map(|p| p.ty.width()).sum::<usize>();
+    let offset = |col: usize| {
+        properties[..col]
+            .iter()
+            .map(|p| p.ty.width())
+            .sum::<usize>()
+    };
     let ty = |col: usize| properties[col].ty;
     let (x, y, z) = (
         (offset(cols.x), ty(cols.x)),
@@ -604,7 +613,12 @@ fn parse_binary_vertices_stride(
         .filter(|end| *end <= body.len())
         .ok_or(BODY_END)?;
 
-    let offset = |col: usize| properties[..col].iter().map(|p| p.ty.width()).sum::<usize>();
+    let offset = |col: usize| {
+        properties[..col]
+            .iter()
+            .map(|p| p.ty.width())
+            .sum::<usize>()
+    };
     let ty = |col: usize| properties[col].ty;
     let (x, y, z) = (
         (offset(cols.x), ty(cols.x)),
@@ -719,9 +733,7 @@ fn parse_ascii_chunked(
             if element.name == "vertex"
                 && let Some(cols) = vertex_columns(&element.properties)
             {
-                parse_ascii_vertices_remapped(
-                    body, &mut cursor, element, &cols, &remap, &mut out,
-                )?;
+                parse_ascii_vertices_remapped(body, &mut cursor, element, &cols, &remap, &mut out)?;
                 continue;
             }
             for _ in 0..element.count {
@@ -791,8 +803,8 @@ fn collect_ascii_faces(
             .max(0.0) as usize;
         let mut face = Vec::with_capacity(length);
         for _ in 0..length {
-            let index = mesh::token_f64(tokens.next_token().ok_or(BODY_END)?)
-                .ok_or(BODY_END)? as u32;
+            let index =
+                mesh::token_f64(tokens.next_token().ok_or(BODY_END)?).ok_or(BODY_END)? as u32;
             face.push(index);
             if (index as usize) < referenced.len() {
                 referenced[index as usize] = 1;

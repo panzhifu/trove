@@ -7654,6 +7654,8 @@ dependencies = [
  "jxl-oxide",
  "kamadak-exif",
  "lofty",
+ "memchr",
+ "memmap2",
  "mp4",
  "ndarray",
  "ort",

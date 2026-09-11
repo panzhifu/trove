@@ -531,7 +531,16 @@ fn paint(
     let mut depth = vec![0f32; w * h];
 
     if mesh.is_point_cloud() {
-        paint_points(&mut colors, &mut depth, mesh, framing, w, h, point_radius, quality);
+        paint_points(
+            &mut colors,
+            &mut depth,
+            mesh,
+            framing,
+            w,
+            h,
+            point_radius,
+            quality,
+        );
         return colors;
     }
     if mesh.triangles.is_empty() {
