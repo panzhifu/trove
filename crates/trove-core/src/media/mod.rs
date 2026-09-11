@@ -2,6 +2,7 @@
 //! the file import pipeline.
 
 pub mod blob;
+pub mod chunked;
 pub mod clip;
 pub mod color;
 pub mod convert;

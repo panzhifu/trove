@@ -597,10 +597,7 @@ impl WorkspacePanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(viewport) = ModelViewport::spawn(name, path, cx) else {
-            self.report_view_error(cx, rust_i18n::t!("viewport.load_failed"));
-            return;
-        };
+        let viewport = ModelViewport::spawn(name, path, cx);
         let subscription = cx.subscribe(&viewport, |this, _, event: &ModelViewportEvent, cx| {
             if *event == ModelViewportEvent::Closed {
                 this.forget_viewport(cx);
