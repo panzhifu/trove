@@ -52,6 +52,7 @@ pub fn plan(mode: ScreenshotMode, custom: Option<&str>, dest: &Path) -> Option<C
 }
 
 /// [`plan`] with an explicit session type — the unit-testable core.
+#[allow(unused_variables)]
 pub fn plan_for(
     mode: ScreenshotMode,
     custom: Option<&str>,
@@ -64,7 +65,7 @@ pub fn plan_for(
 
     #[cfg(target_os = "macos")]
     {
-        return Some(CapturePlan {
+        Some(CapturePlan {
             program: "screencapture".into(),
             args: vec![
                 match mode {
@@ -74,7 +75,7 @@ pub fn plan_for(
                 .to_string(),
                 quotable(dest),
             ],
-        });
+        })
     }
 
     #[cfg(target_os = "windows")]
