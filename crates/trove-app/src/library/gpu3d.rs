@@ -49,11 +49,17 @@ pub enum GpuUnavailable {
 }
 
 /// A model whose geometry already lives in GPU buffers.
+///
+/// A triangle mesh puts its interleaved vertices in `vertices` and indexes
+/// them; a point cloud puts one instance per point there instead and is drawn
+/// with the point pipeline.
 pub struct GpuMesh {
     vertices: wgpu::Buffer,
     indices: Option<wgpu::Buffer>,
     vertex_count: u32,
     index_count: u32,
+    /// Points to draw; `0` when this is a triangle mesh.
+    point_count: u32,
 }
 
 /// Device, pipelines and the resources shared by every frame.
@@ -61,6 +67,7 @@ pub struct GpuRenderer {
     device: wgpu::Device,
     queue: wgpu::Queue,
     model_pipeline: wgpu::RenderPipeline,
+    point_pipeline: wgpu::RenderPipeline,
     backdrop_pipeline: wgpu::RenderPipeline,
     uniforms: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
@@ -226,6 +233,44 @@ impl GpuRenderer {
             cache: None,
         });
 
+        // Points: the sprite corners come from the shader's `vertex_index`, so
+        // the only vertex buffer holds one instance per point.
+        let point_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("trove-3d-points"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_point"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                buffers: &[wgpu::VertexBufferLayout {
+                    array_stride: render3d::PointData::STRIDE,
+                    step_mode: wgpu::VertexStepMode::Instance,
+                    attributes: &attributes,
+                }],
+            },
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                // Sprites turn to face the camera, but the pair of triangles
+                // they are built from can wind either way on screen.
+                cull_mode: None,
+                unclipped_depth: false,
+                polygon_mode: wgpu::PolygonMode::Fill,
+                conservative: false,
+            },
+            depth_stencil: depth_stencil(true),
+            multisample,
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_point"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                targets: &[target(FORMAT, Some(wgpu::BlendState::REPLACE))],
+            }),
+            multiview_mask: None,
+            cache: None,
+        });
+
         let backdrop_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("trove-3d-backdrop"),
             layout: Some(&pipeline_layout),
@@ -252,6 +297,7 @@ impl GpuRenderer {
             device,
             queue,
             model_pipeline,
+            point_pipeline,
             backdrop_pipeline,
             uniforms,
             bind_group,
@@ -265,9 +311,28 @@ impl GpuRenderer {
         self.samples
     }
 
-    /// Move a mesh into GPU buffers, choosing indexed (smooth) or expanded
-    /// (flat) geometry exactly as the CPU path does.
+    /// Move a mesh or cloud into GPU buffers, choosing indexed (smooth),
+    /// expanded (flat) or instanced-point geometry exactly as the CPU path
+    /// does.
     pub fn upload(&self, mesh: &Mesh) -> GpuMesh {
+        if mesh.is_point_cloud() {
+            let data = render3d::point_data(mesh);
+            let points = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("trove-3d-points"),
+                size: (data.bytes().len() as u64).max(4),
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            self.queue.write_buffer(&points, 0, &data.bytes());
+            return GpuMesh {
+                vertices: points,
+                indices: None,
+                vertex_count: 0,
+                index_count: 0,
+                point_count: data.count,
+            };
+        }
+
         let data = render3d::vertex_data(mesh);
         let vertices = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("trove-3d-vertices"),
@@ -293,6 +358,7 @@ impl GpuRenderer {
             indices,
             vertex_count: data.vertex_count,
             index_count: data.indices.as_ref().map_or(0, |i| i.len() as u32),
+            point_count: 0,
         }
     }
 
@@ -394,16 +460,24 @@ impl GpuRenderer {
             pass.set_bind_group(0, &self.bind_group, &[]);
             pass.draw(0..3, 0..1);
 
-            pass.set_pipeline(&self.model_pipeline);
-            pass.set_bind_group(0, &self.bind_group, &[]);
-            pass.set_vertex_buffer(0, mesh.vertices.slice(..));
-            match &mesh.indices {
-                Some(indices) => {
-                    pass.set_index_buffer(indices.slice(..), wgpu::IndexFormat::Uint32);
-                    pass.draw_indexed(0..mesh.index_count, 0, 0..1);
-                }
-                None => {
-                    pass.draw(0..mesh.vertex_count, 0..1);
+            if mesh.point_count > 0 {
+                // Six vertices per instance: the sprite's two triangles.
+                pass.set_pipeline(&self.point_pipeline);
+                pass.set_bind_group(0, &self.bind_group, &[]);
+                pass.set_vertex_buffer(0, mesh.vertices.slice(..));
+                pass.draw(0..6, 0..mesh.point_count);
+            } else {
+                pass.set_pipeline(&self.model_pipeline);
+                pass.set_bind_group(0, &self.bind_group, &[]);
+                pass.set_vertex_buffer(0, mesh.vertices.slice(..));
+                match &mesh.indices {
+                    Some(indices) => {
+                        pass.set_index_buffer(indices.slice(..), wgpu::IndexFormat::Uint32);
+                        pass.draw_indexed(0..mesh.index_count, 0, 0..1);
+                    }
+                    None => {
+                        pass.draw(0..mesh.vertex_count, 0..1);
+                    }
                 }
             }
         }
@@ -491,43 +565,53 @@ mod tests {
             vec![
                 ("fs_backdrop", naga::ShaderStage::Fragment),
                 ("fs_model", naga::ShaderStage::Fragment),
+                ("fs_point", naga::ShaderStage::Fragment),
                 ("vs_backdrop", naga::ShaderStage::Vertex),
                 ("vs_model", naga::ShaderStage::Vertex),
+                ("vs_point", naga::ShaderStage::Vertex),
             ]
         );
     }
 
-    /// `vs_model` must read position and normal from the two locations the
-    /// pipeline's vertex buffer layout describes, both `vec3<f32>`.
+    /// `vs_model` and `vs_point` must each read position and normal from the
+    /// two locations their pipeline's vertex buffer layout describes, both
+    /// `vec3<f32>`.
     #[test]
-    fn the_vertex_inputs_match_the_buffer_layout() {
+    fn the_vertex_inputs_match_the_buffer_layouts() {
         let module = module();
-        let entry = module
-            .entry_points
-            .iter()
-            .find(|entry| entry.name == "vs_model")
-            .expect("vs_model present");
+        for (entry_point, stride) in [
+            ("vs_model", render3d::VertexData::STRIDE),
+            ("vs_point", render3d::PointData::STRIDE),
+        ] {
+            let entry = module
+                .entry_points
+                .iter()
+                .find(|entry| entry.name == entry_point)
+                .unwrap_or_else(|| panic!("{entry_point} present"));
 
-        let mut inputs: Vec<(u32, naga::ScalarKind, naga::VectorSize)> = Vec::new();
-        for argument in &entry.function.arguments {
-            let Some(naga::Binding::Location { location, .. }) = argument.binding else {
-                continue;
-            };
-            let naga::TypeInner::Vector { size, scalar } = module.types[argument.ty].inner else {
-                panic!("vertex input @location({location}) is not a vector");
-            };
-            inputs.push((location, scalar.kind, size));
+            let mut inputs: Vec<(u32, naga::ScalarKind, naga::VectorSize)> = Vec::new();
+            for argument in &entry.function.arguments {
+                let Some(naga::Binding::Location { location, .. }) = argument.binding else {
+                    continue;
+                };
+                let naga::TypeInner::Vector { size, scalar } = module.types[argument.ty].inner
+                else {
+                    panic!("{entry_point} input @location({location}) is not a vector");
+                };
+                inputs.push((location, scalar.kind, size));
+            }
+            inputs.sort_by_key(|(location, _, _)| *location);
+            assert_eq!(
+                inputs,
+                vec![
+                    (0, naga::ScalarKind::Float, naga::VectorSize::Tri),
+                    (1, naga::ScalarKind::Float, naga::VectorSize::Tri),
+                ],
+                "{entry_point} inputs"
+            );
+            // Two vec3<f32> per vertex or instance: the stride declared above.
+            assert_eq!(stride, 2 * 3 * 4, "{entry_point} stride");
         }
-        inputs.sort_by_key(|(location, _, _)| *location);
-        assert_eq!(
-            inputs,
-            vec![
-                (0, naga::ScalarKind::Float, naga::VectorSize::Tri),
-                (1, naga::ScalarKind::Float, naga::VectorSize::Tri),
-            ]
-        );
-        // Two vec3<f32> per vertex: the stride the pipeline declares.
-        assert_eq!(render3d::VertexData::STRIDE, 2 * 3 * 4);
     }
 
     /// The heart of it: the byte offsets WGSL assigns to the uniform struct
@@ -540,11 +624,12 @@ mod tests {
         let layout = uniform_layout(&module);
 
         // (name, bytes) in declaration order — the Rust packing order.
-        let expected: [(&str, u32); 8] = [
+        let expected: [(&str, u32); 9] = [
             ("view_proj", 64),
             ("light", 16),
             ("material", 16),
             ("params", 16),
+            ("params2", 16),
             ("eye", 16),
             ("viewport", 16),
             ("bg_top", 16),

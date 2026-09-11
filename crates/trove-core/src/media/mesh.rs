@@ -1,13 +1,18 @@
-//! Triangle-mesh loading for 3D model previews.
+//! Geometry loading for 3D model previews.
 //!
 //! Three text/binary formats are supported, all parsed in pure Rust with no
 //! new dependencies: Wavefront OBJ, STL (ASCII and binary) and PLY (ASCII and
 //! binary little/big endian). Everything is normalised into one [`Mesh`] so
 //! the renderer never has to know where the triangles came from.
 //!
+//! PLY also arrives as a *point cloud* — a scan or a photogrammetry export
+//! with no `face` element at all — which is why a [`Mesh`] may hold positions
+//! without triangles. OBJ and STL stay triangle-only: their stray vertices are
+//! a broken export rather than a cloud.
+//!
 //! Parsing is deliberately lenient: unknown lines, extra vertex properties
 //! and unsupported primitives are skipped rather than failing the load. Only
-//! a file that yields no triangle at all is an error.
+//! a file that yields no usable vertex at all is an error.
 
 use std::path::Path;
 
@@ -70,13 +75,15 @@ impl Bounds {
     }
 }
 
-/// A triangle mesh in model space.
+/// Usable geometry in model space: a triangle mesh, or a point cloud when the
+/// file carries no faces.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Mesh {
     pub positions: Vec<[f32; 3]>,
     /// Per-vertex normals; empty (or a different length than `positions`)
     /// means the file carries none and the renderer shades per face.
     pub normals: Vec<[f32; 3]>,
+    /// Triangles; empty for a point cloud, which is drawn vertex by vertex.
     pub triangles: Vec<[u32; 3]>,
     pub bounds: Bounds,
 }
@@ -98,6 +105,22 @@ impl Mesh {
         self.positions.len()
     }
 
+    /// A cloud of points rather than a surface: there is nothing to
+    /// rasterise, so the renderers draw one sprite per vertex.
+    pub fn is_point_cloud(&self) -> bool {
+        self.triangles.is_empty() && !self.positions.is_empty()
+    }
+
+    /// What the frame-size heuristics count: triangles for a mesh, points for
+    /// a cloud. Both grow the work per frame, so they share one knob.
+    pub fn primitive_count(&self) -> usize {
+        if self.is_point_cloud() {
+            self.positions.len()
+        } else {
+            self.triangles.len()
+        }
+    }
+
     /// Whether the model has usable per-vertex normals.
     pub fn has_vertex_normals(&self) -> bool {
         self.normals.len() == self.positions.len() && !self.normals.is_empty()
@@ -111,7 +134,23 @@ impl Mesh {
         normals: Vec<[f32; 3]>,
         triangles: Vec<[u32; 3]>,
     ) -> Option<Self> {
-        if positions.is_empty() || triangles.is_empty() {
+        let mesh = Self::assemble(positions, normals, triangles)?;
+        (!mesh.is_point_cloud()).then_some(mesh)
+    }
+
+    /// Build a point cloud: positions only, no triangles to filter.
+    fn finish_points(positions: Vec<[f32; 3]>, normals: Vec<[f32; 3]>) -> Option<Self> {
+        Self::assemble(positions, normals, Vec::new())
+    }
+
+    /// Shared tail of both constructors: checks the vertices are usable,
+    /// drops degenerate triangles and computes the bounds.
+    fn assemble(
+        positions: Vec<[f32; 3]>,
+        normals: Vec<[f32; 3]>,
+        triangles: Vec<[u32; 3]>,
+    ) -> Option<Self> {
+        if positions.is_empty() {
             return None;
         }
         let count = positions.len() as u32;
@@ -120,9 +159,6 @@ impl Mesh {
             .filter(|t| t[0] < count && t[1] < count && t[2] < count)
             .filter(|t| t[0] != t[1] && t[1] != t[2] && t[0] != t[2])
             .collect();
-        if triangles.is_empty() {
-            return None;
-        }
         let mut bounds = Bounds::empty();
         for p in &positions {
             bounds.extend(*p);
@@ -401,7 +437,8 @@ struct PlyElement {
 
 /// Parse a PLY file (ASCII or binary, either endianness): reads the header,
 /// pulls `x y z` (+ optional `nx ny nz`) from the vertex element and the
-/// index list of the face element, then fan-triangulates.
+/// index list of the face element, then fan-triangulates. A file with no
+/// `face` element becomes a point cloud.
 pub fn load_ply(bytes: &[u8]) -> Result<Mesh, String> {
     let header_end = find_ply_header_end(bytes).ok_or("not a PLY file")?;
     let header = String::from_utf8_lossy(&bytes[..header_end]);
@@ -546,8 +583,16 @@ pub fn load_ply(bytes: &[u8]) -> Result<Mesh, String> {
         }
     }
 
-    Mesh::finish(positions, normals, triangles)
-        .ok_or_else(|| "the PLY file contains no triangles".to_string())
+    // A `face` element is what separates a surface from a cloud; a header
+    // that declares one but yields no usable triangle is still an error.
+    let declared_faces = elements.iter().any(|element| element.name == "face");
+    if declared_faces {
+        Mesh::finish(positions, normals, triangles)
+            .ok_or_else(|| "the PLY file contains no triangles".to_string())
+    } else {
+        Mesh::finish_points(positions, normals)
+            .ok_or_else(|| "the PLY file contains no vertices".to_string())
+    }
 }
 
 /// Read one scalar value from a binary PLY body.
@@ -811,6 +856,72 @@ end_header
         assert!(load_ply(ply.as_bytes()).is_err());
     }
 
+    #[test]
+    fn a_ply_without_faces_loads_as_a_point_cloud() {
+        let ply = "\
+ply
+format ascii 1.0
+element vertex 3
+property float x
+property float y
+property float z
+end_header
+0 0 0
+1 2 3
+-1 0 0.5
+";
+        let mesh = load_ply(ply.as_bytes()).expect("a cloud is not an error");
+        assert_eq!(mesh.vertex_count(), 3);
+        assert!(mesh.is_point_cloud());
+        // A cloud counts its points where a mesh counts triangles.
+        assert_eq!(mesh.primitive_count(), 3);
+        assert_eq!(mesh.bounds.min, [-1.0, 0.0, 0.0]);
+        assert_eq!(mesh.bounds.max, [1.0, 2.0, 3.0]);
+    }
+
+    #[test]
+    fn a_binary_ply_point_cloud_reads_its_vertices() {
+        let header = "\
+ply
+format binary_little_endian 1.0
+element vertex 2
+property float x
+property float y
+property float z
+end_header
+";
+        let mut bytes = header.as_bytes().to_vec();
+        for point in [[0f32, 0.0, 0.0], [2.0, 1.0, 0.0]] {
+            for value in point {
+                bytes.extend_from_slice(&value.to_le_bytes());
+            }
+        }
+        let mesh = load_ply(&bytes).expect("binary cloud parses");
+        assert!(mesh.is_point_cloud());
+        assert_eq!(mesh.bounds.max, [2.0, 1.0, 0.0]);
+    }
+
+    /// A declared `face` element makes the file a surface: yielding no
+    /// triangle is then a broken export, not an empty cloud.
+    #[test]
+    fn a_declared_face_element_still_requires_triangles() {
+        let ply = "\
+ply
+format ascii 1.0
+element vertex 1
+property float x
+property float y
+property float z
+element face 0
+property list uchar int vertex_indices
+end_header
+0 0 0
+";
+        assert!(load_ply(ply.as_bytes()).is_err());
+    }
+
+    /// OBJ and STL do not get the cloud treatment: a stray vertex there is a
+    /// broken export, which `obj_without_geometry_is_an_error` pins down.
     #[test]
     fn model_extensions_are_recognised() {
         assert!(is_model_ext("obj") && is_model_ext("stl") && is_model_ext("ply"));

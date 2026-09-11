@@ -145,9 +145,10 @@ impl ModelViewport {
         this
     }
 
-    /// Triangles and vertices of the loaded mesh, for the status line.
+    /// Primitives and vertices of the loaded geometry, for the status line.
+    /// Primitives are triangles for a mesh, points for a cloud.
     pub fn stats(&self) -> (usize, usize) {
-        (self.mesh.triangle_count(), self.mesh.vertex_count())
+        (self.mesh.primitive_count(), self.mesh.vertex_count())
     }
 
     /// Bring the GPU up on a background thread and upload the mesh. Until it
@@ -429,7 +430,12 @@ impl ModelViewport {
 
     /// The toolbar: what the model is, how it is being drawn, and the way out.
     fn toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let (triangles, vertices) = self.stats();
+        let (primitives, vertices) = self.stats();
+        let count_label = if self.mesh.is_point_cloud() {
+            rust_i18n::t!("viewport.points", count = primitives)
+        } else {
+            rust_i18n::t!("viewport.triangles", count = primitives)
+        };
         let backend = match &self.backend {
             Backend::Starting => rust_i18n::t!("viewport.backend_starting").to_string(),
             Backend::Gpu(adapter) => {
@@ -465,7 +471,7 @@ impl ModelViewport {
                     .text_color(cx.theme().muted_foreground)
                     .child(format!(
                         "{} · {}",
-                        rust_i18n::t!("viewport.triangles", count = triangles),
+                        count_label,
                         rust_i18n::t!("viewport.vertices", count = vertices)
                     )),
             )
@@ -630,8 +636,9 @@ fn draw(
 fn cpu_frame(mesh: &Mesh, camera: &Camera, size: (u32, u32)) -> Option<Arc<RenderImage>> {
     let longest = size.0.max(size.1);
     // A software rasterizer is the exception, not the rule: it should stay
-    // usable on a big mesh rather than correct-but-frozen.
-    let cap = if mesh.triangle_count() > CPU_BUSY_TRIANGLES {
+    // usable on a big mesh rather than correct-but-frozen. A cloud counts its
+    // points here, which is the same kind of per-frame work.
+    let cap = if mesh.primitive_count() > CPU_BUSY_TRIANGLES {
         CPU_MAX_EDGE
     } else {
         render3d::clamp_edge(longest)

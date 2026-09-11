@@ -55,6 +55,10 @@ pub const SPECULAR: f32 = 0.20;
 pub const SHININESS: f32 = 40.0;
 /// Fraction of the image the corner vignette darkens by.
 pub const VIGNETTE: f32 = 0.35;
+/// Radius of one point sprite, in pixels of the final image. Both renderers
+/// draw a cloud as discs of this size; it is a uniform because the GPU shader
+/// bakes in no constants of its own.
+pub const POINT_RADIUS: f32 = 1.15;
 
 /// An orbiting camera aimed at the centre of the model.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -145,7 +149,15 @@ pub fn render(mesh: &Mesh, camera: &Camera, width: u32, height: u32, supersample
     let width = clamp_edge(width);
     let height = clamp_edge(height);
     let ss = supersample.clamp(1, MAX_SUPERSAMPLE);
-    let colors = paint(mesh, camera, width * ss, height * ss);
+    // Sprites are sized in final-image pixels, so the supersampled buffer
+    // needs them scaled up or a cloud would come out thinner after the filter.
+    let colors = paint(
+        mesh,
+        camera,
+        width * ss,
+        height * ss,
+        POINT_RADIUS * ss as f32,
+    );
     let colors = if ss > 1 {
         downsample(
             &colors,
@@ -164,10 +176,13 @@ pub fn render(mesh: &Mesh, camera: &Camera, width: u32, height: u32, supersample
     }
 }
 
-/// Longest edge, in pixels, at which to render a mesh: heavy models get fewer
+/// Longest edge, in pixels, at which to render a model: heavy models get fewer
 /// pixels so dragging stays responsive. `max_edge` is the ideal size.
-pub fn auto_size(triangle_count: usize, max_edge: u32) -> u32 {
-    let cap = match triangle_count {
+///
+/// `primitives` is triangles for a mesh, points for a cloud — see
+/// [`Mesh::primitive_count`].
+pub fn auto_size(primitives: usize, max_edge: u32) -> u32 {
+    let cap = match primitives {
         0..=40_000 => max_edge,
         40_001..=120_000 => max_edge.min(900),
         120_001..=300_000 => max_edge.min(720),
@@ -419,13 +434,62 @@ pub fn vertex_data(mesh: &Mesh) -> VertexData {
     }
 }
 
+/// A point cloud laid out for a GPU instance buffer.
+///
+/// One instance per point, drawn as a camera-facing sprite: the vertex buffer
+/// holds the sprites' corners (generated in the shader) and this holds the
+/// points themselves.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PointData {
+    /// Interleaved `[x, y, z, nx, ny, nz]` per point.
+    pub points: Vec<f32>,
+    /// Points in the buffer, i.e. `points.len() / 6`.
+    pub count: u32,
+}
+
+impl PointData {
+    /// Bytes of one interleaved point: two `vec3<f32>`.
+    pub const STRIDE: u64 = 24;
+
+    /// The point array as bytes, ready for `Queue::write_buffer`.
+    pub fn bytes(&self) -> Vec<u8> {
+        f32_bytes(&self.points)
+    }
+}
+
+/// Flatten a point cloud into the instance data its pipeline reads.
+pub fn point_data(mesh: &Mesh) -> PointData {
+    let mut points = Vec::with_capacity(mesh.positions.len() * 6);
+    for (index, position) in mesh.positions.iter().enumerate() {
+        let normal = point_normal(mesh, index);
+        points.extend_from_slice(&[
+            position[0],
+            position[1],
+            position[2],
+            normal[0],
+            normal[1],
+            normal[2],
+        ]);
+    }
+    PointData {
+        count: mesh.positions.len() as u32,
+        points,
+    }
+}
+
 /// Distance at which a model of unit radius exactly fills the viewport.
 fn fit_distance() -> f32 {
     FIT_MARGIN / (FOV_DEG.to_radians() * 0.5).sin()
 }
 
 /// Rasterise into a linear colour buffer, background included.
-fn paint(mesh: &Mesh, camera: &Camera, width: u32, height: u32) -> Vec<[f32; 3]> {
+fn paint(
+    mesh: &Mesh,
+    camera: &Camera,
+    width: u32,
+    height: u32,
+    point_radius: f32,
+) -> Vec<[f32; 3]> {
     let w = width as usize;
     let h = height as usize;
     let mut colors = Vec::with_capacity(w * h);
@@ -435,13 +499,25 @@ fn paint(mesh: &Mesh, camera: &Camera, width: u32, height: u32) -> Vec<[f32; 3]>
         }
     }
     let longest = mesh.bounds.longest_edge();
-    if mesh.triangles.is_empty() || !longest.is_finite() || longest <= 0.0 {
+    if !longest.is_finite() {
+        return colors;
+    }
+    if longest <= 0.0 && !mesh.is_point_cloud() {
         return colors;
     }
 
     // Normalise into a unit bounding sphere so the camera maths never depends
     // on the file's real units.
     let framing = camera.framing(mesh.bounds, w as f32 / h as f32);
+    let mut depth = vec![0f32; w * h];
+
+    if mesh.is_point_cloud() {
+        paint_points(&mut colors, &mut depth, mesh, framing, w, h, point_radius);
+        return colors;
+    }
+    if mesh.triangles.is_empty() {
+        return colors;
+    }
 
     // Model-space positions drive the shading, view-space positions the
     // rasterizer; both come out of a single pass over the vertices.
@@ -458,7 +534,6 @@ fn paint(mesh: &Mesh, camera: &Camera, width: u32, height: u32) -> Vec<[f32; 3]>
     let vertex_count = mesh.positions.len();
     let gouraud = mesh.has_vertex_normals();
 
-    let mut depth = vec![0f32; w * h];
     {
         let mut target = Target {
             colors: &mut colors,
@@ -524,6 +599,82 @@ fn paint(mesh: &Mesh, camera: &Camera, width: u32, height: u32) -> Vec<[f32; 3]>
     colors
 }
 
+/// Draw a point cloud: one sprite per vertex, shaded and depth-tested.
+///
+/// Mirrors `fs_point` in `gpu3d.wgsl` — same normal choice, same lighting
+/// formula, same sprite size — so a cloud's thumbnail and its viewport frame
+/// agree. Everything happens in model space, because that is where the
+/// normals and the eye the uniform block carries both live.
+fn paint_points(
+    colors: &mut [[f32; 3]],
+    depth: &mut [f32],
+    mesh: &Mesh,
+    framing: Framing,
+    width: usize,
+    height: usize,
+    radius: f32,
+) {
+    let (near, _) = framing.depth_range();
+    let eye = framing.eye_in_model_space();
+    let light = normalize(KEY_LIGHT);
+
+    let mut target = Target {
+        colors,
+        depth,
+        width,
+        height,
+        framing,
+    };
+
+    for (index, position) in mesh.positions.iter().enumerate() {
+        let view = framing.to_view(*position);
+        if view[2] <= near {
+            continue; // Behind the eye, or inside the near plane.
+        }
+        let normal = point_normal(mesh, index);
+        let to_eye = normalize(sub(eye, *position));
+        // Two-sided, exactly as the triangle path is.
+        let normal = if dot(normal, to_eye) < 0.0 {
+            neg(normal)
+        } else {
+            normal
+        };
+        let intensity = AMBIENT + DIFFUSE * dot(normal, light).max(0.0);
+        let rgb = [
+            MATERIAL[0] * intensity,
+            MATERIAL[1] * intensity,
+            MATERIAL[2] * intensity,
+        ];
+        target.point(view, radius, rgb);
+    }
+}
+
+/// The normal to light a cloud point with, in model space.
+///
+/// A point has no surface, so a file that carries no normals gets the
+/// direction it sits in relative to the model centre: the cloud then reads as
+/// a lit volume instead of a flat silhouette. A point exactly at the centre
+/// has no such direction, so it is lit head-on.
+pub fn point_normal(mesh: &Mesh, index: usize) -> [f32; 3] {
+    if mesh.has_vertex_normals() {
+        let n = normalize(mesh.normals[index]);
+        return if n == [0.0; 3] {
+            normalize(KEY_LIGHT)
+        } else {
+            n
+        };
+    }
+    let Some(position) = mesh.positions.get(index) else {
+        return normalize(KEY_LIGHT);
+    };
+    let direction = normalize(sub(*position, mesh.bounds.center()));
+    if direction == [0.0; 3] {
+        normalize(KEY_LIGHT)
+    } else {
+        direction
+    }
+}
+
 /// One rasterization target: the colour and depth buffers plus the projection.
 struct Target<'a> {
     colors: &'a mut [[f32; 3]],
@@ -545,6 +696,45 @@ impl Target<'_> {
             y: pos[1],
             inv_z,
             i: v.i,
+        }
+    }
+
+    /// One point sprite: a disc of `radius` pixels around the projected
+    /// vertex, depth-tested per pixel. The whole disc shares the point's
+    /// depth, which is what makes a dense cloud's surfaces come out smooth
+    /// instead of speckled.
+    fn point(&mut self, view: [f32; 3], radius: f32, rgb: [f32; 3]) {
+        let (pos, inv_z) = self
+            .framing
+            .to_screen(view, self.width as f32, self.height as f32);
+        if !inv_z.is_finite() || inv_z <= 0.0 {
+            return; // At or behind the eye: `to_screen` would mirror it.
+        }
+        let (px_center, py_center) = (pos[0], pos[1]);
+        let radius = radius.max(0.5);
+        let min_x = (px_center - radius).floor().max(0.0) as usize;
+        let max_x = (px_center + radius).ceil().min(self.width as f32 - 1.0) as usize;
+        let min_y = (py_center - radius).floor().max(0.0) as usize;
+        let max_y = (py_center + radius).ceil().min(self.height as f32 - 1.0) as usize;
+        if min_x > max_x || min_y > max_y {
+            return; // Fully off screen.
+        }
+        let radius_squared = radius * radius;
+
+        for py in min_y..=max_y {
+            let dy = py as f32 + 0.5 - py_center;
+            for px in min_x..=max_x {
+                let dx = px as f32 + 0.5 - px_center;
+                if dx * dx + dy * dy > radius_squared {
+                    continue; // Outside the disc.
+                }
+                let index = py * self.width + px;
+                if inv_z <= self.depth[index] {
+                    continue; // Hidden behind whatever is already there.
+                }
+                self.depth[index] = inv_z;
+                self.colors[index] = rgb;
+            }
         }
     }
 
@@ -1142,5 +1332,112 @@ mod tests {
             let face = normalize(cross(edge_a, edge_b));
             assert!(dot(face, normal).abs() > 0.9999, "face normal mismatch");
         }
+    }
+
+    // ---- point clouds ---------------------------------------------------
+
+    /// A cloud built the way a file arrives: a PLY with no `face` element.
+    fn cloud(points: &[[f32; 3]]) -> Mesh {
+        let mut ply = format!(
+            "ply\nformat ascii 1.0\nelement vertex {}\n\
+             property float x\nproperty float y\nproperty float z\nend_header\n",
+            points.len()
+        );
+        for p in points {
+            ply.push_str(&format!("{} {} {}\n", p[0], p[1], p[2]));
+        }
+        crate::media::mesh::load_ply(ply.as_bytes()).expect("cloud parses")
+    }
+
+    /// Pixels the renderer touched, i.e. everything that left the background.
+    fn painted(frame: &Frame) -> usize {
+        frame
+            .bgra
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .filter(|pixel| pixel[1] < 220)
+            .count()
+    }
+
+    #[test]
+    fn a_point_cloud_renders_without_any_triangle() {
+        let mesh = cloud(&[
+            [0.0, 0.0, 0.0],
+            [0.6, 0.0, 0.0],
+            [-0.6, 0.0, 0.0],
+            [0.0, 0.6, 0.0],
+            [0.0, 0.0, 0.6],
+        ]);
+        assert!(mesh.is_point_cloud());
+        let frame = render(&mesh, &Camera::default(), 64, 64, 1);
+        assert!(painted(&frame) > 0, "a cloud must paint something");
+    }
+
+    /// One point is a small sprite, not a full-screen blob; the count also
+    /// proves the disc test is not off by a pixel row.
+    #[test]
+    fn one_point_paints_a_small_sprite() {
+        let mesh = cloud(&[[0.0, 0.0, 0.0]]);
+        let frame = render(&mesh, &Camera::default(), 64, 64, 1);
+        let count = painted(&frame);
+        assert!(
+            (1..=16).contains(&count),
+            "one point covered {count} pixels"
+        );
+    }
+
+    /// Two points on the same sight line, seen head-on. The nearer one is lit
+    /// by its outward normal, the far one faces away from the key light and
+    /// shades at ambient only, so the pixel between them tells which one won
+    /// the depth test.
+    #[test]
+    fn points_are_depth_tested() {
+        let axis_on = Camera {
+            yaw: 0.0,
+            pitch: 0.0,
+            zoom: 1.0,
+        };
+        let mesh = cloud(&[[0.0, 0.0, 1.0], [0.0, 0.0, -1.0]]);
+        let frame = render(&mesh, &axis_on, 64, 64, 1);
+        let centre = frame.pixel(32, 32);
+
+        let near = MATERIAL[1] * (AMBIENT + DIFFUSE * dot(normalize(KEY_LIGHT), [0.0, 0.0, 1.0]));
+        let far = MATERIAL[1] * AMBIENT;
+        let blue = centre[0] as f32 / 255.0;
+        assert!(
+            (blue - near).abs() < (blue - far).abs(),
+            "the nearer point must win: pixel {blue} vs near {near} / far {far}"
+        );
+    }
+
+    #[test]
+    fn a_cloud_without_normals_is_lit_from_its_own_centre() {
+        let mesh = cloud(&[[2.0, 0.0, 0.0], [0.0, 0.0, 0.0], [-2.0, 0.0, 0.0]]);
+        assert!(!mesh.has_vertex_normals());
+        assert_eq!(point_normal(&mesh, 0), [1.0, 0.0, 0.0]);
+        assert_eq!(point_normal(&mesh, 2), [-1.0, 0.0, 0.0]);
+        // The centre point has no direction of its own: lit head-on.
+        assert_eq!(point_normal(&mesh, 1), normalize(KEY_LIGHT));
+    }
+
+    #[test]
+    fn the_instance_data_carries_a_normal_per_point() {
+        let mesh = cloud(&[[1.0, 0.0, 0.0], [-1.0, 0.0, 0.0]]);
+        let data = point_data(&mesh);
+        assert_eq!(data.count, 2);
+        assert_eq!(data.points.len(), 12);
+        assert_eq!(PointData::STRIDE, 2 * 3 * 4);
+        assert_eq!(&data.points[0..6], &[1.0, 0.0, 0.0, 1.0, 0.0, 0.0]);
+        assert_eq!(&data.points[6..12], &[-1.0, 0.0, 0.0, -1.0, 0.0, 0.0]);
+    }
+
+    /// A cloud of one repeated point has no extent at all; the framing has to
+    /// survive that and still draw the sprite.
+    #[test]
+    fn a_degenerate_cloud_still_paints_its_sprite() {
+        let mesh = cloud(&[[1.0, 1.0, 1.0], [1.0, 1.0, 1.0]]);
+        assert_eq!(mesh.bounds.longest_edge(), 0.0);
+        assert!(painted(&render(&mesh, &Camera::default(), 64, 64, 1)) > 0);
     }
 }
