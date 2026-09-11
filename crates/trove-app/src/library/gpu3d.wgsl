@@ -14,6 +14,8 @@ struct Uniforms {
     material: vec4<f32>,
     // x = diffuse, y = specular, z = shininess, w = vignette.
     params: vec4<f32>,
+    // x = point sprite radius in pixels; the rest is unused.
+    params2: vec4<f32>,
     // xyz = camera position in model space, where the normals live.
     eye: vec4<f32>,
     // xy = viewport size in pixels.
@@ -59,6 +61,72 @@ fn fs_model(in: ModelOut) -> @location(0) vec4<f32> {
     let spec = u.params.y * pow(max(dot(n, half), 0.0), u.params.z);
 
     return vec4<f32>(u.material.rgb * intensity + vec3<f32>(spec), 1.0);
+}
+
+// A point cloud is drawn one sprite per point, each a camera-facing square
+// that the fragment stage clips into a disc. The corners come from the vertex
+// index and the point itself from an instance buffer, so a cloud needs no
+// per-vertex geometry on the host.
+struct PointOut {
+    @builtin(position) clip: vec4<f32>,
+    @location(0) model_pos: vec3<f32>,
+    @location(1) normal: vec3<f32>,
+    // Unit square coordinate: -1..1 across the sprite, for the disc test.
+    @location(2) offset: vec2<f32>,
+};
+
+@vertex
+fn vs_point(
+    @builtin(vertex_index) index: u32,
+    @location(0) position: vec3<f32>,
+    @location(1) normal: vec3<f32>,
+) -> PointOut {
+    var corners = array<vec2<f32>, 6>(
+        vec2<f32>(-1.0, -1.0),
+        vec2<f32>(1.0, -1.0),
+        vec2<f32>(1.0, 1.0),
+        vec2<f32>(-1.0, -1.0),
+        vec2<f32>(1.0, 1.0),
+        vec2<f32>(-1.0, 1.0),
+    );
+    let corner = corners[index % 6u];
+
+    let base = u.view_proj * vec4<f32>(position, 1.0);
+    // Half the viewport in pixels maps to one unit of clip space, so the
+    // sprite keeps its pixel size at any depth. Scaling by `w` cancels the
+    // perspective divide the rasterizer is about to do.
+    let radius = u.params2.x;
+    let extent = vec2<f32>(
+        radius * 2.0 / max(u.viewport.x, 1.0),
+        radius * 2.0 / max(u.viewport.y, 1.0),
+    );
+
+    var out: PointOut;
+    out.clip = vec4<f32>(base.xy + corner * extent * base.w, base.z, base.w);
+    out.model_pos = position;
+    out.normal = normal;
+    out.offset = corner;
+    return out;
+}
+
+@fragment
+fn fs_point(in: PointOut) -> @location(0) vec4<f32> {
+    // Square sprite, round point.
+    if dot(in.offset, in.offset) > 1.0 {
+        discard;
+    }
+
+    // Same lighting as a triangle, using the normal the host supplied: the
+    // file's own when it has one, otherwise the direction the point sits in
+    // relative to the model centre.
+    let geometric = normalize(in.normal);
+    let to_eye = normalize(u.eye.xyz - in.model_pos);
+    let n = select(-geometric, geometric, dot(geometric, to_eye) >= 0.0);
+
+    let diffuse = max(dot(n, u.light.xyz), 0.0);
+    let intensity = u.material.w + u.params.x * diffuse;
+
+    return vec4<f32>(u.material.rgb * intensity, 1.0);
 }
 
 // A single oversized triangle covering the viewport, so the backdrop gets the

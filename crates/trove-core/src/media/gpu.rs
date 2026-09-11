@@ -14,12 +14,12 @@
 //!   BGRA order the UI expects.
 
 use super::render3d::{
-    AMBIENT, BG_BOTTOM, BG_TOP, DIFFUSE, Framing, KEY_LIGHT, MATERIAL, SHININESS, SPECULAR,
-    VIGNETTE,
+    AMBIENT, BG_BOTTOM, BG_TOP, DIFFUSE, Framing, KEY_LIGHT, MATERIAL, POINT_RADIUS, SHININESS,
+    SPECULAR, VIGNETTE,
 };
 
-/// Bytes of [`Uniforms`]: one `mat4x4<f32>` plus seven `vec4<f32>`.
-pub const UNIFORM_SIZE: usize = 64 + 7 * 16;
+/// Bytes of [`Uniforms`]: one `mat4x4<f32>` plus eight `vec4<f32>`.
+pub const UNIFORM_SIZE: usize = 64 + 8 * 16;
 
 /// The uniform block read by the model and backdrop shaders.
 ///
@@ -35,6 +35,9 @@ pub struct Uniforms {
     pub material: [f32; 4],
     /// `x` = diffuse amount, `y` = specular amount, `z` = shininess.
     pub params: [f32; 4],
+    /// `x` = point sprite radius in pixels; the rest is unused, and reserved
+    /// so the next shading knob does not have to move anything.
+    pub params2: [f32; 4],
     /// Camera position in model space, so shading can work where the normals
     /// live; `w` unused.
     pub eye: [f32; 4],
@@ -54,6 +57,7 @@ impl Uniforms {
             light: [light[0], light[1], light[2], 0.0],
             material: [MATERIAL[0], MATERIAL[1], MATERIAL[2], AMBIENT],
             params: [DIFFUSE, SPECULAR, SHININESS, VIGNETTE],
+            params2: [POINT_RADIUS, 0.0, 0.0, 0.0],
             eye: [eye[0], eye[1], eye[2], 0.0],
             viewport: [viewport.0.max(1) as f32, viewport.1.max(1) as f32, 0.0, 0.0],
             background: [
@@ -79,6 +83,7 @@ impl Uniforms {
             self.light,
             self.material,
             self.params,
+            self.params2,
             self.eye,
             self.viewport,
             self.background[0],
@@ -158,10 +163,10 @@ mod tests {
 
     #[test]
     fn the_uniform_block_is_the_size_the_shader_expects() {
-        // 64 bytes of matrix + seven vec4 = 176, a multiple of 16.
-        assert_eq!(UNIFORM_SIZE, 176);
+        // 64 bytes of matrix + eight vec4 = 192, a multiple of 16.
+        assert_eq!(UNIFORM_SIZE, 192);
         assert_eq!(UNIFORM_SIZE % 16, 0);
-        assert_eq!(Uniforms::new(&framing(), (800, 600)).to_bytes().len(), 176);
+        assert_eq!(Uniforms::new(&framing(), (800, 600)).to_bytes().len(), 192);
     }
 
     #[test]
@@ -198,6 +203,7 @@ mod tests {
                 .sqrt();
         assert!((length - 1.0).abs() < 1e-5, "light must be a unit vector");
         assert_eq!(uniforms.params, [DIFFUSE, SPECULAR, SHININESS, VIGNETTE]);
+        assert_eq!(uniforms.params2[0], POINT_RADIUS);
         assert_eq!(uniforms.material[3], AMBIENT);
         assert_eq!(uniforms.viewport[0], 320.0);
         assert_eq!(uniforms.viewport[1], 240.0);
