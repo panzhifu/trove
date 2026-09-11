@@ -93,13 +93,30 @@ impl GpuRenderer {
             display: None,
         });
 
-        let adapter = gpui_kit::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-            power_preference: wgpu::PowerPreference::HighPerformance,
-            compatible_surface: None,
-            force_fallback_adapter: false,
-        }))
-        .map_err(|_| GpuUnavailable::NoAdapter)?;
-
+        // On Optimus / hybrid-graphics laptops `request_adapter` with a
+        // `HighPerformance` hint can still hand us the integrated GPU, so
+        // enumerate every adapter and pick the discrete one. The fallback
+        // chain: discrete → non-software → whatever is there.
+        let mut adapters: Vec<wgpu::Adapter> =
+            gpui_kit::block_on(instance.enumerate_adapters(wgpu::Backends::all()));
+        if adapters.is_empty() {
+            return Err(GpuUnavailable::NoAdapter);
+        }
+        let info = adapters.iter().map(|a| a.get_info()).collect::<Vec<_>>();
+        let pick = {
+            // 1) A discrete GPU (NVIDIA / AMD) beats everything else.
+            let discrete = info
+                .iter()
+                .position(|i| i.device_type == wgpu::DeviceType::DiscreteGpu);
+            // 2) Otherwise an integrated GPU (Intel Iris Xe etc).  Only when
+            //    there is neither a discrete nor an integrated adapter do we
+            //    fall back to a software rasteriser, which we then refuse.
+            let integrated = info
+                .iter()
+                .position(|i| i.device_type == wgpu::DeviceType::IntegratedGpu);
+            discrete.or(integrated).unwrap_or(0)
+        };
+        let adapter = adapters.swap_remove(pick);
         let info = adapter.get_info();
         if info.device_type == wgpu::DeviceType::Cpu {
             // A software rasterizer is slower than the CPU path we already have.
@@ -312,6 +329,41 @@ impl GpuRenderer {
     /// MSAA sample count the pipelines were built with (1 = none).
     pub fn samples(&self) -> u32 {
         self.samples
+    }
+
+    /// Largest mesh the GPU upload is allowed to hold. Above this the
+    /// viewport falls back to the CPU rasterizer, which renders at a
+    /// bounded resolution regardless of how many triangles the model has.
+    pub const GPU_UPLOAD_BUDGET: usize = 256 << 20;
+
+    /// Move a mesh or cloud into GPU buffers, choosing indexed (smooth),
+    /// expanded (flat) or instanced-point geometry exactly as the CPU path
+    /// does. Returns `None` when the mesh is larger than
+    /// [`GPU_UPLOAD_BUDGET`], so the caller can fall back to CPU.
+    pub fn upload_capped(&self, mesh: &Mesh) -> Option<GpuMesh> {
+        let estimated = Self::estimate_gpu_bytes(mesh);
+        if estimated > Self::GPU_UPLOAD_BUDGET {
+            return None;
+        }
+        Some(self.upload(mesh))
+    }
+
+    /// Bytes of GPU buffer a mesh will occupy: interleaved vertices plus
+    /// the index list.
+    fn estimate_gpu_bytes(mesh: &Mesh) -> usize {
+        let vertex_bytes = mesh.vertex_count() as usize * render3d::VertexData::STRIDE as usize;
+        let index_bytes = if mesh.has_vertex_normals() {
+            mesh.triangle_count() * 3 * 4
+        } else {
+            // Flat-shaded: expanded per face, no index buffer.
+            0
+        };
+        let point_bytes = if mesh.is_point_cloud() {
+            mesh.vertex_count() as usize * render3d::PointData::STRIDE as usize
+        } else {
+            0
+        };
+        vertex_bytes + index_bytes + point_bytes
     }
 
     /// Move a mesh or cloud into GPU buffers, choosing indexed (smooth),

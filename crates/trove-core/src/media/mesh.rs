@@ -1,9 +1,9 @@
 //! Geometry loading for 3D model previews.
 //!
-//! Three text/binary formats are supported, all parsed in pure Rust with no
-//! new dependencies: Wavefront OBJ, STL (ASCII and binary) and PLY (ASCII and
-//! binary little/big endian). Everything is normalised into one [`Mesh`] so
-//! the renderer never has to know where the triangles came from.
+//! Three text/binary formats are supported, all parsed in pure Rust on top
+//! of the raw file bytes: Wavefront OBJ, STL (ASCII and binary) and PLY
+//! (ASCII and binary little/big endian). Everything is normalised into one
+//! [`Mesh`] so the renderer never has to know where the triangles came from.
 //!
 //! PLY also arrives as a *point cloud* — a scan or a photogrammetry export
 //! with no `face` element at all — which is why a [`Mesh`] may hold positions
@@ -142,7 +142,7 @@ impl Mesh {
     /// Build a mesh from raw positions/triangles, dropping degenerate
     /// triangles and recomputing the bounds. Returns `None` when nothing
     /// usable is left.
-    fn finish(
+    pub(crate) fn finish(
         positions: Vec<[f32; 3]>,
         normals: Vec<[f32; 3]>,
         colors: Vec<[f32; 3]>,
@@ -153,7 +153,7 @@ impl Mesh {
     }
 
     /// Build a point cloud: positions only, no triangles to filter.
-    fn finish_points(
+    pub(crate) fn finish_points(
         positions: Vec<[f32; 3]>,
         normals: Vec<[f32; 3]>,
         colors: Vec<[f32; 3]>,
@@ -213,8 +213,18 @@ pub fn is_model_ext(ext: &str) -> bool {
     MODEL_EXTENSIONS.contains(&ext)
 }
 
+/// Ceiling on a model file read whole into memory: the parsed mesh costs a
+/// multiple of the file, so a stray multi-gigabyte export must fail fast
+/// instead of dragging the machine into swap.
+const MAX_MODEL_FILE_BYTES: u64 = 2 << 30;
+
 /// Load a mesh, dispatching on the file extension.
 pub fn load(path: &Path) -> Result<Mesh, String> {
+    load_capped(path, MAX_MODEL_FILE_BYTES)
+}
+
+/// [`load`] with an overridable size cap, so the limit itself can be tested.
+fn load_capped(path: &Path, limit: u64) -> Result<Mesh, String> {
     let ext = path
         .extension()
         .and_then(|e| e.to_str())
@@ -222,6 +232,13 @@ pub fn load(path: &Path) -> Result<Mesh, String> {
         .unwrap_or_default();
     if !is_model_ext(&ext) {
         return Err(format!("unsupported model format: .{ext}"));
+    }
+    let size = std::fs::metadata(path).map_err(|e| e.to_string())?.len();
+    if size > limit {
+        return Err(format!(
+            "the model file is larger than the {} GiB preview limit",
+            limit >> 30
+        ));
     }
     let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
     match ext.as_str() {
@@ -400,17 +417,17 @@ pub fn load_stl_ascii(text: &str) -> Result<Mesh, String> {
 }
 
 /// One PLY property declaration.
-struct PlyProperty {
-    name: String,
+pub(crate) struct PlyProperty {
+    pub(crate) name: String,
     /// Scalar type, or the item type of a list.
-    ty: PlyType,
+    pub(crate) ty: PlyType,
     /// Element type of a list property (count type in front of the values).
-    count_ty: Option<PlyType>,
+    pub(crate) count_ty: Option<PlyType>,
 }
 
 /// PLY scalar types, mapped to their byte width and conversion.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum PlyType {
+pub(crate) enum PlyType {
     I8,
     U8,
     I16,
@@ -422,7 +439,7 @@ enum PlyType {
 }
 
 impl PlyType {
-    fn parse(name: &str) -> Option<Self> {
+    pub(crate) fn parse(name: &str) -> Option<Self> {
         Some(match name {
             "char" | "int8" => Self::I8,
             "uchar" | "uint8" => Self::U8,
@@ -436,7 +453,7 @@ impl PlyType {
         })
     }
 
-    fn width(self) -> usize {
+    pub(crate) fn width(self) -> usize {
         match self {
             Self::I8 | Self::U8 => 1,
             Self::I16 | Self::U16 => 2,
@@ -455,22 +472,92 @@ impl PlyType {
 
 /// PLY byte order.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum PlyEndian {
+pub(crate) enum PlyEndian {
     Little,
     Big,
 }
 
 /// One `element` block of a PLY header.
-struct PlyElement {
-    name: String,
-    count: usize,
-    properties: Vec<PlyProperty>,
+pub(crate) struct PlyElement {
+    pub(crate) name: String,
+    pub(crate) count: usize,
+    pub(crate) properties: Vec<PlyProperty>,
+}
+
+/// Error for a body shorter than the header promised.
+pub(crate) const BODY_END: &str = "the PLY body ends early";
+
+/// ASCII bodies below this size parse serially: handing lines to the thread
+/// pool would cost more than the tokens do.
+const ASCII_PARALLEL_MIN_BYTES: usize = 256 << 10;
+
+/// `u8` colour channels pre-scaled to 0..=1 — the one integer width real
+/// files use — so the hot loops never divide.
+const U8_UNIT: [f32; 256] = {
+    let mut table = [0.0f32; 256];
+    let mut value = 0;
+    while value < 256 {
+        table[value] = (value as f64 / 255.0) as f32;
+        value += 1;
+    }
+    table
+};
+
+/// The parts of a PLY body worth keeping, filled by the ASCII and binary
+/// readers alike.
+#[derive(Default)]
+pub(crate) struct PlyBody {
+    positions: Vec<[f32; 3]>,
+    normals: Vec<[f32; 3]>,
+    colors: Vec<[f32; 3]>,
+    triangles: Vec<[u32; 3]>,
+}
+
+/// Where the values worth reading sit inside the `vertex` element: column
+/// indices resolved once from the header, so the body loops index directly
+/// instead of searching property names for every vertex.
+pub(crate) struct VertexColumns {
+    pub(crate) x: usize,
+    pub(crate) y: usize,
+    pub(crate) z: usize,
+    pub(crate) normals: Option<[usize; 3]>,
+    pub(crate) colors: Option<[usize; 3]>,
+}
+
+/// Resolve the vertex columns; `None` when the element carries no scalar
+/// x/y/z at all. Normals and colours are all-or-nothing: one missing
+/// channel drops the whole set rather than half-reading it.
+pub(crate) fn vertex_columns(properties: &[PlyProperty]) -> Option<VertexColumns> {
+    let scalar = |name: &str| {
+        properties
+            .iter()
+            .position(|p| p.name == name && p.count_ty.is_none())
+    };
+    let triple = |names: [&str; 3]| -> Option<[usize; 3]> {
+        Some([scalar(names[0])?, scalar(names[1])?, scalar(names[2])?])
+    };
+    Some(VertexColumns {
+        x: scalar("x")?,
+        y: scalar("y")?,
+        z: scalar("z")?,
+        normals: triple(["nx", "ny", "nz"]),
+        // `red green blue` is the spec spelling; MeshLab and CloudCompare
+        // write `diffuse_*` often enough to take both.
+        colors: triple(["red", "green", "blue"])
+            .or_else(|| triple(["diffuse_red", "diffuse_green", "diffuse_blue"])),
+    })
+}
+
+/// Whether a face property holds the polygon index list.
+pub(crate) fn is_indices(name: &str) -> bool {
+    name == "vertex_indices" || name == "vertex_index"
 }
 
 /// Parse a PLY file (ASCII or binary, either endianness): reads the header,
-/// pulls `x y z` (+ optional `nx ny nz`) from the vertex element and the
-/// index list of the face element, then fan-triangulates. A file with no
-/// `face` element becomes a point cloud.
+/// resolves the interesting properties to column indices once, then pulls
+/// the vertex element and the face index lists straight into typed arrays —
+/// binary vertex rows through their fixed stride, ASCII lines in parallel
+/// chunks. A file with no `face` element becomes a point cloud.
 pub fn load_ply(bytes: &[u8]) -> Result<Mesh, String> {
     let header_end = find_ply_header_end(bytes).ok_or("not a PLY file")?;
     let header = String::from_utf8_lossy(&bytes[..header_end]);
@@ -529,198 +616,648 @@ pub fn load_ply(bytes: &[u8]) -> Result<Mesh, String> {
         other => return Err(format!("unsupported PLY format: {other}")),
     };
 
-    let mut positions = Vec::new();
-    let mut normals: Vec<[f32; 3]> = Vec::new();
-    let mut colors: Vec<[f32; 3]> = Vec::new();
-    let mut triangles = Vec::new();
     let body = &bytes[header_end..];
-    let mut binary_cursor = std::io::Cursor::new(body);
-    let ascii_body = String::from_utf8_lossy(body);
-    let mut tokens = ascii_body.split_whitespace();
-
-    for element in &elements {
-        let is_vertex = element.name == "vertex";
-        let is_face = element.name == "face";
-        for _ in 0..element.count {
-            // The declared type travels with the value: a colour channel is
-            // 0..=255 as an integer and 0..=1 as a float.
-            let mut values: Vec<(String, Vec<f64>, PlyType)> =
-                Vec::with_capacity(element.properties.len());
-            for property in &element.properties {
-                let mut read = |endian: Option<PlyEndian>| -> Option<Vec<f64>> {
-                    match endian {
-                        None => {
-                            let count = property.count_ty.map(|_| 1).unwrap_or(1);
-                            let mut out = Vec::with_capacity(count);
-                            for _ in 0..count {
-                                out.push(tokens.next()?.parse::<f64>().ok()?);
-                            }
-                            if property.count_ty.is_some() {
-                                // A list: the first token was the length.
-                                let length = out[0].max(0.0) as usize;
-                                let mut items = Vec::with_capacity(length);
-                                for _ in 0..length {
-                                    items.push(tokens.next()?.parse::<f64>().ok()?);
-                                }
-                                return Some(items);
-                            }
-                            Some(out)
-                        }
-                        Some(order) => {
-                            if let Some(counter) = property.count_ty {
-                                let length =
-                                    read_scalar(&mut binary_cursor, counter, order)? as usize;
-                                let mut items = Vec::with_capacity(length);
-                                for _ in 0..length {
-                                    items.push(read_scalar(
-                                        &mut binary_cursor,
-                                        property.ty,
-                                        order,
-                                    )?);
-                                }
-                                Some(items)
-                            } else {
-                                Some(vec![read_scalar(&mut binary_cursor, property.ty, order)?])
-                            }
-                        }
-                    }
-                };
-                let Some(v) = read(endian) else {
-                    return Err("the PLY body ends early".into());
-                };
-                values.push((property.name.clone(), v, property.ty));
-            }
-            let scalar = |name: &str| -> Option<f32> {
-                values
-                    .iter()
-                    .find(|(n, _, _)| n == name)
-                    .and_then(|(_, v, _)| v.first())
-                    .map(|v| *v as f32)
-            };
-            // A colour channel: 0..=255 in an integer field, 0..=1 as a
-            // float. Values outside the range are clamped rather than
-            // wrapping, so a broken file still renders.
-            let channel = |names: &[&str]| -> Option<f32> {
-                values
-                    .iter()
-                    .find(|(n, _, _)| names.iter().any(|name| n == name))
-                    .and_then(|(_, v, ty)| {
-                        let value = *v.first()?;
-                        Some(if ty.is_integer() {
-                            (value / 255.0) as f32
-                        } else {
-                            value as f32
-                        })
-                    })
-                    .map(|value| value.clamp(0.0, 1.0))
-            };
-            if is_vertex {
-                if let (Some(x), Some(y), Some(z)) = (scalar("x"), scalar("y"), scalar("z")) {
-                    positions.push([x, y, z]);
-                    if let (Some(nx), Some(ny), Some(nz)) =
-                        (scalar("nx"), scalar("ny"), scalar("nz"))
-                    {
-                        normals.push([nx, ny, nz]);
-                    }
-                    // `red green blue` is the spec name; MeshLab and
-                    // CloudCompare write `diffuse_*` often enough to take both.
-                    if let (Some(r), Some(g), Some(b)) = (
-                        channel(&["red", "diffuse_red"]),
-                        channel(&["green", "diffuse_green"]),
-                        channel(&["blue", "diffuse_blue"]),
-                    ) {
-                        colors.push([r, g, b]);
-                    }
-                }
-            } else if is_face {
-                let indices: Vec<u32> = values
-                    .iter()
-                    .filter(|(name, _, _)| name == "vertex_indices" || name == "vertex_index")
-                    .flat_map(|(_, v, _)| v.iter().map(|i| *i as u32))
-                    .collect();
-                for i in 1..indices.len().saturating_sub(1) {
-                    triangles.push([indices[0], indices[i], indices[i + 1]]);
-                }
-            }
-        }
-    }
+    let parsed = match endian {
+        Some(order) => load_ply_binary(body, &elements, order)?,
+        None => load_ply_ascii(body, &elements)?,
+    };
 
     // A `face` element is what separates a surface from a cloud; a header
     // that declares one but yields no usable triangle is still an error.
     let declared_faces = elements.iter().any(|element| element.name == "face");
     if declared_faces {
-        Mesh::finish(positions, normals, colors, triangles)
-            .ok_or_else(|| "the PLY file contains no triangles".to_string())
+        Mesh::finish(
+            parsed.positions,
+            parsed.normals,
+            parsed.colors,
+            parsed.triangles,
+        )
+        .ok_or_else(|| "the PLY file contains no triangles".to_string())
     } else {
-        Mesh::finish_points(positions, normals, colors)
+        Mesh::finish_points(parsed.positions, parsed.normals, parsed.colors)
             .ok_or_else(|| "the PLY file contains no vertices".to_string())
     }
 }
 
-/// Read one scalar value from a binary PLY body.
-fn read_scalar(cursor: &mut std::io::Cursor<&[u8]>, ty: PlyType, order: PlyEndian) -> Option<f64> {
-    use std::io::Read as _;
-    let mut buf = [0u8; 8];
-    let width = ty.width();
-    cursor.read_exact(&mut buf[..width]).ok()?;
-    let slice = &buf[..width];
-    let be = order == PlyEndian::Big;
-    Some(match ty {
-        PlyType::I8 => i8::from_ne_bytes([slice[0]]) as f64,
-        PlyType::U8 => slice[0] as f64,
-        PlyType::I16 => {
-            let b = [slice[0], slice[1]];
-            (if be {
-                i16::from_be_bytes(b)
-            } else {
-                i16::from_le_bytes(b)
-            }) as f64
+/// Decode a binary body. Fixed-size vertex rows go through their stride in
+/// one bounds check per row; every list-bearing element — faces above all —
+/// is walked row by row.
+fn load_ply_binary(
+    body: &[u8],
+    elements: &[PlyElement],
+    order: PlyEndian,
+) -> Result<PlyBody, String> {
+    let mut out = PlyBody::default();
+    let mut cursor = 0usize;
+    for element in elements {
+        let fixed = element.properties.iter().all(|p| p.count_ty.is_none());
+        let columns = (element.name == "vertex")
+            .then(|| vertex_columns(&element.properties))
+            .flatten();
+        if element.name == "vertex"
+            && fixed
+            && let Some(cols) = &columns
+        {
+            read_binary_vertices(body, &mut cursor, element, cols, order, &mut out)?;
+            continue;
         }
-        PlyType::U16 => {
-            let b = [slice[0], slice[1]];
-            (if be {
-                u16::from_be_bytes(b)
-            } else {
-                u16::from_le_bytes(b)
-            }) as f64
+        if element.name == "face" || element.name == "vertex" || !fixed {
+            let indices_col = (element.name == "face")
+                .then(|| {
+                    element
+                        .properties
+                        .iter()
+                        .position(|p| p.count_ty.is_some() && is_indices(&p.name))
+                })
+                .flatten();
+            read_binary_rows(
+                body,
+                &mut cursor,
+                element,
+                order,
+                indices_col,
+                columns.as_ref(),
+                &mut out,
+            )?;
+        } else {
+            // Unknown fixed-size element: jump over its records whole.
+            let stride: usize = element.properties.iter().map(|p| p.ty.width()).sum();
+            let size = element.count.checked_mul(stride).ok_or(BODY_END)?;
+            cursor = cursor
+                .checked_add(size)
+                .filter(|end| *end <= body.len())
+                .ok_or(BODY_END)?;
         }
-        PlyType::I32 => {
-            let b: [u8; 4] = slice.try_into().ok()?;
-            (if be {
-                i32::from_be_bytes(b)
-            } else {
-                i32::from_le_bytes(b)
-            }) as f64
+    }
+    Ok(out)
+}
+
+/// The hot loop of every binary point cloud: rows of a fixed stride, values
+/// read at offsets computed from the header, nothing allocated per vertex.
+#[allow(clippy::too_many_arguments)]
+fn read_binary_vertices(
+    body: &[u8],
+    cursor: &mut usize,
+    element: &PlyElement,
+    cols: &VertexColumns,
+    order: PlyEndian,
+    out: &mut PlyBody,
+) -> Result<(), String> {
+    let properties = &element.properties;
+    let stride: usize = properties.iter().map(|p| p.ty.width()).sum();
+    // The whole element must lie inside the body: a header lying about its
+    // count fails here instead of sizing an array from the lie.
+    let end = (*cursor)
+        .checked_add(element.count.checked_mul(stride).ok_or(BODY_END)?)
+        .filter(|end| *end <= body.len())
+        .ok_or(BODY_END)?;
+    let offset = |col: usize| {
+        properties[..col]
+            .iter()
+            .map(|p| p.ty.width())
+            .sum::<usize>()
+    };
+    let ty = |col: usize| properties[col].ty;
+    let (x, y, z) = (
+        (offset(cols.x), ty(cols.x)),
+        (offset(cols.y), ty(cols.y)),
+        (offset(cols.z), ty(cols.z)),
+    );
+    let normals = cols.normals.map(|n| n.map(|c| (offset(c), ty(c))));
+    let colors = cols.colors.map(|n| n.map(|c| (offset(c), ty(c))));
+
+    out.positions.reserve(element.count);
+    if cols.normals.is_some() {
+        out.normals.reserve(element.count);
+    }
+    if cols.colors.is_some() {
+        out.colors.reserve(element.count);
+    }
+    for row in body[*cursor..end].chunks_exact(stride) {
+        // Row length is exactly `stride` and every column offset plus width
+        // fits it, so the reads below are in bounds by construction.
+        out.positions.push([
+            scalar_row(row, x.0, x.1, order) as f32,
+            scalar_row(row, y.0, y.1, order) as f32,
+            scalar_row(row, z.0, z.1, order) as f32,
+        ]);
+        if let Some(n) = normals {
+            out.normals.push([
+                scalar_row(row, n[0].0, n[0].1, order) as f32,
+                scalar_row(row, n[1].0, n[1].1, order) as f32,
+                scalar_row(row, n[2].0, n[2].1, order) as f32,
+            ]);
         }
-        PlyType::U32 => {
-            let b: [u8; 4] = slice.try_into().ok()?;
-            (if be {
-                u32::from_be_bytes(b)
-            } else {
-                u32::from_le_bytes(b)
-            }) as f64
+        if let Some(c) = colors {
+            out.colors.push([
+                color_row(row, c[0].0, c[0].1, order),
+                color_row(row, c[1].0, c[1].1, order),
+                color_row(row, c[2].0, c[2].1, order),
+            ]);
         }
-        PlyType::F32 => {
-            let b: [u8; 4] = slice.try_into().ok()?;
-            (if be {
-                f32::from_be_bytes(b)
-            } else {
-                f32::from_le_bytes(b)
-            }) as f64
-        }
-        PlyType::F64 => {
-            let b: [u8; 8] = slice.try_into().ok()?;
-            if be {
-                f64::from_be_bytes(b)
-            } else {
-                f64::from_le_bytes(b)
+    }
+    *cursor = end;
+    Ok(())
+}
+
+/// Row-by-row walk for everything the fixed-stride path cannot take: faces
+/// for their index list, vertex elements carrying list properties, unknown
+/// elements just to advance past them.
+pub(crate) fn read_binary_rows(
+    body: &[u8],
+    cursor: &mut usize,
+    element: &PlyElement,
+    order: PlyEndian,
+    indices_col: Option<usize>,
+    columns: Option<&VertexColumns>,
+    out: &mut PlyBody,
+) -> Result<(), String> {
+    let mut indices: Vec<u32> = Vec::new();
+    let mut scalars = vec![0.0f64; element.properties.len()];
+    for _ in 0..element.count {
+        indices.clear();
+        for (col, property) in element.properties.iter().enumerate() {
+            match property.count_ty {
+                Some(count_ty) => {
+                    let length =
+                        scalar_at(body, *cursor, count_ty, order).ok_or(BODY_END)? as usize;
+                    *cursor += count_ty.width();
+                    if Some(col) == indices_col {
+                        for _ in 0..length {
+                            indices.push(
+                                scalar_at(body, *cursor, property.ty, order).ok_or(BODY_END)?
+                                    as u32,
+                            );
+                            *cursor += property.ty.width();
+                        }
+                    } else {
+                        let skip = length.checked_mul(property.ty.width()).ok_or(BODY_END)?;
+                        *cursor = (*cursor)
+                            .checked_add(skip)
+                            .filter(|at| *at <= body.len())
+                            .ok_or(BODY_END)?;
+                    }
+                }
+                None => {
+                    scalars[col] = scalar_at(body, *cursor, property.ty, order).ok_or(BODY_END)?;
+                    *cursor += property.ty.width();
+                }
             }
         }
+        if let Some(cols) = columns {
+            push_vertex_record(out, cols, &element.properties, &scalars);
+        }
+        if indices_col.is_some() {
+            push_fan(&mut out.triangles, &indices);
+        }
+    }
+    Ok(())
+}
+
+/// Decode an ASCII body, record per line: the vertex element is cut into
+/// line chunks parsed on the rayon pool, everything else walks serially.
+fn load_ply_ascii(body: &[u8], elements: &[PlyElement]) -> Result<PlyBody, String> {
+    let mut out = PlyBody::default();
+    let mut cursor = 0usize;
+    for element in elements {
+        let fixed = element.properties.iter().all(|p| p.count_ty.is_none());
+        if element.name == "vertex"
+            && fixed
+            && let Some(cols) = vertex_columns(&element.properties)
+        {
+            read_ascii_vertices(body, &mut cursor, element, &cols, &mut out)?;
+            continue;
+        }
+        let indices_col = (element.name == "face")
+            .then(|| {
+                element
+                    .properties
+                    .iter()
+                    .position(|p| p.count_ty.is_some() && is_indices(&p.name))
+            })
+            .flatten();
+        let columns = (element.name == "vertex")
+            .then(|| vertex_columns(&element.properties))
+            .flatten();
+        read_ascii_rows(
+            body,
+            &mut cursor,
+            element,
+            indices_col,
+            columns.as_ref(),
+            &mut out,
+        )?;
+    }
+    Ok(out)
+}
+
+/// ASCII vertex element without list properties: records are whole lines, so
+/// the section is cut at newline boundaries, the chunks parsed in parallel
+/// and concatenated in file order.
+fn read_ascii_vertices(
+    body: &[u8],
+    cursor: &mut usize,
+    element: &PlyElement,
+    cols: &VertexColumns,
+    out: &mut PlyBody,
+) -> Result<(), String> {
+    if element.count == 0 {
+        return Ok(());
+    }
+    // Fast section end: the records are the first `count` newline-terminated
+    // runs, so the `count`-th newline closes the section — one vectorised
+    // scan instead of walking every line. The parsed record sum verifies it;
+    // a blank line between records (or a last record with no trailing
+    // newline) shifts the section, and the exact line scanner then redoes it.
+    // Real exports never take that path.
+    let fast_end = memchr::memchr_iter(b'\n', &body[*cursor..])
+        .nth(element.count - 1)
+        .map(|at| *cursor + at + 1);
+    let (end, parsed) = match fast_end {
+        Some(end) => match parse_vertex_section(&body[*cursor..end], element, cols)? {
+            parsed if parsed.records == element.count => (end, parsed),
+            _ => exact_vertex_section(body, *cursor, element, cols)?,
+        },
+        None => exact_vertex_section(body, *cursor, element, cols)?,
+    };
+    *cursor = end;
+    out.positions.extend_from_slice(&parsed.body.positions);
+    out.normals.extend_from_slice(&parsed.body.normals);
+    out.colors.extend_from_slice(&parsed.body.colors);
+    Ok(())
+}
+
+/// Exact section end + parse, for sections the newline count cannot size:
+/// blank lines between records, or a last record with no trailing newline.
+fn exact_vertex_section(
+    body: &[u8],
+    start: usize,
+    element: &PlyElement,
+    cols: &VertexColumns,
+) -> Result<(usize, ParsedSection), String> {
+    let mut scan = start;
+    for _ in 0..element.count {
+        next_record_line(body, &mut scan).ok_or(BODY_END)?;
+    }
+    let parsed = parse_vertex_section(&body[start..scan], element, cols)?;
+    Ok((scan, parsed))
+}
+
+/// One vertex section's parse: how many records it yielded and the arrays.
+struct ParsedSection {
+    records: usize,
+    body: PlyBody,
+}
+
+/// Cut a whole-line section into chunks and parse them — serially for small
+/// sections, on the rayon pool otherwise.
+fn parse_vertex_section(
+    section: &[u8],
+    element: &PlyElement,
+    cols: &VertexColumns,
+) -> Result<ParsedSection, String> {
+    if section.len() < ASCII_PARALLEL_MIN_BYTES || element.count < 2 {
+        return parse_ascii_vertex_chunk(section, &element.properties, cols);
+    }
+    use rayon::prelude::*;
+
+    let chunks = rayon::current_num_threads().min(element.count).max(1);
+    // Chunk starts on line boundaries: split the section by bytes, then snap
+    // every interior boundary forward to the next newline. Records per chunk
+    // may differ by a line or two; the section end fixes the total.
+    let mut ranges: Vec<(usize, usize)> = Vec::with_capacity(chunks);
+    let mut start = 0usize;
+    for k in 1..=chunks {
+        let end = if k == chunks {
+            section.len()
+        } else {
+            snap_to_line_start(section, k * section.len() / chunks)
+        };
+        ranges.push((start, end));
+        start = end;
+    }
+    let parts = ranges
+        .par_iter()
+        .map(|&(a, b)| parse_ascii_vertex_chunk(&section[a..b], &element.properties, cols))
+        .collect::<Result<Vec<_>, String>>()?;
+    let mut parsed = ParsedSection {
+        records: 0,
+        body: PlyBody::default(),
+    };
+    for part in parts {
+        parsed.records += part.records;
+        parsed
+            .body
+            .positions
+            .extend_from_slice(&part.body.positions);
+        parsed.body.normals.extend_from_slice(&part.body.normals);
+        parsed.body.colors.extend_from_slice(&part.body.colors);
+    }
+    Ok(parsed)
+}
+
+/// Advance `at` to the start of the next line (just past a newline), so a
+/// chunk cut by byte offset still begins on a record boundary.
+fn snap_to_line_start(section: &[u8], at: usize) -> usize {
+    if at == 0 || section[at - 1] == b'\n' {
+        return at;
+    }
+    section[at..]
+        .iter()
+        .position(|&b| b == b'\n')
+        .map_or(section.len(), |i| at + i + 1)
+}
+
+/// Parse a run of whole vertex lines into its own arrays. Every non-empty
+/// line is one record; columns past the last interesting one are ignored.
+fn parse_ascii_vertex_chunk(
+    chunk: &[u8],
+    properties: &[PlyProperty],
+    cols: &VertexColumns,
+) -> Result<ParsedSection, String> {
+    let mut part = PlyBody::default();
+    // What each column feeds: 1-3 the position, 4-6 the normal, 7-9 the
+    // colour channel, 0 nothing worth a parse.
+    let last_col = [cols.x, cols.y, cols.z]
+        .into_iter()
+        .chain(cols.normals.into_iter().flatten())
+        .chain(cols.colors.into_iter().flatten())
+        .max()
+        .unwrap_or(0);
+    let mut plan = vec![0u8; last_col + 1];
+    plan[cols.x] = 1;
+    plan[cols.y] = 2;
+    plan[cols.z] = 3;
+    if let Some([a, b, c]) = cols.normals {
+        plan[a] = 4;
+        plan[b] = 5;
+        plan[c] = 6;
+    }
+    if let Some([r, g, b]) = cols.colors {
+        plan[r] = 7;
+        plan[g] = 8;
+        plan[b] = 9;
+    }
+
+    let mut at = 0usize;
+    while at < chunk.len() {
+        // Plain byte scan: memchr's per-call setup costs more than the loop
+        // on lines this short.
+        let end = chunk[at..]
+            .iter()
+            .position(|&b| b == b'\n')
+            .map_or(chunk.len(), |i| at + i);
+        let line = &chunk[at..end];
+        at = (end + 1).min(chunk.len());
+        let mut tokens = Tokens::new(line);
+        let Some(first) = tokens.next_token() else {
+            continue; // a blank line between records
+        };
+        let mut record = [0.0f64; 9];
+        let mut column = 0usize;
+        let mut token = Some(first);
+        while let Some(value) = token {
+            if column > last_col {
+                break;
+            }
+            let slot = plan[column];
+            if slot != 0 {
+                record[(slot - 1) as usize] = token_f64(value).ok_or(BODY_END)?;
+            }
+            column += 1;
+            token = tokens.next_token();
+        }
+        if column <= last_col {
+            return Err(BODY_END.into());
+        }
+        part.positions
+            .push([record[0] as f32, record[1] as f32, record[2] as f32]);
+        if cols.normals.is_some() {
+            part.normals
+                .push([record[3] as f32, record[4] as f32, record[5] as f32]);
+        }
+        if let Some([r, g, b]) = cols.colors {
+            part.colors.push([
+                unit_colour(record[6], properties[r].ty),
+                unit_colour(record[7], properties[g].ty),
+                unit_colour(record[8], properties[b].ty),
+            ]);
+        }
+    }
+    Ok(ParsedSection {
+        records: part.positions.len(),
+        body: part,
     })
 }
 
+/// Row-by-row ASCII walk for everything the parallel path cannot take: faces
+/// for their index list, vertex elements carrying list properties, unknown
+/// elements to skip their records.
+fn read_ascii_rows(
+    body: &[u8],
+    cursor: &mut usize,
+    element: &PlyElement,
+    indices_col: Option<usize>,
+    columns: Option<&VertexColumns>,
+    out: &mut PlyBody,
+) -> Result<(), String> {
+    let mut indices: Vec<u32> = Vec::new();
+    let mut scalars = vec![0.0f64; element.properties.len()];
+    for _ in 0..element.count {
+        let line = next_record_line(body, cursor).ok_or(BODY_END)?;
+        let mut tokens = Tokens::new(line);
+        indices.clear();
+        for (col, property) in element.properties.iter().enumerate() {
+            match property.count_ty {
+                Some(_) => {
+                    // A list: the first token is its length.
+                    let length = token_f64(tokens.next_token().ok_or(BODY_END)?)
+                        .ok_or(BODY_END)?
+                        .max(0.0) as usize;
+                    if Some(col) == indices_col {
+                        for _ in 0..length {
+                            let index = token_f64(tokens.next_token().ok_or(BODY_END)?)
+                                .ok_or(BODY_END)? as u32;
+                            indices.push(index);
+                        }
+                    } else {
+                        for _ in 0..length {
+                            tokens.next_token().ok_or(BODY_END)?;
+                        }
+                    }
+                }
+                None => {
+                    scalars[col] =
+                        token_f64(tokens.next_token().ok_or(BODY_END)?).ok_or(BODY_END)?;
+                }
+            }
+        }
+        if let Some(cols) = columns {
+            push_vertex_record(out, cols, &element.properties, &scalars);
+        }
+        if indices_col.is_some() {
+            push_fan(&mut out.triangles, &indices);
+        }
+    }
+    Ok(())
+}
+
+/// Advance to the next non-empty line and return it without its terminator;
+/// blank lines separate records, they are not records.
+pub(crate) fn next_record_line<'a>(body: &'a [u8], cursor: &mut usize) -> Option<&'a [u8]> {
+    while *cursor < body.len() {
+        let rest = &body[*cursor..];
+        let end = rest.iter().position(|&b| b == b'\n').unwrap_or(rest.len());
+        *cursor = (*cursor + end + 1).min(body.len());
+        let line = &rest[..end];
+        if !line.iter().all(|&b| b.is_ascii_whitespace()) {
+            return Some(line);
+        }
+    }
+    None
+}
+
+/// Whitespace-separated tokens of one ASCII record line, read as bytes —
+/// the body is never copied into a `String` to split it.
+pub(crate) struct Tokens<'a> {
+    line: &'a [u8],
+    at: usize,
+}
+
+impl<'a> Tokens<'a> {
+    #[inline]
+    pub(crate) fn new(line: &'a [u8]) -> Self {
+        Self { line, at: 0 }
+    }
+
+    #[inline]
+    pub(crate) fn next_token(&mut self) -> Option<&'a [u8]> {
+        while self.at < self.line.len() && self.line[self.at].is_ascii_whitespace() {
+            self.at += 1;
+        }
+        let start = self.at;
+        while self.at < self.line.len() && !self.line[self.at].is_ascii_whitespace() {
+            self.at += 1;
+        }
+        (start < self.at).then(|| &self.line[start..self.at])
+    }
+}
+
+/// Parse one ASCII token as a number; real files hold plain decimals, and
+/// the check costs far less than the copy a lossy UTF-8 pass would make.
+#[inline]
+pub(crate) fn token_f64(token: &[u8]) -> Option<f64> {
+    std::str::from_utf8(token).ok()?.parse().ok()
+}
+
+/// Read one scalar at a fixed offset of a bounds-checked record. The caller
+/// guarantees `at + width ≤ record.len()` — the stride loop does, because
+/// the offsets come from the header and sum within the row — so the reads
+/// index directly instead of shipping an `Option` per value.
+pub(crate) fn scalar_row(record: &[u8], at: usize, ty: PlyType, order: PlyEndian) -> f64 {
+    match (ty, order) {
+        (PlyType::I8, _) => record[at] as i8 as f64,
+        (PlyType::U8, _) => record[at] as f64,
+        (PlyType::I16, PlyEndian::Little) => {
+            i16::from_le_bytes(record[at..at + 2].try_into().unwrap()) as f64
+        }
+        (PlyType::I16, PlyEndian::Big) => {
+            i16::from_be_bytes(record[at..at + 2].try_into().unwrap()) as f64
+        }
+        (PlyType::U16, PlyEndian::Little) => {
+            u16::from_le_bytes(record[at..at + 2].try_into().unwrap()) as f64
+        }
+        (PlyType::U16, PlyEndian::Big) => {
+            u16::from_be_bytes(record[at..at + 2].try_into().unwrap()) as f64
+        }
+        (PlyType::I32, PlyEndian::Little) => {
+            i32::from_le_bytes(record[at..at + 4].try_into().unwrap()) as f64
+        }
+        (PlyType::I32, PlyEndian::Big) => {
+            i32::from_be_bytes(record[at..at + 4].try_into().unwrap()) as f64
+        }
+        (PlyType::U32, PlyEndian::Little) => {
+            u32::from_le_bytes(record[at..at + 4].try_into().unwrap()) as f64
+        }
+        (PlyType::U32, PlyEndian::Big) => {
+            u32::from_be_bytes(record[at..at + 4].try_into().unwrap()) as f64
+        }
+        (PlyType::F32, PlyEndian::Little) => {
+            f32::from_le_bytes(record[at..at + 4].try_into().unwrap()) as f64
+        }
+        (PlyType::F32, PlyEndian::Big) => {
+            f32::from_be_bytes(record[at..at + 4].try_into().unwrap()) as f64
+        }
+        (PlyType::F64, PlyEndian::Little) => {
+            f64::from_le_bytes(record[at..at + 8].try_into().unwrap())
+        }
+        (PlyType::F64, PlyEndian::Big) => {
+            f64::from_be_bytes(record[at..at + 8].try_into().unwrap())
+        }
+    }
+}
+
+/// [`scalar_row`] for a record whose bounds are not yet proven: one range
+/// check in front of the read.
+pub(crate) fn scalar_at(record: &[u8], at: usize, ty: PlyType, order: PlyEndian) -> Option<f64> {
+    record.get(at..at + ty.width())?;
+    Some(scalar_row(record, at, ty, order))
+}
+
+/// A colour channel straight out of a binary row: `u8` goes through the
+/// pre-scaled table, every other width through the generic scalar.
+pub(crate) fn color_row(row: &[u8], at: usize, ty: PlyType, order: PlyEndian) -> f32 {
+    match ty {
+        PlyType::U8 => U8_UNIT[row[at] as usize],
+        _ => unit_colour(scalar_row(row, at, ty, order), ty),
+    }
+}
+
+/// One colour channel: 0..=255 in an integer field, 0..=1 as a float — the
+/// declared type travels with the header — clamped so a broken file still
+/// renders.
+pub(crate) fn unit_colour(value: f64, ty: PlyType) -> f32 {
+    if ty.is_integer() {
+        ((value / 255.0) as f32).clamp(0.0, 1.0)
+    } else {
+        (value as f32).clamp(0.0, 1.0)
+    }
+}
+
+/// Fold one already-read record into the output arrays.
+fn push_vertex_record(
+    out: &mut PlyBody,
+    cols: &VertexColumns,
+    properties: &[PlyProperty],
+    scalars: &[f64],
+) {
+    out.positions.push([
+        scalars[cols.x] as f32,
+        scalars[cols.y] as f32,
+        scalars[cols.z] as f32,
+    ]);
+    if let Some([a, b, c]) = cols.normals {
+        out.normals
+            .push([scalars[a] as f32, scalars[b] as f32, scalars[c] as f32]);
+    }
+    if let Some([r, g, b]) = cols.colors {
+        out.colors.push([
+            unit_colour(scalars[r], properties[r].ty),
+            unit_colour(scalars[g], properties[g].ty),
+            unit_colour(scalars[b], properties[b].ty),
+        ]);
+    }
+}
+
+/// Fan-triangulate one polygon of vertex indices.
+pub(crate) fn push_fan(triangles: &mut Vec<[u32; 3]>, indices: &[u32]) {
+    for i in 1..indices.len().saturating_sub(1) {
+        triangles.push([indices[0], indices[i], indices[i + 1]]);
+    }
+}
+
 /// Offset just past the `end_header` line.
-fn find_ply_header_end(bytes: &[u8]) -> Option<usize> {
+pub(crate) fn find_ply_header_end(bytes: &[u8]) -> Option<usize> {
     let needle = b"end_header";
     let mut index = 0;
     while index + needle.len() <= bytes.len() {
@@ -1112,5 +1649,171 @@ end_header
     fn model_extensions_are_recognised() {
         assert!(is_model_ext("obj") && is_model_ext("stl") && is_model_ext("ply"));
         assert!(!is_model_ext("png"));
+    }
+
+    /// Big-endian binary: the byte order declared in the header travels
+    /// with every value, colours included.
+    #[test]
+    fn binary_ply_big_endian_reads_vertices_and_colours() {
+        let header = "\
+ply
+format binary_big_endian 1.0
+element vertex 2
+property float x
+property float y
+property float z
+property uchar red
+property uchar green
+property uchar blue
+end_header
+";
+        let mut bytes = header.as_bytes().to_vec();
+        let points = [[0f32, 0.0, 0.0], [1.0, 2.0, 3.0]];
+        let colours = [[255u8, 0, 0], [0, 128, 255]];
+        for (point, colour) in points.iter().zip(colours.iter()) {
+            for value in point {
+                bytes.extend_from_slice(&value.to_be_bytes());
+            }
+            bytes.extend_from_slice(colour);
+        }
+        let mesh = load_ply(&bytes).expect("big-endian ply parses");
+        assert!(mesh.is_point_cloud());
+        assert_eq!(mesh.bounds.max, [1.0, 2.0, 3.0]);
+        assert_eq!(
+            mesh.colors,
+            vec![[1.0, 0.0, 0.0], [0.0, 128.0 / 255.0, 1.0]]
+        );
+    }
+
+    /// An ASCII cloud large enough to take the parallel line-chunk path: no
+    /// record may be lost or reordered at the chunk seams.
+    #[test]
+    fn a_large_ascii_ply_parses_in_parallel_chunks() {
+        let mut ply = String::from(
+            "ply\nformat ascii 1.0\nelement vertex 30000\n\
+             property float x\nproperty float y\nproperty float z\n\
+             property uchar red\nproperty uchar green\nproperty uchar blue\n\
+             end_header\n",
+        );
+        for i in 0..30000u32 {
+            let v = i as f32 * 0.25;
+            ply.push_str(&format!("{v:.3} {v:.3} {v:.3} 255 255 255\n"));
+        }
+        let mesh = load_ply(ply.as_bytes()).expect("a large cloud parses");
+        assert_eq!(mesh.vertex_count(), 30000);
+        assert!(mesh.has_vertex_colors());
+        assert_eq!(mesh.positions[0], [0.0; 3]);
+        assert_eq!(mesh.positions[29999], [7499.75; 3]);
+    }
+
+    /// A header that promises far more vertices than the body holds must
+    /// fail, not size an array from the lie.
+    #[test]
+    fn a_binary_header_lying_about_its_count_errors() {
+        let header = "\
+ply
+format binary_little_endian 1.0
+element vertex 1000000000
+property float x
+property float y
+property float z
+end_header
+";
+        let mut bytes = header.as_bytes().to_vec();
+        bytes.extend_from_slice(&0f32.to_le_bytes());
+        assert!(load_ply(&bytes).is_err());
+    }
+
+    /// The size cap in `load`: a file past the limit is refused before it
+    /// is read, without needing a multi-gigabyte fixture.
+    #[test]
+    fn oversized_model_files_are_refused() {
+        let path = std::env::temp_dir().join("trove-ply-cap-test.ply");
+        std::fs::write(&path, b"ply\nformat ascii 1.0\nend_header\n").unwrap();
+        let err = load_capped(&path, 4).expect_err("a file over the cap is refused");
+        std::fs::remove_file(&path).ok();
+        assert!(err.contains("larger than"));
+    }
+
+    /// Faces arrive as polygons: a quad fan-triangulates into two triangles.
+    #[test]
+    fn ascii_ply_quads_fan_triangulate() {
+        let ply = "\
+ply
+format ascii 1.0
+element vertex 4
+property float x
+property float y
+property float z
+element face 1
+property list uchar int vertex_indices
+end_header
+0 0 0
+1 0 0
+1 1 0
+0 1 0
+4 0 1 2 3
+";
+        let mesh = load_ply(ply.as_bytes()).expect("a quad parses");
+        assert_eq!(mesh.triangles, vec![[0, 1, 2], [0, 2, 3]]);
+    }
+
+    /// A vertex element carrying a list property is exotic but valid: the
+    /// list is walked past and the scalars still land.
+    #[test]
+    fn a_vertex_list_property_is_walked_past() {
+        let ply = "\
+ply
+format ascii 1.0
+element vertex 2
+property float x
+property float y
+property float z
+property list uchar float bins
+end_header
+0 0 0 3 1 2 3
+1 1 1 0
+";
+        let mesh = load_ply(ply.as_bytes()).expect("a list-bearing vertex parses");
+        assert_eq!(mesh.vertex_count(), 2);
+        assert_eq!(mesh.bounds.max, [1.0; 3]);
+    }
+
+    /// The binary flavour of the same exotic shape.
+    #[test]
+    fn a_binary_vertex_list_property_is_walked_past() {
+        let header = "\
+ply
+format binary_little_endian 1.0
+element vertex 2
+property float x
+property float y
+property float z
+property list uchar float bins
+end_header
+";
+        let mut bytes = header.as_bytes().to_vec();
+        for x in [0.0f32, 9.5] {
+            for value in [x, 1.0, 2.0] {
+                bytes.extend_from_slice(&value.to_le_bytes());
+            }
+            bytes.push(1); // one bin
+            bytes.extend_from_slice(&x.to_le_bytes());
+        }
+        let mesh = load_ply(&bytes).expect("a binary list-bearing vertex parses");
+        assert_eq!(mesh.vertex_count(), 2);
+        assert_eq!(mesh.bounds.max, [9.5, 1.0, 2.0]);
+    }
+
+    /// CRLF endings and stray blank lines between records still parse: the
+    /// line walker treats them as separators, not records.
+    #[test]
+    fn ascii_ply_tolerates_crlf_and_blank_lines() {
+        let ply = "ply\r\nformat ascii 1.0\r\nelement vertex 3\r\n\
+                   property float x\r\nproperty float y\r\nproperty float z\r\n\
+                   end_header\r\n0 0 0\r\n\r\n1 2 3\r\n-1 0 0.5\r\n";
+        let mesh = load_ply(ply.as_bytes()).expect("a crlf cloud parses");
+        assert_eq!(mesh.vertex_count(), 3);
+        assert_eq!(mesh.bounds.min, [-1.0, 0.0, 0.0]);
     }
 }

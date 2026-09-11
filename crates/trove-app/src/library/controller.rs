@@ -170,6 +170,7 @@ impl LibraryController {
         self.showing_trash = false;
         self.showing_recent = false;
         self.active_smart = None;
+        self.filter_kind = None;
         self.selected_assets.clear();
         self.reset_grid_page();
         self.generation += 1;

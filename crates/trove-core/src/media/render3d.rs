@@ -145,10 +145,23 @@ pub fn clamp_edge(edge: u32) -> u32 {
 /// `supersample` (1 or 2) trades time for smoother silhouettes: 2 renders at
 /// twice the resolution and box-filters down, which costs four times the work.
 /// The interactive draft frame uses 1, the idle frame 2.
-pub fn render(mesh: &Mesh, camera: &Camera, width: u32, height: u32, supersample: u32) -> Frame {
+///
+/// `quality` (0..=1] is the fraction of the geometry to actually rasterise:
+/// `1.0` draws every triangle or point, lower values draw every Nth one.
+/// Used to keep interaction with a heavy mesh responsive — a quarter of the
+/// triangles a quarter of the time still reads as the same model turning.
+pub fn render(
+    mesh: &Mesh,
+    camera: &Camera,
+    width: u32,
+    height: u32,
+    supersample: u32,
+    quality: f32,
+) -> Frame {
     let width = clamp_edge(width);
     let height = clamp_edge(height);
     let ss = supersample.clamp(1, MAX_SUPERSAMPLE);
+    let quality = quality.clamp(0.05, 1.0);
     // Sprites are sized in final-image pixels, so the supersampled buffer
     // needs them scaled up or a cloud would come out thinner after the filter.
     let colors = paint(
@@ -157,6 +170,7 @@ pub fn render(mesh: &Mesh, camera: &Camera, width: u32, height: u32, supersample
         width * ss,
         height * ss,
         POINT_RADIUS * ss as f32,
+        quality,
     );
     let colors = if ss > 1 {
         downsample(
@@ -493,6 +507,7 @@ fn paint(
     width: u32,
     height: u32,
     point_radius: f32,
+    quality: f32,
 ) -> Vec<[f32; 3]> {
     let w = width as usize;
     let h = height as usize;
@@ -516,7 +531,7 @@ fn paint(
     let mut depth = vec![0f32; w * h];
 
     if mesh.is_point_cloud() {
-        paint_points(&mut colors, &mut depth, mesh, framing, w, h, point_radius);
+        paint_points(&mut colors, &mut depth, mesh, framing, w, h, point_radius, quality);
         return colors;
     }
     if mesh.triangles.is_empty() {
@@ -547,7 +562,13 @@ fn paint(
             framing,
         };
 
-        for triangle in &mesh.triangles {
+        // Quality subsampling: render every `step`th triangle.  At
+        // quality 1.0 every triangle draws; at 0.25 only every 4th does.
+        let step = (1.0f32 / quality).round().max(1.0) as usize;
+        for (tri_idx, triangle) in mesh.triangles.iter().enumerate() {
+            if tri_idx % step != 0 {
+                continue;
+            }
             let (i0, i1, i2) = (
                 triangle[0] as usize,
                 triangle[1] as usize,
@@ -626,10 +647,12 @@ fn paint_points(
     width: usize,
     height: usize,
     radius: f32,
+    quality: f32,
 ) {
     let (near, _) = framing.depth_range();
     let eye = framing.eye_in_model_space();
     let light = normalize(KEY_LIGHT);
+    let step = (1.0f32 / quality).round().max(1.0) as usize;
 
     let mut target = Target {
         colors,
@@ -640,6 +663,9 @@ fn paint_points(
     };
 
     for (index, position) in mesh.positions.iter().enumerate() {
+        if index % step != 0 {
+            continue;
+        }
         let view = framing.to_view(*position);
         if view[2] <= near {
             continue; // Behind the eye, or inside the near plane.
@@ -1025,7 +1051,7 @@ mod tests {
 
     #[test]
     fn frame_has_the_requested_size_and_is_opaque() {
-        let frame = render(&cube(), &Camera::default(), 96, 64, 1);
+        let frame = render(&cube(), &Camera::default(), 96, 64, 1, 1.0);
         assert_eq!(frame.width, 96);
         assert_eq!(frame.height, 64);
         assert_eq!(frame.bgra.len(), 96 * 64 * 4);
@@ -1034,7 +1060,7 @@ mod tests {
 
     #[test]
     fn a_cube_covers_part_of_the_frame() {
-        let frame = render(&cube(), &Camera::default(), 96, 96, 1);
+        let frame = render(&cube(), &Camera::default(), 96, 96, 1, 1.0);
         let lit = lit_pixels(&frame);
         assert!(lit > 200, "expected a visible model, got {lit} pixels");
         assert!(lit < 96 * 96, "the model should not fill the frame");
@@ -1045,23 +1071,23 @@ mod tests {
     fn zooming_in_covers_more_pixels() {
         let mesh = cube();
         let mut camera = Camera::default();
-        let wide = lit_pixels(&render(&mesh, &camera, 96, 96, 1));
+        let wide = lit_pixels(&render(&mesh, &camera, 96, 96, 1, 1.0));
         camera.zoom_by(0.5);
-        let close = lit_pixels(&render(&mesh, &camera, 96, 96, 1));
+        let close = lit_pixels(&render(&mesh, &camera, 96, 96, 1, 1.0));
         assert!(close > wide, "close={close} wide={wide}");
     }
 
     #[test]
     fn supersampling_keeps_the_output_size() {
-        let frame = render(&cube(), &Camera::default(), 64, 48, 2);
+        let frame = render(&cube(), &Camera::default(), 64, 48, 2, 1.0);
         assert_eq!((frame.width, frame.height), (64, 48));
         assert_eq!(frame.bgra.len(), 64 * 48 * 4);
     }
 
     #[test]
     fn the_nearer_triangle_wins_the_depth_test() {
-        let backdrop = render(&occluded_quad(false), &Camera::default(), 128, 128, 1);
-        let occluded = render(&occluded_quad(true), &Camera::default(), 128, 128, 1);
+        let backdrop = render(&occluded_quad(false), &Camera::default(), 128, 128, 1, 1.0);
+        let occluded = render(&occluded_quad(true), &Camera::default(), 128, 128, 1, 1.0);
         let (near, far) = (
             brightness(occluded.pixel(64, 64)),
             brightness(backdrop.pixel(64, 64)),
@@ -1074,7 +1100,7 @@ mod tests {
 
     #[test]
     fn a_mesh_without_bounds_renders_background_only() {
-        let frame = render(&Mesh::default(), &Camera::default(), 64, 64, 1);
+        let frame = render(&Mesh::default(), &Camera::default(), 64, 64, 1, 1.0);
         assert!(frame.is_empty_of_geometry());
         assert_eq!(lit_pixels(&frame), 0);
     }
@@ -1122,7 +1148,7 @@ mod tests {
         assert_eq!(clamp_edge(1), MIN_EDGE);
         assert_eq!(clamp_edge(600), 600);
         assert_eq!(clamp_edge(u32::MAX), MAX_EDGE);
-        let tiny = render(&cube(), &Camera::default(), 1, 1, 1);
+        let tiny = render(&cube(), &Camera::default(), 1, 1, 1, 1.0);
         assert_eq!(tiny.width, MIN_EDGE);
     }
 
@@ -1402,7 +1428,7 @@ mod tests {
             [0.0, 0.0, 0.6],
         ]);
         assert!(mesh.is_point_cloud());
-        let frame = render(&mesh, &Camera::default(), 64, 64, 1);
+        let frame = render(&mesh, &Camera::default(), 64, 64, 1, 1.0);
         assert!(painted(&frame) > 0, "a cloud must paint something");
     }
 
@@ -1411,7 +1437,7 @@ mod tests {
     #[test]
     fn one_point_paints_a_small_sprite() {
         let mesh = cloud(&[[0.0, 0.0, 0.0]]);
-        let frame = render(&mesh, &Camera::default(), 64, 64, 1);
+        let frame = render(&mesh, &Camera::default(), 64, 64, 1, 1.0);
         let count = painted(&frame);
         assert!(
             (1..=16).contains(&count),
@@ -1431,7 +1457,7 @@ mod tests {
             zoom: 1.0,
         };
         let mesh = cloud(&[[0.0, 0.0, 1.0], [0.0, 0.0, -1.0]]);
-        let frame = render(&mesh, &axis_on, 64, 64, 1);
+        let frame = render(&mesh, &axis_on, 64, 64, 1, 1.0);
         let centre = frame.pixel(32, 32);
 
         let near = MATERIAL[1] * (AMBIENT + DIFFUSE * dot(normalize(KEY_LIGHT), [0.0, 0.0, 1.0]));
@@ -1499,7 +1525,7 @@ mod tests {
         assert!(mesh.has_vertex_colors());
         assert_eq!(base_color(&mesh, 0), [1.0, 0.0, 0.0]);
 
-        let frame = render(&mesh, &Camera::default(), 64, 64, 1);
+        let frame = render(&mesh, &Camera::default(), 64, 64, 1, 1.0);
         // BGRA: a red point leaves the green and blue channels dark, where a
         // material-shaded one would be a grey-blue.
         let centre = frame.pixel(32, 32);
@@ -1519,6 +1545,6 @@ mod tests {
     fn a_degenerate_cloud_still_paints_its_sprite() {
         let mesh = cloud(&[[1.0, 1.0, 1.0], [1.0, 1.0, 1.0]]);
         assert_eq!(mesh.bounds.longest_edge(), 0.0);
-        assert!(painted(&render(&mesh, &Camera::default(), 64, 64, 1)) > 0);
+        assert!(painted(&render(&mesh, &Camera::default(), 64, 64, 1, 1.0)) > 0);
     }
 }

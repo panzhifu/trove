@@ -28,6 +28,7 @@ use gpui_kit::component::{ActiveTheme, IconName, Sizable};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
+use trove_core::media::chunked::{self, LodConfig};
 use trove_core::media::mesh::{self, Bounds as MeshBounds, Mesh};
 use trove_core::media::render3d::{self, Camera};
 
@@ -47,6 +48,8 @@ const MIN_FRAME_EDGE: f32 = 16.0;
 /// Which renderer is painting the viewport, for the status line.
 #[derive(Debug, Clone)]
 pub enum Backend {
+    /// The mesh is still being parsed on a background thread.
+    Loading,
     /// The GPU device is still coming up on a background thread.
     Starting,
     /// Off-screen wgpu; the string is the adapter description.
@@ -106,6 +109,8 @@ pub struct ModelViewport {
     shown: Option<Arc<RenderImage>>,
     /// Wall time of the last completed frame, in milliseconds.
     frame_ms: f32,
+    /// Instant the last frame finished rendering. Gates `pump` to ~60 fps.
+    last_frame: Option<std::time::Instant>,
 
     dragging: bool,
     /// Last drag position, in window coordinates.
@@ -115,34 +120,83 @@ pub struct ModelViewport {
 impl EventEmitter<ModelViewportEvent> for ModelViewport {}
 
 impl ModelViewport {
-    /// Load `path` and build the viewport, or `None` when it is not a mesh
-    /// that parses (the caller keeps the grid, so nothing is lost).
-    pub fn spawn(name: String, path: PathBuf, cx: &mut App) -> Option<Entity<Self>> {
-        let mesh = Arc::new(mesh::load(&path).ok()?);
-        Some(cx.new(|cx| Self::with_mesh(name, mesh, cx)))
+    /// Open the viewport for `path`, showing a loading indicator until the
+    /// mesh parses. The parse runs on a background thread so the UI never
+    /// blocks — even a 20 GB export turns the spinner instead of freezing
+    /// the window.
+    pub fn spawn(name: String, path: PathBuf, cx: &mut App) -> Entity<Self> {
+        cx.new(|cx| {
+            // Placeholder mesh: one invisible vertex so the renderer has
+            // something valid to hold until the real parse lands. The true
+            // mesh arrives via `set_mesh` from the background task below.
+            let loading_mesh = Arc::new(Mesh::default());
+            let this = Self {
+                name,
+                mesh: loading_mesh,
+                camera: Camera::default(),
+                gpu: None,
+                gpu_mesh: None,
+                backend: Backend::Loading,
+                error: None,
+                logical: (0.0, 0.0),
+                scale: 1.0,
+                dirty: true,
+                in_flight: false,
+                pending: None,
+                shown: None,
+                frame_ms: 0.0,
+                last_frame: None,
+                dragging: false,
+                drag_from: Point::default(),
+            };
+            this.start_load(path, cx);
+            this
+        })
     }
 
-    fn with_mesh(name: String, mesh: Arc<Mesh>, cx: &mut Context<Self>) -> Self {
-        let mut this = Self {
-            name,
-            mesh,
-            camera: Camera::default(),
-            gpu: None,
-            gpu_mesh: None,
-            backend: Backend::Starting,
-            error: None,
-            logical: (0.0, 0.0),
-            scale: 1.0,
-            dirty: true,
-            in_flight: false,
-            pending: None,
-            shown: None,
-            frame_ms: 0.0,
-            dragging: false,
-            drag_from: Point::default(),
-        };
-        this.start_gpu(cx);
-        this
+    /// Parse the mesh off the UI thread, then hand it back to the viewport.
+    fn start_load(&self, path: PathBuf, cx: &mut Context<Self>) {
+        cx.spawn(async move |weak, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { Self::load_mesh(&path) })
+                .await;
+            weak.update(cx, |this, cx| match result {
+                Ok(mesh) => this.set_mesh(mesh, cx),
+                Err(err) => {
+                    this.error = Some(err);
+                    this.backend = Backend::Cpu("load failed".into());
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Swap in a freshly parsed mesh and bring the GPU up.
+    fn set_mesh(&mut self, mesh: Mesh, cx: &mut Context<Self>) {
+        self.mesh = Arc::new(mesh);
+        self.backend = Backend::Starting;
+        self.start_gpu(cx);
+        cx.notify();
+    }
+
+    /// Load a mesh, dispatching on the file size. Files over 512 MiB go
+    /// through the chunked LOD loader with a 128 MiB parsed-geometry budget;
+    /// smaller files take the stock loader, which keeps every vertex.
+    fn load_mesh(path: &PathBuf) -> Result<Mesh, String> {
+        const CHUNKED_THRESHOLD: u64 = 512 << 20;
+        let size = std::fs::metadata(path).map_err(|e| e.to_string())?.len();
+        if size > CHUNKED_THRESHOLD {
+            let config = LodConfig {
+                memory_budget: 128 << 20,
+                max_lod_step: 32,
+            };
+            chunked::load_ply_chunked(path, config)
+        } else {
+            mesh::load(path)
+        }
     }
 
     /// Primitives and vertices of the loaded geometry, for the status line.
@@ -153,6 +207,11 @@ impl ModelViewport {
 
     /// Bring the GPU up on a background thread and upload the mesh. Until it
     /// finishes — or forever, if it fails — the CPU renders the viewport.
+    ///
+    /// When the mesh is larger than [`GpuRenderer::GPU_UPLOAD_BUDGET`] the
+    /// upload is skipped and the viewport falls back to the CPU rasterizer:
+    /// a few-hundred-pixel software preview costs a bounded amount of work
+    /// regardless of how many triangles the model has.
     fn start_gpu(&mut self, cx: &mut Context<Self>) {
         let mesh = self.mesh.clone();
         cx.spawn(async move |weak, cx| {
@@ -160,16 +219,25 @@ impl ModelViewport {
                 .background_executor()
                 .spawn(async move {
                     let renderer = GpuRenderer::new()?;
-                    let uploaded = renderer.upload(&mesh);
-                    Ok::<_, GpuUnavailable>((Arc::new(renderer), Arc::new(uploaded)))
+                    let uploaded = renderer.upload_capped(&mesh);
+                    Ok::<_, GpuUnavailable>((Arc::new(renderer), uploaded))
                 })
                 .await;
             weak.update(cx, |this, cx| {
                 match built {
-                    Ok((renderer, uploaded)) => {
+                    Ok((renderer, Some(uploaded))) => {
                         this.backend = Backend::Gpu(renderer.adapter.clone());
                         this.gpu = Some(renderer);
-                        this.gpu_mesh = Some(uploaded);
+                        this.gpu_mesh = Some(Arc::new(uploaded));
+                    }
+                    Ok((renderer, None)) => {
+                        // The mesh exceeded the GPU budget; keep the renderer
+                        // for its adapter info but fall back to CPU.
+                        this.backend = Backend::Cpu(format!(
+                            "mesh exceeds the {} MiB GPU preview limit",
+                            GpuRenderer::GPU_UPLOAD_BUDGET >> 20
+                        ));
+                        this.gpu = Some(renderer);
                     }
                     Err(unavailable) => this.backend = Backend::Cpu(reason_text(&unavailable)),
                 }
@@ -198,9 +266,25 @@ impl ModelViewport {
     }
 
     /// Render the current camera on a background thread, unless a frame is
-    /// already in flight or the viewport is not ready.
+    /// already in flight or the viewport is not ready. While the mesh is
+    /// still parsing the viewport shows a loading indicator and renders
+    /// nothing.
     fn pump(&mut self, cx: &mut Context<Self>) {
+        if matches!(self.backend, Backend::Loading) {
+            return;
+        }
         if self.in_flight || !self.dirty {
+            return;
+        }
+        // Throttle to ~60 fps.  Rendering faster than the display refreshes
+        // only burns CPU on frames that are never seen; on a laptop that
+        // means heat, fan noise and a sluggish UI.  A moved camera sets
+        // `dirty` again, so the next pose is picked up as soon as this frame
+        // lands.
+        if self
+            .last_frame
+            .is_some_and(|t| t.elapsed() < std::time::Duration::from_millis(16))
+        {
             return;
         }
         let device = self.device_size();
@@ -212,6 +296,10 @@ impl ModelViewport {
         let mesh = self.mesh.clone();
         let camera = self.camera;
         let bounds = self.mesh.bounds;
+        // Dragging: subsample to a quarter of the geometry so a heavy mesh
+        // turns fluently.  After the drag the viewport re-renders at full
+        // quality (the `dirty` flag is set again on mouse up).
+        let quality = if self.dragging { 0.25 } else { 1.0 };
 
         self.dirty = false;
         self.in_flight = true;
@@ -226,6 +314,7 @@ impl ModelViewport {
                         &camera,
                         bounds,
                         device,
+                        quality,
                     )
                 })
                 .await;
@@ -238,6 +327,7 @@ impl ModelViewport {
                         this.error = None;
                         this.frame_ms = elapsed;
                         this.pending = Some(frame);
+                        this.last_frame = Some(std::time::Instant::now());
                     }
                     Rendered::Demoted(frame, reason) => {
                         // The device answered for the upload but not for this
@@ -248,6 +338,7 @@ impl ModelViewport {
                         this.error = Some(reason);
                         this.frame_ms = elapsed;
                         this.pending = Some(frame);
+                        this.last_frame = Some(std::time::Instant::now());
                     }
                     Rendered::Failed(reason) => {
                         this.error = Some(reason);
@@ -366,7 +457,10 @@ impl ModelViewport {
                 // its top towards the viewer — grab-and-turn, not a slider.
                 this.camera.orbit(dx * step, dy * step);
                 this.dirty = true;
-                this.pump(cx);
+                // Don't render during the drag: a large mesh takes hundreds of
+                // milliseconds per frame, so chasing every mouse move would
+                // leave the picture lapsing well behind the cursor. The
+                // render happens on mouse up, when the final pose is known.
                 cx.notify();
             }))
             .on_mouse_up(
@@ -412,9 +506,14 @@ impl ModelViewport {
 
     /// What the canvas shows before the first frame arrives.
     fn placeholder(&self, cx: &App) -> AnyElement {
-        let message = match &self.error {
-            Some(reason) => rust_i18n::t!("viewport.render_failed", reason = reason).to_string(),
-            None => rust_i18n::t!("viewport.rendering").to_string(),
+        let message = match &self.backend {
+            Backend::Loading => rust_i18n::t!("viewport.loading").to_string(),
+            _ => match &self.error {
+                Some(reason) => {
+                    rust_i18n::t!("viewport.render_failed", reason = reason).to_string()
+                }
+                None => rust_i18n::t!("viewport.rendering").to_string(),
+            },
         };
         div()
             .absolute()
@@ -437,6 +536,7 @@ impl ModelViewport {
             rust_i18n::t!("viewport.triangles", count = primitives)
         };
         let backend = match &self.backend {
+            Backend::Loading => rust_i18n::t!("viewport.backend_loading").to_string(),
             Backend::Starting => rust_i18n::t!("viewport.backend_starting").to_string(),
             Backend::Gpu(adapter) => {
                 rust_i18n::t!("viewport.backend_gpu", adapter = adapter).to_string()
@@ -597,6 +697,7 @@ fn draw(
     camera: &Camera,
     bounds: MeshBounds,
     size: (u32, u32),
+    quality: f32,
 ) -> Rendered {
     let aspect = size.0 as f32 / size.1.max(1) as f32;
 
@@ -615,13 +716,13 @@ fn draw(
         // same thing to the caller: draw this one on the CPU and demote the
         // viewport, so a broken GPU costs a single frame instead of every one.
         let reason = rust_i18n::t!("viewport.reason_gpu_lost").to_string();
-        return match cpu_frame(mesh, camera, size) {
+        return match cpu_frame(mesh, camera, size, quality) {
             Some(frame) => Rendered::Demoted(frame, reason),
             None => Rendered::Failed(reason),
         };
     }
 
-    match cpu_frame(mesh, camera, size) {
+    match cpu_frame(mesh, camera, size, quality) {
         Some(frame) => Rendered::Frame(frame),
         None => Rendered::Failed(rust_i18n::t!("viewport.reason_no_frame").to_string()),
     }
@@ -633,7 +734,12 @@ fn draw(
 /// `None` only when the rasterizer's own output cannot be wrapped as an image,
 /// which its contract rules out; the caller treats it as a failed frame rather
 /// than panicking on a background thread.
-fn cpu_frame(mesh: &Mesh, camera: &Camera, size: (u32, u32)) -> Option<Arc<RenderImage>> {
+fn cpu_frame(
+    mesh: &Mesh,
+    camera: &Camera,
+    size: (u32, u32),
+    quality: f32,
+) -> Option<Arc<RenderImage>> {
     let longest = size.0.max(size.1);
     // A software rasterizer is the exception, not the rule: it should stay
     // usable on a big mesh rather than correct-but-frozen. A cloud counts its
@@ -655,7 +761,7 @@ fn cpu_frame(mesh: &Mesh, camera: &Camera, size: (u32, u32)) -> Option<Arc<Rende
     };
     // The interactive frame supersamples once; the grid thumbnail — rendered
     // once per asset at import time, off the interactive path — uses 2.
-    let rendered = render3d::render(mesh, camera, width, height, 1);
+    let rendered = render3d::render(mesh, camera, width, height, 1, quality);
     frame_image((rendered.width, rendered.height), rendered.bgra)
 }
 
