@@ -274,6 +274,12 @@ fn main() {
         .with_assets(gpui_kit::assets::Assets)
         .run(|cx| {
             gpui_kit::init(cx);
+            // Themes before the first paint: the registry has to know every
+            // theme before `apply_from_settings` picks one per mode.
+            crate::app::theme::register_builtin_themes(cx);
+            // User themes last: they may redefine a bundled name.
+            crate::app::theme::register_user_themes(cx);
+            crate::app::theme::apply_from_settings(None, cx);
             slim_scrollbars(cx);
             apply_menus(cx);
             register_keys(cx);

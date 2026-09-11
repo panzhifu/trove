@@ -40,10 +40,18 @@ pub struct AppView {
     controller: Entity<LibraryController>,
     dock: Entity<gpui_kit::component::dock::DockArea>,
     title_bar: Entity<TitleBarView>,
+    /// Kept alive for the life of the view: dropping it would unregister the
+    /// OS light/dark observer that re-applies the appearance.
+    _appearance: Subscription,
 }
 
 impl AppView {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+        // Follow the OS light/dark switch while it runs (the startup apply
+        // happened before this window existed).
+        let _appearance = window.observe_window_appearance(|window, cx| {
+            crate::app::theme::apply_from_settings(Some(window), cx);
+        });
         let library =
             Library::open(default_library_path()).unwrap_or_else(|e| panic!("open library: {e}"));
         // Record the library for Settings ▸ recent libraries (best-effort).
@@ -101,6 +109,7 @@ impl AppView {
             controller,
             dock,
             title_bar,
+            _appearance,
         }
     }
 
