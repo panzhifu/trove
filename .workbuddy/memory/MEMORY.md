@@ -54,10 +54,12 @@
 
 ## 三维模型（Model）资产
 - `AssetKind::Model` 已存在；OBJ/STL/PLY 由 `media::mesh` 解析，缩略图走 `media::render3d`（CPU 光栅化），交互视口走 `library/gpu3d.rs`（自建 wgpu 设备 + 离屏渲染 + readback）。
-- **CPU / GPU 必须共用 `render3d::Framing` 与 `VertexData`**，否则缩略图和视口的取景、着色会不一致。
+- **点云是一条并行路径**：`Mesh::is_point_cloud()`（无三角形且有点）把渲染分成两支，`primitive_count()` 点云数点、其余数三角形。CPU 侧 `paint_points` 逐点画一个半径 `render3d::POINT_RADIUS`（1.15，随超采样放大）的圆盘，逐像素深度测试；GPU 侧 `vs_point`/`fs_point` 用 instanced quad（6 顶点 × N 实例），方形四角在 shader 里由 `vertex_index` 生成、`fs_point` 用 `dot(offset,offset)>1` 裁成圆，因此**主机侧不需要任何逐顶点几何**。点云没有法线时用「相对模型中心的方向」当法线（`point_normal`），点云才像一个有明暗的体积而不是剪影。
+- **CPU / GPU 必须共用 `render3d::Framing`、`VertexData` 与 `PointData`**，否则缩略图和视口的取景、着色会不一致。逐点颜色也只有一个决定点：`render3d::base_color`（有顶点色用顶点色，否则 `MATERIAL`）。
+- **`PointData` 步长是 9 个 f32**（pos+normal+color = 36 字节）。改它必须同时改三处：`PointData::STRIDE`、`gpu3d.rs` 里 point 管线的 `vertex_attr_array!` 与 `gpu3d.wgsl` 的 `vs_point` 入参；`the_vertex_inputs_match_the_buffer_layouts` 会同时校验 location 个数与 stride 的对应关系。uniform 块加了 `params2`（x = 点半径），共 9 个成员、`UNIFORM_SIZE = 192`。
 - wgpu 29 是直接依赖（与 gpui 内置版本对齐，只有一个版本、一套后端）。`PipelineLayoutDescriptor` 无 `push_constant_ranges`（用 `immediate_size: 0`）、`bind_group_layouts: &[Option<&BindGroupLayout>]`、`DepthStencilState` 的 `depth_write_enabled`/`depth_compare` 是 `Option<_>`。
 - **WGSL 可以在无 GPU 机器上校验**：`naga` 作为 trove-app 的 dev-dependency，测试里 parse + validate，并用 `naga::proc::Layouter` 断言 uniform 各成员 offset 与 Rust `Uniforms::to_bytes` 一致。改 shader 或改 uniform 结构后务必跑（`cargo test -p trove-app`）。
-- **PLY 的能力边界**（2026-09-11 核查）：支持 ASCII + `binary_little_endian`/`binary_big_endian`，`vertex` 元素的 x/y/z（+可选 nx/ny/nz），`face` 元素里叫 `vertex_indices`/`vertex_index` 的列表面，扇形三角化。**不支持**：①只有点没有面的点云（`Mesh::finish` 要求至少一个三角形，否则 load 报 "the PLY file contains no triangles"，视口弹 viewport.load_failed，缩略图退回图标）；②顶点颜色（不读 `red/green/blue`/`diffuse_*`，`Mesh` 里根本没有颜色字段）；③自定义面属性名。`mesh::load` 用 `std::fs::read` 整文件读入并展开成 `Vec<[f32;3]>`，超大 PLY 没有上限也没有流式路径。
+- **PLY 的能力边界**（2026-09-11 核查，同日两次提交后已扩到点云 + 顶点色）：支持 ASCII + `binary_little_endian`/`binary_big_endian`，`vertex` 元素的 x/y/z（+可选 nx/ny/nz），`face` 元素里叫 `vertex_indices`/`vertex_index` 的列表面，扇形三角化。**无 `face` 元素 → 点云**（`Mesh::finish_points`），有 `face` 但一个三角形都拼不出仍报错。**顶点色已支持**：读 `red/green/blue` 也读 MeshLab/CloudCompare 的 `diffuse_*`，整数通道按类型判断降采样 ÷255、float 通道原样（`PlyType::is_integer`），clamp 到 0..=1；颜色数不足顶点数则整个丢弃。**仍不支持**：自定义面属性名；点云顶点色对**三角形网格无效**（`Mesh` 里存了，但三角形路径忽略——GPU 顶点布局没有颜色属性，缩略图也一直按材质渲）。`mesh::load` 用 `std::fs::read` 整文件读入并展开成 `Vec<[f32;3]>`，超大 PLY 没有上限也没有流式路径。
 
 ## 拆分脏工作区
 - 通用按 hunk 暂存脚本：`/home/noke/.cache/trove-split/stage_hunks.py`（spec JSON，内部固定 `-U3` + `git apply --cached --recount`）。谓词要写窄，关键字命中的 hunk 常比预期多。
