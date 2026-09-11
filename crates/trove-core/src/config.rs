@@ -72,6 +72,49 @@ pub struct AppConfig {
     /// `{file}` inside the command, or as `$1`. Empty = auto-detect.
     #[serde(default)]
     pub screenshot_command: Option<String>,
+    /// Light/dark appearance. `System` follows the OS and is the default.
+    #[serde(default)]
+    pub appearance: Appearance,
+    /// Named theme (from the UI framework's theme registry) used when the
+    /// appearance resolves to light. `None` = the framework default.
+    #[serde(default)]
+    pub theme_light: Option<String>,
+    /// Named theme used when the appearance resolves to dark.
+    #[serde(default)]
+    pub theme_dark: Option<String>,
+}
+
+/// Which light/dark appearance the UI uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Appearance {
+    /// Follow the operating system's light/dark setting.
+    #[default]
+    System,
+    /// Always light.
+    Light,
+    /// Always dark.
+    Dark,
+}
+
+impl Appearance {
+    /// The value stored in JSON and offered by the settings picker.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::System => "system",
+            Self::Light => "light",
+            Self::Dark => "dark",
+        }
+    }
+
+    /// Inverse of [`Self::as_str`]; unknown values fall back to `System`.
+    pub fn parse(value: &str) -> Self {
+        match value {
+            "light" => Self::Light,
+            "dark" => Self::Dark,
+            _ => Self::System,
+        }
+    }
 }
 
 /// How many recent-library entries to remember.
