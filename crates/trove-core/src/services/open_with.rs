@@ -11,8 +11,11 @@
 //! and the `Exec` line is expanded by hand per the Desktop Entry
 //! specification.
 
+#[cfg(target_os = "linux")]
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(target_os = "linux")]
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::Mutex;
 
@@ -159,6 +162,8 @@ fn collect_desktop_files(dir: &Path, out: &mut Vec<PathBuf>) {
 /// Parse one `.desktop` file. Returns `None` for anything that must not
 /// show up in a menu: non-application entries, `NoDisplay`/`Hidden`, and
 /// terminal programs (we have no terminal to attach them to).
+#[allow(dead_code)]
+#[cfg(target_os = "linux")]
 fn parse_desktop(id: &str, text: &str) -> Option<Application> {
     let mut in_entry = false;
     let mut name = None;
@@ -424,6 +429,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn hidden_and_non_application_entries_are_skipped() {
         let hidden =
             "[Desktop Entry]\nType=Application\nName=Editor\nExec=editor %f\nNoDisplay=true\n";
@@ -437,6 +443,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn a_desktop_entry_keeps_its_mime_types() {
         let text = "[Desktop Entry]\nType=Application\nName=Krita\nExec=krita %U\nIcon=krita\nMimeType=image/png;image/jpeg;\n\n[Desktop Action New]\nName=New\n";
         let app = parse_desktop("krita.desktop", text).expect("parsed");
