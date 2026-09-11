@@ -217,6 +217,7 @@ mod tests {
         assert_eq!(plan.args.last().unwrap(), "/tmp/shot.png");
     }
 
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     #[test]
     fn blank_custom_command_falls_through() {
         let plan = plan_for(
