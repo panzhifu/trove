@@ -73,6 +73,9 @@ struct PointOut {
     @location(1) normal: vec3<f32>,
     // Unit square coordinate: -1..1 across the sprite, for the disc test.
     @location(2) offset: vec2<f32>,
+    // The point's own colour; the host substitutes the material when the file
+    // carries none, so the two renderers cannot disagree.
+    @location(3) color: vec3<f32>,
 };
 
 @vertex
@@ -80,6 +83,7 @@ fn vs_point(
     @builtin(vertex_index) index: u32,
     @location(0) position: vec3<f32>,
     @location(1) normal: vec3<f32>,
+    @location(2) color: vec3<f32>,
 ) -> PointOut {
     var corners = array<vec2<f32>, 6>(
         vec2<f32>(-1.0, -1.0),
@@ -106,6 +110,7 @@ fn vs_point(
     out.model_pos = position;
     out.normal = normal;
     out.offset = corner;
+    out.color = color;
     return out;
 }
 
@@ -126,7 +131,7 @@ fn fs_point(in: PointOut) -> @location(0) vec4<f32> {
     let diffuse = max(dot(n, u.light.xyz), 0.0);
     let intensity = u.material.w + u.params.x * diffuse;
 
-    return vec4<f32>(u.material.rgb * intensity, 1.0);
+    return vec4<f32>(in.color * intensity, 1.0);
 }
 
 // A single oversized triangle covering the viewport, so the backdrop gets the
