@@ -57,6 +57,7 @@
 - **CPU / GPU 必须共用 `render3d::Framing` 与 `VertexData`**，否则缩略图和视口的取景、着色会不一致。
 - wgpu 29 是直接依赖（与 gpui 内置版本对齐，只有一个版本、一套后端）。`PipelineLayoutDescriptor` 无 `push_constant_ranges`（用 `immediate_size: 0`）、`bind_group_layouts: &[Option<&BindGroupLayout>]`、`DepthStencilState` 的 `depth_write_enabled`/`depth_compare` 是 `Option<_>`。
 - **WGSL 可以在无 GPU 机器上校验**：`naga` 作为 trove-app 的 dev-dependency，测试里 parse + validate，并用 `naga::proc::Layouter` 断言 uniform 各成员 offset 与 Rust `Uniforms::to_bytes` 一致。改 shader 或改 uniform 结构后务必跑（`cargo test -p trove-app`）。
+- **PLY 的能力边界**（2026-09-11 核查）：支持 ASCII + `binary_little_endian`/`binary_big_endian`，`vertex` 元素的 x/y/z（+可选 nx/ny/nz），`face` 元素里叫 `vertex_indices`/`vertex_index` 的列表面，扇形三角化。**不支持**：①只有点没有面的点云（`Mesh::finish` 要求至少一个三角形，否则 load 报 "the PLY file contains no triangles"，视口弹 viewport.load_failed，缩略图退回图标）；②顶点颜色（不读 `red/green/blue`/`diffuse_*`，`Mesh` 里根本没有颜色字段）；③自定义面属性名。`mesh::load` 用 `std::fs::read` 整文件读入并展开成 `Vec<[f32;3]>`，超大 PLY 没有上限也没有流式路径。
 
 ## 拆分脏工作区
 - 通用按 hunk 暂存脚本：`/home/noke/.cache/trove-split/stage_hunks.py`（spec JSON，内部固定 `-U3` + `git apply --cached --recount`）。谓词要写窄，关键字命中的 hunk 常比预期多。
