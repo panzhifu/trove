@@ -245,23 +245,23 @@ fn choose_lod_step(vertex_count: usize, elements: &[PlyElement], config: LodConf
 
     if face_count == 0 {
         // Point cloud: subsample vertices directly.
-        let total = vertex_count as u64 * bytes_per_vertex as u64;
+        let total = vertex_count as u64 * bytes_per_vertex;
         if total <= budget {
             return 1;
         }
-        let step = ((total + budget - 1) / budget) as u32;
+        let step = total.div_ceil(budget) as u32;
         return step.max(1).min(config.max_lod_step);
     }
 
     // Mesh: subsample faces. Each kept face references ~2 unique vertices
     // on average (3 indices with sharing), and costs 12 bytes for its
     // indices + 2 * bytes_per_vertex for its vertices.
-    let bytes_per_kept_face = 12 + 2 * bytes_per_vertex as u64;
+    let bytes_per_kept_face = 12 + 2 * bytes_per_vertex;
     let total = face_count as u64 * bytes_per_kept_face;
     if total <= budget {
         return 1;
     }
-    let step = ((total + budget - 1) / budget) as u32;
+    let step = total.div_ceil(budget) as u32;
     step.max(1).min(config.max_lod_step)
 }
 
@@ -343,7 +343,7 @@ fn parse_binary_chunked(
         // the LOD stride was already applied at face-collection time.
         let mut remap = Vec::<u32>::with_capacity(vertex_count);
         let mut new_index = 0u32;
-        for (_old, is_ref) in referenced.iter().enumerate() {
+        for is_ref in referenced.iter() {
             if *is_ref != 0 {
                 remap.push(new_index);
                 new_index += 1;
@@ -493,9 +493,8 @@ fn collect_binary_faces(
         .unwrap_or(PlyType::I32);
 
     let step = lod_step as usize;
-    let mut face_id = 0usize;
 
-    for _ in 0..element.count {
+    for (face_id, _) in (0..element.count).enumerate() {
         if *cursor + count_ty.width() > body.len() {
             return Err(BODY_END.into());
         }
@@ -506,7 +505,7 @@ fn collect_binary_faces(
             return Err(BODY_END.into());
         }
 
-        if face_id % step == 0 {
+        if face_id.is_multiple_of(step) {
             let mut face = Vec::with_capacity(count);
             for i in 0..count {
                 let at = *cursor + i * item_ty.width();
@@ -519,7 +518,6 @@ fn collect_binary_faces(
             face_indices.push(face);
         }
         *cursor += item_bytes;
-        face_id += 1;
     }
     Ok(())
 }
@@ -629,7 +627,7 @@ fn parse_binary_vertices_stride(
     let colors = cols.colors.map(|n| n.map(|c| (offset(c), ty(c))));
 
     let step = lod_step as usize;
-    let kept = (element.count + step - 1) / step;
+    let kept = element.count.div_ceil(step);
     out.positions.reserve(kept);
     if cols.normals.is_some() {
         out.normals.reserve(kept);
@@ -719,7 +717,7 @@ fn parse_ascii_chunked(
 
         let mut remap = Vec::<u32>::with_capacity(vertex_count);
         let mut new_index = 0u32;
-        for (_old, is_ref) in referenced.iter().enumerate() {
+        for is_ref in referenced.iter() {
             if *is_ref != 0 {
                 remap.push(new_index);
                 new_index += 1;
@@ -787,15 +785,12 @@ fn collect_ascii_faces(
     referenced: &mut [u8],
 ) -> Result<(), String> {
     let step = lod_step as usize;
-    let mut face_id = 0usize;
 
-    for _ in 0..element.count {
+    for (face_id, _) in (0..element.count).enumerate() {
         let line = mesh::next_record_line(body, cursor).ok_or(BODY_END)?;
-        if face_id % step != 0 {
-            face_id += 1;
+        if !face_id.is_multiple_of(step) {
             continue;
         }
-        face_id += 1;
 
         let mut tokens = mesh::Tokens::new(line);
         let length = mesh::token_f64(tokens.next_token().ok_or(BODY_END)?)
@@ -854,7 +849,7 @@ fn parse_ascii_vertices_remapped(
         out.colors.reserve(kept);
     }
 
-    for (_old_index, new_index) in remap.iter().enumerate() {
+    for new_index in remap.iter() {
         if *new_index == u32::MAX {
             mesh::next_record_line(body, cursor).ok_or(BODY_END)?;
             continue;
@@ -930,15 +925,12 @@ fn parse_ascii_vertices_stride(
     }
 
     let step = lod_step as usize;
-    let mut vertex_id = 0usize;
 
-    for _ in 0..element.count {
+    for (vertex_id, _) in (0..element.count).enumerate() {
         let line = mesh::next_record_line(body, cursor).ok_or(BODY_END)?;
-        if vertex_id % step != 0 {
-            vertex_id += 1;
+        if !vertex_id.is_multiple_of(step) {
             continue;
         }
-        vertex_id += 1;
 
         let mut tokens = mesh::Tokens::new(line);
         let Some(first) = tokens.next_token() else {
