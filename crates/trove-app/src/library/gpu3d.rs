@@ -351,7 +351,7 @@ impl GpuRenderer {
     /// Bytes of GPU buffer a mesh will occupy: interleaved vertices plus
     /// the index list.
     fn estimate_gpu_bytes(mesh: &Mesh) -> usize {
-        let vertex_bytes = mesh.vertex_count() as usize * render3d::VertexData::STRIDE as usize;
+        let vertex_bytes = mesh.vertex_count() * render3d::VertexData::STRIDE as usize;
         let index_bytes = if mesh.has_vertex_normals() {
             mesh.triangle_count() * 3 * 4
         } else {
@@ -359,7 +359,7 @@ impl GpuRenderer {
             0
         };
         let point_bytes = if mesh.is_point_cloud() {
-            mesh.vertex_count() as usize * render3d::PointData::STRIDE as usize
+            mesh.vertex_count() * render3d::PointData::STRIDE as usize
         } else {
             0
         };

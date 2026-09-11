@@ -531,16 +531,14 @@ fn paint(
     let mut depth = vec![0f32; w * h];
 
     if mesh.is_point_cloud() {
-        paint_points(
-            &mut colors,
-            &mut depth,
-            mesh,
+        let mut target = Target {
+            colors: &mut colors,
+            depth: &mut depth,
+            width: w,
+            height: h,
             framing,
-            w,
-            h,
-            point_radius,
-            quality,
-        );
+        };
+        paint_points(&mut target, mesh, point_radius, quality);
         return colors;
     }
     if mesh.triangles.is_empty() {
@@ -648,34 +646,17 @@ pub fn base_color(mesh: &Mesh, index: usize) -> [f32; 3] {
 /// formula, same sprite size — so a cloud's thumbnail and its viewport frame
 /// agree. Everything happens in model space, because that is where the
 /// normals and the eye the uniform block carries both live.
-fn paint_points(
-    colors: &mut [[f32; 3]],
-    depth: &mut [f32],
-    mesh: &Mesh,
-    framing: Framing,
-    width: usize,
-    height: usize,
-    radius: f32,
-    quality: f32,
-) {
-    let (near, _) = framing.depth_range();
-    let eye = framing.eye_in_model_space();
+fn paint_points(target: &mut Target<'_>, mesh: &Mesh, radius: f32, quality: f32) {
+    let (near, _) = target.framing.depth_range();
+    let eye = target.framing.eye_in_model_space();
     let light = normalize(KEY_LIGHT);
     let step = (1.0f32 / quality).round().max(1.0) as usize;
-
-    let mut target = Target {
-        colors,
-        depth,
-        width,
-        height,
-        framing,
-    };
 
     for (index, position) in mesh.positions.iter().enumerate() {
         if index % step != 0 {
             continue;
         }
-        let view = framing.to_view(*position);
+        let view = target.framing.to_view(*position);
         if view[2] <= near {
             continue; // Behind the eye, or inside the near plane.
         }
