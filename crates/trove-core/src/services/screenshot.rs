@@ -84,14 +84,14 @@ pub fn plan_for(
         if mode == ScreenshotMode::Region {
             return None;
         }
-        return Some(CapturePlan {
+        Some(CapturePlan {
             program: "powershell".into(),
             args: vec![
                 "-NoProfile".into(),
                 "-Command".into(),
                 windows_capture_script(&quotable(dest)),
             ],
-        });
+        })
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
