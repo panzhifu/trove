@@ -58,26 +58,11 @@ fn mine_font(path: &Path) -> Option<MinedMetadata> {
     let face = ttf_parser::Face::parse(&data, 0).ok()?;
     let mut m = MinedMetadata::default();
 
-    // Prefer the Windows/English name records; any language beats none.
-    let named = |name_id| {
-        face.names()
-            .into_iter()
-            .filter(|n| n.name_id == name_id)
-            .find(|n| n.is_unicode())
-            .and_then(|n| n.to_string())
-            .or_else(|| {
-                face.names()
-                    .into_iter()
-                    .filter(|n| n.name_id == name_id)
-                    .find_map(|n| n.to_string())
-            })
-    };
-    let family = named(ttf_parser::name_id::TYPOGRAPHIC_FAMILY)
-        .or_else(|| named(ttf_parser::name_id::FAMILY));
-    let family = family?;
+    let family = face_name(&face, ttf_parser::name_id::TYPOGRAPHIC_FAMILY)
+        .or_else(|| face_name(&face, ttf_parser::name_id::FAMILY))?;
     m.insert("font_family", family);
-    if let Some(style) = named(ttf_parser::name_id::TYPOGRAPHIC_SUBFAMILY)
-        .or_else(|| named(ttf_parser::name_id::SUBFAMILY))
+    if let Some(style) = face_name(&face, ttf_parser::name_id::TYPOGRAPHIC_SUBFAMILY)
+        .or_else(|| face_name(&face, ttf_parser::name_id::SUBFAMILY))
     {
         m.insert("font_style", style);
     }
@@ -90,6 +75,36 @@ fn mine_font(path: &Path) -> Option<MinedMetadata> {
     }
     m.insert("font_glyphs", face.number_of_glyphs());
     Some(m)
+}
+
+/// The family (and optional subfamily) recorded in a font file's name
+/// table, preferring the Windows/English records. Covers the same formats
+/// as [`mine_font`] (ttf/otf/ttc, first face). Powers the system-font
+/// browser, which needs names without importing anything.
+pub fn font_family(path: &Path) -> Option<(String, Option<String>)> {
+    let data = std::fs::read(path).ok()?;
+    let face = ttf_parser::Face::parse(&data, 0).ok()?;
+    let family = face_name(&face, ttf_parser::name_id::TYPOGRAPHIC_FAMILY)
+        .or_else(|| face_name(&face, ttf_parser::name_id::FAMILY))?;
+    let style = face_name(&face, ttf_parser::name_id::TYPOGRAPHIC_SUBFAMILY)
+        .or_else(|| face_name(&face, ttf_parser::name_id::SUBFAMILY));
+    Some((family, style))
+}
+
+/// One name record out of a font's name table: prefer Windows/English,
+/// accept any language as a fallback.
+fn face_name(face: &ttf_parser::Face, name_id: u16) -> Option<String> {
+    face.names()
+        .into_iter()
+        .filter(|n| n.name_id == name_id)
+        .find(|n| n.is_unicode())
+        .and_then(|n| n.to_string())
+        .or_else(|| {
+            face.names()
+                .into_iter()
+                .filter(|n| n.name_id == name_id)
+                .find_map(|n| n.to_string())
+        })
 }
 
 // -- video --------------------------------------------------------------------

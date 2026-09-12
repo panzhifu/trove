@@ -588,8 +588,11 @@ impl Render for AppView {
             .on_action(cx.listener(|this, _: &ExportMediaPackage, window, cx| {
                 this.prompt_export_media_package(window, cx);
             }))
-            .on_action(cx.listener(|this, _: &OpenSettings, window, cx| {
-                crate::dialogs::settings::SettingsDialog::open(window, cx, this.controller.clone());
+            .on_action(cx.listener(|this, _: &OpenSettings, _, cx| {
+                crate::dialogs::settings::open(cx, this.controller.clone());
+            }))
+            .on_action(cx.listener(|this, _: &SystemFonts, window, cx| {
+                crate::dialogs::system_fonts::open(&this.controller, window, cx);
             }))
             .on_action(cx.listener(|this, _: &FindDuplicates, window, cx| {
                 crate::dialogs::duplicates::DuplicateDialog::open(

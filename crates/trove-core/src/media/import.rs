@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 
 use uuid::Uuid;
 
-use super::{blob, metadata, probe, thumb};
+use super::{blob, metadata, probe, search, thumb};
 use crate::error::{Error, Result};
 use crate::model::{Asset, AssetKind, Origin, now};
 use crate::store::{Store, assets, collections};
@@ -181,10 +181,21 @@ pub fn stage_source(root: &Path, src: &Path, linked: bool) -> Result<StagedFile>
         _ => (None, None, None),
     };
     // Generate (or confirm) the thumbnail cache entry on the background thread.
-    thumb::ensure(root, &sha256, p.kind, &blob_path);
+    let thumb_path = thumb::ensure(root, &sha256, p.kind, &blob_path);
     // Mine rich metadata (EXIF camera fields, audio tags/duration, font
     // tables, video container). Best-effort.
     let mut mined = metadata::mine(&blob_path, p.kind);
+    // Visual fingerprint (pHash + colour histogram) for search-by-image and
+    // search-by-colour, computed from the small thumbnail so a huge photo
+    // costs no more than a tiny one. Stored in `extra` and persisted by
+    // `commit_staged` together with the rest of the mined metadata.
+    if p.kind == AssetKind::Image {
+        let sig_source = thumb_path.unwrap_or_else(|| blob_path.clone());
+        let sig = search::VisualSignature::from_image(&sig_source);
+        if sig.phash != search::PHash(0) {
+            sig.apply_to_extra(&mut mined.extra);
+        }
+    }
     if mined.duration_ms.is_none() {
         mined.duration_ms = video_duration_ms;
     }

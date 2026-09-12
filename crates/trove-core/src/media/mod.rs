@@ -3,7 +3,6 @@
 
 pub mod blob;
 pub mod chunked;
-pub mod clip;
 pub mod color;
 pub mod convert;
 pub mod gpu;
@@ -14,5 +13,4 @@ pub mod probe;
 pub mod render3d;
 pub mod search;
 pub mod thumb;
-pub mod tokenizer;
 pub mod video;

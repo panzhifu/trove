@@ -19,11 +19,9 @@ serde_json = { workspace = true }
 sha2 = { workspace = true }
 thiserror = { workspace = true }
 uuid = { workspace = true }
-ndarray = { workspace = true }  # 0.17 to match ort
 rayon = { workspace = true }
 memchr = "2"  # already in the tree via regex; SIMD byte search for the ASCII splitter
 memmap2 = "0.9"  # memory-mapped file access for large PLY files
-ort = { workspace = true }
 regex = "1"
 ureq = { workspace = true }
 resvg = { workspace = true }

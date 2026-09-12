@@ -1,4 +1,4 @@
-//! Search-by-image dialog: visual (pHash + colour) and semantic (CLIP).
+//! Search-by-image dialog: pHash + colour histogram, no model involved.
 
 use std::path::{Path, PathBuf};
 
@@ -11,23 +11,24 @@ use uuid::Uuid;
 
 use crate::library::LibraryController;
 
-/// One search result row (unified across visual + semantic backends).
+/// One search result row.
 pub(crate) struct SearchResult {
+    pub id: Uuid,
     pub name: String,
     pub score: f32,
     pub sha256: Option<String>,
 }
 
-/// Open the search-by-image dialog for the given asset, using the backend
-/// selected in Settings ▸ Search (visual or semantic).
+/// Open the search-by-image dialog for the given asset: pHash + colour
+/// histogram similarity against the stored per-asset visual signatures.
 pub(crate) fn open_image_search(
     asset_id: Uuid,
     controller: &Entity<LibraryController>,
     window: &mut Window,
     cx: &mut App,
 ) {
-    // Resolve the query image + asset, then pick the backend from config.
-    let (query_path, title, mode) = {
+    // Resolve the query image + asset.
+    let (query_path, title) = {
         let ctl = controller.read(cx);
         let conn = ctl.library.store().conn();
         let library_root = ctl.library.root().to_path_buf();
@@ -50,13 +51,12 @@ pub(crate) fn open_image_search(
                 .map(|rel| library_root.join(rel))
                 .filter(|p| p.is_file())
         });
-        let mode = trove_core::config::AppConfig::load().search_mode();
-        (path, name, mode)
+        (path, name)
     };
 
     let Some(query_path) = query_path else { return };
 
-    // Run the selected backend.
+    // Run the visual backend.
     let (store, library_root) = {
         let ctl = controller.read(cx);
         (
@@ -64,17 +64,17 @@ pub(crate) fn open_image_search(
             ctl.library.root().to_path_buf(),
         )
     };
-    let results: Vec<SearchResult> = match mode.as_str() {
-        "semantic" => semantic_search(controller, &query_path, cx),
-        _ => visual_search(&store, &query_path),
-    };
+    let results: Vec<SearchResult> = visual_search(&store, &query_path);
 
-    // Show results in a dialog (backend-agnostic).
-    let mode_label = match mode.as_str() {
-        "semantic" => rust_i18n::t!("settings.search_mode_semantic").to_string(),
-        _ => rust_i18n::t!("settings.search_mode_visual").to_string(),
-    };
-    show_results_dialog(results, title, mode_label, library_root, window, cx);
+    show_results_dialog(
+        results,
+        title,
+        rust_i18n::t!("settings.search_mode_visual").to_string(),
+        library_root,
+        controller,
+        window,
+        cx,
+    );
 }
 
 /// Search images whose palette contains a colour close to `hex` (Inspector
@@ -97,6 +97,7 @@ pub(crate) fn open_color_search(
             .unwrap_or_default()
             .into_iter()
             .map(|r| SearchResult {
+                id: r.asset.id,
                 name: r.asset.file_name,
                 score: r.score,
                 sha256: r.asset.sha256,
@@ -107,6 +108,7 @@ pub(crate) fn open_color_search(
         hex.to_string(),
         rust_i18n::t!("workspace.color_search").to_string(),
         library_root,
+        controller,
         window,
         cx,
     );
@@ -118,6 +120,7 @@ fn visual_search(store: &trove_core::store::Store, query_path: &Path) -> Vec<Sea
         .unwrap_or_default()
         .into_iter()
         .map(|r| SearchResult {
+            id: r.asset.id,
             name: r.asset.file_name,
             score: r.score,
             sha256: r.asset.sha256,
@@ -125,57 +128,18 @@ fn visual_search(store: &trove_core::store::Store, query_path: &Path) -> Vec<Sea
         .collect()
 }
 
-/// Semantic search: CLIP embedding cosine similarity.
-fn semantic_search(
-    controller: &Entity<LibraryController>,
-    query_path: &Path,
-    cx: &mut App,
-) -> Vec<SearchResult> {
-    if !trove_core::media::clip::semantic_ready() {
-        controller.update(cx, |ctl, _| {
-            ctl.notice = Some(rust_i18n::t!("workspace.semantic_not_ready").to_string());
-        });
-        return Vec::new();
-    }
-    // The whole pipeline (query embedding + cosine ranking + asset fetch)
-    // lives behind the Library facade; the threshold comes from config.
-    let threshold = trove_core::config::AppConfig::load().semantic_min_similarity();
-    let hits =
-        match controller
-            .read(cx)
-            .library
-            .semantic_image_search(query_path, threshold, Some(50))
-        {
-            Ok(hits) => hits,
-            Err(e) => {
-                controller.update(cx, |ctl, _| {
-                    ctl.notice = Some(
-                        rust_i18n::t!("workspace.embed_failed_with", error = e.to_string())
-                            .to_string(),
-                    );
-                });
-                return Vec::new();
-            }
-        };
-    hits.into_iter()
-        .map(|(a, score)| SearchResult {
-            name: a.file_name,
-            score,
-            sha256: a.sha256,
-        })
-        .collect()
-}
-
-/// Render the results dialog (shared by both backends). Row-building
+/// Render the results dialog. Row-building
 /// happens inside the dialog closure so that all borrows are moved in.
 fn show_results_dialog(
     results: Vec<SearchResult>,
     title: String,
     mode_label: String,
     library_root: PathBuf,
+    controller: &Entity<LibraryController>,
     window: &mut Window,
     cx: &mut App,
 ) {
+    let controller = controller.clone();
     window.open_dialog(cx, move |dialog, _, cx| {
         let thumb_for = |sha: Option<&str>| -> Option<PathBuf> {
             sha.and_then(|s| {
@@ -189,7 +153,17 @@ fn show_results_dialog(
             .map(|r| {
                 let pct = (r.score * 100.0) as u32;
                 let p = thumb_for(r.sha256.as_deref());
+                let ctl_click = controller.clone();
+                let hit_id = r.id;
                 div()
+                    .id(SharedString::from(format!("search-hit-{}", r.id)))
+                    .cursor_pointer()
+                    .on_click(move |_, _, cx| {
+                        ctl_click.update(cx, |ctl, cx| {
+                            ctl.pending_reveal = Some(hit_id);
+                            cx.notify();
+                        });
+                    })
                     .px_1()
                     .py_1()
                     .rounded(cx.theme().radius)

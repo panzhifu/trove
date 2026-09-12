@@ -22,25 +22,10 @@ pub struct AppConfig {
     /// Custom keybindings. Maps action name to key string (e.g. "enter" -> "ctrl-p").
     #[serde(default)]
     pub keybindings: std::collections::HashMap<String, String>,
-    /// Which "search by image" backend to use: "visual" (pHash + colour
-    /// histogram, no model needed) or "semantic" (CLIP embeddings).
+    /// Grid zoom: multiplier on the ideal thumbnail-row height (the
+    /// title-bar slider). 1.0 = default; clamped on read.
     #[serde(default)]
-    pub search_mode: Option<String>,
-    /// Path to the single CLIP ONNX model file that exposes both the image
-    /// encoder (`pixel_values` → `image_embeds`) and the text encoder
-    /// (`input_ids` → `text_embeds`). Used only when `search_mode` is
-    /// `semantic`. Defaults to `models/model.onnx` under the config dir.
-    #[serde(default)]
-    pub clip_model_path: Option<PathBuf>,
-    /// Path to the ONNX Runtime dynamic library (`libonnxruntime.so` /
-    /// `.dylib` / `.dll`). When `None`, the engine falls back to
-    /// `ORT_DYLIB_PATH` env var then the executable / config directory.
-    #[serde(default)]
-    pub ort_lib_path: Option<PathBuf>,
-    /// Minimum cosine similarity for a semantic (CLIP) search hit. Lower =
-    /// more (noisier) results. Clamped to 0.0..1.0; defaults to 0.2.
-    #[serde(default)]
-    pub semantic_min_similarity: Option<f32>,
+    pub grid_zoom: Option<f32>,
     /// Recently opened libraries, newest first (settings ▸ general lists
     /// these for one-click hot switching). Capped at [`RECENT_LIBRARY_CAP`].
     #[serde(default)]
@@ -217,9 +202,9 @@ impl AppConfig {
         self.save()
     }
 
-    /// Effective search mode ("visual" or "semantic"). Defaults to visual.
-    pub fn search_mode(&self) -> String {
-        self.search_mode.as_deref().unwrap_or("visual").to_string()
+    /// Effective grid zoom, clamped to 0.6..1.8 (1.0 = default size).
+    pub fn grid_zoom(&self) -> f32 {
+        self.grid_zoom.unwrap_or(1.0).clamp(0.6, 1.8)
     }
 
     /// How manual imports treat source files: `true` = link to the original
@@ -240,35 +225,6 @@ impl AppConfig {
     /// The screenshot command as typed by the user (never a fallback).
     pub fn screenshot_command_text(&self) -> String {
         self.screenshot_command.clone().unwrap_or_default()
-    }
-
-    /// Effective semantic-search similarity threshold, clamped to 0.0..1.0.
-    pub fn semantic_min_similarity(&self) -> f32 {
-        self.semantic_min_similarity.unwrap_or(0.2).clamp(0.0, 1.0)
-    }
-
-    /// Directory that should hold the CLIP model file.
-    pub fn clip_model_dir(&self) -> Option<PathBuf> {
-        self.clip_model_path
-            .as_ref()
-            .and_then(|p| p.parent())
-            .map(|p| p.to_path_buf())
-            .or_else(|| Self::config_dir().map(|d| d.join("models")))
-    }
-
-    /// Full path to the single CLIP ONNX model file.
-    pub fn clip_model_path(&self) -> Option<PathBuf> {
-        self.clip_model_path
-            .clone()
-            .or_else(|| Self::config_dir().map(|d| d.join("models").join("model.onnx")))
-    }
-
-    /// Effective path to the ONNX Runtime library: explicit config wins,
-    /// then `ORT_DYLIB_PATH` env, then `None` (engine searches cwd/exe dir).
-    pub fn ort_lib_path(&self) -> Option<PathBuf> {
-        self.ort_lib_path
-            .clone()
-            .or_else(|| std::env::var("ORT_DYLIB_PATH").ok().map(PathBuf::from))
     }
 
     /// Resolved library path: the `TROVE_LIBRARY_DIR` override when set,

@@ -57,6 +57,23 @@ pub struct RowLayout {
 /// For small inputs (<500 items) uses exact DP. For larger inputs uses a
 /// parallel greedy approximation that is O(n) and nearly as good.
 pub fn justify_layout(input: &[f32], content_width: f32) -> Vec<RowLayout> {
+    justify_layout_with_target(input, content_width, TARGET_ROW_HEIGHT)
+}
+
+/// Effective row-height target for a zoom `scale` (1.0 = the default),
+/// clamped into the hard row-height bounds.
+pub fn target_row_height_for_scale(scale: f32) -> f32 {
+    (TARGET_ROW_HEIGHT * scale).clamp(MIN_ROW_HEIGHT, MAX_ROW_HEIGHT)
+}
+
+/// [`justify_layout`] with a caller-chosen ideal row height — the grid zoom
+/// slider scales this instead of the container width. Heights still clamp
+/// to [`MIN_ROW_HEIGHT`]..[`MAX_ROW_HEIGHT`].
+pub fn justify_layout_with_target(
+    input: &[f32],
+    content_width: f32,
+    target_row_height: f32,
+) -> Vec<RowLayout> {
     let n = input.len();
     if n == 0 || content_width <= 0.0 {
         return Vec::new();
@@ -65,14 +82,18 @@ pub fn justify_layout(input: &[f32], content_width: f32) -> Vec<RowLayout> {
     // For small datasets, use exact DP. For large, use parallel greedy.
     const EXACT_DP_THRESHOLD: usize = 500;
     if n < EXACT_DP_THRESHOLD {
-        justify_layout_exact(input, content_width)
+        justify_layout_exact(input, content_width, target_row_height)
     } else {
-        justify_layout_parallel_greedy(input, content_width)
+        justify_layout_parallel_greedy(input, content_width, target_row_height)
     }
 }
 
 /// Exact DP — O(n · avg photos per row). Used for small datasets.
-fn justify_layout_exact(input: &[f32], content_width: f32) -> Vec<RowLayout> {
+fn justify_layout_exact(
+    input: &[f32],
+    content_width: f32,
+    target_row_height: f32,
+) -> Vec<RowLayout> {
     let n = input.len();
     let aspects: Vec<f32> = input.iter().map(|a| (*a).max(MIN_ASPECT)).collect();
 
@@ -85,7 +106,7 @@ fn justify_layout_exact(input: &[f32], content_width: f32) -> Vec<RowLayout> {
         let mut best = f32::INFINITY;
         let mut best_j = i + 1;
         for j in (i + 1)..=n {
-            natural += TARGET_ROW_HEIGHT * aspects[j - 1];
+            natural += target_row_height * aspects[j - 1];
             let k = j - i;
 
             if k > 1 && natural > content_width * PRUNE_FACTOR {
@@ -93,14 +114,14 @@ fn justify_layout_exact(input: &[f32], content_width: f32) -> Vec<RowLayout> {
             }
 
             let content = (content_width - GRID_GAP * (k as f32 - 1.0)).max(1.0);
-            let h_raw = TARGET_ROW_HEIGHT * content / natural.max(1e-3);
+            let h_raw = target_row_height * content / natural.max(1e-3);
             let h = if h_raw < MIN_ROW_HEIGHT {
                 h_raw
             } else {
                 h_raw.min(MAX_ROW_HEIGHT)
             };
 
-            let badness = (h - TARGET_ROW_HEIGHT) * (h - TARGET_ROW_HEIGHT);
+            let badness = (h - target_row_height) * (h - target_row_height);
             let cand = badness + dp[j];
             if cand < best {
                 best = cand;
@@ -111,11 +132,15 @@ fn justify_layout_exact(input: &[f32], content_width: f32) -> Vec<RowLayout> {
         next[i] = best_j;
     }
 
-    build_rows(&aspects, &next, content_width, n)
+    build_rows(&aspects, &next, content_width, n, target_row_height)
 }
 
 /// Parallel greedy — O(n) with parallel row building. Used for large datasets.
-fn justify_layout_parallel_greedy(input: &[f32], content_width: f32) -> Vec<RowLayout> {
+fn justify_layout_parallel_greedy(
+    input: &[f32],
+    content_width: f32,
+    target_row_height: f32,
+) -> Vec<RowLayout> {
     use rayon::prelude::*;
 
     let n = input.len();
@@ -130,21 +155,21 @@ fn justify_layout_parallel_greedy(input: &[f32], content_width: f32) -> Vec<RowL
         let mut best_score = f32::INFINITY;
 
         for j in (i + 1..=n).take(30) {
-            natural += TARGET_ROW_HEIGHT * aspects[j - 1];
+            natural += target_row_height * aspects[j - 1];
             let k = j - i;
             if k > 1 && natural > content_width * 2.0 {
                 break;
             }
 
             let content = (content_width - GRID_GAP * (k as f32 - 1.0)).max(1.0);
-            let h_raw = TARGET_ROW_HEIGHT * content / natural.max(1e-3);
+            let h_raw = target_row_height * content / natural.max(1e-3);
             let h = if h_raw < MIN_ROW_HEIGHT {
                 h_raw
             } else {
                 h_raw.min(MAX_ROW_HEIGHT)
             };
 
-            let score = (h - TARGET_ROW_HEIGHT).abs();
+            let score = (h - target_row_height).abs();
             if score < best_score {
                 best_score = score;
                 best_j = j;
@@ -168,8 +193,8 @@ fn justify_layout_parallel_greedy(input: &[f32], content_width: f32) -> Vec<RowL
         .map(|(&start, &end)| {
             let k = end - start;
             let content = (content_width - GRID_GAP * (k as f32 - 1.0)).max(1.0);
-            let natural: f32 = aspects[start..end].iter().sum::<f32>() * TARGET_ROW_HEIGHT;
-            let h_raw = TARGET_ROW_HEIGHT * content / natural.max(1e-3);
+            let natural: f32 = aspects[start..end].iter().sum::<f32>() * target_row_height;
+            let h_raw = target_row_height * content / natural.max(1e-3);
             let h = if h_raw < MIN_ROW_HEIGHT {
                 h_raw
             } else {
@@ -184,15 +209,21 @@ fn justify_layout_parallel_greedy(input: &[f32], content_width: f32) -> Vec<RowL
 }
 
 /// Build rows from the DP next-pointer table.
-fn build_rows(aspects: &[f32], next: &[usize], content_width: f32, n: usize) -> Vec<RowLayout> {
+fn build_rows(
+    aspects: &[f32],
+    next: &[usize],
+    content_width: f32,
+    n: usize,
+    target_row_height: f32,
+) -> Vec<RowLayout> {
     let mut rows = Vec::new();
     let mut i = 0;
     while i < n {
         let j = next[i];
         let k = j - i;
         let content = (content_width - GRID_GAP * (k as f32 - 1.0)).max(1.0);
-        let natural: f32 = aspects[i..j].iter().sum::<f32>() * TARGET_ROW_HEIGHT;
-        let h_raw = TARGET_ROW_HEIGHT * content / natural.max(1e-3);
+        let natural: f32 = aspects[i..j].iter().sum::<f32>() * target_row_height;
+        let h_raw = target_row_height * content / natural.max(1e-3);
         let h = if h_raw < MIN_ROW_HEIGHT {
             h_raw
         } else {
