@@ -1,0 +1,372 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-page-node-id="JE1J25urJRe6KiAAPOFkxF">
+<head data-page-node-id="CnZa9UQuLlSMvTuJfyp7A3">
+<meta charset="utf-8" data-page-node-id="KS8ryBZcpnh4Mvnvc9sLnK">
+<meta name="viewport" content="width=device-width, initial-scale=1" data-page-node-id="5S6fTwoeEacqqTAsRn5M9F">
+<title>trove vs CloudCompare — PLY 加载性能对比</title>
+<style>
+  :root {
+    --fg: #1f2328; --dim: #656d76; --line: #d0d7de; --bg: #ffffff;
+    --card: #f6f8fa; --blue: #0969da; --amber: #bf8700; --green: #1a7f37;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 40px 24px 80px; background: var(--bg); color: var(--fg);
+    font: 15px/1.65 -apple-system, "Segoe UI", "Noto Sans CJK SC", sans-serif;
+  }
+  .wrap { max-width: 1000px; margin: 0 auto; }
+  h1 { font-size: 27px; margin: 0 0 6px; letter-spacing: -.3px; }
+  h2 { font-size: 19px; margin: 42px 0 14px; padding-bottom: 7px;
+        border-bottom: 1px solid var(--line); }
+  h3 { font-size: 15px; margin: 24px 0 8px; }
+  .meta { color: var(--dim); font-size: 13px; margin-bottom: 26px; }
+  .tldr {
+    background: var(--card); border: 1px solid var(--line); border-left: 3px solid var(--blue);
+    border-radius: 6px; padding: 16px 20px; margin: 22px 0 8px;
+  }
+  .tldr ul { margin: 8px 0 0; padding-left: 20px; }
+  .tldr li { margin: 5px 0; }
+  table { width: 100%; border-collapse: collapse; font-size: 13.5px; margin: 10px 0; }
+  th { text-align: left; font-weight: 600; color: var(--dim); font-size: 12px;
+        text-transform: uppercase; letter-spacing: .4px;
+        border-bottom: 1px solid var(--line); padding: 8px 10px; }
+  td { padding: 9px 10px; border-bottom: 1px solid #eaeef2; vertical-align: middle; }
+  tr:hover td { background: #fbfcfd; }
+  td.num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  td.dim, .dim { color: var(--dim); }
+  .fname { font-weight: 500; }
+  .sub { font-size: 11.5px; color: var(--dim); font-family: ui-monospace, monospace;
+          margin-top: 2px; font-weight: 400; }
+  .bar { position: relative; height: 15px; background: #eaeef2; border-radius: 3px;
+          margin: 3px 0; min-width: 60px; }
+  .fill { position: absolute; left: 0; top: 0; bottom: 0; border-radius: 3px; opacity: .85; }
+  .bartext { position: absolute; left: 6px; top: -1px; font-size: 10.5px;
+              font-family: ui-monospace, monospace; color: #24292f; z-index: 1; }
+  .win { color: var(--green); font-weight: 600; }
+  .mid { color: var(--amber); font-weight: 600; }
+  .lose { color: #cf222e; font-weight: 600; }
+  code { background: var(--card); padding: 1.5px 5px; border-radius: 4px;
+          font: 12.5px ui-monospace, "SF Mono", monospace; }
+  pre { background: var(--card); border: 1px solid var(--line); border-radius: 6px;
+         padding: 13px 16px; overflow-x: auto;
+         font: 12.5px/1.55 ui-monospace, monospace; }
+  .cols { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; }
+  .box { background: var(--card); border: 1px solid var(--line); border-radius: 6px;
+          padding: 14px 18px; }
+  .box h4 { margin: 0 0 8px; font-size: 14px; }
+  .box ul { margin: 0; padding-left: 18px; font-size: 13.5px; }
+  .box li { margin: 4px 0; }
+  .legend { font-size: 12px; color: var(--dim); margin-top: 8px; }
+  .swatch { display: inline-block; width: 10px; height: 10px; border-radius: 2px;
+             margin: 0 4px 0 10px; vertical-align: middle; }
+  @media (max-width: 720px) { .cols { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body data-page-node-id="CFGGtMNDQ6nDdhGv8mxqwi">
+<div class="wrap" data-page-node-id="hEDOaSdaWMKERtNaDGVdW3">
+
+<h1 data-page-node-id="sYrJGv8GHyRZN5mmhy4Ivv">trove 与 CloudCompare 的 PLY 加载性能对比</h1>
+<div class="meta" data-page-node-id="eGT0064BNBUVhCxPeTFf8d">
+  2026-09-11 · Arch Linux / Intel i7-12700H · CloudCompare 由 <code data-page-node-id="HNuS8EVTHytaNoZN0lRHZD">-O</code> 命令行在
+  <code data-page-node-id="FtyGQqUjqHUWoGLy18L10E">QT_QPA_PLATFORM=offscreen</code> 下无头运行 · trove 为 <code data-page-node-id="jLb1sxfA1e4kwj6O8SBWcL">release</code> 构建
+  （<code data-page-node-id="jnxUHsIGysfAycbuwdiATm">opt-level=3, lto=thin</code>）· 每项 3–5 次取中位数，页缓存预热
+</div>
+
+<div class="tldr" data-page-node-id="r7BDWs7rsoMHa1g3y7etIC">
+  <b data-page-node-id="Sqcp5vKSMbRVFYxOB53Ujx">结论</b>
+  <ul data-page-node-id="riEPQVONxIsgosJ9hyIN6t">
+    <li data-page-node-id="BqZxFhdXqj5kHVl6MBUNHi"><b data-page-node-id="7PZuKTyy6GnxPCW60IsUML">二进制 PLY：trove 比 CloudCompare 慢 1.9×–3.3×</b>
+        （500 万点：1323 ms 对 400 ms）。</li>
+    <li data-page-node-id="vrgCYcREzRFYhMTEFjpWGV"><b data-page-node-id="aheCSEDqoLFdIx7fFVPPhb">ASCII PLY：trove 反而快约 34%</b>
+        （500 万点：1341 ms 对 1780 ms）——CloudCompare 的 ASCII 词法解析并不快，
+        trove 落后的是二进制路径。</li>
+    <li data-page-node-id="MLFhDRPlCCInzZsy1A6LWU"><b data-page-node-id="YEHb7U82phWShyZWcgR8du">瓶颈不在读文件，也不在字节解析</b>：100 万点的 ASCII 文件比 binary 大 2.4 倍，
+        解析耗时却是 257.7 ms 对 264.8 ms——几乎完全相同。时间全部花在
+        <b data-page-node-id="XWmhDOv18IDEXHGjGAFquH">每个顶点、每个属性的固定开销</b>上。</li>
+    <li data-page-node-id="5IYTYzsj0LQd7suFQ2RsCx"><b data-page-node-id="EFET3dCLH40i0qohRs2sr8">峰值内存是 CloudCompare 的 4–6 倍</b>
+        （500 万点：320 MB 对 75 MB；CloudCompare 扣掉 123 MB 的 Qt 基线）。</li>
+  </ul>
+</div>
+
+<h2 data-page-node-id="7sirCF6H99UlXiaaLb4nV5">1 · 加载耗时</h2>
+<table data-page-node-id="FkEPb4QV108nRXiFbCKQKg">
+  <thead data-page-node-id="TArzPullLY0kHVaRINLFkq">
+    <tr data-page-node-id="dFuUQmLeOvYaksFiIGBipk">
+      <th data-page-node-id="tqpfPB5FpsX9lWe7GkoecG">样本</th>
+      <th class="num" data-page-node-id="gwwoEhVw5JNAunZBPCsRVT">读文件</th>
+      <th class="num" data-page-node-id="VJhk17eR9YsA22bHpFqcQZ">解析</th>
+      <th class="num" data-page-node-id="YXyv5dtu0xDdGvsDPMIFWl">trove 合计</th>
+      <th class="num" data-page-node-id="hZzGCoNjXB7XzLkpyTtLQL">缩略图渲染</th>
+      <th class="num" data-page-node-id="E2lE7W1ZF9H4ccyBaLDGVO">CloudCompare</th>
+      <th class="num" data-page-node-id="iCtU8igkXvtLdEkg8CmJh0">倍率</th>
+      <th data-page-node-id="VYloOc6zmE2JlFGpmo1GQZ">对比（蓝 = trove，橙 = CC）</th>
+    </tr>
+  </thead>
+  <tbody data-page-node-id="4aTASGxmiVajnE9eMn0xgk">
+      <tr data-page-node-id="Yh6hygtbHNb34qLNXdibqv">
+        <td class="fname" data-page-node-id="xBSb8SnW0X9jkzveAosVve">tiny.ply<div class="sub" data-page-node-id="F5JXtFTOyEv2UFERR5t6YK">tiny.ply · 0.0 MiB</div></td>
+        <td class="num" data-page-node-id="a99nGagImNPGLicZTzTl2A">0.1 ms</td>
+        <td class="num" data-page-node-id="hSjY5Egmez8xbBb3Jgq7Nf">0.0 ms</td>
+        <td class="num" data-page-node-id="tjIMXH0kbvKt2NYGFFLSi7"><b data-page-node-id="0kseeAbiZrIfspUcSRJIDx">0.1 ms</b></td>
+        <td class="num dim" data-page-node-id="JXkG4oZQcdmGrdCfE40Qmj">3.3 ms</td>
+        <td class="num" data-page-node-id="yvxKQKsjtywNWl4nrdAimQ">0 ms</td>
+        <td class="num" data-page-node-id="IcF3gFPdqaKZXSaXICrYTD">—</td>
+        <td data-page-node-id="5aS78BvoViAYd559Zcsztv"><div class="bar" data-page-node-id="6cZZ6rCYFEwncwuPGy0zdS"><div class="fill" style="width:0.0%;background:#0969da" data-page-node-id="CHalTRApAaDtM8EfbmTNic"></div><span class="bartext" data-page-node-id="XLhQsJY1QEL7nYbwsWYY7H">0</span></div>
+            <div class="bar" data-page-node-id="2slCVEySLAvgJFyoc19O11"><div class="fill" style="width:0.0%;background:#bf8700" data-page-node-id="sjcGdRCPyE0zqHr6Vq6Akk"></div><span class="bartext" data-page-node-id="3KNHXx5emlH3MD5hBdlNKo">0</span></div></td>
+      </tr>
+      <tr data-page-node-id="mhTkTZqXnHps2KKw5YqTdR">
+        <td class="fname" data-page-node-id="NZQQCOoG5y5rrvtBnCHHgg">点云 10 万 · binary<div class="sub" data-page-node-id="Wy1wZAprhpRmNmurfTiYXh">cloud-100k-binary.ply · 1.4 MiB</div></td>
+        <td class="num" data-page-node-id="S8XS8PSpnOVcuWHcZPu7f2">0.4 ms</td>
+        <td class="num" data-page-node-id="vsRRNmyzppPX2FbViIaCFn">26.6 ms</td>
+        <td class="num" data-page-node-id="JscxWAtqkeUH6f8YPUl7Oz"><b data-page-node-id="HDEeltnRSKEemVAaJ7JkWC">27.0 ms</b></td>
+        <td class="num dim" data-page-node-id="RgKcOgdWtlDnwwZ4cbRZld">16.9 ms</td>
+        <td class="num" data-page-node-id="SI6Vw9AcEOR1HSZ8v0FJwp">10 ms</td>
+        <td class="num" data-page-node-id="aKrzgK70ZenzG2Ra5AEDcW"><span class="lose" data-page-node-id="qkAgpkdSp9Sr6G7Bno9o7h">2.70×</span></td>
+        <td data-page-node-id="tML7iIaREpVEAEmFqJKunx"><div class="bar" data-page-node-id="kYcZ3GW4la2tZTxMclIdsr"><div class="fill" style="width:1.5%;background:#0969da" data-page-node-id="xvLEPA7hUdTE4nEsrxyDBR"></div><span class="bartext" data-page-node-id="7zZyB2E9FJ3qsYAF7z96U2">27</span></div>
+            <div class="bar" data-page-node-id="DPTafQMQnxR3sXfm34cgGU"><div class="fill" style="width:0.6%;background:#bf8700" data-page-node-id="oUxDBwiGhlLzWWQevkrgz6"></div><span class="bartext" data-page-node-id="QzAsQJXpmvzVQLNKHqCD1j">10</span></div></td>
+      </tr>
+      <tr data-page-node-id="dlm86ExpNTObaFJymlXuJP">
+        <td class="fname" data-page-node-id="xry3bOWoLsGRCkBW9z0ban">点云 100 万 · binary<div class="sub" data-page-node-id="FL640Na1GcEOGzVVSwS3Vf">cloud-1m-binary.ply · 14.3 MiB</div></td>
+        <td class="num" data-page-node-id="6398EWQNAB7FRIkFKziknr">2.8 ms</td>
+        <td class="num" data-page-node-id="inrEjU8oboV744nFXpqA72">264.8 ms</td>
+        <td class="num" data-page-node-id="mEfOSTqutdMJxWqjKRU6Cp"><b data-page-node-id="KP45o6ZOaIpAwl2rGD1af7">267.6 ms</b></td>
+        <td class="num dim" data-page-node-id="HcNku4zkrvG9CENEROuMuM">119.6 ms</td>
+        <td class="num" data-page-node-id="ergmOqASBicElau7buOdUi">80 ms</td>
+        <td class="num" data-page-node-id="Gd5lHgyTFLFJa0ngwRkj11"><span class="lose" data-page-node-id="7BdjC3Er7ZWX5WoUP0EbJu">3.34×</span></td>
+        <td data-page-node-id="DcxBFWzJ8aKyUSPXYHJ9YB"><div class="bar" data-page-node-id="v1w7LHn7ViwafUg6LMkwAu"><div class="fill" style="width:15.1%;background:#0969da" data-page-node-id="dXGkL9CUHg7m69VnZGfIjO"></div><span class="bartext" data-page-node-id="J899vqQr6MttkqOGXuPtAd">268</span></div>
+            <div class="bar" data-page-node-id="tgCF7Wa7osVBQuX1fpHj6D"><div class="fill" style="width:4.5%;background:#bf8700" data-page-node-id="lRrY2Kg7zF5RBCPFETwNMu"></div><span class="bartext" data-page-node-id="eVtJfdBgFB2zYODj7dmGiJ">80</span></div></td>
+      </tr>
+      <tr data-page-node-id="n0PjtATqGObtoCflClQjYb">
+        <td class="fname" data-page-node-id="J7Vsp6ZIFR8C8PvJRYD3AU">点云 100 万 · binary + 法线 + 颜色<div class="sub" data-page-node-id="DFuEA4S6lUiRmdKAcGxGK3">cloud-1m-normals-binary.ply · 25.7 MiB</div></td>
+        <td class="num" data-page-node-id="AsQZLLbyAoXwK7pmEJDTXt">6.0 ms</td>
+        <td class="num" data-page-node-id="jSDZ6spHvEA6cLuQDMFgBK">441.1 ms</td>
+        <td class="num" data-page-node-id="zZTFahUznjwGDQ4SQxelRD"><b data-page-node-id="Vr8EfTFLzDzkVCxTYVzroL">447.1 ms</b></td>
+        <td class="num dim" data-page-node-id="3FDF7q5RcwSYgTlqzBIkeW">118.6 ms</td>
+        <td class="num" data-page-node-id="kq4AbLHDdHQRwFQSlkH4ZP">230 ms</td>
+        <td class="num" data-page-node-id="qpSuOmF96sEtwTRaH3hxBE"><span class="mid" data-page-node-id="xf2E9BmDI7al97mvD0CYCy">1.94×</span></td>
+        <td data-page-node-id="Pnqz0JDSlys7FeN23a0gD8"><div class="bar" data-page-node-id="3hDH4DHEgP45W3ASyk8B7p"><div class="fill" style="width:25.3%;background:#0969da" data-page-node-id="UBC7kYX3Z8BicOGM13fZhP"></div><span class="bartext" data-page-node-id="tfDv6iapJuVxp0ISquookK">447</span></div>
+            <div class="bar" data-page-node-id="TBD0F0s5XLayArQ7bo6rc4"><div class="fill" style="width:13.0%;background:#bf8700" data-page-node-id="w8RHpPmczJMv9kkGgFEcXc"></div><span class="bartext" data-page-node-id="guTbcR7RItoyd8ahmOMBbl">230</span></div></td>
+      </tr>
+      <tr data-page-node-id="nQ1CuJjVfEorCMFwg4aksv">
+        <td class="fname" data-page-node-id="0DRi0VxKhYUBi0TIDsHC0H">点云 500 万 · binary<div class="sub" data-page-node-id="2YykurVdOIlFzfOwiI97R5">cloud-5m-binary.ply · 71.5 MiB</div></td>
+        <td class="num" data-page-node-id="5mlFjXlfYf1ctk0t4F6fN7">14.9 ms</td>
+        <td class="num" data-page-node-id="ZLyKe99lfTHwrAsDrRE6ZH">1308.0 ms</td>
+        <td class="num" data-page-node-id="IWjJXU2IsRItTi2yods7Il"><b data-page-node-id="UvOdRQue3NBIqG35IlsktC">1322.8 ms</b></td>
+        <td class="num dim" data-page-node-id="bxPLVxa0yJDlE3fp0oIqSM">576.6 ms</td>
+        <td class="num" data-page-node-id="NAs1Jtinc3oJUPx1o6WMb6">400 ms</td>
+        <td class="num" data-page-node-id="mlEO2EQlnHZ5mMNmwLAGy6"><span class="lose" data-page-node-id="MW0wqRBHNvTYe4fRtYtkWE">3.31×</span></td>
+        <td data-page-node-id="aeAU8g9OzxcW8Ms8sPEfWq"><div class="bar" data-page-node-id="KAlPoHE7OffRbmVyNzBtss"><div class="fill" style="width:74.7%;background:#0969da" data-page-node-id="OFav4gXdhi9jNjkpahUCu3"></div><span class="bartext" data-page-node-id="OwH6babuI5ZvoRAy5Gp1H2">1323</span></div>
+            <div class="bar" data-page-node-id="E06GueLhsmKUSIYZB8LrB4"><div class="fill" style="width:22.6%;background:#bf8700" data-page-node-id="DA6DFyYPuHaZhVGEwqo78l"></div><span class="bartext" data-page-node-id="I1fQIJxaCa6HeacJww4aGW">400</span></div></td>
+      </tr>
+      <tr data-page-node-id="XE05Hel7h1zTVa2uOcdBhE">
+        <td class="fname" data-page-node-id="2GTqJJ5pGLiSPXxeoBmBa9">点云 100 万 · ascii<div class="sub" data-page-node-id="ksM2AdGhjDhviUdrGTfjPg">cloud-1m-ascii.ply · 35.0 MiB</div></td>
+        <td class="num" data-page-node-id="F4pc2c3maglUgk46SHdCPI">6.4 ms</td>
+        <td class="num" data-page-node-id="tDuPp4BFGBbFAgbrSG6g3g">257.6 ms</td>
+        <td class="num" data-page-node-id="gViV2eGlHsLFLePxHbxOlm"><b data-page-node-id="fWNYty1dH7RbTDrDYeIn3w">264.0 ms</b></td>
+        <td class="num dim" data-page-node-id="iZzeYkqFhbzJqqnhZhacxB">117.0 ms</td>
+        <td class="num" data-page-node-id="IYy49bGyBiYq15gC6DnvNV">360 ms</td>
+        <td class="num" data-page-node-id="h2Rm0HbaXUZN0x0yjLKeYL"><span class="win" data-page-node-id="G7khbn7M8eaf1IByH2dW1F">0.73×</span></td>
+        <td data-page-node-id="VHCFgnDZ6FAJFt4UNkZleX"><div class="bar" data-page-node-id="CgzGlhiVwViv0oaCa5GEiF"><div class="fill" style="width:14.9%;background:#0969da" data-page-node-id="N4nOfqWgosDJYtDzE0Xcck"></div><span class="bartext" data-page-node-id="H4pbxmeUFiMQDtLUF1YDWG">264</span></div>
+            <div class="bar" data-page-node-id="mrV2tPOr3wM5sUgmxHvx9w"><div class="fill" style="width:20.3%;background:#bf8700" data-page-node-id="ybhPKVs0acCUa1GS35Rakp"></div><span class="bartext" data-page-node-id="xEvqjsYGbBj71iX6R2EVtF">360</span></div></td>
+      </tr>
+      <tr data-page-node-id="E1bXDTXbjyOBW0H9V0Gi9O">
+        <td class="fname" data-page-node-id="Dfk8pUXHJMTgiHmkvy7VTO">点云 500 万 · ascii<div class="sub" data-page-node-id="fONzwKavzwRIxedSa2J7Fl">cloud-5m-ascii.ply · 174.8 MiB</div></td>
+        <td class="num" data-page-node-id="GGwa5580HZAIia8vGQmy5H">30.5 ms</td>
+        <td class="num" data-page-node-id="glg2wzOHQ2hmzQT94t33Pr">1310.0 ms</td>
+        <td class="num" data-page-node-id="wZ4CtVOYK7I0pX0gBKGQOZ"><b data-page-node-id="HrozgJj3CtQBms3gyHv4P0">1340.5 ms</b></td>
+        <td class="num dim" data-page-node-id="gjMU2jbVqYthjsLlwg5QFw">573.3 ms</td>
+        <td class="num" data-page-node-id="VcMvo6Wub4Dn6FZ4ZQ04n9">1770 ms</td>
+        <td class="num" data-page-node-id="weiB1j3OJOcf96gcbJuYFf"><span class="win" data-page-node-id="ZYVqX0G9z5eDrtavvADrIt">0.76×</span></td>
+        <td data-page-node-id="lV8EIFLd33uv75tnAVsYTh"><div class="bar" data-page-node-id="GINNGszTymwGGRvtGg3wnU"><div class="fill" style="width:75.7%;background:#0969da" data-page-node-id="gRwzdV2RhxiJy3Tn9L6ZHM"></div><span class="bartext" data-page-node-id="DR3jld2MwafVjlfkwfUFZg">1341</span></div>
+            <div class="bar" data-page-node-id="gk31v6VgKGe893gBqzHita"><div class="fill" style="width:100.0%;background:#bf8700" data-page-node-id="ty4NzNZ1MZsEoPFhub8X7E"></div><span class="bartext" data-page-node-id="otaYpsyf8uuhktnfzFXRq1">1770</span></div></td>
+      </tr>
+      <tr data-page-node-id="YZACfodpuZOR9X9C8Rr8go">
+        <td class="fname" data-page-node-id="JiJORfbvSkCiQDSH42i5tk">网格 50 万顶点 / 100 万面 · binary<div class="sub" data-page-node-id="N5TCxGTXnpRZw2dOgQ5T3R">mesh-500k-binary.ply · 19.5 MiB</div></td>
+        <td class="num" data-page-node-id="uqUQqdrk4KCABEu8xwnHGM">4.3 ms</td>
+        <td class="num" data-page-node-id="TFeVaTUzOZGEfkODcv4eu0">205.1 ms</td>
+        <td class="num" data-page-node-id="0ycgWlvVnxFoh6Ywv9FPtM"><b data-page-node-id="u7naFRpewikcEpvjBS7QTD">209.4 ms</b></td>
+        <td class="num dim" data-page-node-id="K1n9I70HOJ2x9l18Fe75h5">95.4 ms</td>
+        <td class="num" data-page-node-id="nYpBSX9c2GLsefDYxARuiM">90 ms</td>
+        <td class="num" data-page-node-id="Q5qV20YSN6ySyzGyIfLJzl"><span class="lose" data-page-node-id="cz4yB4VSTNDW6aifF890gi">2.33×</span></td>
+        <td data-page-node-id="28RBmhJbSuHMdWHVpXjXgm"><div class="bar" data-page-node-id="8xvFHmMgEinx4CUjpnxJG6"><div class="fill" style="width:11.8%;background:#0969da" data-page-node-id="ARWJUE3yTT3WjbRztg7InZ"></div><span class="bartext" data-page-node-id="RrYsBdTUMp2SS6cfOHncCo">209</span></div>
+            <div class="bar" data-page-node-id="g6sWBAeohp3wnNurMvYM59"><div class="fill" style="width:5.1%;background:#bf8700" data-page-node-id="kwmXHipvFknZ1K1peE1ZqJ"></div><span class="bartext" data-page-node-id="0iB0DXknxliwRYVJ5BBele">90</span></div></td>
+      </tr>
+  </tbody>
+</table>
+<div class="legend" data-page-node-id="TnQsuZEmQhKjpxtDzMHoiv">
+  「trove 合计」= 读文件 + 解析，与 CloudCompare 的 <code data-page-node-id="MQmq2n0UcPfNgsOfSV4VM2">[LOAD] finished</code>
+  口径一致；「缩略图渲染」是 trove 额外做的 512×384 卡片光栅化（supersample 2），
+  CloudCompare 在无头模式下不产生图像，因此不计入它的耗时。
+  <code data-page-node-id="bGUnrT1mZbzOyAsIFRFUxN">0.01 s</code> 这类值受 CloudCompare 日志的 10 ms 精度限制，倍率仅供参考。
+</div>
+
+<h2 data-page-node-id="PZcwQrqTPIK5cqjeFctQPM">2 · 峰值内存</h2>
+<table data-page-node-id="wg3enS8me6b5mFV2RGGYR7">
+  <thead data-page-node-id="qqRY2tWydbjPMXaVPmgLsU">
+    <tr data-page-node-id="ivY06HRFBX7fN25FbGcqkC"><th data-page-node-id="wxmijsMwAgvbNKl3q9zSsv">样本</th><th data-page-node-id="mFxxoqjUyYZD0C4IXjFOnN">trove（进程净增）</th><th data-page-node-id="xWBkofpptahlhYN0IlwlwJ">CloudCompare（扣除 Qt 基线后净增）</th></tr>
+  </thead>
+  <tbody data-page-node-id="kCYIiUjGMr90csLbhBgNIZ">
+      <tr data-page-node-id="DNMFioRuKnuC7hkUtFtmSE">
+        <td class="fname" data-page-node-id="GJkCXDT6DBzE2SwWprKBaK">tiny.ply</td>
+        <td data-page-node-id="BnXHF8cCvMTnBu64FjTr7V"><div class="bar" data-page-node-id="zh2Iu3W19NLtdVmx7jAxm3"><div class="fill" style="width:0.0%;background:#0969da" data-page-node-id="aXdnOMDmwKApVdF7iE6cRf"></div><span class="bartext" data-page-node-id="w5EyjHte7EMmH2onhmjNKV">0 MB</span></div></td>
+        <td data-page-node-id="pAiSsdZKWwhzG48QAYIkw5"><div class="bar" data-page-node-id="gRvyzqC0e2Ad5QaEWfFCA2"><div class="fill" style="width:0.0%;background:#bf8700" data-page-node-id="5VNIP6o0maJEFXGJU5hXMh"></div><span class="bartext" data-page-node-id="RFCpYypS9yXWZhtnDxTodx">0 MB</span></div></td>
+      </tr>
+      <tr data-page-node-id="DPQ2v4Ftc8cb4IYLdlTqI7">
+        <td class="fname" data-page-node-id="R6U5RITAuJDPvYsCujpy02">点云 10 万 · binary</td>
+        <td data-page-node-id="B5oWk0zRgjzs2fe0SS8XXO"><div class="bar" data-page-node-id="FqZGzHiCK47xTuLCkGcWMV"><div class="fill" style="width:2.8%;background:#0969da" data-page-node-id="e780f29cTrG0Has9jwSpYT"></div><span class="bartext" data-page-node-id="oPZomGvJVFLCNGUybuT75k">9 MB</span></div></td>
+        <td data-page-node-id="S00rBgM6njtwa6KVoFrjyn"><div class="bar" data-page-node-id="tqVsWEkz7BC7YV6H8iWUIj"><div class="fill" style="width:0.0%;background:#bf8700" data-page-node-id="DYDDXQOVshU5sQyfhAoiBB"></div><span class="bartext" data-page-node-id="ze27PQzFIzX4hRC3yXIY65">0 MB</span></div></td>
+      </tr>
+      <tr data-page-node-id="VZznQLvxsWwVUgOjbmPGGq">
+        <td class="fname" data-page-node-id="AfCAyh7BHkbzCryVAqfFEu">点云 100 万 · binary</td>
+        <td data-page-node-id="Mo7MdkANNUHk8VzSlifAK6"><div class="bar" data-page-node-id="j5HIcxeB0tScsp6IvC6C4L"><div class="fill" style="width:20.9%;background:#0969da" data-page-node-id="OUMwaU628UZ9m7ieXOiXKO"></div><span class="bartext" data-page-node-id="q4Zn7NK1fTZMZ6sof4hGkf">67 MB</span></div></td>
+        <td data-page-node-id="2noIvA7JNqXuiGNn94VDRH"><div class="bar" data-page-node-id="nYufaKdKndT38FC2TJPZSl"><div class="fill" style="width:4.4%;background:#bf8700" data-page-node-id="oASsjgAjUVqDJ8igWjobuF"></div><span class="bartext" data-page-node-id="86OGtj2FlRLZNaqnS0RHz6">14 MB</span></div></td>
+      </tr>
+      <tr data-page-node-id="aGIETjJNC0rjixWu53B7mH">
+        <td class="fname" data-page-node-id="LkBN6xAY5lz2x11xGNpdr2">点云 100 万 · binary + 法线 + 颜色</td>
+        <td data-page-node-id="sOCvHx3SX1mDpOIeYt52BP"><div class="bar" data-page-node-id="mzQCE4cyMEwW7zZjQfEQZm"><div class="fill" style="width:34.4%;background:#0969da" data-page-node-id="ApGxDjLXxLcKVAZAbWlTbS"></div><span class="bartext" data-page-node-id="hieVasTOxKUcGVHhoM6zHg">110 MB</span></div></td>
+        <td data-page-node-id="F6DDwZy9X7GGSNB1FC9PDz"><div class="bar" data-page-node-id="iqVDifQ7MDUf3N5jvOW6Qq"><div class="fill" style="width:5.6%;background:#bf8700" data-page-node-id="ZmyH9fB5d13IZgHaIkED0s"></div><span class="bartext" data-page-node-id="Wqa2VhPKy5eBMD6OgKc2C2">18 MB</span></div></td>
+      </tr>
+      <tr data-page-node-id="9WJl3iRHA2ufo36JnXubgH">
+        <td class="fname" data-page-node-id="KEuR6hdV5y1mpwTVu7wcN1">点云 500 万 · binary</td>
+        <td data-page-node-id="zgHWITJ5FDOTUCEoVqyfLY"><div class="bar" data-page-node-id="wefsgKqMtnWldzsxHDZ0Sg"><div class="fill" style="width:100.0%;background:#0969da" data-page-node-id="d7OB5CfI4UIQuus1z5x6zo"></div><span class="bartext" data-page-node-id="0fAzDCAD9PbAMf9tUmpRIj">320 MB</span></div></td>
+        <td data-page-node-id="FuxfWIy2OVcPWe3jkTTZ48"><div class="bar" data-page-node-id="ewWXmfNqjkO7yVrZDPAVmx"><div class="fill" style="width:23.4%;background:#bf8700" data-page-node-id="C4E4ZOJxhNQFHvx8BS2aPx"></div><span class="bartext" data-page-node-id="xJaZpAODlMU91UwOZxbv48">75 MB</span></div></td>
+      </tr>
+      <tr data-page-node-id="jn1rOVkTEFzVBJjFrGRSMv">
+        <td class="fname" data-page-node-id="n9UUEddCbBYLZhlhWRwJL1">点云 100 万 · ascii</td>
+        <td data-page-node-id="bu5SNKLK14aflZnAXkp8ml"><div class="bar" data-page-node-id="fzJS0zAmwF8CBGw0e3Ayrn"><div class="fill" style="width:19.1%;background:#0969da" data-page-node-id="6X5g6HoIqldBZoEOFwvVDj"></div><span class="bartext" data-page-node-id="EOPXPOR9UV7FWwg4ICc2Cq">61 MB</span></div></td>
+        <td data-page-node-id="z0nTj16auPutHz34iKRAmy"><div class="bar" data-page-node-id="YPH66okzSvrFQqjjAdGSkP"><div class="fill" style="width:4.4%;background:#bf8700" data-page-node-id="dyf46glb8RxtQc5WFgZBwi"></div><span class="bartext" data-page-node-id="ZglpBdPK0cKt8bpjMPuCI1">14 MB</span></div></td>
+      </tr>
+      <tr data-page-node-id="jMcUtAT67ZxElvikZpl17D">
+        <td class="fname" data-page-node-id="pc21Jyph69oB2E7gJy2ZCj">点云 500 万 · ascii</td>
+        <td data-page-node-id="7lRuH1wG6LIMObrOhRpjDH"><div class="bar" data-page-node-id="21jqOamVoHom4FW7p3Fcey"><div class="fill" style="width:91.2%;background:#0969da" data-page-node-id="NLUUeCACW6Q1Smmx62m6KH"></div><span class="bartext" data-page-node-id="QnQPTAfHA8H9MM9Hj0fMux">292 MB</span></div></td>
+        <td data-page-node-id="pwYWydu5J7Bbxt1P4DK2x9"><div class="bar" data-page-node-id="3WIhN5hHgfL1fJlbE9Nrgi"><div class="fill" style="width:23.4%;background:#bf8700" data-page-node-id="CTvobtHcjwrqhzHZzYcAhH"></div><span class="bartext" data-page-node-id="djDwpXzHm5HSH7bb3LyrSi">75 MB</span></div></td>
+      </tr>
+      <tr data-page-node-id="2zo5ibzOisDPxLuSmpiipv">
+        <td class="fname" data-page-node-id="GFqe5wkZxi6dOps2x2h5ey">网格 50 万顶点 / 100 万面 · binary</td>
+        <td data-page-node-id="iUNLar4L9r7My2BppnqbBD"><div class="bar" data-page-node-id="BOwc00K0AHF0yRTLFNw0UE"><div class="fill" style="width:24.1%;background:#0969da" data-page-node-id="7ubHcC11UNnLsMWTAyvZ04"></div><span class="bartext" data-page-node-id="eAzlSSjQn3ME1BzrM166jq">77 MB</span></div></td>
+        <td data-page-node-id="LzMlMAmfffqbmpgnAJ6kbq"><div class="bar" data-page-node-id="OKy5LwoqRxeBGrPIGcNcyO"><div class="fill" style="width:5.6%;background:#bf8700" data-page-node-id="dj38GgYIeRcvmGgb97xCI2"></div><span class="bartext" data-page-node-id="UWX5BRBZlsLofXPjq4YTV5">18 MB</span></div></td>
+      </tr>
+  </tbody>
+</table>
+<p class="legend" data-page-node-id="5EgBeAJJXc8X7wsxx9FiIF">
+  两者都整文件加载后测得峰值常驻集。CloudCompare 的空载基线实测约
+  123 MB（加载 1 个点的 PLY），表中已扣除；trove 基线不足 1 MB。
+  内存由外部轮询 <code data-page-node-id="c7EtLXa7hSqTiNWAsCMeBU">ps -o rss=</code> 取得，双方同一口径。
+</p>
+
+<h2 data-page-node-id="pfXB5MltrwDa80jOiuS0Pa">3 · 为什么慢</h2>
+<div class="cols" data-page-node-id="mLcAHbolazcGoStoB2dNle">
+  <div class="box" data-page-node-id="MT6YGXa5CLAC1p6Vk6E81x">
+    <h4 data-page-node-id="0qBw8c6JC44INHRf69AI5e">解析耗时与「列数 × 顶点数」成正比</h4>
+    <ul data-page-node-id="YfRFEgoE0Yk4YFJBOYu3xr">
+      <li data-page-node-id="1fW9CFfVTfKPSyDbLQTHTy">10 万 → 100 万 → 500 万点：25.5 ms → 264.8 ms → 1308.0 ms，
+          严格线性，没有固定启动开销。</li>
+      <li data-page-node-id="C9DZEF0aaWgur2iFiUXBFw">同样 100 万点，属性从 6 列（xyz+rgb）加到 9 列（xyz+nxnynz+rgb），
+          耗时 264.8 ms → 441.1 ms，<b data-page-node-id="axkCyenpW29scDFZNTW5ut">1.67×</b>，同样是线性于列数。</li>
+      <li data-page-node-id="CQWdqp58Kd70Ef7Ss6ryN2">换算下来约 <b data-page-node-id="Q0wYKYYE9TXvvG5uzYXmEE">44 ns / 属性</b>，正常的内存填充应该在 1–2 ns 量级。</li>
+    </ul>
+  </div>
+  <div class="box" data-page-node-id="7j7WPDe9A1JHngY21ZjkDj">
+    <h4 data-page-node-id="dQSREUfSZkUddsPpj0chCY">ASCII 与 binary 一样快 = 瓶颈不在字节</h4>
+    <ul data-page-node-id="oLDVwte2pAEHhZPqvoT3K9">
+      <li data-page-node-id="f9jDnZmFxJLbv3mesAe3nA">ASCII 100 万点 257.7 ms，binary 100 万点 264.8 ms。</li>
+      <li data-page-node-id="XoMkj6ciMxzcPwpHOp60Dd">ASCII 文件是 binary 的 2.4 倍大，还多了一次
+          <code data-page-node-id="eqCVJsrZFxxJaFgiHFXmb9">String::from_utf8_lossy</code> 整块拷贝，却更快。</li>
+      <li data-page-node-id="7rCYxXLUT211z6Ntn4tqro">说明无论输入是 3 个浮点文本还是 12 个紧凑字节，每顶点走的都是同一套
+          昂贵的分配流程，真正的词法/编码开销被淹没。</li>
+    </ul>
+  </div>
+</div>
+
+<h3 data-page-node-id="E37Bz2eClhBLV0E9QFtP1S">代码层面的三个分配热点</h3>
+<p data-page-node-id="FmbyJrvMWA7oyXz622YilT"><code data-page-node-id="KHhxEd4ZRTiY7DHw58oZXo">crates/trove-core/src/media/mesh.rs</code> 的 <code data-page-node-id="QbWhk9Ifbv5TuQMohavE0j">load_ply</code>
+在顶点主循环里做了这些事：</p>
+<pre data-page-node-id="nA2zrlJZHbyJX9hv4Y0Btb">// mesh.rs:547 —— 每读一个顶点就建一个堆容器
+let mut values: Vec&lt;(String, Vec&lt;f64&gt;, PlyType)&gt; =
+    Vec::with_capacity(element.properties.len());
+
+// mesh.rs:591 —— 每个属性：clone 一次属性名（堆分配）+ 一个 Vec&lt;f64&gt;（又一次堆分配）
+values.push((property.name.clone(), v, property.ty));
+
+// mesh.rs:593 / 603 —— 之后每个属性还要按名字线性扫描一遍
+let scalar = |name: &amp;str| values.iter().find(|(n, _, _)| n == name)…;
+let channel = |names: &amp;[&amp;str]| values.iter().find(|(n, _, _)| …)…;</pre>
+<p data-page-node-id="7vMkCdD2LgMjZWzFdFvXMu">
+  一次 500 万点的加载因此要产生约 <b data-page-node-id="vzpCc0k4GBIWfoNUGEhX3k">3000 万次堆分配</b>（5M 顶点 × 6 属性 ×
+  2 次）和同等数量的属性名字符串比较。这正是内存也要多占
+  4–6 倍的原因——分配器的碎片和保留页从未还回。
+</p>
+<p data-page-node-id="W5gzoUFwgwDjZgi7vygbjM">次要问题：</p>
+<ul data-page-node-id="mBDuzp5GzcI7Mp6CDSiTVC">
+  <li data-page-node-id="KAW7DmNVDgSIH9oOkBJa49"><code data-page-node-id="1iFt50pNA9Ru0JH6vrXxH0">mesh.rs:538</code> ASCII 路径对整个文件体做 <code data-page-node-id="gZKd7RORxGcHwp0TKMS7D6">from_utf8_lossy</code>
+      拷贝（175 MB 文件即再复制 175 MB），随后才 <code data-page-node-id="om3ZBa2mXnHYfrplU49fTB">split_whitespace</code>。</li>
+  <li data-page-node-id="GfSBAbSokArb9tYjjt77T7"><code data-page-node-id="CKzH4zLySTmh6PFOhSX2FS">mesh.rs:226</code> <code data-page-node-id="e1eKRMBg4Zr056oBduzqez">std::fs::read</code> 整文件读入，没有流式路径，
+      超大 PLY 没有上限。</li>
+  <li data-page-node-id="wwBVExUYzMckxJ4l0tmpBW">整个解析是单线程；<code data-page-node-id="VMshqJo0DrJ0EeIgN1zQCm">rayon</code> 已经是 trove-core 的依赖，但这里没用上。</li>
+</ul>
+
+<h2 data-page-node-id="RNiumXceJZtPEueoFL5LeA">4 · 优化方向</h2>
+<table data-page-node-id="VdQnggUVcmWsfkDJ93JbH6">
+  <thead data-page-node-id="X6e38ohsnThI1mFSYbwMhE"><tr data-page-node-id="1mjSGvB0j9X5vrREzQPaEu"><th data-page-node-id="7UFKBinvfqA59LYVxWBIEa">优先级</th><th data-page-node-id="UDikETGSAHDqsENv5NBHma">改动</th><th data-page-node-id="ITcATZeXeVnFEHajkjiHDX">预期</th></tr></thead>
+  <tbody data-page-node-id="cXOURZ9bwqi0qXXRAIIazi">
+    <tr data-page-node-id="s4cSc28tGgpb9CkDmZsv1b">
+      <td data-page-node-id="UKq67BiUxj34ziDYz1zljr"><b data-page-node-id="fAhNao8yM85rLZmtzRic0I">P0</b></td>
+      <td data-page-node-id="Pi6PhdwuDx62WKaBguqxGk">表头阶段就把属性名映射成列索引，主循环按<b data-page-node-id="GmmXFSIpAgEQ633IWGB5xn">列</b>解析到目标数组，不再每顶点构造
+          <code data-page-node-id="vXHjbsYepsFtwMGQ2KZFK5">Vec&lt;(String, Vec&lt;f64&gt;)&gt;</code>。x/y/z 直接写
+          <code data-page-node-id="NdWus5PiEwiyfY2GAVxOQk">Vec&lt;[f32;3]&gt;</code>。</td>
+      <td data-page-node-id="ORZTloAbuCiBxn6eH80ZoT">消掉 3000 万次分配，预计二进制路径进入 100 ms 量级以内，追上或超过 CloudCompare</td>
+    </tr>
+    <tr data-page-node-id="reujGn066xiSO9c3Omdhge">
+      <td data-page-node-id="zxVy3xJsMuIy2kx47KmNaA"><b data-page-node-id="HRGZFk7QcBiwcFdBqkW78C">P0</b></td>
+      <td data-page-node-id="k38wYUUdLmTAWPcUM8W7Fb">二进制路径批量读：按行的 stride 一次取出整点，用
+          <code data-page-node-id="Nxfj1LFUq1DhuoCJEeXFmD">f32::from_le_bytes</code> / <code data-page-node-id="i0ki9ESB6895jkDkXGo9Nl">bytemuck</code> 而不是逐标量走
+          <code data-page-node-id="uCreeLv9AkN8glDDdTtseM">Cursor</code> + <code data-page-node-id="jHmG5TJQ4jOhrECsnpr2OS">Option</code>。</td>
+      <td data-page-node-id="FgAgTlNa1ee7qLgLs4v2XP">配合上一条一起生效</td>
+    </tr>
+    <tr data-page-node-id="El5cUfzCG3gakwsJiB4CXf">
+      <td data-page-node-id="C2g19be28aHx8T3WEXiG5R"><b data-page-node-id="cRsJ0xbvYE0f1Ugbp4pqm2">P1</b></td>
+      <td data-page-node-id="R22ftnmngoOm1KC5teqHiM">ASCII 路径去掉 <code data-page-node-id="jnrWCGFfojcFknGWiDwEKN">from_utf8_lossy</code> 整块拷贝，直接用
+          <code data-page-node-id="HHinowK4ZJr2zr8dVk9zVn">&amp;[u8]</code> 分词；按行边界切块交给 rayon 并行解析。</td>
+      <td data-page-node-id="RhrsWslQcAGwAUGAXMBDYr">ASCII 100 万点有望从 258 ms 降到数十毫秒</td>
+    </tr>
+    <tr data-page-node-id="DXIWjzJ0CBbxd6SWQMA54O">
+      <td data-page-node-id="43NU54gXIxQZSH61Apb42w"><b data-page-node-id="3DAdITagGmeaOPdq7rgzES">P2</b></td>
+      <td data-page-node-id="piI1duLlGACUFGqOrrjMaP">给 <code data-page-node-id="aCSa9ZQs73opE1kMPFLCyr">mesh::load</code> 加流式/上限保护，避免超大 PLY 直接把内存吃光。</td>
+      <td data-page-node-id="AcBQFHr4nS9PhfA1ls4tkx">健壮性，不影响基准</td>
+    </tr>
+  </tbody>
+</table>
+
+<h2 data-page-node-id="GadG1GPWPDk16OtjXwfHkO">5 · 复现方式</h2>
+<pre data-page-node-id="lKllzEXBa9vVHP0RT5mhJG"># 样本集（同一生成器，坐标 ±10 以内，避免 CloudCompare 触发坐标平移）
+python3 /home/noke/.cache/trove-scratch/ply/gen.py
+
+# trove：分离 read / parse / render 三段计时，5 次取中位数
+cargo run --release -p trove-core --example ply_bench -- --iters 5 --json FILE...
+# 单文件峰值内存（一进程一文件，VmHWM 是单调高水位）
+cargo run --release -p trove-core --example ply_bench -- --mem FILE
+
+# CloudCompare：无头运行，读它自己打的 [LOAD] finished 时间
+QT_QPA_PLATFORM=offscreen CloudCompare -SILENT -AUTO_SAVE OFF -O FILE
+
+# 汇总
+python3 /home/noke/.cache/trove-scratch/ply/generate_report.py</pre>
+
+<h3 data-page-node-id="jG4LFx1xegCsIvGoaIE2Ii">CloudCompare 的逐次原始读数</h3>
+<table data-page-node-id="zPM0SWUdex8i5vFsJ6zaeC">
+  <thead data-page-node-id="az1gos0TngE30aqXoUgdGk"><tr data-page-node-id="TgnrkYm88nMnHwNe0ZJ9Jz"><th data-page-node-id="v48plsmPFQysAe1isPqIeO">样本</th><th class="num" data-page-node-id="C5ocQligKshYLF3Wk78K4k">3 次运行</th></tr></thead>
+  <tbody data-page-node-id="8tyRxopnbyGZLSDjuWbZIZ">
+<tr data-page-node-id="LQYK5XqHeHAIiBADBGT6qP"><td data-page-node-id="2bHP3uFH1jfEQgwZVec15Y">tiny.ply</td><td class='num' data-page-node-id="714iZW2bjK2nfWxLhCxH3H">0 / 0 / 0 ms</td></tr>
+<tr data-page-node-id="3jnJ5azpokNFDHRjmwrgBn"><td data-page-node-id="JffDzvw9lLveD4i35HkSlN">cloud-100k-binary.ply</td><td class='num' data-page-node-id="KOKN8A4BRhSaBCGDY0b8ZB">10 / 10 / 10 ms</td></tr>
+<tr data-page-node-id="Xs82E0rdsWWZIsuEL1ZcpH"><td data-page-node-id="dMyF3Lm7Z0D6hgODTocI5s">cloud-1m-binary.ply</td><td class='num' data-page-node-id="RbZkJhOrpKmppUyCPvI2yT">80 / 80 / 80 ms</td></tr>
+<tr data-page-node-id="MpgGC6ntFNXEHtQBbhTdDb"><td data-page-node-id="1R90iJ5UDyGE5RHqu42ocs">cloud-1m-normals-binary.ply</td><td class='num' data-page-node-id="XygGeLt5PcH1384etrbltP">240 / 230 / 230 ms</td></tr>
+<tr data-page-node-id="qewGRe1sxIADJa287RwEAd"><td data-page-node-id="SDDryB1AUW1w0NJIm214MO">cloud-5m-binary.ply</td><td class='num' data-page-node-id="BLreyUF2B8bI0LZDn6BMmV">410 / 400 / 390 ms</td></tr>
+<tr data-page-node-id="EncukAxBewpUNM9TI3a2kg"><td data-page-node-id="qcot3paTToUfeKNTfhrXfj">cloud-1m-ascii.ply</td><td class='num' data-page-node-id="cxcCVY14iXb9oUVs1BUfCT">360 / 360 / 350 ms</td></tr>
+<tr data-page-node-id="XKgwGrWG8n7WetVNq4X0QJ"><td data-page-node-id="6DaMipYPBUXAfGZWxE1aF2">cloud-5m-ascii.ply</td><td class='num' data-page-node-id="9S1usKktd0Ahx7d3NsYNtv">1800 / 1770 / 1760 ms</td></tr>
+<tr data-page-node-id="cLnDtixG6lOsan8KVIobEC"><td data-page-node-id="Lc2tRIRWIz3IfhHEotTNHp">mesh-500k-binary.ply</td><td class='num' data-page-node-id="j2xUdp0EnBRlzUBgEM13Nm">90 / 90 / 90 ms</td></tr>
+  </tbody>
+</table>
+
+</div>
+</body>
+</html>

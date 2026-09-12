@@ -26,6 +26,10 @@ pub struct AppConfig {
     /// title-bar slider). 1.0 = default; clamped on read.
     #[serde(default)]
     pub grid_zoom: Option<f32>,
+    /// Recently picked colours from the colour picker (newest first,
+    /// capped at 20 on write).
+    #[serde(default)]
+    pub color_history: Vec<String>,
     /// Recently opened libraries, newest first (settings ▸ general lists
     /// these for one-click hot switching). Capped at [`RECENT_LIBRARY_CAP`].
     #[serde(default)]

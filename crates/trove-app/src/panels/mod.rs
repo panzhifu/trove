@@ -38,6 +38,7 @@ macro_rules! panel {
 }
 
 pub mod color_label;
+pub mod color_picker;
 pub mod common;
 mod explorer;
 mod folders;
