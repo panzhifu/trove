@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Trove
+GenericName=Asset Manager
+Comment=Local-first asset library: images, video, fonts, 3D models
+Exec=trove-app
+Icon=trove
+Categories=Graphics;Utility;FileManager;
+StartupWMClass=trove
+Keywords=assets;images;fonts;collection;

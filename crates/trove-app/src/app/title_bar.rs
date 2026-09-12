@@ -30,6 +30,17 @@ pub fn window_options() -> WindowOptions {
         // would stack a second bar under ours, and it also suppresses
         // gpui-kit's own window controls (min/max/close) on the right.
         window_decorations: Some(gpui::WindowDecorations::Client),
+        // Wayland: the dock/launcher matches this against the .desktop entry
+        // (StartupWMClass) to show the app icon; the embedded `icon` field
+        // above only applies to X11.
+        app_id: Some("trove".to_string()),
+        // X11-only in gpui (Wayland takes the icon from the .desktop entry);
+        // embedded so it ships inside the binary.
+        icon: Some(std::sync::Arc::new(
+            image::load_from_memory(include_bytes!("../../../../design/icon/trove-256.png"))
+                .expect("embedded app icon is a valid PNG")
+                .into_rgba8(),
+        )),
         ..Default::default()
     }
 }

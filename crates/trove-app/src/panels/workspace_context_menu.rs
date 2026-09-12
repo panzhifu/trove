@@ -1,5 +1,7 @@
 //! Right-click context menu for assets and drag preview.
 
+use std::path::PathBuf;
+
 use gpui_kit::base::h_flex;
 use gpui_kit::component::ActiveTheme;
 use gpui_kit::component::WindowExt as _;
@@ -32,18 +34,38 @@ pub(crate) fn asset_context_menu(
     }
 
     let conn = controller.read(cx).library.store().conn();
-    let (favorite, current_label, is_image, mime) = assets::get(conn, asset_id)
+    let (favorite, current_label, is_image, mime, font_file) = assets::get(conn, asset_id)
         .ok()
         .flatten()
         .map(|a| {
+            let font_file = if a.kind == AssetKind::Font {
+                a.sha256.clone().map(|sha| {
+                    // Same blob resolution the Inspector uses: the stored
+                    // blob, or the linked original for linked fonts.
+                    let blob = if a.origin == trove_core::model::Origin::Linked {
+                        a.extra
+                            .get("source_path")
+                            .and_then(|v| v.as_str())
+                            .map(PathBuf::from)
+                    } else {
+                        a.rel_path
+                            .as_ref()
+                            .map(|rel| controller.read(cx).library.root().join(rel))
+                    };
+                    (sha, blob)
+                })
+            } else {
+                None
+            };
             (
                 a.is_favorite,
                 a.color_label,
                 a.kind == AssetKind::Image,
                 a.mime,
+                font_file,
             )
         })
-        .unwrap_or((false, None, false, String::new()));
+        .unwrap_or((false, None, false, String::new(), None));
     let browsed_collection = controller.read(cx).current_collection;
 
     let ctl_build = controller.clone();
@@ -124,6 +146,46 @@ pub(crate) fn asset_context_menu(
                     crate::panels::common::reveal_path(&path);
                 }),
         );
+        menu = menu.separator();
+    }
+    // Fonts: system-level install / uninstall right from the grid, same
+    // user-level mechanism as the Inspector button.
+    if let Some((sha, blob)) = font_file {
+        let installed = crate::fonts::is_installed(&sha);
+        let ctl_font = controller.clone();
+        let sha_font = sha.clone();
+        let blob_font = blob.clone();
+        menu = menu.item(
+            PopupMenuItem::new(if installed {
+                rust_i18n::t!("inspector.font_uninstall").to_string()
+            } else {
+                rust_i18n::t!("inspector.font_install").to_string()
+            })
+            .on_click(move |_, _, cx| {
+                let outcome = if installed {
+                    crate::fonts::uninstall(&sha_font).map(|_| ())
+                } else {
+                    match &blob_font {
+                        Some(blob) => crate::fonts::install(blob, &sha_font).map(|_| ()),
+                        None => Err("font file not found".to_string()),
+                    }
+                };
+                if let Err(e) = outcome {
+                    ctl_font.update(cx, |ctl, cx| {
+                        ctl.notice = Some(
+                            rust_i18n::t!("notice.font_install_failed", error = e).to_string(),
+                        );
+                        cx.notify();
+                    });
+                }
+                cx.refresh_windows();
+            }),
+        );
+        if installed {
+            menu = menu.item(PopupMenuItem::new(
+                rust_i18n::t!("inspector.font_installed").to_string(),
+            ));
+        }
         menu = menu.separator();
     }
     // "Open with": the installed applications that claim this mime type,

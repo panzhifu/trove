@@ -1,0 +1,32 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <!-- Trove: a treasure found in the collection grid.
+       Indigo app tile, four asset-grid cells, the top-right one is the gem. -->
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#6366F1"/>
+      <stop offset="1" stop-color="#4338CA"/>
+    </linearGradient>
+    <linearGradient id="gem" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#FCD34D"/>
+      <stop offset="1" stop-color="#D97706"/>
+    </linearGradient>
+  </defs>
+
+  <!-- app tile -->
+  <rect width="512" height="512" rx="115" fill="url(#bg)"/>
+
+  <!-- asset grid: three collection cells -->
+  <rect x="86"  y="86"  width="150" height="150" rx="34" fill="#FFFFFF" opacity="0.94"/>
+  <rect x="86"  y="276" width="150" height="150" rx="34" fill="#FFFFFF" opacity="0.94"/>
+  <rect x="276" y="276" width="150" height="150" rx="34" fill="#FFFFFF" opacity="0.94"/>
+
+  <!-- the treasure: faceted gem in the top-right cell -->
+  <g transform="translate(351 161)">
+    <path d="M -75 -18 L -28 -70 L 28 -70 L 75 -18 L 0 72 Z" fill="url(#gem)"/>
+    <path d="M -75 -18 L 75 -18 L 0 72 Z" fill="#B45309" opacity="0.28"/>
+    <path d="M -28 -70 L -18 -18 L 0 72 L 18 -18 L 28 -70 Z" fill="#FDE68A" opacity="0.55"/>
+    <!-- glint -->
+    <rect x="-52" y="-56" width="26" height="10" rx="5" fill="#FFFFFF" opacity="0.85"
+          transform="rotate(-38 -39 -51)"/>
+  </g>
+</svg>

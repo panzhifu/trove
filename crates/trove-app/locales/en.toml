@@ -73,6 +73,7 @@ color = "Color"
 no_color = "No color"
 
 [workspace]
+pick_color_search = "Pick a colour to search"
 reveal_not_in_view = "Selected — this asset is not in the current view."
 grid_zoom = "Zoom the asset grid"
 search = "Search"
@@ -144,6 +145,7 @@ copy_image = "Copy Image"
 batch_convert = "Batch Convert…"
 
 [inspector]
+pick_color = "Pick a colour to search"
 nothing_selected = "Nothing selected."
 asset_missing = "Asset no longer exists."
 tags = "Tags"
@@ -489,6 +491,7 @@ Workspace = "Workspace"
 global = "Global"
 
 [sysfonts]
+scanning = "Scanning system fonts…"
 title = "System fonts"
 filter = "Filter by family or style…"
 no_match = "No fonts match the filter."
@@ -501,3 +504,10 @@ import_started = "Import started"
 uninstalled = "Uninstalled %{family}"
 no_style = "Regular"
 system_note = "System-owned"
+
+[color_picker]
+basic = "Basic colours"
+common = "Common colours"
+history = "Recent colours"
+reset = "Clear"
+confirm = "OK"

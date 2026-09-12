@@ -10,7 +10,8 @@ use super::*;
 /// heart toggle and a clear button when anything is active. The filters
 /// compose with every view (collection, search, smart collection) and are
 /// also how the favorites view is entered.
-pub(super) fn filter_controls(controller: &Entity<LibraryController>, cx: &App) -> Div {
+/// The icon cluster for the panel title bar: view toggle, sort, favorites.
+pub(super) fn title_controls(controller: &Entity<LibraryController>, cx: &App) -> Div {
     let (kind, favorite, view_mode, sort, sort_desc) = {
         let ctl = controller.read(cx);
         (
@@ -89,56 +90,6 @@ pub(super) fn filter_controls(controller: &Entity<LibraryController>, cx: &App) 
                                 move |_, _, cx| {
                                     controller.update(cx, |ctl, cx| {
                                         ctl.set_sort(value, desc);
-                                        cx.notify();
-                                    });
-                                },
-                            ));
-                    }
-                    menu
-                }
-            }),
-    );
-
-    // Kind dropdown: label shows the active kind, "all" when unset.
-    let kind_label = match kind {
-        Some(k) => t(kind_key(k)),
-        None => t("workspace.filter_all_kinds"),
-    };
-    let options: Vec<(Option<AssetKind>, String)> =
-        std::iter::once((None, t("workspace.filter_all_kinds")))
-            .chain(
-                [
-                    AssetKind::Image,
-                    AssetKind::Video,
-                    AssetKind::Audio,
-                    AssetKind::Document,
-                    AssetKind::Archive,
-                    AssetKind::Font,
-                    AssetKind::Model,
-                    AssetKind::Other,
-                ]
-                .into_iter()
-                .map(|k| (Some(k), t(kind_key(k)))),
-            )
-            .collect();
-    bar = bar.child(
-        Button::new("filter-kind")
-            .xsmall()
-            .outline()
-            .label(kind_label)
-            .dropdown_menu_with_anchor(Anchor::TopLeft, {
-                let controller = controller.clone();
-                move |menu, _, _| {
-                    let mut menu = menu.min_w(px(150.));
-                    for (value, label) in &options {
-                        let checked = *value == kind;
-                        let value = *value;
-                        let controller = controller.clone();
-                        menu =
-                            menu.item(PopupMenuItem::new(label.clone()).checked(checked).on_click(
-                                move |_, _, cx| {
-                                    controller.update(cx, |ctl, cx| {
-                                        ctl.set_filter_kind(value);
                                         cx.notify();
                                     });
                                 },
@@ -400,4 +351,60 @@ pub(super) fn selection_toolbar(
         .flex()
         .justify_center()
         .child(bar)
+}
+
+/// The 全部类型 dropdown for the in-panel toolbar row (kind filter only —
+/// the rest of the controls live in the panel title bar).
+pub(super) fn kind_filter(controller: &Entity<LibraryController>, cx: &App) -> Div {
+    let kind = controller.read(cx).filter_kind;
+    let t = |k: &str| rust_i18n::t!(k).to_string();
+
+    let kind_label = match kind {
+        Some(k) => t(kind_key(k)),
+        None => t("workspace.filter_all_kinds"),
+    };
+    let options: Vec<(Option<AssetKind>, String)> =
+        std::iter::once((None, t("workspace.filter_all_kinds")))
+            .chain(
+                [
+                    AssetKind::Image,
+                    AssetKind::Video,
+                    AssetKind::Audio,
+                    AssetKind::Document,
+                    AssetKind::Archive,
+                    AssetKind::Font,
+                    AssetKind::Model,
+                    AssetKind::Other,
+                ]
+                .into_iter()
+                .map(|k| (Some(k), t(kind_key(k)))),
+            )
+            .collect();
+    h_flex().items_center().child(
+        Button::new("filter-kind")
+            .xsmall()
+            .outline()
+            .label(kind_label)
+            .dropdown_menu_with_anchor(Anchor::TopLeft, {
+                let controller = controller.clone();
+                move |menu, _, _| {
+                    let mut menu = menu.min_w(px(150.));
+                    for (value, label) in &options {
+                        let checked = *value == kind;
+                        let value = *value;
+                        let controller = controller.clone();
+                        menu =
+                            menu.item(PopupMenuItem::new(label.clone()).checked(checked).on_click(
+                                move |_, _, cx| {
+                                    controller.update(cx, |ctl, cx| {
+                                        ctl.set_filter_kind(value);
+                                        cx.notify();
+                                    });
+                                },
+                            ));
+                    }
+                    menu
+                }
+            }),
+    )
 }

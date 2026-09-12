@@ -162,10 +162,22 @@ impl WorkspacePanel {
         });
         cx.subscribe_in(&zoom_slider, window, Self::on_zoom_slider)
             .detach();
+        let color_picker = cx.new(|cx| ColorPickerState::new(None, window, cx));
+        cx.subscribe(
+            &color_picker.clone(),
+            |this, _, picked: &ColorPicked, cx| {
+                this.pending_color_search = Some(picked.0.clone());
+                cx.notify();
+            },
+        )
+        .detach();
         let this = Self {
             focus_handle: cx.focus_handle(),
             controller,
             search_box,
+            color_picker,
+            color_picker_open: std::cell::Cell::new(false),
+            pending_color_search: None,
             available_width,
             rows: Rc::new(Vec::new()),
             list_state,
@@ -176,8 +188,8 @@ impl WorkspacePanel {
             last_total: 0,
             relayout_pending: false,
             debounce_timer: None,
-            viewport: None,
-            viewport_subscription: None,
+            preview: None,
+            preview_subscription: None,
         };
         observe_controller(cx, &this.controller);
         this
