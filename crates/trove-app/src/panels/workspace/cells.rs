@@ -115,6 +115,27 @@ pub(super) fn build_cell_element(
         })
     });
 
+    // Drag the cell out of the window: promote the in-app drag to a native
+    // file drag handed to the OS (droppable into editors, chats, file
+    // managers). Stored assets first get their named working copy
+    // (open_with), so the receiver sees `photo.jpg`, not a content hash.
+    // Must be registered AFTER on_drag with the same payload type.
+    let base = base.external_drag_payload({
+        let controller = controller.clone();
+        move |_: &AssetsDrag, _, cx| {
+            let target = {
+                let ctl = controller.read(cx);
+                crate::library::open_with::target(ctl, id)
+            };
+            target.and_then(|target| {
+                crate::library::open_with::publish(&target).ok()?;
+                Some(gpui_kit::ExternalDragPayload::Files(
+                    gpui_kit::FileDragPaths::new([(target.path, false)]),
+                ))
+            })
+        }
+    });
+
     let ctl_menu = controller.clone();
     base.context_menu(move |menu, window, cx| {
         asset_context_menu(menu, window, cx, &ctl_menu, id, trashed)
@@ -265,6 +286,27 @@ pub(super) fn build_list_row_element(
         })
     });
 
+    // Drag the cell out of the window: promote the in-app drag to a native
+    // file drag handed to the OS (droppable into editors, chats, file
+    // managers). Stored assets first get their named working copy
+    // (open_with), so the receiver sees `photo.jpg`, not a content hash.
+    // Must be registered AFTER on_drag with the same payload type.
+    let base = base.external_drag_payload({
+        let controller = controller.clone();
+        move |_: &AssetsDrag, _, cx| {
+            let target = {
+                let ctl = controller.read(cx);
+                crate::library::open_with::target(ctl, id)
+            };
+            target.and_then(|target| {
+                crate::library::open_with::publish(&target).ok()?;
+                Some(gpui_kit::ExternalDragPayload::Files(
+                    gpui_kit::FileDragPaths::new([(target.path, false)]),
+                ))
+            })
+        }
+    });
+
     let ctl_menu = controller.clone();
     base.context_menu(move |menu, window, cx| {
         asset_context_menu(menu, window, cx, &ctl_menu, id, trashed)
@@ -279,7 +321,7 @@ pub(super) fn build_list_row_element(
 ///
 /// `None` for any other kind, for an asset the library no longer has, and for
 /// a linked model whose source has gone missing — in every one of those cases
-/// the caller falls back to the ordinary preview dialog.
+/// the caller falls back to the full-size asset preview.
 pub(super) fn model_source(controller: &LibraryController, id: Uuid) -> Option<(String, PathBuf)> {
     use trove_core::model::Origin;
 

@@ -1,7 +1,18 @@
-//! Silent video playback for the preview dialog.
+//! Video preview: a live silent player on the main area, the cover
+//! thumbnail in the inspector.
 //!
-//! Frames come from an ffmpeg pipe (see `trove_core::media::video`), one at a
-//! time: the player keeps a single decoded frame alive and hands the previous
+//! The player is an entity — frames come off an ffmpeg pipe (see
+//! `trove_core::media::video`) one at a time on a background task, so the
+//! main-area host spawns it exactly once at open (never per render)
+//! through [`spawn_player`]. When ffmpeg is missing or the file cannot be
+//! probed it returns `None`, and the host falls back to the still, the
+//! same picture [`cover`] shows in the inspector.
+//!
+//! The cover is deliberate, not a limitation: the inspector card is small
+//! and a playing video there would fight the panel's edit controls, so
+//! the card shows the thumbnail the import pipeline extracted.
+//!
+//! The player keeps a single decoded frame alive and hands the previous
 //! one back to the window before painting the next, because gpui's sprite
 //! atlas never evicts entries by itself. Playback is muted — there is no
 //! audio pipeline, and the preview is about looking, not listening.
@@ -15,15 +26,43 @@ use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::slider::{Slider, SliderEvent, SliderState};
 use gpui_kit::component::{ActiveTheme, IconName, Sizable};
 use gpui_kit::*;
-
 use trove_core::media::video::{self, FramePipe, VideoStreamFacts};
+use trove_core::model::AssetKind;
+
+use super::{fallback, AssetPreviewData};
 
 /// How long the decode loop sleeps while paused before looking again.
 const IDLE_POLL: Duration = Duration::from_millis(120);
 
+/// Spawn the live player for `data`, or `None` when the kind is not video,
+/// ffmpeg is unavailable, or the file cannot be probed.
+pub(super) fn spawn_player(data: &AssetPreviewData, cx: &mut App) -> Option<Entity<VideoPlayer>> {
+    if data.kind != AssetKind::Video {
+        return None;
+    }
+    if !trove_core::media::video::ffmpeg_available() {
+        return None;
+    }
+    VideoPlayer::spawn(data.original.as_ref()?.clone(), cx)
+}
+
+/// The cover: the library thumbnail at the inspector card's aspect height,
+/// falling back to the kind icon when no thumbnail exists.
+pub(super) fn cover(data: &AssetPreviewData, cx: &App) -> AnyElement {
+    let height = data.card_height();
+    match &data.thumb {
+        Some(path) => img(path.clone())
+            .w_full()
+            .h(px(height))
+            .object_fit(ObjectFit::Contain)
+            .into_any_element(),
+        None => fallback::icon_card(data.kind, cx),
+    }
+}
+
 /// A silent video player: a frame piped out of ffmpeg plus transport
 /// controls. Dropping the entity ends the loop, which kills ffmpeg.
-pub struct VideoPlayer {
+pub(super) struct VideoPlayer {
     path: PathBuf,
     facts: VideoStreamFacts,
     /// Frame decoded by the background loop, waiting for its first paint.
@@ -42,7 +81,7 @@ pub struct VideoPlayer {
 impl VideoPlayer {
     /// Build a player entity for `path`, or `None` when the file cannot be
     /// probed (caller keeps showing the static poster).
-    pub fn spawn(path: PathBuf, cx: &mut App) -> Option<Entity<Self>> {
+    fn spawn(path: PathBuf, cx: &mut App) -> Option<Entity<Self>> {
         let facts = video::probe(&path)?;
         Some(cx.new(|cx| Self::with_facts(path, facts, cx)))
     }
@@ -78,7 +117,7 @@ impl VideoPlayer {
 
     /// The decode/playback loop: reads one frame per `frame_ms`, advances the
     /// playhead and loops at the end of the stream. Exits as soon as the
-    /// entity is dropped (dialog closed).
+    /// entity is dropped (the preview closed).
     fn start_decoding(&mut self, cx: &mut Context<Self>) {
         let path = self.path.clone();
         let frame_ms = self.facts.frame_ms();
@@ -192,15 +231,15 @@ impl VideoPlayer {
     }
 
     /// The frame element: the current frame, or a dark placeholder until the
-    /// first one arrives.
+    /// first one arrives. Fills whatever container hosts the player.
     fn frame_element(&self) -> AnyElement {
         match &self.shown {
             Some(frame) => img(ImageSource::Render(frame.clone()))
-                .max_h(px(480.))
-                .max_w(px(700.))
+                .max_h_full()
+                .max_w_full()
                 .object_fit(ObjectFit::Contain)
                 .into_any_element(),
-            None => div().h(px(320.)).w(px(560.)).into_any_element(),
+            None => div().h_full().w_full().into_any_element(),
         }
     }
 
@@ -237,6 +276,19 @@ impl VideoPlayer {
                     )),
             )
     }
+
+    /// Hand the decoded frames back to the window before the entity is
+    /// dropped — gpui's sprite atlas never evicts on its own, so simply
+    /// dropping the player would leave the last frame resident. Same
+    /// contract as the 3D viewport's `release`.
+    pub(super) fn release(&mut self, window: &mut Window) {
+        if let Some(frame) = self.pending.take() {
+            let _ = window.drop_image(frame);
+        }
+        if let Some(frame) = self.shown.take() {
+            let _ = window.drop_image(frame);
+        }
+    }
 }
 
 impl Render for VideoPlayer {
@@ -254,12 +306,18 @@ impl Render for VideoPlayer {
         let position = self.position_ms as f32;
         self.slider
             .update(cx, |slider, cx| slider.set_value(position, window, cx));
+        // Fill the hosting stage: the frame takes all the height the
+        // transport controls leave, and the picture contains itself inside.
         v_flex()
-            .gap_2()
+            .flex_1()
+            .min_h_0()
             .w_full()
+            .gap_2()
             .items_center()
             .child(
                 div()
+                    .flex_1()
+                    .min_h_0()
                     .w_full()
                     .flex()
                     .items_center()

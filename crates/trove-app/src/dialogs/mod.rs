@@ -3,7 +3,6 @@
 
 pub mod convert;
 pub mod duplicates;
-pub mod preview;
 pub mod rename;
 pub mod rules;
 pub mod settings;

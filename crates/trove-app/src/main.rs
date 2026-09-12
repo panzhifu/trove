@@ -14,6 +14,7 @@ use gpui_kit::component::Root;
 use gpui_kit::*;
 
 mod app;
+mod components;
 mod dialogs;
 mod fonts;
 mod library;

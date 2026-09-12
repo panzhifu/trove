@@ -21,30 +21,38 @@ use trove_core::services::font_manager::{self, SystemFont};
 /// the browser dialog. Name-table parsing costs a few ms per file, so the
 /// scan must not run on the UI thread.
 pub(crate) fn open(controller: &Entity<LibraryController>, window: &mut Window, cx: &mut App) {
+    // Open instantly with a scanning placeholder; the background scan fills
+    // the shared list in place and refreshes the window when done.
+    let fonts: Rc<RefCellState> = Rc::new(std::cell::RefCell::new(None));
+    show_dialog(fonts.clone(), controller, window, cx);
+
     let scan = cx
         .background_executor()
         .spawn(async move { font_manager::scan_system_fonts() });
     let handle = window.window_handle();
-    let controller = controller.clone();
     cx.spawn(async move |cx| {
-        let fonts = scan.await;
-        let _ = handle.update(cx, |_, window, cx| {
-            show_dialog(fonts, &controller, window, cx);
+        let scanned = scan.await;
+        let _ = handle.update(cx, |_, _, cx| {
+            *fonts.borrow_mut() = Some(scanned);
+            cx.refresh_windows();
         });
     })
     .detach();
 }
 
+/// Shared, fill-later scan result. `None` while the background scan runs.
+type RefCellState = std::cell::RefCell<Option<Vec<SystemFont>>>;
+
 /// The results dialog. The list lives in an `Rc<RefCell>` so the uninstall
 /// buttons can drop rows from the still-rendered dialog.
 fn show_dialog(
-    fonts: Vec<SystemFont>,
+    fonts: Rc<RefCellState>,
     controller: &Entity<LibraryController>,
     window: &mut Window,
     cx: &mut App,
 ) {
-    let list = Rc::new(std::cell::RefCell::new(fonts));
-    let total = list.borrow().len();
+    let list = fonts;
+    let total = list.borrow().as_ref().map(Vec::len).unwrap_or(0);
     // Every rendered row decodes and registers its font file with the text
     // system on first paint, so an unfiltered library (hundreds of files)
     // must not render whole — the filter input keeps the row count bounded.
@@ -54,7 +62,9 @@ fn show_dialog(
     let controller = controller.clone();
     window.open_dialog(cx, move |dialog, _window, cx| {
         let query = filter.read(cx).value().to_lowercase();
-        let all = list.borrow();
+        let guard = list.borrow();
+        let empty_scan = guard.is_none();
+        let all: &[SystemFont] = guard.as_deref().unwrap_or(&[]);
         let matched_len = all
             .iter()
             .filter(|font| {
@@ -79,9 +89,17 @@ fn show_dialog(
             .take(RENDER_CAP)
             .cloned()
             .collect();
-        drop(all);
-
-        let body = if total == 0 {
+        let body = if empty_scan {
+            div()
+                .flex_1()
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_sm()
+                .text_color(cx.theme().muted_foreground)
+                .child(rust_i18n::t!("sysfonts.scanning").to_string())
+                .into_any_element()
+        } else if total == 0 {
             div()
                 .flex_1()
                 .flex()
@@ -158,7 +176,7 @@ fn show_dialog(
 /// path, then uninstall (user fonts only) and import buttons.
 fn font_row(
     font: &SystemFont,
-    list: &Rc<std::cell::RefCell<Vec<SystemFont>>>,
+    list: &Rc<RefCellState>,
     controller: &Entity<LibraryController>,
     cx: &mut App,
 ) -> AnyElement {
@@ -167,11 +185,10 @@ fn font_row(
     let path = font.path.clone();
     let writable = font.writable;
 
-    // Registering is idempotent per family; the preview falls back to the
-    // default face when the file cannot be parsed as a font.
-    if !crate::panels::common::ensure_font_registered(&family, Some(&path), cx) {
-        // fall through with the default font preview
-    }
+    // No add_fonts() here: these fonts are installed by definition, so the
+    // platform's own font source (fontconfig / DirectWrite / CoreText)
+    // resolves them by family name. Registering each row's file on the main
+    // thread was what made the dialog jank — one full read + parse per row.
     let preview = crate::panels::common::font_live_preview(&family, cx)
         .w(px(120.))
         .h(px(40.))
@@ -266,9 +283,9 @@ fn font_row(
                             .on_click(move |_, _window, cx| {
                                 match font_manager::uninstall_system_font(&path_uninstall) {
                                     Ok(()) => {
-                                        list_uninstall
-                                            .borrow_mut()
-                                            .retain(|f| f.path != path_uninstall);
+                                        if let Some(fonts) = list_uninstall.borrow_mut().as_mut() {
+                                            fonts.retain(|f| f.path != path_uninstall);
+                                        }
                                         controller_uninstall.update(cx, |ctl, cx| {
                                             ctl.notice = Some(
                                                 rust_i18n::t!(

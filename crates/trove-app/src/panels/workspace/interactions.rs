@@ -1,7 +1,7 @@
-//! Panel interactions: keyboard selection movement, the 3D model
-//! viewport lifecycle, trash/history actions and smart-collection
-//! creation. Methods on [`WorkspacePanel`]; they run from the
-//! action handlers in `mod.rs` and the title-bar buttons.
+//! Panel interactions: keyboard selection movement, the main-area
+//! preview lifecycle (3D viewport + full-size asset preview), trash/history
+//! actions and smart-collection creation. Methods on [`WorkspacePanel`];
+//! they run from the action handlers in `mod.rs` and the title-bar buttons.
 
 use super::*;
 
@@ -232,24 +232,26 @@ impl WorkspacePanel {
         self.list_state.scroll_to_reveal_item(row_ix);
     }
 
-    /// Enter: open a large preview of the primary selected asset. A 3D model
-    /// takes over the main area with the interactive viewport; everything
-    /// else opens the standalone `dialogs::preview` component.
+    /// Enter: preview the primary selected asset full-size in the main
+    /// area. A 3D model takes over the main area with the interactive
+    /// viewport; everything else shows the full-size still, live video or
+    /// large font specimen from `components::preview`.
     pub(super) fn open_preview(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(id) = self.controller.read(cx).primary() else {
             return;
         };
         // A mesh is worth more than a picture of a mesh: the viewport lets it
-        // be turned and zoomed, and a dialog is no way to look at one.
+        // be turned and zoomed, and a static picture is no way to look at one.
         if let Some((name, path)) = model_source(self.controller.read(cx), id) {
-            self.open_viewport(name, path, window, cx);
+            self.open_model_preview(name, path, window, cx);
             return;
         }
-        crate::dialogs::preview::open_asset_preview(&self.controller, id, window, cx);
+        self.open_asset_preview(id, window, cx);
     }
 
-    /// Show `path` in the main-area viewport, replacing whatever was there.
-    fn open_viewport(
+    /// Show a 3D model in the main-area viewport, replacing whatever was
+    /// there.
+    fn open_model_preview(
         &mut self,
         name: String,
         path: PathBuf,
@@ -259,33 +261,51 @@ impl WorkspacePanel {
         let viewport = ModelViewport::spawn(name, path, cx);
         let subscription = cx.subscribe(&viewport, |this, _, event: &ModelViewportEvent, cx| {
             if *event == ModelViewportEvent::Closed {
-                this.forget_viewport(cx);
+                this.forget_preview(cx);
             }
         });
-        // Enter on another model while one is already showing: let the old
-        // viewport hand its frame back before it is dropped.
-        if let Some(previous) = self.viewport.replace(viewport) {
-            previous.update(cx, |viewport, _| viewport.release(window));
+        // Enter on another asset while one is already showing: let the old
+        // preview hand its frame back before it is dropped.
+        if let Some(previous) = self.preview.replace(MainPreview::Model(viewport)) {
+            previous.release(window, cx);
         }
-        self.viewport_subscription = Some(subscription);
+        self.preview_subscription = Some(subscription);
         cx.notify();
     }
 
-    /// Leave the viewport, giving its frame back to the window first.
-    pub(super) fn dismiss_viewport(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(viewport) = self.viewport.take() {
-            viewport.update(cx, |viewport, _| viewport.release(window));
-            self.viewport_subscription = None;
+    /// Show any non-model asset full-size in the main area, replacing
+    /// whatever was there. No-op when the asset no longer exists.
+    fn open_asset_preview(&mut self, id: Uuid, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(preview) = AssetPreviewPanel::spawn(&self.controller, id, cx) else {
+            return;
+        };
+        let subscription = cx.subscribe(&preview, |this, _, event: &AssetPreviewEvent, cx| {
+            if *event == AssetPreviewEvent::Closed {
+                this.forget_preview(cx);
+            }
+        });
+        if let Some(previous) = self.preview.replace(MainPreview::Asset(preview)) {
+            previous.release(window, cx);
+        }
+        self.preview_subscription = Some(subscription);
+        cx.notify();
+    }
+
+    /// Leave the preview, giving its frame back to the window first.
+    pub(super) fn dismiss_preview(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(preview) = self.preview.take() {
+            preview.release(window, cx);
+            self.preview_subscription = None;
             cx.notify();
         }
     }
 
-    /// Drop the panel's handle on the viewport. The viewport itself has
-    /// already released its frame by the time it announces that it closed, so
-    /// this only has to forget it.
-    fn forget_viewport(&mut self, cx: &mut Context<Self>) {
-        if self.viewport.take().is_some() {
-            self.viewport_subscription = None;
+    /// Drop the panel's handle on the preview. The preview itself has
+    /// already released its frame by the time it announces that it closed,
+    /// so this only has to forget it.
+    fn forget_preview(&mut self, cx: &mut Context<Self>) {
+        if self.preview.take().is_some() {
+            self.preview_subscription = None;
             cx.notify();
         }
     }

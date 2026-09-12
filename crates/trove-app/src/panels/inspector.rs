@@ -20,9 +20,10 @@ use trove_core::model::{AssetKind, AssetPatch, MAX_RATING, Origin};
 use trove_core::store::{assets, tags};
 use uuid::Uuid;
 
+use crate::components::preview::{AssetPreviewData, PreviewContext};
 use crate::library::LibraryController;
 
-use super::common::{color_swatch, hex_to_rgb, human_bytes, kind_icon, observe_controller};
+use super::common::{color_swatch, hex_to_rgb, human_bytes, observe_controller};
 
 // ==================== Inspector: details + tags ==============================
 
@@ -334,11 +335,7 @@ impl Render for InspectorPanel {
             .as_deref()
             .map(|s| s.chars().take(12).collect())
             .unwrap_or_else(|| "—".into());
-        let thumb_path = asset
-            .sha256
-            .as_deref()
-            .map(|sha| trove_core::media::thumb::abs_path(ctl.library.root(), sha))
-            .filter(|p| p.is_file());
+        let library_root = ctl.library.root().to_path_buf();
         // The mined color palette (`dominant_color` + `dominant_colors`).
         let swatches: Vec<(u32, String)> = asset
             .extra
@@ -417,45 +414,40 @@ impl Render for InspectorPanel {
         // Re-populate the edit inputs when the selection changed.
         self.sync_editors(asset_id, window, cx);
 
-        // Preview container height based on image aspect ratio.
-        // Falls back to 200px if dimensions are unknown.
-        let preview_height = match (asset.width, asset.height) {
-            (Some(w), Some(h)) if w > 0 && h > 0 => {
-                let aspect = w as f32 / h as f32;
-                // Clamp to reasonable range: min 120px, max 360px.
-                (300.0 / aspect).clamp(120.0, 360.0)
-            }
-            _ => 200.0,
-        };
-
-        // Animated images (GIF / animated WebP / APNG) play from the
-        // original file; everything else uses the static thumbnail.
-        let animated =
-            super::common::animated_preview_source(Some(asset.mime.as_str()), disk_path.as_deref());
-        let preview: AnyElement = if let Some(source) = animated {
-            img(source)
-                .w_full()
-                .h(px(preview_height))
-                .object_fit(gpui_kit::ObjectFit::Contain)
-                .into_any_element()
-        } else {
-            match thumb_path {
-                Some(path) => img(path)
-                    .w_full()
-                    .h(px(preview_height))
-                    .object_fit(gpui_kit::ObjectFit::Contain)
-                    .into_any_element(),
-                None => v_flex()
-                    .w_full()
-                    .h(px(120.))
-                    .items_center()
-                    .justify_center()
-                    .bg(cx.theme().secondary)
+        // Preview element from the shared asset-preview component, in its
+        // compact inspector variant: videos show their cover thumbnail,
+        // animated images play, everything else falls back to the static
+        // thumbnail and then a kind icon.
+        let preview: AnyElement = AssetPreviewData::from_asset(&asset, &library_root)
+            .element(PreviewContext::Inspector, cx);
+        // Card frame per the reference layout: the image floats on the panel
+        // background with a format badge pinned to its top-left corner.
+        let preview = div()
+            .w_full()
+            .relative()
+            .rounded_lg()
+            .border_1()
+            .border_color(cx.theme().border)
+            .bg(cx.theme().secondary)
+            .overflow_hidden()
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(preview)
+            .child(
+                div()
+                    .absolute()
+                    .top_1p5()
+                    .left_1p5()
+                    .px_1p5()
+                    .py_px()
                     .rounded(cx.theme().radius)
-                    .child(Icon::new(kind_icon(kind)).size_10())
-                    .into_any_element(),
-            }
-        };
+                    .bg(gpui_kit::black().opacity(0.55))
+                    .text_size(px(10.0))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(gpui_kit::white())
+                    .child(asset.ext.to_uppercase()),
+            );
 
         let edit_label = |key: &'static str| {
             div()
@@ -619,48 +611,15 @@ impl Render for InspectorPanel {
                 )
             });
 
-        let mut content = v_flex()
-            .p_3()
-            .gap_2()
-            .w_full()
-            .child(
-                // Preview: dynamic height based on aspect ratio, fills width.
-                div()
-                    .w_full()
-                    .h(px(preview_height))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .rounded(cx.theme().radius)
-                    .overflow_hidden()
-                    .child(preview),
-            )
-            .child(self.collapsible_section(
-                "edit",
-                rust_i18n::t!("inspector.edit").to_string(),
-                cx,
-                edit_content,
-            ))
-            .child(self.collapsible_section(
-                "tags",
-                rust_i18n::t!("inspector.tags").to_string(),
-                cx,
-                tags_content,
-            ))
-            .child(self.collapsible_section(
-                "properties",
-                rust_i18n::t!("inspector.properties").to_string(),
-                cx,
-                props_content,
-            ));
-
-        if !swatches.is_empty() {
+        // Colors sit directly under the preview as a centred row of round
+        // dots (right-click a dot: same-colour search / copy hex).
+        let colors_section = (!swatches.is_empty()).then(|| {
             let controller = self.controller.clone();
             let colors_content =
                 h_flex()
+                    .justify_center()
                     .flex_wrap()
-                    .gap_1p5()
-                    .px_1()
+                    .gap_2()
                     .children(swatches.iter().map(|(_rgb, hex)| {
                         let hex = hex.clone();
                         let menu_controller = controller.clone();
@@ -710,13 +669,47 @@ impl Render for InspectorPanel {
                                 |_, _, _| {},
                             ))
                     }));
-            content = content.child(self.collapsible_section(
+            self.collapsible_section(
                 "colors",
                 rust_i18n::t!("inspector.colors").to_string(),
                 cx,
                 colors_content,
-            ));
+            )
+        });
+
+        let mut content = v_flex().p_3().gap_2().w_full().child(
+            // Preview card: the shared element sizes itself by the asset's
+            // aspect ratio.
+            div()
+                .w_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .overflow_hidden()
+                .child(preview),
+        );
+        if let Some(colors_section) = colors_section {
+            content = content.child(colors_section);
         }
+        content = content
+            .child(self.collapsible_section(
+                "edit",
+                rust_i18n::t!("inspector.edit").to_string(),
+                cx,
+                edit_content,
+            ))
+            .child(self.collapsible_section(
+                "tags",
+                rust_i18n::t!("inspector.tags").to_string(),
+                cx,
+                tags_content,
+            ))
+            .child(self.collapsible_section(
+                "properties",
+                rust_i18n::t!("inspector.properties").to_string(),
+                cx,
+                props_content,
+            ));
 
         if kind == AssetKind::Font {
             let font_content = self.font_section(

@@ -72,6 +72,7 @@ color = "颜色"
 no_color = "无颜色"
 
 [workspace]
+pick_color_search = "取色搜图"
 reveal_not_in_view = "已选中——该资产不在当前视图中。"
 grid_zoom = "缩放资产网格大小"
 search = "搜索"
@@ -143,6 +144,7 @@ copy_image = "复制图片"
 batch_convert = "批量转换格式…"
 
 [inspector]
+pick_color = "取色搜图"
 nothing_selected = "未选中资产。"
 asset_missing = "资产已不存在。"
 tags = "标签"
@@ -486,6 +488,7 @@ Workspace = "工作区"
 global = "全局"
 
 [sysfonts]
+scanning = "正在扫描系统字体…"
 title = "系统字体"
 filter = "按字体族或样式筛选…"
 no_match = "没有匹配筛选条件的字体。"
@@ -498,3 +501,10 @@ import_started = "已开始导入"
 uninstalled = "已卸载 %{family}"
 no_style = "常规"
 system_note = "系统自带"
+
+[color_picker]
+basic = "Basic colours"
+common = "Common colours"
+history = "Recent colours"
+reset = "Clear"
+confirm = "OK"

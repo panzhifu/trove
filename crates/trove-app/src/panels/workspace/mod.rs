@@ -26,6 +26,8 @@ use gpui_kit::*;
 // The `gpui_kit::*` glob above re-exports everything from gpui, but the grid
 // needs the virtualized `list` element under a distinct name: a local
 // `Vec<Asset>` variable called `list` would otherwise shadow it.
+use crate::panels::color_picker::{ColorPicked, ColorPickerState, picker_panel};
+use gpui_kit::component::popover::Popover;
 use gpui_kit::component::slider::{Slider, SliderEvent, SliderState};
 use gpui_kit::list as list_element;
 use gpui_kit::{Anchor, Bounds, ListOffset, Pixels};
@@ -43,7 +45,9 @@ use trove_core::store::{assets, collections, smart_collections};
 use uuid::Uuid;
 
 use crate::app::actions::{ClearSelection, MoveDown, MoveLeft, MoveRight, MoveUp, OpenPreview};
-use crate::library::viewport3d::{ModelViewport, ModelViewportEvent};
+use crate::components::preview::{
+    AssetPreviewEvent, AssetPreviewPanel, ModelViewport, ModelViewportEvent,
+};
 use crate::library::{GRID_PAGE_SIZE, LibraryController, ViewMode};
 
 use crate::panels::workspace_context_menu::AssetsDragPreview;
@@ -62,7 +66,7 @@ use data::{Cell, DataKey, Direction, Row, TIMELINE_HEADER_HEIGHT, ViewData, View
 use rows::{
     materialize_rows, next_cell_row, prev_cell_row, refill_rows, timeline_header, timeline_rows,
 };
-use toolbar::{filter_controls, kind_key, selection_toolbar};
+use toolbar::{kind_filter, kind_key, selection_toolbar, title_controls};
 
 /// Fallback layout width before the container has been measured once
 /// (assumes a ~1024px window minus the two side docks).
@@ -76,11 +80,41 @@ const PAGE_TRIGGER_ROWS: usize = 3;
 
 // ======================== Center: thumbnail grid =============================
 
+/// What fills the main area while a preview is open: the interactive 3D
+/// viewport for models, or the full-size still / live player for every
+/// other kind.
+#[derive(Clone)]
+enum MainPreview {
+    Model(Entity<ModelViewport>),
+    Asset(Entity<AssetPreviewPanel>),
+}
+
+impl MainPreview {
+    /// Hand the preview's frames back to the window before it is dropped —
+    /// gpui's sprite atlas never evicts on its own.
+    fn release(&self, window: &mut Window, cx: &mut App) {
+        match self {
+            MainPreview::Model(viewport) => {
+                viewport.update(cx, |viewport, _| viewport.release(window));
+            }
+            MainPreview::Asset(preview) => {
+                preview.update(cx, |preview, cx| preview.release(window, cx));
+            }
+        }
+    }
+}
+
 pub struct WorkspacePanel {
     focus_handle: FocusHandle,
     controller: Entity<LibraryController>,
     /// Self-contained floating search (trigger + popover + input).
     search_box: Entity<SearchBox>,
+    /// Custom-colour picker state (popover in the toolbar row).
+    color_picker: Entity<ColorPickerState>,
+    /// Whether the picker popover is showing.
+    color_picker_open: std::cell::Cell<bool>,
+    /// A colour confirmed in the picker; consumed by the next render.
+    pending_color_search: Option<String>,
     /// Measured available width of the scroll container, updated each
     /// prepaint so the layout tracks the real panel width.
     available_width: Entity<Pixels>,
@@ -106,12 +140,12 @@ pub struct WorkspacePanel {
     relayout_pending: bool,
     /// Debounce timer handle.
     debounce_timer: Option<gpui::Task<()>>,
-    /// Open 3D viewport. While this is set the main area shows the model and
-    /// the grid is not built at all — the other assets are hidden, which is
-    /// the whole point of previewing one full-size.
-    viewport: Option<Entity<ModelViewport>>,
-    /// Kept so the viewport's close event stops arriving when it is dropped.
-    viewport_subscription: Option<Subscription>,
+    /// Open main-area preview. While this is set the main area shows the
+    /// previewed asset and the grid is not built at all — the other assets
+    /// are hidden, which is the whole point of previewing one full-size.
+    preview: Option<MainPreview>,
+    /// Kept so the preview's close event stops arriving when it is dropped.
+    preview_subscription: Option<Subscription>,
 }
 
 impl WorkspacePanel {
@@ -164,10 +198,7 @@ impl DockPanel for WorkspacePanel {
         None
     }
 
-    /// Trailing edge of the title bar: a search icon in normal mode, an
-    /// "Empty all" button in trash mode, and the clear-search button (×)
-    /// when a search is active. This hook renders outside the title's
-    /// `overflow_hidden` container, so the buttons are always visible.
+    /// The panel title bar: item count, zoom, view/sort/favourites, search.
     fn title_suffix(
         &mut self,
         _window: &mut Window,
@@ -176,98 +207,177 @@ impl DockPanel for WorkspacePanel {
         let ctl = self.controller.read(cx);
         let in_trash = ctl.showing_trash;
         let in_recent = ctl.showing_recent;
-        let search_active = !in_trash && !in_recent && !ctl.search_text.trim().is_empty();
         let loaded = ctl.grid_loaded.min(self.last_total);
         let total = self.last_total;
-        let _ = ctl;
-        // Item count for the browsed view; the heading text itself lives in
-        // the dock title, so only the counter sits beside the buttons here.
-        let count_label = div()
-            .text_xs()
-            .text_color(cx.theme().muted_foreground)
-            .child(if loaded < total {
-                rust_i18n::t!("workspace.scroll_hint", loaded = loaded, total = total).to_string()
-            } else if total == 1 {
-                rust_i18n::t!("workspace.item_one").to_string()
-            } else {
-                rust_i18n::t!("workspace.items_many", count = total).to_string()
-            });
         let controller = self.controller.clone();
-        // Live slider position (the committed scale only changes on
-        // release); hidden while it already sits at the default.
         let slider_value = self.zoom_slider.read(cx).value().start();
-        let zoom_label = format!("{:>3.0}%", (slider_value * 100.0).round());
-        Some(
-            h_flex()
-                .items_center()
-                .gap_1()
-                .child(count_label)
-                .when(!in_trash && !in_recent, |this| {
-                    this.child(
-                        div()
-                            .id("grid-zoom")
-                            .flex_none()
-                            .w(px(96.))
-                            .px_1()
-                            .tooltip(move |window, cx| {
-                                gpui_kit::component::tooltip::Tooltip::new(SharedString::from(
-                                    rust_i18n::t!("workspace.grid_zoom").to_string(),
-                                ))
-                                .build(window, cx)
-                            })
-                            .child(Slider::new(&self.zoom_slider)),
-                    )
-                    .child(
-                        div()
-                            .text_xs()
-                            .w(px(34.))
-                            .text_color(cx.theme().muted_foreground)
-                            .child(zoom_label),
-                    )
-                    // Self-contained floating search: trigger + popover +
-                    // input + inline ✕ all live in `SearchBox`.
-                    .child(filter_controls(&controller, cx))
-                    .child(self.search_box.clone())
-                })
-                .when(in_trash, |this| {
-                    this.child(
-                        Button::new("empty-trash")
-                            .ghost()
-                            .danger()
-                            .xsmall()
-                            .label(rust_i18n::t!("workspace.empty_all").to_string())
-                            .tooltip(rust_i18n::t!("workspace.empty_all_tooltip").to_string())
-                            .on_click(cx.listener(|this, _, _, cx| this.empty_trash(cx))),
-                    )
-                })
-                .when(in_recent, |this| {
-                    this.child(
-                        Button::new("clear-history")
-                            .ghost()
-                            .danger()
-                            .xsmall()
-                            .label(rust_i18n::t!("workspace.clear_history").to_string())
-                            .tooltip(rust_i18n::t!("workspace.clear_history_tooltip").to_string())
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.clear_view_history(cx);
-                            })),
-                    )
-                })
-                .when(search_active, |this| {
-                    this.child(
-                        Button::new("save-smart")
-                            .ghost()
-                            .xsmall()
-                            .icon(IconName::Plus)
-                            .tooltip(rust_i18n::t!("workspace.save_as_smart").to_string())
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.save_search_as_smart(window, cx);
-                            })),
-                    )
-                }),
-        )
+        let zoom_label = format!("{:.0}%", (slider_value * 100.0).round());
+        let count_label = if loaded < total {
+            rust_i18n::t!("workspace.scroll_hint", loaded = loaded, total = total).to_string()
+        } else if total == 1 {
+            rust_i18n::t!("workspace.item_one").to_string()
+        } else {
+            rust_i18n::t!("workspace.items_many", count = total).to_string()
+        };
+        let mut row = h_flex()
+            .items_center()
+            .gap_1()
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(count_label),
+            )
+            .child(
+                div()
+                    .id("grid-zoom")
+                    .flex_none()
+                    .w(px(96.0))
+                    .px_1()
+                    .child(Slider::new(&self.zoom_slider)),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .w(px(34.0))
+                    .text_color(cx.theme().muted_foreground)
+                    .child(zoom_label),
+            )
+            .child(title_controls(&controller, cx))
+            .child(self.search_box.clone());
+        if in_trash || in_recent {
+            // Zoom has no effect in list view contexts of trash/recent? It
+            // still does (grid layout), so keep everything; only these two
+            // contextual actions differ.
+            let action = if in_trash {
+                Button::new("empty-trash")
+                    .ghost()
+                    .danger()
+                    .xsmall()
+                    .label(rust_i18n::t!("workspace.empty_all").to_string())
+                    .tooltip(rust_i18n::t!("workspace.empty_all_tooltip").to_string())
+                    .on_click(cx.listener(|this, _, _, cx| this.empty_trash(cx)))
+            } else {
+                Button::new("clear-history")
+                    .ghost()
+                    .danger()
+                    .xsmall()
+                    .label(rust_i18n::t!("workspace.clear_history").to_string())
+                    .tooltip(rust_i18n::t!("workspace.clear_history_tooltip").to_string())
+                    .on_click(cx.listener(|this, _, _, cx| this.clear_view_history(cx)))
+            };
+            row = row.child(action);
+        }
+        Some(row)
     }
 }
+
+impl WorkspacePanel {
+    /// The in-panel toolbar row below the title bar: the kind filter, the
+    /// colour picker (colour search), and the contextual actions.
+    fn toolbar_row(&mut self, cx: &mut Context<Self>) -> Div {
+        let ctl = self.controller.read(cx);
+        let in_trash = ctl.showing_trash;
+        let in_recent = ctl.showing_recent;
+        let search_active = !in_trash && !in_recent && !ctl.search_text.trim().is_empty();
+        let controller = self.controller.clone();
+        let color_picker = self.color_picker.clone();
+        let picker_open = self.color_picker_open.clone();
+        h_flex()
+            .w_full()
+            .items_center()
+            .gap_1()
+            // Kind filter stays on the left of the row.
+            .child(kind_filter(&controller, cx))
+            .when(!in_trash && !in_recent, |row| {
+                // Custom-colour picker: confirm opens a colour search.
+                row.child(
+                    div()
+                        .id("color-picker-trigger")
+                        .size_5()
+                        .rounded_sm()
+                        .border_1()
+                        .border_color(cx.theme().border)
+                        .bg(cx.theme().secondary)
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .text_color(cx.theme().muted_foreground)
+                        .cursor_pointer()
+                        .hover(|this| this.text_color(cx.theme().foreground))
+                        .on_click({
+                            let picker_open = picker_open.clone();
+                            move |_, _, cx| {
+                                picker_open.set(!picker_open.get());
+                                cx.refresh_windows();
+                            }
+                        })
+                        .tooltip(move |window, cx| {
+                            gpui_kit::component::tooltip::Tooltip::new(SharedString::from(
+                                rust_i18n::t!("workspace.pick_color_search").to_string(),
+                            ))
+                            .build(window, cx)
+                        })
+                        .child(Icon::new(IconName::Palette).size_3()),
+                )
+                .when(self.color_picker_open.get(), |row| {
+                    let color_picker = color_picker.clone();
+                    let picker_open = picker_open.clone();
+                    row.child({
+                        let color_picker = color_picker.clone();
+                        Popover::new("workspace-color-picker")
+                            .anchor(Anchor::TopLeft)
+                            .open(true)
+                            .on_open_change({
+                                let picker_open = picker_open.clone();
+                                move |is_open: &bool, _, cx| {
+                                    picker_open.set(*is_open);
+                                    cx.refresh_windows();
+                                }
+                            })
+                            .content(move |_, window, cx| picker_panel(&color_picker, window, cx))
+                    })
+                })
+            })
+            .when(in_trash, |row| {
+                row.child(
+                    Button::new("empty-trash")
+                        .ghost()
+                        .danger()
+                        .xsmall()
+                        .label(rust_i18n::t!("workspace.empty_all").to_string())
+                        .tooltip(rust_i18n::t!("workspace.empty_all_tooltip").to_string())
+                        .on_click(cx.listener(|this, _, _, cx| this.empty_trash(cx))),
+                )
+            })
+            .when(in_recent, |row| {
+                row.child(
+                    Button::new("clear-history")
+                        .ghost()
+                        .danger()
+                        .xsmall()
+                        .label(rust_i18n::t!("workspace.clear_history").to_string())
+                        .tooltip(rust_i18n::t!("workspace.clear_history_tooltip").to_string())
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.clear_view_history(cx);
+                        })),
+                )
+            })
+            .when(search_active, |row| {
+                row.child(
+                    Button::new("save-smart")
+                        .ghost()
+                        .xsmall()
+                        .icon(IconName::Plus)
+                        .tooltip(rust_i18n::t!("workspace.save_as_smart").to_string())
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.save_search_as_smart(window, cx);
+                        })),
+                )
+            })
+    }
+}
+
 impl EventEmitter<PanelEvent> for WorkspacePanel {}
 impl Focusable for WorkspacePanel {
     fn focus_handle(&self, _: &App) -> FocusHandle {
@@ -276,7 +386,7 @@ impl Focusable for WorkspacePanel {
 }
 
 impl Render for WorkspacePanel {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // The action handlers are shared by both modes, so the shell is built
         // before the branch below picks what goes inside it.
         let shell = v_flex()
@@ -300,20 +410,26 @@ impl Render for WorkspacePanel {
                 this.open_preview(window, cx);
             }))
             .on_action(cx.listener(|this, _: &ClearSelection, window, cx| {
-                // Escape backs out of the innermost thing: out of the 3D
-                // viewport when one is open, otherwise it falls through to the
-                // app root, which clears the grid selection as before.
-                if this.viewport.is_some() {
-                    this.dismiss_viewport(window, cx);
+                // Escape backs out of the innermost thing: out of the
+                // main-area preview when one is open, otherwise it falls
+                // through to the app root, which clears the grid selection
+                // as before.
+                if this.preview.is_some() {
+                    this.dismiss_preview(window, cx);
                     cx.stop_propagation();
                 }
             }));
 
-        // The 3D viewport replaces the grid outright: the query and the row
+        // The preview replaces the grid outright: the query and the row
         // layout are skipped entirely, so hiding the other assets also costs
         // nothing to keep hidden.
-        if let Some(viewport) = self.viewport.clone() {
-            return shell.child(viewport).into_any_element();
+        if let Some(preview) = self.preview.clone() {
+            return shell
+                .child(match preview {
+                    MainPreview::Model(viewport) => viewport.into_any_element(),
+                    MainPreview::Asset(preview) => preview.into_any_element(),
+                })
+                .into_any_element();
         }
 
         // A reveal request (click in the similar-images dialog) lands here:
@@ -666,6 +782,12 @@ impl Render for WorkspacePanel {
             String::new()
         };
 
+        // A colour confirmed in the picker opens a colour search; render has
+        // the window the dialog needs.
+        if let Some(hex) = self.pending_color_search.take() {
+            super::workspace_search::open_color_search(&hex, &self.controller, window, cx);
+        }
+        let shell = shell.child(self.toolbar_row(cx));
         shell
             .child(
                 div()
