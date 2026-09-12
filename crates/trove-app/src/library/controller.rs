@@ -5,6 +5,7 @@ use std::time::Instant;
 
 use uuid::Uuid;
 
+use trove_core::config::AppConfig;
 use trove_core::library::Library;
 use trove_core::model::{AssetKind, AssetSort, Origin};
 use trove_core::store::view_history;
@@ -87,6 +88,13 @@ pub struct LibraryController {
     last_view_record: Option<(Uuid, Instant)>,
     /// How many assets the grid has loaded so far (pagination cursor).
     pub grid_loaded: usize,
+    /// Grid zoom from the title-bar slider: multiplier on the ideal grid
+    /// row height (1.0 = default). Part of the workspace layout key.
+    pub row_height_scale: f32,
+    /// One-shot request to select and scroll the grid to an asset (e.g. a
+    /// click in the similar-images dialog). Consumed by the workspace on
+    /// the next render.
+    pub pending_reveal: Option<Uuid>,
     /// Status line surfaced by the Settings dialog (maintenance jobs,
     /// library switches). Set by whichever action ran last.
     pub notice: Option<String>,
@@ -127,6 +135,8 @@ impl LibraryController {
             selection_anchor: None,
             last_view_record: None,
             grid_loaded: GRID_PAGE_SIZE,
+            row_height_scale: AppConfig::load().grid_zoom(),
+            pending_reveal: None,
             notice: None,
             integrity_report: None,
             busy: false,
@@ -223,6 +233,9 @@ impl LibraryController {
         let conn = self.library.store().conn();
         if view_history::record(conn, asset).is_ok() {
             self.last_view_record = Some((asset, Instant::now()));
+            // Reorder the "recently viewed" grid: the workspace caches its
+            // query result and only re-runs it when the generation moves.
+            self.generation += 1;
         }
     }
 

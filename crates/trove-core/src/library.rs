@@ -809,66 +809,6 @@ impl Library {
         Ok(())
     }
 
-    // -- semantic (CLIP) search ------------------------------------------------
-
-    /// Semantic text-to-image search: embed the query with the CLIP text
-    /// encoder, rank stored image embeddings by cosine similarity and return
-    /// the matching assets best-first. Requires a configured model
-    /// (`media::clip::semantic_ready`); surfaces its error otherwise.
-    pub fn semantic_text_search(
-        &self,
-        query: &str,
-        min_similarity: f32,
-        limit: Option<u32>,
-    ) -> Result<Vec<crate::model::Asset>> {
-        let vec = media::clip::text_embedding(query)?;
-        let query_emb = media::clip::Embedding::new(vec);
-        let scored = media::clip::semantic_search(&self.store, &query_emb, min_similarity, limit)?;
-        let ids: Vec<Uuid> = scored.iter().map(|(id, _)| *id).collect();
-        assets::by_ids(self.store.conn(), &ids)
-    }
-
-    /// Semantic image-to-image search: returns `(asset, similarity)` pairs
-    /// ordered best-first (the results dialog shows the score per hit).
-    pub fn semantic_image_search(
-        &self,
-        query_path: &Path,
-        min_similarity: f32,
-        limit: Option<u32>,
-    ) -> Result<Vec<(crate::model::Asset, f32)>> {
-        let vec = media::clip::image_embedding(query_path)?;
-        let query_emb = media::clip::Embedding::new(vec);
-        let scored = media::clip::semantic_search(&self.store, &query_emb, min_similarity, limit)?;
-        let conn = self.store.conn();
-        let ids: Vec<Uuid> = scored.iter().map(|(id, _)| *id).collect();
-        let by_id: std::collections::HashMap<Uuid, crate::model::Asset> =
-            assets::by_ids(conn, &ids)?
-                .into_iter()
-                .map(|a| (a.id, a))
-                .collect();
-        Ok(scored
-            .into_iter()
-            .filter_map(|(id, score)| by_id.get(&id).cloned().map(|a| (a, score)))
-            .collect())
-    }
-
-    /// Re-embed every live image that has no vector yet. Returns
-    /// `(embedded, skipped)`.
-    pub fn embed_missing_all(&self) -> Result<(u64, u64)> {
-        media::clip::embed_all_missing(&self.store, &self.root)
-    }
-
-    /// Embed one asset if it is a live image without a vector. Returns
-    /// `Ok(true)` when a new embedding was stored, `Ok(false)` when skipped.
-    pub fn embed_one(&self, asset_id: Uuid) -> Result<bool> {
-        media::clip::embed_asset(&self.store, &self.root, asset_id)
-    }
-
-    /// `(embedded_images, total_live_images)` embedding coverage.
-    pub fn embedding_status(&self) -> Result<(u64, u64)> {
-        assets::embedding_counts(self.store.conn())
-    }
-
     /// Undo the most recent recorded mutation. Returns `false` when there is
     /// nothing to undo.
     pub fn undo(&self) -> Result<bool> {
