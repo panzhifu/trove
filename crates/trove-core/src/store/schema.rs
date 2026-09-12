@@ -112,6 +112,9 @@ pub const MIGRATIONS: &[&str] = &[
     "#,
     // v4: CLIP embedding column for semantic search. BLOB stores the
     // 512/768-dim float32 vector (L2-normalized). NULL when not yet computed.
+    // LEGACY: CLIP was removed; visual search now uses pHash + colour
+    // signatures in `extra`. The column stays (SQLite cannot drop columns
+    // on old versions) but nothing reads or writes it.
     r#"
     ALTER TABLE assets ADD COLUMN embedding BLOB;
     "#,

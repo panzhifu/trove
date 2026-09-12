@@ -77,6 +77,23 @@ pub fn assets_needing_signature(store: &crate::store::Store) -> Result<Vec<Uuid>
     )
 }
 
+/// `(signed_images, total_live_images)` — coverage for the settings page.
+/// A signature is present when `extra` carries the `visual_phash` key.
+pub fn signature_counts(conn: &rusqlite::Connection) -> Result<(u64, u64)> {
+    let total = rows::query_count(
+        conn,
+        "SELECT COUNT(*) FROM assets WHERE kind = 'image' AND trashed_at IS NULL",
+        vec![],
+    )? as u64;
+    let signed = rows::query_count(
+        conn,
+        "SELECT COUNT(*) FROM assets WHERE kind = 'image' AND trashed_at IS NULL
+         AND extra LIKE '%visual_phash%'",
+        vec![],
+    )? as u64;
+    Ok((signed, total))
+}
+
 /// Search results with similarity scores.
 #[derive(Debug, Clone)]
 pub struct SimilarAsset {

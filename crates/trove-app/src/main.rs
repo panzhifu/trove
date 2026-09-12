@@ -56,6 +56,7 @@ fn build_menus() -> Vec<Menu> {
             items: vec![
                 MenuItem::action(rust_i18n::t!("app.import_files").to_string(), ImportFiles),
                 MenuItem::action(rust_i18n::t!("app.import_url").to_string(), ImportUrl),
+                MenuItem::action(rust_i18n::t!("app.system_fonts").to_string(), SystemFonts),
                 MenuItem::action(rust_i18n::t!("app.screenshot").to_string(), ScreenshotFull),
                 MenuItem::action(
                     rust_i18n::t!("app.screenshot_region").to_string(),
@@ -246,30 +247,8 @@ fn slim_scrollbars(cx: &mut App) {
     );
 }
 
-/// Initialise the CLIP semantic-search engine from the persisted config.
-/// Best-effort: on any failure (missing model files, missing ONNX Runtime
-/// library) the engine simply stays disabled and the status string reports
-/// why, so the app keeps working with the visual-only backend.
-fn init_semantic_search() {
-    use trove_core::config::AppConfig;
-    use trove_core::media::clip;
-
-    let config = AppConfig::load();
-    if config.search_mode() != "semantic" {
-        return;
-    }
-    let Some(model) = config.clip_model_path() else {
-        return;
-    };
-    // `ort` may panic if the dylib fails to load, so catch it. Failures are
-    // recorded in the engine state and shown in Settings ▸ Search; there is
-    // no window yet at startup, so nothing else to surface here.
-    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| clip::configure(&model)));
-}
-
 fn main() {
     app::i18n::init_from_config();
-    init_semantic_search();
     gpui_kit::application()
         .with_assets(gpui_kit::assets::Assets)
         .run(|cx| {
