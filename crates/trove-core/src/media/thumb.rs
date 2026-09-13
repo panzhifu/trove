@@ -123,7 +123,7 @@ fn write_font_card(blob_path: &Path, out: &Path) -> Option<PathBuf> {
     if let Some(parent) = out.parent() {
         std::fs::create_dir_all(parent).ok()?;
     }
-    let tmp = out.with_extension("tmp.jpg");
+    let tmp = out.with_extension(format!("tmp-{}.jpg", crate::model::new_id().simple()));
     match image::DynamicImage::ImageRgba8(card).save_with_format(&tmp, image::ImageFormat::Jpeg) {
         Ok(()) => {
             std::fs::rename(&tmp, out).ok()?;
@@ -178,7 +178,7 @@ fn write_model_card(blob_path: &Path, out: &Path) -> Option<PathBuf> {
     if let Some(parent) = out.parent() {
         std::fs::create_dir_all(parent).ok()?;
     }
-    let tmp = out.with_extension("tmp.jpg");
+    let tmp = out.with_extension(format!("tmp-{}.jpg", crate::model::new_id().simple()));
     match image::DynamicImage::ImageRgb8(card).save_with_format(&tmp, image::ImageFormat::Jpeg) {
         Ok(()) => {
             std::fs::rename(&tmp, out).ok()?;
@@ -199,7 +199,7 @@ fn write_video_thumb(blob_path: &Path, out: &Path) -> Option<PathBuf> {
     std::fs::create_dir_all(parent).ok()?;
     // Must keep a known extension (ffmpeg picks the muxer from it): the
     // temp file is `<stem>.tmp.jpg`, renamed onto `<stem>.jpg` on success.
-    let tmp = out.with_extension("tmp.jpg");
+    let tmp = out.with_extension(format!("tmp-{}.jpg", crate::model::new_id().simple()));
     let output = std::process::Command::new("ffmpeg")
         .args(["-y", "-loglevel", "error", "-ss", "1", "-i"])
         .arg(blob_path)
@@ -305,7 +305,7 @@ fn write_thumb(blob_path: &Path, out: &Path) -> Option<PathBuf> {
     }
     // Must keep a known extension (ffmpeg picks the muxer from it): the
     // temp file is `<stem>.tmp.jpg`, renamed onto `<stem>.jpg` on success.
-    let tmp = out.with_extension("tmp.jpg");
+    let tmp = out.with_extension(format!("tmp-{}.jpg", crate::model::new_id().simple()));
     match thumb.save_with_format(&tmp, image::ImageFormat::Jpeg) {
         Ok(()) => {
             std::fs::rename(&tmp, out).ok()?;

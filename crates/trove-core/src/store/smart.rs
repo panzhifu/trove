@@ -5,16 +5,26 @@ use rusqlite::types::Value;
 use serde_json::Value as Json;
 use uuid::Uuid;
 
-use super::assets;
 use super::rows;
+
+/// How many text-condition candidates one Tantivy lookup may contribute to
+/// a smart rule (they become an `id IN (json_each)` narrowing).
+const TEXT_CANDIDATE_CAP: usize = 500;
 use crate::error::{Error, Result};
-use crate::model::{AssetKind, SmartCompare, SmartField, SmartNode};
+use crate::model::{AssetKind, Page, SmartCompare, SmartField, SmartNode};
 
 /// Deserialize a stored JSON condition tree into a [`SmartNode`].
 pub fn node_from_json(json: &Json) -> Result<SmartNode> {
     let json = compat_insert_match_tag(json.clone());
     serde_json::from_value(json)
         .map_err(|e| Error::Validation(format!("invalid condition tree: {e}")))
+}
+
+/// Parse and compile a serialized condition tree, checking it is runnable
+/// against the current schema. Creation entry points (facade, rules dialog)
+/// call this instead of the model layer, which carries no storage concerns.
+pub fn validate_json(query: &Json) -> Result<()> {
+    compile(None, None, &node_from_json(query)?).map(|_| ())
 }
 
 /// Re-insert the `"op": "match"` tag on nodes that lack it but carry a
@@ -49,17 +59,19 @@ fn compat_insert_match_tag(json: Json) -> Json {
 /// can expand to the whole subtree.
 pub fn compile(
     conn: Option<&rusqlite::Connection>,
+    text: Option<&crate::search::TextIndex>,
     node: &SmartNode,
 ) -> Result<(String, Vec<Value>)> {
     match node {
-        SmartNode::And { children } => join(conn, " AND ", children),
-        SmartNode::Or { children } => join(conn, " OR ", children),
-        SmartNode::Match { field, op, value } => compile_match(conn, *field, *op, value),
+        SmartNode::And { children } => join(conn, text, " AND ", children),
+        SmartNode::Or { children } => join(conn, text, " OR ", children),
+        SmartNode::Match { field, op, value } => compile_match(conn, text, *field, *op, value),
     }
 }
 
 fn join(
     conn: Option<&rusqlite::Connection>,
+    text: Option<&crate::search::TextIndex>,
     sep: &str,
     children: &[SmartNode],
 ) -> Result<(String, Vec<Value>)> {
@@ -69,7 +81,7 @@ fn join(
     let mut parts = Vec::new();
     let mut args: Vec<Value> = Vec::new();
     for child in children {
-        let (sql, mut child_args) = compile(conn, child)?;
+        let (sql, mut child_args) = compile(conn, text, child)?;
         parts.push(format!("({sql})"));
         args.append(&mut child_args);
     }
@@ -78,6 +90,7 @@ fn join(
 
 fn compile_match(
     conn: Option<&rusqlite::Connection>,
+    text: Option<&crate::search::TextIndex>,
     field: SmartField,
     op: SmartCompare,
     value: &Json,
@@ -161,10 +174,19 @@ fn compile_match(
         SmartField::Text => {
             require_eq(op)?;
             let s = string_value(value, "text")?;
-            let fts = assets::fts_query(&s);
+            // Candidates come from the Tantivy index (words, typo-tolerant
+            // fuzzy, gram substrings, pinyin); the SQL fragment narrows to
+            // those ids. Without an index (compile-time validation) the
+            // candidate list is empty but the fragment still compiles.
+            let candidates = match text {
+                Some(idx) => idx.search(&s, TEXT_CANDIDATE_CAP)?,
+                None => Vec::new(),
+            };
+            let json = serde_json::to_string(&candidates)
+                .map_err(|e| Error::Validation(format!("text candidates: {e}")))?;
             Ok((
-                "assets.id IN (SELECT asset_id FROM asset_fts WHERE asset_fts MATCH ?)".into(),
-                vec![fts.into()],
+                "assets.id IN (SELECT value FROM json_each(?))".into(),
+                vec![Value::from(json)],
             ))
         }
         SmartField::Color => {
@@ -178,20 +200,6 @@ fn compile_match(
                 ),
                 vec![s.into()],
             ))
-        }
-        SmartField::ColorLabel => {
-            require_eq_ne(op)?;
-            let s = string_value(value, "color_label")?;
-            let label = crate::model::normalize_color_label(&s)?;
-            Ok(match label {
-                // "no label" is a real filter dimension: unlabeled = NULL.
-                None if op == SmartCompare::Eq => ("assets.color_label IS NULL".into(), vec![]),
-                None => ("assets.color_label IS NOT NULL".into(), vec![]),
-                Some(l) => (
-                    format!("assets.color_label {} ?", op_sql(op)),
-                    vec![l.into()],
-                ),
-            })
         }
         SmartField::CapturedAt => {
             // `captured_at` stores an RFC 3339 timestamp; comparing the
@@ -244,29 +252,83 @@ fn compile_match(
     }
 }
 
+/// The narrowing applied on top of a rule tree: the grid filters (`kind` /
+/// `favorite`) plus the page window.
+///
+/// Bundled into one value because these four always travel together — through
+/// the `evaluate*` entry points and the store's `BrowseContext` — and because
+/// five positional arguments made every call site unreadable.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SmartPage {
+    /// Restrict to one asset kind (the toolbar's type filter).
+    pub kind: Option<AssetKind>,
+    /// Restrict to favorites only (the toolbar's star filter).
+    pub favorite: Option<bool>,
+    /// `Some(n)` enables paging.
+    pub limit: Option<u32>,
+    /// Rows to skip; ignored when `limit` is `None`.
+    pub offset: u64,
+}
+
 /// Evaluate a condition tree against the live library (trashed assets are
-/// excluded). Returns `(total_matching, matching_ids)`.
+/// excluded). Returns the matching ids as a page.
 pub fn evaluate(
     conn: &rusqlite::Connection,
+    text: Option<&crate::search::TextIndex>,
     node: &SmartNode,
     limit: Option<u32>,
     offset: u64,
-) -> Result<(u64, Vec<uuid::Uuid>)> {
-    evaluate_filtered(conn, node, None, None, limit, offset)
+) -> Result<Page<Uuid>> {
+    evaluate_filtered(
+        conn,
+        text,
+        node,
+        SmartPage {
+            limit,
+            offset,
+            ..Default::default()
+        },
+    )
 }
 
-/// Like [`evaluate`], with extra grid filters (`kind` / favorite) AND-ed
+/// Like [`evaluate`], with the extra grid filters of [`SmartPage`] AND-ed
 /// onto the tree — the toolbar filters compose with smart collections the
 /// same way they compose with plain views.
 pub fn evaluate_filtered(
     conn: &rusqlite::Connection,
+    text: Option<&crate::search::TextIndex>,
     node: &SmartNode,
-    kind: Option<AssetKind>,
-    favorite: Option<bool>,
-    limit: Option<u32>,
-    offset: u64,
-) -> Result<(u64, Vec<uuid::Uuid>)> {
-    let (tree, mut args) = compile(Some(conn), node)?;
+    page: SmartPage,
+) -> Result<Page<Uuid>> {
+    evaluate_counted(conn, text, node, page, true)
+}
+
+/// [`evaluate_filtered`] without the exact COUNT: the returned total is a
+/// lower bound (this page's id count). Rapid refreshes use it and overlay a
+/// cached exact total, keeping the COUNT off the hot path.
+pub fn evaluate_filtered_without_count(
+    conn: &rusqlite::Connection,
+    text: Option<&crate::search::TextIndex>,
+    node: &SmartNode,
+    page: SmartPage,
+) -> Result<Page<Uuid>> {
+    evaluate_counted(conn, text, node, page, false)
+}
+
+fn evaluate_counted(
+    conn: &rusqlite::Connection,
+    text: Option<&crate::search::TextIndex>,
+    node: &SmartNode,
+    page: SmartPage,
+    count: bool,
+) -> Result<Page<Uuid>> {
+    let SmartPage {
+        kind,
+        favorite,
+        limit,
+        offset,
+    } = page;
+    let (tree, mut args) = compile(Some(conn), text, node)?;
     // Parenthesize the tree before appending: a compiled `or` group is a
     // bare `a OR b`, and `a OR b AND kind = ?` would let the AND bind to
     // only the last branch.
@@ -281,12 +343,9 @@ pub fn evaluate_filtered(
     }
     let where_sql = format!("WHERE trashed_at IS NULL AND ({expr})");
 
-    let total = rows::query_count(
-        conn,
-        &format!("SELECT COUNT(DISTINCT assets.id) FROM assets {where_sql}"),
-        args.clone(),
-    )? as u64;
-
+    // The COUNT never carries the page limit/offset, so snapshot the
+    // where-clause args before they gain the paging ones.
+    let count_args = args.clone();
     let mut sql = format!(
         "SELECT DISTINCT assets.id FROM assets {where_sql} \
          ORDER BY assets.created_at DESC, assets.id ASC"
@@ -297,9 +356,18 @@ pub fn evaluate_filtered(
         args.push(Value::Integer(limit as i64));
         args.push(Value::Integer(offset as i64));
     }
-
     let ids = rows::query_map(conn, &sql, args, |row| rows::req_uuid(row, 0))?;
-    Ok((total, ids))
+
+    let total = if count {
+        rows::query_count(
+            conn,
+            &format!("SELECT COUNT(DISTINCT assets.id) FROM assets {where_sql}"),
+            count_args,
+        )? as u64
+    } else {
+        ids.len() as u64
+    };
+    Ok(Page::new(total, ids))
 }
 
 // -- small helpers -----------------------------------------------------------

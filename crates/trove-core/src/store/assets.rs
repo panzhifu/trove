@@ -1,21 +1,23 @@
 //! Asset store: insert / read / query / patch / lifecycle of assets.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 
 use chrono::Utc;
 use rusqlite::{Connection, types::Value};
-use serde_json::Value as Json;
 use uuid::Uuid;
 
 use super::rows::{self, bind_opt_int, bind_opt_str, bind_opt_ts};
 use crate::error::{Error, Result};
-use crate::model::{Asset, AssetKind, AssetPatch, AssetQuery, Origin, now};
+use crate::model::{
+    Asset, AssetFacts, AssetKind, AssetPatch, AssetQuery, Orientation, Origin, Page, UsageStatus,
+    now,
+};
 
 /// Column list shared by every read; index order matches `asset_from_row`.
 pub(crate) const COLS: &str = "id, origin, rel_path, file_name, ext, mime, size_bytes, sha256, \
                     kind, width, height, duration_ms, captured_at, title, description, \
                     rating, is_favorite, source_url, extra, created_at, updated_at, trashed_at, \
-                    color_label";
+                    usage_status, commercial_use";
 
 /// Insert a fully-populated asset.
 pub fn insert(conn: &Connection, asset: &Asset) -> Result<()> {
@@ -23,11 +25,11 @@ pub fn insert(conn: &Connection, asset: &Asset) -> Result<()> {
         conn,
         &format!(
             "INSERT INTO assets ({COLS}) VALUES \
-             (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23)"
+             (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24)"
         ),
         asset_values(asset),
     )?;
-    fts_insert(conn, asset)
+    Ok(())
 }
 
 pub fn get(conn: &Connection, id: Uuid) -> Result<Option<Asset>> {
@@ -93,62 +95,34 @@ pub fn by_ids(conn: &Connection, ids: &[Uuid]) -> Result<Vec<Asset>> {
     Ok(ids.iter().filter_map(|id| found.get(id).cloned()).collect())
 }
 
-/// Full-text search over the FTS index.
+/// Intersect a relevance-ranked id list (from the Tantivy index) with the
+/// structured filters of `q`, preserving the rank order.
 ///
-/// `text` picks matching ids ranked by BM25; the other dimensions of `q`
-/// (kind / collection / tags / favorite / trash) further filter that set, and
-/// `q.limit` / `q.offset` page the result. Order is by relevance, not recency.
-/// Returns `(total_matching, page)`.
-pub fn search(conn: &Connection, text: &str, q: &AssetQuery) -> Result<(u64, Vec<Asset>)> {
-    let text = text.trim();
-    if text.is_empty() {
-        return Ok((0, Vec::new()));
-    }
-    let fts = fts_query(text);
-
-    // Rank first (cheap: ids only), then apply the compound filters to the
-    // ranked subset, preserving order.
-    let ranked = rows::query_map(
-        conn,
-        "SELECT asset_id FROM asset_fts WHERE asset_fts MATCH ?1 \
-         ORDER BY bm25(asset_fts)",
-        vec![fts.into()],
-        |row| rows::req_uuid(row, 0),
-    )?;
-
-    // Search already applies the text filter via the FTS index, so drop the
-    // LIKE clause from the compound filters.
-    let mut filtered = q.clone();
-    filtered.text = None;
-    let (where_sql, args) = build_where(conn, &filtered)?;
-
-    // Exclude assets the compound filters reject by intersecting with the
-    // ranked id set, then slice.
-    let (total, ids) = rank_intersect(conn, &ranked, &where_sql, &args)?;
-    let page = page_assets(&ids, q, conn)?;
-    Ok((total, page))
-}
-
-/// Build the WHERE for the ranked id set: `WHERE <filters> AND id IN (…)`.
-fn rank_intersect(
+/// The candidate list drives the query and the filters only reject rows; see
+/// [`WhereMode`] for why that has to be forced rather than left to the planner.
+/// The query takes the candidate ids as an `IN (…)` list, whose entries are
+/// served straight from the primary-key index, and returns the ids that
+/// survived, in rank order.
+pub(crate) fn rank_intersect(
     conn: &Connection,
     ranked: &[Uuid],
-    where_sql: &str,
-    args: &[Value],
+    q: &AssetQuery,
 ) -> Result<(u64, Vec<Uuid>)> {
     if ranked.is_empty() {
         return Ok((0, Vec::new()));
     }
+    let (where_sql, args) = build_where(conn, q, WhereMode::Rejecting)?;
+
     let mut sql = String::from("SELECT id FROM assets");
-    sql.push(' ');
-    sql.push_str(where_sql); // "" or "WHERE conds"
     if !where_sql.is_empty() {
+        sql.push(' ');
+        sql.push_str(&where_sql);
         sql.push_str(" AND ");
     } else {
         sql.push_str(" WHERE ");
     }
     sql.push_str("id IN (");
-    let mut all_args = args.to_vec();
+    let mut all_args = args;
     for (i, id) in ranked.iter().enumerate() {
         if i > 0 {
             sql.push(',');
@@ -172,7 +146,7 @@ fn rank_intersect(
 }
 
 /// Slice a full ranked id list per `q.limit`/`q.offset` and materialise.
-fn page_assets(ids: &[Uuid], q: &AssetQuery, conn: &Connection) -> Result<Vec<Asset>> {
+pub(crate) fn page_assets(ids: &[Uuid], q: &AssetQuery, conn: &Connection) -> Result<Vec<Asset>> {
     let start = q.offset as usize;
     let end = q
         .limit
@@ -185,47 +159,7 @@ fn page_assets(ids: &[Uuid], q: &AssetQuery, conn: &Connection) -> Result<Vec<As
     by_ids(conn, &ids[start..end])
 }
 
-/// Escape user text into an FTS5 query where every whitespace-separated term
-/// becomes an ANDed prefix phrase, so operators like `"` `*` `NEAR` are treated
-/// as literal characters, never as query syntax.
-///
-/// - `"sunset beach"` → `"sunset"* "beach"*` : both terms must match (FTS5
-///   joins terms with implicit AND).
-/// - Each phrase gets a trailing `*`, so `sunset` also matches `sunsets` and
-///   `sunsetsky` (prefix match within a token).
-pub(crate) fn fts_query(text: &str) -> String {
-    let cleaned: String = text.chars().filter(|c| !c.is_control()).collect();
-    cleaned
-        .split_whitespace()
-        .map(|term| format!("\"{}\"*", term.replace('"', "\"\"")))
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-// -- FTS index maintenance ---------------------------------------------------
-
-/// Insert a row into the FTS index mirroring the asset's searchable text
-/// (file name, title, description, and the names of all attached tags).
-pub(crate) fn fts_insert(conn: &Connection, asset: &Asset) -> Result<()> {
-    let tags = tags_for_fts(conn, asset.id)?;
-    rows::execute(
-        conn,
-        "INSERT INTO asset_fts(asset_id, file_name, title, description, tags) \
-         VALUES (?1, ?2, ?3, ?4, ?5)",
-        vec![
-            rows::uuid(asset.id).into(),
-            asset.file_name.clone().into(),
-            nullable_or_empty(asset.title.as_deref()),
-            nullable_or_empty(asset.description.as_deref()),
-            Value::Text(tags),
-        ],
-    )?;
-    Ok(())
-}
-
-/// Comma-joined names of every tag attached to `asset_id` (empty if none).
-/// FTS5 indexed columns reject NULL, hence the default.
-fn tags_for_fts(conn: &Connection, asset_id: Uuid) -> Result<String> {
+pub(crate) fn tags_for_index(conn: &Connection, asset_id: Uuid) -> Result<String> {
     let names: Vec<String> = rows::query_map(
         conn,
         "SELECT t.name FROM tags t \
@@ -237,35 +171,37 @@ fn tags_for_fts(conn: &Connection, asset_id: Uuid) -> Result<String> {
     Ok(names.join(", "))
 }
 
-/// Rewrite an asset's FTS row from current state (asset row + attached tags).
-/// Used after updates to title/description and after tag membership changes.
-/// A missing asset row simply leaves the index entry removed.
-pub(crate) fn fts_sync(conn: &Connection, asset_id: Uuid) -> Result<()> {
-    rows::execute(
-        conn,
-        "DELETE FROM asset_fts WHERE asset_id = ?1",
-        vec![rows::uuid(asset_id).into()],
-    )?;
-    if let Some(asset) = get(conn, asset_id)? {
-        fts_insert(conn, &asset)?;
-    }
-    Ok(())
-}
-
-/// FTS5 indexed columns reject NULL; map `None` to the empty string.
-fn nullable_or_empty(v: Option<&str>) -> Value {
-    Value::Text(v.unwrap_or("").to_string())
-}
-
-/// List assets matching `query`. Returns `(total_matching, page)`.
-pub fn query(conn: &Connection, q: &AssetQuery) -> Result<(u64, Vec<Asset>)> {
-    let (where_sql, mut args) = build_where(conn, q)?;
+/// List assets matching the structured filters of `q`.
+///
+/// Free text is not part of `q`; see [`AssetQuery`] and `build_where`.
+pub fn query(conn: &Connection, q: &AssetQuery) -> Result<Page<Asset>> {
+    let (where_sql, args) = build_where(conn, q, WhereMode::Driving)?;
     let total = rows::query_count(
         conn,
         &format!("SELECT COUNT(*) FROM assets {where_sql}"),
         args.clone(),
     )? as u64;
+    let assets = query_items(conn, q, where_sql, args)?;
+    Ok(Page::new(total, assets))
+}
 
+/// Like [`query`], but skips the exact COUNT: the returned total is a lower
+/// bound (this page's item count). Rapid refreshes use it and overlay a
+/// cached exact total, keeping the COUNT off the hot path.
+pub fn query_without_count(conn: &Connection, q: &AssetQuery) -> Result<Page<Asset>> {
+    let (where_sql, args) = build_where(conn, q, WhereMode::Driving)?;
+    let assets = query_items(conn, q, where_sql, args)?;
+    Ok(Page::new(assets.len() as u64, assets))
+}
+
+/// The paged item fetch shared by [`query`] and [`query_without_count`]:
+/// order + limit are appended to `args`, so this must own them.
+fn query_items(
+    conn: &Connection,
+    q: &AssetQuery,
+    where_sql: String,
+    mut args: Vec<Value>,
+) -> Result<Vec<Asset>> {
     let mut sql = format!("SELECT {COLS} FROM assets {where_sql}");
     let order_col = match q.sort {
         crate::model::AssetSort::CreatedAt => "created_at",
@@ -282,8 +218,7 @@ pub fn query(conn: &Connection, q: &AssetQuery) -> Result<(u64, Vec<Asset>)> {
         args.push(Value::Integer(q.offset as i64));
     }
 
-    let assets = rows::query_map(conn, &sql, args, asset_from_row)?;
-    Ok((total, assets))
+    rows::query_map(conn, &sql, args, asset_from_row)
 }
 
 /// Apply a partial patch. `None` fields leave the column untouched.
@@ -324,13 +259,17 @@ pub fn update(conn: &Connection, id: Uuid, patch: &AssetPatch) -> Result<Option<
         sets.push(format!("source_url = ?{}", args.len() + 1));
         args.push(bind_opt_str(v.as_deref()));
     }
-    if let Some(v) = &patch.color_label {
-        sets.push(format!("color_label = ?{}", args.len() + 1));
-        args.push(bind_opt_str(v.as_deref()));
+    if let Some(status) = patch.usage_status {
+        sets.push(format!("usage_status = ?{}", args.len() + 1));
+        args.push(usage_status_str(status).into());
     }
-    if let Some(extra) = &patch.extra {
+    if let Some(v) = patch.commercial_use {
+        sets.push(format!("commercial_use = ?{}", args.len() + 1));
+        args.push(v.map(|b| Value::Integer(b as i64)).unwrap_or(Value::Null));
+    }
+    if let Some(facts) = &patch.facts {
         sets.push(format!("extra = ?{}", args.len() + 1));
-        args.push(serde_json::to_string(extra)?.into());
+        args.push(serde_json::to_string(facts)?.into());
     }
 
     // The WHERE parameter comes after every SET value.
@@ -341,22 +280,12 @@ pub fn update(conn: &Connection, id: Uuid, patch: &AssetPatch) -> Result<Option<
     );
     args.push(rows::uuid(id).into());
     rows::execute(conn, &sql, args)?;
-
-    // Mirror title/description changes into the search index.
-    let updated = get(conn, id)?;
-    if let Some(a) = &updated {
-        fts_sync(conn, a.id)?;
-    }
-    Ok(updated)
+    get(conn, id)
 }
 
 /// Replace the `extra` JSON column (used for visual signature backfill).
-pub fn update_extra(
-    conn: &Connection,
-    id: Uuid,
-    extra: &std::collections::BTreeMap<String, serde_json::Value>,
-) -> Result<()> {
-    let json = serde_json::to_string(extra)
+pub fn update_facts(conn: &Connection, id: Uuid, facts: &AssetFacts) -> Result<()> {
+    let json = serde_json::to_string(facts)
         .map_err(|e| crate::Error::Db(format!("serialize extra: {e}")))?;
     rows::execute(
         conn,
@@ -402,11 +331,7 @@ pub fn delete(conn: &Connection, id: Uuid) -> Result<()> {
         "DELETE FROM assets WHERE id = ?1",
         vec![rows::uuid(id).into()],
     )?;
-    rows::execute(
-        conn,
-        "DELETE FROM asset_fts WHERE asset_id = ?1",
-        vec![rows::uuid(id).into()],
-    )?;
+    // The assets_delete trigger enqueues the doc for removal from the index.
     Ok(())
 }
 
@@ -428,7 +353,7 @@ pub struct DuplicateGroup {
 
 /// Group live image assets into near-duplicate clusters.
 ///
-/// Needs visual signatures (`extra.visual_phash`, computed in background
+/// Needs visual signatures (the `visual_phash` fact, computed in background
 /// after import and backfillable via maintenance); unsigned assets are
 /// ignored. Clusters are returned largest first.
 pub fn duplicate_groups(conn: &Connection) -> Result<Vec<DuplicateGroup>> {
@@ -449,9 +374,10 @@ pub fn duplicate_groups(conn: &Connection) -> Result<Vec<DuplicateGroup>> {
     let mut items: Vec<(Asset, PHash)> = Vec::new();
     for asset in rows_vec {
         let phash = asset
-            .extra
-            .get("visual_phash")
-            .and_then(|v| v.as_str())
+            .facts
+            .visual
+            .visual_phash
+            .as_deref()
             .map(PHash::from_hex)
             .unwrap_or(PHash(0));
         if phash != PHash(0) {
@@ -527,11 +453,12 @@ pub(crate) fn asset_from_row(row: &rusqlite::Row) -> Result<Asset> {
         rating: rows::opt_int(row, 15)?.map(|v| v as u8),
         is_favorite: rows::boolean(row, 16)?,
         source_url: rows::opt_str(row, 17)?,
-        extra: parse_extra(&rows::req_str(row, 18)?)?,
+        facts: parse_facts(&rows::req_str(row, 18)?)?,
         created_at: rows::req_ts(row, 19)?,
         updated_at: rows::req_ts(row, 20)?,
         trashed_at: rows::opt_ts(row, 21)?,
-        color_label: rows::opt_str(row, 22)?,
+        usage_status: parse_usage_status(&rows::req_str(row, 22)?)?,
+        commercial_use: rows::opt_int(row, 23)?.map(|v| v != 0),
     })
 }
 
@@ -566,41 +493,75 @@ fn asset_values(a: &Asset) -> Vec<Value> {
             .unwrap_or(Value::Null),
         Value::Integer(a.is_favorite as i64),
         bind_opt_str(a.source_url.as_deref()),
-        serde_json::to_string(&a.extra)
+        serde_json::to_string(&a.facts)
             .unwrap_or_else(|_| "{}".into())
             .into(),
         rows::ts(a.created_at).into(),
         rows::ts(a.updated_at).into(),
         bind_opt_ts(a.trashed_at),
-        bind_opt_str(a.color_label.as_deref()),
+        usage_status_str(a.usage_status).into(),
+        a.commercial_use
+            .map(|b| Value::Integer(b as i64))
+            .unwrap_or(Value::Null),
     ]
 }
 
-fn build_where(conn: &Connection, q: &AssetQuery) -> Result<(String, Vec<Value>)> {
-    let mut conds: Vec<String> = Vec::new();
-    let mut args: Vec<Value> = Vec::new();
+/// Whether the column comparisons in a [`build_where`] clause may drive the
+/// query through an index.
+///
+/// The two callers want opposite things here. The listing paths *are* their
+/// filters, so `idx_assets_kind` driving a `kind = 'image'` listing is exactly
+/// right. [`rank_intersect`] is the opposite case: it already holds an exact,
+/// ordered candidate list, so the filters may only reject rows. Left to itself
+/// the planner happily drives off a filter index instead — and the one every
+/// search carries, `trashed_at IS NULL`, matches every live row, so instead of
+/// 2000 index probes the intersection degenerates into a full scan. Measured on
+/// a 100k library: 21 ms for 97 candidates and 36 ms for 2000, against 0.1 ms
+/// and 5 ms once the id list drives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum WhereMode {
+    /// Plain comparisons; the planner may pick any index, including one built
+    /// for a filter column.
+    Driving,
+    /// Every indexable comparison is wrapped in SQLite's unary `+`, a
+    /// documented no-op that makes the term ineligible as an index source. The
+    /// semantics are unchanged — `+trashed_at IS NULL` still asks whether the
+    /// column is null, and `+x = ?` still matches exactly what `x = ?` did.
+    Rejecting,
+}
 
-    if let Some(text) = q.text.as_deref() {
-        let text = text.trim();
-        if !text.is_empty() {
-            // Same searchable surface as the FTS index: file name, title,
-            // description, and attached tag names.
-            conds.push(
-                "(file_name LIKE ? OR title LIKE ? OR description LIKE ? \
-                 OR EXISTS (SELECT 1 FROM asset_tag ft \
-                            JOIN tags t ON t.id = ft.tag_id \
-                            WHERE ft.asset_id = assets.id AND t.name LIKE ?))"
-                    .into(),
-            );
-            let like = format!("%{}%", text.to_lowercase());
-            args.push(Value::Text(like.clone()));
-            args.push(Value::Text(like.clone()));
-            args.push(Value::Text(like.clone()));
-            args.push(Value::Text(like));
+impl WhereMode {
+    /// The prefix that suppresses index use for one term, if this mode wants it.
+    fn prefix(self) -> &'static str {
+        match self {
+            WhereMode::Driving => "",
+            WhereMode::Rejecting => "+",
         }
     }
+}
+
+/// Build the `WHERE` clause for the structured filters of `q`.
+///
+/// Free text is *not* handled here. It is resolved by the Tantivy index into a
+/// relevance-ranked id list, which callers intersect with this clause through
+/// [`rank_intersect`]; see `AssetQuery`'s doc comment for why there is no
+/// `LIKE` fallback. `mode` decides whether the comparisons may drive the query
+/// through an index — see [`WhereMode`].
+///
+/// Conditions that are not plain column comparisons (`EXISTS (…)` subqueries
+/// correlated on `assets.id`, `json_extract`, the orientation `CASE`, the
+/// `LOWER(ext)` comparison) are never index sources, so they need no prefix.
+pub(super) fn build_where(
+    conn: &Connection,
+    q: &AssetQuery,
+    mode: WhereMode,
+) -> Result<(String, Vec<Value>)> {
+    let mut conds: Vec<String> = Vec::new();
+    let mut args: Vec<Value> = Vec::new();
+    let ni = mode.prefix();
+
     if let Some(kind) = q.kind {
-        conds.push(format!("kind = ?{}", args.len() + 1));
+        conds.push(format!("{ni}kind = ?{}", args.len() + 1));
         args.push(kind_str(kind).into());
     }
     if let Some(cid) = q.collection_id {
@@ -616,7 +577,7 @@ fn build_where(conn: &Connection, q: &AssetQuery) -> Result<(String, Vec<Value>)
         // includes its whole subtree (hierarchical tags).
         for tag in &q.tag_ids {
             let subtree = crate::store::tags::subtree_ids(conn, *tag)?;
-            let (in_sql, mut in_args) = id_list("t.tag_id", &subtree);
+            let (in_sql, mut in_args) = id_list("t.tag_id", &subtree, args.len());
             conds.push(format!(
                 "EXISTS (SELECT 1 FROM asset_tag t WHERE t.asset_id = assets.id AND {in_sql})"
             ));
@@ -624,12 +585,8 @@ fn build_where(conn: &Connection, q: &AssetQuery) -> Result<(String, Vec<Value>)
         }
     }
     if let Some(fav) = q.is_favorite {
-        conds.push(format!("is_favorite = ?{}", args.len() + 1));
+        conds.push(format!("{ni}is_favorite = ?{}", args.len() + 1));
         args.push(Value::Integer(fav as i64));
-    }
-    if let Some(label) = &q.color_label {
-        conds.push(format!("color_label = ?{}", args.len() + 1));
-        args.push(Value::Text(label.clone()));
     }
     if let Some(prefix) = &q.source_path_prefix {
         conds.push(format!(
@@ -644,60 +601,155 @@ fn build_where(conn: &Connection, q: &AssetQuery) -> Result<(String, Vec<Value>)
             .replace('_', "\\_");
         args.push(Value::Text(format!("{escaped}%")));
     }
+    if let Some(status) = q.usage_status {
+        conds.push(format!("{ni}usage_status = ?{}", args.len() + 1));
+        args.push(usage_status_str(status).into());
+    }
+    if let Some(clearance) = q.commercial_use {
+        conds.push(format!("{ni}commercial_use = ?{}", args.len() + 1));
+        args.push(Value::Integer(clearance as i64));
+    }
+    if let Some(orientation) = q.orientation {
+        conds.push(format!(
+            "CASE \
+             WHEN width IS NULL OR height IS NULL OR width = 0 OR height = 0 THEN '' \
+             WHEN width > height THEN 'landscape' \
+             WHEN width < height THEN 'portrait' \
+             ELSE 'square' END = ?{}",
+            args.len() + 1
+        ));
+        args.push(
+            match orientation {
+                Orientation::Landscape => "landscape",
+                Orientation::Portrait => "portrait",
+                Orientation::Square => "square",
+            }
+            .to_string()
+            .into(),
+        );
+    }
+    if let Some(min_rating) = q.min_rating {
+        // Unrated assets (NULL) fail the comparison naturally.
+        conds.push(format!("{ni}rating >= ?{}", args.len() + 1));
+        args.push(Value::Integer(min_rating as i64));
+    }
+    if let Some(ext) = &q.ext {
+        conds.push(format!("LOWER(ext) = LOWER(?{})", args.len() + 1));
+        args.push(Value::Text(ext.clone()));
+    }
+    // Unconditional, so `where_sql` is never empty.
     if q.is_trashed {
-        conds.push("trashed_at IS NOT NULL".into());
+        conds.push(format!("{ni}trashed_at IS NOT NULL"));
     } else {
-        conds.push("trashed_at IS NULL".into());
+        conds.push(format!("{ni}trashed_at IS NULL"));
     }
 
-    let where_sql = if conds.is_empty() {
-        String::new()
-    } else {
-        format!("WHERE {}", conds.join(" AND "))
-    };
+    // The placeholders are hand-numbered, so the clause has to end up using
+    // exactly as many as it binds. Every condition bumps `args` by the same
+    // count it writes, and a mismatch means one of them numbered itself wrong:
+    // `assets::query` would then fail at bind time with "Wrong number of
+    // parameters", or worse, bind a value to the wrong `?N`.
+    debug_assert_eq!(
+        highest_placeholder(&conds),
+        args.len(),
+        "clause binds {} values but numbers {} placeholders: {}",
+        args.len(),
+        highest_placeholder(&conds),
+        conds.join(" AND ")
+    );
+
+    let where_sql = format!("WHERE {}", conds.join(" AND "));
     Ok((where_sql, args))
 }
 
-/// Distinct folders that imported assets came from, including every
-/// ancestor directory (so the panel can render a tree), sorted.
-pub fn source_folders(conn: &Connection) -> Result<Vec<String>> {
+/// Distinct *direct* parent folders that live assets were imported from,
+/// each with its live-asset count, sorted by path. No ancestor walk: the
+/// panel shows one flat row per folder a file was actually dropped into,
+/// nothing else.
+pub fn source_folders(conn: &Connection) -> Result<Vec<(String, u64)>> {
     let paths: Vec<String> = rows::query_map(
         conn,
-        "SELECT DISTINCT json_extract(extra, '$.source_path') FROM assets \
+        "SELECT json_extract(extra, '$.source_path') FROM assets \
          WHERE trashed_at IS NULL AND json_extract(extra, '$.source_path') IS NOT NULL",
         vec![],
         |row| row.get::<_, String>(0).map_err(Error::from),
     )?;
-    let mut dirs: std::collections::BTreeSet<String> = Default::default();
+    // Count in place rather than through `entry(…).or_default()`: the parent
+    // path is only materialised when it is new, so a 100k-row library pays for
+    // its ~50 folders instead of one `String` per asset.
+    let mut counts: std::collections::BTreeMap<String, u64> = Default::default();
     for path in paths {
-        let mut dir = std::path::Path::new(&path)
-            .parent()
-            .map(|p| p.to_path_buf());
-        while let Some(d) = dir {
-            let text = d.to_string_lossy().to_string();
-            if dirs.insert(text.clone()) {
-                dir = d.parent().map(|p| p.to_path_buf());
-            } else {
-                break; // already walked this branch
+        let Some(dir) = std::path::Path::new(&path).parent() else {
+            continue;
+        };
+        let dir = dir.to_string_lossy();
+        match counts.get_mut(dir.as_ref()) {
+            Some(count) => *count += 1,
+            None => {
+                counts.insert(dir.into_owned(), 1);
             }
         }
     }
-    Ok(dirs.into_iter().collect())
+    Ok(counts.into_iter().collect())
 }
 
-/// `col IN (?, ?, …)` over a uuid list (each id one parameter).
-fn id_list(col: &str, ids: &[Uuid]) -> (String, Vec<Value>) {
-    let placeholders: Vec<String> = (1..=ids.len()).map(|ix| format!("?{ix}")).collect();
+/// `col IN (?, ?, …)` over a uuid list (each id one parameter), with the
+/// placeholders numbered from `first` — the number of parameters the clause has
+/// already used.
+///
+/// Numbering matters: every other condition numbers itself `?{args.len() + 1}`,
+/// so a list that started again at `?1` collided with whatever came before it
+/// (`kind = ?1` plus a tag list rendered two `?1`s, which is one SQLite
+/// parameter but two bound values → "Wrong number of parameters"), and a second
+/// tag list collided with the first.
+///
+/// An empty list renders `IN (NULL)`, which matches nothing. That is the honest
+/// answer for, say, a tag whose row has since been deleted, and unlike the
+/// naive `IN ()` it is valid SQL.
+fn id_list(col: &str, ids: &[Uuid], first: usize) -> (String, Vec<Value>) {
+    if ids.is_empty() {
+        return (format!("{col} IN (NULL)"), Vec::new());
+    }
+    let placeholders: Vec<String> = (1..=ids.len())
+        .map(|ix| format!("?{}", first + ix))
+        .collect();
     (
         format!("{col} IN ({})", placeholders.join(",")),
         ids.iter().map(|id| rows::uuid(*id).into()).collect(),
     )
 }
 
-fn parse_extra(s: &str) -> Result<BTreeMap<String, Json>> {
+/// The highest `?N` index appearing in a condition list, or 0 when there is
+/// none. Used by the guard below to check the hand-numbered placeholders.
+fn highest_placeholder(conds: &[String]) -> usize {
+    let mut highest = 0;
+    for cond in conds {
+        let bytes = cond.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] != b'?' {
+                i += 1;
+                continue;
+            }
+            let digits = cond[i + 1..]
+                .chars()
+                .take_while(char::is_ascii_digit)
+                .collect::<String>();
+            if let Ok(n) = digits.parse::<usize>() {
+                highest = highest.max(n);
+                i += 1 + digits.len();
+            } else {
+                i += 1;
+            }
+        }
+    }
+    highest
+}
+
+fn parse_facts(s: &str) -> Result<AssetFacts> {
     match serde_json::from_str(s) {
-        Ok(map) => Ok(map),
-        Err(_) if s.trim().is_empty() => Ok(BTreeMap::new()),
+        Ok(facts) => Ok(facts),
+        Err(_) if s.trim().is_empty() => Ok(AssetFacts::default()),
         Err(e) => Err(Error::Db(format!("bad extra json: {e}"))),
     }
 }
@@ -727,5 +779,44 @@ fn parse_kind(s: &str) -> Result<AssetKind> {
         "model" => AssetKind::Model,
         "" | "other" => AssetKind::Other,
         other => return Err(Error::Db(format!("bad kind {other}"))),
+    })
+}
+
+/// Distinct file extensions of live assets, lowercased and sorted. Powers
+/// the workspace format filter.
+pub fn distinct_exts(conn: &Connection) -> Result<Vec<String>> {
+    // `ext` stays bare in the query so `idx_assets_ext` can answer it —
+    // including the ordering. Wrapping it (`DISTINCT LOWER(ext) … ORDER BY
+    // LOWER(ext)`) makes the expression unindexable and turns a 4 µs index
+    // walk into a 32 ms scan of every live row, on a query the workspace
+    // toolbar runs once per frame. The case folding and de-duplication happen
+    // here instead; `to_ascii_lowercase` matches SQLite's `LOWER`, which is
+    // ASCII-only.
+    let raw: Vec<String> = rows::query_map(
+        conn,
+        "SELECT DISTINCT ext FROM assets \
+         WHERE trashed_at IS NULL AND ext != '' ORDER BY ext",
+        vec![],
+        |row| row.get::<_, String>(0).map_err(Error::from),
+    )?;
+    let mut exts: Vec<String> = raw.iter().map(|e| e.to_ascii_lowercase()).collect();
+    exts.sort_unstable();
+    exts.dedup();
+    Ok(exts)
+}
+
+fn usage_status_str(status: UsageStatus) -> String {
+    match status {
+        UsageStatus::Unused => "unused",
+        UsageStatus::Used => "used",
+    }
+    .to_string()
+}
+
+fn parse_usage_status(s: &str) -> Result<UsageStatus> {
+    Ok(match s {
+        "unused" => UsageStatus::Unused,
+        "used" => UsageStatus::Used,
+        other => return Err(Error::Db(format!("bad usage status {other}"))),
     })
 }

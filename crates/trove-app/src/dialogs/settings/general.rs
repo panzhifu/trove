@@ -115,7 +115,7 @@ fn recent_libraries_group(controller: &Entity<LibraryController>) -> SettingGrou
     let current = config.resolved_library_path();
     let mut group =
         SettingGroup::new().title(rust_i18n::t!("settings.recent_libraries").to_string());
-    let recent = config.recent_libraries.clone();
+    let recent: Vec<PathBuf> = trove_core::history::AppHistory::load().libraries().to_vec();
     if recent.is_empty() {
         group = group.item(SettingItem::new(
             rust_i18n::t!("settings.no_recent").to_string(),
@@ -176,8 +176,7 @@ fn recent_library_row(
                 .icon(IconName::Close)
                 .tooltip(rust_i18n::t!("settings.remove_recent").to_string())
                 .on_click(move |_, _, cx| {
-                    let mut config = AppConfig::load();
-                    let _ = config.remove_recent_library(&path);
+                    let _ = trove_core::history::AppHistory::load().remove_library(&path);
                     cx.refresh_windows();
                 }),
         )
@@ -487,8 +486,17 @@ fn switch_library(controller: &Entity<LibraryController>, path: PathBuf, cx: &mu
         let outcome = ctl.swap_library(path.clone()).and_then(|()| {
             let mut config = AppConfig::load();
             config.set_library_path(path.clone())?;
-            config.push_recent_library(path.clone())
+            let _ = trove_core::history::AppHistory::load().push_library(&path);
+            Ok(())
         });
+        // The old watch task scanned for the previous library; restart the
+        // resident watch on the new one.
+        if outcome.is_ok()
+            && let Some(handle) = ctl.watch_handle
+        {
+            let entity = cx.entity();
+            crate::library::jobs::start_watch_service(&entity, handle, cx);
+        }
         ctl.notice = match outcome {
             Ok(()) => None,
             Err(e) => Some(

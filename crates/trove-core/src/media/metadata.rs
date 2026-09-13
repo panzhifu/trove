@@ -5,15 +5,13 @@
 //! that cannot be parsed yields an empty [`MinedMetadata`] rather than an error,
 //! so mining never fails an import.
 
-use std::collections::BTreeMap;
 use std::path::Path;
 
 use chrono::{TimeZone, Utc};
 use exif::{Field, In, Tag, Value};
-use serde_json::Value as Json;
 
 use super::color;
-use crate::model::AssetKind;
+use crate::model::{AssetFacts, AssetKind};
 
 /// Metadata facts mined from a media file, merged into the asset on import.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -24,14 +22,8 @@ pub struct MinedMetadata {
     pub duration_ms: Option<u64>,
     /// Natural title (audio `title` tag, …).
     pub title: Option<String>,
-    /// Free-form camera / tag fields, stored in the asset's `extra` map.
-    pub extra: BTreeMap<String, Json>,
-}
-
-impl MinedMetadata {
-    fn insert(&mut self, key: &str, value: impl Into<Json>) {
-        self.extra.insert(key.to_string(), value.into());
-    }
+    /// Typed per-kind facts, persisted in the asset's `extra` JSON column.
+    pub facts: AssetFacts,
 }
 
 /// Mine metadata for a blob of `kind`. Never fails: unsupported kinds and
@@ -60,20 +52,21 @@ fn mine_font(path: &Path) -> Option<MinedMetadata> {
 
     let family = face_name(&face, ttf_parser::name_id::TYPOGRAPHIC_FAMILY)
         .or_else(|| face_name(&face, ttf_parser::name_id::FAMILY))?;
-    m.insert("font_family", family);
+    let font = &mut m.facts.font;
+    font.family = Some(family);
     if let Some(style) = face_name(&face, ttf_parser::name_id::TYPOGRAPHIC_SUBFAMILY)
         .or_else(|| face_name(&face, ttf_parser::name_id::SUBFAMILY))
     {
-        m.insert("font_style", style);
+        font.style = Some(style);
     }
     let weight = face.weight().to_number();
     if weight != 0 {
-        m.insert("font_weight", weight);
+        font.weight = Some(weight);
     }
     if face.style() == ttf_parser::Style::Italic {
-        m.insert("font_italic", true);
+        font.italic = Some(true);
     }
-    m.insert("font_glyphs", face.number_of_glyphs());
+    font.glyphs = Some(face.number_of_glyphs() as u32);
     Some(m)
 }
 
@@ -132,11 +125,9 @@ fn mine_image(path: &Path) -> MinedMetadata {
     // Universal color facts: present for every decodable image, unlike EXIF.
     let palette = color::dominant_colors(path);
     if let Some(first) = palette.first() {
-        m.insert("dominant_color", first.clone());
-        m.insert(
-            "dominant_colors",
-            Json::Array(palette.into_iter().map(Json::String).collect()),
-        );
+        let visual = &mut m.facts.visual;
+        visual.dominant_color = Some(first.clone());
+        visual.dominant_colors = Some(palette);
     }
 
     // EXIF below is best-effort: unreadable or EXIF-less images stop here but
@@ -157,31 +148,32 @@ fn mine_image(path: &Path) -> MinedMetadata {
         m.captured_at = parse_exif_datetime(&date.display_value().to_string());
     }
 
+    let photo = &mut m.facts.photo;
     if let Some(v) = exif.get_field(Tag::Make, In::PRIMARY) {
-        m.insert("make", v.display_value().to_string());
+        photo.make = Some(v.display_value().to_string());
     }
     if let Some(v) = exif.get_field(Tag::Model, In::PRIMARY) {
-        m.insert("model", v.display_value().to_string());
+        photo.model = Some(v.display_value().to_string());
     }
     if let Some(v) = exif.get_field(Tag::PhotographicSensitivity, In::PRIMARY)
         && let Some(first) = v.value.get_uint(0)
     {
-        m.insert("iso", first);
+        photo.iso = Some(first);
     }
     if let Some(v) = exif.get_field(Tag::FNumber, In::PRIMARY)
         && let Some(r) = first_ratio(&v.value)
     {
-        m.insert("aperture_f", format!("f/{r}"));
+        photo.aperture_f = Some(format!("f/{r}"));
     }
     if let Some(v) = exif.get_field(Tag::FocalLength, In::PRIMARY)
         && let Some(r) = first_ratio(&v.value)
     {
-        m.insert("focal_length_mm", trimmed(r));
+        photo.focal_length_mm = Some(trimmed(r));
     }
     if let Some(v) = exif.get_field(Tag::ExposureTime, In::PRIMARY)
         && let Some(r) = first_ratio(&v.value)
     {
-        m.insert("exposure_time", format!("{r}s"));
+        photo.exposure_time = Some(format!("{r}s"));
     }
 
     if let (Some(lat), Some(lng)) = (
@@ -201,8 +193,8 @@ fn mine_image(path: &Path) -> MinedMetadata {
             } else {
                 lng
             };
-            m.insert("gps_lat", num(lat));
-            m.insert("gps_lng", num(lng));
+            photo.gps_lat = Some(lat);
+            photo.gps_lng = Some(lng);
         }
     }
 
@@ -288,10 +280,6 @@ fn west(field: Option<&Field>) -> bool {
     gps_ref(field, b'W')
 }
 
-fn num(v: f64) -> Json {
-    Json::Number(serde_json::Number::from_f64(v).unwrap_or_else(|| serde_json::Number::from(0)))
-}
-
 // -- audio -------------------------------------------------------------------
 
 /// Extract tags + duration from an audio file via lofty. Best-effort: an
@@ -303,6 +291,7 @@ fn mine_audio(path: &Path) -> Option<MinedMetadata> {
 
     let tagged = Probe::open(path).ok()?.read().ok()?;
     let mut m = MinedMetadata::default();
+    let media = &mut m.facts.media;
 
     // Prefer a title from any tag present. Accessor values are `Cow<str>`.
     if let Some(title) = tagged
@@ -311,21 +300,21 @@ fn mine_audio(path: &Path) -> Option<MinedMetadata> {
         .find_map(|t| t.title().map(|s| s.into_owned()))
     {
         m.title = Some(title.clone());
-        m.insert("title", title);
+        media.embedded_title = Some(title);
     }
     if let Some(artist) = tagged
         .tags()
         .iter()
         .find_map(|t| t.artist().map(|s| s.into_owned()))
     {
-        m.insert("artist", artist);
+        media.artist = Some(artist);
     }
     if let Some(album) = tagged
         .tags()
         .iter()
         .find_map(|t| t.album().map(|s| s.into_owned()))
     {
-        m.insert("album", album);
+        media.album = Some(album);
     }
 
     let duration = tagged.properties().duration();
@@ -364,8 +353,8 @@ mod tests {
         // No EXIF on a hand-crafted PNG…
         assert!(m.captured_at.is_none());
         // …but the universal color facts are always present.
-        assert!(m.extra.contains_key("dominant_color"));
-        assert!(m.extra.contains_key("dominant_colors"));
+        assert!(m.facts.visual.dominant_color.is_some());
+        assert!(m.facts.visual.dominant_colors.is_some());
     }
 
     #[test]
@@ -373,7 +362,7 @@ mod tests {
         let g = tmp("garbage.mp3", b"not really an mp3");
         let m = mine(&g, AssetKind::Audio);
         assert!(m.duration_ms.is_none());
-        assert!(m.extra.is_empty());
+        assert!(m.facts.is_empty());
         for kind in [
             AssetKind::Video,
             AssetKind::Document,
@@ -393,9 +382,11 @@ mod tests {
         let Some(path) = face else { return };
         let m = mine(&path, AssetKind::Font);
         assert!(
-            m.extra
-                .get("font_family")
-                .is_some_and(|v| v.as_str().is_some_and(|s| !s.is_empty())),
+            m.facts
+                .font
+                .family
+                .as_deref()
+                .is_some_and(|s| !s.is_empty()),
             "family missing for {}",
             path.display()
         );

@@ -158,8 +158,11 @@ pub fn move_to(conn: &Connection, id: Uuid, new_parent: Option<Uuid>, position: 
 }
 
 /// Delete a collection. The DB cascades to children and to the
-/// `asset_collection` membership rows; the assets themselves are kept.
+/// `asset_collection` membership rows; the assets themselves are kept. Smart
+/// collections nested under it are removed as well (their parent reference
+/// is not SQL-enforced, so the cleanup is explicit).
 pub fn delete(conn: &Connection, id: Uuid) -> Result<()> {
+    super::smart_collections::delete_under_collection(conn, id)?;
     rows::execute(
         conn,
         "DELETE FROM collections WHERE id = ?1",

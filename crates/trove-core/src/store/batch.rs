@@ -73,7 +73,7 @@ pub fn add_to_collection_many(conn: &Connection, collection_id: Uuid, ids: &[Uui
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{Asset, AssetKind, Origin, now};
+    use crate::model::{Asset, AssetKind, Origin, UsageStatus, now};
     use crate::store::Store;
 
     fn sample_asset(store: &Store, name: &str, kind: AssetKind) -> Uuid {
@@ -97,8 +97,9 @@ mod tests {
             rating: None,
             is_favorite: false,
             source_url: None,
-            color_label: None,
-            extra: Default::default(),
+            usage_status: UsageStatus::Unused,
+            commercial_use: None,
+            facts: Default::default(),
             created_at: now(),
             updated_at: now(),
             trashed_at: None,
@@ -115,7 +116,7 @@ mod tests {
 
         assert_eq!(set_trashed_many(store.conn(), &[], true).unwrap(), 0);
         assert_eq!(set_trashed_many(store.conn(), &[a, b], true).unwrap(), 2);
-        let (_, trashed) = crate::store::assets::query(
+        let trashed = crate::store::assets::query(
             store.conn(),
             &crate::model::AssetQuery {
                 is_trashed: true,
@@ -123,19 +124,18 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(trashed.len(), 2);
+        assert_eq!(trashed.items.len(), 2);
 
         // Restore only one.
         assert_eq!(set_trashed_many(store.conn(), &[a], false).unwrap(), 1);
-        let (_, live) =
-            crate::store::assets::query(store.conn(), &crate::model::AssetQuery::default())
-                .unwrap();
-        assert_eq!(live.len(), 1);
+        let live = crate::store::assets::query(store.conn(), &crate::model::AssetQuery::default())
+            .unwrap();
+        assert_eq!(live.items.len(), 1);
 
         // Bring `b` back so both are live, then favorite both in one statement.
         assert_eq!(set_trashed_many(store.conn(), &[b], false).unwrap(), 1);
         assert_eq!(set_favorite_many(store.conn(), &[a, b], true).unwrap(), 2);
-        let (_, all) = crate::store::assets::query(
+        let all = crate::store::assets::query(
             store.conn(),
             &crate::model::AssetQuery {
                 is_favorite: Some(true),
@@ -143,7 +143,7 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(all.len(), 2);
+        assert_eq!(all.items.len(), 2);
     }
 
     #[test]

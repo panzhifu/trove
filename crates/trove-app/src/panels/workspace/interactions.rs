@@ -33,6 +33,7 @@ impl WorkspacePanel {
                         if !name.is_empty() {
                             ctl.update(cx, |ctl, cx| {
                                 let input = NewSmartCollection {
+                                    parent_id: None,
                                     name,
                                     query: json!({
                                         "op": "match",
@@ -101,13 +102,20 @@ impl WorkspacePanel {
     }
 
     /// Title-bar label: the name of whatever the library is currently
-    /// browsed through — smart collection, collection (with its parent
-    /// prefix when nested), trash, recently viewed, or the all-assets
-    /// fallback.
+    /// browsed through — the active visual search, smart collection,
+    /// collection (with its parent prefix when nested), trash, recently
+    /// viewed, or the all-assets fallback.
     pub(super) fn title_label(&self, cx: &Context<Self>) -> String {
         let ctl = self.controller.read(cx);
         let conn = ctl.library.store().conn();
 
+        if let Some(visual) = &ctl.visual_results {
+            return format!(
+                "{} · {}",
+                rust_i18n::t!("workspace.visual_title"),
+                visual.label
+            );
+        }
         if ctl.showing_trash {
             return rust_i18n::t!("app.trash").to_string();
         }
@@ -234,12 +242,19 @@ impl WorkspacePanel {
 
     /// Enter: preview the primary selected asset full-size in the main
     /// area. A 3D model takes over the main area with the interactive
-    /// viewport; everything else shows the full-size still, live video or
-    /// large font specimen from `components::preview`.
+    /// viewport; a not-imported system font shows its specimen; everything
+    /// else shows the full-size still, live video or large font specimen
+    /// from `components::preview`.
     pub(super) fn open_preview(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(id) = self.controller.read(cx).primary() else {
             return;
         };
+        // A virtual system font has no store record: preview straight from
+        // its scanned entry.
+        if let Some(font) = self.controller.read(cx).virtual_fonts.get(&id).cloned() {
+            self.open_virtual_font_preview(font, window, cx);
+            return;
+        }
         // A mesh is worth more than a picture of a mesh: the viewport lets it
         // be turned and zoomed, and a static picture is no way to look at one.
         if let Some((name, path)) = model_source(self.controller.read(cx), id) {
@@ -258,7 +273,8 @@ impl WorkspacePanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let viewport = ModelViewport::spawn(name, path, cx);
+        let tasks = self.controller.read(cx).library.tasks().clone();
+        let viewport = ModelViewport::spawn(name, path, tasks, cx);
         let subscription = cx.subscribe(&viewport, |this, _, event: &ModelViewportEvent, cx| {
             if *event == ModelViewportEvent::Closed {
                 this.forget_preview(cx);
@@ -267,6 +283,28 @@ impl WorkspacePanel {
         // Enter on another asset while one is already showing: let the old
         // preview hand its frame back before it is dropped.
         if let Some(previous) = self.preview.replace(MainPreview::Model(viewport)) {
+            previous.release(window, cx);
+        }
+        self.preview_subscription = Some(subscription);
+        cx.notify();
+    }
+
+    /// Show a not-imported system font as a full-size specimen in the main
+    /// area. The file stays where it is; nothing touches the library.
+    fn open_virtual_font_preview(
+        &mut self,
+        font: trove_core::services::font_manager::SystemFont,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let data = AssetPreviewData::for_system_font(&font);
+        let preview = AssetPreviewPanel::spawn_with_data(data, cx);
+        let subscription = cx.subscribe(&preview, |this, _, event: &AssetPreviewEvent, cx| {
+            if *event == AssetPreviewEvent::Closed {
+                this.forget_preview(cx);
+            }
+        });
+        if let Some(previous) = self.preview.replace(MainPreview::Asset(preview)) {
             previous.release(window, cx);
         }
         self.preview_subscription = Some(subscription);
@@ -308,27 +346,5 @@ impl WorkspacePanel {
             self.preview_subscription = None;
             cx.notify();
         }
-    }
-
-    /// Select an asset and scroll the grid so its row is visible. Used by
-    /// the similar-images / colour-search dialog: clicking a hit should
-    /// land the user on that asset. No-op scrolling when the asset is not
-    /// part of the loaded rows (it may live outside the browsed view).
-    pub(super) fn reveal_asset(&mut self, id: Uuid, cx: &mut Context<Self>) {
-        let row_ix = self
-            .rows
-            .iter()
-            .position(|row| row.cells.iter().any(|cell| cell.id == id));
-        self.controller.update(cx, |ctl, cx| {
-            ctl.select_asset(Some(id));
-            if row_ix.is_none() {
-                ctl.notice = Some(rust_i18n::t!("workspace.reveal_not_in_view").to_string());
-            }
-            cx.notify();
-        });
-        if let Some(ix) = row_ix {
-            self.list_state.scroll_to_reveal_item(ix);
-        }
-        cx.notify();
     }
 }

@@ -26,7 +26,7 @@ use trove_core::store::{smart, smart_collections, tags};
 use uuid::Uuid;
 
 use crate::library::LibraryController;
-use crate::panels::common::{COLOR_LABEL_SWATCHES, color_swatch};
+use crate::panels::common::color_swatch;
 
 // ============================ draft state ====================================
 
@@ -40,7 +40,6 @@ struct ConditionRow {
     favorite: bool,
     tag: String,
     rating: u8,
-    label: String,
     orientation: String,
 }
 
@@ -62,7 +61,6 @@ impl ConditionRow {
             favorite: true,
             tag: String::new(),
             rating: 3,
-            label: String::new(),
             orientation: String::new(),
         }
     }
@@ -78,10 +76,7 @@ impl ConditionRow {
             | SmartField::AspectRatio => !self.text.read(cx).value().trim().is_empty(),
             SmartField::Tag => !self.tag.is_empty(),
             SmartField::Orientation => !self.orientation.is_empty(),
-            SmartField::Kind
-            | SmartField::IsFavorite
-            | SmartField::Rating
-            | SmartField::ColorLabel => true,
+            SmartField::Kind | SmartField::IsFavorite | SmartField::Rating => true,
         }
     }
 }
@@ -91,6 +86,10 @@ struct RuleDraft {
     controller: Entity<LibraryController>,
     /// `Some(id)` while editing an existing smart collection.
     editing: Option<Uuid>,
+    /// Where a *new* smart collection is created: another smart collection or
+    /// a regular collection, `None` for the top level. Ignored while editing
+    /// — [`open_rule_editor`] never moves the edited row.
+    parent: Option<Uuid>,
     name_input: Entity<InputState>,
     and_mode: bool,
     rows: Vec<ConditionRow>,
@@ -182,13 +181,6 @@ impl RuleDraft {
         self.touch(cx);
     }
 
-    fn set_label(&mut self, ix: usize, label: String, cx: &mut Context<Self>) {
-        if let Some(row) = self.rows.get_mut(ix) {
-            row.label = label;
-        }
-        self.touch(cx);
-    }
-
     fn set_orientation(&mut self, ix: usize, orientation: String, cx: &mut Context<Self>) {
         if let Some(row) = self.rows.get_mut(ix) {
             row.orientation = orientation;
@@ -267,7 +259,6 @@ impl RuleDraft {
                 SmartField::Rating => serde_json::json!(row.rating),
                 SmartField::Kind => serde_json::json!(row.kind),
                 SmartField::IsFavorite => serde_json::json!(row.favorite),
-                SmartField::ColorLabel => serde_json::json!(row.label),
             };
             children.push(node);
         }
@@ -284,14 +275,16 @@ impl RuleDraft {
             return;
         }
         self.evaluated = self.revision;
-        let conn = self.controller.read(cx).library.store().conn();
+        let ctl = self.controller.read(cx);
+        let conn = ctl.library.store().conn();
+        let text_index = ctl.library.text_index();
         let outcome = self.build_json(cx).and_then(|json| {
             // The raw serde message is English internals; the localized
             // "invalid rule" label is enough for the live count status.
             let node = smart::node_from_json(&json)
                 .map_err(|_| rust_i18n::t!("rules.match_error").to_string())?;
-            smart::evaluate(conn, &node, None, 0)
-                .map(|(total, _)| total)
+            smart::evaluate(conn, Some(text_index), &node, None, 0)
+                .map(|page| page.total)
                 .map_err(|e| e.to_string())
         });
         match outcome {
@@ -395,7 +388,6 @@ fn field_json(field: SmartField) -> &'static str {
         SmartField::Extension => "extension",
         SmartField::SizeBytes => "size_bytes",
         SmartField::Color => "color",
-        SmartField::ColorLabel => "color_label",
         SmartField::CapturedAt => "captured_at",
         SmartField::AspectRatio => "aspect_ratio",
         SmartField::Orientation => "orientation",
@@ -482,9 +474,6 @@ fn load_rows(
             SmartField::Tag => {
                 row.tag = value.as_str().unwrap_or_default().to_string();
             }
-            SmartField::ColorLabel => {
-                row.label = value.as_str().unwrap_or_default().to_string();
-            }
         }
         rows.push(row);
     }
@@ -494,14 +483,19 @@ fn load_rows(
 // ============================ the dialog =====================================
 
 /// Open the rule editor: empty for a new smart collection, prefilled from
-/// `editing`'s stored tree otherwise.
+/// `editing`'s stored tree otherwise. `parent` places a new smart collection
+/// under another one (or under a regular collection); it is ignored when
+/// `editing` is `Some`.
 pub fn open_rule_editor(
     window: &mut Window,
     cx: &mut App,
     controller: Entity<LibraryController>,
     editing: Option<SmartCollection>,
+    parent: Option<Uuid>,
 ) {
     let is_edit = editing.is_some();
+    // Editing never reparents; only a fresh collection has somewhere to land.
+    let parent = if is_edit { None } else { parent };
     let name_input = cx.new(|cx| {
         InputState::new(window, cx)
             .placeholder(rust_i18n::t!("explorer.name_placeholder").to_string())
@@ -533,6 +527,7 @@ pub fn open_rule_editor(
     let draft = cx.new(|_| RuleDraft {
         controller,
         editing: editing.map(|sc| sc.id),
+        parent,
         name_input,
         and_mode,
         rows,
@@ -642,13 +637,22 @@ fn save_draft(draft: &Entity<RuleDraft>, cx: &mut App) -> bool {
                 .map(|_| id)
                 .map_err(|e| e.to_string()),
             None => {
+                // Appended after its siblings, which share one ordering
+                // space per parent.
+                let position = smart_collections::list(conn)
+                    .map(|all| all.iter().filter(|sc| sc.parent_id == d.parent).count())
+                    .unwrap_or(0) as i64;
                 let input = trove_core::model::NewSmartCollection {
+                    parent_id: d.parent,
                     name: name.clone(),
                     query: json,
                     color: d.color.clone(),
-                    position: smart_collections::list(conn).map(|l| l.len()).unwrap_or(0) as i64,
+                    position,
                 };
+                // Name checks live in the model; the condition tree is
+                // validated where it compiles (store::smart).
                 input.validate().map_err(|e| e.to_string())?;
+                trove_core::store::smart::validate_json(&input.query).map_err(|e| e.to_string())?;
                 smart_collections::create(conn, &input)
                     .map(|created| created.id)
                     .map_err(|e| e.to_string())
@@ -657,9 +661,16 @@ fn save_draft(draft: &Entity<RuleDraft>, cx: &mut App) -> bool {
     });
 
     match outcome {
-        Ok(_) => {
+        Ok(saved) => {
             draft.update(cx, |d, cx| {
+                let created = d.editing.is_none();
                 d.controller.update(cx, |ctl, cx| {
+                    // A fresh smart collection becomes the browsed one, the
+                    // way the collections "+" selects what it just created;
+                    // an edit leaves the current view alone.
+                    if created {
+                        ctl.select_smart(Some(saved));
+                    }
                     ctl.generation += 1;
                     cx.notify();
                 });
@@ -812,7 +823,7 @@ fn render_row(
     cx: &mut App,
 ) -> Div {
     let t = |k: &str| rust_i18n::t!(k).to_string();
-    let (kind, favorite, tag, rating, label, orientation, tag_names, text_input) = {
+    let (kind, favorite, tag, rating, orientation, tag_names, text_input) = {
         let d = draft.read(cx);
         let row = &d.rows[ix];
         (
@@ -820,7 +831,6 @@ fn render_row(
             row.favorite,
             row.tag.clone(),
             row.rating,
-            row.label.clone(),
             row.orientation.clone(),
             d.tag_names.clone(),
             row.text.clone(),
@@ -843,7 +853,6 @@ fn render_row(
                 (SmartField::Extension, "rules.f_extension"),
                 (SmartField::SizeBytes, "rules.f_size"),
                 (SmartField::Color, "rules.f_color"),
-                (SmartField::ColorLabel, "rules.f_label"),
                 (SmartField::CapturedAt, "rules.f_captured"),
                 (SmartField::AspectRatio, "rules.f_aspect"),
                 (SmartField::Orientation, "rules.f_orientation"),
@@ -937,27 +946,6 @@ fn render_row(
             {
                 let d = draft.clone();
                 move |picked: String, cx| d.update(cx, |d, cx| d.set_tag(ix, picked, cx))
-            },
-        )),
-        SmartField::ColorLabel => h_flex().flex_1().min_w_0().child(dropdown_button(
-            format!("row-{ix}-label"),
-            if label.is_empty() {
-                t("rules.no_label")
-            } else {
-                rust_i18n::t!(format!("workspace.label_{label}")).to_string()
-            },
-            std::iter::once((String::new(), rust_i18n::t!("rules.no_label").to_string()))
-                .chain(COLOR_LABEL_SWATCHES.iter().map(|(name, _)| {
-                    (
-                        name.to_string(),
-                        rust_i18n::t!(format!("workspace.label_{name}")).to_string(),
-                    )
-                }))
-                .collect(),
-            label,
-            {
-                let d = draft.clone();
-                move |picked: String, cx| d.update(cx, |d, cx| d.set_label(ix, picked, cx))
             },
         )),
         SmartField::Orientation => h_flex().flex_1().min_w_0().child(dropdown_button(
@@ -1114,7 +1102,6 @@ fn field_key(field: SmartField) -> &'static str {
         SmartField::Extension => "rules.f_extension",
         SmartField::SizeBytes => "rules.f_size",
         SmartField::Color => "rules.f_color",
-        SmartField::ColorLabel => "rules.f_label",
         SmartField::CapturedAt => "rules.f_captured",
         SmartField::AspectRatio => "rules.f_aspect",
         SmartField::Orientation => "rules.f_orientation",
@@ -1155,7 +1142,6 @@ fn allowed_ops(field: SmartField) -> &'static [SmartCompare] {
         | SmartField::Kind
         | SmartField::IsFavorite
         | SmartField::Color
-        | SmartField::ColorLabel
         | SmartField::Orientation
         | SmartField::Extension => &[SmartCompare::Eq, SmartCompare::Ne],
         SmartField::Rating
