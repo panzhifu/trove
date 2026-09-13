@@ -1,10 +1,19 @@
-# Trove
+<h1 align="center">Trove</h1>
 
-> A local, private asset library — your photos, documents, audio and video in one searchable, taggable place.
+<p align="center"><b>Local · Private · Your own asset library</b></p>
 
-Trove is a desktop asset manager built in Rust. It uses **[gpui-kit]** for the interface and **[rusqlite]** (SQLite) for single-file persistence. Assets are stored content-addressed on disk, so a file is stored exactly once no matter how it is organized.
+<p align="center">
+  <a href="./README.zh.md">中文（主要文档）</a> ·
+  <a href="./LICENSE">MIT</a>
+</p>
 
-[中文文档 (Chinese README)](./README.zh.md)
+<br>
+
+<p align="center">
+  <img src="docs/screenshots/main-window.png" alt="Trove main window" width="900"/>
+</p>
+
+<p align="center"><i>Justified grid · dock layout · 3D model viewport · semantic search — all local, data never leaves your machine</i></p>
 
 ---
 
@@ -15,216 +24,87 @@ git clone https://github.com/panzhifu/trove.git && cd trove
 cargo run -p trove-app
 ```
 
-The first launch creates a library under the platform's config directory. Open **Settings** in the title bar to change the library location.
+> Needs the [Rust toolchain](https://www.rust-lang.org/tools/install). First launch creates a library under your platform's config directory; open **Settings** to relocate it.
+
+This README summarizes what ships. The **[Chinese README](./README.zh.md)** is the canonical, most up-to-date document.
+
+[docs/](docs/README.md) · [Feature gaps](docs/FEATURE-GAPS.md)
 
 ---
 
-## Features
+## What's inside
 
-### Asset import
-- Drag-and-drop files onto the window, or pick files from the system dialog.
-- Content-addressed blob storage: identical files are deduplicated.
-- Type probing and metadata mining on import — dimensions, duration, dominant color and more.
-- **Smart collections automatically capture matching assets** — no manual sorting needed.
+### Organize & find
 
-### Collections & tree navigation
-- Nested collections form a tree with many-to-many asset membership.
-- Cycle detection prevents accidental loops when moving folders.
-- Cascading delete removes child folders.
+- **Full-text search** — Tantivy-backed, over file name / title / description / tag name, ranked. Word, substring and pinyin matching (`sunse` → `Sunset`, `mao` → 花园里的猫), composable with any filter.
+- **Visual search** — search by image + search by color. Perceptual hash (pHash) + color histogram, computed at import, zero inference required.
+- **Semantic search** *(optional)* — CLIP text-to-image + image-to-image in the same box. Needs a manually-downloaded ONNX model.
+- **Smart collections** — rule-driven virtual folders as JSON query trees. Match on rating / kind / text / tag / favorite / color / date / aspect ratio / orientation; `and` / `or`. Validated at compile time.
+- **Tags** — hierarchical, case-insensitive, color labels; filters, counts and smart collections include subtrees.
+- **Ratings & favorites** — 1–5 stars, one-click favorite.
+- **Collection tree** — nested folders, many-to-many membership, drag to reparent, cycle detection.
 
-### Asset types
-- Images, videos, audio, documents, archives, **fonts** (ttf/otf/ttc/woff), and more — with per-kind icons in the grid.
-- Import-time mining: EXIF, audio tags & duration, font family/style/weight, MP4 dimensions & duration; video posters via the system `ffmpeg` when available.
+### Import & collect
 
-### Bulk selection
-- Multi-select with Ctrl/Cmd+click or Shift range click; a floating toolbar offers favorite / add-to-collection / trash / clear.
+- **Drag-and-drop** — drop files from the file manager onto the window (the whole window is a drop surface).
+- **Paste to import** — `Ctrl+Shift+V` sends a clipboard image straight into the library.
+- **Import from URL** — downloads in the background, imports, records the source URL.
+- **Watched folders** — add a directory in Settings; new files are imported automatically.
+- **Import mode** — copy into library (default) / link to original. Linked assets stay where they are and can be re-linked by SHA-256 after moving.
+- **RAW / HEIC / SVG / PSD** — camera RAW through the rawler pipeline; HEIC via system `heif-dec`; SVG rasterized, PSD composites its embedded preview.
+- **Design-format thumbnails** — mines EXIF / audio tags / font family·style·weight / MP4 dimensions; video poster when ffmpeg is present.
 
-### Tags & favorites & ratings
-- Case-insensitive tags attach to any asset.
-- One-click favorites and a 1–5 rating scale.
+### Browse & inspect
 
-### Full-text search
-- Ranked full-text search over file names, titles, descriptions and tag names, combined with any filter (Tantivy index under `<root>/search_index`).
-- Word, substring and pinyin matching: `sunse` finds `Sunset`, `ower` finds `flower`, and `mao` / `hyl` find 花园里的猫.
-- Special characters are handled safely and literally.
-- An outbox queue keeps the index in sync with every asset/tag write; a lost index rebuilds itself, and a maintenance command can force a full rebuild.
+- **Three views** — grid (justified layout) / list / timeline, with density slider, multi-select and a floating toolbar.
+- **Inspector** — thumbnail + tags + color palette + inline editing (title / description / source URL / rating); properties page shows MIME / size / dimensions / SHA-256; one-click reveal of the underlying file.
+- **Animated images** — GIF / animated WebP / APNG play frame-by-frame in the preview dialog and Inspector; grid thumbnails stay static for performance.
+- **Font live previews** — specimen-card thumbnails rasterized in the font itself at import; sample text customizable in Settings; a Fonts system view and per-font system install / uninstall from the Inspector.
+- **Recently viewed** — sidebar of the last 200 assets; trashed assets drop out until restored.
 
-### Visual search (v0.2)
-- **Search by image**: find visually similar images using perceptual hash + color histogram.
-- **Search by color**: find images matching a specific hex color (e.g. `#ff8000`).
-- Visual signatures computed in background after import — no slowdown.
+### 3D model preview
 
-### Semantic search (CLIP, optional)
-- Text-to-image search merged into the same search box: keyword (FTS) hits first, CLIP matches appended and deduplicated.
-- Image-to-image search against CLIP embeddings in the visual-search panel.
-- Embeddings are computed automatically after import; "Embed all" backfills existing images (Settings ▸ Search).
-- Requirements (manual download, paths shown in Settings ▸ Search): the ONNX Runtime shared library, the CLIP ViT-B/32 ONNX model (`model.onnx`) and its BPE vocab (`bpe_simple_vocab_16e6.txt`) in the model directory.
-- The model is English-caption trained — English queries match noticeably better than other languages.
+- **Formats** — OBJ / STL / PLY imported as a first-class asset kind.
+- **GPU viewport** — wgpu-powered, orbit / zoom / pan, two-sided Lambert + Blinn-Phong shading; falls back to a CPU software rasterizer when no GPU is available.
+- **Quality** — eye-dome lighting (EDL) + gap fill + back-face culling on closed meshes.
+- **Large files** — streaming resident budget + thinning so 20 GB never OOMs; coverage-preserving sampling; smooth zoom and pan; offline spatial index optional (`.trovecloud`, 9 B/point, 60% of source).
+- **Mesh culling** — large meshes (≥8192 tris) are clustered into meshlets with per-cluster GPU frustum culling.
 
-### Smart collections
-- Rule-based virtual folders defined as JSON query trees.
-- Match on rating, kind, text, tag, favorite, color; combine with `and` / `or`.
-- Trees are validated at compile time, and results support pagination.
+### Video & screenshots
 
-### Trash & cleanup
-- Deleted assets go to the trash, with restore at any time.
-- Emptying the trash frees the underlying blobs and thumbnails.
-- Orphan cleanup removes blobs no longer referenced by any asset.
+- **Silent preview** — frame-by-frame ffmpeg decode with play / pause / seek / timeline; no audio pipeline.
+- **Screenshot capture** — full screen or interactive region, imported as PNG. Platform-native backends (gnome-screenshot / scrot / macOS screencapture / Windows snippingtool), user-overridable.
+- **Batch conversion** — re-encode images to JPEG / PNG / WebP / BMP / TIFF, optional longest-edge cap, optional re-import.
 
-### Drag & drop
-- Drag files from the file manager onto the window to import.
-- Drag assets onto a collection or the trash in the explorer.
-- Drag assets onto a tag to tag them in bulk.
-- Multi-select with Ctrl/Cmd+click; drag moves the whole selection.
+### Maintenance & safety
 
-### Context menus
-- Asset: favorite, color label, reveal in file manager, add to collection, move to trash / restore / delete forever.
-- Collection: new sub-collection, rename, delete.
-- Tag: filter by tag, delete.
-- Smart collection: delete.
-- Inline editing: add/rename collections via Enter-to-confirm editors.
+- **Trash** — delete → trash → restore / delete forever; emptying frees blobs and thumbnails.
+- **Orphan cleanup** — removes blobs no longer referenced by any asset.
+- **Integrity check** — re-hashes every stored file and compares with the record; one-click move-to-trash for bad ones.
+- **Auto backup** — SQLite `VACUUM INTO` snapshot into `backups/` (at most once a day, rolling 10).
+- **Duplicate finder** — clusters visually identical images by pHash; "keep newest, trash the rest" per group.
+- **Library hot-switch** — recent libraries; live statistics (counts, size, tags, collections).
 
-### Inspector
-- Thumbnail preview with dynamic height based on image aspect ratio.
-- Tags and mined color palette.
-- Inline editing: title, description, source URL, kind, and a 1–5 star rating — committed on blur/Enter or click.
-- Properties: MIME type, size, dimensions, added date, SHA-256, and a one-click reveal of the underlying file.
-- Add or remove tags directly.
+### Extensions
 
-### Collection entry points
-- **Paste & Import** (Ctrl+Shift+V): the clipboard image lands straight in the library.
-- **Import from URL**: File ▸ Import from URL… downloads the file in the background and imports it, recording the source URL.
-- **Watched folders**: Settings ▸ General lists watched roots; anything new under them imports automatically (unfiled). A folder is baselined on first sight — attaching a watch never retro-imports what is already there.
-- **Import mode**: Settings ▸ General chooses between *copy into library* (default) and *link to original files* — linked assets stay where they are, keep a "Linked" badge in the Inspector and are revealed at their original path. If the original file is moved or deleted, the Inspector shows a "File missing" badge and a one-click **relink** to its new location (SHA-256 verified).
-
-### Color labels & duplicate finder
-- Per-asset **color labels** (red…purple) via the shared color-label widget: Inspector swatch row and grid context menu; smart collections can match `color_label` too (including "no label"). Right-clicking an Inspector mined-color swatch searches images with the same color or copies the hex.
-- **Find Duplicates** (File menu): clusters visually identical images by perceptual hash (distance ≤ 8/64) and offers per-group "keep newest, trash the rest".
-
-### Recently viewed & library health (0.3)
-- **Recently viewed** system view (explorer sidebar): the last 200 assets you selected, most recent first; trashed assets drop out until restored; clear from the title bar.
-- **Integrity check** (Settings ▸ Maintenance): recomputes the SHA-256 of every stored file and compares it with the record — flags missing and corrupted files, each with a one-click move-to-trash.
-- **Smart collection fields**: captured date, aspect ratio and orientation join the rule builder alongside rating/kind/text/tag/size/color.
-- **Animated images**: GIF / animated WebP / APNG play frame-by-frame in the preview dialog and the Inspector (APNG is decoded manually and cached); grid thumbnails stay static for performance.
-- **Font grid live previews**: a specimen-card thumbnail (sample text rendered in the font itself, missing glyphs skipped) is rasterized at import; the sample text is customizable in Settings.
-- **Font collection & system install**: a Fonts system view lists every font in the library; the Inspector can **install** a font for the current user (Linux/macOS, font cache refreshed) or uninstall it, with an installed badge.
-
-### 3D model preview (0.4)
-- **Model asset kind**: OBJ/STL/PLY files are imported as a first-class asset type with format-specific icons.
-- **GPU viewport**: selecting a model hands the main content area to a wgpu-powered 3D viewport — orbit, zoom, and inspect with two-sided Lambert + Blinn-Phong shading. Falls back to a CPU software rasterizer (same shading model) when no GPU is available (remote session, VM, missing driver).
-- Parsing is pure-Rust, deliberately lenient: unknown lines and extra vertex properties are skipped; only a file yielding no triangle at all fails.
-
-### Video playback (0.4)
-- **Silent preview**: video assets open to a frame-by-frame player in the preview dialog — piped from ffmpeg, single-frame decode loop, transport controls (play/pause, seek, timeline). No audio pipeline; the preview is about looking, not listening.
-
-### Screenshot capture (0.4)
-- **Capture into the library** (File ▸ Screenshot…): grab the full screen or pick a region interactively, import the PNG directly. Platform-native backends (gnome-screenshot, scrot, macOS `screencapture`, Windows `snippingtool`) with a user-overridable custom command.
-
-### Batch format conversion (0.4)
-- **Convert images** (Edit ▸ Convert…): re-encode selected image assets to JPEG/PNG/WebP/BMP/TIFF, into a user-chosen folder, with an optional longest-edge cap. Optionally re-import the converted files.
-
-### Library safety & management
-- **Automatic backups**: the database is snapshotted with SQLite `VACUUM INTO` into `backups/` at most once a day (on library open), rolling 10 files; Maintenance ▸ Backups snapshots on demand.
-- **Recent libraries** for one-click hot switching, and a live **statistics** block (counts per kind, total size, tags, collections).
-
-### Power tools (P1)
-- **Batch rename** with a `{n}` (index) / `{name}` (file stem) pattern and a live preview — the whole batch is one undo step.
-- **Hierarchical tags**: nest tags, filters/counts/smart collections include the whole subtree, deleting a parent promotes its children.
-- **Library restore**: File ▸ Import library… rebuilds collections/tags/smart collections from an export; assets link by content hash or wait as placeholders that self-heal when the media is re-imported.
-- **Local collect service**: `http://127.0.0.1:23916` accepts `POST /add` (raw bytes) and `POST /fetch` (server-side download) — collected files import automatically with their source URL (browser-extension ready).
-- **Batch format conversion**: as described above, re-encode images to JPEG/PNG/WebP/BMP/TIFF.
-- **Screenshot capture**: as described above, grab the screen directly into the library.
-
-### Design formats, folders & portability
-- **SVG & PSD thumbnails**: SVGs rasterize (with text, via system fonts), PSDs composite their embedded preview — dimensions are mined at import.
-- **Camera RAW & HEIC**: CR2/CR3/NEF/ARW/DNG/RAF/ORF/RW2 and friends decode through the rawler pipeline (demosaic → white balance → sRGB, orientation-aware); HEIC/HEIF converts via the system `heif-dec` when present.
-- **Folders panel**: imports remember their source path; browse a folder tree in the left dock and filter the grid to any subtree.
-- **Media packages**: File ▸ Export Media Package… writes a portable folder (metadata + blobs); Import library… accepts both bare JSON exports and packages, healing records by content hash.
-- **Browser extension**: `extension/` ships an MV3 addon — right-click any image to send it into your running Trove.
-
-### Interface language
-- English and 简体中文, switchable live in Settings ▸ Language; follows the system language by default.
-
-### Configuration
-- Persisted JSON config in the platform config directory.
-- The library location can be changed from the Settings dialog.
+- **Local collect server** — `http://127.0.0.1:23916`, `POST /add` (raw bytes) and `POST /fetch` (server-side fetch); browser extension connects directly.
+- **Browser extension** — MV3 addon under `extension/`; right-click any image to send it to your running Trove.
+- **Bilingual** — English / 简体中文, switch live in Settings; follows the system language by default.
 
 ---
 
-## UI layout
-
-![Trove main window](docs/screenshots/main-window.png)
-
-The desktop app uses a dock layout with a custom title bar:
+## Layout
 
 | Dock | Panel | Purpose |
-|------|-------|---------|
+|---|---|---|
 | Top | Title bar | File / Settings buttons, window controls |
 | Left | Explorer | Collection tree, smart collections, recently viewed, trash |
 | Center | Workspace | Justified thumbnail grid + search |
 | Right | Tags + Inspector | Tag filter and per-asset details |
 
-- The **File** menu imports files; **Settings** opens the library-path dialog.
-- The whole window is a drop surface — drop any files to import them.
-- The workspace grid is a justified (Google-Photos-style) layout that fills the panel edge-to-edge at any width.
-- A popover search input sits in the workspace title bar, next to the item count of the browsed view.
-
----
-
-## Project structure
-
-```
-crates/
-├── trove-core/          # Domain, persistence & services (no UI)
-│   ├── src/
-│   │   ├── model.rs     # Plain data types (Asset, Collection, Tag, …)
-│   │   ├── library.rs   # High-level facade over store + media dir
-│   │   ├── services/    # backup (VACUUM INTO), maintenance jobs, collect server
-│   │   ├── layout.rs    # Justified grid layout (dynamic programming)
-│   │   ├── store/       # SQLite layer: schema, CRUD, smart queries, stats
-│   │   ├── search.rs    # Tantivy full-text index + the search_queue outbox drain
-│   │   ├── media/       # Import, probing, thumbnails (incl. SVG/PSD), CLIP search, 3D mesh parsing, GPU structs, video decoding, screenshot
-│   │   ├── maintenance.rs # Rebuild thumbs/index, orphan cleanup
-│   │   ├── undo.rs      # Undo/redo operation log
-│   │   ├── events.rs    # Cross-layer events
-│   │   ├── config.rs    # App config persistence (JSON)
-│   │   └── error.rs     # Error types
-└── trove-app/           # gpui-kit desktop UI
-    ├── src/
-    │   ├── main.rs       # GPUI bootstrap, menus, keybindings
-    │   ├── app/          # Window shell: root view, title bar, actions, i18n
-    │   ├── library/      # LibraryController, import jobs, folder watcher
-    │   ├── dialogs/      # Settings, rule editor, duplicate finder, batch rename, format conversion
-    │   └── panels/       # Explorer, Folders, Workspace, Tags, Inspector
-    └── Cargo.toml
-```
-
-Key storage tables:
-
-```
-assets             # asset records
-collections        # nested folders
-asset_collection   # many-to-many membership
-tags               # case-insensitive tags
-asset_tag          # asset–tag links
-smart_collections  # rule-based virtual folders
-search_queue       # full-text outbox: triggers enqueue, the drain feeds Tantivy
-view_history       # recently-viewed log (schema v7, capped at 200)
-```
-
-A library on disk:
-
-```
-<root>/
-├── library.db      # single-file database
-└── media/…         # content-addressed blobs
-```
-
 ---
 
 ## Build & test
-
-Requires the Rust toolchain. The workspace has no external system dependencies for the core crate.
 
 ```sh
 cargo build
@@ -232,22 +112,15 @@ cargo test -p trove-core
 cargo run -p trove-app
 ```
 
-Test status: `trove-core` compiles and all **106** tests pass. `trove-app` compiles cleanly (2 tests).
+**Baseline: `trove-core` 310 + `trove-app` 22 all pass; `cargo fmt --check` clean; clippy 0 warnings workspace-wide.** Two real-GPU smoke tests live in `trove-app` (EDL, meshlet culling) and skip automatically on headless machines.
 
----
-
-## Status
-
-- **trove-core** — feature-complete for the above list; tested (106 tests).
-- **trove-app** — compiles and runs: dock layout, custom title bar, justified thumbnail grid, drag & drop, multi-select, context menus, settings dialog, inspector, visual + semantic search, import with progress, 3D model viewport (GPU + CPU fallback), silent video preview, screenshot capture, and batch format conversion are all wired.
-
-What is still missing (compared with Eagle, Billfish, digiKam, Adobe Bridge & co.) is mapped in [docs/FEATURE-GAPS.md](docs/FEATURE-GAPS.md).
+What is still missing vs. Eagle / Billfish / digiKam / Adobe Bridge is mapped in [docs/FEATURE-GAPS.md](docs/FEATURE-GAPS.md).
 
 ---
 
 ## License
 
-MIT
+[MIT](./LICENSE)
 
 [gpui-kit]: https://github.com/panzhifu/gpui-kit
 [rusqlite]: https://github.com/rusqlite/rusqlite
