@@ -1,110 +1,180 @@
 <h1 align="center">Trove</h1>
 
-<p align="center"><b>Local · Private · Your own asset library</b></p>
+<p align="center"><b>本地 · 私有 · 你自己的素材库</b></p>
 
 <p align="center">
-  <a href="./README.zh.md">中文（主要文档）</a> ·
+  <a href="./README.en.md">English</a> ·
   <a href="./LICENSE">MIT</a>
 </p>
 
 <br>
 
 <p align="center">
-  <img src="docs/screenshots/main-window.png" alt="Trove main window" width="900"/>
+  <img src="docs/screenshots/main-window.png" alt="Trove 主窗口" width="900"/>
 </p>
 
-<p align="center"><i>Justified grid · dock layout · 3D model viewport · semantic search — all local, data never leaves your machine</i></p>
+<p align="center"><i>对齐缩略图网格 · 停靠布局 · 3D 模型视口 · 语义搜索 —— 全都跑在本地，数据永不上传</i></p>
 
 ---
 
-## Quick start
+## 快速开始
 
 ```sh
 git clone https://github.com/panzhifu/trove.git && cd trove
 cargo run -p trove-app
 ```
 
-> Needs the [Rust toolchain](https://www.rust-lang.org/tools/install). First launch creates a library under your platform's config directory; open **Settings** to relocate it.
+> 需要 [Rust 工具链](https://www.rust-lang.org/tools/install)。首次启动会在平台配置目录下创建素材库；打开 **Settings** 可改位置。
 
-This README summarizes what ships. The **[Chinese README](./README.zh.md)** is the canonical, most up-to-date document.
-
-[docs/](docs/README.md) · [Feature gaps](docs/FEATURE-GAPS.md)
+[Trove 文档索引](docs/README.md) · [功能差距分析](docs/FEATURE-GAPS.md)
 
 ---
 
-## What's inside
+## 功能特性
 
-### Organize & find
+### 组织与检索
 
-- **Full-text search** — Tantivy-backed, over file name / title / description / tag name, ranked. Word, substring and pinyin matching (`sunse` → `Sunset`, `mao` → 花园里的猫), composable with any filter.
-- **Visual search** — search by image + search by color. Perceptual hash (pHash) + color histogram, computed at import, zero inference required.
-- **Semantic search** *(optional)* — CLIP text-to-image + image-to-image in the same box. Needs a manually-downloaded ONNX model.
-- **Smart collections** — rule-driven virtual folders as JSON query trees. Match on rating / kind / text / tag / favorite / color / date / aspect ratio / orientation; `and` / `or`. Validated at compile time.
-- **Tags** — hierarchical, case-insensitive, color labels; filters, counts and smart collections include subtrees.
-- **Ratings & favorites** — 1–5 stars, one-click favorite.
-- **Collection tree** — nested folders, many-to-many membership, drag to reparent, cycle detection.
+| | |
+|---|---|
+| **全文搜索** | 基于 Tantivy，覆盖文件名 / 标题 / 描述 / 标签名，支持相关性排序、词语 / 子串 / 拼音三种匹配（`sunse` 命中 `Sunset`，`mao` 命中 花园里的猫），可叠加任意筛选条件 |
+| **视觉搜索** | 以图搜图 + 按颜色搜索 —— 感知哈希 (pHash) + 颜色直方图，导入时自动计算，零推理依赖 |
+| **语义搜索** | *(可选)* CLIP 文搜图 + 图搜图，融进同一个搜索框；需手动下载 ONNX 模型 |
+| **智能收藏夹** | 规则驱动的虚拟文件夹，JSON 查询树，支持评分 / 类型 / 文本 / 标签 / 收藏 / 颜色 / 拍摄日期 / 宽高比 / 方向，`and` / `or` 组合，编译期校验 |
+| **标签** | 层级嵌套、大小写不敏感、带色标；筛选 / 计数 / 智能集合自动包含子树 |
+| **评分 & 收藏** | 1–5 星评分，一键收藏 |
+| **集合树** | 嵌套文件夹、多对多归属，拖拽改父级，循环检测 |
 
-### Import & collect
+### 导入与收集
 
-- **Drag-and-drop** — drop files from the file manager onto the window (the whole window is a drop surface).
-- **Paste to import** — `Ctrl+Shift+V` sends a clipboard image straight into the library.
-- **Import from URL** — downloads in the background, imports, records the source URL.
-- **Watched folders** — add a directory in Settings; new files are imported automatically.
-- **Import mode** — copy into library (default) / link to original. Linked assets stay where they are and can be re-linked by SHA-256 after moving.
-- **RAW / HEIC / SVG / PSD** — camera RAW through the rawler pipeline; HEIC via system `heif-dec`; SVG rasterized, PSD composites its embedded preview.
-- **Design-format thumbnails** — mines EXIF / audio tags / font family·style·weight / MP4 dimensions; video poster when ffmpeg is present.
+| | |
+|---|---|
+| **拖拽导入** | 文件管理器拖进窗口即可，整窗都是拖放面 |
+| **粘贴导入** | `Ctrl+Shift+V`，剪贴板图片直接入库 |
+| **从 URL 导入** | 后台下载并自动入库，记录来源 URL |
+| **监视文件夹** | 设置中添加目录，新增文件自动入库（不归入集合） |
+| **导入方式** | 复制入库（默认）/ 链接原文件 —— 链接资产留在原处，丢失后可 SHA-256 校验重新链接 |
+| **RAW / HEIC / SVG / PSD** | 相机 RAW 走 rawler 管线（去马赛克 → 白平衡 → sRGB），HEIC 经系统 heif-dec 转换；SVG 矢量渲染，PSD 合成内嵌预览 |
+| **设计格式缩略图** | 挖掘 EXIF / 音频标签 / 字体族·样式·字重 / MP4 尺寸时长；有 ffmpeg 时自动生成视频海报 |
 
-### Browse & inspect
+### 浏览与查看
 
-- **Three views** — grid (justified layout) / list / timeline, with density slider, multi-select and a floating toolbar.
-- **Inspector** — thumbnail + tags + color palette + inline editing (title / description / source URL / rating); properties page shows MIME / size / dimensions / SHA-256; one-click reveal of the underlying file.
-- **Animated images** — GIF / animated WebP / APNG play frame-by-frame in the preview dialog and Inspector; grid thumbnails stay static for performance.
-- **Font live previews** — specimen-card thumbnails rasterized in the font itself at import; sample text customizable in Settings; a Fonts system view and per-font system install / uninstall from the Inspector.
-- **Recently viewed** — sidebar of the last 200 assets; trashed assets drop out until restored.
+| | |
+|---|---|
+| **三视图** | 网格（对齐布局）/ 列表 / 时间线，带密度缩放滑杆、多选 + 浮动工具栏 |
+| **检查器** | 缩略图 + 标签 + 色板 + 行内编辑（标题 / 描述 / 来源链接 / 评分），属性页显示 MIME / 大小 / 尺寸 / SHA-256，一键定位源文件 |
+| **动图播放** | GIF / 动态 WebP / APNG 在预览与检查器中逐帧播放；网格缩略图保持静态以保证性能 |
+| **字体实况预览** | 导入时用字体自身渲染「样张卡片」缩略图，样张文字可在设置自定义；左栏「字体」系统视图一键浏览，检查器可安装 / 卸载到系统 |
+| **最近查看** | 左栏侧边最近 200 个资产，入回收站自动隐藏、恢复后回归 |
 
-### 3D model preview
+### 3D 模型预览
 
-- **Formats** — OBJ / STL / PLY imported as a first-class asset kind.
-- **GPU viewport** — wgpu-powered, orbit / zoom / pan, two-sided Lambert + Blinn-Phong shading; falls back to a CPU software rasterizer when no GPU is available.
-- **Quality** — eye-dome lighting (EDL) + gap fill + back-face culling on closed meshes.
-- **Large files** — streaming resident budget + thinning so 20 GB never OOMs; coverage-preserving sampling; smooth zoom and pan; offline spatial index optional (`.trovecloud`, 9 B/point, 60% of source).
-- **Mesh culling** — large meshes (≥8192 tris) are clustered into meshlets with per-cluster GPU frustum culling.
+| | |
+|---|---|
+| **格式** | OBJ / STL / PLY 作为一等资产类型导入，带格式专属图标 |
+| **GPU 视口** | wgpu 驱动，旋转 / 缩放 / 平移，双面 Lambert + Blinn-Phong 着色；无 GPU 时自动回退到 CPU 软件光栅器 |
+| **观感** | 眼罩光照 (EDL) + 补洞 + 闭合网格背面剔除 |
+| **大文件** | 流式常驻预算 + 抽稀，20 GB 不 OOM；覆盖度保持采样，缩放 / 移动全顺滑；离线空间索引可选（`.trovecloud`，9 B/点，60% 体积） |
+| **网格剔除** | 大网格 (≥8192 面) 做 meshlet 聚类 + GPU 逐簇视锥剔除 |
 
-### Video & screenshots
+### 视频与截图
 
-- **Silent preview** — frame-by-frame ffmpeg decode with play / pause / seek / timeline; no audio pipeline.
-- **Screenshot capture** — full screen or interactive region, imported as PNG. Platform-native backends (gnome-screenshot / scrot / macOS screencapture / Windows snippingtool), user-overridable.
-- **Batch conversion** — re-encode images to JPEG / PNG / WebP / BMP / TIFF, optional longest-edge cap, optional re-import.
+| | |
+|---|---|
+| **无声预览** | ffmpeg 管线逐帧解码，播放 / 暂停 / 跳转 / 时间线，无音频管线 |
+| **截图采集** | 全屏或交互式框选，直接入库 PNG；平台原生后端（gnome-screenshot / scrot / macOS screencapture / Windows snippingtool），可自定义命令 |
+| **批量格式转换** | 图片重新编码为 JPEG / PNG / WebP / BMP / TFT，可选长边限制，可重新导入转换后文件 |
 
-### Maintenance & safety
+### 维护与安全
 
-- **Trash** — delete → trash → restore / delete forever; emptying frees blobs and thumbnails.
-- **Orphan cleanup** — removes blobs no longer referenced by any asset.
-- **Integrity check** — re-hashes every stored file and compares with the record; one-click move-to-trash for bad ones.
-- **Auto backup** — SQLite `VACUUM INTO` snapshot into `backups/` (at most once a day, rolling 10).
-- **Duplicate finder** — clusters visually identical images by pHash; "keep newest, trash the rest" per group.
-- **Library hot-switch** — recent libraries; live statistics (counts, size, tags, collections).
+| | |
+|---|---|
+| **回收站** | 删除 → 回收站 → 恢复 / 永久删除；清空回收站释放 blob 与缩略图 |
+| **孤儿清理** | 移除不再被引用的 blob 文件 |
+| **完整性校验** | 重算每个存储文件的 SHA-256 并与记录比对，问题资产一键入回收站 |
+| **自动备份** | SQLite `VACUUM INTO` 快照到 `backups/`（每天至多一次，滚动保留 10 份） |
+| **重复文件查找** | 按 pHash 聚类视觉相同的图片，每组「保留最新、其余入回收站」 |
+| **库热切换** | 最近使用的库一键切换，统计面板实时展示各类型数量 / 总容量 |
 
-### Extensions
+### 扩展
 
-- **Local collect server** — `http://127.0.0.1:23916`, `POST /add` (raw bytes) and `POST /fetch` (server-side fetch); browser extension connects directly.
-- **Browser extension** — MV3 addon under `extension/`; right-click any image to send it to your running Trove.
-- **Bilingual** — English / 简体中文, switch live in Settings; follows the system language by default.
+| | |
+|---|---|
+| **本地采集服务** | `http://127.0.0.1:23916`，`POST /add`（原始字节）与 `POST /fetch`（服务端抓取），浏览器扩展直连 |
+| **浏览器扩展** | `extension/` 内置 MV3 扩展，右键发送网页图片到运行中的 Trove |
+| **中英双语** | 设置 ▸ 语言实时切换，默认跟随系统 |
 
 ---
 
-## Layout
+## 界面布局
 
-| Dock | Panel | Purpose |
+| 停靠位置 | 面板 | 用途 |
 |---|---|---|
-| Top | Title bar | File / Settings buttons, window controls |
-| Left | Explorer | Collection tree, smart collections, recently viewed, trash |
-| Center | Workspace | Justified thumbnail grid + search |
-| Right | Tags + Inspector | Tag filter and per-asset details |
+| 顶 | 标题栏 | File / Settings 按钮、窗口控制 |
+| 左 | 资源管理器 | 收藏夹树、智能收藏夹、最近查看、回收站 |
+| 中 | 工作区 | 对齐缩略图网格 + 搜索 |
+| 右 | 标签 + 检查器 | 标签筛选与资产详情 |
+
+- **File** 菜单导入文件；**Settings** 打开设置对话框（可深链定位页面）
+- 工作区网格采用对齐布局（Google 相册风格），任意宽度下撑满面板
+- 工作区标题栏内嵌弹出式搜索框，旁显示当前视图资产数
+- 整窗都是拖放面；`Ctrl/Cmd+点击` 或 `Shift` 范围选择
 
 ---
 
-## Build & test
+## 项目结构
+
+```
+crates/
+├── trove-core/          # 领域、持久化与服务层（无 UI）
+│   ├── src/
+│   │   ├── model.rs        # 纯数据类型 (Asset, Collection, Tag, …)
+│   │   ├── library.rs      # 对 store + 媒体目录的高级封装
+│   │   ├── services/       # 备份 (VACUUM INTO)、维护任务、采集服务
+│   │   ├── layout.rs       # 对齐网格布局（动态规划）
+│   │   ├── store/          # SQLite 层：schema, CRUD, 智能查询, 统计
+│   │   ├── search.rs       # Tantivy 全文索引 + search_queue 发件箱 drain
+│   │   ├── media/          # 导入、探测、缩略图、颜色、视觉/CLIP 搜索、3D 网格解析、GPU 结构体、视频解码、截图
+│   │   ├── maintenance.rs  # 重建缩略图/索引、孤儿清理
+│   │   ├── undo.rs         # 撤销/重做操作日志
+│   │   ├── events.rs       # 跨层事件
+│   │   ├── config.rs       # 应用配置持久化 (JSON)
+│   │   └── error.rs        # 错误类型
+└── trove-app/           # gpui-kit 桌面 UI
+    ├── src/
+    │   ├── main.rs          # GPUI 引导、菜单、快捷键
+    │   ├── app/             # 窗口壳层：根视图、标题栏、动作、i18n
+    │   ├── library/         # LibraryController、导入任务、文件夹监听
+    │   ├── dialogs/         # 设置、规则编辑器、重复文件查找、批量重命名、格式转换
+    │   ├── panels/          # 资源管理器、文件夹、工作区、标签、检查器
+    │   └── components/      # 预览组件
+    │       └── preview/     # 图片 / 视频 / 字体 / 3D 模型 / 回退
+    └── Cargo.toml
+```
+
+核心数据表：
+
+```
+assets             资产记录
+collections        嵌套文件夹
+asset_collection   资产-收藏夹多对多
+tags               标签（不区分大小写）
+asset_tag          资产-标签关联
+smart_collections  智能收藏夹（规则过滤）
+search_queue       全文索引发件箱：触发器入队，drain 喂给 Tantivy
+view_history       最近查看记录（上限 200 条）
+```
+
+素材库磁盘结构：
+
+```
+<root>/
+├── library.db      单文件数据库
+└── media/…         内容寻址的文件
+```
+
+---
+
+## 构建与测试
 
 ```sh
 cargo build
@@ -112,13 +182,13 @@ cargo test -p trove-core
 cargo run -p trove-app
 ```
 
-**Baseline: `trove-core` 310 + `trove-app` 22 all pass; `cargo fmt --check` clean; clippy 0 warnings workspace-wide.** Two real-GPU smoke tests live in `trove-app` (EDL, meshlet culling) and skip automatically on headless machines.
+**当前测试基线：`trove-core` 310 + `trove-app` 22 全部通过；`cargo fmt --check` 干净；clippy 全工作区 0 告警。** `trove-app` 含 2 个真机 GPU 冒烟测试（EDL、meshlet 剔除），无显卡的机器自动跳过。
 
-What is still missing vs. Eagle / Billfish / digiKam / Adobe Bridge is mapped in [docs/FEATURE-GAPS.md](docs/FEATURE-GAPS.md).
+对标同类软件的功能差距与路线图见 [docs/FEATURE-GAPS.md](docs/FEATURE-GAPS.md)。
 
 ---
 
-## License
+## 许可证
 
 [MIT](./LICENSE)
 
