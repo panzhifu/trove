@@ -9,7 +9,7 @@
 
 use gpui_kit::*;
 
-use super::{fallback, AssetPreviewData};
+use super::{AssetPreviewData, fallback};
 
 /// Full-size still for the main area: animated source when the file can
 /// play frames, thumbnail otherwise, kind icon when there is neither.

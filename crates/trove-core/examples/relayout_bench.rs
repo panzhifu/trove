@@ -1,7 +1,7 @@
 //! Times the per-render work that surrounds `justify_layout` during a
 //! resize: SQL query, per-asset `is_file()` stats, and Cell rebuilding.
 use std::time::Instant;
-use trove_core::model::{Asset, AssetKind, AssetQuery, AssetSort};
+use trove_core::model::{Asset, AssetKind, AssetQuery, AssetSort, UsageStatus};
 use trove_core::store::{self, assets};
 
 fn bench(label: &str, n_assets: usize, runs: usize) {
@@ -35,8 +35,9 @@ fn bench(label: &str, n_assets: usize, runs: usize) {
             rating: None,
             is_favorite: false,
             source_url: None,
-            color_label: None,
-            extra: Default::default(),
+            usage_status: UsageStatus::Unused,
+            commercial_use: None,
+            facts: Default::default(),
         };
         batch.push(a);
     }
@@ -61,9 +62,9 @@ fn bench(label: &str, n_assets: usize, runs: usize) {
     let mut times = Vec::new();
     for _ in 0..runs {
         let t = Instant::now();
-        let (total, list) = assets::query(conn, &q).unwrap();
+        let page = assets::query(conn, &q).unwrap();
         times.push(t.elapsed());
-        std::hint::black_box((total, list.len()));
+        std::hint::black_box((page.total, page.items.len()));
     }
     times.sort();
     println!(
@@ -99,7 +100,7 @@ fn bench(label: &str, n_assets: usize, runs: usize) {
     );
 
     // Time the Cell-style per-asset rebuild (two date formats + strings).
-    let list = assets::query(conn, &q).unwrap().1;
+    let list = assets::query(conn, &q).unwrap().items;
     let mut times = Vec::new();
     for _ in 0..runs {
         let t = Instant::now();

@@ -6,7 +6,6 @@ pub mod duplicates;
 pub mod rename;
 pub mod rules;
 pub mod settings;
-pub mod system_fonts;
 
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::{IconName, Sizable as _, WindowExt as _};

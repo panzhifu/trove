@@ -40,9 +40,9 @@ pub fn compute_and_store_signature(
         let path = library_root.join("media").join(rel);
         let sig = VisualSignature::from_image(&path);
         if sig.phash != PHash(0) {
-            let mut extra = asset.extra.clone();
-            sig.apply_to_extra(&mut extra);
-            assets::update_extra(conn, asset.id, &extra)?;
+            let mut facts = asset.facts.clone();
+            sig.apply_to_facts(&mut facts);
+            assets::update_facts(conn, asset.id, &facts)?;
             return Ok(true);
         }
     }
@@ -164,7 +164,12 @@ fn collect_and_rank(
     // Fetch all image assets that have a visual signature.
     let rows_vec = rows::query_map(
         conn,
-        &format!("SELECT {COLS} FROM assets WHERE kind = 'image' AND trashed_at IS NULL"),
+        // Only rows carrying both signature parts can score; preselect in
+        // SQL instead of materializing every image asset.
+        &format!(
+            "SELECT {COLS} FROM assets WHERE kind = 'image' AND trashed_at IS NULL \
+             AND extra LIKE '%visual_phash%' AND extra LIKE '%visual_color_hist%'"
+        ),
         vec![],
         assets::asset_from_row,
     )?;
@@ -173,26 +178,17 @@ fn collect_and_rank(
     let min_threshold = 0.2_f32;
 
     for asset in rows_vec {
-        // Parse the extra field as JSON to extract visual signature.
-        let extra_json: serde_json::Value =
-            serde_json::to_value(&asset.extra).unwrap_or(serde_json::Value::Null);
-        let extra_map = extra_json.as_object();
-
-        // Try to load the stored visual signature.
-        if let Some(stored_sig) = extra_map.and_then(VisualSignature::from_extra) {
+        // Try to load the stored visual signature from the typed facts.
+        if let Some(stored_sig) = VisualSignature::from_facts(&asset.facts) {
             let mut score = query_sig.similarity(&stored_sig);
 
             // Boost score if a specific color was queried and the asset's
             // dominant colors contain a close match.
             if let Some(qrgb) = query_rgb
-                && let Some(colors) = extra_json
-                    .pointer("/dominant_colors")
-                    .and_then(|v| v.as_array())
+                && let Some(colors) = asset.facts.visual.dominant_colors.as_ref()
             {
-                for c in colors {
-                    if let Some(hex_str) = c.as_str()
-                        && let Some(crgb) = search::hex_to_rgb(hex_str)
-                    {
+                for hex_str in colors {
+                    if let Some(crgb) = search::hex_to_rgb(hex_str) {
                         let csim = search::color_similarity(search::rgb_distance(qrgb, crgb));
                         score = score.max(csim * 0.8);
                     }
@@ -243,9 +239,9 @@ pub fn backfill_signatures(
             let path = library_root.join("media").join(rel);
             let sig = VisualSignature::from_image(&path);
             if sig.phash != PHash(0) {
-                let mut extra = asset.extra.clone();
-                sig.apply_to_extra(&mut extra);
-                assets::update_extra(conn, asset.id, &extra)?;
+                let mut facts = asset.facts.clone();
+                sig.apply_to_facts(&mut facts);
+                assets::update_facts(conn, asset.id, &facts)?;
                 updated += 1;
             }
         }
@@ -282,39 +278,38 @@ mod tests {
 
         // Manually set color histograms.
         // Red (#ff0000): r=255>>4=15, g=0>>4=0, b=0>>4=0 → bucket ((15<<8)|(0<<4)|0) = 0xF00
-        let mut extra_red: std::collections::BTreeMap<String, String> =
-            std::collections::BTreeMap::new();
         let mut buckets = [0.0_f32; 4096];
         buckets[0xF00] = 1.0; // red bucket (#ff0000)
         let hist = ColorHistogram {
             buckets,
             total: 1.0,
         };
-        extra_red.insert("visual_phash".into(), "0000000000000001".into());
-        extra_red.insert("visual_color_hist".into(), hist.to_compact());
-        // Convert to JSON values for storage.
-        let extra_red_json: std::collections::BTreeMap<String, serde_json::Value> = extra_red
-            .iter()
-            .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
-            .collect();
-        assets::update_extra(conn, red_id, &extra_red_json).unwrap();
+        let red_facts = crate::model::AssetFacts {
+            visual: crate::model::VisualFacts {
+                visual_phash: Some("0000000000000001".into()),
+                visual_color_hist: Some(hist.to_compact()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assets::update_facts(conn, red_id, &red_facts).unwrap();
 
         // Blue (#0000ff): r=0>>4=0, g=0>>4=0, b=255>>4=15 → bucket ((0<<8)|(0<<4)|15) = 0x00F
-        let mut extra_blue: std::collections::BTreeMap<String, String> =
-            std::collections::BTreeMap::new();
         let mut buckets = [0.0_f32; 4096];
         buckets[0x00F] = 1.0; // blue bucket (#0000ff)
         let hist = ColorHistogram {
             buckets,
             total: 1.0,
         };
-        extra_blue.insert("visual_phash".into(), "0000000000000002".into());
-        extra_blue.insert("visual_color_hist".into(), hist.to_compact());
-        let extra_blue_json: std::collections::BTreeMap<String, serde_json::Value> = extra_blue
-            .iter()
-            .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
-            .collect();
-        assets::update_extra(conn, blue_id, &extra_blue_json).unwrap();
+        let blue_facts = crate::model::AssetFacts {
+            visual: crate::model::VisualFacts {
+                visual_phash: Some("0000000000000002".into()),
+                visual_color_hist: Some(hist.to_compact()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assets::update_facts(conn, blue_id, &blue_facts).unwrap();
 
         // Search for red.
         let results = search_by_color(conn, "#ff0000", None).unwrap();

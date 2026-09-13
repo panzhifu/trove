@@ -33,6 +33,42 @@ pub fn inbox_dir() -> PathBuf {
         .join("inbox")
 }
 
+/// Files waiting in the inbox, each with its optional `*.meta.json` sidecar
+/// path (present only when the sidecar file exists). Sidecars themselves are
+/// never listed as imports.
+pub fn inbox_items() -> Vec<(PathBuf, Option<PathBuf>)> {
+    inbox_items_in(&inbox_dir())
+}
+
+/// [`inbox_items`] over an explicit directory (tests, alternate inboxes).
+pub fn inbox_items_in(inbox: &std::path::Path) -> Vec<(PathBuf, Option<PathBuf>)> {
+    let Ok(entries) = std::fs::read_dir(inbox) else {
+        return Vec::new();
+    };
+    let mut items = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_file()
+            || path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .map(|n| n.ends_with(".meta.json"))
+                .unwrap_or(true)
+        {
+            continue;
+        }
+        let sidecar = {
+            let name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
+            inbox.join(format!("{name}.meta.json"))
+        };
+        items.push((path, sidecar.is_file().then_some(sidecar)));
+    }
+    items
+}
+
 /// Start the server on a daemon thread. Returns the bound port, or `None`
 /// when the port is taken (another Trove instance is probably listening).
 pub fn spawn_server(port: u16) -> Option<u16> {

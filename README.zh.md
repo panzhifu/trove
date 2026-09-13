@@ -43,10 +43,11 @@ cargo run -p trove-app
 - 标签不区分大小写，可附加到任意资产。
 - 一键收藏，以及 1–5 星评分。
 
-### 全文搜索 (FTS)
-- 基于标题和描述的全文搜索（带相关性排序），并可与任意筛选条件组合。
+### 全文搜索
+- 基于文件名、标题、描述和标签名的全文搜索（带相关性排序），并可与任意筛选条件组合（Tantivy 索引位于 `<root>/search_index`）。
+- 词语、子串、拼音三种匹配：`sunse` 命中 `Sunset`，`ower` 命中 `flower`，`mao` / `hyl` 命中 花园里的猫。
 - 特殊字符会被安全地按字面处理，不会导致崩溃。
-- 提供重建索引的维护命令，迁移后可按需重建。
+- 发件箱队列表跟随每次资产/标签写入同步索引；索引丢失可自愈，也可在维护工具里强制全量重建。
 
 ### 视觉搜索 (v0.2)
 - **以图搜图**：通过感知哈希 + 颜色直方图找到视觉相似的图片。
@@ -180,7 +181,8 @@ crates/
 │   │   ├── library.rs   # 对 store + 媒体目录的高级封装
 │   │   ├── services/    # 备份（VACUUM INTO）、维护任务、采集服务
 │   │   ├── layout.rs    # 对齐网格布局（动态规划）
-│   │   ├── store/       # SQLite 层：schema, CRUD, FTS, 智能查询, 统计
+│   │   ├── store/       # SQLite 层：schema, CRUD, 智能查询, 统计
+│   │   ├── search.rs    # Tantivy 全文索引 + search_queue 发件箱 drain
 │   │   ├── media/       # 导入、探测、缩略图、颜色、视觉/CLIP 语义搜索、3D 网格解析、GPU 结构体、视频解码、截图
 │   │   ├── maintenance.rs # 重建缩略图/索引、孤儿清理
 │   │   ├── undo.rs      # 撤销/重做操作日志
@@ -206,7 +208,7 @@ asset_collection   # 资产-收藏夹多对多
 tags               # 标签（不区分大小写）
 asset_tag          # 资产-标签关联
 smart_collections  # 智能收藏夹（规则过滤）
-asset_fts          # 全文搜索索引
+search_queue       # 全文索引发件箱：触发器入队，drain 喂给 Tantivy
 view_history       # 最近查看记录（schema v7，上限 200 条）
 ```
 

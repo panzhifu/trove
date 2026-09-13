@@ -2,6 +2,8 @@
 
 pub mod assets;
 pub mod batch;
+pub mod browse;
+pub use browse::BrowseContext;
 pub mod collections;
 pub(crate) mod rows;
 pub mod schema;
@@ -36,6 +38,13 @@ impl Store {
             std::fs::create_dir_all(parent)?;
         }
         let conn = rusqlite::Connection::open(path)?;
+        // WAL lets backend jobs (imports own a second connection) write while
+        // the UI thread reads. The mode is persistent per database file; an
+        // in-memory database ignores it, so the result is not checked.
+        let _ = conn.execute_batch("PRAGMA journal_mode = WAL;");
+        // A backend writer holding the write lock must not error the UI's
+        // reads; wait briefly instead.
+        let _ = conn.busy_timeout(std::time::Duration::from_secs(5));
         let store = Self {
             conn: Rc::new(RefCell::new(conn)),
         };
@@ -129,7 +138,8 @@ impl Store {
 mod tests {
     use super::{Store, schema};
     use crate::model::{
-        Asset, AssetKind, AssetPatch, AssetQuery, NewCollection, NewTag, Origin, now,
+        Asset, AssetKind, AssetPatch, AssetQuery, NewCollection, NewTag, Origin, Page, UsageStatus,
+        now,
     };
     use crate::store::{assets, collections, tags};
     use uuid::Uuid;
@@ -155,8 +165,9 @@ mod tests {
             rating: None,
             is_favorite: false,
             source_url: None,
-            color_label: None,
-            extra: Default::default(),
+            usage_status: UsageStatus::Unused,
+            commercial_use: None,
+            facts: Default::default(),
             created_at: now(),
             updated_at: now(),
             trashed_at: None,
@@ -169,7 +180,7 @@ mod tests {
         assets::insert(store.conn(), &sample_asset("Inter.ttf", AssetKind::Font)).unwrap();
         assets::insert(store.conn(), &sample_asset("a.png", AssetKind::Image)).unwrap();
 
-        let (total, list) = assets::query(
+        let page = assets::query(
             store.conn(),
             &AssetQuery {
                 kind: Some(AssetKind::Font),
@@ -177,10 +188,10 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(total, 1);
-        assert_eq!(list[0].kind, AssetKind::Font);
+        assert_eq!(page.total, 1);
+        assert_eq!(page.items[0].kind, AssetKind::Font);
         // A patch can move an asset into (and back out of) the new kind.
-        let id = list[0].id;
+        let id = page.items[0].id;
         assets::update(
             store.conn(),
             id,
@@ -190,7 +201,7 @@ mod tests {
             },
         )
         .unwrap();
-        let (total, _) = assets::query(
+        let page = assets::query(
             store.conn(),
             &AssetQuery {
                 kind: Some(AssetKind::Font),
@@ -198,7 +209,7 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(total, 0);
+        assert_eq!(page.total, 0);
     }
 
     #[test]
@@ -207,7 +218,7 @@ mod tests {
         assets::insert(store.conn(), &sample_asset("dragon.stl", AssetKind::Model)).unwrap();
         assets::insert(store.conn(), &sample_asset("a.png", AssetKind::Image)).unwrap();
 
-        let (total, list) = assets::query(
+        let page = assets::query(
             store.conn(),
             &AssetQuery {
                 kind: Some(AssetKind::Model),
@@ -215,9 +226,9 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(total, 1);
-        let id = list[0].id;
-        assert_eq!(list[0].kind, AssetKind::Model);
+        assert_eq!(page.total, 1);
+        let id = page.items[0].id;
+        assert_eq!(page.items[0].kind, AssetKind::Model);
 
         // The column holds the wire name a smart rule filters on, and decoding
         // it back yields the same kind.
@@ -237,12 +248,47 @@ mod tests {
     }
 
     #[test]
+    fn distinct_exts_folds_case_dedupes_and_skips_trashed() {
+        let store = Store::in_memory().unwrap();
+        for (name, ext) in [
+            ("a.png", "png"),
+            ("b.PNG", "PNG"),
+            ("c.jpg", "jpg"),
+            ("d.Jpg", "Jpg"),
+            ("e", ""),
+        ] {
+            let mut asset = sample_asset(name, AssetKind::Image);
+            asset.ext = ext.into();
+            assets::insert(store.conn(), &asset).unwrap();
+        }
+        // A trashed row must not contribute its extension.
+        let mut gone = sample_asset("f.tiff", AssetKind::Image);
+        gone.ext = "tiff".into();
+        gone.trashed_at = Some(now());
+        assets::insert(store.conn(), &gone).unwrap();
+
+        assert_eq!(
+            assets::distinct_exts(store.conn()).unwrap(),
+            vec!["jpg".to_string(), "png".to_string()]
+        );
+
+        // ⚠️ The index plan is deliberately *not* asserted here. `SELECT
+        // DISTINCT ext` is answered from `idx_assets_ext` on a full-size
+        // library but not on a handful of rows — SQLite's small-table
+        // heuristic picks `idx_assets_trashed` instead, at 6 rows and still at
+        // 400. The plan is pinned by `search_smoke --profile`, which prints it
+        // against a 100k library; this test only covers the semantics the
+        // Rust-side folding is responsible for.
+    }
+
+    #[test]
     fn smart_collection_update_query_validates() {
         use crate::store::smart_collections;
         let store = Store::in_memory().unwrap();
         let sc = smart_collections::create(
             store.conn(),
             &crate::model::NewSmartCollection {
+                parent_id: None,
                 name: "pics".into(),
                 query: serde_json::json!({"op": "match", "field": "kind", "value": "image"}),
                 color: None,
@@ -370,20 +416,9 @@ mod tests {
         )
         .unwrap();
 
-        // Filter by text, kind, favorite.
-        let (total, hits) = assets::query(
-            store.conn(),
-            &AssetQuery {
-                text: Some("sunset".into()),
-                is_trashed: false,
-                ..Default::default()
-            },
-        )
-        .unwrap();
-        assert_eq!(total, 1);
-        assert_eq!(hits[0].id, img.id);
-
-        let (_, favs) = assets::query(
+        // Filter by favorite + kind. (Free text is not a `AssetQuery` concern
+        // any more; the index owns it — see the `search_*` tests below.)
+        let favs = assets::query(
             store.conn(),
             &AssetQuery {
                 is_favorite: Some(true),
@@ -392,7 +427,7 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(favs.len(), 1);
+        assert_eq!(favs.items.len(), 1);
 
         // Collection membership is many-to-many.
         let c1 = collections::create(
@@ -420,7 +455,7 @@ mod tests {
         assert_eq!(collections::count_assets(store.conn(), c1.id).unwrap(), 2);
         assert_eq!(collections::count_assets(store.conn(), c2.id).unwrap(), 1);
 
-        let (total, in_album) = assets::query(
+        let in_album = assets::query(
             store.conn(),
             &AssetQuery {
                 collection_id: Some(c1.id),
@@ -429,14 +464,14 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(total, 2);
-        assert_eq!(in_album.len(), 2);
+        assert_eq!(in_album.total, 2);
+        assert_eq!(in_album.items.len(), 2);
 
         // Trash hides from normal queries, restores bring it back.
         assert!(assets::set_trashed(store.conn(), doc.id, true).unwrap());
-        let (_, live) = assets::query(store.conn(), &AssetQuery::default()).unwrap();
-        assert_eq!(live.len(), 1);
-        let (_, trash) = assets::query(
+        let live = assets::query(store.conn(), &AssetQuery::default()).unwrap();
+        assert_eq!(live.items.len(), 1);
+        let trash = assets::query(
             store.conn(),
             &AssetQuery {
                 is_trashed: true,
@@ -444,11 +479,11 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(trash.len(), 1);
+        assert_eq!(trash.items.len(), 1);
 
-        let (_, live) = assets::query(store.conn(), &AssetQuery::default()).unwrap();
-        assert_eq!(live.len(), 1);
-        let (_, trash) = assets::query(
+        let live = assets::query(store.conn(), &AssetQuery::default()).unwrap();
+        assert_eq!(live.items.len(), 1);
+        let trash = assets::query(
             store.conn(),
             &AssetQuery {
                 is_trashed: true,
@@ -456,7 +491,7 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(trash.len(), 1);
+        assert_eq!(trash.items.len(), 1);
 
         // Membership rows follow the asset when it is deleted.
         assets::delete(store.conn(), doc.id).unwrap();
@@ -497,53 +532,392 @@ mod tests {
 
     // -- full-text search ------------------------------------------------
 
+    // -- full-text search (Tantivy) ----------------------------------------
+
+    /// Index every asset row into `idx`. Production drives this through the
+    /// search_queue outbox on library open; the tests call it directly.
+    fn index_all(store: &Store, idx: &crate::search::TextIndex) {
+        for trashed in [false, true] {
+            let page = assets::query(
+                store.conn(),
+                &AssetQuery {
+                    is_trashed: trashed,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            for a in page.items {
+                idx.index_asset(store.conn(), a.id).unwrap();
+            }
+        }
+        idx.commit().unwrap();
+    }
+
+    /// The search view of the grid: ranked candidates from the index,
+    /// narrowed by the compound filters.
+    fn search_page(
+        store: &Store,
+        idx: &crate::search::TextIndex,
+        text: &str,
+        kind: Option<AssetKind>,
+    ) -> Page<Asset> {
+        super::BrowseContext {
+            search: text.to_string(),
+            kind,
+            ..Default::default()
+        }
+        .run(store.conn(), idx, None)
+        .unwrap()
+    }
+
+    /// The library schema must carry no FTS5 remnants: free-text search is the
+    /// Tantivy index's job, and the SQLite side keeps only the `search_queue`
+    /// outbox that feeds it.
     #[test]
-    fn fts_search_ranks_and_filters() {
+    fn schema_has_no_fts5_leftovers() {
         let store = Store::in_memory().unwrap();
+        // Matches the virtual table and all of its shadow tables at once.
+        let leftovers: Vec<String> = crate::store::rows::query_map(
+            store.conn(),
+            "SELECT name FROM sqlite_master WHERE name LIKE '%fts%'",
+            vec![],
+            |row| crate::store::rows::req_str(row, 0),
+        )
+        .unwrap();
+        assert!(leftovers.is_empty(), "FTS5 leftovers: {leftovers:?}");
+
+        let outbox = crate::store::rows::query_count(
+            store.conn(),
+            "SELECT COUNT(*) FROM sqlite_master WHERE name = 'search_queue'",
+            vec![],
+        )
+        .unwrap();
+        assert_eq!(outbox, 1, "the search_queue outbox must exist");
+    }
+
+    #[test]
+    fn search_ranks_and_filters() {
+        let store = Store::in_memory().unwrap();
+        let idx = crate::search::TextIndex::in_ram().unwrap();
         let mut photo = sample_asset("vacation.jpg", AssetKind::Image);
         photo.title = Some("Sunset over the beach".into());
         let mut doc = sample_asset("beach-plan.md", AssetKind::Document);
         doc.description = Some("Notes about the sunset trip".into());
         let mut audio = sample_asset("song.mp3", AssetKind::Audio);
         audio.title = Some("Rainy morning mix".into());
-
         assets::insert(store.conn(), &photo).unwrap();
         assets::insert(store.conn(), &doc).unwrap();
         assets::insert(store.conn(), &audio).unwrap();
+        index_all(&store, &idx);
 
         // Text hits photo + doc, not audio.
-        let (total, _) = assets::search(store.conn(), "sunset", &AssetQuery::default()).unwrap();
-        assert_eq!(total, 2);
+        let page = search_page(&store, &idx, "sunset", None);
+        assert_eq!(page.total, 2);
 
         // Compound filter (kind) narrows the ranked set.
-        let (total, hits) = assets::search(
-            store.conn(),
-            "sunset",
-            &AssetQuery {
-                kind: Some(AssetKind::Image),
-                is_trashed: false,
-                ..Default::default()
-            },
-        )
-        .unwrap();
-        assert_eq!(total, 1);
-        assert_eq!(hits[0].id, photo.id);
+        let hits = search_page(&store, &idx, "sunset", Some(AssetKind::Image));
+        assert_eq!(hits.total, 1);
+        assert_eq!(hits.items[0].id, photo.id);
 
         // Trashed assets are excluded.
         assets::set_trashed(store.conn(), photo.id, true).unwrap();
-        let (total, _) = assets::search(store.conn(), "sunset", &AssetQuery::default()).unwrap();
-        assert_eq!(total, 1);
+        let page = search_page(&store, &idx, "sunset", None);
+        assert_eq!(page.total, 1);
 
         // Special characters never panic and are treated literally.
-        let (total, hits) =
-            assets::search(store.conn(), "\" * NEAR", &AssetQuery::default()).unwrap();
-        assert_eq!(total, 0);
-        let _ = hits;
+        let hits = search_page(&store, &idx, "\" * NEAR", None);
+        assert_eq!(hits.total, 0);
+    }
+
+    /// The ranked-search clause must leave the candidate id list as the only
+    /// usable index source.
+    ///
+    /// This is worth a test of its own because the failure mode is invisible in
+    /// a small library and catastrophic in a large one: left to itself the
+    /// planner drives the intersection off a filter index, and the one every
+    /// search carries — `trashed_at IS NULL` — matches every live row. The
+    /// intersection then degrades from N index probes into a full scan (100k
+    /// library, measured: 21 ms for 97 candidates and 36 ms for 2000, against
+    /// 0.1 ms and 5 ms with the id list driving).
+    #[test]
+    fn ranked_where_clause_leaves_the_id_list_driving() {
+        let store = Store::in_memory().unwrap();
+        let q = AssetQuery {
+            kind: Some(AssetKind::Image),
+            is_favorite: Some(true),
+            ..Default::default()
+        };
+        let (ranked, args) =
+            assets::build_where(store.conn(), &q, assets::WhereMode::Rejecting).unwrap();
+        let (listing, listing_args) =
+            assets::build_where(store.conn(), &q, assets::WhereMode::Driving).unwrap();
+
+        // The modes differ only in the index-suppressing prefixes, so both
+        // clauses select the same rows with the same arguments.
+        assert_eq!(
+            ranked,
+            "WHERE +kind = ?1 AND +is_favorite = ?2 AND +trashed_at IS NULL"
+        );
+        assert_eq!(
+            listing,
+            "WHERE kind = ?1 AND is_favorite = ?2 AND trashed_at IS NULL"
+        );
+        assert_eq!(args.len(), listing_args.len());
+
+        /// The plan for `SELECT id FROM assets <clause> AND id IN (?, …)`.
+        /// `params` is the statement's total placeholder count: the clause's
+        /// own arguments plus the ids.
+        fn plan(store: &Store, clause: &str, ids: usize, params: usize) -> String {
+            let marks = std::iter::repeat_n("?", ids).collect::<Vec<_>>().join(",");
+            let sql = format!("SELECT id FROM assets {clause} AND id IN ({marks})");
+            let rows: Vec<String> = store
+                .conn()
+                .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                .and_then(|mut stmt| {
+                    let rows = stmt.query_map(
+                        rusqlite::params_from_iter(std::iter::repeat_n(
+                            rusqlite::types::Value::Null,
+                            params,
+                        )),
+                        |r| r.get::<_, String>(3),
+                    )?;
+                    Ok(rows.filter_map(|r| r.ok()).collect())
+                })
+                .unwrap();
+            rows.join("; ")
+        }
+
+        /// Whether the plan lets a filter-column index drive the query. Which
+        /// one it is depends on the filters (`trashed_at` by default,
+        /// `is_favorite` once that is in play), so the test only asks whether
+        /// any of them got the job.
+        fn drives_a_filter_index(plan: &str) -> Option<&'static str> {
+            [
+                "idx_assets_trashed",
+                "idx_assets_kind",
+                "idx_assets_favorite",
+            ]
+            .into_iter()
+            .find(|idx| plan.contains(idx))
+        }
+
+        // The listing clause is *supposed* to drive off a filter index, and on
+        // this schema it does — which is what makes the assertion below a real
+        // one rather than a coincidence. The candidate count has to be in the
+        // hundreds: SQLite prices an `id IN (…)` probe by the length of the
+        // list, so a two-entry list wins on price even when it loses on work.
+        let ids = 300;
+        let listing_plan = plan(&store, &listing, ids, listing_args.len() + ids);
+        assert!(
+            drives_a_filter_index(&listing_plan).is_some(),
+            "expected the listing clause to drive off a filter index, got {listing_plan}"
+        );
+
+        let ranked_plan = plan(&store, &ranked, ids, args.len() + ids);
+        assert_eq!(
+            drives_a_filter_index(&ranked_plan),
+            None,
+            "a filter index drives the ranked intersection: {ranked_plan}"
+        );
+
+        // Every condition kind in one clause: the indexable comparisons get
+        // suppressed, while the terms that were never index sources — an
+        // `EXISTS` on a join table, `json_extract`, `LOWER(ext)`, the
+        // orientation `CASE` — keep their plain rendering.
+        let mixed = AssetQuery {
+            kind: Some(AssetKind::Image),
+            collection_id: Some(Uuid::new_v4()),
+            is_favorite: Some(true),
+            source_path_prefix: Some("/home/shot".into()),
+            orientation: Some(crate::model::Orientation::Landscape),
+            min_rating: Some(3),
+            ext: Some("png".into()),
+            ..Default::default()
+        };
+        let (clause, mixed_args) =
+            assets::build_where(store.conn(), &mixed, assets::WhereMode::Rejecting).unwrap();
+        assert!(clause.starts_with("WHERE +kind = ?1 AND EXISTS (SELECT 1 FROM asset_collection"));
+        for expected in [
+            "+is_favorite = ?3",
+            "json_extract(assets.extra, '$.source_path') LIKE ?4",
+            "CASE WHEN width IS NULL",
+            "+rating >= ?6",
+            "LOWER(ext) = LOWER(?7)",
+            "+trashed_at IS NULL",
+        ] {
+            assert!(
+                clause.contains(expected),
+                "missing {expected:?} in {clause:?}"
+            );
+        }
+        let mixed_plan = plan(&store, &clause, ids, mixed_args.len() + ids);
+        assert_eq!(
+            drives_a_filter_index(&mixed_plan),
+            None,
+            "a filter index drives the mixed ranked intersection: {mixed_plan}"
+        );
+    }
+
+    /// A tag filter has to compose with the conditions that come before it.
+    ///
+    /// `id_list` used to number its placeholders from `?1` no matter what the
+    /// clause had already numbered, so `kind` + tag bound the tag subquery's
+    /// `?1` to the *kind* string and silently matched nothing, and a second tag
+    /// collided with the first. On top of that, a tag whose subtree came back
+    /// empty (row deleted while the query still referenced it) rendered
+    /// `IN ()`, which is not even valid SQL.
+    #[test]
+    fn tag_filter_composes_with_the_conditions_before_it() {
+        let store = Store::in_memory().unwrap();
+        let conn = store.conn();
+        let photo = sample_asset("img.png", AssetKind::Image);
+        let doc = sample_asset("notes.md", AssetKind::Document);
+        assets::insert(conn, &photo).unwrap();
+        assets::insert(conn, &doc).unwrap();
+
+        let mk = |name: &str| {
+            tags::create(
+                conn,
+                &NewTag {
+                    name: name.into(),
+                    color: None,
+                    parent_id: None,
+                },
+            )
+            .unwrap()
+        };
+        let day = mk("day");
+        let night = mk("night");
+        tags::add_to_asset(conn, photo.id, day.id).unwrap();
+        tags::add_to_asset(conn, photo.id, night.id).unwrap();
+        tags::add_to_asset(conn, doc.id, night.id).unwrap();
+
+        let tagged = |q: &AssetQuery| -> Vec<Uuid> {
+            let mut ids: Vec<Uuid> = assets::query(conn, q)
+                .unwrap()
+                .items
+                .iter()
+                .map(|a| a.id)
+                .collect();
+            ids.sort();
+            ids
+        };
+        let sorted = |mut ids: Vec<Uuid>| {
+            ids.sort();
+            ids
+        };
+
+        // Tag alone.
+        let q = AssetQuery {
+            tag_ids: vec![day.id],
+            ..Default::default()
+        };
+        assert_eq!(tagged(&q), vec![photo.id]);
+
+        // Tag next to a condition that is numbered before it — where the
+        // placeholders used to collide.
+        let q = AssetQuery {
+            kind: Some(AssetKind::Image),
+            tag_ids: vec![day.id],
+            ..Default::default()
+        };
+        assert_eq!(tagged(&q), vec![photo.id]);
+        let q = AssetQuery {
+            kind: Some(AssetKind::Document),
+            tag_ids: vec![day.id],
+            ..Default::default()
+        };
+        assert!(tagged(&q).is_empty(), "day is only on the image");
+
+        // Two tags are AND-ed and each keeps its own placeholders.
+        let q = AssetQuery {
+            tag_ids: vec![day.id, night.id],
+            ..Default::default()
+        };
+        assert_eq!(tagged(&q), vec![photo.id]);
+        let q = AssetQuery {
+            tag_ids: vec![night.id],
+            ..Default::default()
+        };
+        assert_eq!(tagged(&q), sorted(vec![photo.id, doc.id]));
+
+        // A tag id whose row is gone yields an empty subtree: match nothing,
+        // rather than build invalid SQL.
+        let q = AssetQuery {
+            tag_ids: vec![Uuid::new_v4()],
+            ..Default::default()
+        };
+        assert!(tagged(&q).is_empty());
+    }
+
+    /// `counts_by_tag` must agree with `count_assets` for every tag, including
+    /// the case that would make a naive roll-up wrong: an asset carrying both a
+    /// parent tag and one of its children counts once, not twice.
+    #[test]
+    fn counts_by_tag_matches_count_assets() {
+        let store = Store::in_memory().unwrap();
+        let conn = store.conn();
+        let mk = |name: &str, parent: Option<Uuid>| {
+            tags::create(
+                conn,
+                &NewTag {
+                    name: name.into(),
+                    color: None,
+                    parent_id: parent,
+                },
+            )
+            .unwrap()
+        };
+        let root = mk("root", None);
+        let child = mk("child", Some(root.id));
+        let grandchild = mk("grandchild", Some(child.id));
+        let unrelated = mk("unrelated", None);
+        let childless = mk("childless", None);
+
+        let a = sample_asset("a.png", AssetKind::Image);
+        let b = sample_asset("b.png", AssetKind::Image);
+        let c = sample_asset("c.png", AssetKind::Image);
+        for asset in [&a, &b, &c] {
+            assets::insert(conn, asset).unwrap();
+        }
+
+        tags::add_to_asset(conn, a.id, root.id).unwrap();
+        tags::add_to_asset(conn, a.id, child.id).unwrap();
+        tags::add_to_asset(conn, b.id, grandchild.id).unwrap();
+        tags::add_to_asset(conn, c.id, unrelated.id).unwrap();
+
+        let counts = tags::counts_by_tag(conn).unwrap();
+        for tag in [&root, &child, &grandchild, &unrelated, &childless] {
+            assert_eq!(
+                counts.get(&tag.id).copied().unwrap_or(0),
+                tags::count_assets(conn, tag.id).unwrap(),
+                "{} disagrees",
+                tag.name
+            );
+        }
+        // The numbers themselves too, so a bug shared by both paths — which
+        // the loop above would happily accept — cannot pass.
+        let at = |tag: &crate::model::Tag| counts.get(&tag.id).copied().unwrap_or(0);
+        assert_eq!(
+            at(&root),
+            2,
+            "a carries root+child, b carries the grandchild"
+        );
+        assert_eq!(at(&child), 2);
+        assert_eq!(at(&grandchild), 1);
+        assert_eq!(at(&unrelated), 1);
+        assert_eq!(at(&childless), 0);
+
+        // A tag whose row is gone is simply absent from the map.
+        tags::delete(conn, childless.id).unwrap();
+        let counts = tags::counts_by_tag(conn).unwrap();
+        assert!(!counts.contains_key(&childless.id));
     }
 
     #[test]
-    fn fts_multi_term_is_and_and_prefix() {
+    fn search_multi_term_is_and_substring() {
         let store = Store::in_memory().unwrap();
+        let idx = crate::search::TextIndex::in_ram().unwrap();
         let mut photo = sample_asset("vacation.jpg", AssetKind::Image);
         photo.title = Some("Sunset over the beach".into());
         let mut doc = sample_asset("trip-notes.md", AssetKind::Document);
@@ -553,45 +927,82 @@ mod tests {
         assets::insert(store.conn(), &photo).unwrap();
         assets::insert(store.conn(), &doc).unwrap();
         assets::insert(store.conn(), &audio).unwrap();
+        index_all(&store, &idx);
 
         // Multiple terms AND together: only the photo has both.
-        let (total, hits) =
-            assets::search(store.conn(), "sunset beach", &AssetQuery::default()).unwrap();
-        assert_eq!(total, 1);
-        assert_eq!(hits[0].id, photo.id);
+        let hits = search_page(&store, &idx, "sunset beach", None);
+        assert_eq!(hits.total, 1);
+        assert_eq!(hits.items[0].id, photo.id);
 
-        // Relevance still ranks (no panic, no dupes); strict ordering is
-        // covered by the rank/compound-filter test above.
-        let (total, _) = assets::search(store.conn(), "sunset", &AssetQuery::default()).unwrap();
-        assert_eq!(total, 2);
+        // Substring matching: a term matches anywhere inside a token, so
+        // `sunse` hits `Sunset` mid-word.
+        let page = search_page(&store, &idx, "sunse", None);
+        assert_eq!(page.total, 2);
+        let hits = search_page(&store, &idx, "beac sunse", None);
+        assert_eq!(hits.total, 1);
+        assert_eq!(hits.items[0].id, photo.id);
 
-        // Prefix matching: a term matches tokens that start with it.
-        let (total, _) = assets::search(store.conn(), "sunse", &AssetQuery::default()).unwrap();
-        assert_eq!(total, 2);
-        let (total, hits) =
-            assets::search(store.conn(), "beac sunse", &AssetQuery::default()).unwrap();
-        assert_eq!(total, 1);
-        assert_eq!(hits[0].id, photo.id);
-
-        // A longer-than-token prefix matches nothing (prefix, not substring).
-        let (total, _) = assets::search(store.conn(), "beacho", &AssetQuery::default()).unwrap();
-        assert_eq!(total, 0);
-        let (total, _) = assets::search(store.conn(), "rainy", &AssetQuery::default()).unwrap();
-        assert_eq!(total, 1);
+        // Typo tolerance: `beacho` is one edit from `beach` and still finds
+        // the beach asset.
+        let page = search_page(&store, &idx, "beacho", None);
+        assert_eq!(page.total, 1);
+        let page = search_page(&store, &idx, "rainy", None);
+        assert_eq!(page.total, 1);
 
         // Whitespace is only a separator; extra spaces change nothing.
-        let (total, _) =
-            assets::search(store.conn(), "  sunset   beach  ", &AssetQuery::default()).unwrap();
-        assert_eq!(total, 1);
+        let page = search_page(&store, &idx, "  sunset   beach  ", None);
+        assert_eq!(page.total, 1);
     }
 
     #[test]
-    fn fts_matches_tag_names_and_stays_in_sync() {
+    fn search_substring_and_chinese() {
         let store = Store::in_memory().unwrap();
+        let idx = crate::search::TextIndex::in_ram().unwrap();
+        let flower = sample_asset("flower.png", AssetKind::Image);
+        let mut cat = sample_asset("花园里的猫.png", AssetKind::Image);
+        cat.title = Some("A cat in the garden 花园里的猫".into());
+        assets::insert(store.conn(), &flower).unwrap();
+        assets::insert(store.conn(), &cat).unwrap();
+        index_all(&store, &idx);
+
+        // Infix substring, not just a prefix: `ower` sits inside `flower`.
+        let hits = search_page(&store, &idx, "ower", None);
+        assert_eq!(hits.total, 1);
+        assert_eq!(hits.items[0].id, flower.id);
+
+        // A single hanzi rides the jieba word field.
+        let hits = search_page(&store, &idx, "猫", None);
+        assert_eq!(hits.total, 1);
+        assert_eq!(hits.items[0].id, cat.id);
+
+        // A two-hanzi substring rides the gram field.
+        let hits = search_page(&store, &idx, "园里", None);
+        assert_eq!(hits.total, 1);
+
+        // Pinyin: full syllables and initials both find the cat.
+        let hits = search_page(&store, &idx, "mao", None);
+        assert_eq!(hits.total, 1);
+        assert_eq!(hits.items[0].id, cat.id);
+        let hits = search_page(&store, &idx, "hyl", None);
+        assert_eq!(hits.total, 1);
+
+        // A smart rule's text condition finds short terms the same way.
+        let node = smart_node(serde_json::json!({
+            "op": "match", "field": "text", "value": "猫"
+        }));
+        let ids = super::smart::evaluate(store.conn(), Some(&idx), &node, None, 0).unwrap();
+        assert_eq!(ids.total, 1);
+        assert_eq!(ids.items[0], cat.id);
+    }
+
+    #[test]
+    fn search_matches_tag_names_and_stays_in_sync() {
+        let store = Store::in_memory().unwrap();
+        let idx = crate::search::TextIndex::in_ram().unwrap();
         let conn = store.conn();
-        let mut photo = sample_asset("mountain.png", AssetKind::Image);
-        photo.title = Some("Unrelated title".into());
+        let photo = sample_asset("img.png", AssetKind::Image);
         assets::insert(conn, &photo).unwrap();
+        index_all(&store, &idx);
 
         let tag = tags::create(
             conn,
@@ -613,97 +1024,51 @@ mod tests {
         .unwrap();
 
         // No tag attached yet: not found.
-        let (total, _) = assets::search(conn, "landscape", &AssetQuery::default()).unwrap();
-        assert_eq!(total, 0);
+        let page = search_page(&store, &idx, "landscape", None);
+        assert_eq!(page.total, 0);
 
-        // Attach: the tag name becomes searchable, prefix included.
+        // Attach: the tag name becomes searchable, prefix included. The
+        // outbox trigger enqueues the asset; the drain refreshes the doc.
         tags::add_to_asset(conn, photo.id, tag.id).unwrap();
-        let (total, hits) = assets::search(conn, "landscape", &AssetQuery::default()).unwrap();
-        assert_eq!(total, 1);
-        assert_eq!(hits[0].id, photo.id);
-        let (total, _) = assets::search(conn, "lands", &AssetQuery::default()).unwrap();
-        assert_eq!(total, 1);
+        crate::search::drain(conn, &idx).unwrap();
+        let hits = search_page(&store, &idx, "landscape", None);
+        assert_eq!(hits.total, 1);
+        assert_eq!(hits.items[0].id, photo.id);
+        let page = search_page(&store, &idx, "lands", None);
+        assert_eq!(page.total, 1);
 
         // Detach: the stale index entry must disappear.
         tags::remove_from_asset(conn, photo.id, tag.id).unwrap();
-        let (total, _) = assets::search(conn, "landscape", &AssetQuery::default()).unwrap();
-        assert_eq!(total, 0);
+        crate::search::drain(conn, &idx).unwrap();
+        let page = search_page(&store, &idx, "landscape", None);
+        assert_eq!(page.total, 0);
 
-        // Batch replace syncs once and carries every new tag name.
+        // Batch replace carries every new tag name.
         tags::set_for_asset(conn, photo.id, &[tag.id, other.id]).unwrap();
-        let (total, _) = assets::search(conn, "landscape night", &AssetQuery::default()).unwrap();
-        assert_eq!(total, 1);
+        crate::search::drain(conn, &idx).unwrap();
+        let page = search_page(&store, &idx, "landscape night", None);
+        assert_eq!(page.total, 1);
 
         // Deleting a tag removes it from every indexed asset.
         tags::delete(conn, other.id).unwrap();
-        let (total, _) = assets::search(conn, "night", &AssetQuery::default()).unwrap();
-        assert_eq!(total, 0);
-        let (total, _) = assets::search(conn, "landscape", &AssetQuery::default()).unwrap();
-        assert_eq!(total, 1);
+        crate::search::drain(conn, &idx).unwrap();
+        let page = search_page(&store, &idx, "night", None);
+        assert_eq!(page.total, 0);
+        let page = search_page(&store, &idx, "landscape", None);
+        assert_eq!(page.total, 1);
     }
 
     #[test]
-    fn query_text_condition_matches_tag_names() {
-        // The LIKE-based `text` filter (used by query() and smart collections)
-        // searches the same surface as FTS, tag names included.
+    fn search_syntax_characters_stay_literal() {
         let store = Store::in_memory().unwrap();
         let conn = store.conn();
-        let photo = sample_asset("img.png", AssetKind::Image);
-        assets::insert(conn, &photo).unwrap();
-
-        let (total, _) = assets::query(
-            conn,
-            &AssetQuery {
-                text: Some("nature".into()),
-                ..Default::default()
-            },
-        )
-        .unwrap();
-        assert_eq!(total, 0);
-
-        let tag = tags::create(
-            conn,
-            &NewTag {
-                name: "nature".into(),
-                color: None,
-                parent_id: None,
-            },
-        )
-        .unwrap();
-        tags::add_to_asset(conn, photo.id, tag.id).unwrap();
-
-        let (total, hits) = assets::query(
-            conn,
-            &AssetQuery {
-                text: Some("nature".into()),
-                ..Default::default()
-            },
-        )
-        .unwrap();
-        assert_eq!(total, 1);
-        assert_eq!(hits[0].id, photo.id);
-
-        tags::remove_from_asset(conn, photo.id, tag.id).unwrap();
-        let (total, _) = assets::query(
-            conn,
-            &AssetQuery {
-                text: Some("nature".into()),
-                ..Default::default()
-            },
-        )
-        .unwrap();
-        assert_eq!(total, 0);
-    }
-
-    #[test]
-    fn fts_syntax_characters_stay_literal_after_refactor() {
-        let store = Store::in_memory().unwrap();
-        let conn = store.conn();
+        let idx = crate::search::TextIndex::in_ram().unwrap();
         let mut photo = sample_asset("a.png", AssetKind::Image);
         photo.title = Some("C++ tips and (tricks)".into());
         assets::insert(conn, &photo).unwrap();
+        index_all(&store, &idx);
 
-        // FTS5 operators and syntax characters are matched literally, never
+        // Query operators and syntax characters are matched literally, never
         // parsed: these inputs must not error or widen the match.
         for q in [
             "c*",
@@ -715,13 +1080,13 @@ mod tests {
             "*",
             "--",
         ] {
-            let result = assets::search(conn, q, &AssetQuery::default());
-            assert!(result.is_ok(), "search panicked on query {q:?}");
+            let page = search_page(&store, &idx, q, None);
+            assert_eq!(page.total, 0, "query {q:?} must match nothing");
         }
         // "tips" still finds it.
-        let (total, hits) = assets::search(conn, "tips", &AssetQuery::default()).unwrap();
-        assert_eq!(total, 1);
-        assert_eq!(hits[0].id, photo.id);
+        let hits = search_page(&store, &idx, "tips", None);
+        assert_eq!(hits.total, 1);
+        assert_eq!(hits.items[0].id, photo.id);
     }
 
     #[test]
@@ -771,9 +1136,9 @@ mod tests {
         let node = smart_node(serde_json::json!({
             "op": "match", "field": "rating", "compare": "gte", "value": 4
         }));
-        let (total, ids) = super::smart::evaluate(store.conn(), &node, None, 0).unwrap();
-        assert_eq!(total, 2);
-        assert!(ids.contains(&img.id) && ids.contains(&doc.id));
+        let ids = super::smart::evaluate(store.conn(), None, &node, None, 0).unwrap();
+        assert_eq!(ids.total, 2);
+        assert!(ids.items.contains(&img.id) && ids.items.contains(&doc.id));
 
         // kind != image ∧ rating >= 4 → doc only (kind pairs with rating in an AND tree)
         let tree = smart_node(serde_json::json!({
@@ -783,9 +1148,9 @@ mod tests {
                 { "op": "match", "field": "kind", "compare": "ne", "value": "image" },
             ]
         }));
-        let (total, ids) = super::smart::evaluate(store.conn(), &tree, None, 0).unwrap();
-        assert_eq!(total, 1);
-        assert_eq!(ids, vec![doc.id]);
+        let ids = super::smart::evaluate(store.conn(), None, &tree, None, 0).unwrap();
+        assert_eq!(ids.total, 1);
+        assert_eq!(ids.items, vec![doc.id]);
     }
 
     #[test]
@@ -805,9 +1170,9 @@ mod tests {
             ]
         });
         let node = super::smart::node_from_json(&legacy).unwrap();
-        let (total, ids) = super::smart::evaluate(store.conn(), &node, None, 0).unwrap();
-        assert_eq!(total, 1);
-        assert_eq!(ids, vec![a.id]);
+        let ids = super::smart::evaluate(store.conn(), None, &node, None, 0).unwrap();
+        assert_eq!(ids.total, 1);
+        assert_eq!(ids.items, vec![a.id]);
 
         // A truly malformed tree (no field either) is still an error.
         assert!(
@@ -839,53 +1204,65 @@ mod tests {
         }));
 
         // kind filter narrows to images.
-        let (total, ids) = super::smart::evaluate_filtered(
+        let ids = super::smart::evaluate_filtered(
             store.conn(),
+            None,
             &node,
-            Some(AssetKind::Image),
-            None,
-            None,
-            0,
+            super::smart::SmartPage {
+                kind: Some(AssetKind::Image),
+                ..Default::default()
+            },
         )
         .unwrap();
-        assert_eq!(total, 1);
-        assert_eq!(ids, vec![img.id]);
+        assert_eq!(ids.total, 1);
+        assert_eq!(ids.items, vec![img.id]);
 
         // favorite filter narrows to the two favorites (img + vid).
-        let (total, _) =
-            super::smart::evaluate_filtered(store.conn(), &node, None, Some(true), None, 0)
-                .unwrap();
-        assert_eq!(total, 2);
-
-        // Both compose with AND.
-        let (total, ids) = super::smart::evaluate_filtered(
+        let page = super::smart::evaluate_filtered(
             store.conn(),
-            &node,
-            Some(AssetKind::Video),
-            Some(true),
             None,
-            0,
+            &node,
+            super::smart::SmartPage {
+                favorite: Some(true),
+                ..Default::default()
+            },
         )
         .unwrap();
-        assert_eq!(total, 1);
-        assert_eq!(ids, vec![vid.id]);
+        assert_eq!(page.total, 2);
+
+        // Both compose with AND.
+        let ids = super::smart::evaluate_filtered(
+            store.conn(),
+            None,
+            &node,
+            super::smart::SmartPage {
+                kind: Some(AssetKind::Video),
+                favorite: Some(true),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(ids.total, 1);
+        assert_eq!(ids.items, vec![vid.id]);
     }
 
     #[test]
     fn smart_collection_text_and_tag_match() {
         let store = Store::in_memory().unwrap();
+        let idx = crate::search::TextIndex::in_ram().unwrap();
         let mut a = sample_asset("notes.md", AssetKind::Document);
         a.title = Some("quarterly beach report".into());
         a.is_favorite = true;
         assets::insert(store.conn(), &a).unwrap();
+        index_all(&store, &idx);
 
-        // text condition routes through the FTS index.
+        // text condition routes through the Tantivy index.
         let tree = smart_node(serde_json::json!({
             "op": "match", "field": "text", "value": "beach"
         }));
-        let (total, ids) = super::smart::evaluate(store.conn(), &tree, None, 0).unwrap();
-        assert_eq!(total, 1);
-        assert_eq!(ids, vec![a.id]);
+        let ids = super::smart::evaluate(store.conn(), Some(&idx), &tree, None, 0).unwrap();
+        assert_eq!(ids.total, 1);
+        assert_eq!(ids.items, vec![a.id]);
 
         // tag match is case-insensitive.
         super::tags::ensure_named(store.conn(), "Travel").unwrap();
@@ -900,8 +1277,8 @@ mod tests {
         let tree = smart_node(serde_json::json!({
             "op": "match", "field": "tag", "value": "TRAVEL"
         }));
-        let (total, _) = super::smart::evaluate(store.conn(), &tree, None, 0).unwrap();
-        assert_eq!(total, 1);
+        let page = super::smart::evaluate(store.conn(), None, &tree, None, 0).unwrap();
+        assert_eq!(page.total, 1);
 
         // favorite filter + AND with a tag.
         let tree = smart_node(serde_json::json!({
@@ -911,22 +1288,18 @@ mod tests {
                 { "op": "match", "field": "tag", "value": "travel" },
             ]
         }));
-        let (total, _) = super::smart::evaluate(store.conn(), &tree, None, 0).unwrap();
-        assert_eq!(total, 1);
+        let page = super::smart::evaluate(store.conn(), None, &tree, None, 0).unwrap();
+        assert_eq!(page.total, 1);
     }
 
     #[test]
     fn smart_collection_color_filter() {
         let store = Store::in_memory().unwrap();
-        // Color lives in `extra.dominant_color` (as mined by color::dominant_colors).
+        // Color lives in the visual facts (as mined by color::dominant_colors).
         let mut red = sample_asset("red.png", AssetKind::Image);
-        red.extra = [("dominant_color".into(), serde_json::json!("#d01010"))]
-            .into_iter()
-            .collect();
+        red.facts.visual.dominant_color = Some("#d01010".into());
         let mut blue = sample_asset("blue.png", AssetKind::Image);
-        blue.extra = [("dominant_color".into(), serde_json::json!("#1a5cff"))]
-            .into_iter()
-            .collect();
+        blue.facts.visual.dominant_color = Some("#1a5cff".into());
         assets::insert(store.conn(), &red).unwrap();
         assets::insert(store.conn(), &blue).unwrap();
 
@@ -934,22 +1307,22 @@ mod tests {
         let tree = smart_node(serde_json::json!({
             "op": "match", "field": "color", "value": "#d01010"
         }));
-        let (total, ids) = super::smart::evaluate(store.conn(), &tree, None, 0).unwrap();
-        assert_eq!(total, 1);
-        assert_eq!(ids, vec![red.id]);
+        let ids = super::smart::evaluate(store.conn(), None, &tree, None, 0).unwrap();
+        assert_eq!(ids.total, 1);
+        assert_eq!(ids.items, vec![red.id]);
 
         let tree = smart_node(serde_json::json!({
             "op": "match", "field": "color", "compare": "ne", "value": "D01010"
         }));
-        let (total, ids) = super::smart::evaluate(store.conn(), &tree, None, 0).unwrap();
-        assert_eq!(total, 1);
-        assert_eq!(ids, vec![blue.id]);
+        let ids = super::smart::evaluate(store.conn(), None, &tree, None, 0).unwrap();
+        assert_eq!(ids.total, 1);
+        assert_eq!(ids.items, vec![blue.id]);
 
         // A malformed color is rejected at compile time.
         let bad = smart_node(serde_json::json!({
             "op": "match", "field": "color", "value": "notacolor"
         }));
-        assert!(super::smart::compile(None, &bad).is_err());
+        assert!(super::smart::compile(None, None, &bad).is_err());
     }
 
     #[test]
@@ -963,9 +1336,9 @@ mod tests {
         let node = smart_node(serde_json::json!({
             "op": "match", "field": "rating", "compare": "gte", "value": 5
         }));
-        let (total, ids) = super::smart::evaluate(store.conn(), &node, Some(4), 0).unwrap();
-        assert_eq!(total, 10);
-        assert_eq!(ids.len(), 4);
+        let ids = super::smart::evaluate(store.conn(), None, &node, Some(4), 0).unwrap();
+        assert_eq!(ids.total, 10);
+        assert_eq!(ids.items.len(), 4);
 
         // An unknown field is rejected when the JSON is deserialized into a node.
         let bad_node = super::smart::node_from_json(&serde_json::json!({
@@ -977,12 +1350,12 @@ mod tests {
         let bad_type = smart_node(serde_json::json!({
             "op": "match", "field": "rating", "value": "high"
         }));
-        assert!(super::smart::compile(None, &bad_type).is_err());
+        assert!(super::smart::compile(None, None, &bad_type).is_err());
 
         let bad_op = smart_node(serde_json::json!({
             "op": "match", "field": "kind", "compare": "gt", "value": "image"
         }));
-        assert!(super::smart::compile(None, &bad_op).is_err());
+        assert!(super::smart::compile(None, None, &bad_op).is_err());
     }
 
     #[test]
@@ -1011,9 +1384,9 @@ mod tests {
         let tree = smart_node(serde_json::json!({
             "op": "match", "field": "captured_at", "value": "2024-06-15"
         }));
-        let (total, ids) = super::smart::evaluate(store.conn(), &tree, None, 0).unwrap();
-        assert_eq!((total, ids.len()), (1, 1));
-        assert_eq!(ids[0], landscape.id);
+        let ids = super::smart::evaluate(store.conn(), None, &tree, None, 0).unwrap();
+        assert_eq!((ids.total, ids.items.len()), (1, 1));
+        assert_eq!(ids.items[0], landscape.id);
 
         // A date range (gte + lt in an `and` group).
         let tree = smart_node(serde_json::json!({
@@ -1023,8 +1396,8 @@ mod tests {
                 { "op": "match", "field": "captured_at", "compare": "lt", "value": "2025-01-01" },
             ]
         }));
-        let (total, _) = super::smart::evaluate(store.conn(), &tree, None, 0).unwrap();
-        assert_eq!(total, 1);
+        let page = super::smart::evaluate(store.conn(), None, &tree, None, 0).unwrap();
+        assert_eq!(page.total, 1);
 
         // Orientation splits the three images; assets without dimensions
         // (the audio file) never match.
@@ -1032,38 +1405,39 @@ mod tests {
             let tree = smart_node(serde_json::json!({
                 "op": "match", "field": "orientation", "value": orientation
             }));
-            let (total, _) = super::smart::evaluate(store.conn(), &tree, None, 0).unwrap();
-            assert_eq!(total, expected, "{orientation}");
+            let page = super::smart::evaluate(store.conn(), None, &tree, None, 0).unwrap();
+            assert_eq!(page.total, expected, "{orientation}");
         }
         let tree = smart_node(serde_json::json!({
             "op": "match", "field": "orientation", "compare": "ne", "value": "landscape"
         }));
-        let (total, _) = super::smart::evaluate(store.conn(), &tree, None, 0).unwrap();
-        assert_eq!(total, 2);
+        let page = super::smart::evaluate(store.conn(), None, &tree, None, 0).unwrap();
+        assert_eq!(page.total, 2);
 
         // Aspect ratio: 800/600 ≈ 1.33 matches the > 1.2 bucket.
         let tree = smart_node(serde_json::json!({
             "op": "match", "field": "aspect_ratio", "compare": "gt", "value": 1.2
         }));
-        let (total, ids) = super::smart::evaluate(store.conn(), &tree, None, 0).unwrap();
-        assert_eq!((total, ids.len()), (1, 1));
-        assert_eq!(ids[0], landscape.id);
+        let ids = super::smart::evaluate(store.conn(), None, &tree, None, 0).unwrap();
+        assert_eq!((ids.total, ids.items.len()), (1, 1));
+        assert_eq!(ids.items[0], landscape.id);
 
         // A malformed date is rejected at compile time.
         let bad = smart_node(serde_json::json!({
             "op": "match", "field": "captured_at", "value": "June 2024"
         }));
-        assert!(super::smart::compile(None, &bad).is_err());
+        assert!(super::smart::compile(None, None, &bad).is_err());
         let bad_orientation = smart_node(serde_json::json!({
             "op": "match", "field": "orientation", "value": "diagonal"
         }));
-        assert!(super::smart::compile(None, &bad_orientation).is_err());
+        assert!(super::smart::compile(None, None, &bad_orientation).is_err());
     }
 
     #[test]
     fn smart_collection_crud_roundtrip() {
         let store = Store::in_memory().unwrap();
         let input = crate::model::NewSmartCollection {
+            parent_id: None,
             name: "Favorites".into(),
             query: serde_json::json!({
                 "op": "match", "field": "is_favorite", "value": true
@@ -1096,6 +1470,97 @@ mod tests {
     }
 
     #[test]
+    fn smart_collection_hierarchy_and_cascade() {
+        use crate::model::{NewCollection, NewSmartCollection};
+        use crate::store::{collections, smart_collections};
+
+        let store = Store::in_memory().unwrap();
+        let conn = store.conn();
+        let fav = serde_json::json!({"op": "match", "field": "is_favorite", "value": true});
+        let mk = |parent_id: Option<Uuid>, name: &str| NewSmartCollection {
+            parent_id,
+            name: name.into(),
+            query: fav.clone(),
+            color: None,
+            position: 0,
+        };
+
+        let folder = collections::create(
+            conn,
+            &NewCollection {
+                parent_id: None,
+                name: "Trips".into(),
+                position: 0,
+            },
+        )
+        .unwrap();
+        let sub = collections::create(
+            conn,
+            &NewCollection {
+                parent_id: Some(folder.id),
+                name: "2026".into(),
+                position: 0,
+            },
+        )
+        .unwrap();
+
+        // A parent that is neither a collection nor a smart collection is
+        // rejected (there is no SQL FK to enforce it).
+        assert!(smart_collections::create(conn, &mk(Some(Uuid::new_v4()), "bad")).is_err());
+
+        let parent = smart_collections::create(conn, &mk(Some(folder.id), "parent")).unwrap();
+        let child = smart_collections::create(conn, &mk(Some(parent.id), "child")).unwrap();
+        let grandchild =
+            smart_collections::create(conn, &mk(Some(child.id), "grandchild")).unwrap();
+        let sibling = smart_collections::create(conn, &mk(Some(parent.id), "sibling")).unwrap();
+
+        assert_eq!(parent.parent_id, Some(folder.id));
+        assert_eq!(
+            smart_collections::get(conn, child.id)
+                .unwrap()
+                .unwrap()
+                .parent_id,
+            Some(parent.id)
+        );
+
+        // Cycle and self-parent refusals.
+        assert!(smart_collections::move_to(conn, parent.id, Some(child.id), 0).is_err());
+        assert!(smart_collections::move_to(conn, parent.id, Some(parent.id), 0).is_err());
+        // Moving a missing row, or under a missing parent, fails cleanly.
+        assert!(smart_collections::move_to(conn, Uuid::new_v4(), None, 0).is_err());
+        assert!(smart_collections::move_to(conn, child.id, Some(Uuid::new_v4()), 0).is_err());
+
+        // Legal moves: to the root, and under a (sub-)collection.
+        smart_collections::move_to(conn, child.id, None, 3).unwrap();
+        assert_eq!(
+            smart_collections::get(conn, child.id)
+                .unwrap()
+                .unwrap()
+                .parent_id,
+            None
+        );
+        smart_collections::move_to(conn, child.id, Some(sub.id), 0).unwrap();
+
+        // Deleting a smart collection takes its smart descendants, and only
+        // those: `child` was moved out from under `parent` beforehand.
+        smart_collections::delete(conn, parent.id).unwrap();
+        assert!(smart_collections::get(conn, parent.id).unwrap().is_none());
+        assert!(smart_collections::get(conn, sibling.id).unwrap().is_none());
+        assert!(smart_collections::get(conn, child.id).unwrap().is_some());
+
+        // Deleting a collection cascades to smart children of the whole
+        // collection subtree (`child` sits under `sub`).
+        collections::delete(conn, folder.id).unwrap();
+        assert!(smart_collections::get(conn, child.id).unwrap().is_none());
+        assert!(
+            smart_collections::get(conn, grandchild.id)
+                .unwrap()
+                .is_none()
+        );
+        assert!(smart_collections::list(conn).unwrap().is_empty());
+    }
+
+    #[test]
     fn rebuild_search_index_backfills() {
         let lib_root = std::env::temp_dir().join(format!("trove-rebuild-{}", Uuid::new_v4()));
         let lib = super::super::library::Library::open_in_memory(&lib_root).unwrap();
@@ -1107,16 +1572,18 @@ mod tests {
         assets::insert(conn, &a).unwrap();
         assets::insert(conn, &b).unwrap();
         // Simulate a wiped index then rebuild it from the rows.
-        crate::store::rows::execute(conn, "DELETE FROM asset_fts", vec![]).unwrap();
+        lib.text_index().wipe().unwrap();
 
         let n = crate::services::maintenance::rebuild_search_index(&lib).unwrap();
         assert_eq!(n, 2);
-        let (total, _) = assets::search(conn, "treasure", &AssetQuery::default()).unwrap();
-        assert_eq!(total, 1);
+        let page = lib
+            .search_assets("treasure", &AssetQuery::default())
+            .unwrap();
+        assert_eq!(page.total, 1);
     }
 
     #[test]
-    fn tag_rename_updates_fts_and_rejects_duplicates() {
+    fn tag_rename_updates_index_and_rejects_duplicates() {
         let store = Store::in_memory().unwrap();
         let conn = store.conn();
         let tag = tags::create(
@@ -1132,18 +1599,21 @@ mod tests {
         a.title = Some("sunset".into());
         assets::insert(conn, &a).unwrap();
         tags::add_to_asset(conn, a.id, tag.id).unwrap();
+        let idx = crate::search::TextIndex::in_ram().unwrap();
+        index_all(&store, &idx);
         // The old name is searchable before the rename.
-        let (total, _) = assets::search(conn, "beach", &AssetQuery::default()).unwrap();
-        assert_eq!(total, 1);
+        let page = search_page(&store, &idx, "beach", None);
+        assert_eq!(page.total, 1);
 
         tags::rename(conn, tag.id, "coastline").unwrap();
         let renamed = tags::get(conn, tag.id).unwrap().unwrap();
         assert_eq!(renamed.name, "coastline");
-        // Search index followed the rename in both directions.
-        let (total, _) = assets::search(conn, "coastline", &AssetQuery::default()).unwrap();
-        assert_eq!(total, 1);
-        let (total, _) = assets::search(conn, "beach", &AssetQuery::default()).unwrap();
-        assert_eq!(total, 0);
+        // The outbox picked the rename up; the index follows in both directions.
+        crate::search::drain(conn, &idx).unwrap();
+        let page = search_page(&store, &idx, "coastline", None);
+        assert_eq!(page.total, 1);
+        let page = search_page(&store, &idx, "beach", None);
+        assert_eq!(page.total, 0);
 
         // Renaming onto an existing name (case-insensitive) fails.
         let other = tags::create(
@@ -1206,7 +1676,7 @@ mod tests {
         let names = |q: AssetQuery| -> Vec<String> {
             assets::query(conn, &q)
                 .unwrap()
-                .1
+                .items
                 .iter()
                 .map(|x| x.file_name.clone())
                 .collect()
@@ -1274,6 +1744,7 @@ mod tests {
         smart_collections::create(
             conn,
             &crate::model::NewSmartCollection {
+                parent_id: None,
                 name: "fav".into(),
                 query: serde_json::json!({
                     "op": "match", "field": "is_favorite", "value": true

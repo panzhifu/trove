@@ -19,15 +19,15 @@ use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::dock::{BasePanel, Panel as DockPanel, PanelControl, PanelEvent};
 use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::component::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenuItem};
-use gpui_kit::component::{ActiveTheme, Icon, IconName};
+use gpui_kit::component::{ActiveTheme, Icon, IconName, Selectable as _};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 // The `gpui_kit::*` glob above re-exports everything from gpui, but the grid
 // needs the virtualized `list` element under a distinct name: a local
 // `Vec<Asset>` variable called `list` would otherwise shadow it.
-use crate::panels::color_picker::{ColorPicked, ColorPickerState, picker_panel};
-use gpui_kit::component::popover::Popover;
+use crate::components::color_picker::{ColorPicked, ColorPickerState, picker_panel};
+use gpui_kit::component::popover::{Popover, PopoverState};
 use gpui_kit::component::slider::{Slider, SliderEvent, SliderState};
 use gpui_kit::list as list_element;
 use gpui_kit::{Anchor, Bounds, ListOffset, Pixels};
@@ -40,18 +40,19 @@ use trove_core::layout::{
     GRID_GAP, MAX_ROW_HEIGHT, MIN_ASPECT, MIN_ROW_HEIGHT, RowLayout, justify_layout_with_target,
     target_row_height_for_scale,
 };
-use trove_core::model::{AssetKind, AssetQuery, AssetSort, NewSmartCollection};
+use trove_core::model::{AssetKind, AssetSort, NewSmartCollection, Orientation};
 use trove_core::store::{assets, collections, smart_collections};
 use uuid::Uuid;
 
 use crate::app::actions::{ClearSelection, MoveDown, MoveLeft, MoveRight, MoveUp, OpenPreview};
 use crate::components::preview::{
-    AssetPreviewEvent, AssetPreviewPanel, ModelViewport, ModelViewportEvent,
+    AssetPreviewData, AssetPreviewEvent, AssetPreviewPanel, ModelViewport, ModelViewportEvent,
 };
 use crate::library::{GRID_PAGE_SIZE, LibraryController, ViewMode};
 
-use crate::panels::workspace_context_menu::AssetsDragPreview;
-use crate::panels::workspace_context_menu::asset_context_menu;
+mod context_menu;
+
+use self::context_menu::{AssetsDragPreview, asset_context_menu};
 
 use crate::panels::common::{AssetsDrag, display_name, kind_icon, observe_controller};
 
@@ -62,11 +63,16 @@ mod rows;
 mod toolbar;
 
 use cells::{build_cell_element, build_list_row_element, model_source};
-use data::{Cell, DataKey, Direction, Row, TIMELINE_HEADER_HEIGHT, ViewData, ViewKey};
+use data::{
+    Cell, DataKey, Direction, Row, TIMELINE_HEADER_HEIGHT, ViewData, ViewKey, total_identity,
+};
 use rows::{
     materialize_rows, next_cell_row, prev_cell_row, refill_rows, timeline_header, timeline_rows,
 };
-use toolbar::{kind_filter, kind_key, selection_toolbar, title_controls};
+use toolbar::{
+    add_filter_button, format_filter, kind_filter, kind_key, rating_filter, selection_toolbar,
+    shape_filter, tag_filter, title_controls,
+};
 
 /// Fallback layout width before the container has been measured once
 /// (assumes a ~1024px window minus the two side docks).
@@ -77,6 +83,14 @@ const LIST_OVERDRAW_PX: f32 = 400.0;
 const LIST_ROW_HEIGHT: f32 = 44.0;
 /// How close (in rows) to the end of the list the next page is requested.
 const PAGE_TRIGGER_ROWS: usize = 3;
+/// Minimum wall time between two exact COUNT queries for the grid total.
+/// Between them the cached number is reused; the data pass fetches items
+/// with a lower-bound total instead, keeping the COUNT off the hot path.
+const TOTAL_REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(2000);
+/// Delay after a refresh that reused the cached total before one exact
+/// re-count runs, so the number always settles once churn (imports, edits)
+/// ends instead of staying stale until the next view switch.
+const TOTAL_SETTLE_DELAY: std::time::Duration = std::time::Duration::from_millis(400);
 
 // ======================== Center: thumbnail grid =============================
 
@@ -109,10 +123,9 @@ pub struct WorkspacePanel {
     controller: Entity<LibraryController>,
     /// Self-contained floating search (trigger + popover + input).
     search_box: Entity<SearchBox>,
-    /// Custom-colour picker state (popover in the toolbar row).
+    /// Custom-colour picker state (popover in the toolbar row). The
+    /// popover's open state is the popover's own.
     color_picker: Entity<ColorPickerState>,
-    /// Whether the picker popover is showing.
-    color_picker_open: std::cell::Cell<bool>,
     /// A colour confirmed in the picker; consumed by the next render.
     pending_color_search: Option<String>,
     /// Measured available width of the scroll container, updated each
@@ -146,9 +159,66 @@ pub struct WorkspacePanel {
     preview: Option<MainPreview>,
     /// Kept so the preview's close event stops arriving when it is dropped.
     preview_subscription: Option<Subscription>,
+    /// In-flight system-font scan for the fonts view; `None` once started
+    /// and finished (the result lives on the controller).
+    fonts_scan_task: Option<gpui::Task<()>>,
+    /// View identity + time of the last exact COUNT for the grid total
+    /// (see `TOTAL_REFRESH_INTERVAL`).
+    total_refresh: Option<(std::time::Instant, DataKey)>,
+    /// Set by the settle timer: the next data pass must re-run the exact
+    /// COUNT even though the cached total is otherwise still fresh.
+    count_recheck: bool,
+    /// Pending settle timer for the re-check above.
+    count_settle: Option<gpui::Task<()>>,
+    /// Distinct live file extensions for the format filter, keyed by the
+    /// controller generation they were read at. The read is a full scan of
+    /// the live rows and the toolbar is rebuilt every frame, so it may only
+    /// run when the generation moves.
+    filter_exts: Option<(u64, Vec<String>)>,
 }
 
 impl WorkspacePanel {
+    /// Schedule one exact re-count of the grid total after a refresh that
+    /// reused the cached number, so the displayed count catches up once the
+    /// churn (import burst, one-off edit) settles.
+    fn arm_total_settle(&mut self, cx: &mut Context<Self>) {
+        if self.count_settle.is_some() {
+            return;
+        }
+        let panel = cx.entity();
+        self.count_settle = Some(cx.spawn(async move |_, cx| {
+            cx.background_executor().timer(TOTAL_SETTLE_DELAY).await;
+            panel.update(cx, |this, cx| {
+                this.count_settle = None;
+                this.count_recheck = true;
+                cx.notify();
+            });
+        }));
+    }
+
+    /// Kick off the system-font scan the first time the fonts view is
+    /// browsed. The scan parses the name table of every font file on the
+    /// machine, so it must run on the background executor; when it lands
+    /// the generation bump lets the data pass merge the virtual entries.
+    fn ensure_system_fonts_scan(&mut self, cx: &mut Context<Self>) {
+        let already_scanned = self.controller.read(cx).system_fonts.is_some();
+        if already_scanned || self.fonts_scan_task.is_some() {
+            return;
+        }
+        let controller = self.controller.clone();
+        self.fonts_scan_task = Some(cx.spawn(async move |_, cx| {
+            let scanned = cx
+                .background_executor()
+                .spawn(async move { trove_core::services::font_manager::scan_system_fonts() })
+                .await;
+            controller.update(cx, |ctl, cx| {
+                ctl.system_fonts = Some(std::sync::Arc::new(scanned));
+                ctl.generation += 1;
+                cx.notify();
+            });
+        }));
+    }
+
     /// Slider events: the label previews live; the actual row-height scale
     /// (and its config persistence) commits on release so a drag does not
     /// re-justify the grid on every tick.
@@ -273,71 +343,122 @@ impl DockPanel for WorkspacePanel {
 }
 
 impl WorkspacePanel {
-    /// The in-panel toolbar row below the title bar: the kind filter, the
-    /// colour picker (colour search), and the contextual actions.
+    /// The in-panel toolbar row below the title bar. While a visual search
+    /// is active it collapses to the result-mode chip and an exit button;
+    /// otherwise it shows the colour picker (colour search), the user's
+    /// enabled filter tools (kind / tag / shape / rating / format), and the
+    /// "+" button that toggles the set.
     fn toolbar_row(&mut self, cx: &mut Context<Self>) -> Div {
         let ctl = self.controller.read(cx);
+        if let Some(visual) = ctl.visual_results.clone() {
+            let controller = self.controller.clone();
+            let count = visual.hits.len();
+            return h_flex()
+                .w_full()
+                .items_center()
+                .gap_2()
+                .child(
+                    div()
+                        .px_2()
+                        .py_0p5()
+                        .rounded(cx.theme().radius)
+                        .bg(cx.theme().secondary)
+                        .text_sm()
+                        .text_color(cx.theme().foreground)
+                        .child(
+                            rust_i18n::t!("workspace.visual_title").to_string()
+                                + " · "
+                                + &visual.label,
+                        ),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(rust_i18n::t!("workspace.visual_count", count = count).to_string()),
+                )
+                .child(
+                    Button::new("exit-visual-search")
+                        .ghost()
+                        .xsmall()
+                        .icon(IconName::Close)
+                        .tooltip(rust_i18n::t!("workspace.exit_visual").to_string())
+                        .on_click(move |_, _, cx| {
+                            controller.update(cx, |ctl, cx| {
+                                ctl.close_visual_search();
+                                cx.notify();
+                            });
+                        }),
+                );
+        }
         let in_trash = ctl.showing_trash;
         let in_recent = ctl.showing_recent;
         let search_active = !in_trash && !in_recent && !ctl.search_text.trim().is_empty();
         let controller = self.controller.clone();
         let color_picker = self.color_picker.clone();
-        let picker_open = self.color_picker_open.clone();
+        // The extension list the format filter offers. Reading it means a full
+        // scan of the live rows (32 ms on a 100k library) and this row is built
+        // every frame, so it is refilled only when the generation moves.
+        let generation = self.controller.read(cx).generation;
+        if self.filter_exts.as_ref().map(|(cached, _)| *cached) != Some(generation) {
+            let conn = self.controller.read(cx).library.store().conn();
+            let exts = trove_core::store::assets::distinct_exts(conn).unwrap_or_default();
+            self.filter_exts = Some((generation, exts));
+        }
+        let exts: &[String] = match &self.filter_exts {
+            Some((_, exts)) => exts.as_slice(),
+            None => &[],
+        };
+        // Which filter tools the user enabled; recomputed per render so a
+        // toggle in the "+" menu applies immediately.
+        let enabled_tools = trove_core::config::AppConfig::load().filter_tools();
+        let tool_enabled =
+            |tool: &str| !in_trash && !in_recent && enabled_tools.iter().any(|t| t == tool);
         h_flex()
             .w_full()
             .items_center()
             .gap_1()
-            // Kind filter stays on the left of the row.
-            .child(kind_filter(&controller, cx))
+            // Colour picker sits at the far left, then the kind filter.
             .when(!in_trash && !in_recent, |row| {
-                // Custom-colour picker: confirm opens a colour search.
+                // Eagle-style "colour" tab. The popover owns its open state
+                // and click handling — the trigger is just a button — and
+                // confirming a colour in the panel opens a colour search.
                 row.child(
-                    div()
-                        .id("color-picker-trigger")
-                        .size_5()
-                        .rounded_sm()
-                        .border_1()
-                        .border_color(cx.theme().border)
-                        .bg(cx.theme().secondary)
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .text_color(cx.theme().muted_foreground)
-                        .cursor_pointer()
-                        .hover(|this| this.text_color(cx.theme().foreground))
-                        .on_click({
-                            let picker_open = picker_open.clone();
-                            move |_, _, cx| {
-                                picker_open.set(!picker_open.get());
-                                cx.refresh_windows();
+                    Popover::new("workspace-color-picker")
+                        .anchor(Anchor::TopLeft)
+                        .trigger(
+                            Button::new("color-picker-trigger")
+                                .ghost()
+                                .xsmall()
+                                .icon(IconName::Palette)
+                                .label(rust_i18n::t!("workspace.color_filter").to_string())
+                                .tooltip(rust_i18n::t!("workspace.pick_color_search").to_string()),
+                        )
+                        .content({
+                            let color_picker = color_picker.clone();
+                            move |_, window, cx: &mut Context<PopoverState>| {
+                                picker_panel(&cx.entity(), &color_picker, window, cx)
                             }
-                        })
-                        .tooltip(move |window, cx| {
-                            gpui_kit::component::tooltip::Tooltip::new(SharedString::from(
-                                rust_i18n::t!("workspace.pick_color_search").to_string(),
-                            ))
-                            .build(window, cx)
-                        })
-                        .child(Icon::new(IconName::Palette).size_3()),
+                        }),
                 )
-                .when(self.color_picker_open.get(), |row| {
-                    let color_picker = color_picker.clone();
-                    let picker_open = picker_open.clone();
-                    row.child({
-                        let color_picker = color_picker.clone();
-                        Popover::new("workspace-color-picker")
-                            .anchor(Anchor::TopLeft)
-                            .open(true)
-                            .on_open_change({
-                                let picker_open = picker_open.clone();
-                                move |is_open: &bool, _, cx| {
-                                    picker_open.set(*is_open);
-                                    cx.refresh_windows();
-                                }
-                            })
-                            .content(move |_, window, cx| picker_panel(&color_picker, window, cx))
-                    })
-                })
+            })
+            .when(tool_enabled("kind"), |row| {
+                row.child(kind_filter(&controller, cx))
+            })
+            .when(tool_enabled("tag"), |row| {
+                row.child(tag_filter(&controller, cx))
+            })
+            .when(tool_enabled("shape"), |row| {
+                row.child(shape_filter(&controller, cx))
+            })
+            .when(tool_enabled("rating"), |row| {
+                row.child(rating_filter(&controller, cx))
+            })
+            .when(tool_enabled("format"), |row| {
+                row.child(format_filter(exts, &controller, cx))
+            })
+            .when(!in_trash && !in_recent, |row| {
+                row.child(add_filter_button(&controller))
             })
             .when(in_trash, |row| {
                 row.child(
@@ -432,14 +553,6 @@ impl Render for WorkspacePanel {
                 .into_any_element();
         }
 
-        // A reveal request (click in the similar-images dialog) lands here:
-        // consume the flag first so handling cannot loop the render.
-        if let Some(reveal) = self.controller.read(cx).pending_reveal {
-            self.controller
-                .update(cx, |ctl, _| ctl.pending_reveal = None);
-            self.reveal_asset(reveal, cx);
-        }
-
         // --- context snapshot (drop the controller borrow early) -----------
         let (
             collection,
@@ -452,10 +565,15 @@ impl Render for WorkspacePanel {
             selected,
             filter_kind,
             filter_favorite,
+            filter_orientation,
+            filter_min_rating,
+            filter_ext,
             view_mode,
             sort,
             sort_desc,
             active_folder,
+            visual_ids,
+            visual_label,
         ) = {
             let ctl = self.controller.read(cx);
             (
@@ -469,13 +587,26 @@ impl Render for WorkspacePanel {
                 ctl.selected_assets.clone(),
                 ctl.filter_kind,
                 ctl.filter_favorite,
+                ctl.filter_orientation,
+                ctl.filter_min_rating,
+                ctl.filter_ext.clone(),
                 ctl.view_mode,
                 ctl.sort,
                 ctl.sort_desc,
                 ctl.active_folder.clone(),
+                ctl.visual_results
+                    .as_ref()
+                    .map(|r| r.hits.iter().map(|(id, _)| *id).collect::<Vec<Uuid>>()),
+                ctl.visual_results.as_ref().map(|r| r.label.clone()),
             )
         };
         let library_root = self.controller.read(cx).library.root().to_path_buf();
+
+        // Fonts view: make sure the system-font scan is on its way so the
+        // virtual entries can merge in once it lands.
+        if !in_trash && !in_recent && filter_kind == Some(AssetKind::Font) && visual_ids.is_none() {
+            self.ensure_system_fonts_scan(cx);
+        }
 
         // --- data pass (cached) ---------------------------------------------
         // The query is the most expensive step in this function and the cell
@@ -494,14 +625,37 @@ impl Render for WorkspacePanel {
             search: search.clone(),
             filter_kind,
             filter_favorite,
+            filter_orientation,
+            filter_min_rating,
+            filter_ext,
             sort,
             sort_desc,
             grid_loaded,
             library_root: library_root.clone(),
             generation: self.controller.read(cx).generation,
+            visual: visual_ids.clone(),
         };
         if self.data.as_ref().is_none_or(|d| d.key != data_key) {
-            let (total, cells) = self.run_data_pass(cx, &data_key);
+            // Decide whether this refresh pays for the exact COUNT. Rapid
+            // refreshes (import ticks, one-off edits) reuse the cached
+            // total; the settle timer guarantees one exact pass once the
+            // churn ends, so the number never settles stale.
+            let identity = total_identity(&data_key);
+            let now = std::time::Instant::now();
+            let need_count = self.total_refresh.as_ref().is_none_or(|(at, key)| {
+                *key != identity || now.duration_since(*at) >= TOTAL_REFRESH_INTERVAL
+            }) || self.count_recheck;
+            self.count_recheck = false;
+            if need_count {
+                self.total_refresh = Some((now, identity));
+            }
+            let (pass_total, cells) = self.run_data_pass(cx, &data_key, need_count);
+            let total = if need_count {
+                pass_total
+            } else {
+                self.arm_total_settle(cx);
+                self.data.as_ref().map(|d| d.total).unwrap_or(pass_total)
+            };
             self.data = Some(ViewData {
                 key: data_key,
                 total,
@@ -548,6 +702,7 @@ impl Render for WorkspacePanel {
                 || k.view_mode != view_mode
                 || k.sort != sort
                 || k.sort_desc != sort_desc
+                || k.visual != visual_ids
         });
 
         // Structural changes (view / filter / asset set) always relayout now;
@@ -587,6 +742,7 @@ impl Render for WorkspacePanel {
             sort_desc,
             content_width,
             row_height_scale,
+            visual: visual_ids.clone(),
         };
         // The debounce settled on a width that already equals the applied one
         // (resize flickered back): clear the pending flag so future resizes
@@ -773,7 +929,9 @@ impl Render for WorkspacePanel {
         // --- empty-state hint -------------------------------------------------
         // An empty grid currently paints nothing at all; tell the user why.
         let empty_message = if cells_empty {
-            if search_active {
+            if let Some(label) = &visual_label {
+                rust_i18n::t!("workspace.no_results", query = label).to_string()
+            } else if search_active {
                 rust_i18n::t!("workspace.no_results", query = search).to_string()
             } else {
                 rust_i18n::t!("workspace.no_assets_hint").to_string()
@@ -866,6 +1024,7 @@ mod tests {
             day: day.to_string(),
             font_family: None,
             font_blob: None,
+            system_font: false,
         }
     }
 

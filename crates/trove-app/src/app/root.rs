@@ -11,7 +11,9 @@ use gpui_kit::base::h_flex;
 use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::component::Sizable as _;
 use gpui_kit::component::WindowExt as _;
-use gpui_kit::component::dock::{DockLayout, DockPlacement, DockSkin, panel_handle};
+use gpui_kit::component::dock::{
+    DockLayout, DockPlacement, DockSkin, InsertTarget, PaneRef, PanelId, panel_handle,
+};
 use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::component::notification::Notification;
 use gpui_kit::prelude::FluentBuilder as _;
@@ -23,10 +25,11 @@ use gpui_kit::*;
 use crate::app::actions::*;
 use crate::app::title_bar::TitleBarView;
 use crate::library::jobs;
-use crate::library::{ImportPhase, LibraryController};
+use crate::library::{ImportPhase, LibraryController, SelectionSource};
 use crate::panels::{ExplorerPanel, FoldersPanel, InspectorPanel, TagsPanel, WorkspacePanel};
 use trove_core::config::AppConfig;
 use trove_core::library::Library;
+use uuid::Uuid;
 
 fn default_library_path() -> PathBuf {
     // `TROVE_LIBRARY_DIR` overrides, then the persisted choice, then the
@@ -39,6 +42,13 @@ fn default_library_path() -> PathBuf {
 pub struct AppView {
     controller: Entity<LibraryController>,
     dock: Entity<gpui_kit::component::dock::DockArea>,
+    /// The inspector panel entity, kept so the selection observer can switch
+    /// the right dock to its tab (see [`AppView::show_inspector`]).
+    inspector: Entity<InspectorPanel>,
+    /// The selection the auto-show observer last saw: showing the inspector
+    /// only when the selection actually changed, so unrelated controller
+    /// notifies never steal the right dock's tab.
+    last_selection: Vec<Uuid>,
     title_bar: Entity<TitleBarView>,
     /// Kept alive for the life of the view: dropping it would unregister the
     /// OS light/dark observer that re-applies the appearance.
@@ -55,8 +65,7 @@ impl AppView {
         let library =
             Library::open(default_library_path()).unwrap_or_else(|e| panic!("open library: {e}"));
         // Record the library for Settings ▸ recent libraries (best-effort).
-        let mut config = AppConfig::load();
-        let _ = config.push_recent_library(library.root().to_path_buf());
+        let _ = trove_core::history::AppHistory::load().push_library(library.root());
         let controller = cx.new(|_cx| LibraryController::new(library));
         let title_bar = cx.new(|cx| TitleBarView::new(controller.clone(), cx));
 
@@ -91,7 +100,7 @@ impl AppView {
                 DockPlacement::Right,
                 DockLayout::tabs()
                     .panel_view(panel_handle(tags), cx)
-                    .panel_view(panel_handle(inspector), cx),
+                    .panel_view(panel_handle(inspector.clone()), cx),
                 window,
                 cx,
             );
@@ -99,18 +108,77 @@ impl AppView {
         });
         skin.set_ellipsis_menu(false, cx);
 
-        // Redraw the status bar whenever the controller state changes.
-        cx.observe(&controller, |_, _, cx| cx.notify()).detach();
+        // Auto-show the inspector: whenever a *plain* selection change
+        // (single click / keyboard move) lands on a non-empty selection,
+        // switch the right dock to the inspector tab and open the dock if
+        // collapsed. Multi-select gestures (Ctrl toggle / Shift range) and
+        // clears never steal the tab.
+        cx.observe_in(&controller, window, move |this, controller, window, cx| {
+            let ctl = controller.read(cx);
+            let plain = ctl.selection_source == SelectionSource::Plain;
+            let selection = ctl.selected_assets.clone();
+            let changed = this.last_selection != selection;
+            this.last_selection = selection;
+            if changed && plain && !this.last_selection.is_empty() {
+                this.show_inspector(window, cx);
+            }
+            cx.notify();
+        })
+        .detach();
 
-        spawn_folder_watcher(controller.clone(), window.window_handle(), cx);
+        crate::library::jobs::start_watch_service(&controller, window.window_handle(), cx);
         start_collect_server(cx);
 
         Self {
             controller,
             dock,
+            inspector,
+            last_selection: Vec::new(),
             title_bar,
             _appearance,
         }
+    }
+
+    /// Bring the inspector tab to the front of the right dock, opening the
+    /// dock first when it is collapsed. A no-op when the inspector is already
+    /// the displayed tab or lives outside the right dock (the user may have
+    /// dragged it elsewhere).
+    fn show_inspector(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let panel_id = PanelId::from(self.inspector.entity_id());
+        self.dock.update(cx, |area, cx| {
+            if !area.is_dock_open(DockPlacement::Right) {
+                area.toggle_dock(DockPlacement::Right, window, cx);
+            }
+            // Find the inspector's tab group and keep its current slot, so
+            // the switch only changes the displayed tab, never the order.
+            let target = area.layout(DockPlacement::Right).and_then(|tree| {
+                let node = tree.find_panel_node(panel_id)?;
+                match tree.find_node(node)?.kind() {
+                    PaneRef::Tabs { panels, active_ix } => {
+                        if panels.get(active_ix) == Some(&panel_id) {
+                            return None;
+                        }
+                        panels
+                            .iter()
+                            .position(|panel| *panel == panel_id)
+                            .map(|ix| (node, ix))
+                    }
+                    _ => None,
+                }
+            });
+            if let Some((node, ix)) = target {
+                area.move_panel(
+                    panel_id,
+                    InsertTarget::Tabs {
+                        node,
+                        ix: Some(ix),
+                        activate: true,
+                    },
+                    window,
+                    cx,
+                );
+            }
+        });
     }
 
     /// Edit ▸ Paste Import: bring the clipboard image into the library. Text
@@ -274,6 +342,19 @@ impl AppView {
         };
         let notice = ctl.notice.clone();
         let (undo_len, redo_len) = (ctl.library.undo_len(), ctl.library.redo_len());
+        // Recent-operation descriptions for the status-bar history tooltip.
+        let undo_entries = ctl.library.undo_entries(5);
+        let redo_entries = ctl.library.redo_entries(3);
+        let history_tooltip = if undo_len == 0 && redo_len == 0 {
+            None
+        } else {
+            let mut lines: Vec<String> = undo_entries.iter().map(describe_op).collect();
+            if !redo_entries.is_empty() {
+                lines.push(rust_i18n::t!("statusbar.redo_header").to_string());
+                lines.extend(redo_entries.iter().map(describe_op));
+            }
+            Some(lines.join("\n"))
+        };
         h_flex()
             .h(px(26.))
             .px_3()
@@ -286,17 +367,30 @@ impl AppView {
             .text_xs()
             .text_color(cx.theme().muted_foreground)
             .child(rust_i18n::t!("statusbar.selected", count = selected).to_string())
-            .when(undo_len > 0 || redo_len > 0, |bar| {
-                bar.child(
-                    div()
+            .when(undo_len > 0 || redo_len > 0, {
+                let history_tooltip = history_tooltip.clone();
+                move |bar| {
+                    let history_seg = div()
+                        .id("statusbar-history")
                         .when(undo_len > 0, |seg| {
                             seg.child(rust_i18n::t!("statusbar.undo", count = undo_len).to_string())
                         })
                         .when(undo_len > 0 && redo_len > 0, |seg| seg.child(" · "))
                         .when(redo_len > 0, |seg| {
                             seg.child(rust_i18n::t!("statusbar.redo", count = redo_len).to_string())
-                        }),
-                )
+                        });
+                    let seg = match history_tooltip {
+                        Some(text) => {
+                            let text = SharedString::from(text);
+                            history_seg.tooltip(move |window, cx| {
+                                gpui_kit::component::tooltip::Tooltip::new(text.clone())
+                                    .build(window, cx)
+                            })
+                        }
+                        None => history_seg,
+                    };
+                    bar.child(seg)
+                }
             })
             .child(
                 div()
@@ -591,8 +685,10 @@ impl Render for AppView {
             .on_action(cx.listener(|this, _: &OpenSettings, _, cx| {
                 crate::dialogs::settings::open(cx, this.controller.clone());
             }))
-            .on_action(cx.listener(|this, _: &SystemFonts, window, cx| {
-                crate::dialogs::system_fonts::open(&this.controller, window, cx);
+            .on_action(cx.listener(|this, _: &SystemFonts, _, cx| {
+                // System fonts live in the fonts view itself (virtual
+                // entries next to the imported ones) — no popup browser.
+                this.controller.update(cx, |ctl, _cx| ctl.select_fonts());
             }))
             .on_action(cx.listener(|this, _: &FindDuplicates, window, cx| {
                 crate::dialogs::duplicates::DuplicateDialog::open(
@@ -690,72 +786,20 @@ impl Render for AppView {
     }
 }
 
-/// Background loop for watched folders: every [`WATCH_POLL_INTERVAL`] the
-/// configured roots are re-scanned and new files import into the library
-/// (unfiled). A root is baselined on first sight, so attaching a watch never
-/// retro-imports what is already there; the config is re-read every cycle, so
-/// changes in Settings apply without a restart.
-const WATCH_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
-
-fn spawn_folder_watcher(
-    controller: Entity<LibraryController>,
-    handle: AnyWindowHandle,
-    cx: &mut Context<AppView>,
-) {
-    cx.spawn(async move |_, cx| {
-        let mut seen: std::collections::HashSet<PathBuf> = Default::default();
-        let mut baselined: std::collections::HashSet<PathBuf> = Default::default();
-        loop {
-            cx.background_executor().timer(WATCH_POLL_INTERVAL).await;
-            let config = AppConfig::load();
-            // Collect-service inbox first: files land there from the local
-            // HTTP server (extension / curl) and import with their source.
-            let _ = handle.update(cx, |_view, window, cx| {
-                crate::library::jobs::collect_inbox_app(&controller, window, cx)
-            });
-            if !config.watch_folders_enabled() {
-                continue;
-            }
-            let roots = config.watched_folders.clone();
-            if roots.is_empty() {
-                continue;
-            }
-            let files = crate::library::watcher::all_files(&roots);
-            for root in &roots {
-                if baselined.insert(root.clone()) {
-                    for file in &files {
-                        if file.starts_with(root) {
-                            seen.insert(file.clone());
-                        }
-                    }
-                }
-            }
-            let fresh: Vec<PathBuf> = files
-                .into_iter()
-                .filter(|file| !seen.contains(file))
-                .collect();
-            if fresh.is_empty() {
-                continue;
-            }
-            // Mark seen only after the batch was accepted; a refusal (e.g. a
-            // manual import still running) retries on the next cycle.
-            let accepted = handle
-                .update(cx, |_view, window, cx| {
-                    jobs::import_paths_app_into(&controller, fresh.clone(), None, window, cx)
-                })
-                .unwrap_or(false);
-            if accepted {
-                for file in &fresh {
-                    seen.insert(file.clone());
-                }
-            }
-        }
-    })
-    .detach();
+/// One history line for the status-bar tooltip: localized verb plus the
+/// recorded target (name when a single object was touched, a count
+/// otherwise).
+fn describe_op(desc: &trove_core::history::undo::OpDesc) -> String {
+    let action = rust_i18n::t!(desc.action.key()).to_string();
+    match (&desc.target, desc.count) {
+        (Some(name), _) => format!("{action} {name}"),
+        (None, n) if n > 1 => format!("{action} ×{n}"),
+        (None, _) => action,
+    }
 }
 
 /// Boot the local collect service (127.0.0.1). The server thread only
-/// writes files into the inbox dir; the watcher loop imports them.
+/// writes files into the inbox dir; the backend watch task imports them.
 fn start_collect_server(_cx: &mut Context<AppView>) {
     let config = AppConfig::load();
     if !config.collect_enabled() {

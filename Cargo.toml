@@ -22,6 +22,10 @@ serde_json = "1"
 
 # Persistence
 rusqlite = { version = "0.37", features = ["bundled", "chrono", "uuid", "serde_json"] }
+# Deliberately kept on 0.10 rather than aligned with the sha2 0.11 that
+# gpui-kit-assets pulls in: oo7 (-> zbus/ashpd, via gpui-pre) hard-requires
+# `sha2 ^0.10`, so both stacks exist either way and moving costs a crypto
+# generation for zero dedup. Revisit when oo7 moves to digest 0.11.
 sha2 = "0.10"
 
 # Utilities
@@ -34,14 +38,29 @@ dirs = "5"
 ttf-parser = "0.25"
 fontdue = "0.9"
 mp4 = "0.14"
-image = { version = "0.25", default-features = false, features = ["png"] }
+# Image decoding. `trove-core` converts/reads every supported format and
+# `trove-app` decodes APNG frames, so the feature set lives here once instead
+# of being declared twice with a subset (features are unioned across the
+# workspace anyway, a second declaration only invites drift).
+image = { version = "0.25", default-features = false, features = [
+    "png",
+    "jpeg",
+    "gif",
+    "webp",
+    "bmp",
+    "tiff",
+    "ico",
+] }
 smallvec = "1"
 
 # Local collect service: URL fetching for the inbox (extension / curl)
 ureq = "3"
 
-# Design-format thumbnails (SVG render, PSD composite, RAW decode)
-resvg = "0.45"
+# Design-format thumbnails (SVG render, PSD composite, RAW decode).
+# Pinned to the 0.46 line so the graph keeps a single resvg/usvg: gpui-pre
+# (through gpui-kit) requires `resvg ^0.46`, and 0.45/0.46 are semver-
+# incompatible under the 0.x rules.
+resvg = "0.46"
 psd = "0.3"
 rawler = "0.8"
 

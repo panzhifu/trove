@@ -1,11 +1,13 @@
-//! Undo / redo operation log for metadata mutations.
+//! Undo / redo operation history for metadata mutations.
 //!
-//! Every recorded [`Op`] carries enough before/after state to be applied and
-//! inverted without recreating history. The stack lives inside
-//! [`crate::library::Library`] (a `RefCell`, so the facade keeps its `&self`
-//! signature); destructive operations that cannot be inverted — purge, empty
-//! trash, imports, deleting a tag or collection — are intentionally **not**
-//! recorded.
+//! Every recorded entry pairs an [`Op`] (enough before/after state to be
+//! applied and inverted without recreating history) with an [`OpDesc`], a
+//! human-facing description snapshot for the status bar. The stack lives
+//! inside [`crate::library::Library`] (a `RefCell`, so the facade keeps its
+//! `&self` signature) and is bounded — the oldest entries are evicted once
+//! `cap` is reached. It is deliberately not persisted: destructive
+//! operations that cannot be inverted — purge, empty trash, imports,
+//! deleting a tag or collection — are never recorded.
 
 use std::cell::RefCell;
 
@@ -15,6 +17,90 @@ use uuid::Uuid;
 use crate::error::Result;
 use crate::model::AssetPatch;
 use crate::store::{assets, collections, tags};
+
+/// How many steps are kept when no explicit cap is configured.
+pub const DEFAULT_UNDO_CAP: usize = 20;
+
+// ---------------------------------------------------------------------------
+// Descriptions
+// ---------------------------------------------------------------------------
+
+/// What kind of mutation a history entry describes. One variant per
+/// user-visible verb; the UI localizes via [`OpAction::key`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpAction {
+    /// Metadata patch on one asset.
+    Edit,
+    Trash,
+    Restore,
+    Favorite,
+    Unfavorite,
+    /// Batch title rewrite.
+    Rename,
+    /// Replace one asset's tag group.
+    TagSet,
+    TagRenamed,
+    TagColored,
+    TagMoved,
+    CollectionRenamed,
+    CollectionMoved,
+    AddedToCollection,
+    RemovedFromCollection,
+}
+
+impl OpAction {
+    /// The i18n key the UI renders this action with.
+    pub fn key(self) -> &'static str {
+        match self {
+            OpAction::Edit => "history.action.edit",
+            OpAction::Trash => "history.action.trash",
+            OpAction::Restore => "history.action.restore",
+            OpAction::Favorite => "history.action.favorite",
+            OpAction::Unfavorite => "history.action.unfavorite",
+            OpAction::Rename => "history.action.rename",
+            OpAction::TagSet => "history.action.tag_set",
+            OpAction::TagRenamed => "history.action.tag_renamed",
+            OpAction::TagColored => "history.action.tag_colored",
+            OpAction::TagMoved => "history.action.tag_moved",
+            OpAction::CollectionRenamed => "history.action.collection_renamed",
+            OpAction::CollectionMoved => "history.action.collection_moved",
+            OpAction::AddedToCollection => "history.action.added_to_collection",
+            OpAction::RemovedFromCollection => "history.action.removed_from_collection",
+        }
+    }
+}
+
+/// Human-facing description of one recorded mutation, snapshotted at record
+/// time (names may go stale later — acceptable for a history line).
+///
+/// `target` carries the affected object's name when exactly one object was
+/// touched (an asset file name, a tag name, a collection name); `count` is
+/// the number of touched objects. The UI localizes the count noun.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpDesc {
+    pub action: OpAction,
+    pub target: Option<String>,
+    pub count: usize,
+}
+
+impl OpDesc {
+    pub fn new(action: OpAction, target: Option<String>, count: usize) -> Self {
+        Self {
+            action,
+            target,
+            count,
+        }
+    }
+
+    /// A description for `count` objects without a name.
+    pub fn counted(action: OpAction, count: usize) -> Self {
+        Self {
+            action,
+            target: None,
+            count,
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Operations
@@ -232,39 +318,79 @@ impl Op {
 // Stack
 // ---------------------------------------------------------------------------
 
-/// Two-stack undo/redo log. `redo` is cleared whenever a new op is recorded
-/// (standard linear-history semantics).
-#[derive(Debug, Default, Clone)]
+/// One history entry: the invertible operation plus its description.
+#[derive(Debug, Clone)]
+pub(crate) struct Recorded {
+    op: Op,
+    desc: OpDesc,
+}
+
+/// Two-stack undo/redo history. `redo` is cleared whenever a new op is
+/// recorded (standard linear-history semantics); the oldest entries are
+/// evicted once `cap` is reached.
+#[derive(Debug, Clone)]
 pub struct UndoStack {
-    undo: Vec<Op>,
-    redo: Vec<Op>,
+    undo: Vec<Recorded>,
+    redo: Vec<Recorded>,
+    cap: usize,
+}
+
+impl Default for UndoStack {
+    fn default() -> Self {
+        Self::with_cap(DEFAULT_UNDO_CAP)
+    }
 }
 
 impl UndoStack {
-    pub fn record(&mut self, op: Op) {
-        self.undo.push(op);
+    pub fn with_cap(cap: usize) -> Self {
+        Self {
+            undo: Vec::new(),
+            redo: Vec::new(),
+            cap: cap.max(1),
+        }
+    }
+
+    pub fn record(&mut self, op: Op, desc: OpDesc) {
+        if self.cap <= self.undo.len() {
+            self.undo.remove(0);
+        }
+        self.undo.push(Recorded { op, desc });
         self.redo.clear();
     }
 
-    /// Undo the most recent op. Returns `false` when the stack is empty.
+    /// Undo the most recent op. Returns `false` when the history is empty.
     pub fn undo(&mut self, conn: &Connection) -> Result<bool> {
-        let Some(op) = self.undo.pop() else {
+        let Some(entry) = self.undo.pop() else {
             return Ok(false);
         };
-        let inverse = op.inverse();
+        let inverse = entry.op.inverse();
         inverse.apply(conn)?;
-        self.redo.push(op);
+        self.redo.push(entry);
         Ok(true)
     }
 
     /// Redo the most recently undone op. Returns `false` when empty.
     pub fn redo(&mut self, conn: &Connection) -> Result<bool> {
-        let Some(op) = self.redo.pop() else {
+        let Some(entry) = self.redo.pop() else {
             return Ok(false);
         };
-        op.apply(conn)?;
-        self.undo.push(op);
+        entry.op.apply(conn)?;
+        self.undo.push(entry);
         Ok(true)
+    }
+
+    /// Undo up to `steps` entries in sequence, stopping early when the
+    /// history runs out or an application fails (already-applied steps stay
+    /// applied). Returns how many steps were undone.
+    pub fn undo_steps(&mut self, steps: usize, conn: &Connection) -> Result<usize> {
+        let mut done = 0;
+        for _ in 0..steps {
+            if !self.undo(conn)? {
+                break;
+            }
+            done += 1;
+        }
+        Ok(done)
     }
 
     pub fn undo_len(&self) -> usize {
@@ -274,15 +400,39 @@ impl UndoStack {
     pub fn redo_len(&self) -> usize {
         self.redo.len()
     }
+
+    /// Descriptions of the last `n` undoable entries, most recent first.
+    pub fn undo_entries(&self, n: usize) -> Vec<OpDesc> {
+        self.undo
+            .iter()
+            .rev()
+            .take(n)
+            .map(|e| e.desc.clone())
+            .collect()
+    }
+
+    /// Descriptions of the last `n` redoable entries, next-first.
+    pub fn redo_entries(&self, n: usize) -> Vec<OpDesc> {
+        self.redo
+            .iter()
+            .rev()
+            .take(n)
+            .map(|e| e.desc.clone())
+            .collect()
+    }
 }
 
-/// Shared stack cell embedded in `Library`.
-#[derive(Debug, Default, Clone)]
+/// Shared history cell embedded in `Library`.
+#[derive(Debug, Clone)]
 pub(crate) struct SharedUndoStack(RefCell<UndoStack>);
 
 impl SharedUndoStack {
-    pub fn record(&self, op: Op) {
-        self.0.borrow_mut().record(op);
+    pub fn with_cap(cap: usize) -> Self {
+        Self(RefCell::new(UndoStack::with_cap(cap)))
+    }
+
+    pub fn record(&self, op: Op, desc: OpDesc) {
+        self.0.borrow_mut().record(op, desc);
     }
 
     pub fn undo(&self, conn: &Connection) -> Result<bool> {
@@ -300,6 +450,18 @@ impl SharedUndoStack {
     pub fn redo_len(&self) -> usize {
         self.0.borrow().redo_len()
     }
+
+    pub fn undo_steps(&self, steps: usize, conn: &Connection) -> Result<usize> {
+        self.0.borrow_mut().undo_steps(steps, conn)
+    }
+
+    pub fn undo_entries(&self, n: usize) -> Vec<OpDesc> {
+        self.0.borrow().undo_entries(n)
+    }
+
+    pub fn redo_entries(&self, n: usize) -> Vec<OpDesc> {
+        self.0.borrow().redo_entries(n)
+    }
 }
 
 /// Build the fully-populated inverse patch that restores every editable
@@ -312,8 +474,9 @@ pub(crate) fn restore_patch(asset: &crate::model::Asset) -> AssetPatch {
         rating: Some(asset.rating),
         is_favorite: Some(asset.is_favorite),
         source_url: Some(asset.source_url.clone()),
-        color_label: Some(asset.color_label.clone()),
-        extra: Some(asset.extra.clone()),
+        usage_status: Some(asset.usage_status),
+        commercial_use: Some(asset.commercial_use),
+        facts: Some(asset.facts.clone()),
     }
 }
 
@@ -321,7 +484,7 @@ pub(crate) fn restore_patch(asset: &crate::model::Asset) -> AssetPatch {
 mod tests {
     use super::*;
     use crate::library::Library;
-    use crate::model::{Asset, AssetKind, NewCollection, NewTag, Origin, now};
+    use crate::model::{Asset, AssetKind, NewCollection, NewTag, Origin, UsageStatus, now};
     use crate::store::Store;
 
     fn sample_asset(name: &str, kind: AssetKind) -> Asset {
@@ -345,8 +508,9 @@ mod tests {
             rating: None,
             is_favorite: false,
             source_url: None,
-            color_label: None,
-            extra: Default::default(),
+            usage_status: UsageStatus::Unused,
+            commercial_use: None,
+            facts: Default::default(),
             created_at: now(),
             updated_at: now(),
             trashed_at: None,
@@ -368,11 +532,14 @@ mod tests {
             title: Some(Some("hello".into())),
             ..Default::default()
         };
-        stack.record(Op::PatchAsset {
-            id: a.id,
-            before: Box::new(restore_patch(&a)),
-            after: Box::new(patch),
-        });
+        stack.record(
+            Op::PatchAsset {
+                id: a.id,
+                before: Box::new(restore_patch(&a)),
+                after: Box::new(patch),
+            },
+            OpDesc::counted(OpAction::Edit, 1),
+        );
         stack.undo(conn).unwrap();
         assert_eq!(assets::get(conn, a.id).unwrap().unwrap().title, None);
         assert_eq!(stack.undo_len(), 0);
@@ -383,10 +550,13 @@ mod tests {
         );
 
         // Forward: favorite flip.
-        stack.record(Op::SetFavorite {
-            before: vec![(a.id, false)],
-            after: vec![(a.id, true)],
-        });
+        stack.record(
+            Op::SetFavorite {
+                before: vec![(a.id, false)],
+                after: vec![(a.id, true)],
+            },
+            OpDesc::counted(OpAction::Favorite, 1),
+        );
         stack.undo(conn).unwrap();
         assert!(!assets::get(conn, a.id).unwrap().unwrap().is_favorite);
         stack.redo(conn).unwrap();
@@ -412,22 +582,28 @@ mod tests {
         )
         .unwrap();
         tags::add_to_asset(conn, a.id, t1.id).unwrap();
-        stack.record(Op::SetTags {
-            asset: a.id,
-            before: vec![t1.id],
-            after: vec![t2.id],
-        });
+        stack.record(
+            Op::SetTags {
+                asset: a.id,
+                before: vec![t1.id],
+                after: vec![t2.id],
+            },
+            OpDesc::counted(OpAction::TagSet, 1),
+        );
         stack.undo(conn).unwrap();
         assert_eq!(tags::for_asset(conn, a.id).unwrap()[0].id, t1.id);
         stack.redo(conn).unwrap();
         assert_eq!(tags::for_asset(conn, a.id).unwrap()[0].id, t2.id);
 
         // Recording clears the redo branch (linear history).
-        stack.record(Op::SetTags {
-            asset: a.id,
-            before: vec![t2.id],
-            after: vec![],
-        });
+        stack.record(
+            Op::SetTags {
+                asset: a.id,
+                before: vec![t2.id],
+                after: vec![],
+            },
+            OpDesc::counted(OpAction::TagSet, 1),
+        );
         assert_eq!(stack.redo_len(), 0);
         assert_eq!(stack.undo_len(), 4);
     }
@@ -466,7 +642,7 @@ mod tests {
             added: vec![a.id],
         };
         op.apply(conn).unwrap();
-        stack.record(op);
+        stack.record(op, OpDesc::counted(OpAction::Edit, 1));
         assert_eq!(collections::asset_ids(conn, c1.id).unwrap(), vec![a.id]);
         stack.undo(conn).unwrap();
         assert!(collections::asset_ids(conn, c1.id).unwrap().is_empty());
@@ -480,7 +656,7 @@ mod tests {
             after: (Some(c1.id), 0),
         };
         op.apply(conn).unwrap();
-        stack.record(op);
+        stack.record(op, OpDesc::counted(OpAction::Edit, 1));
         assert_eq!(
             collections::get(conn, c2.id).unwrap().unwrap().parent_id,
             Some(c1.id)
@@ -510,7 +686,7 @@ mod tests {
         lib.redo().unwrap();
         assert!(assets::get(conn, a.id).unwrap().unwrap().is_favorite);
 
-        // Tag rename through the facade keeps FTS in sync both ways.
+        // Tag rename through the facade keeps the search index in sync both ways.
         let tag = tags::create(
             conn,
             &NewTag {
@@ -531,5 +707,38 @@ mod tests {
         assert!(lib.undo().unwrap());
         assert!(!assets::get(conn, a.id).unwrap().unwrap().is_favorite);
         assert!(!lib.undo().unwrap());
+    }
+
+    #[test]
+    fn cap_evicts_oldest_and_entries_describe() {
+        let store = Store::in_memory().unwrap();
+        let conn = store.conn();
+        let a = sample_asset("a.png", AssetKind::Image);
+        assets::insert(conn, &a).unwrap();
+
+        let mut stack = UndoStack::with_cap(3);
+        for i in 0..5 {
+            stack.record(
+                Op::SetFavorite {
+                    before: vec![(a.id, i % 2 == 0)],
+                    after: vec![(a.id, i % 2 == 1)],
+                },
+                OpDesc::new(OpAction::Favorite, Some(format!("f{i}.png")), 1),
+            );
+        }
+        // Only the newest three survive the cap.
+        assert_eq!(stack.undo_len(), 3);
+        let entries = stack.undo_entries(3);
+        assert_eq!(entries[0].target.as_deref(), Some("f4.png"));
+        assert_eq!(entries[2].target.as_deref(), Some("f2.png"));
+
+        // Undoing flips favorite twice and the redo side describes next-first.
+        assert_eq!(stack.undo_steps(2, conn).unwrap(), 2);
+        assert_eq!(stack.redo_len(), 2);
+        assert_eq!(stack.redo_entries(2)[0].target.as_deref(), Some("f3.png"));
+
+        // undo_steps stops at the empty stack instead of erroring.
+        assert_eq!(stack.undo_steps(10, conn).unwrap(), 1);
+        assert_eq!(stack.undo_len(), 0);
     }
 }

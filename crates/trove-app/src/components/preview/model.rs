@@ -80,6 +80,11 @@ enum Rendered {
 pub struct ModelViewport {
     /// Display name, as the grid shows it.
     name: String,
+    /// Backend task manager (shared from the library): runs the mesh parse
+    /// as a registered, cancellable job.
+    tasks: trove_core::tasks::TaskManager,
+    /// The in-flight mesh-parse task, cancelled if the viewport closes first.
+    load_task: Option<trove_core::tasks::TaskId>,
     mesh: Arc<Mesh>,
     camera: Camera,
 
@@ -124,14 +129,21 @@ impl ModelViewport {
     /// mesh parses. The parse runs on a background thread so the UI never
     /// blocks — even a 20 GB export turns the spinner instead of freezing
     /// the window.
-    pub fn spawn(name: String, path: PathBuf, cx: &mut App) -> Entity<Self> {
+    pub fn spawn(
+        name: String,
+        path: PathBuf,
+        tasks: trove_core::tasks::TaskManager,
+        cx: &mut App,
+    ) -> Entity<Self> {
         cx.new(|cx| {
             // Placeholder mesh: one invisible vertex so the renderer has
             // something valid to hold until the real parse lands. The true
             // mesh arrives via `set_mesh` from the background task below.
             let loading_mesh = Arc::new(Mesh::default());
-            let this = Self {
+            let mut this = Self {
                 name,
+                tasks,
+                load_task: None,
                 mesh: loading_mesh,
                 camera: Camera::default(),
                 gpu: None,
@@ -154,17 +166,34 @@ impl ModelViewport {
         })
     }
 
-    /// Parse the mesh off the UI thread, then hand it back to the viewport.
-    fn start_load(&self, path: PathBuf, cx: &mut Context<Self>) {
+    /// Parse the mesh through the backend task manager (registered, visible
+    /// in the task list, cancelled when the viewport closes), then hand it
+    /// back to the viewport.
+    fn start_load(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        let started = self.tasks.start(
+            trove_core::tasks::TaskKind::ModelPreview,
+            format!("parse {}", path.display()),
+            move |ctx| {
+                let _ = ctx; // parsing is one indivisible unit; no checkpoints
+                Self::load_mesh(&path)
+            },
+        );
+        let (id, rx) = match started {
+            Ok(pair) => pair,
+            Err(_) => return, // a parse is somehow already running; keep the placeholder
+        };
+        self.load_task = Some(id);
         cx.spawn(async move |weak, cx| {
+            // The channel is blocking; park the recv on a pool thread.
             let result = cx
                 .background_executor()
-                .spawn(async move { Self::load_mesh(&path) })
+                .spawn(async move { rx.recv().ok() })
                 .await;
             weak.update(cx, |this, cx| match result {
-                Ok(mesh) => this.set_mesh(mesh, cx),
-                Err(err) => {
-                    this.error = Some(err);
+                Some(mesh) => this.set_mesh(mesh, cx),
+                // Failed or cancelled — the task event carries the details.
+                None => {
+                    this.error = Some("load failed".into());
                     this.backend = Backend::Cpu("load failed".into());
                     cx.notify();
                 }
@@ -642,8 +671,13 @@ impl ModelViewport {
         }
     }
 
-    /// Leave the viewport; the workspace panel puts the grid back.
+    /// Leave the viewport; the workspace panel puts the grid back. A mesh
+    /// parse still in flight is cancelled (cooperatively — it will not
+    /// start further work, though an indivisible parse finishes).
     pub fn close(&mut self, cx: &mut Context<Self>) {
+        if let Some(id) = self.load_task.take() {
+            self.tasks.cancel(id);
+        }
         cx.emit(ModelViewportEvent::Closed);
     }
 }
