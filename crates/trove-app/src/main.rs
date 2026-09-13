@@ -33,111 +33,7 @@ const WORKSPACE_CONTEXT: &str = "Workspace";
 /// so the panel can dismiss the editor.
 const EXPLORER_CONTEXT: &str = "Explorer";
 
-/// (Re)build the application menus from the active locale. Called at startup
-/// and again after a live language switch in Settings.
-///
-/// Menus go two places: `cx.set_menus` feeds the platform (shortcuts,
-/// Wayland global-menu integration), while gpui-kit's in-window
-/// [`gpui_kit::component::menu::AppMenuBar`] reads its own `GlobalState`
-/// catalog — without the second write the title-bar bar renders empty.
-pub fn apply_menus(cx: &mut App) {
-    use gpui_kit::component::global_state::GlobalState;
-
-    // `Menu` is not `Clone` (it carries action trait objects), so build the
-    // list once per consumer.
-    cx.set_menus(build_menus());
-    let owned: Vec<gpui::OwnedMenu> = build_menus().into_iter().map(|menu| menu.owned()).collect();
-    GlobalState::global_mut(cx).set_app_menus(owned);
-}
-
-fn build_menus() -> Vec<Menu> {
-    vec![
-        Menu {
-            name: rust_i18n::t!("app.file").into_owned().into(),
-            items: vec![
-                MenuItem::action(rust_i18n::t!("app.import_files").to_string(), ImportFiles),
-                MenuItem::action(rust_i18n::t!("app.import_url").to_string(), ImportUrl),
-                MenuItem::action(rust_i18n::t!("app.system_fonts").to_string(), SystemFonts),
-                MenuItem::action(rust_i18n::t!("app.screenshot").to_string(), ScreenshotFull),
-                MenuItem::action(
-                    rust_i18n::t!("app.screenshot_region").to_string(),
-                    ScreenshotRegion,
-                ),
-                MenuItem::separator(),
-                MenuItem::action(
-                    rust_i18n::t!("app.export_library").to_string(),
-                    ExportLibrary,
-                ),
-                MenuItem::action(
-                    rust_i18n::t!("app.import_library").to_string(),
-                    ImportLibrary,
-                ),
-                MenuItem::action(
-                    rust_i18n::t!("app.find_duplicates").to_string(),
-                    FindDuplicates,
-                ),
-                MenuItem::separator(),
-                MenuItem::action(
-                    rust_i18n::t!("app.export_media_package").to_string(),
-                    ExportMediaPackage,
-                ),
-                MenuItem::separator(),
-                MenuItem::action(rust_i18n::t!("app.settings").to_string(), OpenSettings),
-            ],
-            disabled: false,
-        },
-        Menu {
-            name: rust_i18n::t!("app.edit").into_owned().into(),
-            items: vec![
-                MenuItem::action(rust_i18n::t!("app.select_all").to_string(), SelectAll),
-                MenuItem::action(
-                    rust_i18n::t!("app.clear_selection").to_string(),
-                    ClearSelection,
-                ),
-                MenuItem::separator(),
-                MenuItem::action(
-                    rust_i18n::t!("app.move_to_trash").to_string(),
-                    TrashSelected,
-                ),
-                MenuItem::separator(),
-                MenuItem::action(rust_i18n::t!("app.undo").to_string(), Undo),
-                MenuItem::action(rust_i18n::t!("app.redo").to_string(), Redo),
-                MenuItem::separator(),
-                MenuItem::action(rust_i18n::t!("app.paste_import").to_string(), PasteImport),
-                MenuItem::action(rust_i18n::t!("app.copy_image").to_string(), CopyImage),
-                MenuItem::action(
-                    rust_i18n::t!("workspace.batch_rename").to_string(),
-                    BatchRename,
-                ),
-                MenuItem::action(
-                    rust_i18n::t!("workspace.batch_convert").to_string(),
-                    BatchConvert,
-                ),
-            ],
-            disabled: false,
-        },
-        Menu {
-            name: rust_i18n::t!("app.view").into_owned().into(),
-            items: vec![
-                MenuItem::action(rust_i18n::t!("app.all_assets").to_string(), ShowAllAssets),
-                MenuItem::action(rust_i18n::t!("app.trash").to_string(), ShowTrash),
-                MenuItem::separator(),
-                MenuItem::action(rust_i18n::t!("app.refresh").to_string(), RefreshLibrary),
-            ],
-            disabled: false,
-        },
-        Menu {
-            name: rust_i18n::t!("app.help").into_owned().into(),
-            items: vec![MenuItem::action(
-                rust_i18n::t!("app.about").to_string(),
-                About,
-            )],
-            disabled: false,
-        },
-    ]
-}
-
-fn register_keys(cx: &mut App) {
+pub(crate) fn register_keys(cx: &mut App) {
     use trove_core::config::AppConfig;
     use trove_core::keybindings::default_keybindings;
 
@@ -261,7 +157,11 @@ fn main() {
             crate::app::theme::register_user_themes(cx);
             crate::app::theme::apply_from_settings(None, cx);
             slim_scrollbars(cx);
-            apply_menus(cx);
+
+            // Menus are owned by the title bar module — it renders them, so it
+            // also defines and registers them.
+            crate::app::title_bar::apply_menus(cx);
+
             register_keys(cx);
 
             cx.spawn(async move |cx| {

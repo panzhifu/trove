@@ -13,7 +13,7 @@ use crate::error::Result;
 use crate::library::Library;
 use crate::media::{blob, thumb};
 use crate::model::{AssetKind, AssetQuery};
-use crate::store::{assets, rows};
+use crate::store::assets;
 use uuid::Uuid;
 
 /// Outcome of a thumbnail rebuild.
@@ -49,7 +49,7 @@ pub fn plan_thumbnail_rebuild(lib: &Library, force: bool) -> Result<ThumbPlan> {
 
     let mut plan = ThumbPlan::default();
     for kind in [AssetKind::Image, AssetKind::Font, AssetKind::Model] {
-        let (_, assets) = assets::query(
+        let assets = assets::query(
             conn,
             &AssetQuery {
                 kind: Some(kind),
@@ -57,7 +57,7 @@ pub fn plan_thumbnail_rebuild(lib: &Library, force: bool) -> Result<ThumbPlan> {
                 ..Default::default()
             },
         )?;
-        for asset in assets {
+        for asset in assets.items {
             let Some(sha) = asset.sha256 else { continue };
             let Some(rel) = asset.rel_path else { continue };
             let blob = root.join(&rel);
@@ -100,29 +100,11 @@ pub fn rebuild_thumbnails(lib: &Library, force: bool) -> Result<ThumbRebuildRepo
     Ok(run_thumbnail_plan(&root, plan))
 }
 
-/// Rebuild the full-text index from the current asset rows (live and trashed
-/// included), returning how many rows were indexed. Use to backfill a library
-/// created before the FTS table existed, or to repair drift.
+/// Rebuild the Tantivy text index from the current asset rows (live and
+/// trashed included), returning how many documents were indexed. Use to
+/// repair drift or to recreate a lost index directory.
 pub fn rebuild_search_index(lib: &Library) -> Result<u64> {
-    let conn = lib.store().conn();
-    rows::execute(conn, "DELETE FROM asset_fts", vec![])?;
-    let mut indexed = 0u64;
-    // The index mirrors every non-deleted row — trashed assets keep their
-    // entry and search filters them at query time — so rebuild walks both.
-    for trashed in [false, true] {
-        let (_, assets) = assets::query(
-            conn,
-            &AssetQuery {
-                is_trashed: trashed,
-                ..Default::default()
-            },
-        )?;
-        for asset in assets {
-            assets::fts_insert(conn, &asset)?;
-            indexed += 1;
-        }
-    }
-    Ok(indexed)
+    lib.rebuild_text_index()
 }
 
 /// Outcome of an orphan sweep.
@@ -155,14 +137,14 @@ pub fn clean_orphans(lib: &Library) -> Result<OrphanReport> {
     let mut report = OrphanReport::default();
 
     // 1. Trash live assets whose blob is missing (recoverable).
-    let (_, live) = assets::query(
+    let live = assets::query(
         conn,
         &AssetQuery {
             is_trashed: false,
             ..Default::default()
         },
     )?;
-    for asset in live {
+    for asset in live.items {
         let Some(rel) = asset.rel_path else { continue };
         if !root.join(&rel).is_file() && assets::set_trashed(conn, asset.id, true)? {
             report.files_trashed += 1;
@@ -264,14 +246,14 @@ pub fn plan_integrity(lib: &Library) -> Result<IntegrityPlan> {
     let root = lib.root();
     let mut plan = IntegrityPlan::default();
     for trashed in [false, true] {
-        let (_, list) = assets::query(
+        let list = assets::query(
             conn,
             &AssetQuery {
                 is_trashed: trashed,
                 ..Default::default()
             },
         )?;
-        for asset in list {
+        for asset in list.items {
             let (Some(sha), Some(rel)) = (asset.sha256.clone(), asset.rel_path.clone()) else {
                 continue;
             };
@@ -440,7 +422,7 @@ mod tests {
         let report = lib.import_files(&[src], None).unwrap();
         let item = &report.imported[0];
         // Look the asset up to get its stored sha.
-        let (_, all) = crate::store::assets::query(
+        let all = crate::store::assets::query(
             lib.store().conn(),
             &AssetQuery {
                 is_trashed: false,
@@ -448,7 +430,8 @@ mod tests {
             },
         )
         .unwrap();
-        all.into_iter()
+        all.items
+            .into_iter()
             .find(|a| a.id == item.asset_id)
             .unwrap()
             .sha256
@@ -507,9 +490,8 @@ mod tests {
         std::fs::write(stray_dir.join(format!("{stray}.png")), b"orphan bytes").unwrap();
 
         // Simulate the asset's blob going missing.
-        let (_, all) =
-            crate::store::assets::query(lib.store().conn(), &AssetQuery::default()).unwrap();
-        let blob = root.join(all[0].rel_path.as_deref().unwrap());
+        let all = crate::store::assets::query(lib.store().conn(), &AssetQuery::default()).unwrap();
+        let blob = root.join(all.items[0].rel_path.as_deref().unwrap());
         std::fs::remove_file(&blob).unwrap();
 
         let report = clean_orphans(&lib).unwrap();
@@ -518,7 +500,7 @@ mod tests {
         assert!(report.thumbs_removed >= 1, "orphan thumb removed");
 
         // The asset is recoverable in the trash.
-        let (_, trashed) = crate::store::assets::query(
+        let trashed = crate::store::assets::query(
             lib.store().conn(),
             &AssetQuery {
                 is_trashed: true,
@@ -526,7 +508,7 @@ mod tests {
             },
         )
         .unwrap();
-        assert!(!trashed.is_empty());
+        assert!(!trashed.items.is_empty());
 
         // Stray blob and thumb are gone.
         assert!(!stray_dir.join(format!("{stray}.png")).exists());
@@ -542,7 +524,7 @@ mod tests {
             },
         )
         .unwrap();
-        collections::add_asset(lib.store().conn(), c.id, trashed[0].id).unwrap();
+        collections::add_asset(lib.store().conn(), c.id, trashed.items[0].id).unwrap();
         assert_eq!(
             collections::count_assets(lib.store().conn(), c.id).unwrap(),
             1
@@ -555,9 +537,8 @@ mod tests {
         import_png(&lib, &root, "ok.png");
 
         // Look the asset up (id + stored blob path).
-        let (_, all) =
-            crate::store::assets::query(lib.store().conn(), &AssetQuery::default()).unwrap();
-        let asset = &all[0];
+        let all = crate::store::assets::query(lib.store().conn(), &AssetQuery::default()).unwrap();
+        let asset = &all.items[0];
         let blob_path = root.join(asset.rel_path.as_deref().unwrap());
         let expected = asset.sha256.clone().unwrap();
 

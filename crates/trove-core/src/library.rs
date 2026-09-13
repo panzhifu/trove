@@ -6,16 +6,16 @@ use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
 use crate::error::Result;
+use crate::history::undo::{self, Op, OpAction, OpDesc, SharedUndoStack};
 use crate::media;
 use crate::store::{Store, assets, batch, collections, rows, smart, smart_collections, tags};
-use crate::undo::{self, Op, SharedUndoStack};
 
 /// Serialize the whole metadata catalog of `store` (assets, collections,
 /// tags, smart collections) as pretty JSON. Media blobs are not included —
 /// the export is a portable catalog, not a backup of the files.
 pub fn export_metadata_from_store(store: &Store) -> Result<String> {
     let conn = store.conn();
-    let (_, assets) = assets::query(conn, &crate::model::AssetQuery::default())?;
+    let assets = assets::query(conn, &crate::model::AssetQuery::default())?.items;
     let collections = collections::list(conn)?;
     let tags = tags::list(conn)?;
     let smart_collections = smart_collections::list(conn)?;
@@ -183,8 +183,16 @@ pub struct PurgeReport {
 pub struct Library {
     store: Store,
     root: PathBuf,
-    /// Undo/redo log for invertible metadata mutations (see [`crate::undo`]).
+    /// Undo/redo operation history for invertible metadata mutations (see
+    /// [`crate::history`]). Bounded; the cap comes from the app config.
     undo: SharedUndoStack,
+    /// Background jobs (imports, maintenance, preview work) owned by this
+    /// library; see [`crate::tasks`]. Cheap to share: `Arc` inside.
+    tasks: std::sync::Arc<crate::tasks::TaskManager>,
+    /// The Tantivy full-text index under `<root>/search_index` — a
+    /// disposable derivative of the asset rows, fed by the search_queue
+    /// outbox (schema triggers) and drained here.
+    text_index: crate::search::TextIndex,
 }
 
 impl Library {
@@ -193,15 +201,18 @@ impl Library {
         let root = root.as_ref().to_path_buf();
         std::fs::create_dir_all(&root)?;
         let store = Store::open(&root.join("library.db"))?;
+        let text_index = crate::search::TextIndex::open(&root.join("search_index"))?;
         let lib = Self {
             store,
             root,
-            undo: SharedUndoStack::default(),
+            undo: SharedUndoStack::with_cap(crate::config::AppConfig::load().undo_cap()),
+            tasks: std::sync::Arc::new(crate::tasks::TaskManager::new()),
+            text_index,
         };
-        // Backfill the FTS index for a library migrated from a schema that had
-        // no search table: without this, `search` silently returns nothing for
-        // assets that predate the index.
-        lib.backfill_search_on_migration()?;
+        // Reconcile the search index with the asset rows: a fresh, wiped or
+        // outdated index re-derives itself from the store here, so `search`
+        // never silently returns nothing for assets that predate it.
+        lib.reconcile_search_index()?;
         // Daily safety snapshot (24h throttle, rolling 10 files). Best-effort:
         // a failed backup never blocks opening the library.
         crate::services::backup::maybe_auto_backup(&lib.root, lib.store.conn());
@@ -223,23 +234,45 @@ impl Library {
         crate::store::stats::library_stats(self.store.conn())
     }
 
-    /// The FTS index mirrors the asset rows and is kept in sync on every write,
-    /// so this only matters on the one migration from v1 -> v2. Cheap no-op
-    /// on a healthy library: `asset_fts` is non-empty as soon as any asset was
-    /// ever indexed.
-    fn backfill_search_on_migration(&self) -> Result<()> {
+    fn reconcile_search_index(&self) -> Result<()> {
         let conn = self.store.conn();
-        let indexed = rows::query_count(conn, "SELECT COUNT(*) FROM asset_fts", vec![])?;
-        if indexed > 0 {
-            return Ok(());
+        let assets_total = rows::query_count(conn, "SELECT COUNT(*) FROM assets", vec![])?;
+        if self.text_index.num_docs() < assets_total as u64 {
+            // Fresh / wiped / outdated index: re-enqueue everything; the
+            // queue dedupes and the drain rebuilds incrementally.
+            rows::execute(
+                conn,
+                "INSERT OR IGNORE INTO search_queue(asset_id, deleted) SELECT id, 0 FROM assets",
+                vec![],
+            )?;
         }
-        let (asset_count, _) = assets::query(conn, &crate::model::AssetQuery::default())?;
-        if asset_count > 0 {
-            // Best-effort: a rebuild failure must not prevent the library from
-            // opening. Fresh imports re-sync the index via the write path.
-            let _ = crate::services::maintenance::rebuild_search_index(self);
-        }
-        Ok(())
+        self.drain_search_queue()
+    }
+
+    /// The live text index (passed to browse / smart-rule evaluation).
+    pub fn text_index(&self) -> &crate::search::TextIndex {
+        &self.text_index
+    }
+
+    /// Flush the search_queue outbox into the Tantivy index: upsert rows
+    /// whose assets still exist, drop documents for purged ones. Cheap when
+    /// the queue is empty (one small SELECT); batches of 500 per commit.
+    pub fn drain_search_queue(&self) -> Result<()> {
+        crate::search::drain(self.store.conn(), &self.text_index)
+    }
+
+    /// Rebuild the text index from scratch: wipe the documents, re-enqueue
+    /// every asset and drain. Returns the number of indexed documents.
+    pub fn rebuild_text_index(&self) -> Result<u64> {
+        self.text_index.wipe()?;
+        let conn = self.store.conn();
+        rows::execute(
+            conn,
+            "INSERT OR IGNORE INTO search_queue(asset_id, deleted) SELECT id, 0 FROM assets",
+            vec![],
+        )?;
+        self.drain_search_queue()?;
+        Ok(self.text_index.num_docs())
     }
 
     /// An in-memory library whose media blobs live under `root` (tests).
@@ -248,10 +281,18 @@ impl Library {
         std::fs::create_dir_all(&root)?;
         let store = Store::in_memory()?;
         Ok(Self {
+            text_index: crate::search::TextIndex::in_ram()?,
             store,
             root,
-            undo: SharedUndoStack::default(),
+            undo: SharedUndoStack::with_cap(crate::history::undo::DEFAULT_UNDO_CAP),
+            tasks: std::sync::Arc::new(crate::tasks::TaskManager::new()),
         })
+    }
+
+    /// The background task manager. One running job per kind; progress and
+    /// lifecycle events are polled from the UI side.
+    pub fn tasks(&self) -> &crate::tasks::TaskManager {
+        &self.tasks
     }
 
     pub fn store(&self) -> &Store {
@@ -265,6 +306,18 @@ impl Library {
     /// Absolute path of a library-relative path (e.g. a stored `rel_path`).
     pub fn resolve(&self, rel: &str) -> PathBuf {
         self.root.join(rel)
+    }
+
+    /// The real file behind `id`: the in-library blob for stored assets, the
+    /// linked original (recorded at import) for linked ones. `None` when the
+    /// record is missing or the file no longer exists.
+    pub fn asset_file(&self, id: Uuid) -> Option<std::path::PathBuf> {
+        let asset = assets::get(self.store.conn(), id).ok().flatten()?;
+        let path = match asset.origin {
+            crate::model::Origin::Linked => std::path::PathBuf::from(asset.facts.source_path?),
+            crate::model::Origin::Stored => self.root.join(asset.rel_path?),
+        };
+        path.is_file().then_some(path)
     }
 
     /// Import files, optionally into a collection. See
@@ -281,24 +334,57 @@ impl Library {
     }
 
     /// Full-text search across live assets, ordered by relevance. `q` narrows
-    /// the ranked set by kind / collection / tags / favorite; see
-    /// [`super::store::assets::search`].
+    /// the ranked set by kind / collection / tags / favorite.
     pub fn search_assets(
         &self,
         text: &str,
         q: &crate::model::AssetQuery,
-    ) -> super::error::Result<(u64, Vec<crate::model::Asset>)> {
-        assets::search(self.store.conn(), text, q)
+    ) -> super::error::Result<crate::model::Page<crate::model::Asset>> {
+        let prof = std::env::var_os("TROVE_PROFILE_QUERY").is_some();
+        let t0 = std::time::Instant::now();
+        let conn = self.store.conn();
+        if text.trim().is_empty() {
+            return Ok(crate::model::Page::new(0, Vec::new()));
+        }
+        // Pending outbox rows flush before the lookup, so a just-committed
+        // mutation is visible to the same search.
+        self.drain_search_queue()?;
+        let t_drain = t0.elapsed();
+        let candidates = self.text_index.search(text, crate::search::CANDIDATE_CAP)?;
+        let t_index = t0.elapsed();
+        // Free text is entirely the index's business; `q` only carries the
+        // structural filters, so it goes straight into the SQL intersection.
+        let (total, ids) = assets::rank_intersect(conn, &candidates, q)?;
+        let t_rank = t0.elapsed();
+        let page = assets::page_assets(&ids, q, conn)?;
+        let t_page = t0.elapsed();
+        if prof {
+            let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
+            eprintln!(
+                "[q] cand={} hits={} drain={:.2} index={:.2} rank={:.2} page={:.2}",
+                candidates.len(),
+                total,
+                ms(t_drain),
+                ms(t_index - t_drain),
+                ms(t_rank - t_index),
+                ms(t_page - t_rank),
+            );
+        }
+        Ok(crate::model::Page::new(total, page))
     }
 
     // -- smart collections ----------------------------------------------------
 
     /// Create a smart collection from a validated `NewSmartCollection`.
+    /// The condition tree is compiled once here (runnability against the
+    /// current schema is a storage concern, so it is not part of the model's
+    /// own validation).
     pub fn create_smart_collection(
         &self,
         input: &crate::model::NewSmartCollection,
     ) -> Result<crate::model::SmartCollection> {
         input.validate()?;
+        smart::validate_json(&input.query)?;
         smart_collections::create(self.store.conn(), input)
     }
 
@@ -318,26 +404,38 @@ impl Library {
         smart_collections::delete(self.store.conn(), id)
     }
 
+    /// Move a smart collection under `new_parent` (another smart collection
+    /// or a regular collection) at `position`; cycles are refused.
+    pub fn move_smart_collection(
+        &self,
+        id: Uuid,
+        new_parent: Option<Uuid>,
+        position: i64,
+    ) -> Result<()> {
+        let conn = self.store.conn();
+        if smart_collections::get(conn, id)?.is_none() {
+            return Err(crate::Error::NotFound("smart_collection"));
+        }
+        smart_collections::move_to(conn, id, new_parent, position)
+    }
+
     /// Evaluate a stored smart collection live, materialising the matching
-    /// assets as a relevance/paged list. Returns `(total_matching, page)`.
-    /// `kind` / `favorite` are extra grid filters AND-ed onto the tree (the
-    /// toolbar filters compose with smart collections too).
+    /// assets as a paged list. `kind` / `favorite` are extra grid filters
+    /// AND-ed onto the tree (the toolbar filters compose with smart
+    /// collections too).
     pub fn evaluate_smart_collection(
         &self,
         id: Uuid,
-        kind: Option<crate::model::AssetKind>,
-        favorite: Option<bool>,
-        limit: Option<u32>,
-        offset: u64,
-    ) -> Result<(u64, Vec<crate::model::Asset>)> {
+        page: smart::SmartPage,
+    ) -> Result<crate::model::Page<crate::model::Asset>> {
         let conn = self.store.conn();
         let Some(smart_collection) = smart_collections::get(conn, id)? else {
             return Err(crate::Error::NotFound("smart_collection"));
         };
         let node = smart::node_from_json(&smart_collection.query)?;
-        let (total, ids) = smart::evaluate_filtered(conn, &node, kind, favorite, limit, offset)?;
-        let page = assets::by_ids(conn, &ids)?;
-        Ok((total, page))
+        let ids = smart::evaluate_filtered(conn, Some(self.text_index()), &node, page)?;
+        let items = assets::by_ids(conn, &ids.items)?;
+        Ok(crate::model::Page::new(ids.total, items))
     }
 
     /// Permanently delete one asset. The database row (and its collection /
@@ -362,7 +460,7 @@ impl Library {
     /// Permanently delete every trashed asset. Returns the number removed.
     pub fn empty_trash(&self) -> Result<u64> {
         let conn = self.store.conn();
-        let (_, trashed) = assets::query(
+        let page = assets::query(
             conn,
             &crate::model::AssetQuery {
                 is_trashed: true,
@@ -370,7 +468,7 @@ impl Library {
             },
         )?;
         let mut removed = 0u64;
-        for asset in trashed {
+        for asset in page.items {
             let id = asset.id;
             let sha = asset.sha256.clone();
             let rel = asset.rel_path.clone();
@@ -427,6 +525,7 @@ impl Library {
         if count == 0 {
             return Ok(0);
         }
+        let desc = OpDesc::counted(OpAction::Rename, after.len());
         for (id, title) in &after {
             assets::update(
                 conn,
@@ -437,7 +536,7 @@ impl Library {
                 },
             )?;
         }
-        self.undo.record(Op::SetTitles { before, after });
+        self.undo.record(Op::SetTitles { before, after }, desc);
         Ok(count)
     }
 
@@ -454,10 +553,10 @@ impl Library {
         std::fs::write(pkg.join("trove-export.json"), json)?;
 
         let conn = self.store.conn();
-        let (_, live) = assets::query(conn, &crate::model::AssetQuery::default())?;
+        let live = assets::query(conn, &crate::model::AssetQuery::default())?;
         let mut files = 0u64;
         let mut bytes = 0u64;
-        for asset in &live {
+        for asset in &live.items {
             let Some(rel) = &asset.rel_path else { continue };
             let src = self.root.join(rel);
             if !src.is_file() {
@@ -536,10 +635,20 @@ impl Library {
             .collect::<Result<Vec<_>>>()?;
         let changed = batch::set_favorite_many(conn, ids, favorite)?;
         if changed > 0 {
-            self.undo.record(Op::SetFavorite {
-                before,
-                after: ids.iter().map(|id| (*id, favorite)).collect(),
-            });
+            self.undo.record(
+                Op::SetFavorite {
+                    before,
+                    after: ids.iter().map(|id| (*id, favorite)).collect(),
+                },
+                OpDesc::counted(
+                    if favorite {
+                        OpAction::Favorite
+                    } else {
+                        OpAction::Unfavorite
+                    },
+                    ids.len(),
+                ),
+            );
         }
         Ok(changed)
     }
@@ -548,6 +657,7 @@ impl Library {
     /// membership delta is recorded for undo.
     pub fn add_assets_to_collection(&self, collection_id: Uuid, ids: &[Uuid]) -> Result<u64> {
         let conn = self.store.conn();
+        let target = collections::get(conn, collection_id)?.map(|c| c.name);
         let members = collections::asset_ids(conn, collection_id)?;
         let changed = batch::add_to_collection_many(conn, collection_id, ids)?;
         let added: Vec<Uuid> = ids
@@ -555,11 +665,15 @@ impl Library {
             .filter(|id| !members.contains(id))
             .copied()
             .collect();
+        let desc = OpDesc::new(OpAction::AddedToCollection, target, added.len());
         if !added.is_empty() {
-            self.undo.record(Op::MembershipAdd {
-                collection: collection_id,
-                added,
-            });
+            self.undo.record(
+                Op::MembershipAdd {
+                    collection: collection_id,
+                    added,
+                },
+                desc,
+            );
         }
         Ok(changed)
     }
@@ -572,6 +686,7 @@ impl Library {
         ids: &[Uuid],
     ) -> Result<usize> {
         let conn = self.store.conn();
+        let target = collections::get(conn, collection_id)?.map(|c| c.name);
         let members = collections::asset_ids(conn, collection_id)?;
         let removed: Vec<Uuid> = ids
             .iter()
@@ -583,29 +698,34 @@ impl Library {
         }
         let count = removed.len();
         if count > 0 {
-            self.undo.record(Op::MembershipRemove {
-                collection: collection_id,
-                removed,
-            });
+            self.undo.record(
+                Op::MembershipRemove {
+                    collection: collection_id,
+                    removed,
+                },
+                OpDesc::new(OpAction::RemovedFromCollection, target, count),
+            );
         }
         Ok(count)
     }
 
     /// Apply a metadata patch to one asset, recording the full pre-state so
     /// undo restores every editable column (title/description edits also
-    /// re-sync the FTS index through `assets::update`).
+    /// re-sync the search index through `assets::update`).
     pub fn patch_asset(&self, asset_id: Uuid, patch: &crate::model::AssetPatch) -> Result<()> {
         patch.validate()?;
         let conn = self.store.conn();
-        let before = assets::get(conn, asset_id)?
-            .map(|asset| undo::restore_patch(&asset))
-            .ok_or(crate::Error::NotFound("asset"))?;
+        let asset = assets::get(conn, asset_id)?.ok_or(crate::Error::NotFound("asset"))?;
+        let before = undo::restore_patch(&asset);
         assets::update(conn, asset_id, patch)?;
-        self.undo.record(Op::PatchAsset {
-            id: asset_id,
-            before: Box::new(before),
-            after: Box::new(patch.clone()),
-        });
+        self.undo.record(
+            Op::PatchAsset {
+                id: asset_id,
+                before: Box::new(before),
+                after: Box::new(patch.clone()),
+            },
+            OpDesc::new(OpAction::Edit, Some(asset.file_name), 1),
+        );
         Ok(())
     }
 
@@ -634,16 +754,13 @@ impl Library {
                 "content mismatch: recorded sha256 {recorded}, found {sha}"
             )));
         }
-        let mut extra = asset.extra.clone();
-        extra.insert(
-            "source_path".into(),
-            serde_json::Value::String(new_path.to_string_lossy().into_owned()),
-        );
+        let mut facts = asset.facts.clone();
+        facts.source_path = Some(new_path.to_string_lossy().into_owned());
         assets::update(
             conn,
             asset_id,
             &crate::model::AssetPatch {
-                extra: Some(extra),
+                facts: Some(facts),
                 ..Default::default()
             },
         )?;
@@ -654,16 +771,20 @@ impl Library {
     /// use [`tags::ensure_named`] at the call site first).
     pub fn set_asset_tags(&self, asset_id: Uuid, tag_ids: &[Uuid]) -> Result<()> {
         let conn = self.store.conn();
+        let target = assets::get(conn, asset_id)?.map(|a| a.file_name);
         let before: Vec<Uuid> = tags::for_asset(conn, asset_id)?
             .iter()
             .map(|t| t.id)
             .collect();
         tags::set_for_asset(conn, asset_id, tag_ids)?;
-        self.undo.record(Op::SetTags {
-            asset: asset_id,
-            before,
-            after: tag_ids.to_vec(),
-        });
+        self.undo.record(
+            Op::SetTags {
+                asset: asset_id,
+                before,
+                after: tag_ids.to_vec(),
+            },
+            OpDesc::new(OpAction::TagSet, target, 1),
+        );
         Ok(())
     }
 
@@ -700,15 +821,17 @@ impl Library {
     /// self-parenting are rejected by the store.
     pub fn set_tag_parent(&self, tag_id: Uuid, parent: Option<Uuid>) -> Result<()> {
         let conn = self.store.conn();
-        let before = tags::get(conn, tag_id)?
-            .ok_or(crate::Error::NotFound("tag"))?
-            .parent_id;
+        let tag = tags::get(conn, tag_id)?.ok_or(crate::Error::NotFound("tag"))?;
+        let before = tag.parent_id;
         tags::move_to(conn, tag_id, parent)?;
-        self.undo.record(Op::TagParent {
-            id: tag_id,
-            before,
-            after: parent,
-        });
+        self.undo.record(
+            Op::TagParent {
+                id: tag_id,
+                before,
+                after: parent,
+            },
+            OpDesc::new(OpAction::TagMoved, Some(tag.name), 1),
+        );
         Ok(())
     }
 
@@ -717,6 +840,7 @@ impl Library {
     pub fn tag_assets(&self, asset_ids: &[Uuid], tag_id: Uuid, add: bool) -> Result<()> {
         let conn = self.store.conn();
         for asset_id in asset_ids {
+            let target = assets::get(conn, *asset_id)?.map(|a| a.file_name);
             let before: Vec<Uuid> = tags::for_asset(conn, *asset_id)?
                 .iter()
                 .map(|t| t.id)
@@ -735,57 +859,70 @@ impl Library {
                 before.iter().copied().filter(|id| *id != tag_id).collect()
             };
             tags::set_for_asset(conn, *asset_id, &after)?;
-            self.undo.record(Op::SetTags {
-                asset: *asset_id,
-                before,
-                after,
-            });
+            self.undo.record(
+                Op::SetTags {
+                    asset: *asset_id,
+                    before,
+                    after,
+                },
+                OpDesc::new(OpAction::TagSet, target, 1),
+            );
         }
         Ok(())
     }
 
-    /// Rename a tag (FTS re-synced), recording the previous name.
+    /// Rename a tag (search index re-synced), recording the previous name.
     pub fn rename_tag(&self, tag_id: Uuid, name: &str) -> Result<()> {
         let conn = self.store.conn();
-        let before = tags::get(conn, tag_id)?
-            .ok_or(crate::Error::NotFound("tag"))?
-            .name;
+        let tag = tags::get(conn, tag_id)?.ok_or(crate::Error::NotFound("tag"))?;
+        let desc = OpDesc::new(OpAction::TagRenamed, Some(tag.name.clone()), 1);
         tags::rename(conn, tag_id, name)?;
-        self.undo.record(Op::TagRename {
-            id: tag_id,
-            before,
-            after: name.to_string(),
-        });
+        self.undo.record(
+            Op::TagRename {
+                id: tag_id,
+                before: tag.name,
+                after: name.to_string(),
+            },
+            desc,
+        );
         Ok(())
     }
 
     /// Set (or clear) a tag's display color, recording the previous value.
     pub fn set_tag_color(&self, tag_id: Uuid, color: Option<&str>) -> Result<()> {
         let conn = self.store.conn();
-        let before = tags::get(conn, tag_id)?
-            .ok_or(crate::Error::NotFound("tag"))?
-            .color;
+        let tag = tags::get(conn, tag_id)?.ok_or(crate::Error::NotFound("tag"))?;
         tags::set_color(conn, tag_id, color)?;
-        self.undo.record(Op::TagColor {
-            id: tag_id,
-            before,
-            after: color.map(|c| c.to_string()),
-        });
+        self.undo.record(
+            Op::TagColor {
+                id: tag_id,
+                before: tag.color,
+                after: color.map(|c| c.to_string()),
+            },
+            OpDesc::new(OpAction::TagColored, Some(tag.name), 1),
+        );
         Ok(())
     }
 
     /// Rename a collection, recording the previous name.
     pub fn rename_collection(&self, collection_id: Uuid, name: &str) -> Result<()> {
         let conn = self.store.conn();
-        let before = collections::get(conn, collection_id)?
-            .ok_or(crate::Error::NotFound("collection"))?
-            .name;
+        let collection =
+            collections::get(conn, collection_id)?.ok_or(crate::Error::NotFound("collection"))?;
+        let desc = OpDesc::new(
+            OpAction::CollectionRenamed,
+            Some(collection.name.clone()),
+            1,
+        );
         collections::rename(conn, collection_id, name)?;
-        self.undo.record(Op::CollectionRename {
-            id: collection_id,
-            before,
-            after: name.to_string(),
-        });
+        self.undo.record(
+            Op::CollectionRename {
+                id: collection_id,
+                before: collection.name,
+                after: name.to_string(),
+            },
+            desc,
+        );
         Ok(())
     }
 
@@ -801,11 +938,14 @@ impl Library {
         let c =
             collections::get(conn, collection_id)?.ok_or(crate::Error::NotFound("collection"))?;
         collections::move_to(conn, collection_id, new_parent, position)?;
-        self.undo.record(Op::CollectionMove {
-            id: collection_id,
-            before: (c.parent_id, c.position),
-            after: (new_parent, position),
-        });
+        self.undo.record(
+            Op::CollectionMove {
+                id: collection_id,
+                before: (c.parent_id, c.position),
+                after: (new_parent, position),
+            },
+            OpDesc::new(OpAction::CollectionMoved, Some(c.name), 1),
+        );
         Ok(())
     }
 
@@ -829,6 +969,23 @@ impl Library {
         self.undo.redo_len()
     }
 
+    /// Descriptions of the last `n` undoable operations, most recent first
+    /// (status bar).
+    pub fn undo_entries(&self, n: usize) -> Vec<OpDesc> {
+        self.undo.undo_entries(n)
+    }
+
+    /// Descriptions of the last `n` redoable operations, next-first.
+    pub fn redo_entries(&self, n: usize) -> Vec<OpDesc> {
+        self.undo.redo_entries(n)
+    }
+
+    /// Undo up to `steps` operations in sequence; returns how many were
+    /// applied (stops early when the history runs out or one fails).
+    pub fn undo_steps(&self, steps: usize) -> Result<usize> {
+        self.undo.undo_steps(steps, self.store.conn())
+    }
+
     fn set_assets_trashed(&self, ids: &[Uuid], trashed: bool) -> Result<u64> {
         let conn = self.store.conn();
         let before = ids
@@ -844,10 +1001,20 @@ impl Library {
             .collect::<Result<Vec<_>>>()?;
         let changed = batch::set_trashed_many(conn, ids, trashed)?;
         if changed > 0 {
-            self.undo.record(Op::SetTrashed {
-                before,
-                after: ids.iter().map(|id| (*id, trashed)).collect(),
-            });
+            self.undo.record(
+                Op::SetTrashed {
+                    before,
+                    after: ids.iter().map(|id| (*id, trashed)).collect(),
+                },
+                OpDesc::counted(
+                    if trashed {
+                        OpAction::Trash
+                    } else {
+                        OpAction::Restore
+                    },
+                    ids.len(),
+                ),
+            );
         }
         Ok(changed)
     }
@@ -919,19 +1086,43 @@ impl Library {
             insert_collection_tree(conn, coll, &by_id, &mut coll_map, &mut report, 0);
         }
 
-        // Smart collections: copied with fresh ids; an invalid condition
+        // Smart collections: copied with fresh ids (hierarchy restored in a
+        // second pass, resolved through the id maps — an exported parent may
+        // be a collection or another smart collection). An invalid condition
         // tree (foreign version) is skipped, not fatal.
+        let mut sc_map: std::collections::HashMap<Uuid, Uuid> = Default::default();
+        let mut created_smarts: Vec<(Uuid, Option<Uuid>, i64)> = Vec::new();
         for sc in file.smart_collections {
             let input = NewSmartCollection {
+                parent_id: None,
                 name: sc.name.clone(),
                 query: sc.query.clone(),
                 color: sc.color.clone(),
                 position: sc.position,
             };
-            if input.validate().is_ok() && smart_collections::create(conn, &input).is_ok() {
-                report.smart_collections += 1;
+            if input.validate().is_ok() && smart::validate_json(&input.query).is_ok() {
+                match smart_collections::create(conn, &input) {
+                    Ok(created) => {
+                        sc_map.insert(sc.id, created.id);
+                        created_smarts.push((created.id, sc.parent_id, sc.position));
+                        report.smart_collections += 1;
+                    }
+                    Err(_) => report.skipped += 1,
+                }
             } else {
                 report.skipped += 1;
+            }
+        }
+        for (sc_id, exported_parent, position) in created_smarts {
+            if let Some(old_parent) = exported_parent {
+                // Prefer the smart-collection map, fall back to the
+                // collection tree; unresolvable parents stay at the root.
+                if let Some(new_parent) = sc_map
+                    .get(&old_parent)
+                    .or_else(|| coll_map.get(&old_parent))
+                {
+                    let _ = smart_collections::move_to(conn, sc_id, Some(*new_parent), position);
+                }
             }
         }
 
@@ -966,8 +1157,9 @@ impl Library {
                 rating: asset.rating,
                 is_favorite: asset.is_favorite,
                 source_url: asset.source_url.clone(),
-                color_label: asset.color_label.clone(),
-                extra: asset.extra.clone(),
+                usage_status: asset.usage_status,
+                commercial_use: asset.commercial_use,
+                facts: asset.facts.clone(),
                 created_at: asset.created_at,
                 updated_at: asset.updated_at,
                 trashed_at: None,
@@ -1093,12 +1285,12 @@ mod tests {
 
         // Import as linked (file stays in place).
         let staged = stage_all(&root, std::slice::from_ref(&src), true);
-        let report = commit_staged_all(lib.store(), None, staged);
+        let report = commit_staged_all(lib.store().conn(), None, staged);
         assert_eq!(report.imported_count(), 1);
         let conn = lib.store().conn();
-        let (_, all) = assets::query(conn, &AssetQuery::default()).unwrap();
-        let id = all[0].id;
-        assert_eq!(all[0].origin, Origin::Linked);
+        let all = assets::query(conn, &AssetQuery::default()).unwrap();
+        let id = all.items[0].id;
+        assert_eq!(all.items[0].origin, Origin::Linked);
 
         // Move the file elsewhere, then reconnect the record to it.
         let moved = outside.join("moved-elsewhere.png");
@@ -1106,10 +1298,10 @@ mod tests {
         lib.relink_asset(id, &moved).unwrap();
         let asset = assets::get(conn, id).unwrap().unwrap();
         assert_eq!(
-            asset.extra.get("source_path").and_then(|v| v.as_str()),
+            asset.facts.source_path.as_deref(),
             Some(moved.display().to_string().as_str())
         );
-        assert_eq!(asset.sha256.as_deref(), all[0].sha256.as_deref());
+        assert_eq!(asset.sha256.as_deref(), all.items[0].sha256.as_deref());
 
         // Different content is rejected — relinking never swaps content.
         let other = outside.join("other.png");
@@ -1120,8 +1312,9 @@ mod tests {
         let stored = write_source(&root, "stored.txt", b"stored content");
         lib.import_files(std::slice::from_ref(&stored), None)
             .unwrap();
-        let (_, all2) = assets::query(conn, &AssetQuery::default()).unwrap();
+        let all2 = assets::query(conn, &AssetQuery::default()).unwrap();
         let stored_id = all2
+            .items
             .iter()
             .find(|a| a.origin != Origin::Linked)
             .expect("stored import")
@@ -1149,10 +1342,8 @@ mod tests {
         assert_eq!(roots.len(), 0);
 
         // Total asset count is 1.
-        let total = assets::query(lib.store().conn(), &crate::model::AssetQuery::default())
-            .unwrap()
-            .0;
-        assert_eq!(total, 1);
+        let page = assets::query(lib.store().conn(), &crate::model::AssetQuery::default()).unwrap();
+        assert_eq!(page.total, 1);
 
         // Re-importing identical content dedupes.
         let report2 = lib.import_files(std::slice::from_ref(&src), None).unwrap();
@@ -1171,9 +1362,9 @@ mod tests {
         assert!(!item.reused);
         assert_eq!(item.kind, AssetKind::Image);
 
-        let (total, all) = assets::query(lib.store().conn(), &AssetQuery::default()).unwrap();
-        assert_eq!(total, 1);
-        let asset = &all[0];
+        let page = assets::query(lib.store().conn(), &AssetQuery::default()).unwrap();
+        assert_eq!(page.total, 1);
+        let asset = &page.items[0];
         assert_eq!(asset.mime, "image/png");
         assert_eq!(asset.width, Some(1));
         assert_eq!(asset.height, Some(1));
@@ -1204,8 +1395,8 @@ mod tests {
         assert!(second.imported[0].reused);
         assert_eq!(first.imported[0].asset_id, second.imported[0].asset_id);
 
-        let (total, _) = assets::query(lib.store().conn(), &AssetQuery::default()).unwrap();
-        assert_eq!(total, 1);
+        let page = assets::query(lib.store().conn(), &AssetQuery::default()).unwrap();
+        assert_eq!(page.total, 1);
     }
 
     #[test]
@@ -1306,7 +1497,7 @@ mod tests {
         }
         let removed = lib.empty_trash().unwrap();
         assert_eq!(removed, 2);
-        let (_, trash) = assets::query(
+        let trash = assets::query(
             lib.store().conn(),
             &AssetQuery {
                 is_trashed: true,
@@ -1314,7 +1505,7 @@ mod tests {
             },
         )
         .unwrap();
-        assert!(trash.is_empty());
+        assert!(trash.items.is_empty());
     }
 
     #[test]
@@ -1341,7 +1532,7 @@ mod tests {
         assert!(tags::for_asset(lib.store().conn(), asset_id).unwrap()[0].name == "blue");
 
         // Tag filter in asset queries.
-        let (total, _) = assets::query(
+        let page = assets::query(
             lib.store().conn(),
             &AssetQuery {
                 tag_ids: vec![blue.id],
@@ -1350,7 +1541,7 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(total, 1);
+        assert_eq!(page.total, 1);
 
         // Deleting a tag removes its membership rows.
         tags::delete(lib.store().conn(), red.id).unwrap();
@@ -1369,9 +1560,9 @@ mod tests {
         assert!(!second.imported[0].reused);
         assert_ne!(second.imported[0].asset_id, id);
 
-        let (live, _) = assets::query(lib.store().conn(), &AssetQuery::default()).unwrap();
-        assert_eq!(live, 1);
-        let (_, trashed) = assets::query(
+        let page = assets::query(lib.store().conn(), &AssetQuery::default()).unwrap();
+        assert_eq!(page.total, 1);
+        let trashed = assets::query(
             lib.store().conn(),
             &AssetQuery {
                 is_trashed: true,
@@ -1379,7 +1570,7 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(trashed.len(), 1);
+        assert_eq!(trashed.items.len(), 1);
     }
 
     #[test]
@@ -1392,8 +1583,13 @@ mod tests {
         lib.import_files(&[two], None).unwrap();
 
         // The photo is retitled so it participates in full-text search.
-        let (_, all) = assets::query(lib.store().conn(), &AssetQuery::default()).unwrap();
-        let photo_id = all.iter().find(|a| a.file_name == "photo.png").unwrap().id;
+        let all = assets::query(lib.store().conn(), &AssetQuery::default()).unwrap();
+        let photo_id = all
+            .items
+            .iter()
+            .find(|a| a.file_name == "photo.png")
+            .unwrap()
+            .id;
         assets::update(
             lib.store().conn(),
             photo_id,
@@ -1406,13 +1602,14 @@ mod tests {
         .unwrap();
 
         // search_assets hits only the retitled photo.
-        let (total, hits) = lib.search_assets("sunset", &AssetQuery::default()).unwrap();
-        assert_eq!(total, 1);
-        assert_eq!(hits[0].id, photo_id);
+        let hits = lib.search_assets("sunset", &AssetQuery::default()).unwrap();
+        assert_eq!(hits.total, 1);
+        assert_eq!(hits.items[0].id, photo_id);
 
         // A smart collection over the same terms evaluates through the facade.
         let sc = lib
             .create_smart_collection(&NewSmartCollection {
+                parent_id: None,
                 name: "Dockpics".into(),
                 query: serde_json::json!({
                     "op": "and",
@@ -1426,11 +1623,11 @@ mod tests {
             })
             .unwrap();
         assert_eq!(lib.list_smart_collections().unwrap().len(), 1);
-        let (total, assets) = lib
-            .evaluate_smart_collection(sc.id, None, None, None, 0)
+        let assets = lib
+            .evaluate_smart_collection(sc.id, crate::store::smart::SmartPage::default())
             .unwrap();
-        assert_eq!(total, 1);
-        assert_eq!(assets[0].id, photo_id);
+        assert_eq!(assets.total, 1);
+        assert_eq!(assets.items[0].id, photo_id);
 
         // Renaming + delete roundtrip.
         lib.rename_smart_collection(sc.id, "Sunset shots").unwrap();
@@ -1443,17 +1640,17 @@ mod tests {
     }
 
     #[test]
-    fn empty_fts_index_is_rebuilt_on_open() {
-        // Simulates the v2 -> v3 migration outcome: assets exist but the FTS
-        // table was dropped and recreated empty. Library::open must backfill
-        // the index (with tag names, per the new schema) so search works.
-        let (lib, root) = temp_library("fts-backfill");
+    fn empty_index_is_rebuilt_on_open() {
+        // A wiped (or lost) index over live rows must be noticed on open and
+        // rebuilt from the rows — tag names included — so search self-repairs
+        // without a manual rebuild.
+        let (lib, root) = temp_library("index-backfill");
         let src = write_source(&root, "photo.png", PNG_1X1);
         lib.import_files(&[src], None).unwrap();
 
         let conn = lib.store().conn();
-        let (_, all) = assets::query(conn, &AssetQuery::default()).unwrap();
-        let photo_id = all[0].id;
+        let all = assets::query(conn, &AssetQuery::default()).unwrap();
+        let photo_id = all.items[0].id;
         assets::update(
             conn,
             photo_id,
@@ -1474,23 +1671,24 @@ mod tests {
         .unwrap();
         tags::add_to_asset(conn, photo_id, tag.id).unwrap();
 
-        // Wipe the index, then reopen the library from disk.
-        crate::store::rows::execute(conn, "DELETE FROM asset_fts", vec![]).unwrap();
+        // Wipe the index, then reopen the library from disk: the reconcile
+        // step must notice the empty index and rebuild it from the rows.
+        lib.text_index().wipe().unwrap();
         drop(lib);
         let reopened = Library::open(&root).unwrap();
         let _conn = reopened.store().conn();
 
-        let (total, hits) = reopened
+        let hits = reopened
             .search_assets("sunset", &AssetQuery::default())
             .unwrap();
-        assert_eq!(total, 1);
-        assert_eq!(hits[0].id, photo_id);
+        assert_eq!(hits.total, 1);
+        assert_eq!(hits.items[0].id, photo_id);
 
         // The rebuilt index carries tag names too.
-        let (total, _) = reopened
+        let page = reopened
             .search_assets("landscape", &AssetQuery::default())
             .unwrap();
-        assert_eq!(total, 1);
+        assert_eq!(page.total, 1);
     }
 
     #[test]
@@ -1517,6 +1715,7 @@ mod tests {
         // Smart collection rename + delete through the facade.
         let sc = lib
             .create_smart_collection(&NewSmartCollection {
+                parent_id: None,
                 name: "old".into(),
                 query: serde_json::json!({
                     "op": "match",
@@ -1536,56 +1735,64 @@ mod tests {
         assert!(lib.get_smart_collection(sc.id).unwrap().is_none());
     }
     #[test]
-    fn color_label_patch_query_smart_and_undo() {
-        use crate::model::{AssetPatch, SmartCompare, SmartField, SmartNode};
-        use crate::store::smart;
+    fn usage_status_and_commercial_use_patch_query_and_undo() {
+        use crate::model::{AssetPatch, UsageStatus};
 
-        let (lib, dir) = temp_library("color-label");
+        let (lib, dir) = temp_library("usage-status");
         let src = write_source(&dir, "a.png", PNG_1X1);
         let report = lib.import_files(&[src], None).unwrap();
         let id = report.imported[0].asset_id;
         let conn = lib.store().conn();
 
-        // Set a label; the query filter and the smart field both see it.
+        // Fresh imports are unused and license-unverified.
+        let asset = assets::get(conn, id).unwrap().unwrap();
+        assert_eq!(asset.usage_status, UsageStatus::Unused);
+        assert_eq!(asset.commercial_use, None);
+
+        // Set both; the query filters see them.
         lib.patch_asset(
             id,
             &AssetPatch {
-                color_label: Some(Some("red".into())),
+                usage_status: Some(UsageStatus::Used),
+                commercial_use: Some(Some(false)),
                 ..Default::default()
             },
         )
         .unwrap();
-        let q = AssetQuery {
-            color_label: Some("red".into()),
-            ..Default::default()
-        };
-        let (total, page) = assets::query(conn, &q).unwrap();
-        assert_eq!((total, page.len()), (1, 1));
+        let page = assets::query(
+            conn,
+            &AssetQuery {
+                usage_status: Some(UsageStatus::Used),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!((page.total, page.items.len()), (1, 1));
+        let page = assets::query(
+            conn,
+            &AssetQuery {
+                commercial_use: Some(false),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!((page.total, page.items.len()), (1, 1));
+        // Unverified rows match neither clearance filter.
+        let page = assets::query(
+            conn,
+            &AssetQuery {
+                commercial_use: Some(true),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(page.total, 0);
 
-        let node = SmartNode::Match {
-            field: SmartField::ColorLabel,
-            op: SmartCompare::Eq,
-            value: serde_json::json!("red"),
-        };
-        let (n, ids) = smart::evaluate(conn, &node, None, 0).unwrap();
-        assert_eq!((n, ids.as_slice()), (1, &[id][..]));
-
-        // Unknown palette names are rejected and change nothing.
-        assert!(
-            lib.patch_asset(
-                id,
-                &AssetPatch {
-                    color_label: Some(Some("magenta".into())),
-                    ..Default::default()
-                },
-            )
-            .is_err()
-        );
-
-        // Undo restores the unlabeled state.
+        // Undo restores the fresh-import state (unused, unverified).
         lib.undo().unwrap();
         let asset = assets::get(conn, id).unwrap().unwrap();
-        assert_eq!(asset.color_label, None);
+        assert_eq!(asset.usage_status, UsageStatus::Unused);
+        assert_eq!(asset.commercial_use, None);
     }
     #[test]
     fn duplicate_content_import_needs_no_sha_scan() {
@@ -1596,8 +1803,8 @@ mod tests {
         let src = write_source(&dir, "same.png", PNG_1X1);
         lib.import_files(std::slice::from_ref(&src), None).unwrap();
         lib.import_files(std::slice::from_ref(&src), None).unwrap();
-        let (total, _) = assets::query(lib.store().conn(), &AssetQuery::default()).unwrap();
-        assert_eq!(total, 1);
+        let page = assets::query(lib.store().conn(), &AssetQuery::default()).unwrap();
+        assert_eq!(page.total, 1);
         assert!(lib.find_duplicates().unwrap().is_empty());
     }
 
@@ -1611,10 +1818,7 @@ mod tests {
         let set_phash = |name: &str, hash: u64| {
             let id = Uuid::new_v4();
             let mut asset = test_asset(name, AssetKind::Image, id);
-            asset.extra.insert(
-                "visual_phash".into(),
-                serde_json::Value::String(format!("{hash:016x}")),
-            );
+            asset.facts.visual.visual_phash = Some(format!("{hash:016x}"));
             assets::insert(conn, &asset).unwrap();
             id
         };
@@ -1711,9 +1915,9 @@ mod tests {
         assert_eq!(report.collections, 1);
         assert_eq!(report.tags, 1);
         let conn = other.store().conn();
-        let (_, restored) = assets::query(conn, &AssetQuery::default()).unwrap();
-        let restored_ids: Vec<Uuid> = restored.iter().map(|x| x.id).collect();
-        assert_eq!(restored.len(), 2);
+        let restored = assets::query(conn, &AssetQuery::default()).unwrap();
+        let restored_ids: Vec<Uuid> = restored.items.iter().map(|x| x.id).collect();
+        assert_eq!(restored.items.len(), 2);
         // Membership survived the id remap.
         let in_coll = collections::asset_ids(conn, coll.id);
         let _ = in_coll; // collection id changed; assert via name below
@@ -1726,6 +1930,7 @@ mod tests {
         let _tagged = tags::for_asset(conn, restored_ids[0]).unwrap();
         // The image asset (first import) carries the tag.
         let image = restored
+            .items
             .iter()
             .find(|x| x.kind == AssetKind::Image)
             .unwrap();
@@ -1738,8 +1943,91 @@ mod tests {
         let report = lib.import_metadata(&json).unwrap();
         assert_eq!(report.assets_linked, 2);
         assert_eq!(report.assets_placeholder, 0);
-        let (total, _) = assets::query(lib.store().conn(), &AssetQuery::default()).unwrap();
-        assert_eq!(total, 2);
+        let page = assets::query(lib.store().conn(), &AssetQuery::default()).unwrap();
+        assert_eq!(page.total, 2);
+    }
+
+    #[test]
+    fn smart_collection_hierarchy_survives_export_import() {
+        use crate::store::smart_collections;
+
+        let (lib, _dir) = temp_library("smart-hier");
+        let conn = lib.store().conn();
+        let coll = collections::create(
+            conn,
+            &NewCollection {
+                parent_id: None,
+                name: "Trip".into(),
+                position: 0,
+            },
+        )
+        .unwrap();
+        let fav = serde_json::json!({"op": "match", "field": "is_favorite", "value": true});
+        let under_coll = lib
+            .create_smart_collection(&NewSmartCollection {
+                parent_id: Some(coll.id),
+                name: "in-trip".into(),
+                query: fav.clone(),
+                color: None,
+                position: 0,
+            })
+            .unwrap();
+        let outer = lib
+            .create_smart_collection(&NewSmartCollection {
+                parent_id: None,
+                name: "outer".into(),
+                query: fav.clone(),
+                color: None,
+                position: 1,
+            })
+            .unwrap();
+        let inner = lib
+            .create_smart_collection(&NewSmartCollection {
+                parent_id: Some(outer.id),
+                name: "inner".into(),
+                query: fav,
+                color: None,
+                position: 0,
+            })
+            .unwrap();
+
+        let json = lib.export_metadata().unwrap();
+        let (other, _) = temp_library("smart-hier-import");
+        let report = other.import_metadata(&json).unwrap();
+        assert_eq!(report.collections, 1);
+        assert_eq!(report.smart_collections, 3);
+
+        // Ids are fresh; both kinds of parent links are re-resolved in the
+        // importing library (collection parent and smart parent alike).
+        let oconn = other.store().conn();
+        let restored = smart_collections::list(oconn).unwrap();
+        let by_name = |n: &str| {
+            restored
+                .iter()
+                .find(|sc| sc.name == n)
+                .unwrap_or_else(|| panic!("missing {n}"))
+                .clone()
+        };
+        let (r_in_trip, r_outer, r_inner) =
+            (by_name("in-trip"), by_name("outer"), by_name("inner"));
+        assert_ne!(r_in_trip.id, under_coll.id);
+        assert_ne!(r_outer.id, outer.id);
+        assert_ne!(r_inner.id, inner.id);
+        let coll_id = collections::list(oconn).unwrap()[0].id;
+        assert_eq!(r_in_trip.parent_id, Some(coll_id));
+        assert_eq!(r_outer.parent_id, None);
+        assert_eq!(r_inner.parent_id, Some(r_outer.id));
+
+        // The moved hierarchy is fully usable: evaluation through the facade.
+        assert!(other.move_smart_collection(r_inner.id, None, 5).is_ok());
+        assert_eq!(
+            other
+                .get_smart_collection(r_inner.id)
+                .unwrap()
+                .unwrap()
+                .parent_id,
+            None
+        );
     }
 
     #[test]
@@ -1752,16 +2040,16 @@ mod tests {
         let (other, _) = temp_library("heal-target");
         other.import_metadata(&json).unwrap();
         let conn = other.store().conn();
-        let (_, restored) = assets::query(conn, &AssetQuery::default()).unwrap();
-        assert_eq!(restored.len(), 1);
-        assert!(restored[0].rel_path.is_none());
+        let restored = assets::query(conn, &AssetQuery::default()).unwrap();
+        assert_eq!(restored.items.len(), 1);
+        assert!(restored.items[0].rel_path.is_none());
 
         // Re-importing the same content links the blob into the placeholder.
         other.import_files(std::slice::from_ref(&a), None).unwrap();
-        let healed = assets::get(conn, restored[0].id).unwrap().unwrap();
+        let healed = assets::get(conn, restored.items[0].id).unwrap().unwrap();
         assert!(healed.rel_path.is_some());
-        let (total, _) = assets::query(conn, &AssetQuery::default()).unwrap();
-        assert_eq!(total, 1);
+        let page = assets::query(conn, &AssetQuery::default()).unwrap();
+        assert_eq!(page.total, 1);
     }
     #[test]
     fn hierarchical_tags_filter_include_subtree() {
@@ -1820,9 +2108,9 @@ mod tests {
             tag_ids: vec![animal.id],
             ..Default::default()
         };
-        let (total, page) = assets::query(conn, &q).unwrap();
-        assert_eq!((total, page.len()), (1, 1));
-        assert_eq!(page[0].id, ia);
+        let page = assets::query(conn, &q).unwrap();
+        assert_eq!((page.total, page.items.len()), (1, 1));
+        assert_eq!(page.items[0].id, ia);
 
         // The subtree count matches the filter.
         assert_eq!(tags::count_assets(conn, animal.id).unwrap(), 1);
@@ -1832,8 +2120,9 @@ mod tests {
             "op": "match", "field": "tag", "value": "animal"
         }))
         .unwrap();
-        let (n, ids) = crate::store::smart::evaluate(conn, &node, None, 0).unwrap();
-        assert_eq!((n, ids.as_slice()), (1, &[ia][..]));
+        let ids =
+            crate::store::smart::evaluate(conn, Some(lib.text_index()), &node, None, 0).unwrap();
+        assert_eq!(ids.items.as_slice(), &[ia][..]);
 
         // Moving `animal` under `cat` would create a cycle: rejected.
         assert!(lib.set_tag_parent(animal.id, Some(cat.id)).is_err());
@@ -1889,19 +2178,27 @@ mod tests {
         lib.import_files(std::slice::from_ref(&a), None).unwrap();
         lib.import_files(std::slice::from_ref(&b), None).unwrap();
 
-        // Distinct folders include ancestors, sorted.
+        // Only the direct parent folders, each with its live-asset count.
         let folders = assets::source_folders(lib.store().conn()).unwrap();
-        assert!(folders.iter().any(|f| f.ends_with("vacation")));
-        assert!(folders.contains(&dir.to_string_lossy().to_string()));
+        assert!(
+            folders
+                .iter()
+                .any(|(f, n)| f.ends_with("vacation") && *n == 1)
+        );
+        assert!(
+            folders
+                .iter()
+                .any(|(f, n)| *f == dir.to_string_lossy() && *n == 1)
+        );
 
         // Prefix filter narrows to the subtree of that folder.
         let q = AssetQuery {
             source_path_prefix: Some(sub.to_string_lossy().to_string()),
             ..Default::default()
         };
-        let (total, page) = assets::query(lib.store().conn(), &q).unwrap();
-        assert_eq!((total, page.len()), (1, 1));
-        assert_eq!(page[0].file_name, "b.txt");
+        let page = assets::query(lib.store().conn(), &q).unwrap();
+        assert_eq!((page.total, page.items.len()), (1, 1));
+        assert_eq!(page.items[0].file_name, "b.txt");
     }
     #[test]
     fn media_package_roundtrip() {
@@ -1945,11 +2242,12 @@ mod tests {
         assert_eq!(imported.metadata.assets_placeholder, 2);
         assert_eq!(imported.imported, 2);
         let conn = other.store().conn();
-        let (_, restored) = assets::query(conn, &AssetQuery::default()).unwrap();
-        assert_eq!(restored.len(), 2);
-        assert!(restored.iter().all(|x| x.rel_path.is_some()));
+        let restored = assets::query(conn, &AssetQuery::default()).unwrap();
+        assert_eq!(restored.items.len(), 2);
+        assert!(restored.items.iter().all(|x| x.rel_path.is_some()));
         // Membership + tags survived.
         let image = restored
+            .items
             .iter()
             .find(|x| x.kind == AssetKind::Image)
             .unwrap();

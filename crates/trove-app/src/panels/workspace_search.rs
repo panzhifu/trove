@@ -1,26 +1,19 @@
-//! Search-by-image dialog: pHash + colour histogram, no model involved.
+//! Search-by-image and search-by-colour: pHash + colour histogram, no
+//! model involved. The ranked hits take over the workspace grid itself —
+//! the same cells, selection and preview interactions as any other view —
+//! instead of opening a results dialog.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-use gpui_kit::base::{h_flex, v_flex};
-use gpui_kit::component::WindowExt as _;
-use gpui_kit::component::scroll::ScrollableElement as _;
-use gpui_kit::component::{ActiveTheme, Icon, IconName};
-use gpui_kit::*;
+use gpui_kit::{App, Entity, Window};
 use uuid::Uuid;
 
 use crate::library::LibraryController;
 
-/// One search result row.
-pub(crate) struct SearchResult {
-    pub id: Uuid,
-    pub name: String,
-    pub score: f32,
-    pub sha256: Option<String>,
-}
-
-/// Open the search-by-image dialog for the given asset: pHash + colour
-/// histogram similarity against the stored per-asset visual signatures.
+/// Open a similar-image search for `asset_id`: pHash + colour histogram
+/// similarity against the stored per-asset visual signatures. The ranking
+/// runs on a background thread (it decodes the query image and scans every
+/// signed asset); when it lands the workspace grid switches to the results.
 pub(crate) fn open_image_search(
     asset_id: Uuid,
     controller: &Entity<LibraryController>,
@@ -56,193 +49,83 @@ pub(crate) fn open_image_search(
 
     let Some(query_path) = query_path else { return };
 
-    // Run the visual backend.
-    let (store, library_root) = {
+    let db_path = {
         let ctl = controller.read(cx);
-        (
-            ctl.library.store().clone(),
-            ctl.library.root().to_path_buf(),
-        )
+        ctl.library.root().join("library.db")
     };
-    let results: Vec<SearchResult> = visual_search(&store, &query_path);
-
-    show_results_dialog(
-        results,
-        title,
-        rust_i18n::t!("settings.search_mode_visual").to_string(),
-        library_root,
-        controller,
-        window,
-        cx,
-    );
+    let handle = window.window_handle();
+    let mode_label = rust_i18n::t!("settings.search_mode_visual").to_string();
+    let controller = controller.clone();
+    cx.spawn(async move |cx| {
+        let results = cx
+            .background_executor()
+            .spawn(async move { visual_search(&db_path, &query_path) })
+            .await;
+        let _ = handle.update(cx, |_, _, cx| {
+            controller.update(cx, |ctl, cx| {
+                ctl.open_visual_search(format!("{mode_label} · {title}"), results);
+                cx.notify();
+            });
+        });
+    })
+    .detach();
 }
 
 /// Search images whose palette contains a colour close to `hex` (Inspector
-/// swatch right-click) and show the ranked results in the shared dialog.
+/// swatch right-click, the workspace colour picker) and show the ranked
+/// hits in the workspace grid.
 pub(crate) fn open_color_search(
     hex: &str,
     controller: &Entity<LibraryController>,
     window: &mut Window,
     cx: &mut App,
 ) {
-    let (store, library_root) = {
+    let db_path = {
         let ctl = controller.read(cx);
-        (
-            ctl.library.store().clone(),
-            ctl.library.root().to_path_buf(),
-        )
+        ctl.library.root().join("library.db")
     };
-    let results: Vec<SearchResult> =
-        trove_core::store::visual_search::search_by_color(store.conn(), hex, Some(50))
-            .unwrap_or_default()
-            .into_iter()
-            .map(|r| SearchResult {
-                id: r.asset.id,
-                name: r.asset.file_name,
-                score: r.score,
-                sha256: r.asset.sha256,
-            })
-            .collect();
-    show_results_dialog(
-        results,
-        hex.to_string(),
-        rust_i18n::t!("workspace.color_search").to_string(),
-        library_root,
-        controller,
-        window,
-        cx,
-    );
+    let handle = window.window_handle();
+    let mode_label = rust_i18n::t!("workspace.color_search").to_string();
+    let hex_owned = hex.to_string();
+    let controller = controller.clone();
+    cx.spawn(async move |cx| {
+        let hex_for_search = hex_owned.clone();
+        let results = cx
+            .background_executor()
+            .spawn(async move { color_search(&db_path, &hex_for_search) })
+            .await;
+        let _ = handle.update(cx, |_, _, cx| {
+            controller.update(cx, |ctl, cx| {
+                ctl.open_visual_search(format!("{mode_label} · {hex_owned}"), results);
+                cx.notify();
+            });
+        });
+    })
+    .detach();
 }
 
-/// Visual search: pHash + colour histogram (no model needed).
-fn visual_search(store: &trove_core::store::Store, query_path: &Path) -> Vec<SearchResult> {
+/// Rank images by pHash + colour-histogram similarity to `query_path`.
+/// Runs on the background executor: it decodes the query and reads every
+/// stored visual signature.
+fn visual_search(db_path: &Path, query_path: &Path) -> Vec<(Uuid, f32)> {
+    let Ok(store) = trove_core::store::Store::open(db_path) else {
+        return Vec::new();
+    };
     trove_core::store::visual_search::search_by_image(store.conn(), query_path, Some(50))
         .unwrap_or_default()
         .into_iter()
-        .map(|r| SearchResult {
-            id: r.asset.id,
-            name: r.asset.file_name,
-            score: r.score,
-            sha256: r.asset.sha256,
-        })
+        .map(|r| (r.asset.id, r.score))
         .collect()
 }
 
-/// Render the results dialog. Row-building
-/// happens inside the dialog closure so that all borrows are moved in.
-fn show_results_dialog(
-    results: Vec<SearchResult>,
-    title: String,
-    mode_label: String,
-    library_root: PathBuf,
-    controller: &Entity<LibraryController>,
-    window: &mut Window,
-    cx: &mut App,
-) {
-    let controller = controller.clone();
-    window.open_dialog(cx, move |dialog, _, cx| {
-        let thumb_for = |sha: Option<&str>| -> Option<PathBuf> {
-            sha.and_then(|s| {
-                let p = trove_core::media::thumb::abs_path(&library_root, s);
-                p.is_file().then_some(p)
-            })
-        };
-        let rows = results
-            .iter()
-            .take(24)
-            .map(|r| {
-                let pct = (r.score * 100.0) as u32;
-                let p = thumb_for(r.sha256.as_deref());
-                let ctl_click = controller.clone();
-                let hit_id = r.id;
-                div()
-                    .id(SharedString::from(format!("search-hit-{}", r.id)))
-                    .cursor_pointer()
-                    .on_click(move |_, _, cx| {
-                        ctl_click.update(cx, |ctl, cx| {
-                            ctl.pending_reveal = Some(hit_id);
-                            cx.notify();
-                        });
-                    })
-                    .px_1()
-                    .py_1()
-                    .rounded(cx.theme().radius)
-                    .hover(|this| this.bg(cx.theme().secondary))
-                    .child(
-                        h_flex()
-                            .gap_2()
-                            .items_center()
-                            .child(match &p {
-                                Some(path) => img(path.clone())
-                                    .w(px(48.))
-                                    .h(px(36.))
-                                    .object_fit(gpui_kit::ObjectFit::Cover)
-                                    .rounded(px(4.))
-                                    .into_any_element(),
-                                None => div()
-                                    .w(px(48.))
-                                    .h(px(36.))
-                                    .items_center()
-                                    .justify_center()
-                                    .bg(cx.theme().secondary)
-                                    .child(Icon::new(IconName::File).size_3())
-                                    .into_any_element(),
-                            })
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .truncate()
-                                    .text_sm()
-                                    .text_color(cx.theme().foreground)
-                                    .child(r.name.clone()),
-                            )
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .w(px(44.))
-                                    .text_right()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child(format!("{pct}%")),
-                            ),
-                    )
-                    .into_any_element()
-            })
-            .collect::<Vec<_>>();
-
-        dialog
-            .title(
-                rust_i18n::t!("workspace.search_results").to_string()
-                    + " ["
-                    + &mode_label
-                    + "] "
-                    + &title,
-            )
-            .width(px(520.))
-            .child(
-                v_flex()
-                    .w_full()
-                    .h(px(440.))
-                    .gap_2()
-                    .child(
-                        div()
-                            .text_sm()
-                            .text_color(cx.theme().muted_foreground)
-                            .child(
-                                rust_i18n::t!(
-                                    "workspace.search_results_count",
-                                    count = results.len()
-                                )
-                                .to_string(),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_h_0()
-                            .overflow_y_scrollbar()
-                            .child(v_flex().gap_0p5().children(rows)),
-                    ),
-            )
-    });
+/// Search images whose palette contains a colour close to `hex`.
+fn color_search(db_path: &Path, hex: &str) -> Vec<(Uuid, f32)> {
+    let Ok(store) = trove_core::store::Store::open(db_path) else {
+        return Vec::new();
+    };
+    trove_core::store::visual_search::search_by_color(store.conn(), hex, Some(50))
+        .unwrap_or_default()
+        .into_iter()
+        .map(|r| (r.asset.id, r.score))
+        .collect()
 }

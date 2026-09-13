@@ -16,17 +16,6 @@ use trove_core::store::assets;
 
 use crate::library::LibraryController;
 
-/// Per-asset color-label palette (name ↔ swatch hex); the names match
-/// `trove_core::model::COLOR_LABELS`.
-pub(crate) const COLOR_LABEL_SWATCHES: &[(&str, &str)] = &[
-    ("red", "#ef4444"),
-    ("orange", "#f97316"),
-    ("yellow", "#eab308"),
-    ("green", "#22c55e"),
-    ("blue", "#3b82f6"),
-    ("purple", "#a855f7"),
-];
-
 /// Distinct icon per asset kind (image cells only fall back to this when no
 /// thumbnail was generated). Icon names resolve to the gpui-kit asset set.
 pub(crate) fn kind_icon(kind: AssetKind) -> IconName {
@@ -84,7 +73,7 @@ pub(crate) fn separator_label(cx: &Context<impl Render>, text: impl Into<String>
 pub(crate) fn live_count(controller: &LibraryController) -> u64 {
     let conn = controller.library.store().conn();
     assets::query(conn, &AssetQuery::default())
-        .map(|(total, _)| total)
+        .map(|page| page.total)
         .unwrap_or(0)
 }
 
@@ -97,7 +86,7 @@ pub(crate) fn trash_count(controller: &LibraryController) -> u64 {
             ..Default::default()
         },
     )
-    .map(|(total, _)| total)
+    .map(|page| page.total)
     .unwrap_or(0)
 }
 
@@ -147,6 +136,11 @@ pub struct AssetsDrag(pub Vec<Uuid>);
 /// Payload for dragging a collection row (reparent / reorder in the tree).
 #[derive(Debug, Clone)]
 pub struct CollectionDrag(pub Uuid);
+
+/// Payload for dragging a smart-collection row onto another row (nest it) or
+/// onto the section header (back to the top level).
+#[derive(Debug, Clone)]
+pub struct SmartDrag(pub Uuid);
 
 /// Reveal a file or directory in the platform file manager. Where the
 /// platform supports it the file is selected (Windows/macOS); on Linux the

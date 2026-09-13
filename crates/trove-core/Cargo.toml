@@ -7,7 +7,7 @@ license = "MIT"
 [dependencies]
 chrono = { workspace = true }
 dirs = { workspace = true }
-image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp", "tiff", "ico"] }
+image = { workspace = true }
 kamadak-exif = "0.5"
 lofty = "0.21"
 mp4 = { workspace = true }
@@ -28,3 +28,14 @@ resvg = { workspace = true }
 psd = { workspace = true }
 rawler = { workspace = true }
 jxl-oxide = { workspace = true }
+# 0.26 pulls fs4 0.13 (rustix 0.38 -> 1.x), collapsing rustix/linux-raw-sys
+# and itertools 0.12 onto the versions the rest of the graph already uses.
+# Two API fixes were needed: `TopDocs::with_limit(..).order_by_score()` and
+# `Document::get_first` returning `CompactDocValue` instead of `OwnedValue`.
+tantivy = "0.26"
+# Deliberately on the 0.7 line: 0.8+ moves to phf 0.13, but the phf 0.11 it
+# currently shares with gpui-base's html5ever -> markup5ever would not go away
+# either (markup5ever pins it), so upgrading only adds phf_codegen 0.13 as a
+# second copy. Revisit once html5ever moves to phf 0.13.
+jieba-rs = "0.7"
+pinyin = "0.10"

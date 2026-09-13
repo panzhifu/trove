@@ -56,7 +56,7 @@ pub(super) fn language_page(controller: &Entity<LibraryController>) -> SettingPa
                             // The locale is a process global: repaint every open
                             // window and rebuild the (already localized) menus.
                             cx.refresh_windows();
-                            crate::apply_menus(cx);
+                            crate::app::title_bar::apply_menus(cx);
                         },
                     ),
                 )

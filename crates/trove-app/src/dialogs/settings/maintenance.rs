@@ -1,4 +1,4 @@
-//! Maintenance page: thumbnail rebuild, FTS rebuild, orphan sweep,
+//! Maintenance page: thumbnail rebuild, search-index rebuild, orphan sweep,
 //! integrity check and backups.
 
 use super::*;
@@ -164,6 +164,81 @@ fn finish_job(controller: &Entity<LibraryController>, message: String, cx: &mut 
     cx.refresh_windows();
 }
 
+/// Run one maintenance job through the library's `TaskManager`: mutual
+/// exclusion (one `Maintenance` job at a time, enforced by the manager),
+/// task-list visibility, plus the busy flag the settings buttons read.
+/// `plan` runs on the main thread (the library handle is not `Send`) and
+/// produces the payload `job` consumes on the task thread; `done` publishes
+/// the outcome back into the controller.
+fn spawn_maintenance_job<T, P>(
+    controller: &Entity<LibraryController>,
+    label: &str,
+    plan: impl FnOnce(&trove_core::library::Library) -> Result<P, trove_core::Error>,
+    job: impl FnOnce(P) -> T + Send + 'static,
+    done: impl FnOnce(&mut LibraryController, T) + Send + 'static,
+    cx: &mut App,
+) where
+    T: Send + 'static,
+    P: Send + 'static,
+{
+    // Plan on the main thread first, so a planning error never starts a job.
+    let payload = match plan(&controller.read(cx).library) {
+        Ok(payload) => payload,
+        Err(e) => {
+            finish_job(
+                controller,
+                rust_i18n::t!("settings.job_failed", error = e.to_string()).to_string(),
+                cx,
+            );
+            return;
+        }
+    };
+    let manager = controller.read(cx).library.tasks().clone();
+    let started = manager.start(
+        trove_core::tasks::TaskKind::Maintenance,
+        label,
+        move |_ctx| {
+            // Job outcomes are plain values: a panicked/failed job closes the
+            // channel and surfaces as a failed task, not through this value.
+            Ok::<_, String>(job(payload))
+        },
+    );
+    let Ok((_task_id, rx)) = started else {
+        return; // a maintenance job is already running
+    };
+    controller.update(cx, |ctl, cx| {
+        ctl.busy = true;
+        ctl.notice = Some(rust_i18n::t!("settings.maintenance_running").to_string());
+        cx.notify();
+    });
+    let controller = controller.clone();
+    cx.spawn(async move |cx| {
+        // The channel is blocking; park the recv on a pool thread.
+        let outcome = cx
+            .background_executor()
+            .spawn(async move { rx.recv() })
+            .await;
+        controller.update(cx, |ctl, cx| {
+            ctl.busy = false;
+            match outcome {
+                // `start` only delivers a value on success; a `Err` job or a
+                // cancelled/failed task closes the channel instead.
+                Ok(value) => done(&mut *ctl, value),
+                // Failed / cancelled: the task event carries the details;
+                // here we surface the failure in the status line.
+                _ => {
+                    ctl.notice = Some(
+                        rust_i18n::t!("settings.job_failed", error = "job failed").to_string(),
+                    );
+                }
+            }
+            cx.notify();
+            cx.refresh_windows();
+        });
+    })
+    .detach();
+}
+
 /// Thumbnails row: incremental rebuild plus a full "rewrite everything"
 /// pass. The plan (which files need work) is collected on the main thread
 /// because the library handle is not `Send`; the file work runs on the
@@ -196,50 +271,30 @@ fn thumbs_row(controller: &Entity<LibraryController>, cx: &mut App) -> Div {
 }
 
 fn rebuild_thumbs(controller: &Entity<LibraryController>, force: bool, cx: &mut App) {
-    if !start_job(controller, cx) {
-        return;
-    }
-    // Plan on the main thread (needs the library), run on a worker thread
-    // (pure filesystem work).
-    let plan = {
-        let library = &controller.read(cx).library;
-        match trove_core::services::maintenance::plan_thumbnail_rebuild(library, force) {
-            Ok(plan) => plan,
-            Err(e) => {
-                finish_job(
-                    controller,
-                    rust_i18n::t!("settings.job_failed", error = e.to_string()).to_string(),
-                    cx,
-                );
-                return;
-            }
-        }
-    };
-    let root = controller.read(cx).library.root().to_path_buf();
-
-    let task = cx
-        .background_executor()
-        .spawn(async move { trove_core::services::maintenance::run_thumbnail_plan(&root, plan) });
-
-    cx.spawn({
-        let controller = controller.clone();
-        async move |cx| {
-            let report = task.await;
-            cx.update(|cx| {
-                finish_job(
-                    &controller,
-                    rust_i18n::t!(
-                        "settings.rebuild_thumbs_done",
-                        count = report.regenerated,
-                        missing = report.missing_blobs
-                    )
-                    .to_string(),
-                    cx,
-                );
-            });
-        }
-    })
-    .detach();
+    spawn_maintenance_job(
+        controller,
+        "thumbnail rebuild",
+        |library| {
+            let root = library.root().to_path_buf();
+            trove_core::services::maintenance::plan_thumbnail_rebuild(library, force)
+                .map(|plan| (root, plan))
+        },
+        |(root, plan)| {
+            // Pure filesystem work.
+            trove_core::services::maintenance::run_thumbnail_plan(&root, plan)
+        },
+        |ctl, report: trove_core::services::maintenance::ThumbRebuildReport| {
+            ctl.notice = Some(
+                rust_i18n::t!(
+                    "settings.rebuild_thumbs_done",
+                    count = report.regenerated,
+                    missing = report.missing_blobs
+                )
+                .to_string(),
+            );
+        },
+        cx,
+    );
 }
 
 /// Search-index row: a synchronous rebuild (database-bound, quick).
@@ -455,55 +510,27 @@ fn integrity_entry_row(
 /// Run the integrity check: plan on the main thread, hash blobs on the
 /// background executor, publish the report into the controller.
 fn run_integrity_check(controller: &Entity<LibraryController>, cx: &mut App) {
-    if !start_job(controller, cx) {
-        return;
-    }
-    let plan = {
-        let library = &controller.read(cx).library;
-        match trove_core::services::maintenance::plan_integrity(library) {
-            Ok(plan) => plan,
-            Err(e) => {
-                finish_job(
-                    controller,
-                    rust_i18n::t!("settings.job_failed", error = e.to_string()).to_string(),
-                    cx,
-                );
-                return;
-            }
-        }
-    };
-
-    let task = cx
-        .background_executor()
-        .spawn(async move { trove_core::services::maintenance::run_integrity_plan(plan) });
-
-    cx.spawn({
-        let controller = controller.clone();
-        async move |cx| {
-            let report = task.await;
-            cx.update(|cx| {
-                let issues = report.entries.len();
-                let message = if issues == 0 {
-                    rust_i18n::t!("settings.verify_done_clean", count = report.checked).to_string()
-                } else {
-                    rust_i18n::t!(
-                        "settings.verify_done_issues",
-                        count = report.checked,
-                        issues = issues
-                    )
-                    .to_string()
-                };
-                controller.update(cx, |ctl, cx| {
-                    ctl.busy = false;
-                    ctl.notice = Some(message);
-                    ctl.integrity_report = Some(report);
-                    cx.notify();
-                });
-                cx.refresh_windows();
+    spawn_maintenance_job(
+        controller,
+        "integrity check",
+        trove_core::services::maintenance::plan_integrity,
+        trove_core::services::maintenance::run_integrity_plan,
+        |ctl, report: trove_core::services::maintenance::IntegrityReport| {
+            let issues = report.entries.len();
+            ctl.notice = Some(if issues == 0 {
+                rust_i18n::t!("settings.verify_done_clean", count = report.checked).to_string()
+            } else {
+                rust_i18n::t!(
+                    "settings.verify_done_issues",
+                    count = report.checked,
+                    issues = issues
+                )
+                .to_string()
             });
-        }
-    })
-    .detach();
+            ctl.integrity_report = Some(report);
+        },
+        cx,
+    );
 }
 
 /// The shared status line: the notice of the last finished job, danger

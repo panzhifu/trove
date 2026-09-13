@@ -96,6 +96,14 @@ pub fn req_uuid(row: &Row, ix: usize) -> Result<Uuid> {
     parse_uuid(&req_str(row, ix)?)
 }
 
+/// Read an optional UUID column.
+pub fn opt_uuid(row: &Row, ix: usize) -> Result<Option<Uuid>> {
+    match opt_str(row, ix)? {
+        Some(s) => Ok(Some(parse_uuid(&s)?)),
+        None => Ok(None),
+    }
+}
+
 /// Serialize a timestamp for storage (RFC 3339, UTC).
 pub fn ts(v: DateTime<Utc>) -> String {
     v.to_rfc3339()

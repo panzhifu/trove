@@ -29,7 +29,7 @@ use gpui_kit::*;
 use trove_core::media::video::{self, FramePipe, VideoStreamFacts};
 use trove_core::model::AssetKind;
 
-use super::{fallback, AssetPreviewData};
+use super::{AssetPreviewData, fallback};
 
 /// How long the decode loop sleeps while paused before looking again.
 const IDLE_POLL: Duration = Duration::from_millis(120);

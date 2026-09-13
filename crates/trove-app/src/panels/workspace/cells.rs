@@ -19,6 +19,7 @@ pub(super) fn build_cell_element(
     h: f32,
 ) -> AnyElement {
     let (kind, thumb, id, trashed) = (cell.kind, cell.thumb.clone(), cell.id, cell.trashed);
+    let system_font = cell.system_font;
     let is_sel = controller.read(cx).selected_assets.contains(&id);
 
     // Fonts render live — the sample text set in the font itself, one row —
@@ -75,10 +76,10 @@ pub(super) fn build_cell_element(
     let base = base.on_click(move |event: &ClickEvent, window, _cx| {
         // Focus the grid so keyboard navigation applies right away.
         window.focus(&focus, _cx);
-        // A double click on a model is the mouse way of saying "preview this
-        // one"; the grid handles the action, and only opens the viewport for
-        // a mesh.
-        if kind == AssetKind::Model && event.click_count() == 2 {
+        // A double click on a model — or a virtual system font — is the
+        // mouse way of saying "preview this one"; the grid handles the
+        // action, and only opens the viewport for a mesh.
+        if (kind == AssetKind::Model || system_font) && event.click_count() == 2 {
             window.dispatch_action(Box::new(OpenPreview), _cx);
             return;
         }
@@ -117,26 +118,27 @@ pub(super) fn build_cell_element(
 
     // Drag the cell out of the window: promote the in-app drag to a native
     // file drag handed to the OS (droppable into editors, chats, file
-    // managers). Stored assets first get their named working copy
-    // (open_with), so the receiver sees `photo.jpg`, not a content hash.
-    // Must be registered AFTER on_drag with the same payload type.
+    // managers). The real file is handed over: the blob for stored assets
+    // (the receiver sees the content-hash name), the linked original for
+    // linked ones. Must be registered AFTER on_drag with the same payload type.
     let base = base.external_drag_payload({
         let controller = controller.clone();
         move |_: &AssetsDrag, _, cx| {
-            let target = {
-                let ctl = controller.read(cx);
-                crate::library::open_with::target(ctl, id)
-            };
-            target.and_then(|target| {
-                crate::library::open_with::publish(&target).ok()?;
-                Some(gpui_kit::ExternalDragPayload::Files(
-                    gpui_kit::FileDragPaths::new([(target.path, false)]),
-                ))
+            let path = controller.read(cx).library.asset_file(id);
+            path.map(|path| {
+                gpui_kit::ExternalDragPayload::Files(gpui_kit::FileDragPaths::new([(path, false)]))
             })
         }
     });
 
     let ctl_menu = controller.clone();
+    if system_font {
+        return base
+            .context_menu(move |menu, window, cx| {
+                super::context_menu::virtual_font_context_menu(menu, window, cx, &ctl_menu, id)
+            })
+            .into_any_element();
+    }
     base.context_menu(move |menu, window, cx| {
         asset_context_menu(menu, window, cx, &ctl_menu, id, trashed)
     })
@@ -176,6 +178,7 @@ pub(super) fn build_list_row_element(
     w: f32,
 ) -> AnyElement {
     let (kind, thumb, id, trashed) = (cell.kind, cell.thumb.clone(), cell.id, cell.trashed);
+    let system_font = cell.system_font;
     let (name, size, added) = (cell.name.clone(), cell.size_bytes, cell.added.clone());
     let is_sel = controller.read(cx).selected_assets.contains(&id);
 
@@ -251,10 +254,9 @@ pub(super) fn build_list_row_element(
     let focus = focus_handle.clone();
     let base = base.on_click(move |event: &ClickEvent, window, _cx| {
         window.focus(&focus, _cx);
-        // A double click on a model is the mouse way of saying "preview this
-        // one"; the grid handles the action, and only opens the viewport for
-        // a mesh.
-        if kind == AssetKind::Model && event.click_count() == 2 {
+        // A double click on a model — or a virtual system font — previews
+        // it (see the grid cell).
+        if (kind == AssetKind::Model || system_font) && event.click_count() == 2 {
             window.dispatch_action(Box::new(OpenPreview), _cx);
             return;
         }
@@ -288,26 +290,27 @@ pub(super) fn build_list_row_element(
 
     // Drag the cell out of the window: promote the in-app drag to a native
     // file drag handed to the OS (droppable into editors, chats, file
-    // managers). Stored assets first get their named working copy
-    // (open_with), so the receiver sees `photo.jpg`, not a content hash.
-    // Must be registered AFTER on_drag with the same payload type.
+    // managers). The real file is handed over: the blob for stored assets
+    // (the receiver sees the content-hash name), the linked original for
+    // linked ones. Must be registered AFTER on_drag with the same payload type.
     let base = base.external_drag_payload({
         let controller = controller.clone();
         move |_: &AssetsDrag, _, cx| {
-            let target = {
-                let ctl = controller.read(cx);
-                crate::library::open_with::target(ctl, id)
-            };
-            target.and_then(|target| {
-                crate::library::open_with::publish(&target).ok()?;
-                Some(gpui_kit::ExternalDragPayload::Files(
-                    gpui_kit::FileDragPaths::new([(target.path, false)]),
-                ))
+            let path = controller.read(cx).library.asset_file(id);
+            path.map(|path| {
+                gpui_kit::ExternalDragPayload::Files(gpui_kit::FileDragPaths::new([(path, false)]))
             })
         }
     });
 
     let ctl_menu = controller.clone();
+    if system_font {
+        return base
+            .context_menu(move |menu, window, cx| {
+                super::context_menu::virtual_font_context_menu(menu, window, cx, &ctl_menu, id)
+            })
+            .into_any_element();
+    }
     base.context_menu(move |menu, window, cx| {
         asset_context_menu(menu, window, cx, &ctl_menu, id, trashed)
     })
@@ -334,7 +337,7 @@ pub(super) fn model_source(controller: &LibraryController, id: Uuid) -> Option<(
     // Imported models live in the library as a blob; linked ones stay where
     // they are and are read in place.
     let path = match asset.origin {
-        Origin::Linked => PathBuf::from(asset.extra.get("source_path")?.as_str()?),
+        Origin::Linked => asset.facts.source_path.as_deref()?.into(),
         _ => root.join(asset.rel_path.as_ref()?),
     };
     path.is_file().then(|| (display_name(&asset), path))

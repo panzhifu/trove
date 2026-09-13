@@ -43,10 +43,11 @@ The first launch creates a library under the platform's config directory. Open *
 - Case-insensitive tags attach to any asset.
 - One-click favorites and a 1–5 rating scale.
 
-### Full-text search (FTS)
-- Ranked full-text search over titles and descriptions, combined with any filter.
+### Full-text search
+- Ranked full-text search over file names, titles, descriptions and tag names, combined with any filter (Tantivy index under `<root>/search_index`).
+- Word, substring and pinyin matching: `sunse` finds `Sunset`, `ower` finds `flower`, and `mao` / `hyl` find 花园里的猫.
 - Special characters are handled safely and literally.
-- A maintenance command can rebuild the index after a migration.
+- An outbox queue keeps the index in sync with every asset/tag write; a lost index rebuilds itself, and a maintenance command can force a full rebuild.
 
 ### Visual search (v0.2)
 - **Search by image**: find visually similar images using perceptual hash + color histogram.
@@ -180,7 +181,8 @@ crates/
 │   │   ├── library.rs   # High-level facade over store + media dir
 │   │   ├── services/    # backup (VACUUM INTO), maintenance jobs, collect server
 │   │   ├── layout.rs    # Justified grid layout (dynamic programming)
-│   │   ├── store/       # SQLite layer: schema, CRUD, FTS, smart queries, stats
+│   │   ├── store/       # SQLite layer: schema, CRUD, smart queries, stats
+│   │   ├── search.rs    # Tantivy full-text index + the search_queue outbox drain
 │   │   ├── media/       # Import, probing, thumbnails (incl. SVG/PSD), CLIP search, 3D mesh parsing, GPU structs, video decoding, screenshot
 │   │   ├── maintenance.rs # Rebuild thumbs/index, orphan cleanup
 │   │   ├── undo.rs      # Undo/redo operation log
@@ -206,7 +208,7 @@ asset_collection   # many-to-many membership
 tags               # case-insensitive tags
 asset_tag          # asset–tag links
 smart_collections  # rule-based virtual folders
-asset_fts          # full-text search index
+search_queue       # full-text outbox: triggers enqueue, the drain feeds Tantivy
 view_history       # recently-viewed log (schema v7, capped at 200)
 ```
 

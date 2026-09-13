@@ -3,8 +3,10 @@
 //! the rest. Content-exact duplicates cannot occur among live assets (the
 //! importer deduplicates by SHA-256), so this catches re-encoded variants.
 //!
-//! The dialog re-queries the library on every render: cleaning one group
-//! shrinks the list in place, no manual refresh needed.
+//! The scan runs once, on a backend thread (own database connection — the
+//! O(n²) pHash pass must never run per render frame); the dialog renders the
+//! cached result and invalidates it after a cleanup so the next frame
+//! recomputes.
 
 use gpui_kit::base::{h_flex, v_flex};
 use gpui_kit::component::button::Button;
@@ -25,13 +27,47 @@ pub struct DuplicateDialog;
 impl DuplicateDialog {
     pub fn open(window: &mut Window, cx: &mut App, controller: Entity<LibraryController>) {
         window.open_dialog(cx, move |dialog, _window, cx| {
-            let groups = controller
-                .read(cx)
-                .library
-                .find_duplicates()
-                .unwrap_or_default();
-            let content: AnyElement = if groups.is_empty() {
-                v_flex()
+            // Kick the backend scan off exactly once; the cached result (or
+            // the "computing" note) renders until it lands.
+            let needs_scan = {
+                let ctl = controller.read(cx);
+                ctl.duplicates.is_none() && !ctl.duplicates_computing
+            };
+            if needs_scan {
+                let root = controller.read(cx).library.root().to_path_buf();
+                controller.update(cx, |ctl, _| ctl.duplicates_computing = true);
+                let controller = controller.clone();
+                cx.spawn(async move |cx| {
+                    let groups = cx
+                        .background_executor()
+                        .spawn(async move {
+                            // Store::open also runs the (no-op) migrations.
+                            let store =
+                                trove_core::store::Store::open(&root.join("library.db")).ok()?;
+                            trove_core::store::assets::duplicate_groups(store.conn()).ok()
+                        })
+                        .await
+                        .unwrap_or_default();
+                    controller.update(cx, |ctl, cx| {
+                        ctl.duplicates = Some(std::sync::Arc::new(groups));
+                        ctl.duplicates_computing = false;
+                        cx.notify();
+                    });
+                })
+                .detach();
+            }
+            let groups = controller.read(cx).duplicates.clone();
+            let content: AnyElement = match groups {
+                None => v_flex()
+                    .p_3()
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(rust_i18n::t!("duplicates.computing").to_string()),
+                    )
+                    .into_any_element(),
+                Some(groups) if groups.is_empty() => v_flex()
                     .p_3()
                     .child(
                         div()
@@ -39,18 +75,19 @@ impl DuplicateDialog {
                             .text_color(cx.theme().muted_foreground)
                             .child(rust_i18n::t!("duplicates.empty").to_string()),
                     )
-                    .into_any_element()
-            } else {
-                let mut list = v_flex().gap_2();
-                for group in &groups {
-                    list = list.child(group_row(controller.clone(), group, cx));
+                    .into_any_element(),
+                Some(groups) => {
+                    let mut list = v_flex().gap_2();
+                    for group in groups.iter() {
+                        list = list.child(group_row(controller.clone(), group, cx));
+                    }
+                    div()
+                        .max_h(px(420.))
+                        .flex_1()
+                        .overflow_y_scrollbar()
+                        .child(list)
+                        .into_any_element()
                 }
-                div()
-                    .max_h(px(420.))
-                    .flex_1()
-                    .overflow_y_scrollbar()
-                    .child(list)
-                    .into_any_element()
             };
 
             dialog
@@ -114,6 +151,7 @@ fn group_row(controller: Entity<LibraryController>, group: &DuplicateGroup, cx: 
                                         );
                                     }
                                     ctl.deselect(&trash_ids);
+                                    ctl.duplicates = None;
                                     ctl.generation += 1;
                                     cx.notify();
                                 });

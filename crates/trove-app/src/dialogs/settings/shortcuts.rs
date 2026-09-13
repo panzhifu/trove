@@ -177,6 +177,12 @@ fn prompt_keybinding_change(action_id: &str, default_key: &str, window: &mut Win
                     let mut config = AppConfig::load();
                     config.keybindings.insert(action_ok.clone(), trimmed);
                     let _ = config.save();
+                    // Keybindings are registered at startup; re-register the
+                    // full set so the change applies without a restart. The
+                    // keymap matches later bindings first, so the new key
+                    // takes precedence (the replaced default keeps firing
+                    // until the next app restart).
+                    crate::register_keys(cx);
                     cx.refresh_windows();
                 }
                 true
@@ -189,6 +195,7 @@ fn reset_keybindings(cx: &mut App) {
     let mut config = AppConfig::load();
     config.keybindings.clear();
     let _ = config.save();
+    crate::register_keys(cx);
     cx.refresh_windows();
 }
 

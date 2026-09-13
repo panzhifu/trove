@@ -16,7 +16,7 @@ use gpui_kit::component::{ActiveTheme, Icon, IconName, Sizable};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
-use trove_core::model::{AssetKind, AssetPatch, MAX_RATING, Origin};
+use trove_core::model::{AssetKind, AssetPatch, MAX_RATING, Origin, UsageStatus};
 use trove_core::store::{assets, tags};
 use uuid::Uuid;
 
@@ -230,7 +230,7 @@ impl InspectorPanel {
                 return;
             }
             // Title/description feed the search index; the generation bump
-            // refreshes the grid and any FTS-driven views.
+            // refreshes the grid and any search-driven views.
             ctl.generation += 1;
             cx.notify();
         });
@@ -308,6 +308,11 @@ impl Render for InspectorPanel {
                 )
                 .into_any_element();
         };
+        // A virtual system font has no store record — it gets its own card
+        // with install / import actions instead of the editable fields.
+        if let Some(font) = ctl.virtual_fonts.get(&asset_id).cloned() {
+            return self.virtual_font_card(&font, cx);
+        }
         let conn = ctl.library.store().conn();
         let Some(asset) = assets::get(conn, asset_id).ok().flatten() else {
             return v_flex()
@@ -338,65 +343,43 @@ impl Render for InspectorPanel {
         let library_root = ctl.library.root().to_path_buf();
         // The mined color palette (`dominant_color` + `dominant_colors`).
         let swatches: Vec<(u32, String)> = asset
-            .extra
-            .get("dominant_colors")
-            .and_then(|v| {
-                v.as_array().map(|a| {
-                    a.iter()
-                        .filter_map(|c| c.as_str())
-                        .map(str::to_string)
-                        .collect::<Vec<_>>()
-                })
-            })
-            .or_else(|| {
-                asset
-                    .extra
-                    .get("dominant_color")
-                    .and_then(|v| v.as_str())
-                    .map(|s| vec![s.to_string()])
-            })
+            .facts
+            .visual
+            .dominant_colors
+            .clone()
+            .or_else(|| asset.facts.visual.dominant_color.clone().map(|s| vec![s]))
             .unwrap_or_default()
             .into_iter()
             .filter_map(|s| hex_to_rgb(&s).map(|rgb| (rgb, s)))
             .collect();
         // Where the file lives: linked assets point at their original
         // location (recorded at import), stored assets at the library blob.
+        // `None` (file missing) renders the "File missing" row below.
         let linked = asset.origin == Origin::Linked;
-        let disk_path: Option<std::path::PathBuf> = if linked {
-            asset
-                .extra
-                .get("source_path")
-                .and_then(|v| v.as_str())
-                .map(std::path::PathBuf::from)
-        } else {
-            asset
-                .rel_path
-                .as_ref()
-                .map(|rel| ctl.library.root().join(rel))
-        };
+        let disk_path: Option<std::path::PathBuf> = ctl.library.asset_file(asset.id);
         let kind = asset.kind;
         let rating = asset.rating;
         let added = asset.created_at.format("%Y-%m-%d %H:%M").to_string();
         let mime = asset.mime.clone();
+        let font = &asset.facts.font;
         let (font_family, font_style, font_weight, font_glyphs, font_italic) = (
-            asset
-                .extra
-                .get("font_family")
-                .and_then(|v| v.as_str())
-                .map(str::to_string),
-            asset
-                .extra
-                .get("font_style")
-                .and_then(|v| v.as_str())
-                .map(str::to_string),
-            asset.extra.get("font_weight").and_then(|v| v.as_u64()),
-            asset.extra.get("font_glyphs").and_then(|v| v.as_u64()),
-            asset
-                .extra
-                .get("font_italic")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false),
+            font.family.clone(),
+            font.style.clone(),
+            font.weight,
+            font.glyphs,
+            font.italic.unwrap_or(false),
         );
+        // Workflow state + license clearance, edited from the workspace
+        // context menu; the inspector displays them read-only.
+        let status_text = match asset.usage_status {
+            UsageStatus::Unused => rust_i18n::t!("workspace.status_unused").to_string(),
+            UsageStatus::Used => rust_i18n::t!("workspace.status_used").to_string(),
+        };
+        let clearance_text = match asset.commercial_use {
+            Some(true) => rust_i18n::t!("workspace.commercial_allowed").to_string(),
+            Some(false) => rust_i18n::t!("workspace.commercial_forbidden").to_string(),
+            None => rust_i18n::t!("workspace.commercial_unverified").to_string(),
+        };
         let font_blob = if kind == AssetKind::Font {
             if linked {
                 // Linked fonts are read straight from their original file.
@@ -469,8 +452,10 @@ impl Render for InspectorPanel {
             .child(self.kind_row(kind))
             .child(edit_label("inspector.rating"))
             .child(self.rating_row(rating))
-            .child(edit_label("inspector.color_label"))
-            .child(self.color_label_row(cx, asset.color_label.as_deref()));
+            .child(edit_label("inspector.usage_status"))
+            .child(self.fact_row(cx, status_text))
+            .child(edit_label("inspector.commercial_use"))
+            .child(self.fact_row(cx, clearance_text));
 
         let tag_chips = h_flex()
             .flex_wrap()
@@ -748,6 +733,112 @@ impl Render for InspectorPanel {
 }
 
 impl InspectorPanel {
+    /// Read-only card for a not-imported system font shown in the fonts
+    /// view: live specimen, the facts the scan found, and the two ways to
+    /// take ownership of it — install for the user, or import a copy into
+    /// the library (which turns it into a real asset on the next pass).
+    fn virtual_font_card(
+        &self,
+        font: &trove_core::services::font_manager::SystemFont,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let preview =
+            AssetPreviewData::for_system_font(font).element(PreviewContext::Inspector, cx);
+        let style = font
+            .style
+            .clone()
+            .unwrap_or_else(|| rust_i18n::t!("sysfonts.no_style").to_string());
+        let size = std::fs::metadata(&font.path).map(|m| m.len()).unwrap_or(0);
+        let ctl_install = self.controller.clone();
+        let ctl_import = self.controller.clone();
+        let install_path = font.path.clone();
+        let import_path = font.path.clone();
+        let reveal_path = font.path.clone();
+
+        v_flex()
+            .p_3()
+            .gap_2()
+            .overflow_y_scrollbar()
+            .child(preview)
+            .child(
+                div()
+                    .text_base()
+                    .font_weight(FontWeight::BOLD)
+                    .text_color(cx.theme().foreground)
+                    .child(font.family.clone()),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(rust_i18n::t!("sysfonts.system_note").to_string()),
+            )
+            .child(property_row(cx, "inspector.font_style", style))
+            .child(property_row(cx, "inspector.size", human_bytes(size)))
+            .child(property_row(
+                cx,
+                "inspector.location",
+                font.path.display().to_string(),
+            ))
+            .child(
+                h_flex()
+                    .flex_wrap()
+                    .gap_2()
+                    .pt_1()
+                    .child(
+                        Button::new("virtual-font-install")
+                            .ghost()
+                            .xsmall()
+                            .label(rust_i18n::t!("inspector.font_install").to_string())
+                            .on_click(move |_, _, cx| {
+                                // The install destination is the content
+                                // hash; system fonts carry no stored sha.
+                                let outcome = trove_core::media::blob::hash_file(&install_path)
+                                    .map_err(|e| e.to_string())
+                                    .and_then(|(sha, _)| {
+                                        crate::fonts::install(&install_path, &sha).map(|_| ())
+                                    });
+                                if let Err(e) = outcome {
+                                    ctl_install.update(cx, |ctl, cx| {
+                                        ctl.notice = Some(
+                                            rust_i18n::t!("notice.font_install_failed", error = e)
+                                                .to_string(),
+                                        );
+                                        cx.notify();
+                                    });
+                                }
+                                cx.refresh_windows();
+                            }),
+                    )
+                    .child(
+                        Button::new("virtual-font-import")
+                            .ghost()
+                            .xsmall()
+                            .label(rust_i18n::t!("sysfonts.import").to_string())
+                            .tooltip(rust_i18n::t!("sysfonts.import_tooltip").to_string())
+                            .on_click(move |_, window, cx| {
+                                crate::library::jobs::import_paths_app(
+                                    &ctl_import,
+                                    vec![import_path.clone()],
+                                    window,
+                                    cx,
+                                );
+                            }),
+                    )
+                    .child(
+                        Button::new("virtual-font-reveal")
+                            .ghost()
+                            .xsmall()
+                            .icon(IconName::Folder)
+                            .tooltip(rust_i18n::t!("workspace.reveal_in_file_manager").to_string())
+                            .on_click(move |_, _, _| {
+                                crate::panels::common::reveal_path(&reveal_path);
+                            }),
+                    ),
+            )
+            .into_any_element()
+    }
+
     /// A titled section whose body can be collapsed. Clicking the header
     /// toggles the state stored in `self.collapsed` (keyed by `id`), so it
     /// survives re-renders and asset switches.
@@ -855,8 +946,8 @@ impl InspectorPanel {
         cx: &mut Context<Self>,
         family: Option<String>,
         style: Option<String>,
-        weight: Option<u64>,
-        glyphs: Option<u64>,
+        weight: Option<u16>,
+        glyphs: Option<u32>,
         italic: bool,
         blob: Option<&std::path::Path>,
         sha: Option<String>,
@@ -988,11 +1079,13 @@ impl InspectorPanel {
         super::common::ensure_font_registered(family, blob, cx)
     }
 
-    /// Color-label palette row — the shared [`super::color_label`] widget.
-    /// Left-click applies to the primary asset, right-click opens the
-    /// function menu (set any color / clear).
-    fn color_label_row(&self, cx: &App, current: Option<&str>) -> impl IntoElement {
-        super::color_label::picker(&self.controller, current, cx)
+    /// Read-only display of the workflow status and license clearance;
+    /// both are edited from the workspace context menu.
+    fn fact_row(&self, cx: &App, value: String) -> Div {
+        div()
+            .text_sm()
+            .text_color(cx.theme().muted_foreground)
+            .child(value)
     }
 
     /// Five star toggles; clicking the current top star clears the rating.

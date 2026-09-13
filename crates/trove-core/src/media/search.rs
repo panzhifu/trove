@@ -291,30 +291,19 @@ impl VisualSignature {
         }
     }
 
-    /// Store in the asset's `extra` map (BTreeMap form, JSON values).
-    pub fn apply_to_extra(
-        &self,
-        extra: &mut std::collections::BTreeMap<String, serde_json::Value>,
-    ) {
-        extra.insert(
-            "visual_phash".into(),
-            serde_json::Value::String(self.phash.to_hex()),
-        );
-        extra.insert(
-            "visual_color_hist".into(),
-            serde_json::Value::String(self.color_hist.to_compact()),
-        );
+    /// Store in the asset's typed facts (persisted in the `extra` column).
+    pub fn apply_to_facts(&self, facts: &mut crate::model::AssetFacts) {
+        facts.visual.visual_phash = Some(self.phash.to_hex());
+        facts.visual.visual_color_hist = Some(self.color_hist.to_compact());
     }
 
-    /// Load from a JSON object (parsed from the `extra` column).
-    pub fn from_extra(extra: &serde_json::Map<String, serde_json::Value>) -> Option<Self> {
-        let phash = extra
-            .get("visual_phash")
-            .and_then(|v| v.as_str())
-            .map(PHash::from_hex)?;
-        let color_hist = extra
-            .get("visual_color_hist")
-            .and_then(|v| v.as_str())
+    /// Load from the asset's typed facts (parsed from the `extra` column).
+    pub fn from_facts(facts: &crate::model::AssetFacts) -> Option<Self> {
+        let phash = facts.visual.visual_phash.as_deref().map(PHash::from_hex)?;
+        let color_hist = facts
+            .visual
+            .visual_color_hist
+            .as_deref()
             .map(ColorHistogram::from_compact)?;
         Some(Self { phash, color_hist })
     }
@@ -393,18 +382,16 @@ mod tests {
     }
 
     #[test]
-    fn visual_signature_extra_roundtrip() {
-        let mut extra = std::collections::BTreeMap::new();
+    fn visual_signature_facts_roundtrip() {
+        let mut facts = crate::model::AssetFacts::default();
         let sig = VisualSignature {
             phash: PHash(0xABCD),
             color_hist: ColorHistogram::from_compact(&"00".repeat(1024)),
         };
-        sig.apply_to_extra(&mut extra);
-        assert!(extra.contains_key("visual_phash"));
-        assert!(extra.contains_key("visual_color_hist"));
-        // Convert BTreeMap to serde_json::Map for from_extra.
-        let extra_json: serde_json::Map<String, serde_json::Value> = extra.into_iter().collect();
-        let loaded = VisualSignature::from_extra(&extra_json).unwrap();
+        sig.apply_to_facts(&mut facts);
+        assert!(facts.visual.visual_phash.is_some());
+        assert!(facts.visual.visual_color_hist.is_some());
+        let loaded = VisualSignature::from_facts(&facts).unwrap();
         assert_eq!(loaded.phash, sig.phash);
     }
 }

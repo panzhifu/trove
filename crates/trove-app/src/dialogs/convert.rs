@@ -17,7 +17,7 @@ use gpui_kit::component::{ActiveTheme, Sizable, WindowExt as _};
 use gpui_kit::*;
 
 use trove_core::media::convert::{self, CONVERT_FORMATS, ConvertFormat, ConvertItem};
-use trove_core::model::{Asset, AssetKind, Origin};
+use trove_core::model::{Asset, AssetKind};
 use trove_core::store::assets;
 
 use crate::library::LibraryController;
@@ -127,20 +127,11 @@ impl ConvertDraft {
         Vec<ConvertItem>,
         bool,
     ) {
-        let root = self.controller.read(cx).library.root().to_path_buf();
         let items = self
             .images
             .iter()
             .filter_map(|asset| {
-                let source = if asset.origin == Origin::Linked {
-                    asset
-                        .extra
-                        .get("source_path")
-                        .and_then(|v| v.as_str())
-                        .map(PathBuf::from)
-                } else {
-                    asset.rel_path.as_ref().map(|rel| root.join(rel))
-                }?;
+                let source = self.controller.read(cx).library.asset_file(asset.id)?;
                 Some(ConvertItem {
                     asset_id: asset.id,
                     source,

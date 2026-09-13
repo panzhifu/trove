@@ -12,7 +12,7 @@
 //! The window carries the [`LibraryController`]: the library-location row
 //! hot-swaps the open library (no restart), and the maintenance page runs
 //! the `trove-core` maintenance jobs — thumbnail rebuild on the background
-//! executor, FTS rebuild and orphan sweep inline (they are database-bound
+//! executor, index rebuild and orphan sweep inline (they are database-bound
 //! and quick). Outcomes land on [`LibraryController::notice`], a status
 //! line both the general and the maintenance page render.
 //!

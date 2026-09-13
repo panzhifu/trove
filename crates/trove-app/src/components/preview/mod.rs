@@ -14,11 +14,11 @@
 //! button, so the workspace panel can hand its whole content area over —
 //! the same contract [`model::ModelViewport`] offers for 3D models.
 
-pub(crate) mod model;
 mod fallback;
 mod font;
 mod gpu3d;
 mod image;
+pub(crate) mod model;
 mod video;
 
 // The model viewport is the model kind's preview surface, so it lives in
@@ -28,8 +28,9 @@ pub(crate) use model::{ModelViewport, ModelViewportEvent};
 
 use std::path::{Path, PathBuf};
 
-use gpui_kit::base::{h_flex, v_flex};
+use gpui_kit::base::{ElementExt as _, h_flex, v_flex};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::slider::{Slider, SliderEvent, SliderState};
 use gpui_kit::component::{ActiveTheme, IconName, Sizable};
 use gpui_kit::*;
 use uuid::Uuid;
@@ -84,27 +85,45 @@ impl AssetPreviewData {
             .filter(|p| p.is_file());
         let original = if asset.origin == trove_core::model::Origin::Linked {
             asset
-                .extra
-                .get("source_path")
-                .and_then(|v| v.as_str())
+                .facts
+                .source_path
+                .as_ref()
                 .map(std::path::PathBuf::from)
         } else {
             asset.rel_path.as_ref().map(|rel| library_root.join(rel))
         };
-        let animated =
-            crate::panels::common::animated_preview_source(Some(asset.mime.as_str()), original.as_deref());
+        let animated = crate::panels::common::animated_preview_source(
+            Some(asset.mime.as_str()),
+            original.as_deref(),
+        );
         Self {
             name: crate::panels::common::display_name(asset),
             kind: asset.kind,
             thumb,
             original,
             animated,
-            font_family: asset
-                .extra
-                .get("font_family")
-                .and_then(|v| v.as_str())
-                .map(str::to_string),
+            font_family: asset.facts.font.family.clone(),
             dimensions: asset.width.zip(asset.height),
+        }
+    }
+
+    /// Build preview inputs for a not-imported system font: the file is
+    /// previewed in place, no store record involved.
+    pub(crate) fn for_system_font(font: &trove_core::services::font_manager::SystemFont) -> Self {
+        let style = font.style.clone().unwrap_or_default();
+        let name = if style.is_empty() {
+            font.family.clone()
+        } else {
+            format!("{} · {}", font.family, style)
+        };
+        Self {
+            name,
+            kind: trove_core::model::AssetKind::Font,
+            thumb: None,
+            original: Some(font.path.clone()),
+            animated: None,
+            font_family: Some(font.family.clone()),
+            dimensions: None,
         }
     }
 
@@ -172,13 +191,19 @@ pub(crate) enum AssetPreviewEvent {
 }
 
 /// The main-area placement for a non-model asset: a toolbar with the asset
-/// name and a close button over the full-size preview. The workspace panel
-/// hands its whole content area to this entity, exactly as it does to
-/// [`model::ModelViewport`] for 3D models.
+/// name, a zoom slider for stills and a close button over the full-size
+/// preview. The workspace panel hands its whole content area to this
+/// entity, exactly as it does to [`model::ModelViewport`] for 3D models.
 pub(crate) struct AssetPreviewPanel {
     data: AssetPreviewData,
     /// Live player for videos; `None` renders the still variants instead.
     video: Option<Entity<VideoPlayer>>,
+    /// Zoom slider state (0.25×–4×); the applied value lands in `zoom`.
+    zoom_slider: Entity<SliderState>,
+    /// Applied zoom for the still (1.0 = fit the viewport).
+    zoom: f32,
+    /// Measured content-viewport size; the fit base for the zoom math.
+    viewport: Entity<Size<Pixels>>,
 }
 
 impl EventEmitter<AssetPreviewEvent> for AssetPreviewPanel {}
@@ -193,10 +218,48 @@ impl AssetPreviewPanel {
         cx: &mut App,
     ) -> Option<Entity<Self>> {
         let data = AssetPreviewData::load(controller.read(cx), id)?;
+        Some(Self::spawn_with_data(data, cx))
+    }
+
+    /// Open the panel for preview inputs the caller already resolved (a
+    /// virtual system font, for instance).
+    pub(crate) fn spawn_with_data(data: AssetPreviewData, cx: &mut App) -> Entity<Self> {
         // The live player is spawned once, here — never per render. An
         // undecodable file (or no ffmpeg) keeps the poster still.
         let video = video::spawn_player(&data, cx);
-        Some(cx.new(|_| Self { data, video }))
+        let zoom_slider = cx.new(|_| {
+            SliderState::new()
+                .min(0.25)
+                .max(4.0)
+                .step(0.05)
+                .default_value(1.0)
+        });
+        let viewport = cx.new(|_| size(px(0.), px(0.)));
+        cx.new(|cx| {
+            cx.subscribe(
+                &zoom_slider,
+                |this: &mut AssetPreviewPanel, _, event: &SliderEvent, cx| {
+                    let value = match event {
+                        SliderEvent::Change(value) | SliderEvent::Release(value) => value,
+                    };
+                    this.zoom = value.start().clamp(0.25, 4.0);
+                    cx.notify();
+                },
+            )
+            .detach();
+            Self {
+                data,
+                video,
+                zoom_slider,
+                zoom: 1.0,
+                viewport,
+            }
+        })
+    }
+
+    /// Stills can be zoomed while the live video plays in its own player.
+    fn zoomable(&self) -> bool {
+        self.video.is_none() && self.data.dimensions.is_some()
     }
 
     /// Hand the video's last decoded frame back to the window before the
@@ -213,7 +276,9 @@ impl AssetPreviewPanel {
     }
 
     fn toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        h_flex()
+        let zoom_value = self.zoom_slider.read(cx).value().start();
+        let zoom_label = format!("{:.0}%", (zoom_value * 100.0).round());
+        let mut row = h_flex()
             .w_full()
             .flex_none()
             .gap_2()
@@ -229,23 +294,108 @@ impl AssetPreviewPanel {
                     .truncate()
                     .text_sm()
                     .child(self.data.name.clone()),
-            )
+            );
+        // Simple-edit tools land here later; for now the still's zoom.
+        if self.zoomable() {
+            row = row
+                .child(
+                    div()
+                        .id("preview-zoom")
+                        .flex_none()
+                        .w(px(140.0))
+                        .px_1()
+                        .child(Slider::new(&self.zoom_slider)),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .w(px(38.0))
+                        .text_color(cx.theme().muted_foreground)
+                        .child(zoom_label),
+                );
+        }
+        row.child(
+            Button::new("preview-close")
+                .ghost()
+                .xsmall()
+                .icon(IconName::Close)
+                .tooltip(rust_i18n::t!("viewport.close").to_string())
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.release(window, cx);
+                    this.close(cx);
+                })),
+        )
+    }
+
+    /// The still at the applied zoom: the image keeps its aspect ratio and
+    /// scales from its viewport fit; past 1:1 the original (not the
+    /// thumbnail) carries the detail the zoom is asking for, and the
+    /// viewport scrolls instead of letterboxing.
+    fn zoomed_still(&self, cx: &mut Context<Self>) -> AnyElement {
+        let (viewport_w, viewport_h) = {
+            let bounds = self.viewport.read(cx);
+            (f32::from(bounds.width), f32::from(bounds.height))
+        };
+        if viewport_w <= 0.0 || viewport_h <= 0.0 {
+            return element(&self.data, PreviewContext::Main, cx);
+        }
+        let Some((iw, ih)) = self.data.dimensions else {
+            return element(&self.data, PreviewContext::Main, cx);
+        };
+        let pad = 32.0; // the content container's p_4
+        let fit = ((viewport_w - pad).max(60.0) / iw as f32)
+            .min((viewport_h - pad).max(60.0) / ih as f32);
+        let w = (iw as f32 * fit * self.zoom).max(1.0);
+        let h = (ih as f32 * fit * self.zoom).max(1.0);
+        let source: Option<gpui_kit::ImageSource> = if self.zoom > 1.05 {
+            self.data
+                .animated
+                .clone()
+                .or(self.data.original.clone().map(Into::into))
+        } else {
+            self.data
+                .animated
+                .clone()
+                .or(self.data.thumb.clone().map(Into::into))
+        };
+        let image = match source {
+            Some(source) => img(source)
+                .w(px(w))
+                .h(px(h))
+                .object_fit(ObjectFit::Contain)
+                .rounded(cx.theme().radius)
+                .into_any_element(),
+            None => element(&self.data, PreviewContext::Main, cx),
+        };
+        div()
+            .id("preview-zoom-area")
+            .size_full()
+            .overflow_scroll()
             .child(
-                Button::new("preview-close")
-                    .ghost()
-                    .xsmall()
-                    .icon(IconName::Close)
-                    .tooltip(rust_i18n::t!("viewport.close").to_string())
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.release(window, cx);
-                        this.close(cx);
-                    })),
+                div()
+                    .w(px(w.max(viewport_w)))
+                    .h(px(h.max(viewport_h)))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(image),
             )
+            .into_any_element()
     }
 }
 
 impl Render for AssetPreviewPanel {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let content: AnyElement = match &self.video {
+            Some(player) => player.clone().into_any_element(),
+            None => {
+                if self.zoomable() && self.zoom != 1.0 {
+                    self.zoomed_still(cx)
+                } else {
+                    element(&self.data, PreviewContext::Main, cx)
+                }
+            }
+        };
         v_flex()
             .size_full()
             .overflow_hidden()
@@ -260,10 +410,19 @@ impl Render for AssetPreviewPanel {
                     .justify_center()
                     .overflow_hidden()
                     .p_4()
-                    .child(match &self.video {
-                        Some(player) => player.clone().into_any_element(),
-                        None => element(&self.data, PreviewContext::Main, cx),
-                    }),
+                    // Track the content viewport so the zoom has a fit base.
+                    .on_prepaint({
+                        let viewport = self.viewport.clone();
+                        move |bounds: Bounds<Pixels>, _, cx| {
+                            viewport.update(cx, |size, cx| {
+                                if *size != bounds.size {
+                                    *size = bounds.size;
+                                    cx.notify();
+                                }
+                            });
+                        }
+                    })
+                    .child(content),
             )
     }
 }

@@ -26,14 +26,14 @@ pub struct AppConfig {
     /// title-bar slider). 1.0 = default; clamped on read.
     #[serde(default)]
     pub grid_zoom: Option<f32>,
-    /// Recently picked colours from the colour picker (newest first,
-    /// capped at 20 on write).
+    /// Undo-history depth: how many invertible operations the library keeps
+    /// for undo. See [`crate::history`]. Clamped to 1..=500 on read.
     #[serde(default)]
-    pub color_history: Vec<String>,
-    /// Recently opened libraries, newest first (settings ▸ general lists
-    /// these for one-click hot switching). Capped at [`RECENT_LIBRARY_CAP`].
+    pub undo_cap: Option<usize>,
+    /// Which workspace filter tools are visible in the in-panel toolbar
+    /// row (subset of [`FILTER_TOOLS`]). `None` = the default set.
     #[serde(default)]
-    pub recent_libraries: Vec<PathBuf>,
+    pub filter_tools: Option<Vec<String>>,
     /// Folders watched for new files; anything that appears under them is
     /// imported automatically (unfiled). Empty = no watching.
     #[serde(default)]
@@ -106,8 +106,15 @@ impl Appearance {
     }
 }
 
-/// How many recent-library entries to remember.
-pub const RECENT_LIBRARY_CAP: usize = 8;
+/// Undo-history depth used when no explicit cap is configured. See
+/// [`crate::history::undo::DEFAULT_UNDO_CAP`].
+pub use crate::history::undo::DEFAULT_UNDO_CAP;
+
+/// Every workspace filter tool that the toolbar can show, in display order.
+pub const FILTER_TOOLS: &[&str] = &["kind", "tag", "shape", "rating", "format"];
+
+/// The filter tools shown when the user has not customized the set.
+pub const DEFAULT_FILTER_TOOLS: &[&str] = &["kind"];
 
 impl AppConfig {
     /// The directory where the config file lives.
@@ -155,18 +162,33 @@ impl AppConfig {
         self.save()
     }
 
-    /// Record a library as recently used: moved to the front, deduplicated,
-    /// capped. Persists immediately.
-    pub fn push_recent_library(&mut self, path: PathBuf) -> Result<()> {
-        self.recent_libraries.retain(|p| p != &path);
-        self.recent_libraries.insert(0, path);
-        self.recent_libraries.truncate(RECENT_LIBRARY_CAP);
-        self.save()
+    /// Undo-history depth: how many invertible operations stay undoable.
+    pub fn undo_cap(&self) -> usize {
+        self.undo_cap.unwrap_or(DEFAULT_UNDO_CAP).clamp(1, 500)
     }
 
-    /// Drop one library from the recent list and persist.
-    pub fn remove_recent_library(&mut self, path: &PathBuf) -> Result<()> {
-        self.recent_libraries.retain(|p| p != path);
+    /// The workspace filter tools currently shown, defaulting to the
+    /// favourites + kind pair.
+    pub fn filter_tools(&self) -> Vec<String> {
+        match &self.filter_tools {
+            Some(tools) => FILTER_TOOLS
+                .iter()
+                .filter(|t| tools.contains(&t.to_string()))
+                .map(|t| t.to_string())
+                .collect(),
+            None => DEFAULT_FILTER_TOOLS.iter().map(|t| t.to_string()).collect(),
+        }
+    }
+
+    /// Toggle one filter tool on/off and persist.
+    pub fn toggle_filter_tool(&mut self, tool: &str) -> Result<()> {
+        let mut tools = self.filter_tools();
+        if tools.iter().any(|t| t == tool) {
+            tools.retain(|t| t != tool);
+        } else {
+            tools.push(tool.to_string());
+        }
+        self.filter_tools = Some(tools);
         self.save()
     }
 

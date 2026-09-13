@@ -3,14 +3,15 @@
 
 pub mod config;
 pub mod error;
-pub mod events;
+pub mod history;
 pub mod keybindings;
 pub mod layout;
 pub mod library;
 pub mod media;
 pub mod model;
+pub mod search;
 pub mod services;
 pub mod store;
-pub mod undo;
+pub mod tasks;
 
 pub use error::{Error, Result};

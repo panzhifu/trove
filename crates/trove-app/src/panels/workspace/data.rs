@@ -5,6 +5,11 @@
 //! structure and the cached query result are rebuilt.
 
 use super::*;
+use std::collections::HashMap;
+use std::path::Path;
+use trove_core::model::Asset;
+use trove_core::services::font_manager::SystemFont;
+use trove_core::store::BrowseContext;
 
 #[derive(Debug, Clone)]
 /// Data needed to paint one grid cell. Immutable per layout epoch;
@@ -28,6 +33,10 @@ pub(super) struct Cell {
     /// Font assets so cells can render the sample text in the actual font.
     pub(super) font_family: Option<String>,
     pub(super) font_blob: Option<PathBuf>,
+    /// A virtual system-font entry (not an imported asset): shown only in
+    /// the fonts view, resolved through `LibraryController::virtual_fonts`
+    /// instead of the store.
+    pub(super) system_font: bool,
 }
 
 impl Cell {
@@ -99,6 +108,9 @@ pub(super) struct ViewKey {
     /// slider change re-justifies through the same debounced path as a
     /// resize.
     pub(super) row_height_scale: f32,
+    /// Active visual search (mirrors [`DataKey::visual`]): a structural
+    /// change of the hit set relayouts and resets scrolling.
+    pub(super) visual: Option<Vec<Uuid>>,
 }
 
 /// Inputs that decide *which* assets are listed. This is the expensive
@@ -117,11 +129,17 @@ pub(super) struct DataKey {
     pub(super) search: String,
     pub(super) filter_kind: Option<AssetKind>,
     pub(super) filter_favorite: bool,
+    pub(super) filter_orientation: Option<Orientation>,
+    pub(super) filter_min_rating: Option<u8>,
+    pub(super) filter_ext: Option<String>,
     pub(super) sort: AssetSort,
     pub(super) sort_desc: bool,
     pub(super) grid_loaded: usize,
     pub(super) library_root: PathBuf,
     pub(super) generation: u64,
+    /// Active visual search: the grid shows exactly these asset ids (in
+    /// rank order) instead of running the browse query.
+    pub(super) visual: Option<Vec<Uuid>>,
 }
 
 /// Cached data pass: the query result materialized into cells, shared with
@@ -176,7 +194,6 @@ impl WorkspacePanel {
             controller,
             search_box,
             color_picker,
-            color_picker_open: std::cell::Cell::new(false),
             pending_color_search: None,
             available_width,
             rows: Rc::new(Vec::new()),
@@ -190,167 +207,135 @@ impl WorkspacePanel {
             debounce_timer: None,
             preview: None,
             preview_subscription: None,
+            fonts_scan_task: None,
+            total_refresh: None,
+            count_recheck: false,
+            count_settle: None,
+            filter_exts: None,
         };
         observe_controller(cx, &this.controller);
         this
     }
 
     /// Run the paged query for `key` and materialize the assets into cells.
-    /// The five mutually-exclusive view drivers (recent, FTS search, smart
-    /// collection, plain query) live here. Called only when the [`DataKey`]
-    /// changes — never on the per-frame path.
+    /// The view dispatch itself lives in `trove_core::store::BrowseContext`;
+    /// this only maps the render-side [`DataKey`] onto it and surfaces query
+    /// errors. Called only when the [`DataKey`] changes — never on the
+    /// per-frame path. An active visual search replaces the browse query
+    /// with a rank-ordered id fetch; the fonts view appends virtual cells
+    /// for system fonts the library has not imported. `count_total = false`
+    /// skips the exact COUNT (a lower-bound total comes back) — the caller
+    /// overlays its cached exact number.
     pub(super) fn run_data_pass(
         &mut self,
         cx: &mut Context<Self>,
         key: &DataKey,
+        count_total: bool,
     ) -> (usize, Vec<Cell>) {
+        if let Some(ids) = &key.visual {
+            return self.run_visual_pass(cx, key, ids);
+        }
+
         let limit = Some(key.grid_loaded as u32);
-        let search_active = !key.in_trash && !key.in_recent && !key.search.is_empty();
-        let (total, list): (usize, Vec<trove_core::model::Asset>) = if key.in_recent {
-            // Recently viewed: ids ordered by last view time, materialised
-            // in that order (missing / trashed ids are dropped by the
-            // query). History is capped at 200, so one page covers it all.
-            let conn = self.controller.read(cx).library.store().conn();
-            match trove_core::store::view_history::recent_ids(conn, key.grid_loaded).and_then(
-                |ids| {
-                    let n = ids.len();
-                    assets::by_ids(conn, &ids).map(|a| (n, a))
-                },
-            ) {
-                Ok((t, a)) => (t, a),
-                Err(e) => {
-                    self.report_view_error(cx, e);
-                    (0, Vec::new())
-                }
-            }
-        } else if search_active {
-            let q = AssetQuery {
-                collection_id: key.collection,
-                tag_ids: key.tag.map(|t| vec![t]).unwrap_or_default(),
-                kind: key.filter_kind,
-                is_favorite: key.filter_favorite.then_some(true),
-                source_path_prefix: key.folder.clone(),
-                is_trashed: false,
-                text: None,
-                limit,
-                ..Default::default()
-            };
-            let result = assets::search(
-                self.controller.read(cx).library.store().conn(),
-                &key.search,
-                &q,
-            );
-            match result {
-                Ok((t, a)) => (t as usize, a),
-                Err(e) => {
-                    self.report_view_error(cx, e);
-                    (0, Vec::new())
-                }
-            }
-        } else if let Some(sid) = key.smart {
-            let result = self.controller.read(cx).library.evaluate_smart_collection(
-                sid,
-                key.filter_kind,
-                key.filter_favorite.then_some(true),
-                limit,
-                0,
-            );
-            match result {
-                Ok((t, a)) => (t as usize, a),
-                Err(e) => {
-                    self.report_view_error(cx, e);
-                    (0, Vec::new())
-                }
-            }
+        let ctx = BrowseContext {
+            collection: key.collection,
+            in_trash: key.in_trash,
+            in_recent: key.in_recent,
+            smart: key.smart,
+            tag: key.tag,
+            folder: key.folder.clone(),
+            search: key.search.clone(),
+            kind: key.filter_kind,
+            is_favorite: key.filter_favorite,
+            orientation: key.filter_orientation,
+            min_rating: key.filter_min_rating,
+            ext: key.filter_ext.clone(),
+            sort: key.sort,
+            sort_desc: key.sort_desc,
+        };
+        let ctl = self.controller.read(cx);
+        let conn = ctl.library.store().conn();
+        // Flush pending outbox rows first so a just-finished write (import,
+        // edit) is reflected in the same refresh.
+        let _ = ctl.library.drain_search_queue();
+        let text_index = ctl.library.text_index();
+        let page = match if count_total {
+            ctx.run(conn, text_index, limit)
         } else {
-            let result = assets::query(
-                self.controller.read(cx).library.store().conn(),
-                &AssetQuery {
-                    collection_id: if key.in_trash { None } else { key.collection },
-                    tag_ids: if key.in_trash {
-                        Vec::new()
-                    } else {
-                        key.tag.map(|t| vec![t]).unwrap_or_default()
-                    },
-                    // The trash view hides the filter controls, so it also
-                    // ignores the grid filters entirely.
-                    kind: if key.in_trash { None } else { key.filter_kind },
-                    is_favorite: (!key.in_trash && key.filter_favorite).then_some(true),
-                    source_path_prefix: if key.in_trash {
-                        None
-                    } else {
-                        key.folder.clone()
-                    },
-                    is_trashed: key.in_trash,
-                    sort: key.sort,
-                    sort_desc: key.sort_desc,
-                    limit,
-                    ..Default::default()
-                },
-            );
-            match result {
-                Ok((t, a)) => (t as usize, a),
-                Err(e) => {
-                    self.report_view_error(cx, e);
-                    (0, Vec::new())
-                }
+            ctx.run_without_count(conn, text_index, limit)
+        } {
+            Ok(page) => page,
+            Err(e) => {
+                self.report_view_error(cx, e);
+                trove_core::model::Page::new(0, Vec::new())
             }
         };
+        let (total, list) = (page.total as usize, page.items);
 
-        let cells: Vec<Cell> = list
+        let mut cells: Vec<Cell> = list
             .iter()
             .filter(|a| key.in_trash || a.trashed_at.is_none())
-            .map(|a| {
-                let thumb = a
-                    .sha256
-                    .as_deref()
-                    .map(|sha| trove_core::media::thumb::abs_path(&key.library_root, sha))
-                    .filter(|p| p.is_file());
-                // Live font preview inputs: family (probed at import) plus
-                // the font file to register (blob or linked source).
-                let (font_family, font_blob) = if a.kind == AssetKind::Font {
-                    let blob = if a.origin == trove_core::model::Origin::Linked {
-                        a.extra
-                            .get("source_path")
-                            .and_then(|v| v.as_str())
-                            .map(PathBuf::from)
-                    } else {
-                        a.rel_path.as_ref().map(|rel| key.library_root.join(rel))
-                    }
-                    .filter(|p| p.is_file());
-                    (
-                        a.extra
-                            .get("font_family")
-                            .and_then(|v| v.as_str())
-                            .map(str::to_string),
-                        blob,
-                    )
-                } else {
-                    (None, None)
-                };
-                Cell {
-                    id: a.id,
-                    kind: a.kind,
-                    thumb,
-                    width: a.width,
-                    height: a.height,
-                    trashed: a.trashed_at.is_some(),
-                    name: display_name(a),
-                    size_bytes: a.size_bytes,
-                    added: a.created_at.format("%Y-%m-%d %H:%M").to_string(),
-                    // Capture date is what a timeline is about; files without
-                    // EXIF fall back to the import date so nothing is lost.
-                    day: a
-                        .captured_at
-                        .unwrap_or(a.created_at)
-                        .format("%Y-%m-%d")
-                        .to_string(),
-                    font_family,
-                    font_blob,
-                }
-            })
+            .map(|a| cell_from_asset(&key.library_root, a))
             .collect();
+
+        // The fonts view mixes in virtual entries for system fonts whose
+        // family the library has not imported. They are presentation only:
+        // nothing is copied or written to the store, so no count anywhere
+        // else is affected.
+        let mut virtual_fonts = HashMap::new();
+        let fonts_view = key.filter_kind == Some(AssetKind::Font)
+            && !key.in_trash
+            && !key.in_recent
+            && key.search.is_empty();
+        if fonts_view {
+            let imported: std::collections::HashSet<String> =
+                cells.iter().filter_map(|c| c.font_family.clone()).collect();
+            if let Some(system) = self.controller.read(cx).system_fonts.clone() {
+                let extra: Vec<Cell> = system
+                    .iter()
+                    .filter(|font| !imported.contains(&font.family))
+                    .map(|font| {
+                        let id = virtual_font_id(&font.path);
+                        virtual_fonts.insert(id, font.clone());
+                        virtual_font_cell(id, font)
+                    })
+                    .collect();
+                cells.extend(extra);
+            }
+        }
+        self.controller.update(cx, |ctl, _| {
+            ctl.virtual_fonts = virtual_fonts;
+        });
+        // The fonts view's own count describes what the grid shows (library
+        // fonts + virtual entries); every library-wide count elsewhere
+        // stays a pure store number.
+        let total = if fonts_view { cells.len() } else { total };
         (total, cells)
+    }
+
+    /// Materialize the visual-search hits into cells, preserving rank
+    /// order. Missing records (deleted since the scan) drop out.
+    fn run_visual_pass(
+        &mut self,
+        cx: &mut Context<Self>,
+        key: &DataKey,
+        ids: &[Uuid],
+    ) -> (usize, Vec<Cell>) {
+        let conn = self.controller.read(cx).library.store().conn();
+        let by_id: HashMap<Uuid, _> = assets::by_ids(conn, ids)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|a| (a.id, a))
+            .collect();
+        let cells: Vec<Cell> = ids
+            .iter()
+            .filter_map(|id| by_id.get(id))
+            .map(|a| cell_from_asset(&key.library_root, a))
+            .collect();
+        self.controller.update(cx, |ctl, _| {
+            ctl.virtual_fonts.clear();
+        });
+        (cells.len(), cells)
     }
 
     /// Surface a view/query failure in the status bar. `report_error`
@@ -364,4 +349,107 @@ impl WorkspacePanel {
             }
         });
     }
+}
+
+/// The view-identity part of a [`DataKey`]: the refresh counter and the
+/// pagination cursor are zeroed, so two keys compare equal when only churn
+/// (imports, edits) separates them. Keys the cached exact total.
+pub(super) fn total_identity(key: &DataKey) -> DataKey {
+    let mut identity = key.clone();
+    identity.generation = 0;
+    identity.grid_loaded = 0;
+    identity
+}
+
+/// One store record → one paintable cell. Shared by the browse query pass
+/// and the visual-search pass so both grids render identically.
+fn cell_from_asset(library_root: &Path, a: &Asset) -> Cell {
+    let thumb = a
+        .sha256
+        .as_deref()
+        .map(|sha| trove_core::media::thumb::abs_path(library_root, sha))
+        .filter(|p| p.is_file());
+    // Live font preview inputs: family (probed at import) plus the font
+    // file to register (blob or linked source).
+    let (font_family, font_blob) = if a.kind == AssetKind::Font {
+        let blob = if a.origin == trove_core::model::Origin::Linked {
+            a.facts.source_path.as_ref().map(PathBuf::from)
+        } else {
+            a.rel_path.as_ref().map(|rel| library_root.join(rel))
+        }
+        .filter(|p| p.is_file());
+        (a.facts.font.family.clone(), blob)
+    } else {
+        (None, None)
+    };
+    Cell {
+        id: a.id,
+        kind: a.kind,
+        thumb,
+        width: a.width,
+        height: a.height,
+        trashed: a.trashed_at.is_some(),
+        name: display_name(a),
+        size_bytes: a.size_bytes,
+        added: a.created_at.format("%Y-%m-%d %H:%M").to_string(),
+        // Capture date is what a timeline is about; files without EXIF fall
+        // back to the import date so nothing is lost.
+        day: a
+            .captured_at
+            .unwrap_or(a.created_at)
+            .format("%Y-%m-%d")
+            .to_string(),
+        font_family,
+        font_blob,
+        system_font: false,
+    }
+}
+
+/// A virtual cell for a system font: no store record backs it — the
+/// library, inspector and preview resolve `id` through
+/// `LibraryController::virtual_fonts`.
+fn virtual_font_cell(id: Uuid, font: &SystemFont) -> Cell {
+    let style = font
+        .style
+        .clone()
+        .unwrap_or_else(|| rust_i18n::t!("sysfonts.no_style").to_string());
+    Cell {
+        id,
+        kind: AssetKind::Font,
+        thumb: None,
+        width: None,
+        height: None,
+        trashed: false,
+        name: format!("{} · {}", font.family, style),
+        size_bytes: std::fs::metadata(&font.path).map(|m| m.len()).unwrap_or(0),
+        added: rust_i18n::t!("sysfonts.system_note").to_string(),
+        // Timeline views never see these cells (they only appear in the
+        // fonts view, which is kind-filtered and undated).
+        day: String::new(),
+        font_family: Some(font.family.clone()),
+        font_blob: Some(font.path.clone()),
+        system_font: true,
+    }
+}
+
+/// Deterministic synthetic id for a system-font file. Nothing persists
+/// these ids; they only have to stay stable for the session so a selected
+/// virtual cell keeps resolving across data-pass rebuilds.
+fn virtual_font_id(path: &Path) -> Uuid {
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    path.hash(&mut hasher);
+    let high = hasher.finish();
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    hasher.write_u64(0x9e37_79b9_7f4a_7c15);
+    path.hash(&mut hasher);
+    let low = hasher.finish();
+    let mut bytes = [0u8; 16];
+    bytes[..8].copy_from_slice(&high.to_be_bytes());
+    bytes[8..].copy_from_slice(&low.to_be_bytes());
+    // Mark as a random (v4) uuid so downstream UUID formatting stays sane.
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    Uuid::from_bytes(bytes)
 }

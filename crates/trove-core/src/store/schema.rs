@@ -5,9 +5,26 @@
 //! released migration; append a new one.
 
 /// Current schema version, bumped whenever a migration is appended.
-pub const SCHEMA_VERSION: i64 = 7;
+pub const SCHEMA_VERSION: i64 = 12;
 
 /// One migration per version index: `MIGRATIONS[0]` upgrades 0 -> 1, and so on.
+///
+/// # The `asset_fts` removal (a documented exception to "never edit a released
+/// migration")
+///
+/// This array used to build a SQLite FTS5 table `asset_fts` in v2, recreate it
+/// in v3 and v11, and drop it for good in v12 when text search moved to the
+/// Tantivy index (`crate::search`). The three `CREATE VIRTUAL TABLE` statements
+/// are now gone: they were dead weight — nothing outside this file has
+/// referenced the table since v12 landed, and each create was already followed
+/// by a `DROP` in a later migration.
+///
+/// Removing them keeps the *end state identical* from every starting point: a
+/// fresh library never creates the table, one at v1 skips the create and still
+/// walks through the drops, and one at v7+ never re-runs these migrations at
+/// all. The `DROP TABLE IF EXISTS` lines stay on purpose — libraries on disk
+/// today were written by the released (v7) build and genuinely contain the
+/// table, so the drops are the only thing that still has work to do.
 pub const MIGRATIONS: &[&str] = &[
     // v1: initial asset library.
     r#"
@@ -78,16 +95,10 @@ pub const MIGRATIONS: &[&str] = &[
 
     CREATE INDEX idx_asset_tag_tag ON asset_tag(tag_id);
     "#,
-    // v2: full-text search index + smart (saved-search) collections.
-    // The FTS table mirrors live+trashed assets; search filters live rows at
-    // query time so trash/restore never touch the index.
+    // v2: smart (saved-search) collections. Historically this migration also
+    // created the FTS5 table `asset_fts`; that DDL is gone (see the note above
+    // `MIGRATIONS`) because text search now runs on the Tantivy index.
     r#"
-    CREATE VIRTUAL TABLE asset_fts USING fts5(
-        asset_id UNINDEXED,
-        file_name, title, description,
-        tokenize = 'unicode61'
-    );
-
     CREATE TABLE smart_collections (
         id         TEXT PRIMARY KEY,
         name       TEXT NOT NULL,
@@ -98,17 +109,11 @@ pub const MIGRATIONS: &[&str] = &[
         updated_at TEXT NOT NULL
     );
     "#,
-    // v3: tag names join the full-text index. FTS5 tables cannot be altered,
-    // so the index is dropped and recreated; the Library backfill (which runs
-    // after migrations) rebuilds it from the live asset rows.
+    // v3: historic FTS5 tag-column migration. Its `CREATE VIRTUAL TABLE` is
+    // gone (see the note above `MIGRATIONS`); the drop stays so libraries
+    // written by pre-v12 builds shed the table on upgrade.
     r#"
     DROP TABLE IF EXISTS asset_fts;
-
-    CREATE VIRTUAL TABLE asset_fts USING fts5(
-        asset_id UNINDEXED,
-        file_name, title, description, tags,
-        tokenize = 'unicode61'
-    );
     "#,
     // v4: CLIP embedding column for semantic search. BLOB stores the
     // 512/768-dim float32 vector (L2-normalized). NULL when not yet computed.
@@ -139,5 +144,82 @@ pub const MIGRATIONS: &[&str] = &[
     );
 
     CREATE INDEX idx_view_history_viewed ON view_history(viewed_at);
+    "#,
+    // v8: hierarchical smart collections. `parent_id` may reference either
+    // `collections.id` or another `smart_collections.id`, which a single SQL
+    // FK cannot express — existence and acyclicity are enforced by the store
+    // layer instead. Deleting a parent (of either kind) cascades to the smart
+    // subtree, also handled in code (`smart_collections::delete*`).
+    r#"
+    ALTER TABLE smart_collections ADD COLUMN parent_id TEXT;
+
+    CREATE INDEX idx_smart_collections_parent ON smart_collections(parent_id);
+    "#,
+    // v9: usage status (workflow state, `model::UsageStatus`) and the
+    // commercial-use tri-state license flag (`NULL` = not verified) replace
+    // the v5 color label, which stays as a legacy column that nothing reads
+    // or writes anymore.
+    r#"
+    ALTER TABLE assets ADD COLUMN usage_status TEXT NOT NULL DEFAULT 'unused';
+
+    ALTER TABLE assets ADD COLUMN commercial_use INTEGER;
+    "#,
+    // v10: sort/filter indexes. Every view orders by created_at, and the
+    // toolbar filters and smart rules hit rating, is_favorite and
+    // size_bytes; the earlier set only covered trashed_at/ext/kind/sha256.
+    r#"
+    CREATE INDEX idx_assets_created  ON assets(created_at);
+    CREATE INDEX idx_assets_rating   ON assets(rating);
+    CREATE INDEX idx_assets_favorite ON assets(is_favorite);
+    CREATE INDEX idx_assets_size     ON assets(size_bytes);
+    "#,
+    // v11: historic trigram-tokenizer migration for the FTS5 index. The
+    // `CREATE VIRTUAL TABLE` is gone (see the note above `MIGRATIONS`); the
+    // drop stays as cleanup for libraries that still carry the table.
+    r#"
+    DROP TABLE IF EXISTS asset_fts;
+    "#,
+    // v12: text search moves out of SQLite into the Tantivy index under
+    // `<root>/search_index`, so the FTS5 table is dropped here for the last
+    // time. Synchronization goes through a queue table filled by triggers on
+    // every asset / tag write (the outbox pattern): no mutation site has to
+    // remember the index, and the drain re-derives everything from the rows,
+    // so a lost index self-repairs.
+    r#"
+    DROP TABLE IF EXISTS asset_fts;
+
+    -- No UNIQUE constraint here: SQLite trigger/FK-cascade interactions
+    -- can surface spurious UNIQUE errors against it, and the drain is
+    -- idempotent, so duplicate pending rows are harmless.
+    CREATE TABLE search_queue (
+        asset_id TEXT NOT NULL,
+        deleted  INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE INDEX idx_search_queue_asset ON search_queue(asset_id);
+
+    -- OR REPLACE inside a trigger inherits the outer statement's conflict
+    -- resolution (a DELETE carries ABORT), which aborts on a pending row —
+    -- so these use OR IGNORE plus an explicit flag update instead.
+    CREATE TRIGGER search_queue_assets_insert AFTER INSERT ON assets BEGIN
+        INSERT OR IGNORE INTO search_queue(asset_id, deleted) VALUES (new.id, 0);
+    END;
+    CREATE TRIGGER search_queue_assets_update AFTER UPDATE ON assets BEGIN
+        INSERT OR IGNORE INTO search_queue(asset_id, deleted) VALUES (new.id, 0);
+        UPDATE search_queue SET deleted = 0 WHERE asset_id = new.id;
+    END;
+    CREATE TRIGGER search_queue_assets_delete AFTER DELETE ON assets BEGIN
+        INSERT OR IGNORE INTO search_queue(asset_id, deleted) VALUES (old.id, 1);
+        UPDATE search_queue SET deleted = 1 WHERE asset_id = old.id;
+    END;
+    CREATE TRIGGER search_queue_asset_tag_insert AFTER INSERT ON asset_tag BEGIN
+        INSERT OR IGNORE INTO search_queue(asset_id, deleted) VALUES (new.asset_id, 0);
+    END;
+    CREATE TRIGGER search_queue_asset_tag_delete AFTER DELETE ON asset_tag BEGIN
+        INSERT OR IGNORE INTO search_queue(asset_id, deleted) VALUES (old.asset_id, 0);
+    END;
+    CREATE TRIGGER search_queue_tags_update AFTER UPDATE ON tags BEGIN
+        INSERT OR IGNORE INTO search_queue(asset_id, deleted)
+        SELECT asset_id, 0 FROM asset_tag WHERE tag_id = new.id;
+    END;
     "#,
 ];

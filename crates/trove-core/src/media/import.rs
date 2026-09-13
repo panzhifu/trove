@@ -15,8 +15,9 @@ use uuid::Uuid;
 
 use super::{blob, metadata, probe, search, thumb};
 use crate::error::{Error, Result};
-use crate::model::{Asset, AssetKind, Origin, now};
+use crate::model::{Asset, AssetKind, Origin, UsageStatus, now};
 use crate::store::{Store, assets, collections};
+use rusqlite::Connection;
 
 /// One successfully imported (or deduplicated) file.
 #[derive(Debug, Clone)]
@@ -94,7 +95,7 @@ pub fn import_files(
         return Err(Error::NotFound("collection"));
     }
     Ok(commit_staged_all(
-        store,
+        store.conn(),
         into_collection,
         stage_all(root, sources, false),
     ))
@@ -109,8 +110,14 @@ pub fn stage_all(
     sources: &[PathBuf],
     linked: bool,
 ) -> Vec<std::result::Result<StagedFile, ImportSkip>> {
+    use rayon::prelude::*;
+
+    // Parallel: every stage is independent file I/O (hash + blob copy +
+    // thumbnail), so throughput tracks the disk, not one core. `par_iter`
+    // preserves input order, and blob/thumb writes are temp-file + rename,
+    // so concurrent staging of identical content cannot corrupt anything.
     sources
-        .iter()
+        .par_iter()
         .map(|src| {
             stage_source(root, src, linked).map_err(|e| ImportSkip {
                 path: src.clone(),
@@ -122,10 +129,10 @@ pub fn stage_all(
 
 /// Phase two for a batch: commit staged files (or pass through staging
 /// failures) into the database, collecting per-file outcomes into an
-/// [`ImportReport`]. Runs on whatever thread owns the [`Store`]; callers that
-/// keep a `Store` on the UI thread should commit from that thread.
+/// [`ImportReport`]. Runs on whatever thread owns the connection; the
+/// connection may be a transaction / savepoint (batched commits).
 pub fn commit_staged_all(
-    store: &Store,
+    store: &Connection,
     into_collection: Option<Uuid>,
     staged: Vec<std::result::Result<StagedFile, ImportSkip>>,
 ) -> ImportReport {
@@ -187,13 +194,13 @@ pub fn stage_source(root: &Path, src: &Path, linked: bool) -> Result<StagedFile>
     let mut mined = metadata::mine(&blob_path, p.kind);
     // Visual fingerprint (pHash + colour histogram) for search-by-image and
     // search-by-colour, computed from the small thumbnail so a huge photo
-    // costs no more than a tiny one. Stored in `extra` and persisted by
-    // `commit_staged` together with the rest of the mined metadata.
+    // costs no more than a tiny one. Stored in the visual facts and persisted
+    // by `commit_staged` together with the rest of the mined metadata.
     if p.kind == AssetKind::Image {
         let sig_source = thumb_path.unwrap_or_else(|| blob_path.clone());
         let sig = search::VisualSignature::from_image(&sig_source);
         if sig.phash != search::PHash(0) {
-            sig.apply_to_extra(&mut mined.extra);
+            sig.apply_to_facts(&mut mined.facts);
         }
     }
     if mined.duration_ms.is_none() {
@@ -218,10 +225,10 @@ pub fn stage_source(root: &Path, src: &Path, linked: bool) -> Result<StagedFile>
 
 /// Phase two (fast, database-only): dedupe or insert, attach to a collection.
 ///
-/// Runs on whatever thread calls it; callers that keep a `Store` on the UI
-/// thread should commit from that thread.
+/// Runs on whatever thread calls it, on any connection to the library —
+/// including a transaction or savepoint, so callers can batch commits.
 pub fn commit_staged(
-    store: &Store,
+    conn: &Connection,
     into_collection: Option<Uuid>,
     staged: &StagedFile,
 ) -> Result<ImportItem> {
@@ -233,15 +240,15 @@ pub fn commit_staged(
     }
 
     // Reuse an existing live asset with identical content.
-    if let Some(existing) = assets::find_by_sha256(store.conn(), &staged.sha256)? {
+    if let Some(existing) = assets::find_by_sha256(conn, &staged.sha256)? {
         // A placeholder record (metadata restore without media) becomes a
         // full asset the moment its content lands in the library. Linked
         // records keep pointing at their original location.
         if existing.rel_path.is_none() && existing.origin == Origin::Stored {
-            assets::set_rel_path(store.conn(), existing.id, &staged.rel_path)?;
+            assets::set_rel_path(conn, existing.id, &staged.rel_path)?;
         }
         for cid in &targets {
-            collections::add_asset(store.conn(), *cid, existing.id)?;
+            collections::add_asset(conn, *cid, existing.id)?;
         }
         return Ok(ImportItem {
             asset_id: existing.id,
@@ -253,13 +260,9 @@ pub fn commit_staged(
     }
 
     let mined = &staged.mined;
-    let mut extra = std::collections::BTreeMap::new();
-    extra.extend(mined.extra.clone());
+    let mut facts = mined.facts.clone();
     // Remember where the file came from: the folders panel browses by it.
-    extra.insert(
-        "source_path".into(),
-        serde_json::Value::String(staged.path.display().to_string()),
-    );
+    facts.source_path = Some(staged.path.display().to_string());
 
     // Note: visual signature is computed in background after import to keep
     // the import pipeline fast. See `compute_visual_signature_background()`.
@@ -291,15 +294,16 @@ pub fn commit_staged(
         rating: None,
         is_favorite: false,
         source_url: None,
-        color_label: None,
-        extra,
+        usage_status: UsageStatus::Unused,
+        commercial_use: None,
+        facts,
         created_at: now(),
         updated_at: now(),
         trashed_at: None,
     };
-    assets::insert(store.conn(), &asset)?;
+    assets::insert(conn, &asset)?;
     for cid in &targets {
-        collections::add_asset(store.conn(), *cid, asset.id)?;
+        collections::add_asset(conn, *cid, asset.id)?;
     }
 
     Ok(ImportItem {
@@ -362,7 +366,7 @@ mod tests {
         assert!(staged[1].is_err());
 
         // Phase two: the commit loop turns everything into an ImportReport.
-        let report = commit_staged_all(&store, None, staged);
+        let report = commit_staged_all(store.conn(), None, staged);
         assert_eq!(report.imported_count(), 1);
         assert_eq!(report.skipped_count(), 1);
         assert_eq!(report.skipped[0].path, missing);
@@ -375,7 +379,7 @@ mod tests {
 
         // Re-importing identical content dedupes (reused = true).
         let staged2 = stage_all(&root, &[good], false);
-        let report2 = commit_staged_all(&store, None, staged2);
+        let report2 = commit_staged_all(store.conn(), None, staged2);
         assert_eq!(report2.imported_count(), 1);
         assert!(report2.imported[0].reused);
 
@@ -395,19 +399,19 @@ mod tests {
 
         let staged = stage_all(&root, std::slice::from_ref(&src), true);
         assert!(staged[0].is_ok(), "{:?}", staged[0].as_ref().err());
-        let report = commit_staged_all(&store, None, staged);
+        let report = commit_staged_all(store.conn(), None, staged);
         assert_eq!(report.imported_count(), 1);
 
         let conn = store.conn();
-        let (_, all) = assets::query(conn, &AssetQuery::default()).unwrap();
-        let asset = &all[0];
+        let all = assets::query(conn, &AssetQuery::default()).unwrap();
+        let asset = &all.items[0];
         // Linked record: no blob copied, origin linked, original location
-        // recorded in extra.
+        // recorded in the facts.
         assert_eq!(asset.origin, Origin::Linked);
         assert!(asset.rel_path.is_none());
         assert!(walk_blobs(&root.join("media")).is_empty());
         assert_eq!(
-            asset.extra.get("source_path").and_then(|v| v.as_str()),
+            asset.facts.source_path.as_deref(),
             Some(src.display().to_string().as_str())
         );
         let (src_sha, _) = super::super::blob::hash_file(&src).unwrap();
