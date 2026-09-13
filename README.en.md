@@ -13,7 +13,7 @@
   <img src="docs/screenshots/main-window.png" alt="Trove main window" width="900"/>
 </p>
 
-<p align="center"><i>Justified grid · dock layout · 3D model viewport · semantic search — all local, data never leaves your machine</i></p>
+<p align="center"><i>Justified grid · dock layout · 3D model viewport · visual search — all local, data never leaves your machine</i></p>
 
 ---
 
@@ -38,7 +38,6 @@ This README summarizes what ships. The **[Chinese README](./README.zh.md)** is t
 
 - **Full-text search** — Tantivy-backed, over file name / title / description / tag name, ranked. Word, substring and pinyin matching (`sunse` → `Sunset`, `mao` → 花园里的猫), composable with any filter.
 - **Visual search** — search by image + search by color. Perceptual hash (pHash) + color histogram, computed at import, zero inference required.
-- **Semantic search** *(optional)* — CLIP text-to-image + image-to-image in the same box. Needs a manually-downloaded ONNX model.
 - **Smart collections** — rule-driven virtual folders as JSON query trees. Match on rating / kind / text / tag / favorite / color / date / aspect ratio / orientation; `and` / `or`. Validated at compile time.
 - **Tags** — hierarchical, case-insensitive, color labels; filters, counts and smart collections include subtrees.
 - **Ratings & favorites** — 1–5 stars, one-click favorite.
