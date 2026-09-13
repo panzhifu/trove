@@ -80,10 +80,13 @@ sys-locale = "0.3"
 arboard = { version = "3", features = ["wayland-data-control"] }
 
 [patch.crates-io]
+# The published `gpui-kit` 0.6 does not carry the branch this project builds
+# against, so both crates come from the fork. The `gpui-pre-*` platform crates
+# are deliberately *not* patched: they are on crates.io at the version the fork
+# asks for (0.3.3). They used to be overridden with
+# `path = "../gpui-kit/crates/gpui-pre-*"`, which only exists on a workstation
+# with a sibling gpui-kit checkout — never on a CI runner, where cargo could
+# not even load the manifest and every macOS/Windows target build died before
+# it started.
 gpui-kit = { git = "https://github.com/panzhifu/gpui-kit.git", branch = "feat/optional-ellipsis-menu" }
 gpui-kit-assets = { git = "https://github.com/panzhifu/gpui-kit.git", branch = "feat/optional-ellipsis-menu" }
-gpui-pre-wgpu = { path = "../gpui-kit/crates/gpui-pre-wgpu" }
-gpui-pre-linux = { path = "../gpui-kit/crates/gpui-pre-linux" }
-gpui-pre-windows = { path = "../gpui-kit/crates/gpui-pre-windows" }
-gpui-pre-macos = { path = "../gpui-kit/crates/gpui-pre-macos" }
-gpui-pre-apple = { path = "../gpui-kit/crates/gpui-pre-apple" }
