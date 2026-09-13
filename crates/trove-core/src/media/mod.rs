@@ -5,12 +5,15 @@ pub mod blob;
 pub mod chunked;
 pub mod color;
 pub mod convert;
+pub mod formats;
 pub mod gpu;
 pub mod import;
-pub mod mesh;
+pub mod index;
 pub mod metadata;
 pub mod probe;
 pub mod render3d;
 pub mod search;
 pub mod thumb;
 pub mod video;
+
+pub use formats::streaming_point_cloud::StreamingPointCloud;

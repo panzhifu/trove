@@ -14,7 +14,8 @@ struct Uniforms {
     material: vec4<f32>,
     // x = diffuse, y = specular, z = shininess, w = vignette.
     params: vec4<f32>,
-    // x = point sprite radius in pixels; the rest is unused.
+    // x = point sprite radius in pixels, y = eye-dome lighting strength,
+    // z/w = the depth-to-log-depth constants the point-cloud post pass reads.
     params2: vec4<f32>,
     // xyz = camera position in model space, where the normals live.
     eye: vec4<f32>,
@@ -157,4 +158,134 @@ fn fs_backdrop(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32>
     color = mix(color, u.bg_bottom.rgb, vignette);
 
     return vec4<f32>(color, 1.0);
+}
+
+// Eye-dome lighting and gap filling, over the depth the point pass left.
+//
+// This is the GPU half of `render3d::enhance_points`: the same algorithm
+// reading the same depth, so a cloud lit here matches one lit on the CPU. It
+// runs after the points as a full-screen pass, and only for a settled
+// point-cloud frame — a draft is drawn without MSAA and stretched back over
+// the canvas, and the creases it would compute could not survive the scaling.
+//
+// The depth binding is the multisampled depth attachment itself (sample 0),
+// which is why this pass carries a bind group of its own and why it needs an
+// adapter that multisamples: without MSAA there is no such texture to read,
+// and the frame is drawn without the effect rather than with a broken one.
+@group(1) @binding(0) var edl_depth: texture_depth_multisampled_2d;
+@group(1) @binding(1) var edl_source: texture_2d<f32>;
+
+fn drew(coord: vec2<i32>) -> bool {
+    return textureLoad(edl_depth, coord, 0) < 1.0;
+}
+
+// The CPU keeps `-log2(1/z)`, which is `log2(w)` for view depth `w`. Depth is
+// affine in `1/w` (`ndc = z_scale + z_bias / w`), so the same value comes back
+// from the depth buffer with the two constants the host packs into `params2`.
+// Subtracting two of them gives the log of the ratio of their distances, in
+// the right order.
+fn log_depth_at(coord: vec2<i32>) -> f32 {
+    let ndc = textureLoad(edl_depth, coord, 0);
+    if ndc >= 1.0 {
+        return 0.0;
+    }
+    return log2(max(u.params2.w / (ndc - u.params2.z), 1e-6));
+}
+
+// Whether the 3×3 neighbour at an offset drew something. Off the edge counts
+// as not drawn, which is what the CPU's `has_left`/`has_up` guards do.
+fn occupies(coord: vec2<i32>, size: vec2<i32>, offset: vec2<i32>) -> bool {
+    let p = coord + offset;
+    if p.x < 0 || p.y < 0 || p.x >= size.x || p.y >= size.y {
+        return false;
+    }
+    return drew(p);
+}
+
+fn flag(value: bool) -> u32 {
+    return select(0u, 1u, value);
+}
+
+@fragment
+fn fs_edl(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
+    let size = vec2<i32>(u.viewport.xy);
+    let coord = clamp(vec2<i32>(position.xy), vec2<i32>(0), size - vec2<i32>(1));
+    let color = textureLoad(edl_source, coord, 0).rgb;
+
+    // A pixel nothing drew is a gap between the discs, and takes the average
+    // of the colours around it — but only where the neighbourhood supports it:
+    // filling next to a silhouette would grow the model outwards into the
+    // background by a pixel. The domino rule is Nimbus's, kept as the CPU
+    // keeps it.
+    if !drew(coord) {
+        let x0 = max(coord.x - 1, 0);
+        let x1 = min(coord.x + 1, size.x - 1);
+        let y0 = max(coord.y - 1, 0);
+        let y1 = min(coord.y + 1, size.y - 1);
+        let lt = occupies(coord, size, vec2<i32>(-1, -1));
+        let mt = occupies(coord, size, vec2<i32>(0, -1));
+        let rt = occupies(coord, size, vec2<i32>(1, -1));
+        let lm = occupies(coord, size, vec2<i32>(-1, 0));
+        let rm = occupies(coord, size, vec2<i32>(1, 0));
+        let lb = occupies(coord, size, vec2<i32>(-1, 1));
+        let mb = occupies(coord, size, vec2<i32>(0, 1));
+        let rb = occupies(coord, size, vec2<i32>(1, 1));
+
+        let neighbours = flag(lt) + flag(mt) + flag(rt) + flag(lm)
+            + flag(rm) + flag(lb) + flag(mb) + flag(rb);
+        let window = u32((x1 - x0 + 1) * (y1 - y0 + 1) - 1);
+        let every_direction = (lt || mt || rt || rm || mb)
+            && (lt || mt || rt || lm || rm)
+            && (lt || mt || lm || lb || mb)
+            && (lm || rm || lb || mb || rb)
+            && (lt || mt || rt || rm || rb)
+            && (lt || mt || rt || lm || lb)
+            && (lt || lm || lb || mb || rb)
+            && (rt || rm || rb || mb || lb);
+        if neighbours == window || every_direction {
+            var sum = vec3<f32>(0.0);
+            var count = 0.0;
+            for (var y = y0; y <= y1; y += 1) {
+                for (var x = x0; x <= x1; x += 1) {
+                    let p = vec2<i32>(x, y);
+                    if drew(p) {
+                        sum += textureLoad(edl_source, p, 0).rgb;
+                        count += 1.0;
+                    }
+                }
+            }
+            if count > 0.0 {
+                return vec4<f32>(sum / count, 1.0);
+            }
+        }
+        // Nothing to fill from: the backdrop pass's own colour stands.
+        return vec4<f32>(color, 1.0);
+    }
+
+    // Eye-dome lighting: average how much farther each drawn neighbour is, and
+    // darken by that. It only ever darkens, so the background is untouched.
+    let center = log_depth_at(coord);
+    var sum = 0.0;
+    var count = 0.0;
+    let steps = array<vec2<i32>, 4>(
+        vec2<i32>(-1, 0),
+        vec2<i32>(1, 0),
+        vec2<i32>(0, -1),
+        vec2<i32>(0, 1),
+    );
+    for (var i = 0; i < 4; i += 1) {
+        let p = coord + steps[i];
+        if p.x < 0 || p.y < 0 || p.x >= size.x || p.y >= size.y {
+            continue;
+        }
+        if drew(p) {
+            sum += max(center - log_depth_at(p), 0.0);
+            count += 1.0;
+        }
+    }
+    var factor = 1.0;
+    if count > 0.0 {
+        factor = exp(-(sum / count) * u.params2.y);
+    }
+    return vec4<f32>(color * factor, 1.0);
 }

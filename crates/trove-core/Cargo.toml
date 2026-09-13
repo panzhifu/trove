@@ -1,6 +1,6 @@
 [package]
 name = "trove-core"
-version = "0.4.0"
+version = "0.4.1"
 edition = "2024"
 license = "MIT"
 
@@ -28,6 +28,7 @@ resvg = { workspace = true }
 psd = { workspace = true }
 rawler = { workspace = true }
 jxl-oxide = { workspace = true }
+gltf = { workspace = true }
 # 0.26 pulls fs4 0.13 (rustix 0.38 -> 1.x), collapsing rustix/linux-raw-sys
 # and itertools 0.12 onto the versions the rest of the graph already uses.
 # Two API fixes were needed: `TopDocs::with_limit(..).order_by_score()` and

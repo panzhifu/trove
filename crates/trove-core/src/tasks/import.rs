@@ -19,7 +19,7 @@ use std::time::Duration;
 use rusqlite::Connection;
 
 use super::JobContext;
-use crate::media::import::{self, ImportReport};
+use crate::media::import::{self, ImportPolicy, ImportReport};
 use crate::model::AssetPatch;
 use crate::store::assets;
 
@@ -60,8 +60,10 @@ pub struct ImportOptions {
     pub db_path: PathBuf,
     /// The library root (blob + thumbnail storage).
     pub library_root: PathBuf,
-    /// Import mode from the app config: copy blobs (`false`) or link.
-    pub linked: bool,
+    /// How sources are stored: copied into the library, or linked where they
+    /// already are (the user's preference, plus the size rule that keeps a
+    /// multi-gigabyte model from being duplicated).
+    pub policy: ImportPolicy,
     pub source: ImportSource,
 }
 
@@ -163,7 +165,7 @@ pub fn run(options: &ImportOptions, ctx: &JobContext) -> Result<ImportOutcome, S
     conn.execute_batch("PRAGMA foreign_keys = ON;")
         .map_err(|e| format!("enable foreign keys: {e}"))?;
 
-    let staged = import::stage_all(&options.library_root, &paths, options.linked);
+    let staged = import::stage_all(&options.library_root, &paths, options.policy);
     let mut report = ImportReport::default();
     let mut done: u64 = 0;
     let mut cancelled = false;
@@ -289,7 +291,7 @@ mod tests {
         let options = ImportOptions {
             db_path: root.path().join("library.db"),
             library_root: root.path().to_path_buf(),
-            linked: false,
+            policy: ImportPolicy::default(),
             source: ImportSource::Paths {
                 paths,
                 into_collection: None,
@@ -347,7 +349,7 @@ mod tests {
         let options = ImportOptions {
             db_path: root.path().join("library.db"),
             library_root: root.path().to_path_buf(),
-            linked: false,
+            policy: ImportPolicy::default(),
             source: ImportSource::Paths {
                 paths,
                 into_collection: None,

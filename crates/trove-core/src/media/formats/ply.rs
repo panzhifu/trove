@@ -1,422 +1,20 @@
-//! Geometry loading for 3D model previews.
+//! PLY (Polygon File Format) parser.
 //!
-//! Three text/binary formats are supported, all parsed in pure Rust on top
-//! of the raw file bytes: Wavefront OBJ, STL (ASCII and binary) and PLY
-//! (ASCII and binary little/big endian). Everything is normalised into one
-//! [`Mesh`] so the renderer never has to know where the triangles came from.
+//! Hand-written because no off-the-shelf crate handles every case trove needs:
 //!
-//! PLY also arrives as a *point cloud* — a scan or a photogrammetry export
-//! with no `face` element at all — which is why a [`Mesh`] may hold positions
-//! without triangles. OBJ and STL stay triangle-only: their stray vertices are
-//! a broken export rather than a cloud.
-//!
-//! A PLY may also carry a colour per vertex. Point clouds are where that
-//! matters (a scan without its colours is grey noise), so the point renderer
-//! uses them; a triangle mesh still shades from the material, because its GPU
-//! layout carries no colour attribute.
-//!
-//! Parsing is deliberately lenient: unknown lines, extra vertex properties
-//! and unsupported primitives are skipped rather than failing the load. Only
-//! a file that yields no usable vertex at all is an error.
+//! * **Point clouds** — a PLY with no `face` element is not an error; it is a
+//!   scan or photogrammetry export drawn vertex-by-vertex.
+//! * **Vertex colours** — `uchar` channels (0..=255) scale to 0..=1; `float`
+//!   channels are taken as-is. `diffuse_*` aliases from MeshLab /
+//!   CloudCompare are accepted.
+//! * **Parallel ASCII** — large bodies are cut at newline boundaries and the
+//!   chunks parsed on the rayon pool, then concatenated in file order.
+//! * **Leniency** — unknown elements, extra properties and list-bearing
+//!   vertex records are walked past; only a file with no usable vertex at
+//!   all fails.
 
-use std::path::Path;
+use super::types::Mesh;
 
-/// Axis-aligned bounds of a mesh.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct Bounds {
-    pub min: [f32; 3],
-    pub max: [f32; 3],
-}
-
-impl Bounds {
-    /// Bounds of an empty mesh.
-    fn empty() -> Self {
-        Self {
-            min: [f32::INFINITY; 3],
-            max: [f32::NEG_INFINITY; 3],
-        }
-    }
-
-    /// Whether any vertex was folded in.
-    pub fn is_empty(&self) -> bool {
-        self.min[0] > self.max[0]
-    }
-
-    fn extend(&mut self, p: [f32; 3]) {
-        for ((min, max), v) in self.min.iter_mut().zip(self.max.iter_mut()).zip(p) {
-            *min = (*min).min(v);
-            *max = (*max).max(v);
-        }
-    }
-
-    /// Size along each axis.
-    pub fn size(&self) -> [f32; 3] {
-        if self.is_empty() {
-            return [0.0; 3];
-        }
-        [
-            self.max[0] - self.min[0],
-            self.max[1] - self.min[1],
-            self.max[2] - self.min[2],
-        ]
-    }
-
-    /// Center of the box.
-    pub fn center(&self) -> [f32; 3] {
-        if self.is_empty() {
-            return [0.0; 3];
-        }
-        [
-            (self.min[0] + self.max[0]) * 0.5,
-            (self.min[1] + self.max[1]) * 0.5,
-            (self.min[2] + self.max[2]) * 0.5,
-        ]
-    }
-
-    /// Longest edge, used to frame the model in the viewport.
-    pub fn longest_edge(&self) -> f32 {
-        let size = self.size();
-        size[0].max(size[1]).max(size[2])
-    }
-}
-
-/// Usable geometry in model space: a triangle mesh, or a point cloud when the
-/// file carries no faces.
-#[derive(Debug, Clone, Default, PartialEq)]
-pub struct Mesh {
-    pub positions: Vec<[f32; 3]>,
-    /// Per-vertex normals; empty (or a different length than `positions`)
-    /// means the file carries none and the renderer shades per face.
-    pub normals: Vec<[f32; 3]>,
-    /// Per-vertex colour in 0..=1, empty when the file carries none. Read by
-    /// the point renderer; a triangle mesh shades from the material instead.
-    pub colors: Vec<[f32; 3]>,
-    /// Triangles; empty for a point cloud, which is drawn vertex by vertex.
-    pub triangles: Vec<[u32; 3]>,
-    pub bounds: Bounds,
-}
-
-impl Default for Bounds {
-    fn default() -> Self {
-        Self::empty()
-    }
-}
-
-impl Mesh {
-    /// Number of triangles.
-    pub fn triangle_count(&self) -> usize {
-        self.triangles.len()
-    }
-
-    /// Number of vertices.
-    pub fn vertex_count(&self) -> usize {
-        self.positions.len()
-    }
-
-    /// A cloud of points rather than a surface: there is nothing to
-    /// rasterise, so the renderers draw one sprite per vertex.
-    pub fn is_point_cloud(&self) -> bool {
-        self.triangles.is_empty() && !self.positions.is_empty()
-    }
-
-    /// What the frame-size heuristics count: triangles for a mesh, points for
-    /// a cloud. Both grow the work per frame, so they share one knob.
-    pub fn primitive_count(&self) -> usize {
-        if self.is_point_cloud() {
-            self.positions.len()
-        } else {
-            self.triangles.len()
-        }
-    }
-
-    /// Whether the model has usable per-vertex normals.
-    pub fn has_vertex_normals(&self) -> bool {
-        self.normals.len() == self.positions.len() && !self.normals.is_empty()
-    }
-
-    /// Whether the model has a usable colour per vertex.
-    pub fn has_vertex_colors(&self) -> bool {
-        self.colors.len() == self.positions.len() && !self.colors.is_empty()
-    }
-
-    /// Build a mesh from raw positions/triangles, dropping degenerate
-    /// triangles and recomputing the bounds. Returns `None` when nothing
-    /// usable is left.
-    pub(crate) fn finish(
-        positions: Vec<[f32; 3]>,
-        normals: Vec<[f32; 3]>,
-        colors: Vec<[f32; 3]>,
-        triangles: Vec<[u32; 3]>,
-    ) -> Option<Self> {
-        let mesh = Self::assemble(positions, normals, colors, triangles)?;
-        (!mesh.is_point_cloud()).then_some(mesh)
-    }
-
-    /// Build a point cloud: positions only, no triangles to filter.
-    pub(crate) fn finish_points(
-        positions: Vec<[f32; 3]>,
-        normals: Vec<[f32; 3]>,
-        colors: Vec<[f32; 3]>,
-    ) -> Option<Self> {
-        Self::assemble(positions, normals, colors, Vec::new())
-    }
-
-    /// Shared tail of both constructors: checks the vertices are usable,
-    /// drops degenerate triangles and computes the bounds.
-    fn assemble(
-        positions: Vec<[f32; 3]>,
-        normals: Vec<[f32; 3]>,
-        colors: Vec<[f32; 3]>,
-        triangles: Vec<[u32; 3]>,
-    ) -> Option<Self> {
-        if positions.is_empty() {
-            return None;
-        }
-        let count = positions.len() as u32;
-        let triangles: Vec<[u32; 3]> = triangles
-            .into_iter()
-            .filter(|t| t[0] < count && t[1] < count && t[2] < count)
-            .filter(|t| t[0] != t[1] && t[1] != t[2] && t[0] != t[2])
-            .collect();
-        let mut bounds = Bounds::empty();
-        for p in &positions {
-            bounds.extend(*p);
-        }
-        if bounds.is_empty() {
-            return None;
-        }
-        let normals = if normals.len() == positions.len() {
-            normals
-        } else {
-            Vec::new()
-        };
-        let colors = if colors.len() == positions.len() {
-            colors
-        } else {
-            Vec::new()
-        };
-        Some(Self {
-            positions,
-            normals,
-            colors,
-            triangles,
-            bounds,
-        })
-    }
-}
-
-/// Extensions this module can parse (lowercase, without the dot).
-pub const MODEL_EXTENSIONS: [&str; 3] = ["obj", "stl", "ply"];
-
-/// Whether `ext` (lowercase, without the dot) is a mesh format.
-pub fn is_model_ext(ext: &str) -> bool {
-    MODEL_EXTENSIONS.contains(&ext)
-}
-
-/// Ceiling on a model file read whole into memory: the parsed mesh costs a
-/// multiple of the file, so a stray multi-gigabyte export must fail fast
-/// instead of dragging the machine into swap.
-const MAX_MODEL_FILE_BYTES: u64 = 2 << 30;
-
-/// Load a mesh, dispatching on the file extension.
-pub fn load(path: &Path) -> Result<Mesh, String> {
-    load_capped(path, MAX_MODEL_FILE_BYTES)
-}
-
-/// [`load`] with an overridable size cap, so the limit itself can be tested.
-fn load_capped(path: &Path, limit: u64) -> Result<Mesh, String> {
-    let ext = path
-        .extension()
-        .and_then(|e| e.to_str())
-        .map(|e| e.to_ascii_lowercase())
-        .unwrap_or_default();
-    if !is_model_ext(&ext) {
-        return Err(format!("unsupported model format: .{ext}"));
-    }
-    let size = std::fs::metadata(path).map_err(|e| e.to_string())?.len();
-    if size > limit {
-        return Err(format!(
-            "the model file is larger than the {} GiB preview limit",
-            limit >> 30
-        ));
-    }
-    let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
-    match ext.as_str() {
-        "obj" => {
-            let text = String::from_utf8_lossy(&bytes);
-            load_obj(&text)
-        }
-        "stl" => load_stl(&bytes),
-        "ply" => load_ply(&bytes),
-        _ => Err(format!("unsupported model format: .{ext}")),
-    }
-}
-
-/// Parse a Wavefront OBJ. Faces are fan-triangulated, so quads and n-gons
-/// work; texture coordinates and materials are ignored.
-pub fn load_obj(text: &str) -> Result<Mesh, String> {
-    let mut positions: Vec<[f32; 3]> = Vec::new();
-    let mut normals: Vec<[f32; 3]> = Vec::new();
-    let mut triangles: Vec<[u32; 3]> = Vec::new();
-    // Per-face normal indices, resolved into per-vertex normals at the end.
-    let mut normal_ids: Vec<Vec<u32>> = Vec::new();
-
-    for line in text.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let mut parts = line.split_whitespace();
-        match parts.next() {
-            Some("v") => {
-                let values = parse_floats(parts.take(3));
-                if values.len() == 3 {
-                    positions.push([values[0], values[1], values[2]]);
-                }
-            }
-            Some("vn") => {
-                let values = parse_floats(parts.take(3));
-                if values.len() == 3 {
-                    normals.push([values[0], values[1], values[2]]);
-                }
-            }
-            Some("f") => {
-                let corners: Vec<(u32, u32)> = parts
-                    .map(|token| resolve_obj_corner(token, positions.len(), normals.len()))
-                    .collect();
-                if corners.len() < 3 {
-                    continue;
-                }
-                let ids: Vec<u32> = corners.iter().map(|(_, n)| *n).collect();
-                for i in 1..corners.len() - 1 {
-                    triangles.push([corners[0].0, corners[i].0, corners[i + 1].0]);
-                    normal_ids.push(vec![ids[0], ids[i], ids[i + 1]]);
-                }
-            }
-            _ => {}
-        }
-    }
-
-    // Expand per-face normal indices into per-vertex normals when every face
-    // carried one (otherwise the renderer shades flat).
-    let vertex_normals = if normal_ids.len() == triangles.len()
-        && normal_ids
-            .iter()
-            .all(|ids| ids.len() == 3 && ids.iter().all(|id| *id != u32::MAX))
-        && !normals.is_empty()
-    {
-        let mut out = vec![[0.0f32; 3]; positions.len()];
-        let mut seen = vec![false; positions.len()];
-        for (tri, ids) in triangles.iter().zip(normal_ids.iter()) {
-            for (slot, id) in tri.iter().zip(ids.iter()) {
-                let idx = *slot as usize;
-                if !seen[idx] {
-                    out[idx] = normals[*id as usize];
-                    seen[idx] = true;
-                }
-            }
-        }
-        out
-    } else {
-        Vec::new()
-    };
-
-    Mesh::finish(positions, vertex_normals, Vec::new(), triangles)
-        .ok_or_else(|| "the OBJ file contains no triangles".to_string())
-}
-
-/// Resolve one `f` corner (`v`, `v/vt`, `v//vn` or `v/vt/vn`) into a
-/// (position, normal) index pair; OBJ indices are 1-based and may be
-/// negative (relative to the end). `u32::MAX` marks "no normal".
-fn resolve_obj_corner(token: &str, position_count: usize, normal_count: usize) -> (u32, u32) {
-    let mut fields = token.split('/');
-    let v = fields.next().unwrap_or("");
-    let _tex = fields.next();
-    let n = fields.next();
-    let resolve = |raw: &str, count: usize| -> Option<u32> {
-        let value: i64 = raw.parse().ok()?;
-        let index = if value < 0 {
-            count as i64 + value
-        } else {
-            value - 1
-        };
-        (index >= 0 && (index as usize) < count).then_some(index as u32)
-    };
-    let position = resolve(v, position_count).unwrap_or(0);
-    let normal = n.and_then(|n| resolve(n, normal_count)).unwrap_or(u32::MAX);
-    (position, normal)
-}
-
-/// Parse an STL file, detecting the ASCII and binary layouts.
-pub fn load_stl(bytes: &[u8]) -> Result<Mesh, String> {
-    if let Some(count) = binary_stl_triangle_count(bytes) {
-        return load_stl_binary(bytes, count);
-    }
-    let text = String::from_utf8_lossy(bytes);
-    if text.trim_start().to_ascii_lowercase().starts_with("solid") {
-        return load_stl_ascii(&text);
-    }
-    Err("not a readable STL file".into())
-}
-
-/// Triangle count of a binary STL, or `None` when the size does not match
-/// the fixed 84-byte header + 50-byte triangle layout.
-fn binary_stl_triangle_count(bytes: &[u8]) -> Option<usize> {
-    if bytes.len() < 84 {
-        return None;
-    }
-    let declared = u32::from_le_bytes([bytes[80], bytes[81], bytes[82], bytes[83]]) as usize;
-    let expected = 84usize.checked_add(declared.checked_mul(50)?)?;
-    (expected == bytes.len()).then_some(declared)
-}
-
-/// Parse the fixed binary STL layout: 80-byte header, `u32` count, then
-/// 12 `f32` (facet normal + three vertices) and a `u16` attribute per face.
-fn load_stl_binary(bytes: &[u8], count: usize) -> Result<Mesh, String> {
-    let mut positions = Vec::with_capacity(count * 3);
-    let mut triangles = Vec::with_capacity(count);
-    for i in 0..count {
-        let base = 84 + i * 50 + 12; // skip the facet normal
-        for corner in 0..3 {
-            let offset = base + corner * 12;
-            positions.push([
-                f32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap()),
-                f32::from_le_bytes(bytes[offset + 4..offset + 8].try_into().unwrap()),
-                f32::from_le_bytes(bytes[offset + 8..offset + 12].try_into().unwrap()),
-            ]);
-        }
-        let first = (i * 3) as u32;
-        triangles.push([first, first + 1, first + 2]);
-    }
-    Mesh::finish(positions, Vec::new(), Vec::new(), triangles)
-        .ok_or_else(|| "the STL file contains no triangles".to_string())
-}
-
-/// Parse the ASCII STL layout: three `vertex x y z` lines per `facet normal`.
-pub fn load_stl_ascii(text: &str) -> Result<Mesh, String> {
-    let mut positions = Vec::new();
-    let mut triangles = Vec::new();
-    let mut pending: Vec<[f32; 3]> = Vec::new();
-    for line in text.lines() {
-        let mut parts = line.split_whitespace();
-        if !matches!(parts.next(), Some("vertex") | Some("Vertex")) {
-            continue;
-        }
-        let values = parse_floats(parts.take(3));
-        if values.len() == 3 {
-            pending.push([values[0], values[1], values[2]]);
-            if pending.len() == 3 {
-                let first = positions.len() as u32;
-                positions.append(&mut pending);
-                triangles.push([first, first + 1, first + 2]);
-            }
-        }
-    }
-    Mesh::finish(positions, Vec::new(), Vec::new(), triangles)
-        .ok_or_else(|| "the STL file contains no triangles".to_string())
-}
-
-/// One PLY property declaration.
 pub(crate) struct PlyProperty {
     pub(crate) name: String,
     /// Scalar type, or the item type of a list.
@@ -553,14 +151,42 @@ pub(crate) fn is_indices(name: &str) -> bool {
     name == "vertex_indices" || name == "vertex_index"
 }
 
-/// Parse a PLY file (ASCII or binary, either endianness): reads the header,
-/// resolves the interesting properties to column indices once, then pulls
-/// the vertex element and the face index lists straight into typed arrays —
-/// binary vertex rows through their fixed stride, ASCII lines in parallel
-/// chunks. A file with no `face` element becomes a point cloud.
-pub fn load_ply(bytes: &[u8]) -> Result<Mesh, String> {
-    let header_end = find_ply_header_end(bytes).ok_or("not a PLY file")?;
-    let header = String::from_utf8_lossy(&bytes[..header_end]);
+/// Byte width of one record of a fixed-size element: the sum of its property
+/// widths. `None` when any property is a list, which makes the rows
+/// variable-width and has to be walked instead of strided.
+pub(crate) fn fixed_row_stride(properties: &[PlyProperty]) -> Option<usize> {
+    properties.iter().try_fold(0usize, |total, property| {
+        property
+            .count_ty
+            .is_none()
+            .then(|| total + property.ty.width())
+    })
+}
+
+/// Byte offset of every property inside one fixed-size record; the entry for
+/// a list property is meaningless and is only produced after
+/// [`fixed_row_stride`] has agreed the element has none.
+pub(crate) fn property_offsets(properties: &[PlyProperty]) -> Vec<usize> {
+    let mut offsets = Vec::with_capacity(properties.len());
+    let mut at = 0;
+    for property in properties {
+        offsets.push(at);
+        at += property.ty.width();
+    }
+    offsets
+}
+
+/// Parse the textual part of a PLY header: the byte order and the element
+/// blocks, each with its properties resolved to types and column indices.
+///
+/// Shared by the whole-file loader and the streaming point reader so the two
+/// cannot disagree about what a record contains or where a channel sits.
+/// A `face` element — the tag that separates a surface from a cloud — is
+/// reported like any other; it is up to the caller to decide what to do
+/// with it.
+pub(crate) fn parse_ply_header(
+    header: &str,
+) -> Result<(Option<PlyEndian>, Vec<PlyElement>), String> {
     let mut lines = header.lines().map(str::trim);
     if lines.next().map(|l| l.to_ascii_lowercase()) != Some("ply".to_string()) {
         return Err("not a PLY file".into());
@@ -615,6 +241,18 @@ pub fn load_ply(bytes: &[u8]) -> Result<Mesh, String> {
         "binary_big_endian" => Some(PlyEndian::Big),
         other => return Err(format!("unsupported PLY format: {other}")),
     };
+    Ok((endian, elements))
+}
+
+/// Parse a PLY file (ASCII or binary, either endianness): reads the header,
+/// resolves the interesting properties to column indices once, then pulls
+/// the vertex element and the face index lists straight into typed arrays —
+/// binary vertex rows through their fixed stride, ASCII lines in parallel
+/// chunks. A file with no `face` element becomes a point cloud.
+pub fn load_ply(bytes: &[u8]) -> Result<Mesh, String> {
+    let header_end = find_ply_header_end(bytes).ok_or("not a PLY file")?;
+    let header = String::from_utf8_lossy(&bytes[..header_end]);
+    let (endian, elements) = parse_ply_header(&header)?;
 
     let body = &bytes[header_end..];
     let parsed = match endian {
@@ -1274,112 +912,9 @@ pub(crate) fn find_ply_header_end(bytes: &[u8]) -> Option<usize> {
     None
 }
 
-/// Parse up to three floats, stopping at the first unparsable token.
-fn parse_floats<'a>(tokens: impl Iterator<Item = &'a str>) -> Vec<f32> {
-    tokens
-        .map(|t| t.trim().parse::<f32>())
-        .take_while(|r| r.is_ok())
-        .filter_map(Result::ok)
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    const CUBE_OBJ: &str = "\
-# a unit cube
-v 0 0 0
-v 1 0 0
-v 1 1 0
-v 0 1 0
-v 0 0 1
-v 1 0 1
-v 1 1 1
-v 0 1 1
-vn 0 0 1
-f 1/1/1 2/1/1 3/1/1 4/1/1
-f 5 6 7 8
-";
-
-    #[test]
-    fn obj_quads_are_fan_triangulated() {
-        let mesh = load_obj(CUBE_OBJ).expect("cube parses");
-        assert_eq!(mesh.vertex_count(), 8);
-        assert_eq!(mesh.triangle_count(), 4);
-        assert_eq!(mesh.bounds.min, [0.0, 0.0, 0.0]);
-        assert_eq!(mesh.bounds.max, [1.0, 1.0, 1.0]);
-        assert_eq!(mesh.bounds.longest_edge(), 1.0);
-        assert_eq!(mesh.bounds.center(), [0.5, 0.5, 0.5]);
-        // The first face carried a normal, the second did not, so the mesh
-        // is shaded flat.
-        assert!(!mesh.has_vertex_normals());
-    }
-
-    #[test]
-    fn obj_negative_indices_and_full_normals() {
-        let obj = "\
-v 0 0 0
-v 1 0 0
-v 0 1 0
-vn 0 0 1
-f -3//1 -2//1 -1//1
-";
-        let mesh = load_obj(obj).expect("triangle parses");
-        assert_eq!(mesh.triangle_count(), 1);
-        assert_eq!(mesh.triangles[0], [0, 1, 2]);
-        assert!(mesh.has_vertex_normals());
-    }
-
-    #[test]
-    fn obj_without_geometry_is_an_error() {
-        assert!(load_obj("# nothing here\nv 0 0 0\n").is_err());
-    }
-
-    #[test]
-    fn ascii_stl_reads_vertices() {
-        let stl = "\
-solid test
-  facet normal 0 0 1
-    outer loop
-      vertex 0 0 0
-      vertex 1 0 0
-      vertex 0 1 0
-    endloop
-  endfacet
-endsolid test
-";
-        let mesh = load_stl(stl.as_bytes()).expect("ascii stl parses");
-        assert_eq!(mesh.triangle_count(), 1);
-        assert_eq!(mesh.bounds.max, [1.0, 1.0, 0.0]);
-        assert!(!mesh.has_vertex_normals());
-    }
-
-    /// Build a one-triangle binary STL the way exporters write it.
-    fn binary_stl(triangle: [[f32; 3]; 3]) -> Vec<u8> {
-        let mut out = vec![0u8; 80];
-        out[..6].copy_from_slice(b"binary");
-        out.extend_from_slice(&1u32.to_le_bytes());
-        for _ in 0..3 {
-            out.extend_from_slice(&0f32.to_le_bytes()); // facet normal
-        }
-        for vertex in triangle {
-            for value in vertex {
-                out.extend_from_slice(&value.to_le_bytes());
-            }
-        }
-        out.extend_from_slice(&0u16.to_le_bytes()); // attribute byte count
-        out
-    }
-
-    #[test]
-    fn binary_stl_is_detected_by_its_size() {
-        let bytes = binary_stl([[0.0, 0.0, 0.0], [2.0, 0.0, 0.0], [0.0, 3.0, 0.0]]);
-        assert_eq!(bytes.len(), 134);
-        let mesh = load_stl(&bytes).expect("binary stl parses");
-        assert_eq!(mesh.triangle_count(), 1);
-        assert_eq!(mesh.bounds.max, [2.0, 3.0, 0.0]);
-    }
 
     #[test]
     fn ascii_ply_reads_vertices_and_faces() {
@@ -1472,7 +1007,6 @@ end_header
         let mesh = load_ply(ply.as_bytes()).expect("a cloud is not an error");
         assert_eq!(mesh.vertex_count(), 3);
         assert!(mesh.is_point_cloud());
-        // A cloud counts its points where a mesh counts triangles.
         assert_eq!(mesh.primitive_count(), 3);
         assert_eq!(mesh.bounds.min, [-1.0, 0.0, 0.0]);
         assert_eq!(mesh.bounds.max, [1.0, 2.0, 3.0]);
@@ -1638,17 +1172,7 @@ end_header
         let mesh = load_ply(ply.as_bytes()).expect("a coloured mesh parses");
         assert!(!mesh.is_point_cloud());
         assert_eq!(mesh.triangles.len(), 1);
-        // Read anyway, so a later consumer need not reparse, but the triangle
-        // renderer ignores them.
         assert!(mesh.has_vertex_colors());
-    }
-
-    /// OBJ and STL do not get the cloud treatment: a stray vertex there is a
-    /// broken export, which `obj_without_geometry_is_an_error` pins down.
-    #[test]
-    fn model_extensions_are_recognised() {
-        assert!(is_model_ext("obj") && is_model_ext("stl") && is_model_ext("ply"));
-        assert!(!is_model_ext("png"));
     }
 
     /// Big-endian binary: the byte order declared in the header travels
@@ -1722,17 +1246,6 @@ end_header
         let mut bytes = header.as_bytes().to_vec();
         bytes.extend_from_slice(&0f32.to_le_bytes());
         assert!(load_ply(&bytes).is_err());
-    }
-
-    /// The size cap in `load`: a file past the limit is refused before it
-    /// is read, without needing a multi-gigabyte fixture.
-    #[test]
-    fn oversized_model_files_are_refused() {
-        let path = std::env::temp_dir().join("trove-ply-cap-test.ply");
-        std::fs::write(&path, b"ply\nformat ascii 1.0\nend_header\n").unwrap();
-        let err = load_capped(&path, 4).expect_err("a file over the cap is refused");
-        std::fs::remove_file(&path).ok();
-        assert!(err.contains("larger than"));
     }
 
     /// Faces arrive as polygons: a quad fan-triangulates into two triangles.

@@ -64,7 +64,7 @@ pub fn probe(ext: &str) -> Probe {
         "ttf" | "otf" | "ttc" | "woff" | "woff2" => AssetKind::Font,
         // Only the formats the mesh parser actually reads; other 3D extensions
         // stay `Other` rather than promising a preview we cannot render.
-        ext if crate::media::mesh::is_model_ext(ext) => AssetKind::Model,
+        ext if crate::media::formats::is_model_ext(ext) => AssetKind::Model,
         _ => AssetKind::Other,
     };
     let mime = match ext {
@@ -127,6 +127,8 @@ pub fn probe(ext: &str) -> Probe {
         "obj" => "model/obj",
         "stl" => "model/stl",
         "ply" => "model/ply",
+        "gltf" => "model/gltf+json",
+        "glb" => "model/gltf-binary",
         _ => "application/octet-stream",
     }
     .to_string();
@@ -308,14 +310,14 @@ mod tests {
 
     #[test]
     fn model_extensions_map_to_model_kind() {
-        for ext in ["obj", "stl", "ply", "OBJ", "Stl"] {
+        for ext in ["obj", "stl", "ply", "gltf", "glb", "OBJ", "Stl"] {
             let p = probe(&normalize_ext(ext));
             assert_eq!(p.kind, AssetKind::Model, "{ext}");
             assert!(p.mime.starts_with("model/"), "{ext} mime {}", p.mime);
         }
         // Formats we cannot parse stay unclassified rather than half-supported.
         assert_eq!(probe("fbx").kind, AssetKind::Other);
-        assert_eq!(probe("gltf").kind, AssetKind::Other);
+        assert_eq!(probe("dae").kind, AssetKind::Other);
     }
 
     #[test]

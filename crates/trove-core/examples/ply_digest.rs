@@ -8,7 +8,7 @@
 
 use std::path::PathBuf;
 
-use trove_core::media::mesh::load_ply;
+use trove_core::media::formats::load_ply;
 
 fn main() {
     let mut args = std::env::args().skip(1);

@@ -182,11 +182,11 @@ pub fn import_paths_app_into(
         let total = expanded.len();
         let library_root = ctl.library.root().to_path_buf();
         // The import mode (copy vs link) is read at call time from the config.
-        let linked = trove_core::config::AppConfig::load().import_linked();
+        let policy = trove_core::config::AppConfig::load().import_policy();
         let options = ImportOptions {
             db_path: library_root.join("library.db"),
             library_root,
-            linked,
+            policy,
             source: ImportSource::Paths {
                 paths: expanded,
                 into_collection,
@@ -256,7 +256,9 @@ pub fn collect_inbox_app(
         let options = ImportOptions {
             db_path: library_root.join("library.db"),
             library_root,
-            linked: false,
+            // Collected files are already inside the library's own inbox, so
+            // there is nothing to copy and nothing to link.
+            policy: trove_core::media::import::ImportPolicy::default(),
             source: ImportSource::CollectInbox { items },
         };
         (ctl.library.tasks().clone(), options)
