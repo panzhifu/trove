@@ -22,10 +22,15 @@
 //! shading across the surface: the model reads as a solid object turning,
 //! rather than a silhouette under a headlight.
 
-use super::mesh::{Bounds, Mesh};
+use super::formats::point_cloud::Frustum;
+use super::formats::types::{Bounds, Mesh};
 
 /// Vertical field of view used to frame a model, in degrees.
-const FOV_DEG: f32 = 35.0;
+pub const FOV_DEG: f32 = 35.0;
+/// Weight of the eye-dome lighting term, shared with the GPU post pass so a
+/// cloud lit on either renderer looks the same. Low enough that a flat surface
+/// stays flat, high enough that a fold in a scan is obvious.
+pub const EDL_STRENGTH: f32 = 1.6;
 /// Extra room left around the model when it is framed.
 const FIT_MARGIN: f32 = 1.12;
 /// Pitch stops just short of the poles, where the view basis degenerates.
@@ -69,6 +74,12 @@ pub struct Camera {
     pub pitch: f32,
     /// Distance multiplier; 1.0 frames the whole model.
     pub zoom: f32,
+    /// Pivot offset across the view, in bounding-sphere radii: `x` along the
+    /// view's right axis, `y` along its up axis. The eye travels with the
+    /// pivot, so orbiting after a pan still turns around what the user is
+    /// looking at — the difference between panning a view and sliding a
+    /// picture inside a fixed one.
+    pub pan: [f32; 2],
 }
 
 impl Default for Camera {
@@ -78,6 +89,7 @@ impl Default for Camera {
             yaw: 0.62,
             pitch: 0.34,
             zoom: 1.0,
+            pan: [0.0, 0.0],
         }
     }
 }
@@ -92,6 +104,24 @@ impl Camera {
     /// Scale the distance; a factor below 1 moves closer.
     pub fn zoom_by(&mut self, factor: f32) {
         self.zoom = (self.zoom * factor).clamp(MIN_ZOOM, MAX_ZOOM);
+    }
+
+    /// Slide the pivot by a delta across the view, in bounding-sphere radii:
+    /// positive `x` right, positive `y` up.
+    pub fn pan_by(&mut self, delta: [f32; 2]) {
+        self.pan = [self.pan[0] + delta[0], self.pan[1] + delta[1]];
+    }
+
+    /// How much of the view one pixel of drag covers at the pivot, in
+    /// bounding-sphere radii.
+    ///
+    /// Measured where the model is, so a panned or zoomed view moves the same
+    /// distance under the cursor as the pixels the cursor travelled — the
+    /// property that makes dragging feel like grabbing the model.
+    pub fn pan_per_pixel(&self, viewport_height: f32) -> f32 {
+        let distance = fit_distance() * self.zoom;
+        let tan_half = (FOV_DEG.to_radians() * 0.5).tan();
+        2.0 * distance * tan_half / viewport_height.max(1.0)
     }
 
     /// Back to the default three-quarter view.
@@ -158,35 +188,122 @@ pub fn render(
     supersample: u32,
     quality: f32,
 ) -> Frame {
+    render_with_scratch(
+        mesh,
+        camera,
+        width,
+        height,
+        supersample,
+        quality,
+        RenderOptions::default(),
+        &mut Scratch::default(),
+    )
+}
+
+/// Scratch buffers a rasteriser needs, kept between frames.
+///
+/// A frame is `width × height × 16` bytes of colour and depth plus one
+/// position pair per vertex — on a 1 MP preview and a million-vertex mesh
+/// that is over 50 MB of allocation per frame, for buffers whose size never
+/// changes while the viewport does. Holding them makes an interactive drag
+/// pay for pixels instead of for the allocator.
+#[derive(Debug, Default, Clone)]
+pub struct Scratch {
+    colors: Vec<[f32; 3]>,
+    depth: Vec<f32>,
+    /// Model-space and view-space positions of every vertex, one pass each.
+    model: Vec<[f32; 3]>,
+    view: Vec<[f32; 3]>,
+    /// Per-pixel `-log2(depth)`, which is what eye-dome lighting compares.
+    log_depth: Vec<f32>,
+}
+
+impl Scratch {
+    /// Bytes currently held, for the viewport's own accounting and tests.
+    pub fn bytes(&self) -> usize {
+        self.colors.len() * std::mem::size_of::<[f32; 3]>()
+            + self.depth.len() * std::mem::size_of::<f32>()
+            + (self.model.len() + self.view.len()) * std::mem::size_of::<[f32; 3]>()
+            + self.log_depth.len() * std::mem::size_of::<f32>()
+    }
+}
+
+/// Optional work the rasteriser can do on top of a raw frame.
+///
+/// Both default to off, so [`render`] — and every caller that did not ask —
+/// keeps producing exactly the frame it always did.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RenderOptions {
+    /// Skip the back faces of a closed, outward-wound mesh.
+    ///
+    /// Safe only for a mesh whose [`Mesh::winding`] says so: on an open shell
+    /// the back face is the surface you see from the other side, and skipping
+    /// it would punch a hole in the model.
+    pub cull_backfaces: bool,
+    /// Eye-dome lighting and gap filling for point clouds.
+    ///
+    /// A cloud is drawn as discs of a couple of pixels; without this, sparse
+    /// regions read as dust and the shape of the surface inside is hard to
+    /// see. Eye-dome lighting darkens where the cloud turns away from the
+    /// camera, which is what makes the form legible; gap filling closes the
+    /// single-pixel holes between neighbouring discs.
+    pub enhance_points: bool,
+}
+
+/// [`render`], reusing the caller's buffers. The interactive path goes through
+/// this one.
+///
+/// The frame size, the two quality knobs, the options and the scratch buffers
+/// are independent of one another, and bundling them would only move the list
+/// somewhere else — the viewport already groups callers by frame kind.
+#[allow(clippy::too_many_arguments)]
+pub fn render_with_scratch(
+    mesh: &Mesh,
+    camera: &Camera,
+    width: u32,
+    height: u32,
+    supersample: u32,
+    quality: f32,
+    options: RenderOptions,
+    scratch: &mut Scratch,
+) -> Frame {
     let width = clamp_edge(width);
     let height = clamp_edge(height);
     let ss = supersample.clamp(1, MAX_SUPERSAMPLE);
     let quality = quality.clamp(0.05, 1.0);
     // Sprites are sized in final-image pixels, so the supersampled buffer
     // needs them scaled up or a cloud would come out thinner after the filter.
-    let colors = paint(
+    paint(
         mesh,
         camera,
         width * ss,
         height * ss,
         POINT_RADIUS * ss as f32,
         quality,
+        options,
+        scratch,
     );
-    let colors = if ss > 1 {
-        downsample(
-            &colors,
+    if options.enhance_points && mesh.is_point_cloud() {
+        // At the supersampled resolution, before the box filter: the lighting
+        // then survives the downsample instead of being averaged away.
+        enhance_points(scratch, (width * ss) as usize, (height * ss) as usize);
+    }
+    let bgra = if ss > 1 {
+        let down = downsample(
+            &scratch.colors,
             (width * ss) as usize,
             (height * ss) as usize,
             width as usize,
             height as usize,
-        )
+        );
+        to_bgra(&down)
     } else {
-        colors
+        to_bgra(&scratch.colors)
     };
     Frame {
         width,
         height,
-        bgra: to_bgra(&colors),
+        bgra,
     }
 }
 
@@ -213,7 +330,8 @@ pub fn auto_size(primitives: usize, max_edge: u32) -> u32 {
 /// framed identically whichever backend drew it.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Framing {
-    /// Centre of the model's bounding sphere, in file coordinates.
+    /// The point the camera looks at, in file coordinates: the model's
+    /// bounding-sphere centre, moved by the camera's pan.
     pub center: [f32; 3],
     /// Reciprocal of the bounding-sphere radius: model space → unit sphere.
     pub inv_radius: f32,
@@ -316,6 +434,24 @@ impl Framing {
             [x[3], y[3], z[3], w[3]],
         ]
     }
+
+    /// This camera's frustum in **model space**, for culling geometry before
+    /// it is loaded or drawn.
+    ///
+    /// The extraction reads the matrix by rows and [`Framing::view_projection`]
+    /// hands it over by columns, so the transpose happens here rather than in
+    /// every caller: getting that backwards produces a plausible-looking
+    /// frustum that culls the wrong half of the model.
+    pub fn frustum(&self) -> Frustum {
+        let columns = self.view_projection();
+        let mut rows = [[0.0f32; 4]; 4];
+        for (column, values) in columns.iter().enumerate() {
+            for (row, value) in values.iter().enumerate() {
+                rows[row][column] = *value;
+            }
+        }
+        Frustum::from_matrix(&rows)
+    }
 }
 
 impl Camera {
@@ -332,8 +468,18 @@ impl Camera {
         let forward = neg(to_eye);
         let right = normalize(cross(forward, [0.0, 1.0, 0.0]));
         let up = cross(right, forward);
-        Framing {
+        // Panning moves the pivot and the eye together, so the model slides
+        // across the viewport and a later orbit still turns around whatever
+        // the user panned to.
+        let pivot = add(
             center,
+            add(
+                scale(right, self.pan[0] * radius),
+                scale(up, self.pan[1] * radius),
+            ),
+        );
+        Framing {
+            center: pivot,
             inv_radius: 1.0 / radius,
             eye: scale(to_eye, distance),
             right,
@@ -408,16 +554,35 @@ pub fn u32_bytes(values: &[u32]) -> Vec<u8> {
 /// expanded triangle by triangle with the face normal repeated on all three
 /// corners, which reproduces the CPU rasterizer's flat shading.
 pub fn vertex_data(mesh: &Mesh) -> VertexData {
+    vertex_data_with(mesh, false)
+}
+
+/// [`vertex_data`], optionally reversing every triangle's winding.
+///
+/// A closed mesh wound inside-out is easiest to fix here, on the way into the
+/// buffer, rather than by cloning the geometry: reversing the corner order
+/// both points the index list the right way and, on the flat-shaded path,
+/// flips the face normal that is computed from it. That lets the renderer
+/// cull back faces of a correctly wound surface whichever way the file
+/// spelled it.
+pub fn vertex_data_with(mesh: &Mesh, flip_winding: bool) -> VertexData {
     let mut vertices = Vec::new();
     if mesh.has_vertex_normals() {
         vertices.reserve(mesh.positions.len() * 6);
         for (p, n) in mesh.positions.iter().zip(mesh.normals.iter()) {
-            let n = normalize(*n);
+            // A flipped winding means the file's normals point the other way
+            // too, or the shading would disagree with the culling.
+            let n = if flip_winding { neg(*n) } else { *n };
+            let n = normalize(n);
             vertices.extend_from_slice(&[p[0], p[1], p[2], n[0], n[1], n[2]]);
         }
         let mut indices = Vec::with_capacity(mesh.triangles.len() * 3);
         for triangle in &mesh.triangles {
-            indices.extend_from_slice(triangle);
+            if flip_winding {
+                indices.extend_from_slice(&[triangle[0], triangle[2], triangle[1]]);
+            } else {
+                indices.extend_from_slice(triangle);
+            }
         }
         VertexData {
             vertices,
@@ -427,11 +592,19 @@ pub fn vertex_data(mesh: &Mesh) -> VertexData {
     } else {
         vertices.reserve(mesh.triangles.len() * 18);
         for triangle in &mesh.triangles {
-            let corners = [
-                mesh.positions[triangle[0] as usize],
-                mesh.positions[triangle[1] as usize],
-                mesh.positions[triangle[2] as usize],
-            ];
+            let corners = if flip_winding {
+                [
+                    mesh.positions[triangle[0] as usize],
+                    mesh.positions[triangle[2] as usize],
+                    mesh.positions[triangle[1] as usize],
+                ]
+            } else {
+                [
+                    mesh.positions[triangle[0] as usize],
+                    mesh.positions[triangle[1] as usize],
+                    mesh.positions[triangle[2] as usize],
+                ]
+            };
             let n = normalize(cross(
                 sub(corners[1], corners[0]),
                 sub(corners[2], corners[0]),
@@ -500,7 +673,11 @@ fn fit_distance() -> f32 {
     FIT_MARGIN / (FOV_DEG.to_radians() * 0.5).sin()
 }
 
-/// Rasterise into a linear colour buffer, background included.
+/// Rasterise into the scratch buffers, background included.
+///
+/// The buffers are resized in place: a frame that matches the last one pays
+/// for clearing, not for allocating.
+#[allow(clippy::too_many_arguments)]
 fn paint(
     mesh: &Mesh,
     camera: &Camera,
@@ -508,47 +685,53 @@ fn paint(
     height: u32,
     point_radius: f32,
     quality: f32,
-) -> Vec<[f32; 3]> {
+    options: RenderOptions,
+    scratch: &mut Scratch,
+) {
     let w = width as usize;
     let h = height as usize;
-    let mut colors = Vec::with_capacity(w * h);
-    for y in 0..h {
-        for x in 0..w {
-            colors.push(background(x, y, w, h));
-        }
-    }
+    let Scratch {
+        colors,
+        depth,
+        model,
+        view,
+        ..
+    } = scratch;
+    colors.clear();
+    colors.extend((0..h).flat_map(|y| (0..w).map(move |x| background(x, y, w, h))));
     let longest = mesh.bounds.longest_edge();
-    if !longest.is_finite() {
-        return colors;
-    }
-    if longest <= 0.0 && !mesh.is_point_cloud() {
-        return colors;
+    let drawable = longest.is_finite() && (longest > 0.0 || mesh.is_point_cloud());
+    if !drawable {
+        return;
     }
 
     // Normalise into a unit bounding sphere so the camera maths never depends
     // on the file's real units.
     let framing = camera.framing(mesh.bounds, w as f32 / h as f32);
-    let mut depth = vec![0f32; w * h];
+    depth.clear();
+    depth.resize(w * h, 0.0);
 
     if mesh.is_point_cloud() {
         let mut target = Target {
-            colors: &mut colors,
-            depth: &mut depth,
+            colors,
+            depth,
             width: w,
             height: h,
             framing,
         };
         paint_points(&mut target, mesh, point_radius, quality);
-        return colors;
+        return;
     }
     if mesh.triangles.is_empty() {
-        return colors;
+        return;
     }
 
     // Model-space positions drive the shading, view-space positions the
     // rasterizer; both come out of a single pass over the vertices.
-    let mut model = Vec::with_capacity(mesh.positions.len());
-    let mut view = Vec::with_capacity(mesh.positions.len());
+    model.clear();
+    view.clear();
+    model.reserve(mesh.positions.len());
+    view.reserve(mesh.positions.len());
     for p in &mesh.positions {
         model.push(framing.to_unit(*p));
         view.push(framing.to_view(*p));
@@ -562,8 +745,8 @@ fn paint(
 
     {
         let mut target = Target {
-            colors: &mut colors,
-            depth: &mut depth,
+            colors,
+            depth,
             width: w,
             height: h,
             framing,
@@ -592,11 +775,16 @@ fn paint(
             let centroid = scale(add(add(p0, p1), p2), 1.0 / 3.0);
             let to_camera = normalize(sub(eye, centroid));
             // Two-sided: an open shell should not have invisible back faces.
-            let shaded_face = if dot(face, to_camera) < 0.0 {
-                neg(face)
-            } else {
-                face
-            };
+            // A closed, outward-wound surface hides its own back faces, so
+            // they can be skipped before rasterising instead of shaded and
+            // depth-tested: half the triangles, for the same picture. An open
+            // shell keeps both faces — its back face is what you see from
+            // behind.
+            let facing_away = dot(face, to_camera) < 0.0;
+            if options.cull_backfaces && facing_away {
+                continue;
+            }
+            let shaded_face = if facing_away { neg(face) } else { face };
             let half = normalize(add(light, to_camera));
             let spec = SPECULAR * dot(shaded_face, half).max(0.0).powf(SHININESS);
 
@@ -627,8 +815,6 @@ fn paint(
             }
         }
     }
-
-    colors
 }
 
 /// The colour to paint one vertex with: the file's own when it carries one,
@@ -869,6 +1055,185 @@ fn clip_near(triangle: [Vertex; 3], near: f32, out: &mut [Vertex; 4]) -> usize {
     count
 }
 
+/// Eye-dome lighting and gap filling for a rendered point cloud, in place.
+///
+/// Both come from the same idea, and both are what Nimbus's `EDL` and
+/// `ComposeImage` compute passes do on the GPU: the frame is not a picture of a
+/// surface but a scatter of discs, and the shape inside it only becomes
+/// legible once the scatter is closed up and shaded by how the cloud turns away
+/// from the eye.
+///
+/// Pass one builds `-log2(depth)` per pixel. Eye-dome lighting compares the
+/// *ratio* of two depths, and taking the logarithm once turns that comparison
+/// into a subtraction, which is what makes the second pass cheap enough to run
+/// over every pixel.
+///
+/// Pass two darkens a pixel by how much nearer its four orthogonal neighbours
+/// are: `exp(-mean(max(0, l - l_neighbour)) * strength)`. A crease, a
+/// silhouette or a surface turning away goes dark; a surface facing the camera
+/// stays bright. That is the whole illusion — a cloud rendered flat reads as
+/// dust, and the same cloud with eye-dome lighting reads as a surface.
+///
+/// Pass three fills the pixels nothing drew, from the colours around them, and
+/// only where the neighbourhood supports it: filling next to a silhouette
+/// would grow the model outwards into the background by a pixel.
+fn enhance_points(scratch: &mut Scratch, width: usize, height: usize) {
+    /// Radius searched for colour when filling a gap. Nimbus keeps this
+    /// adjustable in the UI and defaults to one pixel.
+    const FILL_RADIUS: usize = 1;
+
+    let pixels = width * height;
+    if pixels == 0 || scratch.colors.len() < pixels || scratch.depth.len() < pixels {
+        return;
+    }
+    let drawn = |depth: &f32| *depth > 0.0;
+
+    // Pass one: the log-depth image, with 0.0 marking "nothing here" — the
+    // same sentinel the depth buffer itself uses.
+    scratch.log_depth.clear();
+    scratch.log_depth.reserve(pixels);
+    for depth in &scratch.depth[..pixels] {
+        // `depth` is `1/z`, so a larger value is a nearer pixel and
+        // `-log2(depth)` grows with distance; subtracting two of them gives
+        // the log of the ratio of their distances, in the right order.
+        scratch
+            .log_depth
+            .push(if drawn(depth) { -depth.log2() } else { 0.0 });
+    }
+
+    // Pass two: eye-dome lighting, over the pixels that drew something. It
+    // only ever darkens, so the background and the unlit pixels are untouched.
+    {
+        let Scratch {
+            colors,
+            depth,
+            log_depth,
+            ..
+        } = scratch;
+        for y in 0..height {
+            for x in 0..width {
+                let index = y * width + x;
+                if !drawn(&depth[index]) {
+                    continue;
+                }
+                let center = log_depth[index];
+                let mut sum = 0.0;
+                let mut count = 0.0;
+                let mut neighbour = |nx: usize, ny: usize| {
+                    let value = log_depth[ny * width + nx];
+                    if drawn(&depth[ny * width + nx]) {
+                        sum += (center - value).max(0.0);
+                        count += 1.0;
+                    }
+                };
+                if x > 0 {
+                    neighbour(x - 1, y);
+                }
+                if x + 1 < width {
+                    neighbour(x + 1, y);
+                }
+                if y > 0 {
+                    neighbour(x, y - 1);
+                }
+                if y + 1 < height {
+                    neighbour(x, y + 1);
+                }
+                let factor = if count == 0.0 {
+                    1.0
+                } else {
+                    (-(sum / count) * EDL_STRENGTH).exp()
+                };
+                for channel in colors[index].iter_mut() {
+                    *channel *= factor;
+                }
+            }
+        }
+    }
+
+    // Pass three: fill the gaps the discs left between them. Reading only
+    // pixels that drew something, so filling in place cannot feed a filled
+    // colour back into the average.
+    for y in 0..height {
+        for x in 0..width {
+            let index = y * width + x;
+            if drawn(&scratch.depth[index]) {
+                continue;
+            }
+            let (x0, x1) = (
+                x.saturating_sub(FILL_RADIUS),
+                (x + FILL_RADIUS).min(width - 1),
+            );
+            let (y0, y1) = (
+                y.saturating_sub(FILL_RADIUS),
+                (y + FILL_RADIUS).min(height - 1),
+            );
+            // The eight neighbours, in the order Nimbus's shader reads them:
+            // lt, mt, rt, lm, rm, lb, mb, rb.
+            let occupied = |dx: usize, dy: usize| drawn(&scratch.depth[dy * width + dx]);
+            let (has_left, has_right) = (x > x0, x < x1);
+            let (has_up, has_down) = (y > y0, y < y1);
+            let lt = has_left && has_up && occupied(x - 1, y - 1);
+            let mt = has_up && occupied(x, y - 1);
+            let rt = has_right && has_up && occupied(x + 1, y - 1);
+            let lm = has_left && occupied(x - 1, y);
+            let rm = has_right && occupied(x + 1, y);
+            let lb = has_left && has_down && occupied(x - 1, y + 1);
+            let mb = has_down && occupied(x, y + 1);
+            let rb = has_right && has_down && occupied(x + 1, y + 1);
+
+            let neighbours = usize::from(lt)
+                + usize::from(mt)
+                + usize::from(rt)
+                + usize::from(lm)
+                + usize::from(rm)
+                + usize::from(lb)
+                + usize::from(mb)
+                + usize::from(rb);
+            let window = (x1 - x0 + 1) * (y1 - y0 + 1) - 1;
+            // Nimbus's rule, kept as it is: a gap that is completely surrounded
+            // is filled, and so is one where every one of the eight five-pixel
+            // dominoes around it has some support. On a full 3×3 that is
+            // `sum == 8`, and the domino test is what lets a slightly ragged
+            // hole close too — without it, interior gaps that are missing one
+            // neighbour would stay black.
+            let dominoes = [
+                [lt, mt, rt, rm, mb],
+                [lt, mt, rt, lm, rm],
+                [lt, mt, lm, lb, mb],
+                [lm, rm, lb, mb, rb],
+                [lt, mt, rt, rm, rb],
+                [lt, mt, rt, lm, lb],
+                [lt, lm, lb, mb, rb],
+                [rt, rm, rb, mb, lb],
+            ];
+            let surrounded = neighbours == window;
+            let every_direction = dominoes.iter().all(|set| set.iter().any(|v| *v));
+            if !surrounded && !every_direction {
+                continue;
+            }
+
+            let mut sum = [0.0f32; 3];
+            let mut count = 0.0;
+            for ny in y0..=y1 {
+                for nx in x0..=x1 {
+                    if !occupied(nx, ny) {
+                        continue;
+                    }
+                    let color = scratch.colors[ny * width + nx];
+                    for channel in 0..3 {
+                        sum[channel] += color[channel];
+                    }
+                    count += 1.0;
+                }
+            }
+            if count == 0.0 {
+                continue;
+            }
+            scratch.colors[index] = [sum[0] / count, sum[1] / count, sum[2] / count];
+        }
+    }
+}
+
 /// Background gradient with a soft corner vignette.
 fn background(x: usize, y: usize, width: usize, height: usize) -> [f32; 3] {
     let vertical = (y as f32 + 0.5) / height as f32;
@@ -984,7 +1349,7 @@ fn lerp3(a: [f32; 3], b: [f32; 3], t: f32) -> [f32; 3] {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::media::mesh::load_obj;
+    use crate::media::formats::load_obj;
 
     /// A closed cube in the unit range, two triangles per face.
     fn cube() -> Mesh {
@@ -1037,6 +1402,228 @@ mod tests {
 
     fn brightness(p: [u8; 4]) -> u32 {
         p[0] as u32 + p[1] as u32 + p[2] as u32
+    }
+
+    /// Renders one frame with the enhancement on, for the tests below.
+    fn enhanced(mesh: &Mesh, camera: &Camera, size: u32) -> Frame {
+        render_with_scratch(
+            mesh,
+            camera,
+            size,
+            size,
+            1,
+            1.0,
+            RenderOptions {
+                cull_backfaces: false,
+                enhance_points: true,
+            },
+            &mut Scratch::default(),
+        )
+    }
+
+    /// A cube whose triangles all wind the same way, seen from outside.
+    ///
+    /// The `cube()` fixture above is the more interesting case: its faces are
+    /// wound as a human wrote them, which is inconsistent, so it is reported
+    /// as two-sided and never culled. That is exactly what a renderer has to
+    /// do with most files in the wild, and it is why culling is opt-in.
+    fn closed_cube() -> Mesh {
+        let obj = "v 0 0 0\nv 1 0 0\nv 1 1 0\nv 0 1 0\n\
+                   v 0 0 1\nv 1 0 1\nv 1 1 1\nv 0 1 1\n\
+                   f 1 3 2\nf 1 4 3\nf 5 6 7\nf 5 7 8\n\
+                   f 1 2 6\nf 1 6 5\nf 4 8 7\nf 4 7 3\n\
+                   f 1 5 8\nf 1 8 4\nf 2 3 7\nf 2 7 6\n";
+        let mesh = load_obj(obj).expect("cube parses");
+        assert_eq!(
+            mesh.winding(),
+            crate::media::formats::types::Winding::ClosedOutward,
+            "the fixture must be wound consistently to test culling"
+        );
+        mesh
+    }
+
+    /// A cloud sparse enough to leave gaps between its sprites: the case the
+    /// enhancement exists for.
+    fn sparse_cloud() -> Mesh {
+        let mut points = Vec::new();
+        let mut colors = Vec::new();
+        for y in 0..12 {
+            for x in 0..12 {
+                points.push([x as f32 * 0.02 - 0.12, y as f32 * 0.02 - 0.12, 0.0]);
+                colors.push([0.6, 0.6, 0.6]);
+            }
+        }
+        crate::media::formats::types::Mesh::finish_points(points, Vec::new(), colors)
+            .expect("cloud builds")
+    }
+
+    /// Gap filling closes the pixels between the discs: the point of the pass
+    /// is that a cloud reads as a surface, not as dust.
+    #[test]
+    fn enhancing_a_cloud_fills_the_gaps_between_its_points() {
+        let mesh = sparse_cloud();
+        let camera = Camera::default();
+        let plain = render(&mesh, &camera, 96, 96, 1, 1.0);
+        let enhanced = enhanced(&mesh, &camera, 96);
+        let (before, after) = (lit_pixels(&plain), lit_pixels(&enhanced));
+        assert!(
+            after > before,
+            "filling should add pixels: {before} -> {after}"
+        );
+        // Filling closes gaps; it must not paint the whole frame.
+        assert!(after < 96 * 96, "the background must survive: {after}");
+    }
+
+    /// Eye-dome lighting only ever darkens, and it does darken something —
+    /// otherwise the pass would be a no-op with extra steps.
+    #[test]
+    fn eye_dome_lighting_darkens_without_brightening() {
+        let mesh = sparse_cloud();
+        let camera = Camera::default();
+        let plain = render(&mesh, &camera, 96, 96, 1, 1.0);
+        let enhanced = enhanced(&mesh, &camera, 96);
+        let mut darkened = 0;
+        for (before, after) in plain
+            .bgra
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .zip(enhanced.bgra.as_chunks::<4>().0)
+        {
+            for channel in 0..3 {
+                assert!(
+                    after[channel] <= before[channel],
+                    "lighting brightened a pixel: {before:?} -> {after:?}"
+                );
+                if after[channel] < before[channel] {
+                    darkened += 1;
+                }
+            }
+        }
+        assert!(darkened > 0, "nothing was shaded");
+    }
+
+    /// A triangle mesh is left alone: its shading is already a lighting model,
+    /// and the pass exists for the scatter a cloud is drawn as.
+    #[test]
+    fn enhancement_leaves_a_mesh_untouched() {
+        let mesh = cube();
+        let camera = Camera::default();
+        let plain = render(&mesh, &camera, 64, 64, 1, 1.0);
+        let enhanced = enhanced(&mesh, &camera, 64);
+        assert_eq!(plain.bgra, enhanced.bgra);
+    }
+
+    /// Culling the back faces of a closed mesh is free: the front faces won
+    /// the depth test anyway, so the picture is the one it always was.
+    #[test]
+    fn culling_the_back_faces_of_a_closed_mesh_changes_nothing() {
+        let mesh = closed_cube();
+        let camera = Camera::default();
+        let two_sided = render(&mesh, &camera, 96, 96, 1, 1.0);
+        let culled = render_with_scratch(
+            &mesh,
+            &camera,
+            96,
+            96,
+            1,
+            1.0,
+            RenderOptions {
+                cull_backfaces: true,
+                enhance_points: false,
+            },
+            &mut Scratch::default(),
+        );
+        assert_eq!(two_sided.bgra, culled.bgra);
+    }
+
+    /// The other half of that contract: culling an open shell is *not* free.
+    /// Seen from behind, its only surface is a back face, and it disappears —
+    /// which is why the viewport only asks for culling on a mesh whose winding
+    /// says it is closed.
+    #[test]
+    fn culling_an_open_shell_erases_it_seen_from_behind() {
+        // One quad in the XY plane, wound towards +z.
+        let quad = load_obj("v -1 -1 0\nv 1 -1 0\nv 1 1 0\nv -1 1 0\nf 1 2 3\nf 1 3 4\n")
+            .expect("quad parses");
+        assert_eq!(
+            quad.winding(),
+            crate::media::formats::types::Winding::TwoSided
+        );
+        // Looking at it from behind: rotate the camera a half turn.
+        let camera = Camera {
+            yaw: std::f32::consts::PI,
+            pitch: 0.0,
+            zoom: 1.0,
+            pan: [0.0, 0.0],
+        };
+        let two_sided = render(&quad, &camera, 64, 64, 1, 1.0);
+        let culled = render_with_scratch(
+            &quad,
+            &camera,
+            64,
+            64,
+            1,
+            1.0,
+            RenderOptions {
+                cull_backfaces: true,
+                enhance_points: false,
+            },
+            &mut Scratch::default(),
+        );
+        assert!(lit_pixels(&two_sided) > 100, "the shell is visible");
+        assert_eq!(lit_pixels(&culled), 0, "culling left nothing behind it");
+    }
+
+    /// The whole point of `Scratch`: a frame of the same size reuses the
+    /// buffers instead of allocating 50 MB again, and a bigger frame grows
+    /// them rather than corrupting anything.
+    #[test]
+    fn scratch_buffers_are_reused_between_frames() {
+        let mesh = cube();
+        let camera = Camera::default();
+        let mut scratch = Scratch::default();
+        let _ = render_with_scratch(
+            &mesh,
+            &camera,
+            64,
+            48,
+            1,
+            1.0,
+            RenderOptions::default(),
+            &mut scratch,
+        );
+        let after_first = scratch.bytes();
+        assert!(after_first > 0, "a frame must have used the buffers");
+
+        for _ in 0..4 {
+            let frame = render_with_scratch(
+                &mesh,
+                &camera,
+                64,
+                48,
+                1,
+                1.0,
+                RenderOptions::default(),
+                &mut scratch,
+            );
+            assert_eq!((frame.width, frame.height), (64, 48));
+        }
+        assert_eq!(scratch.bytes(), after_first, "the buffers are reused");
+
+        let frame = render_with_scratch(
+            &mesh,
+            &camera,
+            128,
+            96,
+            1,
+            1.0,
+            RenderOptions::default(),
+            &mut scratch,
+        );
+        assert_eq!((frame.width, frame.height), (128, 96));
+        assert!(scratch.bytes() > after_first, "a bigger frame needs more");
+        assert!(!frame.is_empty_of_geometry());
     }
 
     #[test]
@@ -1181,16 +1768,22 @@ mod tests {
         let (width, height) = (320.0f32, 240.0f32);
         let mut camera = Camera::default();
         let viewpoints = [
-            (0.0f32, 0.0f32, 1.0f32),
-            (0.62, 0.34, 1.0),
-            (-1.3, -0.8, 0.5),
-            (2.4, 0.4, 2.0),
-            (0.0, 1.4, 1.0),
+            (0.0f32, 0.0f32, 1.0f32, [0.0f32, 0.0]),
+            (0.62, 0.34, 1.0, [0.0, 0.0]),
+            (-1.3, -0.8, 0.5, [0.0, 0.0]),
+            (2.4, 0.4, 2.0, [0.0, 0.0]),
+            (0.0, 1.4, 1.0, [0.0, 0.0]),
+            // Panned views too: the matrix carries the pivot, so a pan the CPU
+            // path honoured but the matrix did not would put the two pictures
+            // side by side.
+            (0.62, 0.34, 1.0, [0.35, -0.2]),
+            (-2.0, 0.9, 3.5, [-0.6, 0.45]),
         ];
-        for (yaw, pitch, zoom) in viewpoints {
+        for (yaw, pitch, zoom, pan) in viewpoints {
             camera.yaw = yaw;
             camera.pitch = pitch;
             camera.zoom = zoom;
+            camera.pan = pan;
             let framing = camera.framing(bounds, width / height);
             let matrix = framing.view_projection();
             for p in [
@@ -1241,6 +1834,67 @@ mod tests {
         }
     }
 
+    /// The culling frustum must be the exact volume the projection matrix
+    /// draws. A frustum built with the transpose the wrong way round, or with
+    /// the OpenGL `-1..=1` near/far planes, is still a plausible-looking box;
+    /// only comparing it against the matrix catches that.
+    #[test]
+    fn the_frustum_matches_the_projection_matrix() {
+        let bounds = cube().bounds;
+        let (width, height) = (640.0f32, 480.0f32);
+        let viewpoints = [
+            (0.0f32, 0.0f32, 1.0f32, [0.0f32, 0.0]),
+            (0.9, 0.5, 1.6, [0.2, -0.1]),
+            (-2.2, -0.7, 0.6, [-0.4, 0.3]),
+            (3.1, 1.2, 3.0, [0.0, 0.0]),
+        ];
+        // Points on and around the model, so both outcomes are exercised.
+        let points = [
+            [0.0f32, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [0.5, 0.5, 0.5],
+            [1.0, 1.0, 1.0],
+            [-0.25, 0.5, 1.25],
+            [4.0, 0.0, 0.0],
+            [0.0, -4.0, 0.0],
+            [0.5, 0.5, -5.0],
+            [0.5, 0.5, 40.0],
+        ];
+        for (yaw, pitch, zoom, pan) in viewpoints {
+            let camera = Camera {
+                yaw,
+                pitch,
+                zoom,
+                pan,
+            };
+            let framing = camera.framing(bounds, width / height);
+            let frustum = framing.frustum();
+            let matrix = framing.view_projection();
+            for point in points {
+                let clip = mat_vec(&matrix, [point[0], point[1], point[2], 1.0]);
+                // Skip the boundary, where float error and a `<` vs `<=`
+                // decide differently: this test is about which side of the
+                // volume a point is on, not about the edge itself.
+                if clip[3] < 1e-3 {
+                    continue;
+                }
+                let ndc = [clip[0] / clip[3], clip[1] / clip[3], clip[2] / clip[3]];
+                if ndc.iter().any(|v| v.abs() < 1e-3 || (v - 1.0).abs() < 1e-3) {
+                    continue;
+                }
+                let inside = ndc.iter().all(|v| (-1.0..=1.0).contains(v));
+                let kept = frustum.intersects_bounds(&Bounds {
+                    min: point,
+                    max: point,
+                });
+                assert_eq!(
+                    kept, inside,
+                    "point {point:?} at yaw {yaw} pitch {pitch}: frustum {kept}, matrix {inside} (ndc {ndc:?})"
+                );
+            }
+        }
+    }
+
     #[test]
     fn framing_keeps_the_model_inside_the_viewport() {
         let bounds = cube().bounds;
@@ -1286,6 +1940,151 @@ mod tests {
         }
     }
 
+    // -- Turning: the sign convention the viewport's drag relies on --------
+
+    /// Where a world point lands, with the camera turned by `(yaw, pitch)`.
+    fn turned_screen(point: [f32; 3], yaw: f32, pitch: f32) -> [f32; 2] {
+        let bounds = cube().bounds;
+        let (width, height) = (400.0f32, 300.0f32);
+        let camera = Camera {
+            yaw,
+            pitch,
+            zoom: 1.0,
+            pan: [0.0, 0.0],
+        };
+        let framing = camera.framing(bounds, width / height);
+        framing.to_screen(framing.to_view(point), width, height).0
+    }
+
+    /// A growing yaw moves the eye towards +x, which swings the model's near
+    /// face to the *left*. The viewport drags with a negated yaw so that the
+    /// surface follows the pointer — this pins the sign it negates away from.
+    #[test]
+    fn growing_yaw_swings_the_model_left() {
+        // The centre of the cube's +z face, i.e. the surface nearest the eye
+        // at the default orientation.
+        let near = [0.5, 0.5, 1.0];
+        let before = turned_screen(near, 0.0, 0.0);
+        let after = turned_screen(near, 0.2, 0.0);
+        assert!(
+            after[0] < before[0] - 1.0,
+            "yaw +0.2 moved the near face right: {before:?} -> {after:?}"
+        );
+        // And the opposite way for the opposite turn, so the drag is symmetric.
+        let back = turned_screen(near, -0.2, 0.0);
+        assert!(back[0] > before[0] + 1.0, "{before:?} -> {back:?}");
+    }
+
+    /// A growing pitch lifts the eye, which slides the near face *down* the
+    /// screen — the direction a downward drag goes, so this axis needs no sign
+    /// flip.
+    #[test]
+    fn growing_pitch_slides_the_model_down() {
+        let near = [0.5, 0.5, 1.0];
+        let before = turned_screen(near, 0.0, 0.0);
+        let after = turned_screen(near, 0.0, 0.2);
+        assert!(
+            after[1] > before[1] + 1.0,
+            "pitch +0.2 moved the near face up: {before:?} -> {after:?}"
+        );
+    }
+
+    // -- Panning -------------------------------------------------------------
+
+    /// The pan/pixel conversion has to be the one the projection actually
+    /// uses, or dragging would move the model a different distance than the
+    /// cursor travelled.
+    #[test]
+    fn pan_per_pixel_matches_the_projection() {
+        let bounds = cube().bounds;
+        let (width, height) = (400.0f32, 300.0f32);
+        let aspect = width / height;
+        let camera = Camera::default();
+        let world = bounds.center();
+        let project = |camera: &Camera| {
+            let framing = camera.framing(bounds, aspect);
+            framing.to_screen(framing.to_view(world), width, height).0
+        };
+        let before = project(&camera);
+
+        // Dragging 40 px right means the pivot moves left by those pixels' worth.
+        let per_pixel = camera.pan_per_pixel(height);
+        let mut panned = camera;
+        panned.pan_by([-per_pixel * 40.0, 0.0]);
+        let after = project(&panned);
+        assert!(
+            (after[0] - before[0] - 40.0).abs() < 0.1,
+            "expected the model to move 40 px right, moved {}",
+            after[0] - before[0]
+        );
+        assert!((after[1] - before[1]).abs() < 0.1, "y must not move");
+    }
+
+    /// Panning up slides the model down the screen — the content follows the
+    /// hand, which is why the app adds a downward drag to the pan.
+    #[test]
+    fn panning_up_moves_the_model_down() {
+        let bounds = cube().bounds;
+        let (width, height) = (400.0f32, 300.0f32);
+        let aspect = width / height;
+        let camera = Camera::default();
+        let world = bounds.center();
+        let project = |camera: &Camera| {
+            let framing = camera.framing(bounds, aspect);
+            framing.to_screen(framing.to_view(world), width, height).0
+        };
+        let before = project(&camera);
+        let mut panned = camera;
+        panned.pan_by([0.0, camera.pan_per_pixel(height) * 25.0]);
+        let after = project(&panned);
+        assert!(
+            (after[1] - before[1] - 25.0).abs() < 0.1,
+            "expected 25 px down, moved {}",
+            after[1] - before[1]
+        );
+    }
+
+    /// The point the camera was panned to stays at the centre of the viewport,
+    /// which is what makes a later orbit turn around what the user is looking
+    /// at instead of around the model's middle.
+    #[test]
+    fn the_panned_pivot_stays_centred() {
+        let bounds = cube().bounds;
+        let (width, height) = (400.0f32, 300.0f32);
+        let aspect = width / height;
+        let mut camera = Camera::default();
+        camera.pan_by([0.4, -0.3]);
+        let framing = camera.framing(bounds, aspect);
+        let (screen, _) = framing.to_screen(framing.to_view(framing.center), width, height);
+        assert!((screen[0] - width / 2.0).abs() < 1e-3, "{screen:?}");
+        assert!((screen[1] - height / 2.0).abs() < 1e-3, "{screen:?}");
+
+        // ...and it still does after orbiting: the pivot is the orbit centre.
+        let mut orbited = camera;
+        orbited.orbit(1.7, 0.6);
+        let framing = orbited.framing(bounds, aspect);
+        let (screen, _) = framing.to_screen(framing.to_view(framing.center), width, height);
+        assert!((screen[0] - width / 2.0).abs() < 1e-3, "{screen:?}");
+        assert!((screen[1] - height / 2.0).abs() < 1e-3, "{screen:?}");
+    }
+
+    /// A pan is a camera move like any other: `reset` undoes it, and it does
+    /// not change how far away the eye is.
+    #[test]
+    fn pan_does_not_change_the_distance_and_reset_undoes_it() {
+        let bounds = cube().bounds;
+        let camera = Camera::default();
+        let mut panned = camera;
+        panned.pan_by([0.5, 0.25]);
+        assert!(!panned.is_default());
+        let before = camera.framing(bounds, 1.0);
+        let after = panned.framing(bounds, 1.0);
+        assert!((before.distance - after.distance).abs() < 1e-6);
+        assert!((before.inv_radius - after.inv_radius).abs() < 1e-6);
+        panned.reset();
+        assert!(panned.is_default());
+    }
+
     #[test]
     fn the_eye_round_trips_into_model_space() {
         let framing = Camera::default().framing(cube().bounds, 1.0);
@@ -1328,6 +2127,30 @@ mod tests {
         assert_eq!(indices.len(), 12);
         assert_eq!(u32::from_ne_bytes(indices[4..8].try_into().unwrap()), 0);
         assert_eq!(u32::from_ne_bytes(indices[8..12].try_into().unwrap()), 12);
+    }
+
+    /// Reversing the winding on the way into the buffer is what lets a closed
+    /// mesh be culled whichever way its file happened to spell it.
+    #[test]
+    fn vertex_data_can_flip_the_winding() {
+        let obj = "v 0 0 0\nv 1 0 0\nv 0 1 0\nvn 0 0 1\nf 1//1 2//1 3//1\n";
+        let mesh = load_obj(obj).expect("mesh parses");
+        let straight = vertex_data_with(&mesh, false);
+        let flipped = vertex_data_with(&mesh, true);
+        assert_eq!(straight.indices.as_deref(), Some([0, 1, 2].as_slice()));
+        assert_eq!(flipped.indices.as_deref(), Some([0, 2, 1].as_slice()));
+        // The normal follows the winding, so the shading keeps up.
+        assert_eq!(&straight.vertices[3..6], &[0.0, 0.0, 1.0]);
+        assert_eq!(&flipped.vertices[3..6], &[0.0, 0.0, -1.0]);
+        assert_eq!(flipped.vertex_count, straight.vertex_count);
+
+        // Flat meshes recompute the face normal from the corners, so the flip
+        // has to reach them too.
+        let flat = load_obj("v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n").expect("mesh parses");
+        let straight = vertex_data_with(&flat, false);
+        let flipped = vertex_data_with(&flat, true);
+        assert_eq!(&straight.vertices[3..6], &[0.0, 0.0, 1.0]);
+        assert_eq!(&flipped.vertices[3..6], &[0.0, 0.0, -1.0]);
     }
 
     #[test]
@@ -1376,7 +2199,7 @@ mod tests {
         for p in points {
             ply.push_str(&format!("{} {} {}\n", p[0], p[1], p[2]));
         }
-        crate::media::mesh::load_ply(ply.as_bytes()).expect("cloud parses")
+        crate::media::formats::load_ply(ply.as_bytes()).expect("cloud parses")
     }
 
     /// A cloud whose vertices carry a colour, as a coloured scan arrives.
@@ -1394,7 +2217,7 @@ mod tests {
                 point[0], point[1], point[2], color[0], color[1], color[2]
             ));
         }
-        crate::media::mesh::load_ply(ply.as_bytes()).expect("cloud parses")
+        crate::media::formats::load_ply(ply.as_bytes()).expect("cloud parses")
     }
 
     /// Pixels the renderer touched, i.e. everything that left the background.
@@ -1445,6 +2268,7 @@ mod tests {
             yaw: 0.0,
             pitch: 0.0,
             zoom: 1.0,
+            pan: [0.0, 0.0],
         };
         let mesh = cloud(&[[0.0, 0.0, 1.0], [0.0, 0.0, -1.0]]);
         let frame = render(&mesh, &axis_on, 64, 64, 1, 1.0);

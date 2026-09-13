@@ -42,6 +42,13 @@
 - **`PointData` 步长 9 个 f32**：改它要同时改 `PointData::STRIDE`、`gpu3d.rs` 的 point 管线 `vertex_attr_array!`、`gpu3d.wgsl::vs_point`（`the_vertex_inputs_match_the_buffer_layouts` 校验）。uniform 共 9 成员、`UNIFORM_SIZE = 192`。wgpu 29 与 gpui 内置版对齐（单版本单后端）：`immediate_size: 0`、`bind_group_layouts: &[Option<&BindGroupLayout>]`。
 - **WGSL 无 GPU 也能校验**：`naga` 作 dev-dep，测试里 parse + validate + `Layouter` 断言 uniform offset。改 shader/uniform 后跑 `cargo test -p trove-app`。
 - PLY 能力边界与性能基线见 `trove-ply-benchmark`／`docs/ply-load-bench.html`（⚠️ 报告与脚本未提交）。
+- **索引只读不建**：大点云打开时若侧车 `<源文件>.trovecloud` 在（离线 `example index_build` 生成）→ `IndexedCloud` 按视锥 ×（近端⋈位反转铺开）交错读块进 `StreamingOctree`，否则回退流式。**产品永远不构建索引。** 转视锥只能用 `Framing::frustum()`（`view_projection` 是列主序 + 深度 0..1，平面提取按行读，必须转置；近平面是 `z=0` 不是 `w+z`）；批量点云走 `insert_points`（一次 rebuild + **循环 `decimate` 回预算内**，一次减半守不住内存上界），逐点 `insert_point` 会每 1 万点重建整棵树。
+- **全量空间查询别放在每步循环里**：`render_mesh_all` 是 O(resident)，流式每 5 万点块重建一次会把 40 M 点加载从 3.8 s 拖到 69.5 s；现在每份文件只精化 `STREAM_REFINEMENTS = 32` 次。
+- **GPU 点云后处理**：EDL + 补洞在 `gpu3d.wgsl::fs_edl`（读 `texture_depth_multisampled_2d`，仅“成品帧 + 点云 + MSAA”），`EDL_STRENGTH` 从 `render3d` 共享；WGSL 深度纹理类型不带 `<f32>`。真机冒烟测试无适配器自动跳过。开关：`AppConfig.point_enhance`（默认开，视口每帧重读）。
+- **meshlet**（`formats/meshlet.rs`）：大网格（带法线 + ≥8192 面）按质心 Morton 聚成 4096 面/簇，`GpuMesh` 按 `order` 重排索引后逐簇视锥剔除，全可见则退回单 draw。平面着色（每面自带 3 顶点、无索引）不切。
+- **大文件路由**：`load_mesh` 只有 `.ply` >512 MiB 走分块加载器，其余走整文件加载器（>2 GiB 报错）——别再把大 OBJ/STL 送进 PLY-only 分块器。`formats/bvh.rs` 已删（`#[cfg(test)]` 死代码）。
+- **clippy 基线是 0 告警**（`--all-targets -p trove-core -p trove-app`）、fmt 干净、`trove-core` 310 + `trove-app` 21（含 2 个真机 GPU 测试，无适配器自动跳过）。没做的优化在 [`docs/MODEL-PREVIEW-BACKLOG.md`](../../docs/MODEL-PREVIEW-BACKLOG.md)。
+- **`max_points` 是采样预算不是“最近 N 点”**：点云 LOD（`point_cloud.rs::spread_sample`）与索引选块都必须把预算铺在可见区域上；按距离取前 N 会让大模型预览静默退化成相机前一小块（两层叠加：常驻取最近 + 渲染再取最近）。
 
 ## 主题与外观（gpui-kit 的 Theme）
 - `Theme` global（light/dark 两个 `ThemeConfig` + 当前 `ThemeMode`）+ `ThemeRegistry` 按名存。切换 = 换 config + `Theme::change(mode, window, cx)` + `cx.refresh_windows()`。入口唯一：`app/theme.rs::apply_from_settings`。

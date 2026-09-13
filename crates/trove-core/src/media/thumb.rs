@@ -56,6 +56,48 @@ pub fn regenerate(root: &Path, sha: &str, kind: AssetKind, blob_path: &Path) -> 
     }
 }
 
+/// How a model thumbnail gets its geometry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CardSource {
+    /// Parse the file: it is small enough that one pass is nothing.
+    Whole,
+    /// Parse it through the chunked loader, which bounds the memory it needs
+    /// but still reads the file once.
+    Chunked,
+    /// Sample a bounded number of points off disk: too large to parse at all
+    /// on an import.
+    Sampled,
+}
+
+/// Below this, a model is parsed whole for its card.
+const CARD_WHOLE_MAX: u64 = 64 << 20;
+/// Above this, it is only sampled.
+const CARD_CHUNKED_MAX: u64 = 512 << 20;
+/// Points sampled for a card of a file too large to parse.
+const CARD_SAMPLES: usize = 32_768;
+
+/// Which way a card gets the file's geometry.
+///
+/// The chunked loader only reads PLY, so a large OBJ or GLB goes down the
+/// whole-file path (which caps at 2 GiB) rather than being handed a format it
+/// cannot parse and coming back with no card at all.
+fn card_source(path: &Path, size: u64) -> CardSource {
+    let is_ply = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("ply"));
+    if !is_ply {
+        return CardSource::Whole;
+    }
+    if size <= CARD_WHOLE_MAX {
+        CardSource::Whole
+    } else if size <= CARD_CHUNKED_MAX {
+        CardSource::Chunked
+    } else {
+        CardSource::Sampled
+    }
+}
+
 /// Size of the font-specimen card, in pixels (landscape, thumbnail-scale).
 const FONT_CARD_SIZE: (u32, u32) = (512, 256);
 /// Pixel size used to rasterize the sample text on the card.
@@ -147,22 +189,35 @@ const MODEL_CARD_SIZE: (u32, u32) = (512, 384);
 /// paths share the same camera and shading parameters. Returns `None` when
 /// the bytes are not an OBJ/STL/PLY we can parse, so the asset keeps its icon.
 fn write_model_card(blob_path: &Path, out: &Path) -> Option<PathBuf> {
-    use crate::media::{mesh, render3d};
+    use crate::media::{formats, render3d};
 
-    // Large model files go through the chunked/LOD loader so a 500 MB
-    // export does not have to be read whole into memory and fully parsed
-    // just to draw a 512×384 thumbnail.  The card is a preview, not the
-    // interactive viewport, so the subsampled geometry is plenty.
+    // The card is a preview, not the interactive viewport: the cheapest way to
+    // get *some* geometry out of the file is the right one, and for a file too
+    // large to parse at all that means reading a sample of it.
     let size = std::fs::metadata(blob_path).map(|m| m.len()).unwrap_or(0);
-    const CHUNKED_THRESHOLD: u64 = 64 << 20;
-    let mesh = if size > CHUNKED_THRESHOLD {
-        let config = crate::media::chunked::LodConfig {
-            memory_budget: 32 << 20,
-            max_lod_step: 16,
-        };
-        crate::media::chunked::load_ply_chunked(blob_path, config).ok()?
-    } else {
-        mesh::load(blob_path).ok()?
+    let mesh = match card_source(blob_path, size) {
+        CardSource::Whole => formats::load(blob_path).ok()?,
+        CardSource::Chunked => {
+            let config = crate::media::chunked::LodConfig {
+                memory_budget: 32 << 20,
+                max_lod_step: 16,
+            };
+            crate::media::chunked::load_ply_chunked(blob_path, config).ok()?
+        }
+        CardSource::Sampled => {
+            // A few thousand reads off the front of nothing: a twenty-
+            // gigabyte scan cannot be walked at import time to draw a
+            // 512×384 card. The points come with their colours, so a scan's
+            // card is not grey.
+            let (mut streamer, _) =
+                crate::media::formats::streaming::PointStreamer::open(blob_path).ok()?;
+            let sampled = streamer.sample_points(CARD_SAMPLES)?;
+            crate::media::formats::types::Mesh::finish_points(
+                sampled.positions,
+                Vec::new(),
+                sampled.colors,
+            )?
+        }
     };
     let (w, h) = MODEL_CARD_SIZE;
     // Supersample once: this runs a single time per asset, and the grid is
@@ -540,6 +595,29 @@ mod tests {
         assert_eq!(w, FONT_CARD_SIZE.0);
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The card path is chosen by size and by what the chunked loader can
+    /// actually read: a large OBJ must not be sent to a PLY-only parser, and a
+    /// twenty-gigabyte PLY must not be walked at import time.
+    #[test]
+    fn model_card_source_follows_size_and_format() {
+        let ply = Path::new("/tmp/a.ply");
+        let obj = Path::new("/tmp/a.obj");
+        assert_eq!(card_source(ply, 1 << 20), CardSource::Whole);
+        assert_eq!(card_source(ply, CARD_WHOLE_MAX), CardSource::Whole);
+        assert_eq!(card_source(ply, CARD_WHOLE_MAX + 1), CardSource::Chunked);
+        assert_eq!(card_source(ply, CARD_CHUNKED_MAX), CardSource::Chunked);
+        assert_eq!(card_source(ply, CARD_CHUNKED_MAX + 1), CardSource::Sampled);
+        assert_eq!(card_source(ply, 20 << 30), CardSource::Sampled);
+        // Not PLY: the chunked loader cannot read it, so it is parsed whole
+        // (and refused if it is past the loader's own cap).
+        assert_eq!(card_source(obj, 100 << 20), CardSource::Whole);
+        assert_eq!(card_source(obj, 20 << 30), CardSource::Whole);
+        assert_eq!(
+            card_source(Path::new("/tmp/a.PLY"), 20 << 30),
+            CardSource::Sampled
+        );
     }
 
     #[test]

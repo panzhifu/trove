@@ -59,6 +59,7 @@ use crate::panels::common::{AssetsDrag, display_name, kind_icon, observe_control
 mod cells;
 mod data;
 mod interactions;
+mod open_with_apps;
 mod rows;
 mod toolbar;
 

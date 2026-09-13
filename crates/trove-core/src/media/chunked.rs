@@ -1,6 +1,6 @@
 //! Chunked / streaming PLY loader for files that don't fit in memory.
 //!
-//! The stock [`super::mesh::load`] reads the whole file and parses every
+//! The stock [`super::formats::load`] reads the whole file and parses every
 //! vertex into a `Vec` — fine up to a few gigabytes, impossible at twenty.
 //! This module replaces both steps for large PLY files:
 //!
@@ -30,9 +30,10 @@
 use std::fs::File;
 use std::path::Path;
 
-use super::mesh::{
-    self, BODY_END, Mesh, PlyElement, PlyEndian, PlyProperty, PlyType, VertexColumns,
+use super::formats::ply::{
+    self, BODY_END, PlyElement, PlyEndian, PlyProperty, PlyType, VertexColumns,
 };
+use super::formats::types::Mesh;
 
 /// How much RAM the parsed [`Mesh`] is allowed to occupy. The loader picks
 /// a level-of-detail step that keeps the result under this budget.
@@ -111,7 +112,7 @@ struct ChunkedBody {
 
 /// Parse a PLY file with bounded memory.
 ///
-/// The file-size cap that [`mesh::load`] enforces (2 GiB) is gone.
+/// The file-size cap that [`super::formats::load`] enforces (2 GiB) is gone.
 pub fn load_ply_chunked(path: &Path, config: LodConfig) -> Result<Mesh, String> {
     // 64 GiB threshold: below it the kernel's page cache makes a plain
     // read competitive; above it mmap saves us from doubling the file in
@@ -121,7 +122,7 @@ pub fn load_ply_chunked(path: &Path, config: LodConfig) -> Result<Mesh, String> 
     let file = MmapFile::open(path, MMAP_THRESHOLD)?;
     let bytes = file.as_slice();
 
-    let header_end = mesh::find_ply_header_end(bytes).ok_or("not a PLY file")?;
+    let header_end = ply::find_ply_header_end(bytes).ok_or("not a PLY file")?;
     let header = String::from_utf8_lossy(&bytes[..header_end]);
     let mut lines = header.lines().map(str::trim);
     if lines.next().map(|l| l.to_ascii_lowercase()) != Some("ply".to_string()) {
@@ -447,7 +448,7 @@ fn skip_binary_element(
                         if cursor.saturating_add(width) > body.len() {
                             return Err(BODY_END.into());
                         }
-                        let length = mesh::scalar_at(body, *cursor, count_ty, order)
+                        let length = ply::scalar_at(body, *cursor, count_ty, order)
                             .ok_or(BODY_END)? as usize;
                         let item_width = property.ty.width();
                         let record_width = width + length * item_width;
@@ -484,7 +485,7 @@ fn collect_binary_faces(
     let indices_col = element
         .properties
         .iter()
-        .position(|p| p.count_ty.is_some() && mesh::is_indices(&p.name));
+        .position(|p| p.count_ty.is_some() && ply::is_indices(&p.name));
     let count_ty = indices_col
         .map(|col| element.properties[col].count_ty.unwrap_or(PlyType::U8))
         .unwrap_or(PlyType::U8);
@@ -498,7 +499,7 @@ fn collect_binary_faces(
         if *cursor + count_ty.width() > body.len() {
             return Err(BODY_END.into());
         }
-        let count = mesh::scalar_at(body, *cursor, count_ty, order).ok_or(BODY_END)? as usize;
+        let count = ply::scalar_at(body, *cursor, count_ty, order).ok_or(BODY_END)? as usize;
         *cursor += count_ty.width();
         let item_bytes = count * item_ty.width();
         if *cursor + item_bytes > body.len() {
@@ -509,7 +510,7 @@ fn collect_binary_faces(
             let mut face = Vec::with_capacity(count);
             for i in 0..count {
                 let at = *cursor + i * item_ty.width();
-                let idx = mesh::scalar_at(body, at, item_ty, order).ok_or(BODY_END)? as u32;
+                let idx = ply::scalar_at(body, at, item_ty, order).ok_or(BODY_END)? as u32;
                 face.push(idx);
                 if (idx as usize) < referenced.len() {
                     referenced[idx as usize] = 1;
@@ -570,22 +571,22 @@ fn parse_binary_vertices_remapped(
         let base = *cursor + old_index * stride;
         let row = &body[base..base + stride];
         out.positions.push([
-            mesh::scalar_row(row, x.0, x.1, order) as f32,
-            mesh::scalar_row(row, y.0, y.1, order) as f32,
-            mesh::scalar_row(row, z.0, z.1, order) as f32,
+            ply::scalar_row(row, x.0, x.1, order) as f32,
+            ply::scalar_row(row, y.0, y.1, order) as f32,
+            ply::scalar_row(row, z.0, z.1, order) as f32,
         ]);
         if let Some(n) = normals {
             out.normals.push([
-                mesh::scalar_row(row, n[0].0, n[0].1, order) as f32,
-                mesh::scalar_row(row, n[1].0, n[1].1, order) as f32,
-                mesh::scalar_row(row, n[2].0, n[2].1, order) as f32,
+                ply::scalar_row(row, n[0].0, n[0].1, order) as f32,
+                ply::scalar_row(row, n[1].0, n[1].1, order) as f32,
+                ply::scalar_row(row, n[2].0, n[2].1, order) as f32,
             ]);
         }
         if let Some(c) = colors {
             out.colors.push([
-                mesh::color_row(row, c[0].0, c[0].1, order),
-                mesh::color_row(row, c[1].0, c[1].1, order),
-                mesh::color_row(row, c[2].0, c[2].1, order),
+                ply::color_row(row, c[0].0, c[0].1, order),
+                ply::color_row(row, c[1].0, c[1].1, order),
+                ply::color_row(row, c[2].0, c[2].1, order),
             ]);
         }
     }
@@ -641,22 +642,22 @@ fn parse_binary_vertices_stride(
         let base = *cursor + index * stride;
         let row = &body[base..base + stride];
         out.positions.push([
-            mesh::scalar_row(row, x.0, x.1, order) as f32,
-            mesh::scalar_row(row, y.0, y.1, order) as f32,
-            mesh::scalar_row(row, z.0, z.1, order) as f32,
+            ply::scalar_row(row, x.0, x.1, order) as f32,
+            ply::scalar_row(row, y.0, y.1, order) as f32,
+            ply::scalar_row(row, z.0, z.1, order) as f32,
         ]);
         if let Some(n) = normals {
             out.normals.push([
-                mesh::scalar_row(row, n[0].0, n[0].1, order) as f32,
-                mesh::scalar_row(row, n[1].0, n[1].1, order) as f32,
-                mesh::scalar_row(row, n[2].0, n[2].1, order) as f32,
+                ply::scalar_row(row, n[0].0, n[0].1, order) as f32,
+                ply::scalar_row(row, n[1].0, n[1].1, order) as f32,
+                ply::scalar_row(row, n[2].0, n[2].1, order) as f32,
             ]);
         }
         if let Some(c) = colors {
             out.colors.push([
-                mesh::color_row(row, c[0].0, c[0].1, order),
-                mesh::color_row(row, c[1].0, c[1].1, order),
-                mesh::color_row(row, c[2].0, c[2].1, order),
+                ply::color_row(row, c[0].0, c[0].1, order),
+                ply::color_row(row, c[1].0, c[1].1, order),
+                ply::color_row(row, c[2].0, c[2].1, order),
             ]);
         }
         index += step;
@@ -695,7 +696,7 @@ fn parse_ascii_chunked(
         for element in elements {
             if element.name == "vertex" {
                 for _ in 0..element.count {
-                    mesh::next_record_line(body, &mut cursor).ok_or(BODY_END)?;
+                    ply::next_record_line(body, &mut cursor).ok_or(BODY_END)?;
                 }
                 continue;
             }
@@ -711,7 +712,7 @@ fn parse_ascii_chunked(
                 continue;
             }
             for _ in 0..element.count {
-                mesh::next_record_line(body, &mut cursor).ok_or(BODY_END)?;
+                ply::next_record_line(body, &mut cursor).ok_or(BODY_END)?;
             }
         }
 
@@ -735,7 +736,7 @@ fn parse_ascii_chunked(
                 continue;
             }
             for _ in 0..element.count {
-                mesh::next_record_line(body, &mut cursor).ok_or(BODY_END)?;
+                ply::next_record_line(body, &mut cursor).ok_or(BODY_END)?;
             }
         }
 
@@ -767,7 +768,7 @@ fn parse_ascii_chunked(
                 continue;
             }
             for _ in 0..element.count {
-                mesh::next_record_line(body, &mut cursor).ok_or(BODY_END)?;
+                ply::next_record_line(body, &mut cursor).ok_or(BODY_END)?;
             }
         }
     }
@@ -787,19 +788,19 @@ fn collect_ascii_faces(
     let step = lod_step as usize;
 
     for (face_id, _) in (0..element.count).enumerate() {
-        let line = mesh::next_record_line(body, cursor).ok_or(BODY_END)?;
+        let line = ply::next_record_line(body, cursor).ok_or(BODY_END)?;
         if !face_id.is_multiple_of(step) {
             continue;
         }
 
-        let mut tokens = mesh::Tokens::new(line);
-        let length = mesh::token_f64(tokens.next_token().ok_or(BODY_END)?)
+        let mut tokens = ply::Tokens::new(line);
+        let length = ply::token_f64(tokens.next_token().ok_or(BODY_END)?)
             .ok_or(BODY_END)?
             .max(0.0) as usize;
         let mut face = Vec::with_capacity(length);
         for _ in 0..length {
             let index =
-                mesh::token_f64(tokens.next_token().ok_or(BODY_END)?).ok_or(BODY_END)? as u32;
+                ply::token_f64(tokens.next_token().ok_or(BODY_END)?).ok_or(BODY_END)? as u32;
             face.push(index);
             if (index as usize) < referenced.len() {
                 referenced[index as usize] = 1;
@@ -851,11 +852,11 @@ fn parse_ascii_vertices_remapped(
 
     for new_index in remap.iter() {
         if *new_index == u32::MAX {
-            mesh::next_record_line(body, cursor).ok_or(BODY_END)?;
+            ply::next_record_line(body, cursor).ok_or(BODY_END)?;
             continue;
         }
-        let line = mesh::next_record_line(body, cursor).ok_or(BODY_END)?;
-        let mut tokens = mesh::Tokens::new(line);
+        let line = ply::next_record_line(body, cursor).ok_or(BODY_END)?;
+        let mut tokens = ply::Tokens::new(line);
         let Some(first) = tokens.next_token() else {
             continue;
         };
@@ -868,7 +869,7 @@ fn parse_ascii_vertices_remapped(
             }
             let slot = plan[column];
             if slot != 0 {
-                record[(slot - 1) as usize] = mesh::token_f64(value).ok_or(BODY_END)?;
+                record[(slot - 1) as usize] = ply::token_f64(value).ok_or(BODY_END)?;
             }
             column += 1;
             token = tokens.next_token();
@@ -884,9 +885,9 @@ fn parse_ascii_vertices_remapped(
         }
         if let Some([r, g, b]) = cols.colors {
             out.colors.push([
-                mesh::unit_colour(record[6], element.properties[r].ty),
-                mesh::unit_colour(record[7], element.properties[g].ty),
-                mesh::unit_colour(record[8], element.properties[b].ty),
+                ply::unit_colour(record[6], element.properties[r].ty),
+                ply::unit_colour(record[7], element.properties[g].ty),
+                ply::unit_colour(record[8], element.properties[b].ty),
             ]);
         }
     }
@@ -927,12 +928,12 @@ fn parse_ascii_vertices_stride(
     let step = lod_step as usize;
 
     for (vertex_id, _) in (0..element.count).enumerate() {
-        let line = mesh::next_record_line(body, cursor).ok_or(BODY_END)?;
+        let line = ply::next_record_line(body, cursor).ok_or(BODY_END)?;
         if !vertex_id.is_multiple_of(step) {
             continue;
         }
 
-        let mut tokens = mesh::Tokens::new(line);
+        let mut tokens = ply::Tokens::new(line);
         let Some(first) = tokens.next_token() else {
             continue;
         };
@@ -945,7 +946,7 @@ fn parse_ascii_vertices_stride(
             }
             let slot = plan[column];
             if slot != 0 {
-                record[(slot - 1) as usize] = mesh::token_f64(value).ok_or(BODY_END)?;
+                record[(slot - 1) as usize] = ply::token_f64(value).ok_or(BODY_END)?;
             }
             column += 1;
             token = tokens.next_token();
@@ -961,9 +962,9 @@ fn parse_ascii_vertices_stride(
         }
         if let Some([r, g, b]) = cols.colors {
             out.colors.push([
-                mesh::unit_colour(record[6], element.properties[r].ty),
-                mesh::unit_colour(record[7], element.properties[g].ty),
-                mesh::unit_colour(record[8], element.properties[b].ty),
+                ply::unit_colour(record[6], element.properties[r].ty),
+                ply::unit_colour(record[7], element.properties[g].ty),
+                ply::unit_colour(record[8], element.properties[b].ty),
             ]);
         }
     }
@@ -974,7 +975,7 @@ fn parse_ascii_vertices_stride(
 // Shared helpers
 // ---------------------------------------------------------------------------
 
-/// Resolve the vertex columns; mirrors `mesh::vertex_columns`.
+/// Resolve the vertex columns; mirrors `formats::ply::vertex_columns`.
 fn vertex_columns(properties: &[PlyProperty]) -> Option<VertexColumns> {
     let scalar = |name: &str| {
         properties
@@ -1081,7 +1082,7 @@ mod tests {
         let path = dir.join("test.ply");
         write_binary_cloud(&path, 1000);
 
-        let stock = mesh::load_ply(&std::fs::read(&path).unwrap()).unwrap();
+        let stock = ply::load_ply(&std::fs::read(&path).unwrap()).unwrap();
         let chunked = load_ply_chunked(&path, LodConfig::default()).unwrap();
 
         assert_eq!(chunked.positions.len(), stock.positions.len());
@@ -1095,7 +1096,7 @@ mod tests {
         let path = dir.join("grid.ply");
         write_binary_mesh(&path, 100);
 
-        let stock = mesh::load_ply(&std::fs::read(&path).unwrap()).unwrap();
+        let stock = ply::load_ply(&std::fs::read(&path).unwrap()).unwrap();
         let chunked = load_ply_chunked(&path, LodConfig::default()).unwrap();
 
         assert!(!stock.is_point_cloud());
@@ -1118,7 +1119,7 @@ mod tests {
             max_lod_step: 16,
         };
         let chunked = load_ply_chunked(&path, config).unwrap();
-        let stock = mesh::load_ply(&std::fs::read(&path).unwrap()).unwrap();
+        let stock = ply::load_ply(&std::fs::read(&path).unwrap()).unwrap();
 
         assert!(chunked.positions.len() < stock.positions.len());
         assert!(chunked.triangles.len() < stock.triangles.len());

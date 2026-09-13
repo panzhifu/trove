@@ -47,6 +47,33 @@ pub(super) fn general_page(
                 )
                 .item(
                     SettingItem::new(
+                        rust_i18n::t!("settings.import_link_over").to_string(),
+                        SettingField::input(
+                            |_cx| {
+                                SharedString::from(
+                                    AppConfig::load()
+                                        .import_link_over_mb
+                                        .unwrap_or(trove_core::media::import::LINK_OVER_MB_DEFAULT)
+                                        .to_string(),
+                                )
+                            },
+                            |value, cx| {
+                                let mut config = AppConfig::load();
+                                // An unparsable box keeps the stored value
+                                // rather than silently turning the rule off.
+                                if let Ok(mb) = value.trim().parse::<u64>() {
+                                    config.import_link_over_mb = Some(mb);
+                                    if config.save().is_ok() {
+                                        cx.refresh_windows();
+                                    }
+                                }
+                            },
+                        ),
+                    )
+                    .description(rust_i18n::t!("settings.import_link_over_desc").to_string()),
+                )
+                .item(
+                    SettingItem::new(
                         rust_i18n::t!("settings.font_sample").to_string(),
                         SettingField::input(
                             |_cx| SharedString::from(AppConfig::load().font_sample_text()),
@@ -78,6 +105,13 @@ pub(super) fn general_page(
                         ),
                     )
                     .description(rust_i18n::t!("settings.screenshot_command_desc").to_string()),
+                )
+                .item(
+                    SettingItem::new(
+                        rust_i18n::t!("settings.point_enhance").to_string(),
+                        SettingField::render(|_, _, cx| point_enhance_row(cx)),
+                    )
+                    .description(rust_i18n::t!("settings.point_enhance_desc").to_string()),
                 ),
         )
         .group(recent_libraries_group(&controller))
@@ -223,6 +257,30 @@ fn watch_toggle_row(enabled: bool, _cx: &mut App) -> Div {
             .on_click(|_, _, cx| {
                 let mut config = AppConfig::load();
                 config.watch_folders_enabled = Some(!config.watch_folders_enabled());
+                let _ = config.save();
+                cx.refresh_windows();
+            }),
+    )
+}
+
+/// Toggle for the point-cloud preview's eye-dome lighting and gap filling.
+///
+/// The viewport re-reads the config each frame, so flipping this reaches a
+/// preview that is already open.
+fn point_enhance_row(_cx: &mut App) -> Div {
+    let enabled = AppConfig::load().point_enhance();
+    h_flex().w_full().justify_end().child(
+        Button::new("point-enhance-toggle")
+            .outline()
+            .small()
+            .label(if enabled {
+                rust_i18n::t!("settings.enhance_on").to_string()
+            } else {
+                rust_i18n::t!("settings.enhance_off").to_string()
+            })
+            .on_click(|_, _, cx| {
+                let mut config = AppConfig::load();
+                config.point_enhance = Some(!config.point_enhance());
                 let _ = config.save();
                 cx.refresh_windows();
             }),

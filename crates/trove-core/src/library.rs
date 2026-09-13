@@ -320,6 +320,28 @@ impl Library {
         path.is_file().then_some(path)
     }
 
+    /// Open the file behind `id` with an external application.
+    ///
+    /// `None` hands the file to the system default program for its type;
+    /// `Some(app_path)` opens it with that specific application. Returns the
+    /// resolved path on success so callers can report which file was opened.
+    pub fn open_in_external(
+        &self,
+        id: Uuid,
+        app_path: Option<&Path>,
+    ) -> Result<std::path::PathBuf> {
+        let path = self
+            .asset_file(id)
+            .ok_or(crate::error::Error::NotFound("asset file"))?;
+        let target = match app_path {
+            Some(p) => crate::services::open_external::OpenTarget::With(p),
+            None => crate::services::open_external::OpenTarget::Default,
+        };
+        crate::services::open_external::open(&path, target)
+            .map_err(|e| crate::error::Error::Io(std::io::Error::other(e)))?;
+        Ok(path)
+    }
+
     /// Import files, optionally into a collection. See
     /// [`media::import::import_files`] for semantics.
     /// Imported assets are added directly to "All Assets" unless a target
@@ -1274,7 +1296,7 @@ mod tests {
 
     #[test]
     fn relink_asset_repoints_a_moved_file() {
-        use crate::media::import::{commit_staged_all, stage_all};
+        use crate::media::import::{ImportPolicy, commit_staged_all, stage_all};
         use crate::model::Origin;
 
         let (lib, root) = temp_library("relink");
@@ -1284,7 +1306,14 @@ mod tests {
         std::fs::write(&src, PNG_1X1).unwrap();
 
         // Import as linked (file stays in place).
-        let staged = stage_all(&root, std::slice::from_ref(&src), true);
+        let staged = stage_all(
+            &root,
+            std::slice::from_ref(&src),
+            ImportPolicy {
+                link_all: true,
+                ..Default::default()
+            },
+        );
         let report = commit_staged_all(lib.store().conn(), None, staged);
         assert_eq!(report.imported_count(), 1);
         let conn = lib.store().conn();

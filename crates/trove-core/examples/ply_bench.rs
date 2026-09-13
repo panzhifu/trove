@@ -3,7 +3,7 @@
 //! Times the three stages a PLY asset goes through in trove, separately:
 //!
 //! * `read`   — `std::fs::read`, the whole file into one `Vec<u8>`
-//! * `parse`  — `mesh::load_ply`, bytes into a `Mesh`
+//! * `parse`  — `formats::load_ply`, bytes into a `Mesh`
 //! * `render` — `render3d::render`, the 512x384 card the library grid shows
 //!   (supersample 2, exactly what `thumb::write_model_card` asks for)
 //!
@@ -20,7 +20,7 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use trove_core::media::{mesh, render3d};
+use trove_core::media::{formats, render3d};
 
 /// The card size `thumb::write_model_card` renders at.
 const CARD: (u32, u32) = (512, 384);
@@ -118,7 +118,7 @@ fn measure(path: &Path, options: &Options) -> Result<Report, String> {
     // paying for all of it.
     {
         let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
-        let warm = mesh::load_ply(&bytes)?;
+        let warm = formats::load_ply(&bytes)?;
         std::hint::black_box(&warm);
     }
 
@@ -134,7 +134,7 @@ fn measure(path: &Path, options: &Options) -> Result<Report, String> {
         reads.push(started.elapsed());
 
         let started = Instant::now();
-        let model = mesh::load_ply(&bytes)?;
+        let model = formats::load_ply(&bytes)?;
         parses.push(started.elapsed());
         primitives = model.primitive_count();
         point_cloud = model.is_point_cloud();
@@ -182,7 +182,7 @@ fn main() {
         let before = peak_rss().unwrap_or(0);
         match std::fs::read(path)
             .map_err(|e| e.to_string())
-            .and_then(|bytes| mesh::load_ply(&bytes))
+            .and_then(|bytes| formats::load_ply(&bytes))
         {
             Ok(model) => {
                 let after = peak_rss().unwrap_or(0);

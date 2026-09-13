@@ -6,4 +6,5 @@ pub mod backup;
 pub mod collect;
 pub mod font_manager;
 pub mod maintenance;
+pub mod open_external;
 pub mod screenshot;

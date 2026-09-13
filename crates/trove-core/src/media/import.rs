@@ -97,18 +97,52 @@ pub fn import_files(
     Ok(commit_staged_all(
         store.conn(),
         into_collection,
-        stage_all(root, sources, false),
+        stage_all(root, sources, ImportPolicy::default()),
     ))
+}
+
+/// Size from which a source is linked where it lies instead of being copied
+/// into the library, in MiB.
+///
+/// A twenty-gigabyte model duplicated into the store costs the user twenty
+/// gigabytes of disk for nothing: the thumbnail and the viewport both read the
+/// original, and the library only needs to remember where it is.
+pub const LINK_OVER_MB_DEFAULT: u64 = 500;
+
+/// How an import stores its sources.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ImportPolicy {
+    /// Link everything, never copy — the user's own preference.
+    pub link_all: bool,
+    /// Link anything at least this large, whatever the preference says. `0`
+    /// turns the rule off.
+    pub link_over: u64,
+}
+
+impl Default for ImportPolicy {
+    fn default() -> Self {
+        Self {
+            link_all: false,
+            link_over: LINK_OVER_MB_DEFAULT << 20,
+        }
+    }
+}
+
+impl ImportPolicy {
+    /// Whether one source file is referenced where it is rather than copied.
+    pub fn links(&self, size: u64) -> bool {
+        self.link_all || (self.link_over > 0 && size >= self.link_over)
+    }
 }
 
 /// Phase one for a batch: stage every source file (copy + hash + probe + thumbnail).
 /// Pure filesystem work, safe to run on a background thread. Individual
 /// failures never abort the batch; they are collected as [`ImportSkip`]s.
-/// With `linked = true` the files are hashed + probed but *not* copied.
+/// Sources the policy links are hashed + probed but *not* copied.
 pub fn stage_all(
     root: &Path,
     sources: &[PathBuf],
-    linked: bool,
+    policy: ImportPolicy,
 ) -> Vec<std::result::Result<StagedFile, ImportSkip>> {
     use rayon::prelude::*;
 
@@ -119,7 +153,7 @@ pub fn stage_all(
     sources
         .par_iter()
         .map(|src| {
-            stage_source(root, src, linked).map_err(|e| ImportSkip {
+            stage_source(root, src, policy).map_err(|e| ImportSkip {
                 path: src.clone(),
                 reason: e.to_string(),
             })
@@ -153,10 +187,14 @@ pub fn commit_staged_all(
 }
 
 /// Phase one (slow, pure I/O): hash + probe one source file, copying it into
-/// the media store unless `linked` is set (then the file stays where it is
+/// the media store unless the policy links it (then the file stays where it is
 /// and the record points at its original location).
-pub fn stage_source(root: &Path, src: &Path, linked: bool) -> Result<StagedFile> {
+pub fn stage_source(root: &Path, src: &Path, policy: ImportPolicy) -> Result<StagedFile> {
     let file_name = file_name_of(src)?;
+    // The decision needs the size, which costs one stat: a huge model is
+    // linked even when the user's preference is to copy everything.
+    let size = std::fs::metadata(src).map(|m| m.len()).unwrap_or(0);
+    let linked = policy.links(size);
     let ext = probe::normalize_ext(
         &src.extension()
             .map(|e| e.to_string_lossy().to_string())
@@ -360,7 +398,11 @@ mod tests {
         let missing = root.join("nope.png");
 
         // Phase one: staging collects failures instead of aborting the batch.
-        let staged = stage_all(&root, &[good.clone(), missing.clone()], false);
+        let staged = stage_all(
+            &root,
+            &[good.clone(), missing.clone()],
+            ImportPolicy::default(),
+        );
         assert_eq!(staged.len(), 2);
         assert!(staged[0].is_ok());
         assert!(staged[1].is_err());
@@ -378,7 +420,7 @@ mod tests {
         assert_eq!(roots.len(), 0, "no auto-collection should be created");
 
         // Re-importing identical content dedupes (reused = true).
-        let staged2 = stage_all(&root, &[good], false);
+        let staged2 = stage_all(&root, &[good], ImportPolicy::default());
         let report2 = commit_staged_all(store.conn(), None, staged2);
         assert_eq!(report2.imported_count(), 1);
         assert!(report2.imported[0].reused);
@@ -397,7 +439,14 @@ mod tests {
         let src = outside.join("linked.png");
         std::fs::write(&src, PNG_1X1).unwrap();
 
-        let staged = stage_all(&root, std::slice::from_ref(&src), true);
+        let staged = stage_all(
+            &root,
+            std::slice::from_ref(&src),
+            ImportPolicy {
+                link_all: true,
+                ..Default::default()
+            },
+        );
         assert!(staged[0].is_ok(), "{:?}", staged[0].as_ref().err());
         let report = commit_staged_all(store.conn(), None, staged);
         assert_eq!(report.imported_count(), 1);

@@ -18,15 +18,59 @@
 
 use std::sync::mpsc;
 
+use trove_core::media::formats::meshlet::{self, Meshlet};
+use trove_core::media::formats::types::{Mesh, Winding};
 use trove_core::media::gpu::{self, UNIFORM_SIZE, Uniforms};
-use trove_core::media::mesh::Mesh;
 use trove_core::media::render3d::{self, Framing};
 
-/// Off-screen colour format: plain 8-bit RGBA, so the bytes read back are the
-/// perceptual values the shader wrote — the same ones the CPU path emits.
-const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
+/// Colour formats this renderer can use, in order of preference.
+///
+/// `Bgra8Unorm` first: it is what gpui's images hold, so a frame read back from
+/// it needs no per-pixel swizzle. Both are 8-bit unorm, so the shader writes
+/// the same perceptual values either way — the CPU path's output is matched by
+/// construction.
+const COLOR_FORMATS: [wgpu::TextureFormat; 2] = [
+    wgpu::TextureFormat::Bgra8Unorm,
+    wgpu::TextureFormat::Rgba8Unorm,
+];
 /// Depth buffer for the model pass.
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
+
+/// The read-back order of a frame rendered in `format`, for [`gpu::unpack_bgra`].
+fn pixel_order(format: wgpu::TextureFormat) -> gpu::PixelOrder {
+    match format {
+        wgpu::TextureFormat::Bgra8Unorm => gpu::PixelOrder::Bgra,
+        _ => gpu::PixelOrder::Rgba,
+    }
+}
+
+/// Choose the colour format and the MSAA sample count together.
+///
+/// Multisampling is where a model's silhouette aliases worst, and the BGRA
+/// format saves a swizzle on every interactive frame — but neither is worth
+/// losing the renderer over, so the order is: the preferred format with MSAA,
+/// the other format with MSAA, and finally the preferred format without.
+fn choose_format_and_samples(adapter: &wgpu::Adapter) -> (wgpu::TextureFormat, u32) {
+    let supports = |format: wgpu::TextureFormat, count: u32| {
+        adapter
+            .get_texture_format_features(format)
+            .flags
+            .sample_count_supported(count)
+            && adapter
+                .get_texture_format_features(DEPTH_FORMAT)
+                .flags
+                .sample_count_supported(count)
+    };
+    let best =
+        |format: wgpu::TextureFormat| [4u32, 2].into_iter().find(|&count| supports(format, count));
+
+    let [preferred, fallback] = COLOR_FORMATS;
+    match (best(preferred), best(fallback)) {
+        (Some(count), _) => (preferred, count),
+        (None, Some(count)) => (fallback, count),
+        (None, None) => (preferred, 1),
+    }
+}
 
 const SHADER: &str = include_str!("gpu3d.wgsl");
 
@@ -60,23 +104,160 @@ pub struct GpuMesh {
     index_count: u32,
     /// Points to draw; `0` when this is a triangle mesh.
     point_count: u32,
+    /// The mesh is a closed, consistently wound surface, so its back faces are
+    /// hidden by its front ones and can be culled instead of shaded. Open
+    /// shells and inside-out files keep both faces.
+    cull_backfaces: bool,
+    /// Spatial clusters of triangles, when the mesh was large enough to be
+    /// partitioned. Each is one draw call the frustum can skip; empty means
+    /// "draw the whole index buffer in one call".
+    meshlets: Vec<Meshlet>,
+}
+
+impl GpuMesh {
+    /// Index ranges to draw for `framing`, or `None` for the whole buffer in
+    /// one call.
+    ///
+    /// `None` when the mesh was not partitioned, and when every cluster is
+    /// visible — one draw beats thousands when the culling has nothing to
+    /// skip. An empty `Some` means nothing is on screen at all.
+    fn visible_meshlets(&self, framing: &Framing) -> Option<Vec<std::ops::Range<u32>>> {
+        if self.meshlets.is_empty() {
+            return None;
+        }
+        let frustum = framing.frustum();
+        let ranges: Vec<std::ops::Range<u32>> = self
+            .meshlets
+            .iter()
+            .filter(|meshlet| frustum.intersects_bounds(&meshlet.bounds))
+            .map(Meshlet::index_range)
+            .collect();
+        (ranges.len() != self.meshlets.len()).then_some(ranges)
+    }
+}
+
+/// Off-screen targets for one viewport size, reused across frames.
+///
+/// A 1080p viewport with 4× MSAA is roughly 40 MB of textures plus an 8 MB
+/// read-back buffer; allocating and freeing that every frame is driver churn
+/// the preview does not need, and the camera moves often enough that it would
+/// happen many times a second.
+struct Targets {
+    width: u32,
+    height: u32,
+    /// MSAA count the textures were created with; the pipeline has to match.
+    samples: u32,
+    /// Resolve target, and the copy source.
+    color: wgpu::Texture,
+    color_view: wgpu::TextureView,
+    /// Multisampled target the pass draws into, when MSAA is on.
+    msaa: Option<(wgpu::Texture, wgpu::TextureView)>,
+    /// Held (not read) so the depth texture outlives the view of it. It is
+    /// also sampled by the post pass, which is why it outlives the view.
+    _depth: wgpu::Texture,
+    depth_view: wgpu::TextureView,
+    /// Where the eye-dome lighting pass writes, and what the read-back copies
+    /// when it ran. `None` on a single-sampled frame, where there is no
+    /// multisampled depth for the post pass to read.
+    edl_color: Option<(wgpu::Texture, wgpu::TextureView)>,
+    /// The depth and resolved colour the post pass reads. `None` with it.
+    edl_bind_group: Option<wgpu::BindGroup>,
+    staging: wgpu::Buffer,
+}
+
+/// The draw pipelines for one multisample count.
+///
+/// Two model pipelines, because back-face culling is a per-mesh decision: a
+/// closed surface is drawn with its back faces culled, an open shell with
+/// both. The point and backdrop pipelines are unaffected.
+struct Pipelines {
+    /// Model pipeline for a closed, outward-wound mesh.
+    model_culled: wgpu::RenderPipeline,
+    /// Model pipeline that draws both faces.
+    model_two_sided: wgpu::RenderPipeline,
+    point: wgpu::RenderPipeline,
+    backdrop: wgpu::RenderPipeline,
 }
 
 /// Device, pipelines and the resources shared by every frame.
 pub struct GpuRenderer {
     device: wgpu::Device,
     queue: wgpu::Queue,
-    model_pipeline: wgpu::RenderPipeline,
-    point_pipeline: wgpu::RenderPipeline,
-    backdrop_pipeline: wgpu::RenderPipeline,
+    /// Pipelines for a settled frame, at the adapter's best sample count.
+    pipelines: Pipelines,
+    /// Single-sampled pipelines for frames drawn while the pointer is down.
+    /// `None` when the adapter cannot multisample at all, in which case
+    /// `pipelines` is already single-sampled.
+    interactive_pipelines: Option<Pipelines>,
     uniforms: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
-    /// MSAA sample count, resolved from the adapter's capabilities. 1 when the
-    /// format cannot be multisampled; a model's silhouette is where aliasing
-    /// shows worst, so this is worth asking for.
+    /// Layout of the post pass's depth + resolved-colour bindings. Separate
+    /// from the uniform-only layout the draw pipelines use, because only the
+    /// post pass reads those two textures.
+    edl_bind_group_layout: wgpu::BindGroupLayout,
+    /// Eye-dome lighting and gap filling over a settled point-cloud frame.
+    /// The CPU rasteriser's `render3d::enhance_points`, as a full-screen pass.
+    edl_pipeline: wgpu::RenderPipeline,
+    /// Colour format every target and pipeline uses, chosen so the read-back
+    /// needs no swizzle where the adapter allows it.
+    format: wgpu::TextureFormat,
+    /// MSAA sample count of `pipelines`; 1 when the adapter cannot
+    /// multisample. A model's silhouette is where aliasing shows worst, so
+    /// this is worth asking for.
     samples: u32,
+    /// Current off-screen targets, rebuilt only when the viewport is resized.
+    targets: std::sync::Mutex<Option<Targets>>,
     /// Adapter description, shown in the status line.
     pub adapter: String,
+}
+
+/// What the chosen device supports, in the terms this renderer cares about.
+///
+/// Printed once at start-up: on a machine whose GPU is not what it looks like
+/// (a software rasteriser, no MSAA, no 64-bit atomics) this is the one place
+/// that says so, and the next stage of the large-model work reads
+/// `int64_atomics` to choose between its packed-buffer and fallback paths.
+#[derive(Debug, Clone)]
+pub struct DeviceCaps {
+    /// 64-bit `atomicMin`/`atomicMax` in shaders, which is what a packed
+    /// depth-and-attribute buffer needs (Nimbus leans on NVIDIA's
+    /// `atomic_int64` extension for exactly that trick). This is what the
+    /// *adapter offers*: the device requests it when a path needs it, and
+    /// without it that path has to fall back to a 32-bit depth buffer plus a
+    /// resolve pass over every point.
+    pub int64_atomics: bool,
+    /// Largest storage-buffer binding, which bounds how many points can be
+    /// resident in one buffer.
+    pub max_storage_buffer: u64,
+    /// Largest single buffer allocation.
+    pub max_buffer: u64,
+    /// MSAA count settled frames are drawn with.
+    pub samples: u32,
+    /// Colour format of every target.
+    pub format: wgpu::TextureFormat,
+    /// Adapter kind, so a software or integrated device is visible here.
+    pub device_type: wgpu::DeviceType,
+}
+
+impl DeviceCaps {
+    /// One line for the status line.
+    pub fn summary(&self) -> String {
+        format!(
+            "{} · {}× MSAA · {:?} · storage {} MiB · buffer {} MiB · u64 atomics {}",
+            match self.device_type {
+                wgpu::DeviceType::DiscreteGpu => "discrete GPU",
+                wgpu::DeviceType::IntegratedGpu => "integrated GPU",
+                wgpu::DeviceType::VirtualGpu => "virtual GPU",
+                wgpu::DeviceType::Cpu => "software",
+                wgpu::DeviceType::Other => "other",
+            },
+            self.samples,
+            self.format,
+            self.max_storage_buffer >> 20,
+            self.max_buffer >> 20,
+            if self.int64_atomics { "yes" } else { "no" },
+        )
+    }
 }
 
 impl GpuRenderer {
@@ -84,9 +265,18 @@ impl GpuRenderer {
     /// the UI thread.
     pub fn new() -> Result<Self, GpuUnavailable> {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-            // Vulkan first — that is what the desktop drivers expose — with
-            // GLES as the fallback for older or software setups.
-            backends: wgpu::Backends::VULKAN | wgpu::Backends::GL,
+            // Every backend the platform can offer, not just Vulkan/GL: the
+            // instance is what decides which adapters exist at all, so asking
+            // for Vulkan and GL alone means no Metal on macOS and no D3D12 on
+            // Windows — the viewport would silently render on the CPU there.
+            //
+            // GL is deliberately *not* asked for. It is the one backend that
+            // goes through EGL on X11, and probing it costs a display
+            // initialisation that fails noisily on machines whose Mesa has no
+            // driver for the GPU (`failed to create dri2 screen`); the only
+            // adapter it could add is a software rasteriser, which this
+            // renderer refuses anyway (see `GpuUnavailable::Software`).
+            backends: wgpu::Backends::PRIMARY,
             flags: wgpu::InstanceFlags::default(),
             backend_options: wgpu::BackendOptions::default(),
             memory_budget_thresholds: wgpu::MemoryBudgetThresholds::default(),
@@ -97,67 +287,99 @@ impl GpuRenderer {
         // `HighPerformance` hint can still hand us the integrated GPU, so
         // enumerate every adapter and pick the discrete one. The fallback
         // chain: discrete → non-software → whatever is there.
-        let mut adapters: Vec<wgpu::Adapter> =
+        let adapters: Vec<wgpu::Adapter> =
             gpui_kit::block_on(instance.enumerate_adapters(wgpu::Backends::all()));
         if adapters.is_empty() {
+            // Worth printing: "no adapter" is the answer to "why is this
+            // rendering on the CPU", and it is not visible anywhere else.
+            eprintln!(
+                "trove: no graphics adapter found on Vulkan/D3D12/Metal — on Linux this \
+                 usually means no working Vulkan driver (`vulkaninfo --summary` says so)"
+            );
             return Err(GpuUnavailable::NoAdapter);
         }
         let info = adapters.iter().map(|a| a.get_info()).collect::<Vec<_>>();
-        let pick = {
-            // 1) A discrete GPU (NVIDIA / AMD) beats everything else.
-            let discrete = info
-                .iter()
-                .position(|i| i.device_type == wgpu::DeviceType::DiscreteGpu);
-            // 2) Otherwise an integrated GPU (Intel Iris Xe etc).  Only when
-            //    there is neither a discrete nor an integrated adapter do we
-            //    fall back to a software rasteriser, which we then refuse.
-            let integrated = info
-                .iter()
-                .position(|i| i.device_type == wgpu::DeviceType::IntegratedGpu);
-            discrete.or(integrated).unwrap_or(0)
-        };
-        let adapter = adapters.swap_remove(pick);
-        let info = adapter.get_info();
-        if info.device_type == wgpu::DeviceType::Cpu {
-            // A software rasterizer is slower than the CPU path we already have.
-            return Err(GpuUnavailable::Software(info.name));
+        // The list, every time: "there is a GPU in this machine" and "the
+        // renderer can use it" are different statements, and this is the line
+        // that tells them apart.
+        for adapter in &info {
+            eprintln!(
+                "trove: adapter found: {} · {:?} · {:?} · driver {} {}",
+                adapter.name,
+                adapter.device_type,
+                adapter.backend,
+                adapter.driver,
+                adapter.driver_info
+            );
         }
-        let adapter_name = format!("{} · {:?}", info.name, info.backend);
+        // Preference order: a discrete GPU (NVIDIA / AMD) beats an integrated
+        // one, which beats anything else; a software rasteriser is last and is
+        // refused, because the built-in CPU rasteriser is faster for a preview.
+        let rank = |info: &wgpu::AdapterInfo| match info.device_type {
+            wgpu::DeviceType::DiscreteGpu => 0,
+            wgpu::DeviceType::IntegratedGpu => 1,
+            wgpu::DeviceType::VirtualGpu => 2,
+            wgpu::DeviceType::Other => 3,
+            wgpu::DeviceType::Cpu => 4,
+        };
+        let mut order: Vec<usize> = (0..adapters.len()).collect();
+        order.sort_by_key(|index| rank(&info[*index]));
 
-        let (device, queue) = gpui_kit::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-            label: Some("trove-3d-device"),
-            required_features: wgpu::Features::empty(),
-            required_limits: adapter.limits(),
-            memory_hints: wgpu::MemoryHints::MemoryUsage,
-            trace: wgpu::Trace::Off,
-            experimental_features: wgpu::ExperimentalFeatures::disabled(),
-        }))
-        .map_err(|error| GpuUnavailable::NoDevice(error.to_string()))?;
+        // Every candidate is *tried*, not just ranked. An adapter that cannot
+        // produce a device — a hybrid laptop whose discrete node is half
+        // installed, say — must not cost the user the one that works.
+        let mut software = None;
+        let mut last_error = None;
+        let mut chosen = None;
+        for index in order {
+            let adapter = &adapters[index];
+            let candidate = adapter.get_info();
+            if candidate.device_type == wgpu::DeviceType::Cpu {
+                eprintln!(
+                    "trove: skipping the software rasteriser {} — the built-in CPU \
+                     rasteriser is faster for a preview",
+                    candidate.name
+                );
+                software.get_or_insert(candidate.name);
+                continue;
+            }
+            // Decided per candidate, from what that adapter can do.
+            let formats = choose_format_and_samples(adapter);
+            match gpui_kit::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+                label: Some("trove-3d-device"),
+                required_features: wgpu::Features::empty(),
+                required_limits: adapter.limits(),
+                memory_hints: wgpu::MemoryHints::MemoryUsage,
+                trace: wgpu::Trace::Off,
+                experimental_features: wgpu::ExperimentalFeatures::disabled(),
+            })) {
+                Ok((device, queue)) => {
+                    chosen = Some((device, queue, candidate, adapter.features(), formats));
+                    break;
+                }
+                Err(error) => {
+                    eprintln!(
+                        "trove: no device from {} ({error}); trying the next adapter",
+                        candidate.name
+                    );
+                    last_error = Some(error.to_string());
+                }
+            }
+        }
+        let Some((device, queue, info, adapter_features, (format, samples))) = chosen else {
+            // Only software was on offer, or nothing could be created at all.
+            return Err(match (software, last_error) {
+                (Some(name), _) => GpuUnavailable::Software(name),
+                (None, Some(detail)) => GpuUnavailable::NoDevice(detail),
+                (None, None) => GpuUnavailable::NoAdapter,
+            });
+        };
+        let adapter_name = format!("{} · {:?}", info.name, info.backend);
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("trove-3d"),
             source: wgpu::ShaderSource::Wgsl(SHADER.into()),
         });
-
-        // 4× MSAA where the adapter allows it, then 2×, then off. Both the
-        // colour and the depth format have to accept the count.
-        let samples = [4u32, 2]
-            .into_iter()
-            .find(|&count| {
-                adapter
-                    .get_texture_format_features(FORMAT)
-                    .flags
-                    .sample_count_supported(count)
-                    && adapter
-                        .get_texture_format_features(DEPTH_FORMAT)
-                        .flags
-                        .sample_count_supported(count)
-            })
-            .unwrap_or(1);
-        let multisample = wgpu::MultisampleState {
-            count: samples,
-            ..Default::default()
-        };
 
         let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("trove-3d"),
@@ -193,107 +415,44 @@ impl GpuRenderer {
             }],
         });
 
-        let target = |format: wgpu::TextureFormat, blend| {
-            Some(wgpu::ColorTargetState {
-                format,
-                blend,
-                write_mask: wgpu::ColorWrites::ALL,
-            })
-        };
-        // A pipeline used in a pass that has a depth attachment must declare
-        // one too; the backdrop just neither writes nor tests against it,
-        // which wgpu 29 spells as `None` for both fields.
-        let depth_stencil = |write: bool| {
-            Some(wgpu::DepthStencilState {
-                format: DEPTH_FORMAT,
-                depth_write_enabled: Some(write),
-                depth_compare: write.then_some(wgpu::CompareFunction::Less),
-                stencil: wgpu::StencilState::default(),
-                bias: wgpu::DepthBiasState::default(),
-            })
-        };
-
-        let attributes = wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3];
-        let model_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("trove-3d-model"),
-            layout: Some(&pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs_model"),
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-                buffers: &[wgpu::VertexBufferLayout {
-                    array_stride: render3d::VertexData::STRIDE,
-                    step_mode: wgpu::VertexStepMode::Vertex,
-                    attributes: &attributes,
-                }],
-            },
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleList,
-                strip_index_format: None,
-                front_face: wgpu::FrontFace::Ccw,
-                // Shading is two-sided, so nothing is culled: open meshes and
-                // inside-out exports both stay visible.
-                cull_mode: None,
-                unclipped_depth: false,
-                polygon_mode: wgpu::PolygonMode::Fill,
-                conservative: false,
-            },
-            depth_stencil: depth_stencil(true),
-            multisample,
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("fs_model"),
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-                targets: &[target(FORMAT, Some(wgpu::BlendState::REPLACE))],
-            }),
-            multiview_mask: None,
-            cache: None,
+        // The point-cloud post pass reads the multisampled depth attachment
+        // and the resolved colour, so it needs a layout of its own. It is
+        // single-sampled and has no depth attachment of its own: it only ever
+        // runs on the settled, multisampled frame.
+        let edl_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("trove-3d-edl"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Depth,
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: true,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                ],
+            });
+        let edl_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("trove-3d-edl"),
+            bind_group_layouts: &[Some(&layout), Some(&edl_bind_group_layout)],
+            immediate_size: 0,
         });
-
-        // Points: the sprite corners come from the shader's `vertex_index`, so
-        // the only vertex buffer holds one instance per point — position,
-        // normal and the point's own colour.
-        let point_attributes =
-            wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x3];
-        let point_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("trove-3d-points"),
-            layout: Some(&pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs_point"),
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-                buffers: &[wgpu::VertexBufferLayout {
-                    array_stride: render3d::PointData::STRIDE,
-                    step_mode: wgpu::VertexStepMode::Instance,
-                    attributes: &point_attributes,
-                }],
-            },
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleList,
-                strip_index_format: None,
-                front_face: wgpu::FrontFace::Ccw,
-                // Sprites turn to face the camera, but the pair of triangles
-                // they are built from can wind either way on screen.
-                cull_mode: None,
-                unclipped_depth: false,
-                polygon_mode: wgpu::PolygonMode::Fill,
-                conservative: false,
-            },
-            depth_stencil: depth_stencil(true),
-            multisample,
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("fs_point"),
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-                targets: &[target(FORMAT, Some(wgpu::BlendState::REPLACE))],
-            }),
-            multiview_mask: None,
-            cache: None,
-        });
-
-        let backdrop_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("trove-3d-backdrop"),
-            layout: Some(&pipeline_layout),
+        let edl_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("trove-3d-edl"),
+            layout: Some(&edl_pipeline_layout),
             vertex: wgpu::VertexState {
                 module: &shader,
                 entry_point: Some("vs_backdrop"),
@@ -301,32 +460,350 @@ impl GpuRenderer {
                 buffers: &[],
             },
             primitive: wgpu::PrimitiveState::default(),
-            depth_stencil: depth_stencil(false),
-            multisample,
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
             fragment: Some(wgpu::FragmentState {
                 module: &shader,
-                entry_point: Some("fs_backdrop"),
+                entry_point: Some("fs_edl"),
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
-                targets: &[target(FORMAT, Some(wgpu::BlendState::REPLACE))],
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend: Some(wgpu::BlendState::REPLACE),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
             }),
             multiview_mask: None,
             cache: None,
         });
 
+        // Built once per sample count: the settled frame gets the adapter's
+        // MSAA, the frame drawn while the pointer is down gets none — it is
+        // about to be scaled up anyway, so its antialiasing is spent on pixels
+        // nobody sees.
+        let build = |sample_count: u32| -> Pipelines {
+            let multisample = wgpu::MultisampleState {
+                count: sample_count,
+                ..Default::default()
+            };
+            let target = |format: wgpu::TextureFormat, blend| {
+                Some(wgpu::ColorTargetState {
+                    format,
+                    blend,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })
+            };
+            // A pipeline used in a pass that has a depth attachment must
+            // declare one too; the backdrop just neither writes nor tests
+            // against it, which wgpu 29 spells as `None` for both fields.
+            let depth_stencil = |write: bool| {
+                Some(wgpu::DepthStencilState {
+                    format: DEPTH_FORMAT,
+                    depth_write_enabled: Some(write),
+                    depth_compare: write.then_some(wgpu::CompareFunction::Less),
+                    stencil: wgpu::StencilState::default(),
+                    bias: wgpu::DepthBiasState::default(),
+                })
+            };
+
+            let attributes = wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3];
+            let model = |cull: bool| {
+                device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                    label: Some(if cull {
+                        "trove-3d-model-culled"
+                    } else {
+                        "trove-3d-model"
+                    }),
+                    layout: Some(&pipeline_layout),
+                    vertex: wgpu::VertexState {
+                        module: &shader,
+                        entry_point: Some("vs_model"),
+                        compilation_options: wgpu::PipelineCompilationOptions::default(),
+                        buffers: &[wgpu::VertexBufferLayout {
+                            array_stride: render3d::VertexData::STRIDE,
+                            step_mode: wgpu::VertexStepMode::Vertex,
+                            attributes: &attributes,
+                        }],
+                    },
+                    primitive: wgpu::PrimitiveState {
+                        topology: wgpu::PrimitiveTopology::TriangleList,
+                        strip_index_format: None,
+                        front_face: wgpu::FrontFace::Ccw,
+                        // Culling is the GPU's own cheap pass: it discards a
+                        // triangle before it is shaded. Only a closed mesh
+                        // may use it — an open shell's back face is the
+                        // surface you see when you look at its other side,
+                        // and an inside-out file's front faces are its
+                        // inside. Both are drawn two-sided instead.
+                        cull_mode: cull.then_some(wgpu::Face::Back),
+                        unclipped_depth: false,
+                        polygon_mode: wgpu::PolygonMode::Fill,
+                        conservative: false,
+                    },
+                    depth_stencil: depth_stencil(true),
+                    multisample,
+                    fragment: Some(wgpu::FragmentState {
+                        module: &shader,
+                        entry_point: Some("fs_model"),
+                        compilation_options: wgpu::PipelineCompilationOptions::default(),
+                        targets: &[target(format, Some(wgpu::BlendState::REPLACE))],
+                    }),
+                    multiview_mask: None,
+                    cache: None,
+                })
+            };
+            let model_culled = model(true);
+            let model = model(false);
+
+            // Points: the sprite corners come from the shader's
+            // `vertex_index`, so the only vertex buffer holds one instance per
+            // point — position, normal and the point's own colour.
+            let point_attributes =
+                wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x3];
+            let point = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("trove-3d-points"),
+                layout: Some(&pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: Some("vs_point"),
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    buffers: &[wgpu::VertexBufferLayout {
+                        array_stride: render3d::PointData::STRIDE,
+                        step_mode: wgpu::VertexStepMode::Instance,
+                        attributes: &point_attributes,
+                    }],
+                },
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    strip_index_format: None,
+                    front_face: wgpu::FrontFace::Ccw,
+                    // Sprites turn to face the camera, but the pair of
+                    // triangles they are built from can wind either way on
+                    // screen.
+                    cull_mode: None,
+                    unclipped_depth: false,
+                    polygon_mode: wgpu::PolygonMode::Fill,
+                    conservative: false,
+                },
+                depth_stencil: depth_stencil(true),
+                multisample,
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: Some("fs_point"),
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    targets: &[target(format, Some(wgpu::BlendState::REPLACE))],
+                }),
+                multiview_mask: None,
+                cache: None,
+            });
+
+            let backdrop = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("trove-3d-backdrop"),
+                layout: Some(&pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: Some("vs_backdrop"),
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    buffers: &[],
+                },
+                primitive: wgpu::PrimitiveState::default(),
+                depth_stencil: depth_stencil(false),
+                multisample,
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: Some("fs_backdrop"),
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    targets: &[target(format, Some(wgpu::BlendState::REPLACE))],
+                }),
+                multiview_mask: None,
+                cache: None,
+            });
+
+            Pipelines {
+                model_culled,
+                model_two_sided: model,
+                point,
+                backdrop,
+            }
+        };
+        let pipelines = build(samples);
+        // Only a second set when the adapter multisamples at all; otherwise
+        // the settled pipelines are already single-sampled.
+        let interactive_pipelines = (samples > 1).then(|| build(1));
+
+        let limits = device.limits();
+        // Reported once, where a user can see it: an odd picture is usually a
+        // device that is not what it looks like (a software rasteriser, no
+        // MSAA, no 64-bit atomics for the packed-buffer paths).
+        let caps = DeviceCaps {
+            int64_atomics: adapter_features.contains(wgpu::Features::SHADER_INT64_ATOMIC_MIN_MAX),
+            max_storage_buffer: limits.max_storage_buffer_binding_size,
+            max_buffer: limits.max_buffer_size,
+            samples,
+            format,
+            device_type: info.device_type,
+        };
+
+        eprintln!("trove: 3D backend {} — {}", adapter_name, caps.summary());
+
         Ok(Self {
             device,
             queue,
-            model_pipeline,
-            point_pipeline,
-            backdrop_pipeline,
+            pipelines,
+            interactive_pipelines,
+            format,
+            samples,
             uniforms,
             bind_group,
-            samples,
+            edl_bind_group_layout,
+            edl_pipeline,
+            targets: std::sync::Mutex::new(None),
             adapter: adapter_name,
         })
     }
 
-    /// MSAA sample count the pipelines were built with (1 = none).
+    /// The targets for this frame's size and sample count, reusing the last
+    /// set when neither changed.
+    ///
+    /// An interactive drag flips the sample count twice per gesture — once
+    /// when it starts, once when it ends — so the rebuild cost is paid twice,
+    /// not per frame.
+    fn targets(
+        &self,
+        width: u32,
+        height: u32,
+        samples: u32,
+    ) -> std::sync::MutexGuard<'_, Option<Targets>> {
+        let mut targets = self
+            .targets
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let current = targets.as_ref();
+        if current.map(|t| (t.width, t.height, t.samples)) != Some((width, height, samples)) {
+            *targets = Some(self.create_targets(width, height, samples));
+        }
+        targets
+    }
+
+    /// Pipelines for a frame: the single-sampled set while the pointer is
+    /// down, the multisampled set otherwise.
+    fn pipelines(&self, interactive: bool) -> &Pipelines {
+        match (interactive, &self.interactive_pipelines) {
+            (true, Some(pipelines)) => pipelines,
+            _ => &self.pipelines,
+        }
+    }
+
+    /// Sample count the frame will be drawn with.
+    fn sample_count(&self, interactive: bool) -> u32 {
+        if interactive && self.interactive_pipelines.is_some() {
+            1
+        } else {
+            self.samples
+        }
+    }
+
+    fn create_targets(&self, width: u32, height: u32, samples: u32) -> Targets {
+        let extent = wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        };
+        let color = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("trove-3d-color"),
+            size: extent,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: self.format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::COPY_SRC
+                // The post pass reads the resolved image it produced.
+                | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let color_view = color.create_view(&wgpu::TextureViewDescriptor::default());
+        // With MSAA the pass draws into a multisampled target that resolves
+        // into `color`; without it, straight into `color`.
+        let msaa = (samples > 1).then(|| {
+            let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("trove-3d-msaa"),
+                size: extent,
+                mip_level_count: 1,
+                sample_count: samples,
+                dimension: wgpu::TextureDimension::D2,
+                format: self.format,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                view_formats: &[],
+            });
+            let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+            (texture, view)
+        });
+        let depth = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("trove-3d-depth"),
+            size: extent,
+            mip_level_count: 1,
+            sample_count: samples,
+            dimension: wgpu::TextureDimension::D2,
+            format: DEPTH_FORMAT,
+            // Sampled by the post pass, at sample 0.
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let depth_view = depth.create_view(&wgpu::TextureViewDescriptor::default());
+        // The post pass needs a multisampled depth texture to read; a
+        // single-sampled frame has none, so it is drawn without the effect.
+        let edl_color = (samples > 1).then(|| {
+            let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("trove-3d-edl-color"),
+                size: extent,
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: self.format,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+                view_formats: &[],
+            });
+            let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+            (texture, view)
+        });
+        let edl_bind_group = edl_color.as_ref().map(|_| {
+            self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("trove-3d-edl"),
+                layout: &self.edl_bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&depth_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(&color_view),
+                    },
+                ],
+            })
+        });
+        let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("trove-3d-readback"),
+            size: gpu::staging_len(width, height),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        Targets {
+            width,
+            height,
+            samples,
+            color,
+            color_view,
+            msaa,
+            _depth: depth,
+            depth_view,
+            edl_color,
+            edl_bind_group,
+            staging,
+        }
+    }
+
+    /// MSAA sample count a settled frame is drawn with (1 = none).
     pub fn samples(&self) -> u32 {
         self.samples
     }
@@ -350,20 +827,23 @@ impl GpuRenderer {
 
     /// Bytes of GPU buffer a mesh will occupy: interleaved vertices plus
     /// the index list.
+    ///
+    /// The three layouts have to be counted as [`render3d::vertex_data`]
+    /// and [`render3d::point_data`] actually build them. A flat-shaded mesh
+    /// is expanded per face, so its vertex buffer is `triangles × 3` —
+    /// counting the source vertices instead under-reports a soup with more
+    /// triangles than vertices by a factor of three or more, which is how a
+    /// mesh gets past [`Self::upload_capped`] and then fails to allocate.
     fn estimate_gpu_bytes(mesh: &Mesh) -> usize {
-        let vertex_bytes = mesh.vertex_count() * render3d::VertexData::STRIDE as usize;
-        let index_bytes = if mesh.has_vertex_normals() {
-            mesh.triangle_count() * 3 * 4
+        if mesh.is_point_cloud() {
+            return mesh.vertex_count() * render3d::PointData::STRIDE as usize;
+        }
+        if mesh.has_vertex_normals() {
+            mesh.vertex_count() * render3d::VertexData::STRIDE as usize
+                + mesh.triangle_count() * 3 * 4
         } else {
-            // Flat-shaded: expanded per face, no index buffer.
-            0
-        };
-        let point_bytes = if mesh.is_point_cloud() {
-            mesh.vertex_count() * render3d::PointData::STRIDE as usize
-        } else {
-            0
-        };
-        vertex_bytes + index_bytes + point_bytes
+            mesh.triangle_count() * 3 * render3d::VertexData::STRIDE as usize
+        }
     }
 
     /// Move a mesh or cloud into GPU buffers, choosing indexed (smooth),
@@ -385,10 +865,36 @@ impl GpuRenderer {
                 vertex_count: 0,
                 index_count: 0,
                 point_count: data.count,
+                // A sprite is always facing the camera, whatever its winding.
+                cull_backfaces: false,
+                meshlets: Vec::new(),
             };
         }
 
-        let data = render3d::vertex_data(mesh);
+        // Which way the surface faces decides whether its back faces can be
+        // culled. An inside-out file is re-wound on the way into the buffer,
+        // so one culled pipeline serves any closed mesh.
+        let winding = mesh.winding();
+        let flip_winding = winding == Winding::ClosedInward;
+        let mut data = render3d::vertex_data_with(mesh, flip_winding);
+        // Cut a large mesh into cullable clusters. The triangles are reordered
+        // so each cluster is a contiguous run of the index buffer, which is
+        // the point of the exercise: one draw per cluster the camera can see,
+        // instead of every triangle in the model.
+        let meshlets = match meshlet::partition(mesh, meshlet::DEFAULT_MESHLET_TRIANGLES) {
+            Some(set) => {
+                if let Some(indices) = data.indices.as_mut() {
+                    let mut reordered = Vec::with_capacity(indices.len());
+                    for &triangle in &set.order {
+                        let at = triangle as usize * 3;
+                        reordered.extend_from_slice(&indices[at..at + 3]);
+                    }
+                    *indices = reordered;
+                }
+                set.meshlets
+            }
+            None => Vec::new(),
+        };
         let vertices = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("trove-3d-vertices"),
             size: (data.vertex_bytes().len() as u64).max(4),
@@ -414,13 +920,32 @@ impl GpuRenderer {
             vertex_count: data.vertex_count,
             index_count: data.indices.as_ref().map_or(0, |i| i.len() as u32),
             point_count: 0,
+            cull_backfaces: winding != Winding::TwoSided,
+            meshlets,
         }
     }
 
     /// Draw one frame and read it back as tightly packed BGRA, `width *
     /// height * 4` bytes — the same layout the CPU rasterizer produces, so the
     /// UI cannot tell the two apart. `None` when the read-back fails.
-    pub fn render(&self, mesh: &GpuMesh, framing: &Framing, size: (u32, u32)) -> Option<Vec<u8>> {
+    ///
+    /// `interactive` frames are drawn without multisampling: they are the ones
+    /// the user is dragging, they are about to be scaled up, and the samples
+    /// they would spend are on detail nobody can see while the model is
+    /// moving.
+    ///
+    /// `enhance_points` asks for the eye-dome lighting and gap fill a point
+    /// cloud wants. It is honoured only on a settled frame that multisampled,
+    /// which is exactly when the effect is visible; `false` leaves the frame
+    /// as the rasterizer drew it, matching the CPU path's own opt-out.
+    pub fn render(
+        &self,
+        mesh: &GpuMesh,
+        framing: &Framing,
+        size: (u32, u32),
+        interactive: bool,
+        enhance_points: bool,
+    ) -> Option<Vec<u8>> {
         let (width, height) = (size.0.max(1), size.1.max(1));
         self.queue.write_buffer(
             &self.uniforms,
@@ -432,52 +957,20 @@ impl GpuRenderer {
             height,
             depth_or_array_layers: 1,
         };
-
-        let color = self.device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("trove-3d-color"),
-            size: extent,
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: FORMAT,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
-            view_formats: &[],
-        });
-        let color_view = color.create_view(&wgpu::TextureViewDescriptor::default());
-        // With MSAA the pass draws into a multisampled target that resolves
-        // into `color`; without it, straight into `color`.
-        let msaa = (self.samples > 1).then(|| {
-            self.device.create_texture(&wgpu::TextureDescriptor {
-                label: Some("trove-3d-msaa"),
-                size: extent,
-                mip_level_count: 1,
-                sample_count: self.samples,
-                dimension: wgpu::TextureDimension::D2,
-                format: FORMAT,
-                usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-                view_formats: &[],
-            })
-        });
-        let msaa_view = msaa
-            .as_ref()
-            .map(|texture| texture.create_view(&wgpu::TextureViewDescriptor::default()));
-        let depth = self.device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("trove-3d-depth"),
-            size: extent,
-            mip_level_count: 1,
-            sample_count: self.samples,
-            dimension: wgpu::TextureDimension::D2,
-            format: DEPTH_FORMAT,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-            view_formats: &[],
-        });
-        let depth_view = depth.create_view(&wgpu::TextureViewDescriptor::default());
-        let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("trove-3d-readback"),
-            size: gpu::staging_len(width, height),
-            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-            mapped_at_creation: false,
-        });
+        let samples = self.sample_count(interactive);
+        let pipelines = self.pipelines(interactive);
+        let targets = self.targets(width, height, samples);
+        let Targets {
+            color,
+            color_view,
+            msaa,
+            depth_view,
+            edl_color,
+            edl_bind_group,
+            staging,
+            ..
+        } = targets.as_ref()?;
+        let msaa_view = msaa.as_ref().map(|(_, view)| view);
 
         let mut encoder = self
             .device
@@ -488,17 +981,17 @@ impl GpuRenderer {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("trove-3d"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: msaa_view.as_ref().unwrap_or(&color_view),
+                    view: msaa_view.unwrap_or(color_view),
                     depth_slice: None,
                     // `Some` resolves the multisampled target into `color`.
-                    resolve_target: msaa_view.as_ref().map(|_| &color_view),
+                    resolve_target: msaa_view.map(|_| color_view),
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
                         store: wgpu::StoreOp::Store,
                     },
                 })],
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                    view: &depth_view,
+                    view: depth_view,
                     depth_ops: Some(wgpu::Operations {
                         load: wgpu::LoadOp::Clear(1.0),
                         store: wgpu::StoreOp::Store,
@@ -511,24 +1004,38 @@ impl GpuRenderer {
             });
 
             // Backdrop first: it covers the viewport and leaves depth alone.
-            pass.set_pipeline(&self.backdrop_pipeline);
+            pass.set_pipeline(&pipelines.backdrop);
             pass.set_bind_group(0, &self.bind_group, &[]);
             pass.draw(0..3, 0..1);
 
             if mesh.point_count > 0 {
                 // Six vertices per instance: the sprite's two triangles.
-                pass.set_pipeline(&self.point_pipeline);
+                pass.set_pipeline(&pipelines.point);
                 pass.set_bind_group(0, &self.bind_group, &[]);
                 pass.set_vertex_buffer(0, mesh.vertices.slice(..));
                 pass.draw(0..6, 0..mesh.point_count);
             } else {
-                pass.set_pipeline(&self.model_pipeline);
+                pass.set_pipeline(if mesh.cull_backfaces {
+                    &pipelines.model_culled
+                } else {
+                    &pipelines.model_two_sided
+                });
                 pass.set_bind_group(0, &self.bind_group, &[]);
                 pass.set_vertex_buffer(0, mesh.vertices.slice(..));
                 match &mesh.indices {
                     Some(indices) => {
                         pass.set_index_buffer(indices.slice(..), wgpu::IndexFormat::Uint32);
-                        pass.draw_indexed(0..mesh.index_count, 0, 0..1);
+                        // A mesh large enough to be partitioned is drawn one
+                        // cluster at a time, skipping the ones the frustum
+                        // cannot see; everything else stays a single call.
+                        match mesh.visible_meshlets(framing) {
+                            None => pass.draw_indexed(0..mesh.index_count, 0, 0..1),
+                            Some(ranges) => {
+                                for range in ranges {
+                                    pass.draw_indexed(range, 0, 0..1);
+                                }
+                            }
+                        }
                     }
                     None => {
                         pass.draw(0..mesh.vertex_count, 0..1);
@@ -537,15 +1044,50 @@ impl GpuRenderer {
             }
         }
 
+        // Eye-dome lighting and gap filling, over the depth just drawn. Only a
+        // settled point-cloud frame has both the multisampled depth to read
+        // and the pixels to spare; the rest read back what the rasterizer
+        // wrote directly.
+        let mut enhanced = None;
+        if enhance_points
+            && mesh.point_count > 0
+            && let (Some((texture, view)), Some(bind_group)) =
+                (edl_color.as_ref(), edl_bind_group.as_ref())
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("trove-3d-edl"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_pipeline(&self.edl_pipeline);
+            pass.set_bind_group(0, &self.bind_group, &[]);
+            pass.set_bind_group(1, bind_group, &[]);
+            pass.draw(0..3, 0..1);
+            drop(pass);
+            enhanced = Some(texture);
+        }
+        let source = enhanced.unwrap_or(color);
+
         encoder.copy_texture_to_buffer(
             wgpu::TexelCopyTextureInfo {
-                texture: &color,
+                texture: source,
                 mip_level: 0,
                 origin: wgpu::Origin3d { x: 0, y: 0, z: 0 },
                 aspect: wgpu::TextureAspect::All,
             },
             wgpu::TexelCopyBufferInfo {
-                buffer: &staging,
+                buffer: staging,
                 layout: wgpu::TexelCopyBufferLayout {
                     offset: 0,
                     bytes_per_row: Some(gpu::padded_row_bytes(width)),
@@ -567,10 +1109,11 @@ impl GpuRenderer {
         receiver.recv().ok()?.ok()?;
 
         let mapped = slice.get_mapped_range();
-        let frame = gpu::unpack_bgra(&mapped, width, height);
+        let frame = gpu::unpack_bgra(&mapped, width, height, pixel_order(self.format));
         drop(mapped);
         staging.unmap();
-        // Frees the textures and staging buffer this frame created.
+        // The targets stay allocated for the next frame; this only lets the
+        // device retire the work that just finished.
         let _ = self.device.poll(wgpu::PollType::Poll);
         Some(frame)
     }
@@ -605,6 +1148,47 @@ mod tests {
         module
     }
 
+    /// The upload budget is only a real guard if the estimate matches the
+    /// buffers `upload` actually creates. A flat-shaded mesh is the case that
+    /// used to slip through: its vertex buffer is expanded per face, so
+    /// counting source vertices under-reported it several times over.
+    #[test]
+    fn the_size_estimate_matches_the_buffers_upload_builds() {
+        let smooth = {
+            let obj = "v 0 0 0\nv 1 0 0\nv 0 1 0\nvn 0 0 1\nf 1//1 2//1 3//1\n";
+            trove_core::media::formats::load_obj(obj).expect("mesh parses")
+        };
+        let flat = {
+            // Two triangles over four vertices: the expanded buffer is six
+            // corners, so counting source vertices under-reports it by half —
+            // the direction of the error that let oversized meshes through.
+            let obj = "v 0 0 0\nv 1 0 0\nv 1 1 0\nv 0 1 0\nf 1 2 3\nf 1 3 4\n";
+            trove_core::media::formats::load_obj(obj).expect("mesh parses")
+        };
+        let cloud = {
+            let ply = "ply\nformat ascii 1.0\nelement vertex 2\n\
+                       property float x\nproperty float y\nproperty float z\n\
+                       end_header\n0 0 0\n1 1 1\n";
+            trove_core::media::formats::load_ply(ply.as_bytes()).expect("cloud parses")
+        };
+
+        for mesh in [&smooth, &flat, &cloud] {
+            let data = render3d::vertex_data(mesh);
+            let actual: usize = if mesh.is_point_cloud() {
+                render3d::point_data(mesh).bytes().len()
+            } else {
+                data.vertex_bytes().len() + data.index_bytes().map_or(0, |b| b.len())
+            };
+            assert_eq!(
+                GpuRenderer::estimate_gpu_bytes(mesh),
+                actual,
+                "estimate for {} vertices / {} triangles",
+                mesh.vertex_count(),
+                mesh.triangle_count()
+            );
+        }
+    }
+
     /// Every entry point `GpuRenderer::new` asks for, and nothing else.
     #[test]
     fn the_shader_declares_the_entry_points_the_pipelines_use() {
@@ -619,6 +1203,7 @@ mod tests {
             found,
             vec![
                 ("fs_backdrop", naga::ShaderStage::Fragment),
+                ("fs_edl", naga::ShaderStage::Fragment),
                 ("fs_model", naga::ShaderStage::Fragment),
                 ("fs_point", naga::ShaderStage::Fragment),
                 ("vs_backdrop", naga::ShaderStage::Vertex),
@@ -722,6 +1307,128 @@ mod tests {
         let laid_out = &layouter[layout_type(&module)];
         assert_eq!(laid_out.alignment, naga::proc::Alignment::SIXTEEN);
         assert_eq!(laid_out.size, UNIFORM_SIZE as u32);
+    }
+
+    /// The shader only proves the post pass parses. This proves the device
+    /// accepts the pipelines — including the multisampled depth binding the
+    /// main pipelines never mention — and that the pass actually changes a
+    /// point-cloud frame. Skipped where there is no usable adapter, which is
+    /// the same condition the viewport falls back to the CPU on.
+    #[test]
+    fn the_eye_dome_pass_runs_on_a_real_device() {
+        let Ok(renderer) = GpuRenderer::new() else {
+            eprintln!("no graphics device: skipping the GPU frame test");
+            return;
+        };
+        // Points on a sphere: a settled frame of it has depth steps between
+        // neighbouring pixels, which is what the lighting darkens.
+        let mut positions = Vec::new();
+        for index in 0..4_000 {
+            let t = index as f32 / 4_000.0;
+            let (sin, cos) = (t * std::f32::consts::TAU * 8.0).sin_cos();
+            let y = 1.0 - 2.0 * t;
+            let r = (1.0 - y * y).max(0.0).sqrt();
+            positions.push([r * cos, y, r * sin]);
+        }
+        let mesh = Mesh::from_parts(positions, Vec::new(), Vec::new(), Vec::new()).expect("cloud");
+        let uploaded = renderer
+            .upload_capped(&mesh)
+            .expect("the cloud fits the GPU");
+        let framing = render3d::Camera::default().framing(mesh.bounds, 1.0);
+        let size = (160, 120);
+
+        let plain = renderer
+            .render(&uploaded, &framing, size, false, false)
+            .expect("a plain frame comes back");
+        let enhanced = renderer
+            .render(&uploaded, &framing, size, false, true)
+            .expect("an enhanced frame comes back");
+        assert_eq!(plain.len(), enhanced.len());
+        assert_ne!(
+            plain, enhanced,
+            "the post pass has to change a point-cloud frame"
+        );
+        // Its output is a picture, not a cleared target.
+        let lit = enhanced.as_chunks::<4>().0;
+        assert!(
+            lit.iter()
+                .any(|pixel| pixel[0] > 0 || pixel[1] > 0 || pixel[2] > 0),
+            "the enhanced frame is all black"
+        );
+    }
+
+    /// A triangulated plane with normals: the indexed layout a large mesh has
+    /// to be in for the partitioner to take it.
+    fn grid_mesh(n: usize) -> Mesh {
+        let mut positions = Vec::new();
+        let mut normals = Vec::new();
+        for z in 0..=n {
+            for x in 0..=n {
+                positions.push([x as f32, 0.0, z as f32]);
+                normals.push([0.0, 1.0, 0.0]);
+            }
+        }
+        let mut triangles = Vec::new();
+        let row = (n + 1) as u32;
+        for z in 0..n as u32 {
+            for x in 0..n as u32 {
+                let corner = z * row + x;
+                triangles.push([corner, corner + 1, corner + row]);
+                triangles.push([corner + 1, corner + row + 1, corner + row]);
+            }
+        }
+        Mesh::from_parts(positions, normals, Vec::new(), triangles).expect("grid builds")
+    }
+
+    /// A mesh large enough to be partitioned is cut into clusters, culled
+    /// against the real frustum, and drawn without the device complaining —
+    /// the index reorder and the per-cluster draws together.
+    #[test]
+    fn a_large_mesh_is_partitioned_and_culled_on_a_real_device() {
+        let Ok(renderer) = GpuRenderer::new() else {
+            eprintln!("no graphics device: skipping the meshlet frame test");
+            return;
+        };
+        let mesh = grid_mesh(256); // 131 072 triangles
+        assert!(mesh.triangle_count() >= meshlet::MIN_MESHLET_TRIANGLES);
+        let uploaded = renderer
+            .upload_capped(&mesh)
+            .expect("the mesh fits the GPU");
+        assert!(
+            uploaded.meshlets.len() > 1,
+            "a large mesh has to be partitioned"
+        );
+
+        // Framed from far away every cluster is visible: one draw, no culling.
+        let wide = render3d::Camera {
+            zoom: render3d::MAX_ZOOM,
+            ..render3d::Camera::default()
+        }
+        .framing(mesh.bounds, 1.0);
+        assert!(uploaded.visible_meshlets(&wide).is_none());
+
+        // Close up, part of the model is off screen and its clusters drop out.
+        let close = render3d::Camera {
+            zoom: render3d::MIN_ZOOM,
+            ..render3d::Camera::default()
+        }
+        .framing(mesh.bounds, 1.0);
+        let visible = uploaded
+            .visible_meshlets(&close)
+            .expect("the close view culls");
+        assert!(!visible.is_empty() && visible.len() < uploaded.meshlets.len());
+
+        let frame = renderer
+            .render(&uploaded, &close, (160, 120), false, false)
+            .expect("a frame comes back");
+        assert!(
+            frame
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .any(|pixel| pixel[0] > 0 || pixel[1] > 0 || pixel[2] > 0),
+            "the culled mesh drew nothing"
+        );
     }
 
     /// The members of the shader's `Uniforms` struct, in order.

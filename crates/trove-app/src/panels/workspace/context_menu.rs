@@ -13,6 +13,8 @@ use crate::panels::workspace_search::open_image_search;
 use trove_core::model::{AssetKind, AssetPatch, UsageStatus};
 use trove_core::store::{assets, collections};
 
+use super::open_with_apps::discover_apps;
+
 /// Build the right-click context menu for an asset cell.
 pub(crate) fn asset_context_menu(
     menu: PopupMenu,
@@ -142,12 +144,20 @@ pub(crate) fn asset_context_menu(
             .separator();
     }
     if let Some(path) = disk_path {
+        let reveal_path = path.clone();
         menu = menu.item(
             PopupMenuItem::new(rust_i18n::t!("workspace.reveal_in_file_manager").to_string())
                 .on_click(move |_, _, _cx| {
-                    crate::panels::common::reveal_path(&path);
+                    crate::panels::common::reveal_path(&reveal_path);
                 }),
         );
+        // --- Open With submenu ---
+        let open_with_menu =
+            build_open_with_submenu(_window, cx, controller, asset_id, path.clone());
+        menu = menu.item(PopupMenuItem::submenu(
+            rust_i18n::t!("workspace.open_with").to_string(),
+            open_with_menu,
+        ));
         menu = menu.separator();
     }
     // Fonts: system-level install / uninstall right from the grid, same
@@ -449,6 +459,91 @@ fn build_collection_submenu(
         }));
     }
     menu
+}
+
+/// "Open With" submenu: discover installed apps for this file type,
+/// offer a "default" entry, and fall back to the platform chooser.
+fn build_open_with_submenu(
+    _window: &mut Window,
+    cx: &mut Context<PopupMenu>,
+    controller: &Entity<LibraryController>,
+    asset_id: Uuid,
+    file_path: PathBuf,
+) -> Entity<PopupMenu> {
+    let apps = discover_apps(&file_path);
+    let ctl_default = controller.clone();
+    let path_default = file_path.clone();
+
+    PopupMenu::build(_window, cx, move |menu, _window, _cx| {
+        // --- "Open with Default App" entry ---
+        let ctl_d = ctl_default.clone();
+        let path_d = path_default.clone();
+        let mut menu = menu.item(
+            PopupMenuItem::new(rust_i18n::t!("workspace.open_with_default").to_string()).on_click(
+                move |_, _, cx| {
+                    do_open_with(&ctl_d, asset_id, None, &path_d, cx);
+                },
+            ),
+        );
+
+        // --- Discovered apps ---
+        if !apps.is_empty() {
+            menu = menu.separator();
+            for app in apps {
+                if let Some(exec_path) = &app.exec_path {
+                    let ctl = controller.clone();
+                    let path = file_path.clone();
+                    let name = app.name.clone();
+                    let exec = exec_path.clone();
+                    menu = menu.item(PopupMenuItem::new(name.clone()).on_click(move |_, _, cx| {
+                        do_open_with(&ctl, asset_id, Some(&exec), &path, cx);
+                    }));
+                }
+            }
+        }
+
+        menu
+    })
+}
+
+/// Shared open-with action: resolve the asset, call the library to hand it
+/// to the chosen (or default) application, and surface the result in the
+/// status bar.
+fn do_open_with(
+    controller: &Entity<LibraryController>,
+    asset_id: Uuid,
+    app_path: Option<&std::path::Path>,
+    file_path: &std::path::Path,
+    cx: &mut App,
+) {
+    controller.update(cx, move |ctl, cx| {
+        match ctl.library.open_in_external(asset_id, app_path) {
+            Ok(_) => {
+                let file_name = file_path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("")
+                    .to_string();
+                let app_name = match app_path {
+                    Some(p) => p
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("Unknown")
+                        .to_string(),
+                    None => rust_i18n::t!("workspace.open_with_default_app").to_string(),
+                };
+                ctl.notice = Some(
+                    rust_i18n::t!("workspace.open_with_done", name = file_name, app = app_name)
+                        .to_string(),
+                );
+            }
+            Err(e) => {
+                ctl.notice =
+                    Some(rust_i18n::t!("workspace.open_with_failed", error = e).to_string());
+            }
+        }
+        cx.notify();
+    });
 }
 
 /// Drag ghost shown while dragging assets.

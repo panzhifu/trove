@@ -1,6 +1,6 @@
 [package]
 name = "trove-app"
-version = "0.4.0"
+version = "0.4.1"
 edition = "2024"
 license = "MIT"
 
@@ -16,6 +16,7 @@ serde_json = { workspace = true }
 uuid = { workspace = true }
 rust-i18n = { workspace = true }
 sys-locale = { workspace = true }
+bytemuck = { version = "1", features = ["derive"] }
 
 [dev-dependencies]
 # Used only to parse and validate `gpu3d.wgsl` on machines without a GPU.
