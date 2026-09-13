@@ -53,6 +53,19 @@ pub struct AppConfig {
     /// records the original location instead.
     #[serde(default)]
     pub import_mode: Option<String>,
+    /// Size from which a source is linked in place whatever `import_mode`
+    /// says, in MiB. Defaults to
+    /// [`crate::media::import::LINK_OVER_MB_DEFAULT`]: a multi-gigabyte
+    /// model copied into the library would double the disk it needs for no
+    /// benefit, since the preview reads it where it lies anyway. `0` turns
+    /// the rule off.
+    #[serde(default)]
+    pub import_link_over_mb: Option<u64>,
+    /// Eye-dome lighting and gap filling on a point-cloud preview. On by
+    /// default: without it a scan reads as dust rather than a surface. Turn it
+    /// off for a flatter, marginally cheaper picture.
+    #[serde(default)]
+    pub point_enhance: Option<bool>,
     /// Sample text rendered on font-specimen thumbnails (font cards).
     /// Characters missing from a given font are skipped while rendering.
     #[serde(default)]
@@ -237,6 +250,23 @@ impl AppConfig {
     /// location (no copy), `false` = copy into the library (default).
     pub fn import_linked(&self) -> bool {
         self.import_mode.as_deref() == Some("link")
+    }
+
+    /// Whether point-cloud previews get eye-dome lighting and gap filling.
+    pub fn point_enhance(&self) -> bool {
+        self.point_enhance.unwrap_or(true)
+    }
+
+    /// The import policy this configuration describes: the user's all-or-
+    /// nothing preference plus the size at which a file is linked anyway.
+    pub fn import_policy(&self) -> crate::media::import::ImportPolicy {
+        crate::media::import::ImportPolicy {
+            link_all: self.import_linked(),
+            link_over: self
+                .import_link_over_mb
+                .unwrap_or(crate::media::import::LINK_OVER_MB_DEFAULT)
+                .saturating_mul(1 << 20),
+        }
     }
 
     /// Sample text for font-specimen thumbnails (`font_sample` or the

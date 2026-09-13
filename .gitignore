@@ -12,6 +12,9 @@ tty7-bin/
 # 代码助手留下的计划/草稿目录，工具产物，不进仓库。
 .zcode/
 
+# 文件管理器删除文件时留下的本地回收站目录，不属于 trove。
+.Trash-0/
+
 # PLY 基准测试的生成数据（最大单文件 573MB，超过 GitHub 限制），由
 # crates/trove-core/examples/ply_bench.rs 生成，不进仓库。
 bench-data/
