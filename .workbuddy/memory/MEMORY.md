@@ -48,9 +48,16 @@
 - `build.rs` 用 `cargo metadata` 定位 gpui-kit 的 `themes/`，拷进 `OUT_DIR/themes` 生成 `builtin_themes.rs`（36 个主题 = 25 dark / 11 light；框架只注册 Default Light/Dark）。`TROVE_THEMES_DIR` 可覆盖。用户主题在 `<config>/trove/themes/*.json`（覆盖同名内置）。
 - ⚠️ `apply_from_settings` 在 appearance 观察者里必须传 `Some(window)`：Linux 上 `cx.window_appearance()` 的 RefCell 正被借用，直接查会 panic。
 
-## Open With / 外部编辑器
-- `services/open_with.rs` 扫 `$XDG_DATA_HOME` + `$XDG_DATA_DIRS` 下所有 `.desktop`（含子目录），要 `Type=Application`、非 NoDisplay/Hidden/Terminal、`MimeType` 命中；`Exec` 字段码自己展开，无文件码时按规范补路径；排序「精确 mime 优先于 `type/*` 通配，再按名字」；进程内缓存（`reload_catalogue()` 失效）。
-- **内容寻址的 blob 不能就地编辑**：`Origin::Stored` 先复制到 `<config>/edit/<asset_id>/<原文件名>`（副本存在就绝不覆盖），`edited_copy()` 判「改过」才显示「导入编辑后的副本」（先比大小，≤32 MiB 才真 hash，避免右键卡帧）。`Origin::Linked` 原地打开。
+## Open With —— ⚠️ 已在 19a3dd8 被整体删除
+原 `services/open_with.rs`（扫 `$XDG_DATA_HOME`/`$XDG_DATA_DIRS` 下 `.desktop`、展开 `Exec` 字段码）与 app 侧 `library/open_with.rs`（`Origin::Stored` 先复制到 `<config>/edit/<asset_id>/` 再交给外部程序，因为内容寻址 blob 不能就地编辑；`edited_copy()` 先比大小、≤32 MiB 才 hash）**在 2026-09-13 的大重构里被删除**，全代码无调用者（`media/probe.rs` 里的 `open_with_defaults` 是 jxl_oxide 的无关 API）。若以后要恢复，从 `19a3dd8^` 取回；「blob 不能就地编辑」这条约束仍然成立。
+
+## 工具栏每帧库读（2026-09-13）
+- `WorkspacePanel::toolbar_row` 是 `&mut self`、每帧重建，曾把 `assets::distinct_exts`（~25 ms/次）放在里面。
+- `distinct_exts` 的 `LOWER(ext)` 包住索引列 → `idx_assets_ext` 失效 → `SCAN assets` + temp B-tree。改成 `SELECT DISTINCT ext … ORDER BY ext`，case folding/去重挪到 Rust（`to_ascii_lowercase`，对齐 SQLite 的 ASCII-only `LOWER`）：12 种扩展名/10 万行 24.6 → 15.2 ms。
+- `WorkspacePanel::filter_exts` 按 generation 缓存，`format_filter` 改吃 `&[String]`。
+- 量过但**不值得动**：`tags::list` 0.05 ms、`by_ids × 20` 0.3 ms、`AppConfig::load()`（每帧读 JSON 配置文件）**仅 0.012 ms**。
+- 待拍板的迁移候选：`CREATE INDEX … ON assets(ext) WHERE trashed_at IS NULL` → scratch 表实测 24.6 → **3.96 ms**（变 index-only）。缓存解决「每帧」，这条解决「导入后的首次读」。
+- ⚠️ 别在退化的单一基数数据集上量索引查询（本库压测数据全是 `ext='jpg'`，把收益放大成假的 8000×）；别在单测里断言索引计划（小表启发式与满规模相反）；`plan_of` 要在计时旁边抓，否则建完索引后三行计划会全显示新索引。
 
 ## 面板内元素与标题栏 action 对齐（左 dock / explorer）
 - dock tab 栏把 `title_suffix` 包在 `px_2` 盒子里、后跟一个 `gap_1` 才到 toolbar 槽 → 标题栏按钮右缘距面板右缘 **12px**；面板内容自己 `p_1`(4) + 行 `px_2`(8) 也是 12px，故行内数字天然对齐，分组标题（如智能收藏夹的 `+`）只有 4px，需补 `pr(px(8.))`。常量在 `panels/explorer.rs` 顶部「Layout metrics」（12 是推算值，未 GUI 复核）。
