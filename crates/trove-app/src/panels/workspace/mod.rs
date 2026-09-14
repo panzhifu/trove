@@ -26,7 +26,6 @@ use gpui_kit::*;
 // The `gpui_kit::*` glob above re-exports everything from gpui, but the grid
 // needs the virtualized `list` element under a distinct name: a local
 // `Vec<Asset>` variable called `list` would otherwise shadow it.
-use gpui_kit::component::color_picker::ColorPicker;
 use gpui_kit::component::slider::{SliderEvent, SliderState};
 use gpui_kit::list as list_element;
 use gpui_kit::{Bounds, ListOffset, Pixels};
@@ -71,8 +70,8 @@ use rows::{
     materialize_rows, next_cell_row, prev_cell_row, refill_rows, timeline_header, timeline_rows,
 };
 use toolbar::{
-    add_filter_button, format_filter, kind_filter, kind_key, rating_filter, selection_toolbar,
-    shape_filter, tag_filter, title_controls,
+    add_filter_button, color_filter, format_filter, kind_filter, kind_key, rating_filter,
+    selection_toolbar, shape_filter, tag_filter, title_controls,
 };
 
 /// Fallback layout width before the container has been measured once
@@ -399,33 +398,12 @@ impl WorkspacePanel {
             .w_full()
             .items_center()
             .gap_1()
-            // Colour picker sits at the far left, then the kind filter.
+            // Colour filter sits at the far left, then the kind filter.
             .when(!in_trash && !in_recent, |row| {
-                // The framework picker owns its trigger and popover. Recent
-                // colours ride along as the featured row, so the colours the
-                // user actually reaches for stay one click away; the palette
-                // tab behind it carries the full nine-family ramp. The trigger
-                // keeps the palette icon and the visible label the hand-rolled
-                // one had: without the icon it renders a swatch of the current
-                // colour, which reads as a state display rather than a button.
-                //
-                // The icon is sized by hand because `ColorPickerButton`
-                // forwards it unsized, unlike `Button`, which shrinks its icon
-                // with the button (`button.rs:541-544`, `:676`). A bare `Icon`
-                // instead falls back to the ambient text size
-                // (`icon.rs:150-158`), which renders visibly larger than the
-                // neighbouring `xsmall` filter buttons. This matches `Button`'s
-                // `Size::XSmall` icon (`icon.rs:161`).
-                row.child(
-                    ColorPicker::new(&color_picker)
-                        .xsmall()
-                        .icon(
-                            Icon::new(IconName::Palette)
-                                .with_size(gpui_kit::component::Size::XSmall),
-                        )
-                        .label(rust_i18n::t!("workspace.color_filter").to_string())
-                        .featured_colors(recent_picker_colors(cx)),
-                )
+                // Trigger and popover both live in `toolbar::color_filter`;
+                // recent colours ride along as the featured row, so the colours
+                // the user actually reaches for stay one click away.
+                row.child(color_filter(&color_picker, recent_picker_colors(cx), cx))
             })
             .when(tool_enabled("kind"), |row| {
                 row.child(kind_filter(&controller, cx))

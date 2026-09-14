@@ -564,6 +564,12 @@ system_note = "系统自带"
 [color_picker]
 none = "无颜色"
 confirm = "确定"
+palette = "色板"
+hsla = "HSLA"
+hue = "色相"
+saturation = "饱和度"
+lightness = "明度"
+alpha = "透明度"
 
 [dock]
 collapse = "收起侧栏"
