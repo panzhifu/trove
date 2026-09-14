@@ -8,7 +8,21 @@ lto = "thin"
 
 [workspace.dependencies]
 # UI
-gpui-kit = "0.6"
+#
+# Tracks upstream `main` rather than a crates.io release: the dock/window
+# changes this project builds against are not in any published version, and
+# following the tip keeps new upstream work one `cargo update` away. Its
+# `gpui-*` and `gpui-kit-assets` members are path dependencies inside that
+# checkout, so the whole tree moves as one; the `gpui-pre-*` platform crates
+# come from crates.io at the version upstream asks for (they used to be
+# overridden with `path = "../gpui-kit/crates/gpui-pre-*"`, which only exists
+# on a workstation with a sibling gpui-kit checkout — never on a CI runner,
+# where cargo could not even load the manifest and every macOS/Windows target
+# build died before it started).
+#
+# Riding a branch tip means an upstream commit can break this build; if that
+# happens, pin `rev = "<sha>"` here.
+gpui-kit = { git = "https://github.com/longbridge/gpui-kit.git", branch = "main" }
 
 # GPU rendering for the 3D model viewport. Kept in step with the wgpu that
 # gpui itself builds against, so the graph has one version and one backend set.
@@ -79,14 +93,6 @@ sys-locale = "0.3"
 # priority over the X11 backend when the compositor speaks the protocol.
 arboard = { version = "3", features = ["wayland-data-control"] }
 
-[patch.crates-io]
-# The published `gpui-kit` 0.6 does not carry the branch this project builds
-# against, so both crates come from the fork. The `gpui-pre-*` platform crates
-# are deliberately *not* patched: they are on crates.io at the version the fork
-# asks for (0.3.3). They used to be overridden with
-# `path = "../gpui-kit/crates/gpui-pre-*"`, which only exists on a workstation
-# with a sibling gpui-kit checkout — never on a CI runner, where cargo could
-# not even load the manifest and every macOS/Windows target build died before
-# it started.
-gpui-kit = { git = "https://github.com/panzhifu/gpui-kit.git", branch = "feat/optional-ellipsis-menu" }
-gpui-kit-assets = { git = "https://github.com/panzhifu/gpui-kit.git", branch = "feat/optional-ellipsis-menu" }
+# No `[patch.crates-io]` section on purpose: `gpui-kit` is declared as a git
+# dependency above, and everything else it drags in is either a path member of
+# that checkout or a crates.io crate at the version upstream asks for.

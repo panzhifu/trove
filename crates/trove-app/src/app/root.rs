@@ -12,7 +12,7 @@ use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::component::Sizable as _;
 use gpui_kit::component::WindowExt as _;
 use gpui_kit::component::dock::{
-    DockLayout, DockPlacement, DockSkin, InsertTarget, PaneRef, PanelId, panel_handle,
+    DockLayout, DockPlacement, InsertTarget, PaneRef, PanelId, panel_handle,
 };
 use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::component::notification::Notification;
@@ -75,7 +75,9 @@ impl AppView {
         let tags = cx.new(|cx| TagsPanel::new(cx, controller.clone()));
         let inspector = cx.new(|cx| InspectorPanel::new(window, cx, controller.clone()));
 
-        let (dock, skin) = DockSkin::dock_area("trove", None, window, cx);
+        // Trove draws its own title bar (see `app::dock_skin`): the framework
+        // skin always appends a "⋯" menu, and there is no switch for it.
+        let dock = crate::app::dock_skin::dock_area("trove", None, window, cx);
         dock.update(cx, |area, cx| {
             // Panels must be registered through `panel_handle` + `panel_view`:
             // a bare entity (`DockLayout::panel`) cannot be downcast back into
@@ -106,7 +108,6 @@ impl AppView {
             );
             area.set_dock_size(DockPlacement::Right, px(300.), window, cx);
         });
-        skin.set_ellipsis_menu(false, cx);
 
         // Auto-show the inspector: whenever a *plain* selection change
         // (single click / keyboard move) lands on a non-empty selection,

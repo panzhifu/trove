@@ -564,3 +564,7 @@ system_note = "系统自带"
 [color_picker]
 none = "无颜色"
 confirm = "确定"
+
+[dock]
+collapse = "收起侧栏"
+expand = "展开侧栏"

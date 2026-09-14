@@ -567,3 +567,7 @@ system_note = "System-owned"
 [color_picker]
 none = "No colour"
 confirm = "OK"
+
+[dock]
+collapse = "Collapse Sidebar"
+expand = "Expand Sidebar"
