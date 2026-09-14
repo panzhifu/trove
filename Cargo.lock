@@ -8127,7 +8127,6 @@ dependencies = [
  "psd",
  "rawler",
  "rayon",
- "regex",
  "resvg 0.46.0",
  "rusqlite",
  "serde",

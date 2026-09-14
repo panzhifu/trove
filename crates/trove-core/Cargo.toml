@@ -1,6 +1,6 @@
 [package]
 name = "trove-core"
-version = "0.4.1"
+version = "0.4.2"
 edition = "2024"
 license = "MIT"
 
@@ -20,9 +20,8 @@ sha2 = { workspace = true }
 thiserror = { workspace = true }
 uuid = { workspace = true }
 rayon = { workspace = true }
-memchr = "2"  # already in the tree via regex; SIMD byte search for the ASCII splitter
+memchr = "2"
 memmap2 = "0.9"  # memory-mapped file access for large PLY files
-regex = "1"
 ureq = { workspace = true }
 resvg = { workspace = true }
 psd = { workspace = true }
@@ -34,9 +33,9 @@ gltf = { workspace = true }
 # Two API fixes were needed: `TopDocs::with_limit(..).order_by_score()` and
 # `Document::get_first` returning `CompactDocValue` instead of `OwnedValue`.
 tantivy = "0.26"
+jieba-rs = "0.7"
 # Deliberately on the 0.7 line: 0.8+ moves to phf 0.13, but the phf 0.11 it
 # currently shares with gpui-base's html5ever -> markup5ever would not go away
 # either (markup5ever pins it), so upgrading only adds phf_codegen 0.13 as a
 # second copy. Revisit once html5ever moves to phf 0.13.
-jieba-rs = "0.7"
 pinyin = "0.10"

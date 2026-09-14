@@ -128,6 +128,27 @@ impl ModelViewport {
         if device.0 == 0 || device.1 == 0 {
             return;
         }
+        // Re-read on a slow backoff rather than every frame: the settings
+        // window is a separate OS window, so a change there can only reach an
+        // already-open viewport by polling, but a config-file read on the frame
+        // path is not free and the value only changes when a person clicks.
+        //
+        // Done before the camera is copied below, so a zoom-limit change
+        // takes effect on this frame rather than the next one.
+        if self
+            .enhance_checked
+            .is_none_or(|at| at.elapsed() >= ENHANCE_REFRESH)
+        {
+            let cfg = trove_core::config::AppConfig::load();
+            self.enhance_points = cfg.point_enhance();
+            self.height_color = cfg.height_color();
+            // The zoom limits live in the same file: clamp so lowering the
+            // range while a model is open pulls the camera back in, instead
+            // of leaving it parked outside the configured limits.
+            let (zmin, zmax) = super::ui::distance_bounds(&cfg);
+            self.camera.zoom = self.camera.zoom.clamp(zmin, zmax);
+            self.enhance_checked = Some(Instant::now());
+        }
         let gpu = self.gpu.clone();
         let gpu_mesh = self.gpu_mesh.clone();
         let mesh = self.mesh.clone();
@@ -139,17 +160,6 @@ impl ModelViewport {
         let interactive = self.is_interacting();
         let quality = if interactive { 0.25 } else { 1.0 };
         let scratch = self.scratch.clone();
-        // Re-read on a slow backoff rather than every frame: the settings
-        // window is a separate OS window, so a toggle there can only reach an
-        // already-open viewport by polling, but a config-file read on the frame
-        // path is not free and the value only changes when a person clicks.
-        if self
-            .enhance_checked
-            .is_none_or(|at| at.elapsed() >= ENHANCE_REFRESH)
-        {
-            self.enhance_points = trove_core::config::AppConfig::load().point_enhance();
-            self.enhance_checked = Some(Instant::now());
-        }
         let options = RenderOptions {
             // Skipping back faces is free for a closed mesh and wrong for
             // anything else, so it follows the winding exactly.
@@ -158,6 +168,11 @@ impl ModelViewport {
             // they are worth it on a settled frame and wasted on a draft the
             // user is dragging past.
             enhance_points: !interactive && self.enhance_points,
+            // Height colouring and the axis gizmo are set together: the
+            // gizmo is what makes a height band readable as a size, so it
+            // has nothing to add when the colouring is off.
+            height_color: self.height_color,
+            show_axes: self.height_color,
         };
 
         self.dirty = false;
@@ -416,12 +431,20 @@ fn draw(shot: Shot<'_>) -> Rendered {
         // function, so the two renderers cannot disagree about what "framed"
         // means.
         let framing = camera.framing(bounds, aspect);
+        // The bands count from the model's own floor, exactly as the CPU
+        // rasteriser counts them, so the two pictures agree.
+        let bands = render3d::bands_uniform(
+            options.height_color,
+            options.show_axes,
+            bounds.min[1],
+        );
         if let Some(bytes) = renderer.render(
             uploaded,
             &framing,
             size,
             interactive,
             options.enhance_points,
+            bands,
         ) && let Some(frame) = frame_image(size, bytes)
         {
             return Rendered::Frame(frame);

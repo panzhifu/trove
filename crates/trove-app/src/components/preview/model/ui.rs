@@ -11,6 +11,17 @@ use gpui_kit::*;
 
 use super::{Backend, Drag, ModelViewport, drag_for};
 
+/// The camera's distance bounds for the configured magnification limits.
+///
+/// [`render3d::Camera::zoom`] scales the eye *distance*, so it is the
+/// reciprocal of a magnification: a small value moves the camera in and
+/// makes the model look bigger. The config stores magnification (shared
+/// with the image preview, where it is used directly), so the bounds are
+/// inverted here — the smallest distance is the *largest* magnification.
+pub(super) fn distance_bounds(cfg: &trove_core::config::AppConfig) -> (f32, f32) {
+    (1.0 / cfg.max_preview_zoom(), 1.0 / cfg.min_preview_zoom())
+}
+
 impl ModelViewport {
     /// The canvas: the model, and every interaction that moves the camera.
     pub(super) fn canvas(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -122,7 +133,9 @@ impl ModelViewport {
                     return;
                 }
                 // Exponential, so every notch scales the distance equally.
-                this.camera.zoom_by((-lines * 0.12).exp());
+                let cfg = trove_core::config::AppConfig::load();
+                let (zmin, zmax) = distance_bounds(&cfg);
+                this.camera.zoom_by((-lines * 0.12).exp(), zmin, zmax);
                 // A wheel notch is a gesture with no button to release, so it
                 // runs on the linger window: draft frames while the wheel
                 // turns, one settled frame once it stops.
@@ -134,6 +147,9 @@ impl ModelViewport {
                 // same at any zoom — the same idea as `turn_per_pixel`.
                 let panstep = 0.05f32;
                 let zoom_factor = 1.1f32;
+                // Read zoom limits from config once per key press.
+                let cfg = trove_core::config::AppConfig::load();
+                let (zmin, zmax) = distance_bounds(&cfg);
                 // Shift turns the arrow keys from turning the model into
                 // sliding it, so the keyboard can do everything the mouse can.
                 let pan = event.keystroke.modifiers.shift;
@@ -160,19 +176,19 @@ impl ModelViewport {
                     "a" => nudge(this, -1.0, 0.0),
                     "d" => nudge(this, 1.0, 0.0),
                     "e" => {
-                        this.camera.zoom_by(1.0 / zoom_factor);
+                        this.camera.zoom_by(1.0 / zoom_factor, zmin, zmax);
                         this.dirty = true;
                     }
                     "q" => {
-                        this.camera.zoom_by(zoom_factor);
+                        this.camera.zoom_by(zoom_factor, zmin, zmax);
                         this.dirty = true;
                     }
                     "=" | "+" => {
-                        this.camera.zoom_by(1.0 / zoom_factor);
+                        this.camera.zoom_by(1.0 / zoom_factor, zmin, zmax);
                         this.dirty = true;
                     }
                     "-" | "_" => {
-                        this.camera.zoom_by(zoom_factor);
+                        this.camera.zoom_by(zoom_factor, zmin, zmax);
                         this.dirty = true;
                     }
                     "r" => this.reset_camera(cx),
@@ -200,7 +216,39 @@ impl ModelViewport {
                 Some(frame) => frame_element(frame),
                 None => self.placeholder(cx),
             })
+            .child(self.height_toggle(cx))
             .child(self.shortcuts_hint(cx))
+    }
+
+    /// The height-colouring switch, in the canvas's top-left corner.
+    ///
+    /// On the canvas rather than in the toolbar because it changes what is
+    /// drawn, not the panel's chrome. Switching it also draws a frame, since
+    /// the axis gizmo appears and disappears with it.
+    fn height_toggle(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let on = self.height_color;
+        div().absolute().top_2().left_2().child(
+            Button::new("height-color")
+                .xsmall()
+                .when(on, |button| button.primary())
+                .when(!on, |button| button.ghost())
+                .icon(IconName::Palette)
+                .label(rust_i18n::t!("viewport.height_color").to_string())
+                .tooltip(rust_i18n::t!("viewport.height_color_tip").to_string())
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.height_color = !this.height_color;
+                    // Persisted, so the choice survives the viewport — and so
+                    // the frame loop's periodic re-read agrees with what is on
+                    // screen instead of flicking it back.
+                    let mut config = trove_core::config::AppConfig::load();
+                    config.height_color = Some(this.height_color);
+                    let _ = config.save();
+                    this.enhance_checked = None;
+                    this.dirty = true;
+                    this.pump(cx);
+                    cx.notify();
+                })),
+        )
     }
 
     /// A small panel in the top-right corner listing the keyboard shortcuts.
@@ -259,7 +307,14 @@ impl ModelViewport {
     }
 
     /// The toolbar: what the model is, how it is being drawn, and the way out.
-    pub(super) fn toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    /// The viewport's title-bar controls: name, geometry stats, backend, and
+    /// the reset / close buttons.
+    ///
+    /// Rendered by the host panel's title bar while a model preview is open —
+    /// see `WorkspacePanel::title_suffix` — so the canvas below is nothing but
+    /// the picture. The title bar supplies the chrome, so this carries no
+    /// padding or border of its own.
+    pub(crate) fn title_tools(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let (primitives, vertices) = self.stats();
         let count_label = if self.mesh.is_point_cloud() {
             rust_i18n::t!("viewport.points", count = primitives)
@@ -308,13 +363,10 @@ impl ModelViewport {
 
         h_flex()
             .w_full()
+            .min_w_0()
             .flex_none()
             .gap_2()
             .items_center()
-            .px_3()
-            .py_2()
-            .border_b_1()
-            .border_color(cx.theme().border)
             .child(
                 div()
                     .flex_1()
