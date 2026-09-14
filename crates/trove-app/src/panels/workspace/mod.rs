@@ -428,6 +428,33 @@ impl WorkspacePanel {
     }
 }
 
+/// Ask the platform for the frame that draws a relayout armed this frame.
+///
+/// Marking state dirty is not a frame request, and on Wayland that difference
+/// is fatal: frames arrive only from `schedule_frame()` and the compositor's
+/// `wl_surface.frame` callbacks, and nothing else can produce one — Linux
+/// leaves `PlatformWindow::frame_waker()` at its `None` default
+/// (`gpui-pre/src/platform.rs:854`), so the waker `Window::refresh` and
+/// `Window::invalidate_view` would call (`window.rs:167-191`, `2179`) does not
+/// exist. X11 hides that: its client invokes the frame callback every vblank
+/// (`x11/client.rs:1990` -> `x11/window.rs:1177`), so a dirty window is drawn
+/// within a frame no matter what. Wayland has no such poll, so an armed
+/// relayout waits for the next input event to drag a frame out of the window —
+/// "toggle fullscreen, then click, and only then does the grid fill in".
+///
+/// `Window::on_next_frame` is the primitive that cannot be dropped: it calls
+/// `platform_window.schedule_frame()` synchronously (`window.rs:2507-2510`)
+/// while the current frame is still ticking, which Wayland turns into a
+/// reschedule, i.e. a one-vblank retry (`wayland/window.rs:1013-1026`,
+/// `976-981`; `FRAME_RETRY_INTERVAL` = 16.7 ms). The callback then marks the
+/// window dirty again (`App::refresh_windows`, `app.rs:1808-1814`), so the
+/// frame it produces always draws a relayout that was armed this frame —
+/// `Context::notify` on its own only sets a dirty bit, and a relayout must not
+/// depend on which of the two survived.
+fn arm_relayout_frame(window: &mut Window) {
+    window.on_next_frame(|_window, cx| cx.refresh_windows());
+}
+
 impl EventEmitter<PanelEvent> for WorkspacePanel {}
 impl Focusable for WorkspacePanel {
     fn focus_handle(&self, _: &App) -> FocusHandle {
@@ -656,27 +683,15 @@ impl Render for WorkspacePanel {
                 cx.background_executor()
                     .timer(std::time::Duration::from_millis(150))
                     .await;
-                // `refresh_windows` besides the notify: the pending flag is
-                // state, not a request for a frame, and once a resize settles
-                // nothing else is necessarily in flight. `Context::notify`
-                // alone is not enough — it routes through
-                // `Window::invalidate_view`, which wakes the platform only when
-                // the window is not mid-draw *and* was not already dirty
-                // (`window.rs:167-191`), and `Window::refresh` has the same
-                // not-drawing gate (`window.rs:2179`). `refresh_windows` pushes
-                // `Effect::RefreshWindows`, which sets `refreshing` and the
-                // dirty flag unconditionally (`app.rs:1808-1814`) — the one
-                // guaranteed frame. Without it the relayout can sit armed until
-                // the next input event (a stray click) drags a frame out of the
-                // window, which is exactly the "resize, then click, and only
-                // then does the grid fill in" symptom this timer exists to
-                // prevent.
+                // The pending flag is state, not a request for a frame, and
+                // once a resize settles nothing else is necessarily in
+                // flight, so the timer has to ask for the frame itself.
                 panel
-                    .update_in(cx, |this, _window, cx| {
+                    .update_in(cx, |this, window, cx| {
                         this.relayout_pending = true;
                         this.debounce_timer = None;
                         cx.notify();
-                        cx.refresh_windows();
+                        arm_relayout_frame(window);
                     })
                     .ok();
             }));
@@ -936,16 +951,25 @@ impl Render for WorkspacePanel {
                     .on_prepaint({
                         let available_width = self.available_width.clone();
                         let controller = self.controller.clone();
-                        move |bounds: Bounds<Pixels>, _, cx| {
+                        move |bounds: Bounds<Pixels>, window, cx| {
                             let w = bounds.size.width;
-                            available_width.update(cx, |width, cx| {
+                            let mut measured_changed = false;
+                            available_width.update(cx, |width, _| {
                                 if *width != w {
                                     *width = w;
-                                    // Width changes re-layout the grid; wake
-                                    // the controller so panels re-render.
-                                    controller.update(cx, |_, cx| cx.notify());
+                                    measured_changed = true;
                                 }
                             });
+                            if measured_changed {
+                                // Width changes re-layout the grid; wake the
+                                // controller so panels re-render, and ask for
+                                // the frame that applies the new measurement —
+                                // `render` reads `available_width` a frame
+                                // *ahead* of it landing here, so the relayout
+                                // always needs one more frame.
+                                controller.update(cx, |_, cx| cx.notify());
+                                arm_relayout_frame(window);
+                            }
                         }
                     })
                     // Empty-state hint sits UNDER the grid so the grid keeps
