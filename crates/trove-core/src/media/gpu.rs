@@ -19,7 +19,6 @@ use super::render3d::{
     MATERIAL, POINT_RADIUS, SHININESS, SPECULAR, VIGNETTE,
 };
 
-
 /// Bytes of [`Uniforms`]: one `mat4x4<f32>` plus nine `vec4<f32>`.
 pub const UNIFORM_SIZE: usize = 64 + 9 * 16;
 
@@ -155,7 +154,12 @@ pub fn axis_data(mesh: &Mesh) -> AxisData {
     let mut vertices = Vec::with_capacity(triangles.len() * 6);
     for (position, color) in &triangles {
         vertices.extend_from_slice(&[
-            position[0], position[1], position[2], color[0], color[1], color[2],
+            position[0],
+            position[1],
+            position[2],
+            color[0],
+            color[1],
+            color[2],
         ]);
     }
     AxisData {

@@ -440,67 +440,62 @@ impl Render for AssetPreviewPanel {
             }
         };
         let zoomable = self.zoomable();
-        v_flex()
-            .size_full()
-            .overflow_hidden()
-            .child(
-                div()
-                    .flex_1()
-                    .min_h_0()
-                    .flex()
-                    .flex_col()
-                    .items_center()
-                    .justify_center()
-                    .overflow_hidden()
-                    .p_4()
-                    .cursor(if self.dragging {
-                        CursorStyle::ClosedHand
-                    } else if zoomable {
-                        CursorStyle::OpenHand
-                    } else {
-                        CursorStyle::Arrow
-                    })
-                    // Track the content viewport so the zoom has a fit base.
-                    .on_prepaint({
-                        let viewport = self.viewport.clone();
-                        move |bounds: Bounds<Pixels>, _, cx| {
-                            viewport.update(cx, |size, cx| {
-                                if *size != bounds.size {
-                                    *size = bounds.size;
-                                    cx.notify();
-                                }
-                            });
-                        }
-                    })
-                    // Wheel zoom toward the cursor.
-                    .when(zoomable, |this| {
-                        this.on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, _, cx| {
-                            this.handle_scroll_wheel(event, cx);
-                        }))
-                    })
-                    // Drag to pan when zoomed in.
-                    .when(zoomable, |this| {
-                        this.on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(|this, event: &MouseDownEvent, _, cx| {
-                                this.begin_pan(event.position);
+        v_flex().size_full().overflow_hidden().child(
+            div()
+                .flex_1()
+                .min_h_0()
+                .flex()
+                .flex_col()
+                .items_center()
+                .justify_center()
+                .overflow_hidden()
+                .p_4()
+                .cursor(if self.dragging {
+                    CursorStyle::ClosedHand
+                } else if zoomable {
+                    CursorStyle::OpenHand
+                } else {
+                    CursorStyle::Arrow
+                })
+                // Track the content viewport so the zoom has a fit base.
+                .on_prepaint({
+                    let viewport = self.viewport.clone();
+                    move |bounds: Bounds<Pixels>, _, cx| {
+                        viewport.update(cx, |size, cx| {
+                            if *size != bounds.size {
+                                *size = bounds.size;
                                 cx.notify();
-                            }),
-                        )
-                        .on_mouse_move(cx.listener(
-                            |this, event: &MouseMoveEvent, _, cx| {
-                                this.update_pan(event.position, cx);
-                            },
-                        ))
-                        .on_mouse_up(
-                            MouseButton::Left,
-                            cx.listener(|this, _: &MouseUpEvent, _, cx| {
-                                this.end_pan();
-                                cx.notify();
-                            }),
-                        )
-                    })
-                    .child(content),
-            )
+                            }
+                        });
+                    }
+                })
+                // Wheel zoom toward the cursor.
+                .when(zoomable, |this| {
+                    this.on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, _, cx| {
+                        this.handle_scroll_wheel(event, cx);
+                    }))
+                })
+                // Drag to pan when zoomed in.
+                .when(zoomable, |this| {
+                    this.on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                            this.begin_pan(event.position);
+                            cx.notify();
+                        }),
+                    )
+                    .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
+                        this.update_pan(event.position, cx);
+                    }))
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(|this, _: &MouseUpEvent, _, cx| {
+                            this.end_pan();
+                            cx.notify();
+                        }),
+                    )
+                })
+                .child(content),
+        )
     }
 }

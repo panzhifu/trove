@@ -6,8 +6,8 @@ use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::{IconName, Selectable as _, Sizable as _};
 use gpui_kit::prelude::FluentBuilder as _;
-use gpui_kit::{Anchor, App};
 use gpui_kit::*;
+use gpui_kit::{Anchor, App};
 
 use trove_core::config::{AppConfig, FILTER_TOOLS};
 use trove_core::model::{AssetKind, AssetSort, Orientation};

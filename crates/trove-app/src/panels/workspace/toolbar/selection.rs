@@ -2,12 +2,12 @@
 //! assets are selected.
 
 use gpui_kit::base::h_flex;
+use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
-use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::component::{IconName, Sizable as _};
-use gpui_kit::{Anchor, App, Div, Entity};
 use gpui_kit::*;
+use gpui_kit::{Anchor, App, Div, Entity};
 
 use trove_core::store::{assets, collections};
 

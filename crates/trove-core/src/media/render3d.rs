@@ -1949,7 +1949,10 @@ mod tests {
         let top = triangles.iter().map(|(p, _)| p[1]).fold(f32::MIN, f32::max);
         assert!(top >= 3.9, "the Y rod reaches the top, got {top}");
         for (p, _) in &triangles {
-            assert!(p.iter().all(|c| *c >= -0.1 && *c <= 5.1), "inside bounds: {p:?}");
+            assert!(
+                p.iter().all(|c| *c >= -0.1 && *c <= 5.1),
+                "inside bounds: {p:?}"
+            );
         }
     }
 

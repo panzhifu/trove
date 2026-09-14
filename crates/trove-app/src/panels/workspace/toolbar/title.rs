@@ -6,17 +6,17 @@
 //! a main-area preview is open.
 
 use gpui_kit::base::h_flex;
+use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::dock::{Panel as DockPanel, PanelControl};
 use gpui_kit::component::slider::Slider;
-use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::component::{IconName, Sizable as _};
 use gpui_kit::*;
 
 use crate::components::preview::ModelViewport;
-use crate::panels::workspace::title_controls;
-use crate::panels::workspace::MainPreview;
 use crate::panels::WorkspacePanel;
+use crate::panels::workspace::MainPreview;
+use crate::panels::workspace::title_controls;
 
 impl DockPanel for WorkspacePanel {
     /// Title text: follows the browsed view (collection name, smart
@@ -138,11 +138,10 @@ impl DockPanel for WorkspacePanel {
 ///
 /// A thin adaptation rather than a reimplementation: the viewport owns these
 /// buttons, so the bar asks it for them and the two cannot drift.
-fn model_toolbar(
-    viewport: &Entity<ModelViewport>,
-    cx: &mut Context<WorkspacePanel>,
-) -> AnyElement {
-    viewport.update(cx, |viewport, cx| viewport.title_tools(cx).into_any_element())
+fn model_toolbar(viewport: &Entity<ModelViewport>, cx: &mut Context<WorkspacePanel>) -> AnyElement {
+    viewport.update(cx, |viewport, cx| {
+        viewport.title_tools(cx).into_any_element()
+    })
 }
 
 /// The still / video preview's title-bar controls: just the close button,
