@@ -100,12 +100,26 @@ pub(crate) fn hex_to_rgb(s: &str) -> Option<u32> {
     u32::from_str_radix(s, 16).ok()
 }
 
-/// A square color chip in the shared palette style: hairline border, a
-/// stronger ring when `selected`, hover feedback. Used by the smart-collection
-/// palette and the Inspector's mined-color swatches.
+/// A square color chip in the shared palette style: hairline frame, a stronger
+/// one when `selected`, hover feedback. Used by the smart-collection palette
+/// and the Inspector's mined-color swatches.
 ///
 /// Square rather than round so the chips match the swatches in the toolbar
 /// colour picker's palette, which are square.
+///
+/// The frame is painted as *padding* rather than as an outline. An element's
+/// `bg` and its `border` are two separate `paint_quad` calls inside gpui
+/// (`style.rs:730` and `:748`), each anti-aliasing its own rounded outline;
+/// at this size — 24 px across a 6 px radius — both anti-aliased edges land on
+/// the same ring of pixels, and the frame colour bleeds into the fill, which
+/// reads as a frayed edge. Painting the frame as a filled rounded box behind
+/// an inset rounded box gives each edge its own background to blend into: the
+/// outer one against the panel, the inner one against the frame.
+///
+/// The inner box therefore carries its own, smaller radius. `overflow_hidden`
+/// cannot supply it: gpui's content mask is a plain rectangle
+/// (`window.rs:2119` — `ContentMask` has `bounds` and nothing else), so a
+/// square inner box would fill the outer corners instead of being cut by them.
 pub(crate) fn color_swatch(
     cx: &App,
     id: String,
@@ -114,21 +128,32 @@ pub(crate) fn color_swatch(
     on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
 ) -> Stateful<Div> {
     let rgb = u32::from_str_radix(hex.trim_start_matches('#'), 16).unwrap_or(0);
-    // Larger swatch for smoother edges (less visible aliasing) and a more
-    // touch-friendly target.
+    // The ring is doubled when this chip is the chosen one.
+    let (frame, ring) = match selected {
+        true => (cx.theme().foreground, px(2.)),
+        false => (cx.theme().border, px(1.)),
+    };
+    // Concentric radii: pulling the inner radius in by the ring width keeps the
+    // two curves parallel, which is what a real border does.
+    let inner_radius = (cx.theme().radius - ring).max(px(0.));
+
     div()
         .id(id)
         .cursor_pointer()
         .size_6()
         .flex_shrink_0()
         .rounded(cx.theme().radius)
-        .bg(gpui_kit::rgb(rgb))
-        .border_1()
-        .border_color(cx.theme().border)
-        .hover(|this| this.border_color(cx.theme().muted_foreground))
-        .when(selected, |this| {
-            this.border_2().border_color(cx.theme().foreground)
+        .p(ring)
+        .bg(frame)
+        .when(!selected, |this| {
+            this.hover(|this| this.bg(cx.theme().muted_foreground))
         })
+        .child(
+            div()
+                .size_full()
+                .rounded(inner_radius)
+                .bg(gpui_kit::rgb(rgb)),
+        )
         .on_click(on_click)
 }
 
