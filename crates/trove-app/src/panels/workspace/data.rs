@@ -182,15 +182,11 @@ impl WorkspacePanel {
         });
         cx.subscribe_in(&zoom_slider, window, Self::on_zoom_slider)
             .detach();
-        let color_picker = cx.new(|cx| ColorPickerState::new(None, window, cx));
-        cx.subscribe(
-            &color_picker.clone(),
-            |this, _, picked: &ColorPicked, cx| {
-                this.pending_color_search = Some(picked.0.clone());
-                cx.notify();
-            },
-        )
-        .detach();
+        // The framework picker: its palette tab carries the whole nine-family
+        // ramp (plus whatever recent colours we feed it), which the local
+        // hand-rolled panel never had.
+        let color_picker = cx.new(|cx| gpui_kit::base::ColorPickerState::new(window, cx));
+        cx.subscribe(&color_picker, Self::on_color_picked).detach();
         let this = Self {
             focus_handle: cx.focus_handle(),
             controller,
@@ -456,4 +452,77 @@ fn virtual_font_id(path: &Path) -> Uuid {
     bytes[6] = (bytes[6] & 0x0f) | 0x40;
     bytes[8] = (bytes[8] & 0x3f) | 0x80;
     Uuid::from_bytes(bytes)
+}
+
+/// The recently confirmed colours, as the picker's featured row.
+///
+/// The picker wants `Hsla`; the history stores `#rrggbb` (what the colour
+/// search consumes and what survives a config round-trip). Only the front of
+/// the list is shown — the featured row is one strip, not a scroll region.
+pub(super) fn recent_picker_colors(_: &App) -> Vec<Hsla> {
+    const FEATURED: usize = 12;
+
+    trove_core::history::AppHistory::load()
+        .colors()
+        .iter()
+        .rev()
+        .take(FEATURED)
+        .filter_map(|hex| hex_to_hsla(hex))
+        .collect()
+}
+
+/// Parse `#rgb` / `#rrggbb` into the picker's colour type. Anything else,
+/// including the 8-digit form, is rejected rather than guessed at.
+fn hex_to_hsla(hex: &str) -> Option<Hsla> {
+    let hex = hex.strip_prefix('#').unwrap_or(hex);
+    // `from_str_radix` accepts a leading sign, so reject non-hex first.
+    if !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    let (r, g, b) = match hex.len() {
+        // A single digit repeats itself rather than scaling, so `#fff` is white.
+        3 => {
+            // Validated as ASCII hex above, so each byte decodes directly and
+            // the repeated-digit expansion is exact.
+            let digit = |byte: u8| (byte as char).to_digit(16).expect("validated hex");
+            let mut digits = hex.bytes().map(digit);
+            let (r, g, b) = (
+                digits.next().expect("length checked"),
+                digits.next().expect("length checked"),
+                digits.next().expect("length checked"),
+            );
+            ((r * 0x11) as u8, (g * 0x11) as u8, (b * 0x11) as u8)
+        }
+        6 => (
+            u8::from_str_radix(&hex[0..2], 16).ok()?,
+            u8::from_str_radix(&hex[2..4], 16).ok()?,
+            u8::from_str_radix(&hex[4..6], 16).ok()?,
+        ),
+        _ => return None,
+    };
+    Some(
+        Rgba {
+            r: r as f32 / 255.0,
+            g: g as f32 / 255.0,
+            b: b as f32 / 255.0,
+            a: 1.0,
+        }
+        .into(),
+    )
+}
+
+/// Convert a picked colour to the `#rrggbb` string the colour search takes.
+///
+/// The framework picker reports `Hsla`, and its own hex formatter is private,
+/// so the conversion lives here. Alpha is dropped: a colour search matches
+/// pixels, which have no transparency to match against.
+pub(super) fn hsla_to_hex(color: Hsla) -> String {
+    let rgba = Rgba::from(color);
+    let channel = |value: f32| (value.clamp(0.0, 1.0) * 255.0).round() as u32;
+    format!(
+        "#{:02x}{:02x}{:02x}",
+        channel(rgba.r),
+        channel(rgba.g),
+        channel(rgba.b)
+    )
 }

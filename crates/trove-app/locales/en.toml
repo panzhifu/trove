@@ -75,7 +75,6 @@ color = "Color"
 no_color = "No color"
 
 [workspace]
-pick_color_search = "Pick a colour to search"
 color_filter = "Colour"
 kind_filter = "Type"
 filter_tag = "Tag"
