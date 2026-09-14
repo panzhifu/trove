@@ -84,6 +84,14 @@ const LIST_OVERDRAW_PX: f32 = 400.0;
 const LIST_ROW_HEIGHT: f32 = 44.0;
 /// How close (in rows) to the end of the list the next page is requested.
 const PAGE_TRIGGER_ROWS: usize = 3;
+/// Width jump (in px) that counts as a discrete resize rather than a drag.
+///
+/// A drag reports a handful of px per frame; a fullscreen toggle, a
+/// double-clicked titlebar or a snapped window reports the whole delta at
+/// once. Only the drag needs the debounce — deferring a jump means the grid
+/// sits stretched with its old column count for the whole debounce window,
+/// which reads as a stall followed by a sudden fill-in.
+const WIDTH_JUMP_PX: f32 = 120.0;
 /// Minimum wall time between two exact COUNT queries for the grid total.
 /// Between them the cached number is reused; the data pass fetches items
 /// with a lower-bound total instead, keeping the COUNT off the hot path.
@@ -608,6 +616,17 @@ impl Render for WorkspacePanel {
         let width_changed = self.view_key.as_ref().is_some_and(|k| {
             k.content_width != content_width || k.row_height_scale != row_height_scale
         });
+        // A large one-shot width change is a discrete resize (fullscreen
+        // button, double-clicked titlebar, snapping), not a drag: it lands in
+        // a single frame with the whole delta. Deferring that one leaves the
+        // grid drawn at the old column count inside a stretched viewport until
+        // the debounce fires, which is exactly the "it pauses, then clicking
+        // fills it in" stall. Drags stay debounced — they arrive a few px per
+        // frame, so they never clear this threshold.
+        let jumped_width = self
+            .view_key
+            .as_ref()
+            .is_some_and(|k| (k.content_width - content_width).abs() > WIDTH_JUMP_PX);
         let other_changed = self.view_key.as_ref().is_none_or(|k| {
             k.collection != collection
                 || k.in_trash != in_trash
@@ -629,19 +648,37 @@ impl Render for WorkspacePanel {
         // slider drag settles, at which point the timer sets
         // `relayout_pending` and the next render applies it.
         let structural_changed = other_changed || self.covered != cells.len();
-        let defer_layout = !structural_changed && width_changed && !self.relayout_pending;
+        let defer_layout =
+            !structural_changed && width_changed && !jumped_width && !self.relayout_pending;
 
         if defer_layout && self.debounce_timer.is_none() {
-            let panel = cx.entity();
-            self.debounce_timer = Some(cx.spawn(async move |_, cx| {
+            self.debounce_timer = Some(cx.spawn_in(window, async move |panel, cx| {
                 cx.background_executor()
                     .timer(std::time::Duration::from_millis(150))
                     .await;
-                panel.update(cx, |this, cx| {
-                    this.relayout_pending = true;
-                    this.debounce_timer = None;
-                    cx.notify();
-                });
+                // `refresh_windows` besides the notify: the pending flag is
+                // state, not a request for a frame, and once a resize settles
+                // nothing else is necessarily in flight. `Context::notify`
+                // alone is not enough — it routes through
+                // `Window::invalidate_view`, which wakes the platform only when
+                // the window is not mid-draw *and* was not already dirty
+                // (`window.rs:167-191`), and `Window::refresh` has the same
+                // not-drawing gate (`window.rs:2179`). `refresh_windows` pushes
+                // `Effect::RefreshWindows`, which sets `refreshing` and the
+                // dirty flag unconditionally (`app.rs:1808-1814`) — the one
+                // guaranteed frame. Without it the relayout can sit armed until
+                // the next input event (a stray click) drags a frame out of the
+                // window, which is exactly the "resize, then click, and only
+                // then does the grid fill in" symptom this timer exists to
+                // prevent.
+                panel
+                    .update_in(cx, |this, _window, cx| {
+                        this.relayout_pending = true;
+                        this.debounce_timer = None;
+                        cx.notify();
+                        cx.refresh_windows();
+                    })
+                    .ok();
             }));
         }
 
