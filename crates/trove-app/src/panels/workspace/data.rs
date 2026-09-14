@@ -52,11 +52,16 @@ impl Cell {
 ///
 /// A row may also carry `header` instead of cells: the timeline view inserts
 /// one such row per day section.
+///
+/// `cells` and `widths` sit behind an `Rc` because the list's item builder
+/// hands each visible row out by value on every frame: a plain `Vec` would
+/// deep-copy every `Cell` (name / path / dates) per row per frame, which is
+/// the worst part of a resize — visible rows multiply as the area grows.
 #[derive(Debug, Clone)]
 pub(super) struct Row {
     pub(super) height: f32,
-    pub(super) widths: Vec<f32>,
-    pub(super) cells: Vec<Cell>,
+    pub(super) widths: Rc<[f32]>,
+    pub(super) cells: Rc<[Cell]>,
     pub(super) header: Option<String>,
 }
 
@@ -68,8 +73,8 @@ impl Row {
     pub(super) fn section(label: String) -> Self {
         Self {
             height: TIMELINE_HEADER_HEIGHT,
-            widths: Vec::new(),
-            cells: Vec::new(),
+            widths: Rc::from([]),
+            cells: Rc::from([]),
             header: Some(label),
         }
     }
