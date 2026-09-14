@@ -187,12 +187,26 @@ impl WorkspacePanel {
         // hand-rolled panel never had.
         let color_picker = cx.new(|cx| gpui_kit::base::ColorPickerState::new(window, cx));
         cx.subscribe(&color_picker, Self::on_color_picked).detach();
+        // `set_open` only calls `notify`, so the close has to be observed
+        // rather than subscribed to. Only the true→false edge commits: an
+        // open is always followed by another choice, and committing on it
+        // would fire a search the user never finished making.
+        let was_open = Rc::new(CellFlag::new(false));
+        cx.observe(&color_picker, move |this, picker, cx| {
+            let open = picker.read(cx).is_open();
+            let previously_open = was_open.replace(open);
+            if super::picker_just_closed(previously_open, open) {
+                this.on_picker_closed(cx);
+            }
+        })
+        .detach();
         let this = Self {
             focus_handle: cx.focus_handle(),
             controller,
             search_box,
             color_picker,
             pending_color_search: None,
+            color_search_armed: false,
             available_width,
             rows: Rc::new(Vec::new()),
             list_state,
