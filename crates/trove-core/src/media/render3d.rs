@@ -1114,7 +1114,7 @@ impl Target<'_> {
     /// floating over it.
     fn paint_axes(&mut self, mesh: &Mesh) {
         let triangles = axis_triangles(mesh);
-        for tri in triangles.chunks_exact(3) {
+        for tri in triangles.as_chunks::<3>().0 {
             // Intensity 1 and no specular is what makes it unlit: a
             // measurement aid reads better flat, and it keeps the GPU's axis
             // pass, which has no lighting at all, in agreement.
@@ -1958,8 +1958,10 @@ mod tests {
 
     #[test]
     fn a_mesh_with_no_bounds_has_no_axis() {
-        let mut mesh = Mesh::default();
-        mesh.bounds = Bounds::empty();
+        let mesh = Mesh {
+            bounds: Bounds::empty(),
+            ..Mesh::default()
+        };
         assert!(axis_triangles(&mesh).is_empty());
     }
 
