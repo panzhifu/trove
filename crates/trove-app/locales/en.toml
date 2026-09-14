@@ -567,6 +567,12 @@ system_note = "System-owned"
 [color_picker]
 none = "No colour"
 confirm = "OK"
+palette = "Palette"
+hsla = "HSLA"
+hue = "Hue"
+saturation = "Saturation"
+lightness = "Lightness"
+alpha = "Alpha"
 
 [dock]
 collapse = "Collapse Sidebar"
