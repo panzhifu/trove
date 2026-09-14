@@ -288,6 +288,67 @@ mod tests {
         std::fs::write(path, &file).unwrap();
     }
 
+    /// Write a binary PLY cloud whose points are exactly those given, so a
+    /// test can plant a non-finite coordinate on purpose.
+    fn write_points(path: &std::path::Path, points: &[[f32; 3]]) {
+        let mut file = format!(
+            "ply\nformat binary_little_endian 1.0\nelement vertex {}\n\
+             property float x\nproperty float y\nproperty float z\nend_header\n",
+            points.len()
+        )
+        .into_bytes();
+        for point in points {
+            for value in point {
+                file.extend_from_slice(&value.to_le_bytes());
+            }
+        }
+        std::fs::write(path, &file).unwrap();
+    }
+
+    /// A scan written with NaN for its unobserved points must load, not hang.
+    /// The octree used to loop forever growing its bounds around the NaN —
+    /// every comparison with NaN is false, so the point could never be inside
+    /// them. This is the regression that took the whole viewport down at 100%
+    /// CPU.
+    #[test]
+    fn a_cloud_with_nan_points_still_loads() {
+        let path = temp("nan.ply");
+        write_points(
+            &path,
+            &[
+                [0.0, 0.0, 0.0],
+                [f32::NAN, 0.0, 0.0],
+                [1.0, 1.0, 1.0],
+                [f32::INFINITY, 0.0, 0.0],
+                [0.5, 0.5, 0.5],
+            ],
+        );
+        let mut cloud = StreamingPointCloud::open(&path).expect("opens");
+        std::fs::remove_file(&path).ok();
+
+        let mut steps = 0;
+        loop {
+            let step = cloud.step();
+            steps += 1;
+            if step.complete {
+                assert_eq!(step.points_read, 5, "every record is read");
+                break;
+            }
+            assert!(steps < 100, "the cloud must finish");
+        }
+        // The three finite points are the ones on screen.
+        assert_eq!(cloud.points_kept(), 3);
+        let mesh = cloud.render_mesh_all([0.0, 0.0, 0.0]);
+        assert!(mesh.vertex_count() > 0);
+        assert!(
+            mesh.positions
+                .iter()
+                .all(|p| p.iter().all(|v| v.is_finite()))
+        );
+        assert!(mesh.bounds.min.iter().all(|v| v.is_finite()));
+        assert!(mesh.bounds.max.iter().all(|v| v.is_finite()));
+    }
+
     /// Progress is measured in points *read*, not points kept: once the cloud
     /// is thinning to stay inside its budget, the kept count stops tracking the
     /// file and a progress bar driven by it would stall.
