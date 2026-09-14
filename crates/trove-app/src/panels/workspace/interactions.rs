@@ -77,7 +77,7 @@ impl WorkspacePanel {
                         .to_string(),
                 ),
             };
-            ctl.selected_assets.clear();
+            ctl.selected_assets = Rc::new(Vec::new());
             ctl.generation += 1;
             cx.notify();
         });
@@ -95,7 +95,7 @@ impl WorkspacePanel {
                         .to_string(),
                 ),
             };
-            ctl.selected_assets.clear();
+            ctl.selected_assets = Rc::new(Vec::new());
             ctl.generation += 1;
             cx.notify();
         });
@@ -105,44 +105,62 @@ impl WorkspacePanel {
     /// browsed through — the active visual search, smart collection,
     /// collection (with its parent prefix when nested), trash, recently
     /// viewed, or the all-assets fallback.
-    pub(super) fn title_label(&self, cx: &Context<Self>) -> String {
+    ///
+    /// The smart-collection and collection names come from SQLite, and the
+    /// label is rebuilt on every frame (the dock calls it from `title`, which
+    /// is outside the workspace's own render). `rename_collection` /
+    /// `rename_smart_collection` bump the generation, so keying the cache on
+    /// it is enough to keep a rename from going stale.
+    pub(super) fn title_label(&mut self, cx: &Context<Self>) -> String {
+        // The whole label is cached, not just the store lookups: `title` is
+        // rebuilt outside this panel's own render, and every branch below
+        // allocates, so a per-frame recompute is wasted work even for the
+        // branches that never reach SQLite. Everything the label depends on
+        // is covered by the generation — view switches bump it, and renames
+        // do too.
+        let generation = self.controller.read(cx).generation;
+        if let Some((cached, label)) = &self.title_cache
+            && *cached == generation
+        {
+            return label.clone();
+        }
+
         let ctl = self.controller.read(cx);
         let conn = ctl.library.store().conn();
 
-        if let Some(visual) = &ctl.visual_results {
-            return format!(
+        let label = if let Some(visual) = &ctl.visual_results {
+            format!(
                 "{} · {}",
                 rust_i18n::t!("workspace.visual_title"),
                 visual.label
-            );
-        }
-        if ctl.showing_trash {
-            return rust_i18n::t!("app.trash").to_string();
-        }
-        if ctl.showing_recent {
-            return rust_i18n::t!("app.recent_viewed").to_string();
-        }
-        if let Some(sid) = ctl.active_smart
+            )
+        } else if ctl.showing_trash {
+            rust_i18n::t!("app.trash").to_string()
+        } else if ctl.showing_recent {
+            rust_i18n::t!("app.recent_viewed").to_string()
+        } else if let Some(sid) = ctl.active_smart
             && let Ok(Some(sc)) = smart_collections::get(conn, sid)
         {
-            return sc.name;
-        }
-        if let Some(cid) = ctl.current_collection
+            sc.name
+        } else if let Some(cid) = ctl.current_collection
             && let Ok(Some(c)) = collections::get(conn, cid)
         {
-            if let Some(pid) = c.parent_id
-                && let Ok(Some(p)) = collections::get(conn, pid)
+            match c
+                .parent_id
+                .and_then(|pid| collections::get(conn, pid).ok().flatten())
             {
-                return format!("{} / {}", p.name, c.name);
+                Some(p) => format!("{} / {}", p.name, c.name),
+                None => c.name,
             }
-            return c.name;
-        }
-        // The favorites toggle turns the unfiltered "all assets" view into
-        // the favorites view; named views keep their names.
-        if ctl.filter_favorite {
-            return rust_i18n::t!("workspace.title_favorites").to_string();
-        }
-        rust_i18n::t!("app.all_assets").to_string()
+        } else if ctl.filter_favorite {
+            // The favorites toggle turns the unfiltered "all assets" view
+            // into the favorites view; named views keep their names.
+            rust_i18n::t!("workspace.title_favorites").to_string()
+        } else {
+            rust_i18n::t!("app.all_assets").to_string()
+        };
+        self.title_cache = Some((generation, label.clone()));
+        label
     }
 
     // -- keyboard navigation ---------------------------------------------------

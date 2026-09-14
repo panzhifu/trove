@@ -176,6 +176,16 @@ pub struct WorkspacePanel {
     /// the live rows and the toolbar is rebuilt every frame, so it may only
     /// run when the generation moves.
     filter_exts: Option<(u64, Vec<String>)>,
+    /// Title-bar label, keyed by the controller generation it was resolved
+    /// at. The dock asks for the title outside this panel's own render, so
+    /// the collection / smart-collection name lookup behind it would
+    /// otherwise run once per frame.
+    title_cache: Option<(u64, String)>,
+    /// Infinite-scroll guard: the `grid_loaded` cursor the last page request
+    /// was issued for. Held across frames on purpose — see the paging trigger
+    /// in `render` for why a per-frame flag pages eagerly. `usize::MAX` means
+    /// "no request yet", which no real cursor can equal.
+    page_guard: Rc<CellFlag<usize>>,
 }
 
 impl WorkspacePanel {
@@ -505,9 +515,7 @@ impl Render for WorkspacePanel {
                 ctl.sort,
                 ctl.sort_desc,
                 ctl.active_folder.clone(),
-                ctl.visual_results
-                    .as_ref()
-                    .map(|r| r.hits.iter().map(|(id, _)| *id).collect::<Vec<Uuid>>()),
+                ctl.visual_results.as_ref().map(|r| r.ids.clone()),
                 ctl.visual_results.as_ref().map(|r| r.label.clone()),
             )
         };
@@ -661,12 +669,23 @@ impl Render for WorkspacePanel {
         if self.relayout_pending && self.view_key.as_ref() == Some(&key) {
             self.relayout_pending = false;
         }
+        // Whether either branch below rebuilt the frozen rows. The published
+        // visible-id list has to follow the rows, but only when they move.
+        let mut layout_changed = false;
+        // A view change resets `grid_loaded` back to the first page, which can
+        // land on a cursor the guard already served (the tail of the previous
+        // view). Forget that cursor so the new view's first page can still be
+        // requested when its end row comes into view.
+        if other_changed {
+            self.page_guard.set(usize::MAX);
+        }
         if self.view_key.as_ref() != Some(&key) && !defer_layout {
             // View, width or zoom changed: full layout. Structural changes
             // reset scrolling (a new view starts at the top), but a
             // width/zoom-only change merely re-justifies the same assets —
             // remember what is on screen and restore it below, so a resize
             // or a slider drag does not throw the user back to the top.
+            layout_changed = true;
             let width_only = width_changed && !other_changed;
             let anchor = if width_only {
                 let top = self.list_state.logical_scroll_top();
@@ -725,6 +744,7 @@ impl Render for WorkspacePanel {
             // (cells per row) and refill them, so scrolling stays stable
             // across unrelated mutations. List mode just rebuilds its
             // trivial one-cell rows.
+            layout_changed = true;
             let new_rows: Vec<Row> = if view_mode == ViewMode::Timeline {
                 // Sections move whenever the set does, so there is no frozen
                 // shape worth preserving here.
@@ -764,15 +784,18 @@ impl Render for WorkspacePanel {
         let rows = self.rows.clone();
         self.last_total = total;
 
-        // Publish the visible ids for Edit ▸ Select-all (no notify needed:
-        // the panels re-render through the regular observation channels).
-        let visible: Vec<Uuid> = rows
-            .iter()
-            .flat_map(|r| r.cells.iter().map(|c| c.id))
-            .collect();
-        self.controller.update(cx, |ctl, _| {
-            ctl.visible_assets = visible;
-        });
+        // Publish the visible ids for Edit ▸ Select-all / Shift-range. Only
+        // when the rows actually moved: flattening them is O(assets), and
+        // both consumers are user gestures rather than per-frame reads.
+        if layout_changed {
+            let visible: Vec<Uuid> = rows
+                .iter()
+                .flat_map(|r| r.cells.iter().map(|c| c.id))
+                .collect();
+            self.controller.update(cx, |ctl, _| {
+                ctl.set_visible_assets(visible);
+            });
+        }
 
         // --- virtualized list -----------------------------------------------------
         let list_state = self.list_state.clone();
@@ -782,21 +805,29 @@ impl Render for WorkspacePanel {
         let rows_for_render = rows.clone();
         let rows_len = rows.len();
         let list_mode = view_mode == ViewMode::List;
-        // One page request per frame at most (several visible rows can all
-        // sit within the trigger window of the end).
-        let page_guard = Rc::new(CellFlag::new(false));
+        // One page request per `grid_loaded` value at most. The guard lives on
+        // the panel and remembers the cursor the last request was issued for,
+        // rather than being rebuilt (and thus cleared) every frame: with a
+        // per-frame flag the trigger re-arms on every re-render while the end
+        // row is still on screen, so anything that re-renders repeatedly —
+        // import churn, a resize, the frames the request itself schedules —
+        // paged the grid forward on its own instead of following the user's
+        // scrolling. Keying on the cursor also means it re-arms exactly when a
+        // page lands, which is the one moment another request is legitimate.
+        let page_guard = self.page_guard.clone();
         let total_for_trigger = total;
 
         let grid = list_element(list_state, move |ix, _window, cx: &mut App| {
             // Infinite scroll: near the end, request the next page.
-            if ix + PAGE_TRIGGER_ROWS >= rows_len && !page_guard.get() {
-                page_guard.set(true);
-                controller.update(cx, |ctl, cx| {
-                    if ctl.grid_loaded < total_for_trigger {
+            if ix + PAGE_TRIGGER_ROWS >= rows_len {
+                let loaded = controller.read(cx).grid_loaded;
+                if loaded < total_for_trigger && page_guard.get() != loaded {
+                    page_guard.set(loaded);
+                    controller.update(cx, |ctl, cx| {
                         ctl.grid_loaded = (ctl.grid_loaded + GRID_PAGE_SIZE).min(total_for_trigger);
                         cx.notify();
-                    }
-                });
+                    });
+                }
             }
             let Some(row) = rows_for_render.get(ix) else {
                 return v_flex().into_any_element();
