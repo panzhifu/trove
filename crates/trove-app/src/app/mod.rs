@@ -3,6 +3,7 @@
 //! (light/dark + theme) plumbing.
 
 pub mod actions;
+pub mod dock_skin;
 pub mod i18n;
 pub mod theme;
 pub mod title_bar;
