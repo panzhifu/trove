@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::time::Instant;
 
 use uuid::Uuid;
@@ -49,6 +50,20 @@ pub const GRID_PAGE_SIZE: usize = 200;
 pub struct VisualSearchResults {
     pub label: String,
     pub hits: Vec<(Uuid, f32)>,
+    /// Rank-ordered ids derived from `hits`, cached because the workspace
+    /// render copies them into its per-frame object snapshot (and rebuilds
+    /// the query key with them) on every frame. Deriving them per frame is
+    /// O(hits) — capped at [`CANDIDATE_CAP`](crate::search::CANDIDATE_CAP)
+    /// — for a list that only changes when a new search lands.
+    pub ids: Rc<Vec<Uuid>>,
+}
+
+impl VisualSearchResults {
+    /// Build the result set, deriving the rank-ordered id list once.
+    pub fn new(label: String, hits: Vec<(Uuid, f32)>) -> Self {
+        let ids = Rc::new(hits.iter().map(|(id, _)| *id).collect());
+        Self { label, hits, ids }
+    }
 }
 
 /// How the selection was last changed. The root view auto-shows the
@@ -76,7 +91,13 @@ pub struct LibraryController {
     /// The collection being browsed in the workspace view (`None` = all).
     pub current_collection: Option<Uuid>,
     /// Selected assets; the last entry is the primary (shown in Inspector).
-    pub selected_assets: Vec<Uuid>,
+    /// Behind an `Rc` because the workspace render copies the selection into
+    /// its per-frame snapshot: with a plain `Vec` that is an O(selection)
+    /// allocation on every frame (notably a full-page Select-all), with an
+    /// `Rc` it is a refcount bump. Mutate through
+    /// [`Rc::make_mut`](std::rc::Rc::make_mut) so a snapshot held by the
+    /// current frame cannot be corrupted.
+    pub selected_assets: Rc<Vec<Uuid>>,
     /// When set, the workspace browses the trash instead of a collection.
     pub showing_trash: bool,
     /// When set, the workspace browses the recently-viewed history.
@@ -103,9 +124,13 @@ pub struct LibraryController {
     pub sort_desc: bool,
     /// Progress of the most recent import.
     pub import_phase: ImportPhase,
-    /// Asset ids currently displayed by the workspace grid (this page only).
-    /// Written by the panel each render; the source of Select-all.
-    pub visible_assets: Vec<Uuid>,
+    /// Asset ids currently displayed by the workspace grid. Published lazily
+    /// by the panel ([`set_visible_assets`](Self::set_visible_assets)) because
+    /// flattening the frozen rows on every frame only to serve Select-all and
+    /// Shift-range is pure waste: both are user gestures, so the ids can be
+    /// collected when the gesture happens instead. Read through
+    /// [`visible_assets`](Self::visible_assets).
+    pub(crate) visible_assets: Vec<Uuid>,
     /// The last clicked asset in the grid: the fixed end of a Shift range
     /// selection. Cleared whenever the selection is cleared.
     pub selection_anchor: Option<Uuid>,
@@ -176,7 +201,7 @@ impl LibraryController {
             library,
             generation: 0,
             current_collection: None,
-            selected_assets: Vec::new(),
+            selected_assets: Rc::new(Vec::new()),
             showing_trash: false,
             showing_recent: false,
             active_tag: None,
@@ -266,7 +291,7 @@ impl LibraryController {
         self.showing_recent = false;
         self.active_smart = None;
         self.filter_kind = None;
-        self.selected_assets.clear();
+        self.selected_assets = Rc::new(Vec::new());
         self.close_visual_search();
         self.reset_grid_page();
         self.generation += 1;
@@ -277,7 +302,7 @@ impl LibraryController {
         self.showing_trash = true;
         self.showing_recent = false;
         self.active_smart = None;
-        self.selected_assets.clear();
+        self.selected_assets = Rc::new(Vec::new());
         self.close_visual_search();
         self.reset_grid_page();
         self.generation += 1;
@@ -289,7 +314,7 @@ impl LibraryController {
         self.showing_trash = false;
         self.showing_recent = true;
         self.active_smart = None;
-        self.selected_assets.clear();
+        self.selected_assets = Rc::new(Vec::new());
         self.close_visual_search();
         self.reset_grid_page();
         self.generation += 1;
@@ -301,7 +326,7 @@ impl LibraryController {
         self.showing_trash = false;
         self.showing_recent = false;
         self.active_smart = None;
-        self.selected_assets.clear();
+        self.selected_assets = Rc::new(Vec::new());
         self.filter_kind = Some(AssetKind::Font);
         self.close_visual_search();
         self.reset_grid_page();
@@ -340,7 +365,7 @@ impl LibraryController {
         self.active_tag = None;
         self.showing_trash = false;
         self.showing_recent = false;
-        self.selected_assets.clear();
+        self.selected_assets = Rc::new(Vec::new());
         self.close_visual_search();
         self.reset_grid_page();
         self.generation += 1;
@@ -461,7 +486,7 @@ impl LibraryController {
         self.showing_recent = false;
         self.active_smart = None;
         self.active_tag = None;
-        self.selected_assets.clear();
+        self.selected_assets = Rc::new(Vec::new());
         self.selection_anchor = None;
         self.search_text.clear();
         self.filter_kind = None;
@@ -509,6 +534,19 @@ impl LibraryController {
         self.selected_assets.last().copied()
     }
 
+    /// Replace the published visible-id list. Called by the workspace panel
+    /// when it (re)lays out its rows, not once per frame — the list is a
+    /// snapshot of the frozen rows, which only move on a view change.
+    pub(crate) fn set_visible_assets(&mut self, ids: Vec<Uuid>) {
+        self.visible_assets = ids;
+    }
+
+    /// The ids the grid is currently displaying, for Select-all and
+    /// Shift-range. Empty until the panel has published a layout.
+    pub fn visible_assets(&self) -> &[Uuid] {
+        &self.visible_assets
+    }
+
     /// The file behind `id`: the in-library blob for imported assets, the
     /// original path for linked ones. `None` when the record or the file is
     /// gone.
@@ -533,7 +571,7 @@ impl LibraryController {
     /// out. The grid repaints the selection highlight from a plain
     /// re-render; the root observer switches the inspector tab.
     pub fn select_asset(&mut self, asset: Option<Uuid>) {
-        self.selected_assets = asset.into_iter().collect();
+        self.selected_assets = Rc::new(asset.into_iter().collect());
         self.selection_anchor = asset;
         self.selection_source = SelectionSource::Plain;
         if let Some(id) = asset {
@@ -549,16 +587,17 @@ impl LibraryController {
         let Some(start) = anchor.or(Some(id)) else {
             return;
         };
-        let flat = &self.visible_assets;
+        let flat = self.visible_assets.as_slice();
         let (a, b) = (
             flat.iter().position(|&x| x == start),
             flat.iter().position(|&x| x == id),
         );
-        self.selected_assets = match (a, b) {
+        let range = match (a, b) {
             (Some(a), Some(b)) if a <= b => flat[a..=b].to_vec(),
             (Some(a), Some(b)) => flat[b..=a].to_vec(),
             _ => vec![id],
         };
+        self.selected_assets = Rc::new(range);
         self.selection_anchor = Some(id);
         self.selection_source = SelectionSource::Multi;
         self.record_view(id);
@@ -566,10 +605,11 @@ impl LibraryController {
 
     /// Ctrl/Cmd click: toggle `id` in the selection.
     pub fn toggle_asset(&mut self, id: Uuid) {
-        if let Some(pos) = self.selected_assets.iter().position(|&x| x == id) {
-            self.selected_assets.remove(pos);
+        let selected = Rc::make_mut(&mut self.selected_assets);
+        if let Some(pos) = selected.iter().position(|&x| x == id) {
+            selected.remove(pos);
         } else {
-            self.selected_assets.push(id);
+            selected.push(id);
         }
         self.selection_anchor = Some(id);
         self.selection_source = SelectionSource::Multi;
@@ -582,7 +622,7 @@ impl LibraryController {
     /// selection if it contains the asset, otherwise just the asset.
     pub fn action_targets(&self, clicked: Uuid) -> Vec<Uuid> {
         if self.selected_assets.contains(&clicked) {
-            self.selected_assets.clone()
+            (*self.selected_assets).clone()
         } else {
             vec![clicked]
         }
@@ -590,7 +630,7 @@ impl LibraryController {
 
     /// Drop assets from the selection (e.g. after moving them to the trash).
     pub fn deselect(&mut self, ids: &[Uuid]) {
-        self.selected_assets.retain(|id| !ids.contains(id));
+        Rc::make_mut(&mut self.selected_assets).retain(|id| !ids.contains(id));
         self.generation += 1;
     }
 
@@ -614,14 +654,14 @@ impl LibraryController {
 
     /// Select every asset currently displayed by the grid.
     pub fn select_all_visible(&mut self) {
-        self.selected_assets = self.visible_assets.clone();
+        self.selected_assets = Rc::new(self.visible_assets().to_vec());
         self.selection_source = SelectionSource::Multi;
     }
 
     /// Clear the selection entirely.
     pub fn clear_selection(&mut self) {
         if !self.selected_assets.is_empty() {
-            self.selected_assets.clear();
+            self.selected_assets = Rc::new(Vec::new());
             self.selection_anchor = None;
             self.selection_source = SelectionSource::None;
         }
@@ -631,8 +671,8 @@ impl LibraryController {
     /// hits in place of the browsed view. The selection resets because the
     /// content under it changes.
     pub fn open_visual_search(&mut self, label: String, hits: Vec<(Uuid, f32)>) {
-        self.visual_results = Some(VisualSearchResults { label, hits });
-        self.selected_assets.clear();
+        self.visual_results = Some(VisualSearchResults::new(label, hits));
+        self.selected_assets = Rc::new(Vec::new());
         self.selection_anchor = None;
         self.selection_source = SelectionSource::None;
         self.reset_grid_page();
@@ -643,7 +683,7 @@ impl LibraryController {
     /// browsed view. No-op when no search is active.
     pub fn close_visual_search(&mut self) {
         if self.visual_results.take().is_some() {
-            self.selected_assets.clear();
+            self.selected_assets = Rc::new(Vec::new());
             self.selection_anchor = None;
             self.selection_source = SelectionSource::None;
             self.reset_grid_page();
