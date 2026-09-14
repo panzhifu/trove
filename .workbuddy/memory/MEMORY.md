@@ -24,12 +24,7 @@
 
 ## 滚动 / 每帧渲染
 - gpui list 内核（`gpui-pre-0.3.3/src/elements/list.rs`）：判定好（B+ 树 O(log n) 偏移、400px 头部 overdraw、delta 合并），重建差 —— **可视行每帧无条件跑 build 闭包**（list.rs:1074），无元素缓存（ListState 只存 SumTree 高度），宽度变化全量作废行高缓存（list.rs:1543-1558，trove 靠 150ms debounce 缓解）。想跨帧复用只能自己包 `Entity`。
-- ⚠️ **gpui `loading_assets` 是无上限 FxHashMap**（`gpui/src/app.rs:548`），只有显式 `remove_asset` 才淘汰；trove 从不对网格缩略图调它 → CPU 侧解码结果永久驻留（真泄漏，加重 swap 压力；区别于 sprite atlas 管 GPU 纹理那条）。
-- 🔴 **`Entity::cached()` 在 resize 期间恒不命中**（路线 A 原始形态因此失败）：复用条件含 `!window.refreshing`（`view.rs:301-322`），而 `refreshing` 是**整帧级**标志 —— resize 唯一入口 `platform_window.on_resize` → `window.bounds_changed()`，其第一步就是 `self.refresh()`（`window.rs:2592`）→ 置 `refreshing=true`。**要跨帧复用元素只有 `.cached()` 一条官方通道，而它被锁死**；`.cached()` 只在「平台事件驱动且无实体标脏」的帧有效。
-- gpui list 的两个死结：① `list.rs:1074` 的 item builder 对**可视区内每行每帧无条件重跑**（判据 `visible_height < available_height || size.is_none()`），`ListState` 只存 SumTree 高度**不存元素**；② `list.rs:1527-1541` prepaint 在**宽度一变**时把整树重建成 `Unmeasured{size_hint: None}` + `measuring_behavior.reset()`，连 `with_uniform_item_height` 的 hint 都被冲掉（且 `Item::size()` 只对 `Measured` 返回 `Some`，size_hint 根本不省重建）。**→ 想治本只能自写虚拟化（按旧坐标系裁剪可视区间）或压小单元成本。**
-- 🟢 **全屏卡顿已定案：UI 原因（每帧重建），非计算原因**（2026-09-14）。计算侧宽度变化那次全量布局是亚毫秒；缩略图 512px JPEG 全在 `RetainAllImageCache` + atlas 里，`paint_image` 只按 UV 画子区域**不重新解码**。瓶颈是「每帧 build cell 数」从 ~4（1 列 3.8 行）涨到 ~54（6 列 8.9 行），**13.5×**。已修：`Row.cells/widths` → `Rc<[..]>`、`AssetsDrag` → `Rc<Vec<Uuid>>`、cell/row id → `ElementId::Uuid`（零分配）。
-- ⚠️ `Rc<[f32]>` **不是 Iterator**：`zip` 要显式 `.iter()`、闭包要 `*w`。`Rc<Vec<_>>` 做 drag payload 时，drop 侧 `&payload.0` 传给 `&[Uuid]` 形参靠**两级 deref coercion** 仍成立，不必改调用点。
-- 未做（收益最小/风险最大）：`context_menu` 每 cell 每帧一次 `format!` + `Rc::new(trait object)`（gpui-kit 代码，改不了）；`mark_view_dirty` 只沿祖先链传染，不往下（`window.rs:2102`）。
+- 🔴 **gpui `loading_assets` 是无上限 FxHashMap**（`gpui/src/app.rs:548`），只有显式 `remove_asset` 才淘汰；trove 从不对网格缩略图调它 → CPU 侧解码结果永久驻留（真泄漏，加重 swap 压力；区别于 sprite atlas 管 GPU 纹理那条）。
 - 🟢 **每帧热点已修（2026-09-14，`perf(workspace)` 提交）**，四条都靠「按 `controller.generation` 缓存 / 惰性化」：
   - `title_label` → `WorkspacePanel.title_cache: Option<(u64, String)>`（dock 的 `title` 在面板 render **之外**跑，原来每帧两跳 SQLite）。函数签名已是 `&mut self`。
   - `visible_assets` → 只在 rows 真的重建时发布（局部 `layout_changed` 标志），读取走 accessor `visible_assets()`；字段 `pub(crate)`。
