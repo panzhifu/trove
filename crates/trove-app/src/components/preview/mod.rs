@@ -10,9 +10,10 @@
 //! of playing them.
 //!
 //! [`AssetPreviewPanel`] is the main-area host: an entity owning the live
-//! video player (if any) under a toolbar with the asset name and a close
-//! button, so the workspace panel can hand its whole content area over —
-//! the same contract [`model::ModelViewport`] offers for 3D models.
+//! video player (if any). Its toolbar (asset name, zoom, close) is rendered
+//! by the host panel's title bar, so the workspace panel can hand its whole
+//! content area over — the same contract [`model::ModelViewport`] offers
+//! for 3D models.
 
 mod fallback;
 mod font;
@@ -28,12 +29,14 @@ pub(crate) use model::{ModelViewport, ModelViewportEvent};
 
 use std::path::{Path, PathBuf};
 
-use gpui_kit::base::{ElementExt as _, h_flex, v_flex};
-use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::slider::{Slider, SliderEvent, SliderState};
-use gpui_kit::component::{ActiveTheme, IconName, Sizable};
+use gpui_kit::base::{ElementExt as _, v_flex};
+use gpui_kit::component::ActiveTheme;
+use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use uuid::Uuid;
+
+/// Zoom factor per wheel notch.
+const ZOOM_FACTOR: f32 = 1.15;
 
 use crate::library::LibraryController;
 use video::VideoPlayer;
@@ -190,20 +193,27 @@ pub(crate) enum AssetPreviewEvent {
     Closed,
 }
 
-/// The main-area placement for a non-model asset: a toolbar with the asset
-/// name, a zoom slider for stills and a close button over the full-size
-/// preview. The workspace panel hands its whole content area to this
-/// entity, exactly as it does to [`model::ModelViewport`] for 3D models.
+/// The main-area placement for a non-model asset: the full-size still or
+/// live player. Its toolbar (asset name + close) is rendered by the host
+/// panel's title bar while a preview is open — see
+/// [`crate::panels::WorkspacePanel::title_suffix`]. The workspace panel
+/// hands its whole content area to this entity, exactly as it does to
+/// [`model::ModelViewport`] for 3D models.
 pub(crate) struct AssetPreviewPanel {
     data: AssetPreviewData,
     /// Live player for videos; `None` renders the still variants instead.
     video: Option<Entity<VideoPlayer>>,
-    /// Zoom slider state (0.25×–4×); the applied value lands in `zoom`.
-    zoom_slider: Entity<SliderState>,
     /// Applied zoom for the still (1.0 = fit the viewport).
     zoom: f32,
     /// Measured content-viewport size; the fit base for the zoom math.
     viewport: Entity<Size<Pixels>>,
+    /// Pan/drag state: where the cursor was when the drag started.
+    drag_from: Point<Pixels>,
+    /// Whether the user is currently dragging to pan.
+    dragging: bool,
+    /// Current scroll offset for panning (tracked so wheel-zoom can
+    /// recenter on the cursor).
+    scroll_offset: Point<Pixels>,
 }
 
 impl EventEmitter<AssetPreviewEvent> for AssetPreviewPanel {}
@@ -227,39 +237,26 @@ impl AssetPreviewPanel {
         // The live player is spawned once, here — never per render. An
         // undecodable file (or no ffmpeg) keeps the poster still.
         let video = video::spawn_player(&data, cx);
-        let zoom_slider = cx.new(|_| {
-            SliderState::new()
-                .min(0.25)
-                .max(4.0)
-                .step(0.05)
-                .default_value(1.0)
-        });
         let viewport = cx.new(|_| size(px(0.), px(0.)));
-        cx.new(|cx| {
-            cx.subscribe(
-                &zoom_slider,
-                |this: &mut AssetPreviewPanel, _, event: &SliderEvent, cx| {
-                    let value = match event {
-                        SliderEvent::Change(value) | SliderEvent::Release(value) => value,
-                    };
-                    this.zoom = value.start().clamp(0.25, 4.0);
-                    cx.notify();
-                },
-            )
-            .detach();
-            Self {
-                data,
-                video,
-                zoom_slider,
-                zoom: 1.0,
-                viewport,
-            }
+        cx.new(|_cx| Self {
+            data,
+            video,
+            zoom: 1.0,
+            viewport,
+            drag_from: Point::default(),
+            dragging: false,
+            scroll_offset: Point::default(),
         })
     }
 
     /// Stills can be zoomed while the live video plays in its own player.
-    fn zoomable(&self) -> bool {
+    pub(crate) fn zoomable(&self) -> bool {
         self.video.is_none() && self.data.dimensions.is_some()
+    }
+
+    /// Expose the asset name so the title bar can render it.
+    pub(crate) fn asset_name(&self) -> &str {
+        &self.data.name
     }
 
     /// Hand the video's last decoded frame back to the window before the
@@ -270,61 +267,100 @@ impl AssetPreviewPanel {
         }
     }
 
-    /// Leave the preview; the workspace panel puts the grid back.
-    fn close(&mut self, cx: &mut Context<Self>) {
-        cx.emit(AssetPreviewEvent::Closed);
+    /// Handle a scroll-wheel event: zoom toward the cursor, like the 3D
+    /// model viewport does.
+    fn handle_scroll_wheel(&mut self, event: &ScrollWheelEvent, cx: &mut Context<Self>) {
+        if !self.zoomable() {
+            return;
+        }
+        let lines = match event.delta {
+            ScrollDelta::Lines(delta) => delta.y,
+            ScrollDelta::Pixels(delta) => delta.y.as_f32() / 40.0,
+        };
+        if lines == 0.0 {
+            return;
+        }
+        let cfg = trove_core::config::AppConfig::load();
+        let zmin = cfg.min_preview_zoom();
+        let zmax = cfg.max_preview_zoom();
+        let old_zoom = self.zoom;
+        let factor = ZOOM_FACTOR.powf(lines);
+        let new_zoom = (self.zoom * factor).clamp(zmin, zmax);
+        if new_zoom == old_zoom {
+            return;
+        }
+        // Zoom toward the cursor: keep the point under the cursor stationary.
+        let cursor = event.position;
+        let (vp_w, vp_h) = {
+            let vp = self.viewport.read(cx);
+            (f32::from(vp.width), f32::from(vp.height))
+        };
+        // Cursor position relative to the viewport center, in content space.
+        let cx_rel = f32::from(cursor.x) - vp_w / 2.0 - f32::from(self.scroll_offset.x);
+        let cy_rel = f32::from(cursor.y) - vp_h / 2.0 - f32::from(self.scroll_offset.y);
+        // Scale the offset so the content under the cursor stays put.
+        let ratio = new_zoom / old_zoom;
+        let new_cx = cx_rel * ratio;
+        let new_cy = cy_rel * ratio;
+        self.scroll_offset = point(
+            px(new_cx - f32::from(cursor.x) + vp_w / 2.0),
+            px(new_cy - f32::from(cursor.y) + vp_h / 2.0),
+        );
+        self.zoom = new_zoom;
+        // Clamp panning to image bounds.
+        self.clamp_scroll_offset(cx);
+        // Sync the slider next render (needs Window).
+        cx.notify();
     }
 
-    fn toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let zoom_value = self.zoom_slider.read(cx).value().start();
-        let zoom_label = format!("{:.0}%", (zoom_value * 100.0).round());
-        let mut row = h_flex()
-            .w_full()
-            .flex_none()
-            .gap_2()
-            .items_center()
-            .px_3()
-            .py_2()
-            .border_b_1()
-            .border_color(cx.theme().border)
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .truncate()
-                    .text_sm()
-                    .child(self.data.name.clone()),
-            );
-        // Simple-edit tools land here later; for now the still's zoom.
-        if self.zoomable() {
-            row = row
-                .child(
-                    div()
-                        .id("preview-zoom")
-                        .flex_none()
-                        .w(px(140.0))
-                        .px_1()
-                        .child(Slider::new(&self.zoom_slider)),
-                )
-                .child(
-                    div()
-                        .text_xs()
-                        .w(px(38.0))
-                        .text_color(cx.theme().muted_foreground)
-                        .child(zoom_label),
-                );
+    /// Clamp the scroll offset so the image cannot be panned out of view.
+    fn clamp_scroll_offset(&mut self, cx: &mut Context<Self>) {
+        let (vp_w, vp_h) = {
+            let vp = self.viewport.read(cx);
+            (f32::from(vp.width), f32::from(vp.height))
+        };
+        let (iw, ih) = match self.data.dimensions {
+            Some((w, h)) => (w as f32, h as f32),
+            None => return,
+        };
+        let pad = 32.0;
+        let fit = ((vp_w - pad).max(60.0) / iw).min((vp_h - pad).max(60.0) / ih);
+        let w = iw * fit * self.zoom;
+        let h = ih * fit * self.zoom;
+        // Allow panning only when the image is larger than the viewport.
+        let max_x = ((w - vp_w) / 2.0).max(0.0);
+        let max_y = ((h - vp_h) / 2.0).max(0.0);
+        let x = f32::from(self.scroll_offset.x).clamp(-max_x, max_x);
+        let y = f32::from(self.scroll_offset.y).clamp(-max_y, max_y);
+        self.scroll_offset = point(px(x), px(y));
+    }
+
+    /// Begin a pan drag.
+    fn begin_pan(&mut self, position: Point<Pixels>) {
+        self.dragging = true;
+        self.drag_from = position;
+    }
+
+    /// Update a pan drag: scroll the viewport.
+    fn update_pan(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
+        if !self.dragging {
+            return;
         }
-        row.child(
-            Button::new("preview-close")
-                .ghost()
-                .xsmall()
-                .icon(IconName::Close)
-                .tooltip(rust_i18n::t!("viewport.close").to_string())
-                .on_click(cx.listener(|this, _, window, cx| {
-                    this.release(window, cx);
-                    this.close(cx);
-                })),
-        )
+        let dx = self.drag_from.x - position.x;
+        let dy = self.drag_from.y - position.y;
+        self.scroll_offset = point(
+            px(f32::from(self.scroll_offset.x) + f32::from(dx)),
+            px(f32::from(self.scroll_offset.y) + f32::from(dy)),
+        );
+        self.drag_from = position;
+        // Clamp panning to image bounds.
+        self.clamp_scroll_offset(cx);
+        cx.notify();
+    }
+
+    /// End a pan drag.
+    fn end_pan(&mut self) {
+        self.dragging = false;
     }
 
     /// The still at the applied zoom: the image keeps its aspect ratio and
@@ -370,7 +406,7 @@ impl AssetPreviewPanel {
         div()
             .id("preview-zoom-area")
             .size_full()
-            .overflow_scroll()
+            .overflow_hidden()
             .child(
                 div()
                     .w(px(w.max(viewport_w)))
@@ -378,6 +414,9 @@ impl AssetPreviewPanel {
                     .flex()
                     .items_center()
                     .justify_center()
+                    // Position the image based on scroll offset for panning.
+                    .ml(px(-f32::from(self.scroll_offset.x)))
+                    .mt(px(-f32::from(self.scroll_offset.y)))
                     .child(image),
             )
             .into_any_element()
@@ -385,7 +424,7 @@ impl AssetPreviewPanel {
 }
 
 impl Render for AssetPreviewPanel {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let content: AnyElement = match &self.video {
             Some(player) => player.clone().into_any_element(),
             None => {
@@ -396,10 +435,10 @@ impl Render for AssetPreviewPanel {
                 }
             }
         };
+        let zoomable = self.zoomable();
         v_flex()
             .size_full()
             .overflow_hidden()
-            .child(self.toolbar(cx))
             .child(
                 div()
                     .flex_1()
@@ -410,6 +449,13 @@ impl Render for AssetPreviewPanel {
                     .justify_center()
                     .overflow_hidden()
                     .p_4()
+                    .cursor(if self.dragging {
+                        CursorStyle::ClosedHand
+                    } else if zoomable {
+                        CursorStyle::OpenHand
+                    } else {
+                        CursorStyle::Arrow
+                    })
                     // Track the content viewport so the zoom has a fit base.
                     .on_prepaint({
                         let viewport = self.viewport.clone();
@@ -421,6 +467,34 @@ impl Render for AssetPreviewPanel {
                                 }
                             });
                         }
+                    })
+                    // Wheel zoom toward the cursor.
+                    .when(zoomable, |this| {
+                        this.on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, _, cx| {
+                            this.handle_scroll_wheel(event, cx);
+                        }))
+                    })
+                    // Drag to pan when zoomed in.
+                    .when(zoomable, |this| {
+                        this.on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                                this.begin_pan(event.position);
+                                cx.notify();
+                            }),
+                        )
+                        .on_mouse_move(cx.listener(
+                            |this, event: &MouseMoveEvent, _, cx| {
+                                this.update_pan(event.position, cx);
+                            },
+                        ))
+                        .on_mouse_up(
+                            MouseButton::Left,
+                            cx.listener(|this, _: &MouseUpEvent, _, cx| {
+                                this.end_pan();
+                                cx.notify();
+                            }),
+                        )
                     })
                     .child(content),
             )

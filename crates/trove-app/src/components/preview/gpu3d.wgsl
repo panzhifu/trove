@@ -25,9 +25,39 @@ struct Uniforms {
     bg_top: vec4<f32>,
     // rgb = gradient bottom.
     bg_bottom: vec4<f32>,
+    // x = height colouring on (1) / off (0), y = band size in model units,
+    // z = the model's floor (where the bands count from), w = draw the axes.
+    bands: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
+
+// The hue step between height bands, matching `render3d::BAND_HUE_STEP`.
+const BAND_HUE_STEP: f32 = 0.618034;
+
+// HSV(hue, 1, 1) as RGB, hue in turns.
+//
+// The familiar `n + h/60 mod 6` form, kept branchless so there is no select
+// chain to hold in step with the CPU's `hue_rgb`.
+fn hue_rgb(t: f32) -> vec3<f32> {
+    let base = vec3<f32>(5.0, 3.0, 1.0) + t * 6.0;
+    let k = base - 6.0 * floor(base / 6.0);
+    return vec3<f32>(1.0) - clamp(min(k, vec3<f32>(4.0) - k), vec3<f32>(0.0), vec3<f32>(1.0));
+}
+
+// The colour one height band is painted with. Mirrors `render3d::height_tint`.
+fn band_color(y: f32) -> vec3<f32> {
+    return hue_rgb(floor((y - u.bands.z) / u.bands.y) * BAND_HUE_STEP);
+}
+
+// The base colour for a point at height `y`: the file's own colour, or the
+// height band when the mode is on.
+fn surface_color(y: f32, own: vec3<f32>) -> vec3<f32> {
+    if u.bands.x > 0.5 {
+        return band_color(y);
+    }
+    return own;
+}
 
 struct ModelOut {
     @builtin(position) clip: vec4<f32>,
@@ -35,6 +65,10 @@ struct ModelOut {
     // are defined, without transforming them per vertex.
     @location(0) model_pos: vec3<f32>,
     @location(1) normal: vec3<f32>,
+    // Base colour: the material, or a height band when that mode is on.
+    // Resolved here — from the model-space Y — so toggling it costs a uniform
+    // write rather than a vertex-buffer re-upload.
+    @location(2) tint: vec3<f32>,
 };
 
 @vertex
@@ -46,6 +80,7 @@ fn vs_model(
     out.clip = u.view_proj * vec4<f32>(position, 1.0);
     out.model_pos = position;
     out.normal = normal;
+    out.tint = surface_color(position.y, u.material.rgb);
     return out;
 }
 
@@ -61,7 +96,7 @@ fn fs_model(in: ModelOut) -> @location(0) vec4<f32> {
     let half = normalize(u.light.xyz + to_eye);
     let spec = u.params.y * pow(max(dot(n, half), 0.0), u.params.z);
 
-    return vec4<f32>(u.material.rgb * intensity + vec3<f32>(spec), 1.0);
+    return vec4<f32>(in.tint * intensity + vec3<f32>(spec), 1.0);
 }
 
 // A point cloud is drawn one sprite per point, each a camera-facing square
@@ -111,7 +146,7 @@ fn vs_point(
     out.model_pos = position;
     out.normal = normal;
     out.offset = corner;
-    out.color = color;
+    out.color = surface_color(position.y, color);
     return out;
 }
 
@@ -133,6 +168,32 @@ fn fs_point(in: PointOut) -> @location(0) vec4<f32> {
     let intensity = u.material.w + u.params.x * diffuse;
 
     return vec4<f32>(in.color * intensity, 1.0);
+}
+
+// The X/Y/Z gizmo: flat, unlit triangles in model space.
+//
+// The CPU rasteriser draws the very same triangle list (see
+// `render3d::axis_triangles`), which is why this pass carries a colour per
+// vertex and no lighting at all — there is nothing here to keep in step.
+struct AxisOut {
+    @builtin(position) clip: vec4<f32>,
+    @location(0) color: vec3<f32>,
+};
+
+@vertex
+fn vs_axis(
+    @location(0) position: vec3<f32>,
+    @location(1) color: vec3<f32>,
+) -> AxisOut {
+    var out: AxisOut;
+    out.clip = u.view_proj * vec4<f32>(position, 1.0);
+    out.color = color;
+    return out;
+}
+
+@fragment
+fn fs_axis(in: AxisOut) -> @location(0) vec4<f32> {
+    return vec4<f32>(in.color, 1.0);
 }
 
 // A single oversized triangle covering the viewport, so the backdrop gets the

@@ -234,6 +234,9 @@ pub struct ModelViewport {
     /// Cached `AppConfig::point_enhance`, so the frame path does not read the
     /// config file every time it draws.
     enhance_points: bool,
+    /// Whether the model is painted by height, cached from the same config
+    /// read as `enhance_points`.
+    height_color: bool,
     /// When `enhance_points` was last re-read.
     enhance_checked: Option<Instant>,
 }
@@ -301,6 +304,7 @@ impl ModelViewport {
                 last_camera_move: None,
                 gesture_armed: false,
                 enhance_points: true,
+                height_color: trove_core::config::AppConfig::load().height_color(),
                 enhance_checked: None,
             };
             this.start_load(path, cx);
@@ -362,10 +366,11 @@ impl Render for ModelViewport {
         // runs after this.
         self.scale = window.scale_factor();
 
+        // The toolbar lives in the host panel's title bar (see
+        // `WorkspacePanel::title_suffix`), so the canvas gets the whole area.
         v_flex()
             .size_full()
             .overflow_hidden()
-            .child(self.toolbar(cx))
             .child(self.canvas(cx))
     }
 }

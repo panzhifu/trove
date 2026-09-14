@@ -1,7 +1,8 @@
 //! General page: library location, import mode, recents, watched
-//! folders, collect service and library statistics.
+//! folders, collect service, preview zoom limits and library statistics.
 
 use super::*;
+use gpui_kit::component::setting::NumberFieldOptions;
 
 // ============================ general page ===================================
 
@@ -118,6 +119,7 @@ pub(super) fn general_page(
         .group(watch_folders_group())
         .group(collect_group())
         .group(stats_group(stats))
+        .group(zoom_group())
 }
 
 // ========================= recent libraries ==================================
@@ -563,4 +565,54 @@ fn switch_library(controller: &Entity<LibraryController>, path: PathBuf, cx: &mu
         };
         cx.notify();
     });
+}
+
+// ========================= preview zoom limits ==============================
+
+/// General ▸ Preview Zoom: min/max zoom for image and 3D previews.
+fn zoom_group() -> SettingGroup {
+    SettingGroup::new()
+        .title(rust_i18n::t!("settings.preview_zoom").to_string())
+        .item(
+            SettingItem::new(
+                rust_i18n::t!("settings.preview_zoom_min").to_string(),
+                SettingField::number_input(
+                    NumberFieldOptions {
+                        min: 0.1,
+                        max: 1.0,
+                        step: 0.05,
+                    },
+                    |_cx| AppConfig::load().min_preview_zoom() as f64,
+                    |value, cx| {
+                        let mut config = AppConfig::load();
+                        config.min_preview_zoom = Some(value as f32);
+                        if config.save().is_ok() {
+                            cx.refresh_windows();
+                        }
+                    },
+                ),
+            )
+            .description(rust_i18n::t!("settings.preview_zoom_min_desc").to_string()),
+        )
+        .item(
+            SettingItem::new(
+                rust_i18n::t!("settings.preview_zoom_max").to_string(),
+                SettingField::number_input(
+                    NumberFieldOptions {
+                        min: 2.0,
+                        max: 100.0,
+                        step: 1.0,
+                    },
+                    |_cx| AppConfig::load().max_preview_zoom() as f64,
+                    |value, cx| {
+                        let mut config = AppConfig::load();
+                        config.max_preview_zoom = Some(value as f32);
+                        if config.save().is_ok() {
+                            cx.refresh_windows();
+                        }
+                    },
+                ),
+            )
+            .description(rust_i18n::t!("settings.preview_zoom_max_desc").to_string()),
+        )
 }
