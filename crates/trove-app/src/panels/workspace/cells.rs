@@ -3,7 +3,6 @@
 //! wiring, plus the list-view row variant.
 
 use super::*;
-use std::rc::Rc;
 
 // ============================ cell rendering =================================
 
@@ -56,9 +55,7 @@ pub(super) fn build_cell_element(
         }
     };
     let base = div()
-        // `ElementId::Uuid` avoids a `format!` per cell per frame; the grid
-        // rebuilds every visible cell on every resize frame.
-        .id(ElementId::Uuid(id))
+        .id(format!("cell-{id}"))
         .cursor_pointer()
         .flex_none()
         .w(px(w))
@@ -102,15 +99,15 @@ pub(super) fn build_cell_element(
     });
 
     // Drag source: drags the clicked asset, or the whole selection when it
-    // includes this one. Both branches share the controller's `Rc` selection
-    // rather than copying it, so this stays O(1) per visible cell per frame
-    // instead of O(visible × selection) during a resize.
-    let ids_for_drag: Rc<Vec<Uuid>> = {
-        let selected = controller.read(cx).selected_assets.clone();
+    // includes this one. Borrow before copying: this runs per visible cell
+    // per frame, so cloning the whole selection unconditionally would cost
+    // O(visible × selection) on every render (notably during a resize).
+    let ids_for_drag: Vec<Uuid> = {
+        let selected = controller.read(cx).selected_assets.as_slice();
         if selected.contains(&id) {
-            selected
+            selected.to_vec()
         } else {
-            Rc::new(vec![id])
+            vec![id]
         }
     };
     let base = base.on_drag(AssetsDrag(ids_for_drag), move |payload, _offset, _, cx| {
@@ -200,8 +197,7 @@ pub(super) fn build_list_row_element(
     };
 
     let base = div()
-        // Same per-frame `format!` avoidance as the grid cell above.
-        .id(ElementId::Uuid(id))
+        .id(format!("row-{id}"))
         .cursor_pointer()
         .w(px(w))
         .h(px(LIST_ROW_HEIGHT))
@@ -277,14 +273,13 @@ pub(super) fn build_list_row_element(
         });
     });
 
-    // Same per-frame cost note as the grid cell drag source above: the
-    // selection is shared behind an `Rc`, never copied per row per frame.
-    let ids_for_drag: Rc<Vec<Uuid>> = {
-        let selected = controller.read(cx).selected_assets.clone();
+    // Same per-frame cost note as the grid cell drag source above.
+    let ids_for_drag: Vec<Uuid> = {
+        let selected = controller.read(cx).selected_assets.as_slice();
         if selected.contains(&id) {
-            selected
+            selected.to_vec()
         } else {
-            Rc::new(vec![id])
+            vec![id]
         }
     };
     let base = base.on_drag(AssetsDrag(ids_for_drag), move |payload, _offset, _, cx| {

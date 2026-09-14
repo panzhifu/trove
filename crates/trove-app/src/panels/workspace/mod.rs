@@ -707,8 +707,8 @@ impl Render for WorkspacePanel {
                     .into_iter()
                     .map(|c| Row {
                         height: LIST_ROW_HEIGHT,
-                        widths: Rc::from([content_width]),
-                        cells: Rc::from([c]),
+                        widths: vec![content_width],
+                        cells: vec![c],
                         header: None,
                     })
                     .collect()
@@ -755,8 +755,8 @@ impl Render for WorkspacePanel {
                     .into_iter()
                     .map(|c| Row {
                         height: LIST_ROW_HEIGHT,
-                        widths: Rc::from([content_width]),
-                        cells: Rc::from([c]),
+                        widths: vec![content_width],
+                        cells: vec![c],
                         header: None,
                     })
                     .collect()
@@ -836,9 +836,6 @@ impl Render for WorkspacePanel {
             if let Some(label) = row.header.clone() {
                 return timeline_header(label, cx);
             }
-            // Both are `Rc` on the frozen row, so handing them to the cell
-            // builder is a refcount bump rather than a per-row deep copy —
-            // this runs for every visible row on every frame.
             let widths = row.widths.clone();
             let height = row.height;
             let cells = row.cells.clone();
@@ -858,9 +855,9 @@ impl Render for WorkspacePanel {
                 .children(
                     cells
                         .iter()
-                        .zip(widths.iter())
+                        .zip(widths)
                         .map(|(cell, w)| {
-                            build_cell_element(cx, &controller, &focus_handle, cell, *w, height)
+                            build_cell_element(cx, &controller, &focus_handle, cell, w, height)
                         })
                         .collect::<Vec<_>>(),
                 )
@@ -950,7 +947,6 @@ mod tests {
     // attribute macro from the gpui prelude, which makes expanding `#[test]`
     // below recurse.
     use super::{Cell, Row, next_cell_row, prev_cell_row, timeline_rows};
-    use std::rc::Rc;
     use trove_core::layout::target_row_height_for_scale;
     use trove_core::model::AssetKind;
     use uuid::Uuid;
@@ -1013,15 +1009,15 @@ mod tests {
             Row::section("newest".into()),
             Row {
                 height: 100.0,
-                widths: Rc::from([100.0, 100.0]),
-                cells: Rc::from([cell(1, "2026-09-10"), cell(2, "2026-09-10")]),
+                widths: vec![100.0, 100.0],
+                cells: vec![cell(1, "2026-09-10"), cell(2, "2026-09-10")],
                 header: None,
             },
             Row::section("older".into()),
             Row {
                 height: 100.0,
-                widths: Rc::from([100.0]),
-                cells: Rc::from([cell(3, "2026-09-09")]),
+                widths: vec![100.0],
+                cells: vec![cell(3, "2026-09-09")],
                 header: None,
             },
         ];
