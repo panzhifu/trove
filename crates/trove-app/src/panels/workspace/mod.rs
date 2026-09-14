@@ -26,11 +26,10 @@ use gpui_kit::*;
 // The `gpui_kit::*` glob above re-exports everything from gpui, but the grid
 // needs the virtualized `list` element under a distinct name: a local
 // `Vec<Asset>` variable called `list` would otherwise shadow it.
-use crate::components::color_picker::{ColorPicked, ColorPickerState, picker_panel};
-use gpui_kit::component::popover::{Popover, PopoverState};
+use gpui_kit::component::color_picker::ColorPicker;
 use gpui_kit::component::slider::{SliderEvent, SliderState};
 use gpui_kit::list as list_element;
-use gpui_kit::{Anchor, Bounds, ListOffset, Pixels};
+use gpui_kit::{Bounds, ListOffset, Pixels};
 use gpui_kit::{ListAlignment, ListState};
 
 use crate::panels::search_box::SearchBox;
@@ -65,7 +64,8 @@ mod toolbar;
 
 use cells::{build_cell_element, build_list_row_element, model_source};
 use data::{
-    Cell, DataKey, Direction, Row, TIMELINE_HEADER_HEIGHT, ViewData, ViewKey, total_identity,
+    Cell, DataKey, Direction, Row, TIMELINE_HEADER_HEIGHT, ViewData, ViewKey, hsla_to_hex,
+    recent_picker_colors, total_identity,
 };
 use rows::{
     materialize_rows, next_cell_row, prev_cell_row, refill_rows, timeline_header, timeline_rows,
@@ -132,9 +132,9 @@ pub struct WorkspacePanel {
     controller: Entity<LibraryController>,
     /// Self-contained floating search (trigger + popover + input).
     search_box: Entity<SearchBox>,
-    /// Custom-colour picker state (popover in the toolbar row). The
-    /// popover's open state is the popover's own.
-    color_picker: Entity<ColorPickerState>,
+    /// Framework colour picker state; the element owns its own popover, so
+    /// the toolbar row just renders it.
+    color_picker: Entity<gpui_kit::base::ColorPickerState>,
     /// A colour confirmed in the picker; consumed by the next render.
     pending_color_search: Option<String>,
     /// Measured available width of the scroll container, updated each
@@ -260,6 +260,25 @@ impl WorkspacePanel {
         }
         cx.notify();
     }
+
+    /// A colour confirmed in the picker: stash the hex and let the render
+    /// pass start the colour search. The search has to run from `render`
+    /// because it needs the window's pending state, and the picker only
+    /// tells us what was chosen.
+    fn on_color_picked(
+        &mut self,
+        _: Entity<gpui_kit::base::ColorPickerState>,
+        event: &gpui_kit::base::ColorPickerEvent,
+        cx: &mut Context<Self>,
+    ) {
+        // A cleared picker (`Change(None)`) means "no colour", which is not
+        // a search — leave the grid as it is rather than filtering to nothing.
+        let gpui_kit::base::ColorPickerEvent::Change(Some(color)) = event else {
+            return;
+        };
+        self.pending_color_search = Some(hsla_to_hex(*color));
+        cx.notify();
+    }
 }
 
 impl BasePanel for WorkspacePanel {
@@ -349,26 +368,17 @@ impl WorkspacePanel {
             .gap_1()
             // Colour picker sits at the far left, then the kind filter.
             .when(!in_trash && !in_recent, |row| {
-                // Eagle-style "colour" tab. The popover owns its open state
-                // and click handling — the trigger is just a button — and
-                // confirming a colour in the panel opens a colour search.
+                // The framework picker owns its trigger and popover. Recent
+                // colours ride along as the featured row, so the colours the
+                // user actually reaches for stay one click away; the palette
+                // tab behind it carries the full nine-family ramp. Its
+                // trigger is icon-only, so the name a screen reader gets has
+                // to come from us (`label` would paint a visible caption).
                 row.child(
-                    Popover::new("workspace-color-picker")
-                        .anchor(Anchor::TopLeft)
-                        .trigger(
-                            Button::new("color-picker-trigger")
-                                .ghost()
-                                .xsmall()
-                                .icon(IconName::Palette)
-                                .label(rust_i18n::t!("workspace.color_filter").to_string())
-                                .tooltip(rust_i18n::t!("workspace.pick_color_search").to_string()),
-                        )
-                        .content({
-                            let color_picker = color_picker.clone();
-                            move |_, window, cx: &mut Context<PopoverState>| {
-                                picker_panel(&cx.entity(), &color_picker, window, cx)
-                            }
-                        }),
+                    ColorPicker::new(&color_picker)
+                        .xsmall()
+                        .accessibility_label(rust_i18n::t!("workspace.color_filter").to_string())
+                        .featured_colors(recent_picker_colors(cx)),
                 )
             })
             .when(tool_enabled("kind"), |row| {
