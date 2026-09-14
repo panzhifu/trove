@@ -1,10 +1,12 @@
 //! The workspace panel's toolbar surfaces: the dock title bar (title +
 //! suffix), the in-panel filter tools, and the floating batch-action bar.
 
+mod color_filter;
 mod filters;
 mod selection;
 mod title;
 
+pub(crate) use color_filter::color_filter;
 pub(crate) use filters::{
     add_filter_button, format_filter, kind_filter, kind_key, rating_filter, shape_filter,
     tag_filter, title_controls,
