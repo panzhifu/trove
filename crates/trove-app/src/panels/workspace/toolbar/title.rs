@@ -13,7 +13,7 @@ use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::component::{IconName, Sizable as _};
 use gpui_kit::*;
 
-use crate::components::preview::{AssetPreviewPanel, ModelViewport};
+use crate::components::preview::ModelViewport;
 use crate::panels::workspace::title_controls;
 use crate::panels::workspace::MainPreview;
 use crate::panels::WorkspacePanel;
@@ -24,11 +24,19 @@ impl DockPanel for WorkspacePanel {
     /// buttons live in [`title_suffix`] which renders outside the title's
     /// clipping container, so they stay visible.
     fn title(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // A preview open: the tab names what is on screen, the way a document
+        // window does, and the suffix carries that preview's tools. Back in
+        // grid mode it goes back to naming the browsed view.
+        let label = match &self.preview {
+            Some(MainPreview::Asset(preview)) => preview.read(cx).asset_name().to_string(),
+            Some(MainPreview::Model(viewport)) => viewport.read(cx).name().to_string(),
+            None => self.title_label(cx),
+        };
         div()
             .text_sm()
             .font_weight(FontWeight::BOLD)
             .text_color(cx.theme().foreground)
-            .child(self.title_label(cx))
+            .child(label)
     }
 
     fn zoom_control(&self, _: &App) -> Option<PanelControl> {
@@ -49,8 +57,8 @@ impl DockPanel for WorkspacePanel {
         // of the grid's, so the content area is nothing but the picture. Which
         // set it is follows the preview, so opening one switches the bar.
         match &self.preview {
-            Some(MainPreview::Asset(preview)) => {
-                return Some(preview_toolbar(preview, cx).into_any_element());
+            Some(MainPreview::Asset(_)) => {
+                return Some(preview_toolbar(cx).into_any_element());
             }
             Some(MainPreview::Model(viewport)) => {
                 return Some(model_toolbar(viewport, cx));
@@ -137,33 +145,17 @@ fn model_toolbar(
     viewport.update(cx, |viewport, cx| viewport.title_tools(cx).into_any_element())
 }
 
-/// The preview toolbar rendered in the panel's title bar while a preview
-/// is open: asset name and close button. Zoom is wheel-only.
-fn preview_toolbar(
-    preview: &Entity<AssetPreviewPanel>,
-    cx: &mut Context<WorkspacePanel>,
-) -> Div {
-    let name = preview.read(cx).asset_name().to_string();
-    h_flex()
-        .items_center()
-        .gap_1()
-        .child(
-            div()
-                .flex_1()
-                .min_w_0()
-                .truncate()
-                .text_xs()
-                .text_color(cx.theme().muted_foreground)
-                .child(name),
-        )
-        .child(
-            Button::new("preview-close")
-                .ghost()
-                .xsmall()
-                .icon(IconName::Close)
-                .tooltip(rust_i18n::t!("viewport.close").to_string())
-                .on_click(cx.listener(|this, _, window, cx| {
-                    this.dismiss_preview(window, cx);
-                })),
-        )
+/// The still / video preview's title-bar controls: just the close button,
+/// because the tab beside it already names the asset. Zoom is wheel-only.
+fn preview_toolbar(cx: &mut Context<WorkspacePanel>) -> Div {
+    h_flex().items_center().child(
+        Button::new("preview-close")
+            .ghost()
+            .xsmall()
+            .icon(IconName::Close)
+            .tooltip(rust_i18n::t!("viewport.close").to_string())
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.dismiss_preview(window, cx);
+            })),
+    )
 }

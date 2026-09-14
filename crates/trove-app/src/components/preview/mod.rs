@@ -403,20 +403,24 @@ impl AssetPreviewPanel {
                 .into_any_element(),
             None => element(&self.data, PreviewContext::Main, cx),
         };
+        // Centred by hand and offset by the pan, rather than centred by the
+        // layout and shifted with margins: a sized child of an
+        // overflow-clipped flex container does not move reliably on the cross
+        // axis, which left the picture pannable up and down but not sideways.
+        let left = (viewport_w - w) / 2.0 - f32::from(self.scroll_offset.x);
+        let top = (viewport_h - h) / 2.0 - f32::from(self.scroll_offset.y);
         div()
             .id("preview-zoom-area")
+            .relative()
             .size_full()
             .overflow_hidden()
             .child(
                 div()
-                    .w(px(w.max(viewport_w)))
-                    .h(px(h.max(viewport_h)))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    // Position the image based on scroll offset for panning.
-                    .ml(px(-f32::from(self.scroll_offset.x)))
-                    .mt(px(-f32::from(self.scroll_offset.y)))
+                    .absolute()
+                    .left(px(left))
+                    .top(px(top))
+                    .w(px(w))
+                    .h(px(h))
                     .child(image),
             )
             .into_any_element()
