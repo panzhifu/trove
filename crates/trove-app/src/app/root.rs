@@ -116,7 +116,7 @@ impl AppView {
         cx.observe_in(&controller, window, move |this, controller, window, cx| {
             let ctl = controller.read(cx);
             let plain = ctl.selection_source == SelectionSource::Plain;
-            let selection = ctl.selected_assets.clone();
+            let selection: Vec<Uuid> = (*ctl.selected_assets).clone();
             let changed = this.last_selection != selection;
             this.last_selection = selection;
             if changed && plain && !this.last_selection.is_empty() {

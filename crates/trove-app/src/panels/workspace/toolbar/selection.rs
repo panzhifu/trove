@@ -9,6 +9,8 @@ use gpui_kit::component::{IconName, Sizable as _};
 use gpui_kit::*;
 use gpui_kit::{Anchor, App, Div, Entity};
 
+use std::rc::Rc;
+
 use trove_core::store::{assets, collections};
 
 use crate::library::LibraryController;
@@ -19,7 +21,7 @@ use uuid::Uuid;
 pub(crate) fn selection_toolbar(
     controller: &Entity<LibraryController>,
     in_trash: bool,
-    ids: Vec<Uuid>,
+    ids: Rc<Vec<Uuid>>,
     cx: &App,
 ) -> Div {
     let count = ids.len();
@@ -66,7 +68,7 @@ pub(crate) fn selection_toolbar(
                     .tooltip(rust_i18n::t!("workspace.restore").to_string())
                     .on_click(move |_, _, cx| {
                         ctl_restore.update(cx, |ctl, cx| {
-                            let ids = std::mem::take(&mut ctl.selected_assets);
+                            let ids = std::mem::take(Rc::make_mut(&mut ctl.selected_assets));
                             let _ = ctl.library.restore_assets(&ids);
                             ctl.selection_anchor = None;
                             ctl.generation += 1;
@@ -82,7 +84,7 @@ pub(crate) fn selection_toolbar(
                     .tooltip(rust_i18n::t!("workspace.delete_forever").to_string())
                     .on_click(move |_, _, cx| {
                         ctl_purge.update(cx, |ctl, cx| {
-                            let ids = std::mem::take(&mut ctl.selected_assets);
+                            let ids = std::mem::take(Rc::make_mut(&mut ctl.selected_assets));
                             if let Err(e) = ctl.library.purge_assets(&ids) {
                                 ctl.notice = Some(
                                     rust_i18n::t!("workspace.purge_failed", error = e.to_string())

@@ -109,8 +109,10 @@ pub(super) struct ViewKey {
     /// resize.
     pub(super) row_height_scale: f32,
     /// Active visual search (mirrors [`DataKey::visual`]): a structural
-    /// change of the hit set relayouts and resets scrolling.
-    pub(super) visual: Option<Vec<Uuid>>,
+    /// change of the hit set relayouts and resets scrolling. Shared with the
+    /// controller's cached id list: both keys are rebuilt every frame, so a
+    /// plain `Vec` here would deep-copy up to CANDIDATE_CAP ids per frame.
+    pub(super) visual: Option<Rc<Vec<Uuid>>>,
 }
 
 /// Inputs that decide *which* assets are listed. This is the expensive
@@ -139,7 +141,7 @@ pub(super) struct DataKey {
     pub(super) generation: u64,
     /// Active visual search: the grid shows exactly these asset ids (in
     /// rank order) instead of running the browse query.
-    pub(super) visual: Option<Vec<Uuid>>,
+    pub(super) visual: Option<Rc<Vec<Uuid>>>,
 }
 
 /// Cached data pass: the query result materialized into cells, shared with
@@ -212,6 +214,8 @@ impl WorkspacePanel {
             count_recheck: false,
             count_settle: None,
             filter_exts: None,
+            title_cache: None,
+            page_guard: Rc::new(CellFlag::new(usize::MAX)),
         };
         observe_controller(cx, &this.controller);
         this

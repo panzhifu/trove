@@ -11,6 +11,8 @@ use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::component::{ActiveTheme, Sizable, WindowExt as _};
 use gpui_kit::*;
 
+use std::rc::Rc;
+
 use trove_core::store::assets;
 
 use crate::library::LibraryController;
@@ -127,7 +129,7 @@ impl RenameDialog {
 struct RenameDraft {
     pattern: Entity<InputState>,
     start: Entity<InputState>,
-    selection: Vec<uuid::Uuid>,
+    selection: Rc<Vec<uuid::Uuid>>,
     controller: Entity<LibraryController>,
 }
 
