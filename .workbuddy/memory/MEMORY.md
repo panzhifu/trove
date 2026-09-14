@@ -31,7 +31,15 @@
   - 每帧快照 clone → `controller.selected_assets` 与 `VisualSearchResults.ids` 都是 `Rc<Vec<Uuid>>`，`DataKey/ViewKey.visual` 是 `Option<Rc<Vec<Uuid>>>`（两个 key 每帧重建，原写法每帧深拷至多 CANDIDATE_CAP 个 id）。变更一律 `Rc::make_mut`。
   - `page_guard` → 面板字段 `Rc<Cell<usize>>`，记「上次请求是哪个 `grid_loaded`」，同一 cursor 只请求一次；视图切换置 `usize::MAX`。
   - ⚠️ 改 `Rc<Vec<_>>` 字段的注意点：`.clear()` 报 `E0596`，要整值替换；`mem::take(&mut f)` 要写 `Rc::make_mut(&mut f)`；**`action_targets()` 契约返回 `Vec<Uuid>`**，得写 `(*self.selected_assets).clone()`。
+- ✅ **全屏卡顿已定案：不是性能问题，是 debounce 状态机两个缺陷**（2026-09-14，修复在 `f35da88`）。耗时探针实测：**`render` 单帧仅 0.5 ms**（max < 1.3 ms），`render + item builder + cell 构造` 合计 ≈ **6 ms/s**（占一秒的 0.6%；其中 cell 构造 0.33%）—— **「每帧重建 cell」不是瓶颈，我前五轮全在优化错的东西，降乘数也没意义**。
+  - **缺陷 1（「点一下才补全」）**：150ms 定时器只置 `relayout_pending` + `cx.notify()`，**`notify` 不保证排帧**。必须用 **`App::refresh_windows()`**（`Effect::RefreshWindows`，`app.rs:1808-1814`，无条件置 `refreshing`+`dirty`）—— ⚠️ `Window::refresh`（`window.rs:2179`）有 `not_drawing()` 门、`notify` 经 `invalidate_view`（`window.rs:167-191`）需 `draw_phase==None` 且「已脏就不叫 waker」，**两者都可能静默 no-op**。
+  - **缺陷 2（「卡一下」= 150ms 空转）**：`defer=true` 时网格停在「新宽度 + 旧 `cols`」矛盾态，肉眼即卡顿。150ms debounce 本为**拖动**防抖，不该用于**全屏/双击标题栏/吸附**这类一步到位的跳变 → 新增 `WIDTH_JUMP_PX = 120.0` 按跳变幅度分流。⚠️ **`ViewKey.content_width` 是「上次已应用」宽度**，故阈值测的是「距上次匹配以来的总增量」（全屏 560px 过线，拖拽几 px 不过）。
+  - ⚠️ **拿 `Window` 的坑**：`panel.update(cx,..)` 无 `Window`；`Entity::update_in` 的 `C: VisualContext` **不满足 `AsyncApp`**（E0277）。正解 `cx.spawn_in(window, async move |panel, cx| ...)`。
+  - ⚠️ **探针口径的坑**：`cell_ms/s` 可能 > `render_ms/s` —— 因为 item builder 多数调发生在 `render` 没跑的帧（list prepaint）。**逐项相加会低估总量。**
+  - ⚠️ **判据教训**：`timer_fires` 与 `relayouts` **不必配平**；`timer_fires=1 relayouts=0` 是正确行为（宽度绕回原值 → `:672` flickered-back 清 pending）。
+  - A′ 三条（`Rc<[..]>` / `AssetsDrag` / `ElementId::Uuid`）**已回滚**（`4b792d3`）；路线 B/C′ 自写虚拟化**不需要**。探针已全删（`grep TEMP RESIZE` 为空）。
 - 探针方案已放弃（2026-09-14 用户要求移除，代码全删无残留）；**滚动性能至今未实测**——上面四条是「把每帧 O(n)/SQL 挪出热路径」的确定性收益，但没有帧时间数字；要量化只能用外部 profiler 或对比 digiKam（Eagle 未装且闭源）。
+- ⚠️ **临时探针方法论**（这次验证有效，可复用）：用 `thread_local` 计数器 + Drop guard（`RenderTimer`/`ItemTimer`）覆盖多返回路径；`flush_if_due` 每秒打一次；**flush 必须在 render 结束时**（开头 flush 会把 N 次 render 配 N-1 次耗时）。探针**用完即删**，标注 `TEMP RESIZE PROBE` 便于 grep 清场。
 - trove-app 无 examples 目录；现有 bench（layout/relayout）都是纯 core。
 
 ## 导入管线（结论已收敛）
