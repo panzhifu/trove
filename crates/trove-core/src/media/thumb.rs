@@ -289,8 +289,24 @@ pub fn decode_image(blob_path: &Path) -> Option<image::DynamicImage> {
         "heic" | "heif" | "avif" => crate::media::probe::heif_to_image(blob_path),
         "jxl" => render_jxl(blob_path),
         _ if crate::media::probe::is_raw_ext(&ext) => render_raw(blob_path),
-        _ => image::open(blob_path).ok(),
+        _ => decode_raster(blob_path),
     }
+}
+
+/// Decode an ordinary raster (JPEG/PNG/WebP/TIFF/…) with the EXIF
+/// orientation applied. `image::open` hands back the raw sensor orientation,
+/// so a portrait phone photo would keep lying on its side — thumbnails and
+/// palettes would both be wrong (the RAW path applies orientation via
+/// rawler in [`render_raw`]; this is the same fix for the plain formats).
+fn decode_raster(path: &Path) -> Option<image::DynamicImage> {
+    use image::{ImageDecoder, ImageReader};
+    let mut decoder = ImageReader::open(path).ok()?.into_decoder().ok()?;
+    let orientation = decoder
+        .orientation()
+        .unwrap_or(image::metadata::Orientation::NoTransforms);
+    let mut image = image::DynamicImage::from_decoder(decoder).ok()?;
+    image.apply_orientation(orientation);
+    Some(image)
 }
 
 /// Decode a JPEG-XL file through `jxl-oxide` (pure Rust; the `image`
@@ -565,6 +581,67 @@ mod tests {
             out.is_some_and(|p| p.is_file()),
             "AVIF should produce a thumbnail"
         );
+    }
+
+    /// A portrait phone photo is stored as landscape sensor data plus an EXIF
+    /// orientation tag (6 = rotate 90° CW) — the tag is the only thing saying
+    /// so. `image::open` ignores it, so `decode_image` and `image_dimensions`
+    /// must apply it themselves or every thumbnail of such a photo lies on
+    /// its side.
+    #[test]
+    fn jpeg_exif_orientation_is_applied() {
+        use exif::{In, Tag, Value, experimental::Writer as ExifWriter};
+
+        let dir = std::env::temp_dir().join(format!("trove-orient-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut img = image::RgbImage::new(8, 6);
+        for pixel in img.pixels_mut() {
+            *pixel = image::Rgb([220, 90, 40]);
+        }
+        let plain = dir.join("plain.jpg");
+        img.save_with_format(&plain, image::ImageFormat::Jpeg)
+            .expect("jpeg written");
+
+        // kamadak-exif 0.5 has no JPEG inserter: it emits a bare TIFF
+        // payload, so wrap it in a JPEG APP1 segment ("Exif\0\0" + TIFF) and
+        // splice it in right after the SOI marker.
+        let field = exif::Field {
+            tag: Tag::Orientation,
+            ifd_num: In::PRIMARY,
+            value: Value::Short(vec![6]),
+        };
+        let mut writer = ExifWriter::new();
+        writer.push_field(&field);
+        let mut tiff = std::io::Cursor::new(Vec::new());
+        writer.write(&mut tiff, false).expect("exif tiff written");
+        let tiff = tiff.into_inner();
+
+        let mut jpeg = std::fs::read(&plain).unwrap();
+        assert_eq!(&jpeg[..2], &[0xFF, 0xD8], "source must start with SOI");
+        let mut app1 = vec![0xFF, 0xE1];
+        // The segment length counts its own two length bytes.
+        app1.extend_from_slice(&((tiff.len() + 6 + 2) as u16).to_be_bytes());
+        app1.extend_from_slice(b"Exif\0\0");
+        app1.extend_from_slice(&tiff);
+        jpeg.splice(2..2, app1);
+        let sideways = dir.join("sideways.jpg");
+        std::fs::write(&sideways, &jpeg).unwrap();
+
+        // Decoding rotates the pixels: 8×6 sensor data comes back 6×8.
+        let decoded = decode_image(&sideways).expect("jpeg decodes");
+        assert_eq!(decoded.dimensions(), (6, 8));
+
+        // The probed dimensions swap as well, or the grid would still size
+        // the tile like a landscape photo.
+        let dims = crate::media::probe::image_dimensions(&sideways).expect("dimensions");
+        assert_eq!((dims.width, dims.height), (6, 8));
+
+        // The twin without the tag must keep reporting 8×6.
+        let dims = crate::media::probe::image_dimensions(&plain).expect("dimensions");
+        assert_eq!((dims.width, dims.height), (8, 6));
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// Font-card generation against a system font, skipped when none can be
