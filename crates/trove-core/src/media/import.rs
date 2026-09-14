@@ -135,6 +135,48 @@ impl ImportPolicy {
     }
 }
 
+/// Cap on staging threads, regardless of how many cores the machine has.
+///
+/// Staging is I/O-bound, not CPU-bound: each file costs two fresh on-disk
+/// writes (blob + thumbnail, both temp-file + rename), so widening the pool
+/// past a few threads only deepens contention on the filesystem's metadata
+/// locks. The parallel speedup also depends strongly on file size — small
+/// files are metadata-lock bound and barely scale at all, large ones scale
+/// close to linearly — so this is a fixed ceiling rather than a tuned
+/// optimum.
+///
+/// The value assumes a btrfs library. On a filesystem with cheaper
+/// concurrent writes (XFS/ext4 on NVMe) a larger pool may win; if that ever
+/// matters, make this adaptive on the target's fstype rather than raising it
+/// blindly.
+const STAGE_THREADS_MAX: usize = 4;
+
+/// The pool staging runs on. Built once, outside the global rayon pool: the
+/// global pool is sized to the core count, which is exactly the overshoot
+/// [`STAGE_THREADS_MAX`] exists to avoid — and the global pool is also shared
+/// with the PLY parser's own `par_iter`, which should keep its full width.
+fn stage_pool() -> &'static rayon::ThreadPool {
+    use std::sync::OnceLock;
+    static POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
+    POOL.get_or_init(|| {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(stage_thread_count())
+            .thread_name(|i| format!("trove-stage-{i}"))
+            .build()
+            .expect("build staging thread pool")
+    })
+}
+
+/// How wide the staging pool is on this machine: [`STAGE_THREADS_MAX`], or
+/// the core count when that is smaller. Exposed for benchmarks and logs.
+pub fn stage_thread_count() -> usize {
+    STAGE_THREADS_MAX.min(
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1),
+    )
+}
+
 /// Phase one for a batch: stage every source file (copy + hash + probe + thumbnail).
 /// Pure filesystem work, safe to run on a background thread. Individual
 /// failures never abort the batch; they are collected as [`ImportSkip`]s.
@@ -146,19 +188,23 @@ pub fn stage_all(
 ) -> Vec<std::result::Result<StagedFile, ImportSkip>> {
     use rayon::prelude::*;
 
-    // Parallel: every stage is independent file I/O (hash + blob copy +
-    // thumbnail), so throughput tracks the disk, not one core. `par_iter`
-    // preserves input order, and blob/thumb writes are temp-file + rename,
-    // so concurrent staging of identical content cannot corrupt anything.
-    sources
-        .par_iter()
-        .map(|src| {
-            stage_source(root, src, policy).map_err(|e| ImportSkip {
-                path: src.clone(),
-                reason: e.to_string(),
+    // Bounded parallel: every stage is independent file I/O (hash + blob copy
+    // + thumbnail) and the two on-disk writes per file make the filesystem the
+    // bottleneck, so the pool is deliberately narrower than the core count —
+    // see [`STAGE_THREADS_MAX`]. `par_iter` preserves input order, and
+    // blob/thumb writes are temp-file + rename, so concurrent staging of
+    // identical content cannot corrupt anything.
+    stage_pool().install(|| {
+        sources
+            .par_iter()
+            .map(|src| {
+                stage_source(root, src, policy).map_err(|e| ImportSkip {
+                    path: src.clone(),
+                    reason: e.to_string(),
+                })
             })
-        })
-        .collect()
+            .collect()
+    })
 }
 
 /// Phase two for a batch: commit staged files (or pass through staging
@@ -228,8 +274,12 @@ pub fn stage_source(root: &Path, src: &Path, policy: ImportPolicy) -> Result<Sta
     // Generate (or confirm) the thumbnail cache entry on the background thread.
     let thumb_path = thumb::ensure(root, &sha256, p.kind, &blob_path);
     // Mine rich metadata (EXIF camera fields, audio tags/duration, font
-    // tables, video container). Best-effort.
-    let mut mined = metadata::mine(&blob_path, p.kind);
+    // tables, video container). Best-effort. The palette is read from the
+    // thumbnail: the original has already been decoded once for the thumbnail,
+    // and a second full decode of a 6000x4000 image costs ~120 ms per file.
+    // (EXIF still comes from the original; thumbnails don't carry it.)
+    let color_source = thumb_path.clone().unwrap_or_else(|| blob_path.clone());
+    let mut mined = metadata::mine(&blob_path, p.kind, &color_source);
     // Visual fingerprint (pHash + colour histogram) for search-by-image and
     // search-by-colour, computed from the small thumbnail so a huge photo
     // costs no more than a tiny one. Stored in the visual facts and persisted

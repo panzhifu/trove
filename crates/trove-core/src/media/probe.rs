@@ -198,13 +198,24 @@ pub fn image_dimensions(path: &std::path::Path) -> Option<Dimensions> {
     let format = image::ImageReader::new(&mut reader)
         .with_guessed_format()
         .ok()?;
-    // Format-level probing still performs a bounded read; unknown formats
-    // would return an error here.
-    let dims = format.into_dimensions().ok()?;
-    Some(Dimensions {
-        width: dims.0,
-        height: dims.1,
-    })
+    // The orientation ride-along costs the same bounded header read that
+    // dimensions does: 90-degree orientations swap width and height, and a
+    // portrait phone photo stored unswapped would lie on its side in every
+    // layout that trusts these columns.
+    use image::ImageDecoder as _;
+    let mut decoder = format.into_decoder().ok()?;
+    let dims = decoder.dimensions();
+    let orientation = decoder
+        .orientation()
+        .unwrap_or(image::metadata::Orientation::NoTransforms);
+    let (width, height) = match orientation {
+        image::metadata::Orientation::Rotate90
+        | image::metadata::Orientation::Rotate270
+        | image::metadata::Orientation::Rotate90FlipH
+        | image::metadata::Orientation::Rotate270FlipH => (dims.1, dims.0),
+        _ => dims,
+    };
+    Some(Dimensions { width, height })
 }
 
 /// Intrinsic size of an SVG (from its root `<svg width/height/viewBox>`).
