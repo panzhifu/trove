@@ -260,9 +260,15 @@ pub fn load_ply(bytes: &[u8]) -> Result<Mesh, String> {
         None => load_ply_ascii(body, &elements)?,
     };
 
-    // A `face` element is what separates a surface from a cloud; a header
-    // that declares one but yields no usable triangle is still an error.
-    let declared_faces = elements.iter().any(|element| element.name == "face");
+    // A `face` element separates a surface from a cloud — but only when it
+    // declares records. `element face 0` is a point cloud an exporter tagged
+    // with a vestigial face element, which is common enough to matter, and
+    // rejecting it would lose a perfectly readable scan. A header that
+    // declares face records and still yields no usable triangle is a broken
+    // export, and that stays an error.
+    let declared_faces = elements
+        .iter()
+        .any(|element| element.name == "face" && element.count > 0);
     if declared_faces {
         Mesh::finish(
             parsed.positions,
@@ -986,8 +992,12 @@ end_header
 0 0 0 255 0 0
 1 1 1 0 255 0
 ";
-        // Two vertices but no face: nothing to render.
-        assert!(load_ply(ply.as_bytes()).is_err());
+        // Two vertices, extra colour properties, and a face element that
+        // declares nothing: the colours are read and the file is a cloud.
+        let mesh = load_ply(ply.as_bytes()).expect("a tagged cloud parses");
+        assert!(mesh.is_point_cloud());
+        assert_eq!(mesh.vertex_count(), 2);
+        assert_eq!(mesh.colors, vec![[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]);
     }
 
     #[test]
@@ -1034,14 +1044,37 @@ end_header
         assert_eq!(mesh.bounds.max, [2.0, 1.0, 0.0]);
     }
 
-    /// A declared `face` element makes the file a surface: yielding no
-    /// triangle is then a broken export, not an empty cloud.
+    /// A `face` element that declares records but yields no usable triangle
+    /// is a broken export, and stays an error.
     #[test]
-    fn a_declared_face_element_still_requires_triangles() {
+    fn a_face_element_that_yields_no_triangle_still_errors() {
         let ply = "\
 ply
 format ascii 1.0
-element vertex 1
+element vertex 3
+property float x
+property float y
+property float z
+element face 1
+property list uchar int vertex_indices
+end_header
+0 0 0
+1 0 0
+0 1 0
+3 0 0 0
+";
+        assert!(load_ply(ply.as_bytes()).is_err());
+    }
+
+    /// `element face 0` declares no surface at all: the file is a point cloud
+    /// an exporter tagged with an empty face element, and it has to load as a
+    /// cloud rather than fail with "no triangles".
+    #[test]
+    fn a_face_element_with_zero_records_is_a_point_cloud() {
+        let ply = "\
+ply
+format ascii 1.0
+element vertex 2
 property float x
 property float y
 property float z
@@ -1049,8 +1082,11 @@ element face 0
 property list uchar int vertex_indices
 end_header
 0 0 0
+1 2 3
 ";
-        assert!(load_ply(ply.as_bytes()).is_err());
+        let mesh = load_ply(ply.as_bytes()).expect("a tagged cloud parses");
+        assert!(mesh.is_point_cloud());
+        assert_eq!(mesh.vertex_count(), 2);
     }
 
     /// A coloured scan: `red green blue` as `uchar` scales to 0..=1.

@@ -406,7 +406,6 @@ impl ModelViewport {
         if is_ply && size > CHUNKED_THRESHOLD {
             let config = LodConfig {
                 memory_budget: 128 << 20,
-                max_lod_step: 32,
             };
             chunked::load_ply_chunked(path, config)
         } else {

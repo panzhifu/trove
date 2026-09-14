@@ -137,7 +137,13 @@ impl PointStreamer {
         let (header, body_start) = read_header(&mut reader)?;
         let (endian, elements) = ply::parse_ply_header(&header)?;
 
-        let declares_faces = elements.iter().any(|element| element.name == "face");
+        // Only a face element that declares records makes this a surface. A
+        // `face 0` element is a point cloud an exporter tagged with an empty
+        // face list, and it belongs on the streaming path rather than being
+        // bounced to the mesh fallback.
+        let declares_faces = elements
+            .iter()
+            .any(|element| element.name == "face" && element.count > 0);
         let vertex = elements
             .iter()
             .find(|element| element.name == "vertex")
@@ -672,6 +678,23 @@ mod tests {
         std::fs::remove_file(&path).ok();
         assert_eq!(count, 3);
         assert!(streamer.declares_faces());
+    }
+
+    /// `element face 0` declares no surface: the file is a point cloud an
+    /// exporter tagged with an empty face element, and it must take the
+    /// streaming path instead of being bounced to the mesh fallback.
+    #[test]
+    fn an_empty_face_element_is_not_a_surface() {
+        let path = temp("facezero.ply");
+        let body = "ply\nformat ascii 1.0\nelement vertex 3\n\
+                    property float x\nproperty float y\nproperty float z\n\
+                    element face 0\nproperty list uchar int vertex_indices\n\
+                    end_header\n0 0 0\n1 0 0\n0 1 0\n";
+        std::fs::write(&path, body).unwrap();
+        let (streamer, count) = PointStreamer::open(&path).expect("opens");
+        std::fs::remove_file(&path).ok();
+        assert_eq!(count, 3);
+        assert!(!streamer.declares_faces());
     }
 
     /// Sampling a cloud is how a thumbnail of a twenty-gigabyte scan is drawn:

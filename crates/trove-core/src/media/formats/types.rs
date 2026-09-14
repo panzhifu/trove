@@ -248,6 +248,12 @@ impl Mesh {
         colors: Vec<[f32; 3]>,
         triangles: Vec<[u32; 3]>,
     ) -> Option<Self> {
+        // Normalise non-finite coordinates away first: nothing downstream can
+        // use them, and several things (the bounds, the winding check, the
+        // point-cloud octree) misbehave in ways that run from wrong to
+        // non-terminating. Doing it once here covers every format reader.
+        let (positions, normals, colors, triangles) =
+            drop_non_finite((positions, normals, colors, triangles));
         if positions.is_empty() {
             return None;
         }
@@ -282,6 +288,60 @@ impl Mesh {
             bounds,
         })
     }
+}
+
+/// The four parallel arrays a [`Mesh`] is assembled from.
+///
+/// Named so the filtering below can hand all four back without tripping
+/// clippy's complexity lint on a four-tuple return.
+type MeshArrays = (Vec<[f32; 3]>, Vec<[f32; 3]>, Vec<[f32; 3]>, Vec<[u32; 3]>);
+
+/// Drop every vertex whose coordinate is not finite, remapping the triangles
+/// onto what is left.
+///
+/// A NaN or infinite coordinate is not a position: it can never lie inside a
+/// box, every comparison against it is false, and it poisons the bounds, the
+/// winding check and the point-cloud octree in turn. Scans write NaN for
+/// unobserved points often enough that normalising once here — for every
+/// format — is cheaper than teaching each reader about it. The all-finite
+/// case, which is the common one, moves the arrays through untouched.
+fn drop_non_finite(geometry: MeshArrays) -> MeshArrays {
+    let (positions, normals, colors, triangles) = geometry;
+    if positions.iter().all(|p| p.iter().all(|v| v.is_finite())) {
+        return (positions, normals, colors, triangles);
+    }
+    let mut remap = vec![u32::MAX; positions.len()];
+    let mut kept = Vec::with_capacity(positions.len());
+    for (old, position) in positions.iter().enumerate() {
+        if position.iter().all(|v| v.is_finite()) {
+            remap[old] = kept.len() as u32;
+            kept.push(*position);
+        }
+    }
+    // A parallel array is only meaningful when it covers the same vertices;
+    // one that does not is dropped, exactly as the caller would have done.
+    let filter_parallel = |data: Vec<[f32; 3]>| -> Vec<[f32; 3]> {
+        if data.len() != remap.len() {
+            return Vec::new();
+        }
+        data.into_iter()
+            .enumerate()
+            .filter(|(index, _)| remap[*index] != u32::MAX)
+            .map(|(_, value)| value)
+            .collect()
+    };
+    let normals = filter_parallel(normals);
+    let colors = filter_parallel(colors);
+    let triangles = triangles
+        .into_iter()
+        .filter_map(|t| {
+            let a = *remap.get(t[0] as usize).unwrap_or(&u32::MAX);
+            let b = *remap.get(t[1] as usize).unwrap_or(&u32::MAX);
+            let c = *remap.get(t[2] as usize).unwrap_or(&u32::MAX);
+            (a != u32::MAX && b != u32::MAX && c != u32::MAX).then_some([a, b, c])
+        })
+        .collect();
+    (kept, normals, colors, triangles)
 }
 
 #[cfg(test)]
@@ -387,5 +447,59 @@ mod tests {
         let cloud = mesh(vec![[0.0, 0.0, 0.0], [1.0, 1.0, 1.0]], Vec::new());
         assert!(cloud.is_point_cloud());
         assert_eq!(cloud.winding(), Winding::TwoSided);
+    }
+
+    /// A coordinate that is not finite is not a vertex: it is dropped, its
+    /// triangles go with it, and the survivors keep their colours.
+    #[test]
+    fn non_finite_vertices_are_dropped_with_their_triangles() {
+        let mesh = Mesh::from_parts(
+            vec![
+                [0.0, 0.0, 0.0],
+                [f32::NAN, 0.0, 0.0],
+                [1.0, 0.0, 0.0],
+                [f32::INFINITY, 0.0, 0.0],
+                [0.0, 1.0, 0.0],
+            ],
+            Vec::new(),
+            vec![
+                [1.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0],
+                [0.0, 0.0, 1.0],
+                [1.0, 1.0, 1.0],
+                [0.5, 0.5, 0.5],
+            ],
+            vec![[0, 2, 4], [0, 1, 2]],
+        )
+        .expect("the finite vertices still build a mesh");
+        assert_eq!(
+            mesh.positions,
+            vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]
+        );
+        // The colours travel with their own vertices.
+        assert_eq!(
+            mesh.colors,
+            vec![[1.0, 0.0, 0.0], [0.0, 0.0, 1.0], [0.5, 0.5, 0.5]]
+        );
+        // The triangle that referenced a dropped vertex is gone; the one made
+        // of survivors is remapped onto their new indices.
+        assert_eq!(mesh.triangles, vec![[0, 1, 2]]);
+        assert!(mesh.bounds.min.iter().all(|v| v.is_finite()));
+        assert!(mesh.bounds.max.iter().all(|v| v.is_finite()));
+    }
+
+    /// A cloud of only non-finite points is empty, not a mesh with NaN
+    /// bounds: nothing about it is drawable.
+    #[test]
+    fn a_cloud_of_only_non_finite_points_is_empty() {
+        assert!(
+            Mesh::from_parts(
+                vec![[f32::NAN; 3], [f32::INFINITY; 3]],
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            )
+            .is_none()
+        );
     }
 }

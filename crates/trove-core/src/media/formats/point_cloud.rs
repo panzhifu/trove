@@ -238,7 +238,12 @@ impl Octree {
             }
         }
 
-        let indices: Vec<usize> = (0..positions.len()).collect();
+        let indices: Vec<usize> = positions
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| p.iter().all(|value| value.is_finite()))
+            .map(|(index, _)| index)
+            .collect();
 
         let root = Self::build_node(bounds, &positions, indices, 0);
 
@@ -551,6 +556,14 @@ impl StreamingOctree {
         if self.stride > 1 && !self.seen.is_multiple_of(self.stride) {
             return;
         }
+        // A point with a non-finite coordinate has nowhere to sit: see
+        // `expand_bounds_to_include`. Dropping it here keeps the tree's own
+        // arrays finite, which the bounds growth and the LOD walk both rely
+        // on. It still counted as offered (`seen`), so a stream's progress and
+        // its thinning stride are unaffected.
+        if !position.iter().all(|value| value.is_finite()) {
+            return;
+        }
 
         let index = self.positions.len();
         self.positions.push(position);
@@ -613,6 +626,12 @@ impl StreamingOctree {
         for (index, position) in positions.iter().enumerate() {
             self.seen += 1;
             if self.stride > 1 && !self.seen.is_multiple_of(self.stride) {
+                continue;
+            }
+            // Same rule as `insert_point`: a non-finite coordinate is not a
+            // position, and letting one through would spin the bounds growth
+            // below without end.
+            if !position.iter().all(|value| value.is_finite()) {
                 continue;
             }
             let at = self.positions.len();
@@ -698,9 +717,13 @@ impl StreamingOctree {
         }
         self.bounds = actual;
 
-        // Ensure allocated bounds cover actual bounds.
-        while !bounds_contains(&self.allocated_bounds, actual.min)
-            || !bounds_contains(&self.allocated_bounds, actual.max)
+        // Ensure allocated bounds cover actual bounds. `actual` is built with
+        // the NaN-ignoring `extend`, so it comes out empty only when there was
+        // nothing finite to cover — and there is no box to grow to then, so
+        // the loop has to be skipped rather than run without end.
+        while !actual.is_empty()
+            && (!bounds_contains(&self.allocated_bounds, actual.min)
+                || !bounds_contains(&self.allocated_bounds, actual.max))
         {
             self.double_allocated_bounds();
         }
@@ -796,7 +819,17 @@ impl StreamingOctree {
         }
     }
 
+    /// Grow the allocated box until it holds `point`.
+    ///
+    /// The loop is only sound for a finite point. `bounds_contains` compares
+    /// directly, and every comparison with NaN is false, so a NaN would make
+    /// `double_allocated_bounds` run forever — the box grows, but the point
+    /// can never be inside it. Callers drop non-finite points before getting
+    /// here; this guard is what keeps a stray one from hanging the load.
     fn expand_bounds_to_include(&mut self, point: [f32; 3]) {
+        if !point.iter().all(|value| value.is_finite()) {
+            return;
+        }
         while !bounds_contains(&self.allocated_bounds, point) {
             self.double_allocated_bounds();
         }
@@ -1186,6 +1219,41 @@ mod tests {
         let b = batch.to_mesh_lod(&frustum, [0.0, 0.0, 0.0], 12_000);
         assert_eq!(a.positions, b.positions);
         assert_eq!(a.colors, b.colors);
+    }
+
+    /// A non-finite point must not be inserted. `expand_bounds_to_include`
+    /// loops until its box holds the point, and a NaN is never inside any box
+    /// — every comparison against it is false — so one would spin the loader
+    /// forever at 100% CPU. It must not poison the bounds either, because the
+    /// LOD walk and the camera framing both read them.
+    #[test]
+    fn non_finite_points_do_not_hang_or_poison_the_tree() {
+        let mut octree = StreamingOctree::empty();
+        octree.insert_points(
+            &[
+                [0.0, 0.0, 0.0],
+                [f32::NAN, 1.0, 2.0],
+                [1.0, 1.0, 1.0],
+                [f32::INFINITY, 0.0, 0.0],
+                [f32::NEG_INFINITY, 0.0, 0.0],
+            ],
+            &[],
+        );
+        octree.rebuild();
+        assert_eq!(octree.kept_points(), 2, "only the finite points are kept");
+        let bounds = octree.bounds();
+        assert!(bounds.min.iter().all(|value| value.is_finite()));
+        assert!(bounds.max.iter().all(|value| value.is_finite()));
+
+        // The single-point path takes the same guard, and a tree that only
+        // ever saw NaN still answers a query instead of looping.
+        let mut one = StreamingOctree::empty();
+        one.insert_point([f32::NAN; 3], None);
+        one.insert_point([2.0, 2.0, 2.0], None);
+        one.rebuild();
+        assert_eq!(one.kept_points(), 1);
+        let bounds = one.bounds();
+        assert!(bounds.min.iter().all(|value| value.is_finite()));
     }
 
     /// A point budget thins the cloud evenly. Keeping the nearest points
