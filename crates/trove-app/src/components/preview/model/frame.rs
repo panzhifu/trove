@@ -433,11 +433,7 @@ fn draw(shot: Shot<'_>) -> Rendered {
         let framing = camera.framing(bounds, aspect);
         // The bands count from the model's own floor, exactly as the CPU
         // rasteriser counts them, so the two pictures agree.
-        let bands = render3d::bands_uniform(
-            options.height_color,
-            options.show_axes,
-            bounds.min[1],
-        );
+        let bands = render3d::bands_uniform(options.height_color, options.show_axes, bounds.min[1]);
         if let Some(bytes) = renderer.render(
             uploaded,
             &framing,

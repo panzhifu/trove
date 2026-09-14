@@ -419,8 +419,6 @@ impl Focusable for WorkspacePanel {
 
 impl Render for WorkspacePanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-
-
         // The action handlers are shared by both modes, so the shell is built
         // before the branch below picks what goes inside it.
         let shell = v_flex()
