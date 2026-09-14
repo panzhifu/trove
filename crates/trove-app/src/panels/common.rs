@@ -100,9 +100,12 @@ pub(crate) fn hex_to_rgb(s: &str) -> Option<u32> {
     u32::from_str_radix(s, 16).ok()
 }
 
-/// A round color chip in the shared palette style: hairline border, a
+/// A square color chip in the shared palette style: hairline border, a
 /// stronger ring when `selected`, hover feedback. Used by the smart-collection
 /// palette and the Inspector's mined-color swatches.
+///
+/// Square rather than round so the chips match the swatches in the toolbar
+/// colour picker's palette, which are square.
 pub(crate) fn color_swatch(
     cx: &App,
     id: String,
@@ -118,7 +121,7 @@ pub(crate) fn color_swatch(
         .cursor_pointer()
         .size_6()
         .flex_shrink_0()
-        .rounded_full()
+        .rounded(cx.theme().radius)
         .bg(gpui_kit::rgb(rgb))
         .border_1()
         .border_color(cx.theme().border)
