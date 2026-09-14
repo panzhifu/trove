@@ -33,8 +33,8 @@ pub(super) fn materialize_rows(cells: Vec<Cell>, layouts: &[RowLayout]) -> Vec<R
         .iter()
         .map(|layout| Row {
             height: layout.height,
-            widths: layout.item_widths.clone(),
-            cells: (&mut cells).take(layout.item_widths.len()).collect(),
+            widths: Rc::from(layout.item_widths.as_slice()),
+            cells: Rc::from_iter((&mut cells).take(layout.item_widths.len())),
             header: None,
         })
         .collect()
@@ -108,8 +108,8 @@ pub(super) fn refill_rows(
         let layout = fit_row(&aspects, content_width, target);
         rows.push(Row {
             height: layout.height,
-            widths: layout.item_widths,
-            cells: chunk,
+            widths: Rc::from(layout.item_widths.as_slice()),
+            cells: Rc::from_iter(chunk),
             header: None,
         });
     }
@@ -121,8 +121,8 @@ pub(super) fn refill_rows(
         for layout in layouts {
             rows.push(Row {
                 height: layout.height,
-                widths: layout.item_widths.clone(),
-                cells: (&mut rest).take(layout.item_widths.len()).collect(),
+                widths: Rc::from(layout.item_widths.as_slice()),
+                cells: Rc::from_iter((&mut rest).take(layout.item_widths.len())),
                 header: None,
             });
         }
