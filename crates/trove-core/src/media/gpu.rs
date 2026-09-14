@@ -13,13 +13,15 @@
 //! * [`unpack_bgra`] — stripping that padding back off and swizzling to the
 //!   BGRA order the UI expects.
 
+use super::formats::types::Mesh;
 use super::render3d::{
-    AMBIENT, BG_BOTTOM, BG_TOP, DIFFUSE, EDL_STRENGTH, Framing, KEY_LIGHT, MATERIAL, POINT_RADIUS,
-    SHININESS, SPECULAR, VIGNETTE,
+    self, AMBIENT, BG_BOTTOM, BG_TOP, DIFFUSE, EDL_STRENGTH, Framing, HEIGHT_BAND, KEY_LIGHT,
+    MATERIAL, POINT_RADIUS, SHININESS, SPECULAR, VIGNETTE,
 };
 
-/// Bytes of [`Uniforms`]: one `mat4x4<f32>` plus eight `vec4<f32>`.
-pub const UNIFORM_SIZE: usize = 64 + 8 * 16;
+
+/// Bytes of [`Uniforms`]: one `mat4x4<f32>` plus nine `vec4<f32>`.
+pub const UNIFORM_SIZE: usize = 64 + 9 * 16;
 
 /// The uniform block read by the model and backdrop shaders.
 ///
@@ -47,6 +49,13 @@ pub struct Uniforms {
     pub viewport: [f32; 4],
     /// Backdrop gradient, top then bottom.
     pub background: [[f32; 4]; 2],
+    /// Height colouring and the axis gizmo.
+    ///
+    /// `x` = height colouring on (1) or off (0), `y` = band size in model
+    /// units, `z` = the model's floor (the bands' origin), `w` = draw the axis
+    /// gizmo (1) or not (0). Packed here rather than baked into the vertex
+    /// buffer so toggling costs a uniform write instead of a re-upload.
+    pub bands: [f32; 4],
 }
 
 impl Uniforms {
@@ -72,7 +81,17 @@ impl Uniforms {
                 [BG_TOP[0], BG_TOP[1], BG_TOP[2], 0.0],
                 [BG_BOTTOM[0], BG_BOTTOM[1], BG_BOTTOM[2], 0.0],
             ],
+            bands: [0.0, HEIGHT_BAND, 0.0, 0.0],
         }
+    }
+
+    /// Set the height-colouring / axis uniform from a packed [`bands_uniform`]
+    /// vector.
+    ///
+    /// [`bands_uniform`]: render3d::bands_uniform
+    pub fn with_bands(mut self, bands: [f32; 4]) -> Self {
+        self.bands = bands;
+        self
     }
 
     /// Flatten to the byte layout wgpu uploads. Every field is 16-byte aligned,
@@ -96,6 +115,7 @@ impl Uniforms {
             self.viewport,
             self.background[0],
             self.background[1],
+            self.bands,
         ] {
             push(&vector, &mut at);
         }
@@ -106,6 +126,41 @@ impl Uniforms {
             bytes[index * 4..index * 4 + 4].copy_from_slice(&value.to_ne_bytes());
         }
         bytes
+    }
+}
+
+/// The axis gizmo as interleaved vertex data, ready for `Queue::write_buffer`.
+pub struct AxisData {
+    /// Vertices, three per triangle.
+    pub count: u32,
+    vertices: Vec<f32>,
+}
+
+impl AxisData {
+    /// Bytes of one vertex: position then colour.
+    pub const STRIDE: u64 = 2 * 3 * 4;
+
+    /// The vertex array as bytes.
+    pub fn bytes(&self) -> Vec<u8> {
+        render3d::f32_bytes(&self.vertices)
+    }
+}
+
+/// Flatten the axis gizmo into the vertex data its pipeline reads.
+///
+/// The geometry comes from [`render3d::axis_triangles`], the same list the CPU
+/// rasteriser draws, so the two renderers put the same gizmo on screen.
+pub fn axis_data(mesh: &Mesh) -> AxisData {
+    let triangles = render3d::axis_triangles(mesh);
+    let mut vertices = Vec::with_capacity(triangles.len() * 6);
+    for (position, color) in &triangles {
+        vertices.extend_from_slice(&[
+            position[0], position[1], position[2], color[0], color[1], color[2],
+        ]);
+    }
+    AxisData {
+        count: triangles.len() as u32,
+        vertices,
     }
 }
 
@@ -204,10 +259,10 @@ mod tests {
 
     #[test]
     fn the_uniform_block_is_the_size_the_shader_expects() {
-        // 64 bytes of matrix + eight vec4 = 192, a multiple of 16.
-        assert_eq!(UNIFORM_SIZE, 192);
+        // 64 bytes of matrix + nine vec4 = 208, a multiple of 16.
+        assert_eq!(UNIFORM_SIZE, 208);
         assert_eq!(UNIFORM_SIZE % 16, 0);
-        assert_eq!(Uniforms::new(&framing(), (800, 600)).to_bytes().len(), 192);
+        assert_eq!(Uniforms::new(&framing(), (800, 600)).to_bytes().len(), 208);
     }
 
     #[test]

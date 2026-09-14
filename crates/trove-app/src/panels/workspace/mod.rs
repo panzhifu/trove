@@ -16,10 +16,10 @@ use gpui_kit::base::{ElementExt as _, h_flex, v_flex};
 use gpui_kit::component::Sizable;
 use gpui_kit::component::WindowExt as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::dock::{BasePanel, Panel as DockPanel, PanelControl, PanelEvent};
+use gpui_kit::component::dock::{BasePanel, PanelEvent};
 use gpui_kit::component::input::{Input, InputState};
-use gpui_kit::component::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenuItem};
-use gpui_kit::component::{ActiveTheme, Icon, IconName, Selectable as _};
+use gpui_kit::component::menu::ContextMenuExt as _;
+use gpui_kit::component::{ActiveTheme, Icon, IconName};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
@@ -28,7 +28,7 @@ use gpui_kit::*;
 // `Vec<Asset>` variable called `list` would otherwise shadow it.
 use crate::components::color_picker::{ColorPicked, ColorPickerState, picker_panel};
 use gpui_kit::component::popover::{Popover, PopoverState};
-use gpui_kit::component::slider::{Slider, SliderEvent, SliderState};
+use gpui_kit::component::slider::{SliderEvent, SliderState};
 use gpui_kit::list as list_element;
 use gpui_kit::{Anchor, Bounds, ListOffset, Pixels};
 use gpui_kit::{ListAlignment, ListState};
@@ -252,96 +252,6 @@ impl BasePanel for WorkspacePanel {
         false
     }
 }
-impl DockPanel for WorkspacePanel {
-    /// Title text: follows the browsed view (collection name, smart
-    /// collection, trash, or the all-assets fallback). The interactive
-    /// buttons live in [`title_suffix`] which renders outside the title's
-    /// clipping container, so they stay visible.
-    fn title(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        div()
-            .text_sm()
-            .font_weight(FontWeight::BOLD)
-            .text_color(cx.theme().foreground)
-            .child(self.title_label(cx))
-    }
-
-    fn zoom_control(&self, _: &App) -> Option<PanelControl> {
-        None
-    }
-
-    /// The panel title bar: item count, zoom, view/sort/favourites, search.
-    fn title_suffix(
-        &mut self,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Option<impl IntoElement> {
-        let ctl = self.controller.read(cx);
-        let in_trash = ctl.showing_trash;
-        let in_recent = ctl.showing_recent;
-        let loaded = ctl.grid_loaded.min(self.last_total);
-        let total = self.last_total;
-        let controller = self.controller.clone();
-        let slider_value = self.zoom_slider.read(cx).value().start();
-        let zoom_label = format!("{:.0}%", (slider_value * 100.0).round());
-        let count_label = if loaded < total {
-            rust_i18n::t!("workspace.scroll_hint", loaded = loaded, total = total).to_string()
-        } else if total == 1 {
-            rust_i18n::t!("workspace.item_one").to_string()
-        } else {
-            rust_i18n::t!("workspace.items_many", count = total).to_string()
-        };
-        let mut row = h_flex()
-            .items_center()
-            .gap_1()
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(count_label),
-            )
-            .child(
-                div()
-                    .id("grid-zoom")
-                    .flex_none()
-                    .w(px(96.0))
-                    .px_1()
-                    .child(Slider::new(&self.zoom_slider)),
-            )
-            .child(
-                div()
-                    .text_xs()
-                    .w(px(34.0))
-                    .text_color(cx.theme().muted_foreground)
-                    .child(zoom_label),
-            )
-            .child(title_controls(&controller, cx))
-            .child(self.search_box.clone());
-        if in_trash || in_recent {
-            // Zoom has no effect in list view contexts of trash/recent? It
-            // still does (grid layout), so keep everything; only these two
-            // contextual actions differ.
-            let action = if in_trash {
-                Button::new("empty-trash")
-                    .ghost()
-                    .danger()
-                    .xsmall()
-                    .label(rust_i18n::t!("workspace.empty_all").to_string())
-                    .tooltip(rust_i18n::t!("workspace.empty_all_tooltip").to_string())
-                    .on_click(cx.listener(|this, _, _, cx| this.empty_trash(cx)))
-            } else {
-                Button::new("clear-history")
-                    .ghost()
-                    .danger()
-                    .xsmall()
-                    .label(rust_i18n::t!("workspace.clear_history").to_string())
-                    .tooltip(rust_i18n::t!("workspace.clear_history_tooltip").to_string())
-                    .on_click(cx.listener(|this, _, _, cx| this.clear_view_history(cx)))
-            };
-            row = row.child(action);
-        }
-        Some(row)
-    }
-}
 
 impl WorkspacePanel {
     /// The in-panel toolbar row below the title bar. While a visual search
@@ -509,6 +419,8 @@ impl Focusable for WorkspacePanel {
 
 impl Render for WorkspacePanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+
+
         // The action handlers are shared by both modes, so the shell is built
         // before the branch below picks what goes inside it.
         let shell = v_flex()

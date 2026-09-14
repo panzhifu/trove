@@ -65,6 +65,62 @@ pub const VIGNETTE: f32 = 0.35;
 /// bakes in no constants of its own.
 pub const POINT_RADIUS: f32 = 1.15;
 
+/// Height band size for the elevation colouring, in model units.
+///
+/// Every this many units of model-space `y` gets its own hue, so the count of
+/// bands follows the file's real scale rather than its pixel size.
+pub const HEIGHT_BAND: f32 = 10.0;
+
+/// Axis gizmo colours: X, Y, Z, the usual red/green/blue.
+pub const AXIS_X: [f32; 3] = [0.87, 0.28, 0.28];
+pub const AXIS_Y: [f32; 3] = [0.30, 0.74, 0.34];
+pub const AXIS_Z: [f32; 3] = [0.30, 0.47, 0.90];
+
+/// Hue step between neighbouring height bands, in turns.
+///
+/// The golden angle, so neighbouring bands are as far apart as possible and
+/// the sequence keeps finding new hues instead of cycling after a handful.
+const BAND_HUE_STEP: f32 = 0.618_034;
+
+/// `HSV(hue, 1, 1)` as RGB, with the hue `t` in turns.
+fn hue_rgb(t: f32) -> [f32; 3] {
+    let h = t.rem_euclid(1.0) * 6.0;
+    let x = 1.0 - (h.rem_euclid(2.0) - 1.0).abs();
+    match h as u32 {
+        0 => [1.0, x, 0.0],
+        1 => [x, 1.0, 0.0],
+        2 => [0.0, 1.0, x],
+        3 => [0.0, x, 1.0],
+        4 => [x, 0.0, 1.0],
+        _ => [1.0, 0.0, x],
+    }
+}
+
+/// The colour one height band is painted with.
+///
+/// Each [`HEIGHT_BAND`] units of model-space `y` gets its own hue, counted
+/// from the model's own floor (`base`) so the first band starts at the model's
+/// feet rather than at world zero. `gpu3d.wgsl` mirrors this function, which
+/// is what keeps a thumbnail and its viewport frame the same picture.
+pub fn height_tint(y: f32, base: f32) -> [f32; 3] {
+    hue_rgb(((y - base) / HEIGHT_BAND).floor() * BAND_HUE_STEP)
+}
+
+/// Pack the height-colouring / axis uniform into its four floats.
+///
+/// `x` = colouring on (1) or off (0), `y` = the band size, `z` = the model's
+/// floor (where the bands count from), `w` = draw the axis gizmo (1) or not.
+/// The GPU reads this as the `bands` vector, so the packing lives here rather
+/// than at the call site.
+pub fn bands_uniform(height_color: bool, show_axes: bool, base_y: f32) -> [f32; 4] {
+    [
+        if height_color { 1.0 } else { 0.0 },
+        HEIGHT_BAND,
+        base_y,
+        if show_axes { 1.0 } else { 0.0 },
+    ]
+}
+
 /// An orbiting camera aimed at the centre of the model.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Camera {
@@ -101,9 +157,10 @@ impl Camera {
         self.pitch = (self.pitch + delta_pitch).clamp(-MAX_PITCH, MAX_PITCH);
     }
 
-    /// Scale the distance; a factor below 1 moves closer.
-    pub fn zoom_by(&mut self, factor: f32) {
-        self.zoom = (self.zoom * factor).clamp(MIN_ZOOM, MAX_ZOOM);
+    /// Scale the distance; a factor below 1 moves closer. The caller
+    /// supplies the limits so they can come from the app config.
+    pub fn zoom_by(&mut self, factor: f32, min_zoom: f32, max_zoom: f32) {
+        self.zoom = (self.zoom * factor).clamp(min_zoom, max_zoom);
     }
 
     /// Slide the pivot by a delta across the view, in bounding-sphere radii:
@@ -248,6 +305,14 @@ pub struct RenderOptions {
     /// camera, which is what makes the form legible; gap filling closes the
     /// single-pixel holes between neighbouring discs.
     pub enhance_points: bool,
+    /// Paint the surface by height instead of the flat material colour.
+    ///
+    /// Every [`HEIGHT_BAND`] units of model-space `y` gets its own hue, which
+    /// turns a mesh into a readable elevation map. Off by default, so nothing
+    /// that did not ask for it keeps the picture it always had.
+    pub height_color: bool,
+    /// Draw the X/Y/Z axis gizmo on the bounding box's floor corner.
+    pub show_axes: bool,
 }
 
 /// [`render`], reusing the caller's buffers. The interactive path goes through
@@ -719,7 +784,16 @@ fn paint(
             height: h,
             framing,
         };
-        paint_points(&mut target, mesh, point_radius, quality);
+        paint_points(
+            &mut target,
+            mesh,
+            point_radius,
+            quality,
+            options.height_color,
+        );
+        if options.show_axes {
+            target.paint_axes(mesh);
+        }
         return;
     }
     if mesh.triangles.is_empty() {
@@ -742,6 +816,8 @@ fn paint(
     let (near, _) = framing.depth_range();
     let vertex_count = mesh.positions.len();
     let gouraud = mesh.has_vertex_normals();
+    // Height bands count from the model's own floor, not from world zero.
+    let base_y = mesh.bounds.min[1];
 
     {
         let mut target = Target {
@@ -802,9 +878,18 @@ fn paint(
                 } else {
                     shaded_face
                 };
+                // Height colouring is decided per vertex, so a band boundary
+                // lands on the geometry rather than on a pixel; the shader
+                // does the same from the same model-space `y`.
+                let c = if options.height_color {
+                    height_tint(mesh.positions[index][1], base_y)
+                } else {
+                    MATERIAL
+                };
                 corners[slot] = Vertex {
                     p: view[index],
                     i: AMBIENT + DIFFUSE * dot(normal, light).max(0.0),
+                    c,
                 };
             }
 
@@ -813,6 +898,12 @@ fn paint(
             for k in 1..count.saturating_sub(1) {
                 target.triangle(polygon[0], polygon[k], polygon[k + 1], spec);
             }
+        }
+
+        // After the model, so the gizmo depth-tests against it and shows
+        // wherever the model is not in the way.
+        if options.show_axes {
+            target.paint_axes(mesh);
         }
     }
 }
@@ -832,7 +923,13 @@ pub fn base_color(mesh: &Mesh, index: usize) -> [f32; 3] {
 /// formula, same sprite size — so a cloud's thumbnail and its viewport frame
 /// agree. Everything happens in model space, because that is where the
 /// normals and the eye the uniform block carries both live.
-fn paint_points(target: &mut Target<'_>, mesh: &Mesh, radius: f32, quality: f32) {
+fn paint_points(
+    target: &mut Target<'_>,
+    mesh: &Mesh,
+    radius: f32,
+    quality: f32,
+    height_color: bool,
+) {
     let (near, _) = target.framing.depth_range();
     let eye = target.framing.eye_in_model_space();
     let light = normalize(KEY_LIGHT);
@@ -855,7 +952,13 @@ fn paint_points(target: &mut Target<'_>, mesh: &Mesh, radius: f32, quality: f32)
             normal
         };
         let intensity = AMBIENT + DIFFUSE * dot(normal, light).max(0.0);
-        let base = base_color(mesh, index);
+        // Height colouring wins over the file's own colours; that is the
+        // whole point of switching it on.
+        let base = if height_color {
+            height_tint(position[1], mesh.bounds.min[1])
+        } else {
+            base_color(mesh, index)
+        };
         let rgb = [
             base[0] * intensity,
             base[1] * intensity,
@@ -912,6 +1015,7 @@ impl Target<'_> {
             y: pos[1],
             inv_z,
             i: v.i,
+            c: v.c,
         }
     }
 
@@ -997,21 +1101,113 @@ impl Target<'_> {
                 self.depth[index] = inv_z;
                 let intensity = w0 * a.i + w1 * b.i + w2 * c.i;
                 self.colors[index] = [
-                    MATERIAL[0] * intensity + spec,
-                    MATERIAL[1] * intensity + spec,
-                    MATERIAL[2] * intensity + spec,
+                    (w0 * a.c[0] + w1 * b.c[0] + w2 * c.c[0]) * intensity + spec,
+                    (w0 * a.c[1] + w1 * b.c[1] + w2 * c.c[1]) * intensity + spec,
+                    (w0 * a.c[2] + w1 * b.c[2] + w2 * c.c[2]) * intensity + spec,
                 ];
             }
         }
     }
+
+    /// The X/Y/Z gizmo, as unlit triangles through the same rasteriser and
+    /// depth test as the model — so it belongs to the scene rather than
+    /// floating over it.
+    fn paint_axes(&mut self, mesh: &Mesh) {
+        let triangles = axis_triangles(mesh);
+        for tri in triangles.chunks_exact(3) {
+            // Intensity 1 and no specular is what makes it unlit: a
+            // measurement aid reads better flat, and it keeps the GPU's axis
+            // pass, which has no lighting at all, in agreement.
+            let view: Vec<Vertex> = tri
+                .iter()
+                .map(|(p, c)| Vertex {
+                    p: self.framing.to_view(*p),
+                    i: 1.0,
+                    c: *c,
+                })
+                .collect();
+            self.triangle(view[0], view[1], view[2], 0.0);
+        }
+    }
 }
 
-/// A view-space vertex; `i` is the shading intensity carried through clipping.
+/// The X/Y/Z gizmo as flat triangles, `(position, colour)` per vertex with
+/// three vertices per triangle.
+///
+/// Shared by both renderers — the CPU rasterises this list, the GPU uploads
+/// it — so the gizmo cannot drift between the two pictures. The rods rise from
+/// the bounding box's floor corner: X and Z reach equally far so the floor
+/// reads square, and Y spans the model's full height so it doubles as the
+/// height-band legend.
+pub fn axis_triangles(mesh: &Mesh) -> Vec<([f32; 3], [f32; 3])> {
+    let bounds = mesh.bounds;
+    if bounds.is_empty() {
+        return Vec::new();
+    }
+    let origin = bounds.min;
+    let span = sub(bounds.max, bounds.min);
+    let floor = span[0].max(span[2]).max(1e-6);
+    let height = span[1].max(1e-6);
+    let half = floor.max(height) * 0.006;
+    let mut out = Vec::with_capacity(3 * 8 * 3);
+    for (tip, color) in [
+        (add(origin, [floor, 0.0, 0.0]), AXIS_X),
+        (add(origin, [0.0, height, 0.0]), AXIS_Y),
+        (add(origin, [0.0, 0.0, floor]), AXIS_Z),
+    ] {
+        push_rod(&mut out, origin, tip, half, color);
+    }
+    out
+}
+
+/// Append one square rod from `a` to `b` as eight triangles.
+fn push_rod(
+    out: &mut Vec<([f32; 3], [f32; 3])>,
+    a: [f32; 3],
+    b: [f32; 3],
+    half: f32,
+    color: [f32; 3],
+) {
+    let dir = normalize(sub(b, a));
+    // Any axis not parallel to the rod; a vertical rod is the one case where
+    // the Y slot degenerates, hence the flip.
+    let seed = if dir[1].abs() < 0.9 {
+        [0.0, 1.0, 0.0]
+    } else {
+        [1.0, 0.0, 0.0]
+    };
+    let u = normalize(cross(dir, seed));
+    let v = cross(dir, u);
+    let ring = |p: [f32; 3]| {
+        let corner = |du: f32, dv: f32| add(p, add(scale(u, du * half), scale(v, dv * half)));
+        [
+            corner(-1.0, -1.0),
+            corner(1.0, -1.0),
+            corner(1.0, 1.0),
+            corner(-1.0, 1.0),
+        ]
+    };
+    let (ra, rb) = (ring(a), ring(b));
+    for i in 0..4 {
+        let j = (i + 1) % 4;
+        for corner in [ra[i], ra[j], rb[j]] {
+            out.push((corner, color));
+        }
+        for corner in [ra[i], rb[j], rb[i]] {
+            out.push((corner, color));
+        }
+    }
+}
+
+/// A view-space vertex; `i` is the shading intensity and `c` the base colour,
+/// both carried through clipping and interpolated per pixel.
 #[derive(Clone, Copy, Default)]
 struct Vertex {
     /// x right, y up, z forward.
     p: [f32; 3],
     i: f32,
+    /// Base surface colour: the material, a height band, or an axis colour.
+    c: [f32; 3],
 }
 
 /// A projected vertex.
@@ -1022,6 +1218,7 @@ struct ScreenVertex {
     /// `1/z`, linear in screen space and larger when nearer.
     inv_z: f32,
     i: f32,
+    c: [f32; 3],
 }
 
 /// Twice the signed area of the triangle `(a, b, p)`; the sign says which side
@@ -1048,6 +1245,11 @@ fn clip_near(triangle: [Vertex; 3], near: f32, out: &mut [Vertex; 4]) -> usize {
             out[count] = Vertex {
                 p: lerp3(current.p, next.p, t),
                 i: current.i + (next.i - current.i) * t,
+                c: [
+                    current.c[0] + (next.c[0] - current.c[0]) * t,
+                    current.c[1] + (next.c[1] - current.c[1]) * t,
+                    current.c[2] + (next.c[2] - current.c[2]) * t,
+                ],
             };
             count += 1;
         }
@@ -1416,6 +1618,8 @@ mod tests {
             RenderOptions {
                 cull_backfaces: false,
                 enhance_points: true,
+                height_color: false,
+                show_axes: false,
             },
             &mut Scratch::default(),
         )
@@ -1531,6 +1735,8 @@ mod tests {
             RenderOptions {
                 cull_backfaces: true,
                 enhance_points: false,
+                height_color: false,
+                show_axes: false,
             },
             &mut Scratch::default(),
         );
@@ -1568,6 +1774,8 @@ mod tests {
             RenderOptions {
                 cull_backfaces: true,
                 enhance_points: false,
+                height_color: false,
+                show_axes: false,
             },
             &mut Scratch::default(),
         );
@@ -1649,7 +1857,7 @@ mod tests {
         let mesh = cube();
         let mut camera = Camera::default();
         let wide = lit_pixels(&render(&mesh, &camera, 96, 96, 1, 1.0));
-        camera.zoom_by(0.5);
+        camera.zoom_by(0.5, MIN_ZOOM, MAX_ZOOM);
         let close = lit_pixels(&render(&mesh, &camera, 96, 96, 1, 1.0));
         assert!(close > wide, "close={close} wide={wide}");
     }
@@ -1705,14 +1913,62 @@ mod tests {
     }
 
     #[test]
+    fn a_height_band_keeps_one_colour_and_its_neighbour_differs() {
+        let base = 100.0;
+        // Constant inside one band...
+        assert_eq!(height_tint(base, base), height_tint(base + 9.9, base));
+        // ...and a different colour in the next.
+        assert_ne!(height_tint(base, base), height_tint(base + 10.0, base));
+        // Bands count from the model's own floor, not from world zero.
+        assert_eq!(height_tint(0.0, 0.0), height_tint(base, base));
+    }
+
+    #[test]
+    fn the_axis_gizmo_spans_the_bounds_in_three_colours() {
+        let mesh = Mesh {
+            positions: vec![[0.0, 0.0, 0.0], [3.0, 4.0, 5.0]],
+            triangles: Vec::new(),
+            bounds: Bounds {
+                min: [0.0; 3],
+                max: [3.0, 4.0, 5.0],
+            },
+            ..Mesh::default()
+        };
+        let triangles = axis_triangles(&mesh);
+        assert!(!triangles.is_empty());
+        assert_eq!(triangles.len() % 3, 0, "three vertices per triangle");
+        // Every vertex carries one of the three axis colours.
+        for (_, color) in &triangles {
+            assert!(
+                [AXIS_X, AXIS_Y, AXIS_Z].contains(color),
+                "unexpected colour {color:?}"
+            );
+        }
+        // The rods stay inside the bounding box, and the Y rod reaches the
+        // model's top — which is what makes it a height legend.
+        let top = triangles.iter().map(|(p, _)| p[1]).fold(f32::MIN, f32::max);
+        assert!(top >= 3.9, "the Y rod reaches the top, got {top}");
+        for (p, _) in &triangles {
+            assert!(p.iter().all(|c| *c >= -0.1 && *c <= 5.1), "inside bounds: {p:?}");
+        }
+    }
+
+    #[test]
+    fn a_mesh_with_no_bounds_has_no_axis() {
+        let mut mesh = Mesh::default();
+        mesh.bounds = Bounds::empty();
+        assert!(axis_triangles(&mesh).is_empty());
+    }
+
+    #[test]
     fn zoom_and_reset_stay_in_range() {
         let mut camera = Camera::default();
         for _ in 0..50 {
-            camera.zoom_by(0.5);
+            camera.zoom_by(0.5, MIN_ZOOM, MAX_ZOOM);
         }
         assert_eq!(camera.zoom, MIN_ZOOM);
         for _ in 0..50 {
-            camera.zoom_by(2.0);
+            camera.zoom_by(2.0, MIN_ZOOM, MAX_ZOOM);
         }
         assert_eq!(camera.zoom, MAX_ZOOM);
         assert!(!camera.is_default());

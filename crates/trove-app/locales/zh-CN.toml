@@ -371,6 +371,11 @@ backup_now_desc = "把素材库数据库快照到 backups/ 目录（最多保留
 backup_done = "备份完成：%{path}"
 backup_count = "已保留 %{count} 份快照（上限 %{max}）"
 open_backups_dir = "打开备份目录"
+preview_zoom = "预览缩放"
+preview_zoom_min = "最小缩放"
+preview_zoom_min_desc = "图片和 3D 预览的最小缩放级别（0.1–1.0）。值越小，能缩得越远。默认：0.25×。"
+preview_zoom_max = "最大缩放"
+preview_zoom_max_desc = "图片和 3D 预览的最大缩放级别（2.0–100.0）。值越大，能放得越近。默认：32×。"
 
 [stats]
 assets = "资产总数"
@@ -501,6 +506,8 @@ shortcut_rotate = "左键拖动 · W/A/S/D · 方向键：旋转"
 shortcut_pan_drag = "中键 / Shift+左键拖动：平移"
 shortcut_pan_keys = "Shift + 方向键：平移"
 shortcut_zoom = "滚轮 · Q/E · +/-：缩放"
+height_color = "高度着色"
+height_color_tip = "按高度给模型上色——以模型自身尺度每 10 个单位一种颜色——并显示 X/Y/Z 坐标轴。"
 shortcut_reset = "R · 双击：重置视角"
 
 [shortcuts]

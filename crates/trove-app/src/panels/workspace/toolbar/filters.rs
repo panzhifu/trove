@@ -1,18 +1,29 @@
-//! Title-bar filter controls (kind / favorites / view mode / sort)
-//! and the floating batch-action bar shown while several assets
-//! are selected.
+//! Title-bar filter controls (view toggle, sort, favorites) and the
+//! in-panel filter tools (kind / tag / shape / rating / format / +).
 
-use super::*;
-use trove_core::config::AppConfig;
+use gpui_kit::base::h_flex;
+use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
+use gpui_kit::component::{IconName, Selectable as _, Sizable as _};
+use gpui_kit::prelude::FluentBuilder as _;
+use gpui_kit::{Anchor, App};
+use gpui_kit::*;
 
-// ============================ filter controls ================================
+use trove_core::config::{AppConfig, FILTER_TOOLS};
+use trove_core::model::{AssetKind, AssetSort, Orientation};
+use trove_core::store::tags;
+
+use crate::library::{LibraryController, ViewMode};
+use uuid::Uuid;
+
+// ======================== title-bar controls ================================
 
 /// Type + favorites grid filters for the title bar: a kind dropdown, a
 /// heart toggle and a clear button when anything is active. The filters
 /// compose with every view (collection, search, smart collection) and are
 /// also how the favorites view is entered.
 /// The icon cluster for the panel title bar: view toggle, sort, favorites.
-pub(super) fn title_controls(controller: &Entity<LibraryController>, cx: &App) -> Div {
+pub(crate) fn title_controls(controller: &Entity<LibraryController>, cx: &App) -> Div {
     let (kind, favorite, view_mode, sort, sort_desc) = {
         let ctl = controller.read(cx);
         (
@@ -134,7 +145,7 @@ pub(super) fn title_controls(controller: &Entity<LibraryController>, cx: &App) -
     bar
 }
 
-pub(super) fn kind_key(kind: AssetKind) -> &'static str {
+pub(crate) fn kind_key(kind: AssetKind) -> &'static str {
     match kind {
         AssetKind::Image => "asset.kind.image",
         AssetKind::Video => "asset.kind.video",
@@ -147,217 +158,10 @@ pub(super) fn kind_key(kind: AssetKind) -> &'static str {
     }
 }
 
-/// Floating batch-action bar over the grid while two or more assets are
-/// selected. Every action hits the existing batch APIs, then deselects.
-pub(super) fn selection_toolbar(
-    controller: &Entity<LibraryController>,
-    in_trash: bool,
-    ids: Vec<Uuid>,
-    cx: &App,
-) -> Div {
-    let count = ids.len();
-    let all_favorite = if in_trash {
-        false
-    } else {
-        let conn = controller.read(cx).library.store().conn();
-        assets::by_ids(conn, &ids)
-            .map(|list| list.iter().all(|a| a.is_favorite))
-            .unwrap_or(false)
-    };
-    let ctl_fav = controller.clone();
-    let ctl_trash = controller.clone();
-    let ctl_restore = controller.clone();
-    let ctl_purge = controller.clone();
-    let ctl_add = controller.clone();
-    let ctl_clear = controller.clone();
+// ======================== in-panel filter tools ==============================
 
-    let mut bar = h_flex()
-        .items_center()
-        .gap_1()
-        .px_2()
-        .py_1()
-        .rounded_full()
-        .bg(cx.theme().background)
-        .border_1()
-        .border_color(cx.theme().border)
-        .shadow_lg()
-        .child(
-            div()
-                .px_1()
-                .text_xs()
-                .text_color(cx.theme().muted_foreground)
-                .child(rust_i18n::t!("workspace.selected_many", count = count).to_string()),
-        );
-
-    if in_trash {
-        bar = bar
-            .child(
-                Button::new("sel-restore")
-                    .xsmall()
-                    .ghost()
-                    .icon(IconName::Undo)
-                    .tooltip(rust_i18n::t!("workspace.restore").to_string())
-                    .on_click(move |_, _, cx| {
-                        ctl_restore.update(cx, |ctl, cx| {
-                            let ids = std::mem::take(&mut ctl.selected_assets);
-                            let _ = ctl.library.restore_assets(&ids);
-                            ctl.selection_anchor = None;
-                            ctl.generation += 1;
-                            cx.notify();
-                        });
-                    }),
-            )
-            .child(
-                Button::new("sel-purge")
-                    .xsmall()
-                    .ghost()
-                    .icon(IconName::Delete)
-                    .tooltip(rust_i18n::t!("workspace.delete_forever").to_string())
-                    .on_click(move |_, _, cx| {
-                        ctl_purge.update(cx, |ctl, cx| {
-                            let ids = std::mem::take(&mut ctl.selected_assets);
-                            if let Err(e) = ctl.library.purge_assets(&ids) {
-                                ctl.notice = Some(
-                                    rust_i18n::t!("workspace.purge_failed", error = e.to_string())
-                                        .to_string(),
-                                );
-                            }
-                            ctl.selection_anchor = None;
-                            ctl.generation += 1;
-                            cx.notify();
-                        });
-                    }),
-            );
-    } else {
-        bar = bar
-            .child(
-                Button::new("sel-rename")
-                    .xsmall()
-                    .ghost()
-                    .icon(IconName::CaseSensitive)
-                    .tooltip(rust_i18n::t!("workspace.batch_rename").to_string())
-                    .on_click({
-                        let controller = controller.clone();
-                        move |_, window, cx| {
-                            crate::dialogs::rename::RenameDialog::open(
-                                window,
-                                cx,
-                                controller.clone(),
-                            );
-                        }
-                    }),
-            )
-            .child(
-                Button::new("sel-fav")
-                    .xsmall()
-                    .ghost()
-                    .icon(if all_favorite {
-                        IconName::HeartOff
-                    } else {
-                        IconName::Heart
-                    })
-                    .tooltip(
-                        rust_i18n::t!(if all_favorite {
-                            "workspace.remove_from_favorites"
-                        } else {
-                            "workspace.add_to_favorites"
-                        })
-                        .to_string(),
-                    )
-                    .on_click(move |_, _, cx| {
-                        ctl_fav.update(cx, |ctl, cx| {
-                            let ids = ctl.selected_assets.clone();
-                            let _ = ctl.library.set_assets_favorite(&ids, !all_favorite);
-                            ctl.generation += 1;
-                            cx.notify();
-                        });
-                    }),
-            )
-            .child(
-                Button::new("sel-add")
-                    .xsmall()
-                    .ghost()
-                    .icon(IconName::Plus)
-                    .tooltip(rust_i18n::t!("workspace.add_to_collection").to_string())
-                    .dropdown_menu_with_anchor(Anchor::TopLeft, move |menu, _, cx| {
-                        let conn = ctl_add.read(cx).library.store().conn();
-                        let mut items: Vec<(Uuid, String)> = Vec::new();
-                        if let Ok(roots) = collections::roots(conn) {
-                            for root in roots {
-                                items.push((root.id, root.name.clone()));
-                                if let Ok(children) = collections::children_of(conn, Some(root.id))
-                                {
-                                    for child in children {
-                                        items.push((child.id, child.name.clone()));
-                                    }
-                                }
-                            }
-                        }
-                        let mut menu = menu.min_w(px(180.));
-                        if items.is_empty() {
-                            menu = menu.item(PopupMenuItem::label(
-                                rust_i18n::t!("workspace.no_collections").to_string(),
-                            ));
-                        }
-                        for (cid, cname) in items {
-                            let ctl = ctl_add.clone();
-                            menu =
-                                menu.item(PopupMenuItem::new(cname).on_click(move |_, _, cx| {
-                                    ctl.update(cx, |ctl, cx| {
-                                        let ids = ctl.selected_assets.clone();
-                                        let _ = ctl.library.add_assets_to_collection(cid, &ids);
-                                        ctl.generation += 1;
-                                        cx.notify();
-                                    });
-                                }));
-                        }
-                        menu
-                    }),
-            )
-            .child(
-                Button::new("sel-trash")
-                    .xsmall()
-                    .ghost()
-                    .icon(IconName::Delete)
-                    .tooltip(rust_i18n::t!("app.move_to_trash").to_string())
-                    .on_click(move |_, _, cx| {
-                        ctl_trash.update(cx, |ctl, cx| {
-                            ctl.trash_or_purge_selection();
-                            ctl.selection_anchor = None;
-                            cx.notify();
-                        });
-                    }),
-            );
-    }
-
-    let bar = bar.child(
-        Button::new("sel-clear")
-            .xsmall()
-            .ghost()
-            .label("×")
-            .tooltip(rust_i18n::t!("app.clear_selection").to_string())
-            .on_click(move |_, _, cx| {
-                ctl_clear.update(cx, |ctl, cx| {
-                    ctl.clear_selection();
-                    cx.notify();
-                });
-            }),
-    );
-
-    div()
-        .absolute()
-        .left_0()
-        .right_0()
-        .bottom_3()
-        .flex()
-        .justify_center()
-        .child(bar)
-}
-
-/// The kind dropdown for the in-panel toolbar row, styled like the
-/// "colour" tab: an icon + fixed label. The active kind is marked inside
-/// the menu, and the button reads as active while a kind filter is set.
-pub(super) fn kind_filter(controller: &Entity<LibraryController>, cx: &App) -> impl IntoElement {
+/// The kind dropdown for the in-panel toolbar row.
+pub(crate) fn kind_filter(controller: &Entity<LibraryController>, cx: &App) -> impl IntoElement {
     let kind = controller.read(cx).filter_kind;
     let t = |k: &str| rust_i18n::t!(k).to_string();
 
@@ -406,15 +210,12 @@ pub(super) fn kind_filter(controller: &Entity<LibraryController>, cx: &App) -> i
         })
 }
 
-// ============================ filter tools ==================================
-
-/// The tag filter: every known tag plus a clear entry. Selecting one browses
-/// assets carrying it (the whole subtree, via `active_tag`).
-pub(super) fn tag_filter(controller: &Entity<LibraryController>, cx: &App) -> impl IntoElement {
+/// The tag filter.
+pub(crate) fn tag_filter(controller: &Entity<LibraryController>, cx: &App) -> impl IntoElement {
     let active = controller.read(cx).active_tag;
     let tags: Vec<(Uuid, String)> = {
         let conn = controller.read(cx).library.store().conn();
-        trove_core::store::tags::list(conn)
+        tags::list(conn)
             .unwrap_or_default()
             .into_iter()
             .map(|t| (t.id, t.name))
@@ -453,10 +254,8 @@ pub(super) fn tag_filter(controller: &Entity<LibraryController>, cx: &App) -> im
         })
 }
 
-/// The shape filter: image orientation (landscape / portrait / square),
-/// derived from width vs height. Assets without dimensions match nothing.
-pub(super) fn shape_filter(controller: &Entity<LibraryController>, cx: &App) -> impl IntoElement {
-    use trove_core::model::Orientation;
+/// The shape filter.
+pub(crate) fn shape_filter(controller: &Entity<LibraryController>, cx: &App) -> impl IntoElement {
     let current = controller.read(cx).filter_orientation;
     let t = |k: &str| rust_i18n::t!(k).to_string();
 
@@ -494,8 +293,8 @@ pub(super) fn shape_filter(controller: &Entity<LibraryController>, cx: &App) -> 
         })
 }
 
-/// The rating filter: minimum star rating (unrated assets match nothing).
-pub(super) fn rating_filter(controller: &Entity<LibraryController>, cx: &App) -> impl IntoElement {
+/// The rating filter.
+pub(crate) fn rating_filter(controller: &Entity<LibraryController>, cx: &App) -> impl IntoElement {
     let current = controller.read(cx).filter_min_rating;
     let t = |k: &str| rust_i18n::t!(k).to_string();
 
@@ -538,12 +337,7 @@ pub(super) fn rating_filter(controller: &Entity<LibraryController>, cx: &App) ->
 }
 
 /// The format filter: distinct file extensions among live assets.
-///
-/// `exts` is the caller's cached list — reading it means a full scan of the
-/// live rows (`DISTINCT LOWER(ext)` cannot use `idx_assets_ext`), which is
-/// 32 ms on a 100k library and far too much to pay on every frame. It only
-/// changes when assets do, so the panel caches it per controller generation.
-pub(super) fn format_filter(
+pub(crate) fn format_filter(
     exts: &[String],
     controller: &Entity<LibraryController>,
     cx: &App,
@@ -592,9 +386,8 @@ pub(super) fn format_filter(
         })
 }
 
-/// The "+" button: toggles which filter tools are visible in the toolbar
-/// row. The set persists in the app config.
-pub(super) fn add_filter_button(controller: &Entity<LibraryController>) -> impl IntoElement {
+/// The "+" button: toggles which filter tools are visible in the toolbar row.
+pub(crate) fn add_filter_button(controller: &Entity<LibraryController>) -> impl IntoElement {
     let enabled: Vec<String> = AppConfig::load().filter_tools();
     let t = |k: &str| rust_i18n::t!(k).to_string();
 
@@ -606,7 +399,7 @@ pub(super) fn add_filter_button(controller: &Entity<LibraryController>) -> impl 
         .tooltip(t("workspace.add_filter_tooltip"))
         .dropdown_menu_with_anchor(Anchor::TopLeft, move |menu, _, _| {
             let mut menu = menu.min_w(px(170.));
-            for tool in trove_core::config::FILTER_TOOLS {
+            for tool in FILTER_TOOLS {
                 let tool = tool.to_string();
                 let checked = enabled.iter().any(|e| e == &tool);
                 let label_key = format!("workspace.filter_tool_{tool}");

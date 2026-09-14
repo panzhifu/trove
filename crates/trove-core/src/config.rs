@@ -84,7 +84,23 @@ pub struct AppConfig {
     /// Named theme used when the appearance resolves to dark.
     #[serde(default)]
     pub theme_dark: Option<String>,
+    /// Minimum preview zoom (image and 3D model). Clamped on read.
+    #[serde(default)]
+    pub min_preview_zoom: Option<f32>,
+    /// Maximum preview zoom (image and 3D model). Clamped on read.
+    #[serde(default)]
+    pub max_preview_zoom: Option<f32>,
+    /// Paint 3D previews by height — every [`crate::media::render3d::HEIGHT_BAND`]
+    /// units gets its own hue — with the axis gizmo for reference. Off by
+    /// default so a model looks the way the file intended.
+    #[serde(default)]
+    pub height_color: Option<bool>,
 }
+
+/// Default minimum preview zoom (0.25×).
+pub const DEFAULT_MIN_PREVIEW_ZOOM: f32 = 0.25;
+/// Default maximum preview zoom (32×).
+pub const DEFAULT_MAX_PREVIEW_ZOOM: f32 = 32.0;
 
 /// Which light/dark appearance the UI uses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -244,6 +260,25 @@ impl AppConfig {
     /// Effective grid zoom, clamped to 0.6..1.8 (1.0 = default size).
     pub fn grid_zoom(&self) -> f32 {
         self.grid_zoom.unwrap_or(1.0).clamp(0.6, 1.8)
+    }
+
+    /// Minimum preview zoom, clamped to a sane range.
+    pub fn min_preview_zoom(&self) -> f32 {
+        self.min_preview_zoom
+            .unwrap_or(DEFAULT_MIN_PREVIEW_ZOOM)
+            .clamp(0.1, 1.0)
+    }
+
+    /// Maximum preview zoom, clamped to a sane range.
+    pub fn max_preview_zoom(&self) -> f32 {
+        self.max_preview_zoom
+            .unwrap_or(DEFAULT_MAX_PREVIEW_ZOOM)
+            .clamp(2.0, 100.0)
+    }
+
+    /// Whether 3D previews are painted by height rather than the material.
+    pub fn height_color(&self) -> bool {
+        self.height_color.unwrap_or(false)
     }
 
     /// How manual imports treat source files: `true` = link to the original

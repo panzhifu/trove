@@ -374,6 +374,11 @@ backup_now_desc = "Snapshot the library database into backups/ (max 10 kept). Au
 backup_done = "Backup written: %{path}"
 backup_count = "%{count} snapshots kept (max %{max})"
 open_backups_dir = "Open the backups folder"
+preview_zoom = "Preview Zoom"
+preview_zoom_min = "Minimum zoom"
+preview_zoom_min_desc = "Smallest zoom level for image and 3D previews (0.1–1.0). Lower = can zoom out further. Default: 0.25×."
+preview_zoom_max = "Maximum zoom"
+preview_zoom_max_desc = "Largest zoom level for image and 3D previews (2.0–100.0). Higher = can zoom in closer. Default: 32×."
 
 [stats]
 assets = "Assets"
@@ -504,6 +509,8 @@ shortcut_rotate = "LMB drag · W/A/S/D · Arrows: Rotate"
 shortcut_pan_drag = "MMB / Shift+LMB drag: Pan"
 shortcut_pan_keys = "Shift + Arrows: Pan"
 shortcut_zoom = "Wheel · Q/E · +/-: Zoom"
+height_color = "Height colour"
+height_color_tip = "Paint the model by height — every 10 units of its own scale gets its own colour — and show the X/Y/Z axis gizmo."
 shortcut_reset = "R · Double-click: Reset view"
 
 [shortcuts]

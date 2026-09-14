@@ -5,6 +5,15 @@
 //! carries no feature or layout logic. The [`AppView`] lives in the sibling
 //! `app` module.
 
+// Windows: link as a GUI-subsystem binary in release builds.
+//
+// Without this the binary is a console-subsystem program, so Windows
+// allocates a console window on launch and closing that console sends
+// `CTRL_CLOSE_EVENT`, killing the app. A GUI process gets no console to
+// close. Debug builds deliberately keep the console: `println!`/`eprintln!`
+// and panics still surface there while developing.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 // Embeds `locales/*.toml` into the binary (compile-time parse; `en.toml` is
 // the fallback catalog). After this, `rust_i18n::t!` resolves keys and
 // `rust_i18n::set_locale` switches the process-global language — see `i18n`.
