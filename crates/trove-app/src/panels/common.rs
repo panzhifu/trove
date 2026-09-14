@@ -2,7 +2,6 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::rc::Rc;
 use std::sync::OnceLock;
 use std::sync::{Arc, Mutex};
 
@@ -131,12 +130,8 @@ pub(crate) fn color_swatch(
 }
 
 /// Payload for internal drag & drop of one or many selected assets.
-///
-/// The ids live behind an `Rc` because a grid cell builds this payload on
-/// every frame it is visible: cloning the whole selection per cell per frame
-/// costs O(visible × selection) during a resize, while an `Rc` bump is O(1).
 #[derive(Debug, Clone)]
-pub struct AssetsDrag(pub Rc<Vec<Uuid>>);
+pub struct AssetsDrag(pub Vec<Uuid>);
 
 /// Payload for dragging a collection row (reparent / reorder in the tree).
 #[derive(Debug, Clone)]
