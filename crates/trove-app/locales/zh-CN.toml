@@ -74,7 +74,6 @@ color = "颜色"
 no_color = "无颜色"
 
 [workspace]
-pick_color_search = "取色搜图"
 color_filter = "颜色"
 kind_filter = "类型"
 filter_tag = "标签"
