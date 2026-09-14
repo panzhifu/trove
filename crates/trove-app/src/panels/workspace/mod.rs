@@ -404,15 +404,26 @@ impl WorkspacePanel {
                 // The framework picker owns its trigger and popover. Recent
                 // colours ride along as the featured row, so the colours the
                 // user actually reaches for stay one click away; the palette
-                // tab behind it carries the full nine-family ramp. Keep the
-                // palette icon the hand-rolled trigger had: without it the
-                // button renders a swatch of the current colour instead, which
-                // reads as a state display rather than a button.
+                // tab behind it carries the full nine-family ramp. The trigger
+                // keeps the palette icon and the visible label the hand-rolled
+                // one had: without the icon it renders a swatch of the current
+                // colour, which reads as a state display rather than a button.
+                //
+                // The icon is sized by hand because `ColorPickerButton`
+                // forwards it unsized, unlike `Button`, which shrinks its icon
+                // with the button (`button.rs:541-544`, `:676`). A bare `Icon`
+                // instead falls back to the ambient text size
+                // (`icon.rs:150-158`), which renders visibly larger than the
+                // neighbouring `xsmall` filter buttons. This matches `Button`'s
+                // `Size::XSmall` icon (`icon.rs:161`).
                 row.child(
                     ColorPicker::new(&color_picker)
                         .xsmall()
-                        .icon(IconName::Palette)
-                        .accessibility_label(rust_i18n::t!("workspace.color_filter").to_string())
+                        .icon(
+                            Icon::new(IconName::Palette)
+                                .with_size(gpui_kit::component::Size::XSmall),
+                        )
+                        .label(rust_i18n::t!("workspace.color_filter").to_string())
                         .featured_colors(recent_picker_colors(cx)),
                 )
             })
