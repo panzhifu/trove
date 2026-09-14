@@ -312,6 +312,11 @@ impl ModelViewport {
         })
     }
 
+    /// The model's display name, for the host panel's title bar.
+    pub(crate) fn name(&self) -> &str {
+        &self.name
+    }
+
     /// Primitives and vertices of the loaded geometry, for the status line.
     /// Primitives are triangles for a mesh, points for a cloud.
     pub fn stats(&self) -> (usize, usize) {

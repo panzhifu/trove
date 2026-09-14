@@ -361,20 +361,14 @@ impl ModelViewport {
         };
         let frame_ms = self.frame_ms;
 
+        // Deliberately *not* `w_full`: this renders in the panel's title bar,
+        // which is a row shared with the title and the window controls. Asking
+        // for the full width there pushes the row past the panel's edge; the
+        // content sizes itself instead, and the name lives in the tab.
         h_flex()
-            .w_full()
             .min_w_0()
-            .flex_none()
             .gap_2()
             .items_center()
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .truncate()
-                    .text_sm()
-                    .child(self.name.clone()),
-            )
             .child(
                 div()
                     .flex_none()
