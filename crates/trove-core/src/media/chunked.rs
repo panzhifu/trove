@@ -39,12 +39,16 @@ use super::formats::types::Mesh;
 /// a level-of-detail step that keeps the result under this budget.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LodConfig {
-    /// Target upper bound on the parsed mesh, in bytes of `Vec` storage
+    /// Upper bound on the parsed mesh, in bytes of `Vec` storage
     /// (positions + normals + colours + triangles).
+    ///
+    /// This is a ceiling, not a target: the step is whatever it takes to stay
+    /// under it. The struct used to also carry a `max_lod_step`, but a cap on
+    /// the step fights the budget for any file large enough that the budget
+    /// demands a bigger step than the cap allows — and memory is the bound
+    /// that actually matters. Small files need no cap: `choose_lod_step`
+    /// already returns 1 when the whole file fits.
     pub memory_budget: usize,
-    /// Hard ceiling on the LOD step regardless of the budget, so a file
-    /// with few vertices is never pointlessly thinned.
-    pub max_lod_step: u32,
 }
 
 impl LodConfig {
@@ -53,7 +57,6 @@ impl LodConfig {
     pub const fn default_preview() -> Self {
         Self {
             memory_budget: 512 << 20,
-            max_lod_step: 16,
         }
     }
 }
@@ -190,7 +193,10 @@ pub fn load_ply_chunked(path: &Path, config: LodConfig) -> Result<Mesh, String> 
         return Err("the PLY file contains no vertices".to_string());
     }
 
-    let declared_faces = elements.iter().any(|e| e.name == "face");
+    // Same rule as the whole-file loader: only a `face` element that declares
+    // records makes this a surface. `element face 0` is a point cloud with a
+    // vestigial face tag, and thinning its vertices is right.
+    let declared_faces = elements.iter().any(|e| e.name == "face" && e.count > 0);
 
     // LOD step: how many vertices / faces to skip between two we keep.
     let lod_step = choose_lod_step(vertex_count, &elements, config);
@@ -219,8 +225,7 @@ pub fn load_ply_chunked(path: &Path, config: LodConfig) -> Result<Mesh, String> 
 // ---------------------------------------------------------------------------
 
 /// Pick the stride N so that keeping every Nth vertex and every Nth face
-/// lands the parsed `Mesh` near `config.memory_budget` bytes, capped at
-/// `config.max_lod_step`.
+/// lands the parsed `Mesh` under `config.memory_budget` bytes.
 ///
 /// The strategy differs by geometry kind:
 ///
@@ -230,6 +235,9 @@ pub fn load_ply_chunked(path: &Path, config: LodConfig) -> Result<Mesh, String> 
 ///   referenced by the kept faces is parsed. A face references 3
 ///   vertices on average but they share, so the unique-vertex count is
 ///   roughly `kept_faces * 2`. We solve `kept_faces * (24 + 12) <= budget`.
+///
+/// The budget is the only limit on the step: a file that fits whole returns 1
+/// above, and one that does not is thinned as much as the budget requires.
 fn choose_lod_step(vertex_count: usize, elements: &[PlyElement], config: LodConfig) -> u32 {
     let vertex = match elements.iter().find(|e| e.name == "vertex") {
         Some(v) => v,
@@ -251,7 +259,7 @@ fn choose_lod_step(vertex_count: usize, elements: &[PlyElement], config: LodConf
             return 1;
         }
         let step = total.div_ceil(budget) as u32;
-        return step.max(1).min(config.max_lod_step);
+        return step.max(1);
     }
 
     // Mesh: subsample faces. Each kept face references ~2 unique vertices
@@ -263,7 +271,7 @@ fn choose_lod_step(vertex_count: usize, elements: &[PlyElement], config: LodConf
         return 1;
     }
     let step = total.div_ceil(budget) as u32;
-    step.max(1).min(config.max_lod_step)
+    step.max(1)
 }
 
 fn vertex_normal_cost(vertex: &PlyElement) -> u64 {
@@ -496,15 +504,21 @@ fn collect_binary_faces(
     let step = lod_step as usize;
 
     for (face_id, _) in (0..element.count).enumerate() {
-        if *cursor + count_ty.width() > body.len() {
-            return Err(BODY_END.into());
-        }
         let count = ply::scalar_at(body, *cursor, count_ty, order).ok_or(BODY_END)? as usize;
-        *cursor += count_ty.width();
-        let item_bytes = count * item_ty.width();
-        if *cursor + item_bytes > body.len() {
-            return Err(BODY_END.into());
-        }
+        *cursor = (*cursor)
+            .checked_add(count_ty.width())
+            .filter(|at| *at <= body.len())
+            .ok_or(BODY_END)?;
+        // The list length is read straight from the file and is far from
+        // trustworthy: a corrupt or lying header can put billions here, so
+        // the byte count is checked rather than multiplied into an offset.
+        // (`usize::MAX` from a saturated float-to-int cast would overflow the
+        // multiply and, in a debug build, panic.)
+        let item_bytes = count.checked_mul(item_ty.width()).ok_or(BODY_END)?;
+        let face_end = (*cursor)
+            .checked_add(item_bytes)
+            .filter(|at| *at <= body.len())
+            .ok_or(BODY_END)?;
 
         if face_id.is_multiple_of(step) {
             let mut face = Vec::with_capacity(count);
@@ -518,7 +532,7 @@ fn collect_binary_faces(
             }
             face_indices.push(face);
         }
-        *cursor += item_bytes;
+        *cursor = face_end;
     }
     Ok(())
 }
@@ -564,9 +578,14 @@ fn parse_binary_vertices_remapped(
         out.colors.reserve(kept);
     }
 
-    for (old_index, new_index) in remap.iter().enumerate() {
-        if *new_index == u32::MAX {
-            continue;
+    // Walk the vertex element's own record count, looking each index up in
+    // the remap. Iterating `remap` instead would read past the element when a
+    // file declares more than one `vertex` element — the remap is sized from
+    // the first — and slicing off the end of the body panics.
+    for old_index in 0..element.count {
+        match remap.get(old_index).copied() {
+            Some(u32::MAX) | None => continue,
+            Some(_) => {}
         }
         let base = *cursor + old_index * stride;
         let row = &body[base..base + stride];
@@ -850,8 +869,11 @@ fn parse_ascii_vertices_remapped(
         out.colors.reserve(kept);
     }
 
-    for new_index in remap.iter() {
-        if *new_index == u32::MAX {
+    // Walk the vertex element's own record count, looking each index up in
+    // the remap, so a file with more than one `vertex` element does not
+    // consume lines belonging to a later element.
+    for old_index in 0..element.count {
+        if remap.get(old_index).copied().unwrap_or(u32::MAX) == u32::MAX {
             ply::next_record_line(body, cursor).ok_or(BODY_END)?;
             continue;
         }
@@ -1113,10 +1135,9 @@ mod tests {
         // 64x64 grid = 4096 vertices, 8192 triangles.
         write_binary_mesh(&path, 64);
 
-        // Force LOD step 4 via a small budget.
+        // A small budget forces thinning.
         let config = LodConfig {
             memory_budget: 20_000,
-            max_lod_step: 16,
         };
         let chunked = load_ply_chunked(&path, config).unwrap();
         let stock = ply::load_ply(&std::fs::read(&path).unwrap()).unwrap();
@@ -1150,11 +1171,43 @@ mod tests {
         // A tiny budget forces heavy thinning.
         let config = LodConfig {
             memory_budget: 1_000,
-            max_lod_step: 64,
         };
         let chunked = load_ply_chunked(&path, config).unwrap();
         assert!(!chunked.positions.is_empty());
         assert!(!chunked.triangles.is_empty());
+    }
+
+    /// The budget is the only cap on the step. A file large enough that the
+    /// budget demands more thinning than a step cap would have allowed still
+    /// has to come out under budget — the cap used to win, which let the
+    /// parsed mesh exceed it by an order of magnitude.
+    #[test]
+    fn the_memory_budget_is_not_capped_away() {
+        let dir = std::env::temp_dir().join("trove-chunked-uncapped");
+        std::fs::create_dir_all(&dir).ok();
+        let path = dir.join("big.ply");
+        // 128x128 grid = 16641 vertices, 32768 triangles.
+        write_binary_mesh(&path, 128);
+
+        let budget = 4_096usize;
+        let config = LodConfig {
+            memory_budget: budget,
+        };
+        let chunked = load_ply_chunked(&path, config).unwrap();
+        let bytes = chunked.positions.len() * 12
+            + chunked.normals.len() * 12
+            + chunked.triangles.len() * 12;
+        // The per-face vertex estimate is approximate, so allow some slack —
+        // what matters is that the result is the same order as the budget, not
+        // the order of the whole file.
+        assert!(
+            bytes <= budget * 4,
+            "parsed {bytes} bytes against a {budget}-byte budget"
+        );
+        assert!(
+            !chunked.triangles.is_empty(),
+            "thinning must leave a surface"
+        );
     }
 
     #[test]
@@ -1167,5 +1220,25 @@ mod tests {
         let chunked = load_ply_chunked(&path, LodConfig::default()).unwrap();
         assert!(!chunked.bounds.is_empty());
         assert!(chunked.bounds.min[0] <= chunked.bounds.max[0]);
+    }
+
+    /// A cloud tagged with `element face 0` is a point cloud, not a broken
+    /// surface: the chunked loader has to subsample its vertices and hand back
+    /// a cloud rather than error with "no triangles".
+    #[test]
+    fn a_face_zero_cloud_loads_through_the_chunked_loader() {
+        let dir = std::env::temp_dir().join("trove-chunked-facezero");
+        std::fs::create_dir_all(&dir).ok();
+        let path = dir.join("cloud.ply");
+        let text = "ply\nformat ascii 1.0\nelement vertex 3\n\
+                    property float x\nproperty float y\nproperty float z\n\
+                    element face 0\nproperty list uchar int vertex_indices\n\
+                    end_header\n0 0 0\n1 1 1\n2 2 2\n";
+        std::fs::write(&path, text).unwrap();
+
+        let cloud = load_ply_chunked(&path, LodConfig::default()).unwrap();
+        assert!(cloud.is_point_cloud());
+        assert_eq!(cloud.positions.len(), 3);
+        std::fs::remove_file(&path).ok();
     }
 }

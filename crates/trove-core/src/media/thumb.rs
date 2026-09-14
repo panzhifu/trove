@@ -200,7 +200,6 @@ fn write_model_card(blob_path: &Path, out: &Path) -> Option<PathBuf> {
         CardSource::Chunked => {
             let config = crate::media::chunked::LodConfig {
                 memory_budget: 32 << 20,
-                max_lod_step: 16,
             };
             crate::media::chunked::load_ply_chunked(blob_path, config).ok()?
         }
