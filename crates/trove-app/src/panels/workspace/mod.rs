@@ -137,6 +137,10 @@ pub struct WorkspacePanel {
     color_picker: Entity<gpui_kit::base::ColorPickerState>,
     /// A colour confirmed in the picker; consumed by the next render.
     pending_color_search: Option<String>,
+    /// Set when a staged colour has been *committed* (the popover closed) and
+    /// the next render should search for it. False while the picker is still
+    /// open, which is what keeps a slider drag from searching every frame.
+    color_search_armed: bool,
     /// Measured available width of the scroll container, updated each
     /// prepaint so the layout tracks the real panel width.
     available_width: Entity<Pixels>,
@@ -261,23 +265,52 @@ impl WorkspacePanel {
         cx.notify();
     }
 
-    /// A colour confirmed in the picker: stash the hex and let the render
-    /// pass start the colour search. The search has to run from `render`
-    /// because it needs the window's pending state, and the picker only
-    /// tells us what was chosen.
+    /// A colour chosen in the picker: stage it, and let the close commit it.
+    ///
+    /// The picker emits `Change` from two places that mean different things:
+    ///
+    /// - a palette swatch commits and closes the popover (`select_color`),
+    /// - a slider drag streams `Change` on every tick and deliberately keeps
+    ///   the popover open (`update_value_from_slider`, "Commits a color
+    ///   without changing the open state, as a slider drag does").
+    ///
+    /// Both arrive as the same event with the same payload, so the drag
+    /// cannot be told apart from the commit here. Searching on each `Change`
+    /// would therefore replace the grid on every frame of a drag — the "it
+    /// confirms before I let go" bug — so this handler only stages the value.
+    /// [`Self::on_picker_closed`] does the committing, which also covers
+    /// dismissing the popover after a drag (a path that emits no `Change`).
     fn on_color_picked(
         &mut self,
         _: Entity<gpui_kit::base::ColorPickerState>,
         event: &gpui_kit::base::ColorPickerEvent,
         cx: &mut Context<Self>,
     ) {
-        // A cleared picker (`Change(None)`) means "no colour", which is not
-        // a search — leave the grid as it is rather than filtering to nothing.
-        let gpui_kit::base::ColorPickerEvent::Change(Some(color)) = event else {
+        // `ColorPickerEvent` has a single variant, so this only has to pick
+        // the payload apart. A cleared picker (`None`) means "no colour",
+        // which is not a search — leave the grid as it is rather than
+        // filtering to nothing.
+        let gpui_kit::base::ColorPickerEvent::Change(color) = event;
+        let Some(color) = color else {
             return;
         };
         self.pending_color_search = Some(hsla_to_hex(*color));
+        // While the popover is open the user is still editing, so nothing is
+        // committed yet; the close is what commits.
+        self.color_search_armed = color_change_commits(self.color_picker.read(cx).is_open());
         cx.notify();
+    }
+    /// The picker popover closed: commit whatever colour is staged.
+    ///
+    /// This is the single commit point. It catches both the palette click
+    /// (which closes *and* emits `Change`) and dismissing the popover after
+    /// nudging a slider, where the last `Change` landed mid-drag and no
+    /// further event ever came.
+    fn on_picker_closed(&mut self, cx: &mut Context<Self>) {
+        if close_commits(self.pending_color_search.is_some()) {
+            self.color_search_armed = true;
+            cx.notify();
+        }
     }
 }
 
@@ -371,12 +404,14 @@ impl WorkspacePanel {
                 // The framework picker owns its trigger and popover. Recent
                 // colours ride along as the featured row, so the colours the
                 // user actually reaches for stay one click away; the palette
-                // tab behind it carries the full nine-family ramp. Its
-                // trigger is icon-only, so the name a screen reader gets has
-                // to come from us (`label` would paint a visible caption).
+                // tab behind it carries the full nine-family ramp. Keep the
+                // palette icon the hand-rolled trigger had: without it the
+                // button renders a swatch of the current colour instead, which
+                // reads as a state display rather than a button.
                 row.child(
                     ColorPicker::new(&color_picker)
                         .xsmall()
+                        .icon(IconName::Palette)
                         .accessibility_label(rust_i18n::t!("workspace.color_filter").to_string())
                         .featured_colors(recent_picker_colors(cx)),
                 )
@@ -463,6 +498,38 @@ impl WorkspacePanel {
 /// depend on which of the two survived.
 fn arm_relayout_frame(window: &mut Window) {
     window.on_next_frame(|_window, cx| cx.refresh_windows());
+}
+
+/// Whether a `Change` that arrived while the picker was in state `open` is a
+/// commit worth searching for.
+///
+/// The picker emits `Change` for both a palette click and every tick of a
+/// slider drag, and the two are indistinguishable by payload. Only the open
+/// state tells them apart: `select_color` shuts the popover *before* it
+/// emits, whereas a drag leaves it open ("Commits a color without changing
+/// the open state, as a slider drag does"). So a change that finds the
+/// popover shut is the commit, and one that finds it open is mid-drag.
+fn color_change_commits(picker_is_open: bool) -> bool {
+    !picker_is_open
+}
+
+/// Whether closing the picker should commit the staged colour.
+///
+/// A close is always a commit *if* something was staged. Dismissing the
+/// popover after a drag emits no `Change`, so without this the colour the
+/// user just dialled in would be silently dropped.
+fn close_commits(staged: bool) -> bool {
+    staged
+}
+
+/// Whether an `is_open` observation is the true→false edge.
+///
+/// `set_open` only calls `notify`, so the close is detected by watching the
+/// flag. The opening edge must not count: it is always followed by another
+/// choice, and firing there would search for a colour the user had not
+/// finished picking.
+fn picker_just_closed(previously_open: bool, now_open: bool) -> bool {
+    previously_open && !now_open
 }
 
 impl EventEmitter<PanelEvent> for WorkspacePanel {}
@@ -945,8 +1012,13 @@ impl Render for WorkspacePanel {
         };
 
         // A colour confirmed in the picker opens a colour search; render has
-        // the window the dialog needs.
-        if let Some(hex) = self.pending_color_search.take() {
+        // the window the dialog needs. Only a committed pick runs — a slider
+        // drag keeps the popover open and must not replace the grid until the
+        // user lets go (see `on_color_picked`).
+        if self.color_search_armed
+            && let Some(hex) = self.pending_color_search.take()
+        {
+            self.color_search_armed = false;
             super::workspace_search::open_color_search(&hex, &self.controller, window, cx);
         }
         let shell = shell.child(self.toolbar_row(cx));
@@ -1017,7 +1089,10 @@ mod tests {
     // Explicit imports, not `use super::*`: the glob drags in a `test`
     // attribute macro from the gpui prelude, which makes expanding `#[test]`
     // below recurse.
-    use super::{Cell, Row, next_cell_row, prev_cell_row, timeline_rows};
+    use super::{
+        Cell, Row, close_commits, color_change_commits, next_cell_row, picker_just_closed,
+        prev_cell_row, timeline_rows,
+    };
     use trove_core::layout::target_row_height_for_scale;
     use trove_core::model::AssetKind;
     use uuid::Uuid;
@@ -1097,5 +1172,36 @@ mod tests {
         assert_eq!(next_cell_row(&rows, 4), None);
         assert_eq!(prev_cell_row(&rows, 2), Some(1));
         assert_eq!(prev_cell_row(&rows, 0), None, "a leading header is skipped");
+    }
+
+    /// The bug this pins: `Change` fires on every slider tick, so treating
+    /// each one as a commit replaced the grid mid-drag.
+    #[test]
+    fn a_slider_drag_does_not_commit_but_a_palette_click_does() {
+        // Mid-drag: the popover is still open, so nothing is committed.
+        assert!(!color_change_commits(true));
+        // `select_color` closes the popover before emitting.
+        assert!(color_change_commits(false));
+    }
+
+    /// The other half: after a drag the last `Change` arrived while the
+    /// popover was open, and dismissing it emits no further event — so the
+    /// staged colour has to be committed on the close instead of dropped.
+    #[test]
+    fn a_close_commits_the_colour_staged_by_a_drag() {
+        assert!(close_commits(true));
+        // Nothing staged means the user opened the picker and left; the grid
+        // must not change.
+        assert!(!close_commits(false));
+    }
+
+    /// Only the true→false edge is a close. Observing an open would search
+    /// for a colour the user had not chosen yet.
+    #[test]
+    fn only_the_closing_edge_counts() {
+        assert!(picker_just_closed(true, false));
+        assert!(!picker_just_closed(false, true), "opening is not closing");
+        assert!(!picker_just_closed(false, false));
+        assert!(!picker_just_closed(true, true), "still open is not closing");
     }
 }
