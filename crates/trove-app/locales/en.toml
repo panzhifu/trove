@@ -533,7 +533,6 @@ corner_axis_tip = "Pin a small X/Y/Z indicator to the corner — it turns with t
 shortcut_reset = "R · Double-click: Reset view"
 
 [video]
-volume = "Volume"
 fullscreen = "Fullscreen"
 exit_fullscreen = "Exit fullscreen"
 
