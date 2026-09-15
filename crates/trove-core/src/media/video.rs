@@ -279,9 +279,36 @@ pub fn has_audio_track(path: &Path) -> bool {
     output.status.success() && !output.stdout.is_empty()
 }
 
+/// Lowest playback speed the player offers; the audio side chains
+/// [`atempo_filter`] instances down to this.
+pub const MIN_PLAYBACK_SPEED: f32 = 0.25;
+
+/// Highest playback speed the player offers; the audio side chains
+/// [`atempo_filter`] instances up to this.
+pub const MAX_PLAYBACK_SPEED: f32 = 4.0;
+
+/// The `-af` expression that tempo-scales audio by `speed` while keeping
+/// the pitch. A single `atempo` instance only spans 0.5–2.0, so anything
+/// outside that is split into a chain (`4×` → `atempo=2,atempo=2.000`);
+/// `speed` is clamped to [`MIN_PLAYBACK_SPEED`]–[`MAX_PLAYBACK_SPEED`].
+pub fn atempo_filter(speed: f32) -> String {
+    let mut remaining = speed.clamp(MIN_PLAYBACK_SPEED, MAX_PLAYBACK_SPEED);
+    let mut filters: Vec<String> = Vec::new();
+    while remaining > 2.0 {
+        filters.push("atempo=2".to_string());
+        remaining /= 2.0;
+    }
+    while remaining < 0.5 {
+        filters.push("atempo=0.5".to_string());
+        remaining /= 0.5;
+    }
+    filters.push(format!("atempo={remaining:.3}"));
+    filters.join(",")
+}
+
 /// A one-way pipe of raw PCM frames decoded by ffmpeg: signed 16-bit LE,
 /// 44.1 kHz, interleaved stereo, tempo-adjusted so playback speed changes
-/// keep the pitch (ffmpeg's `atempo`, 0.5–2.0 per instance).
+/// keep the pitch (ffmpeg's `atempo`, chained by [`atempo_filter`]).
 ///
 /// Same backpressure contract as [`FramePipe`]: the consumer paces the
 /// stream, dropping the pipe kills the process.
@@ -295,14 +322,12 @@ const AUDIO_CHUNK_BYTES: usize = 44100 * 2 * 2 / 10;
 
 impl AudioPipe {
     /// Start decoding audio at `seek_ms`, resampled to 44.1 kHz stereo and
-    /// tempo-scaled by `speed` (clamped to 0.5–2.0, the single-instance
-    /// range of `atempo`). `None` when ffmpeg cannot be spawned.
+    /// tempo-scaled by `speed` (clamped to the player's range and chained
+    /// through as many `atempo` instances as it takes). `None` when ffmpeg
+    /// cannot be spawned.
     pub fn open(path: &Path, seek_ms: u64, speed: f32) -> Option<Self> {
         let seek = format!("{:.3}", seek_ms as f64 / 1000.0);
-        // atempo only spans 0.5–2.0 per instance; the player's presets stay
-        // inside that range, and anything else is clamped rather than
-        // chained (the preview never plays faster than 2×).
-        let tempo = speed.clamp(0.5, 2.0);
+        let tempo = atempo_filter(speed);
         let mut child = Command::new("ffmpeg")
             .args(["-v", "error", "-ss", &seek, "-i"])
             .arg(path)
@@ -312,7 +337,7 @@ impl AudioPipe {
                 "-map",
                 "0:a:0?",
                 "-af",
-                &format!("atempo={:.2}", tempo),
+                &tempo,
                 "-f",
                 "s16le",
                 "-acodec",
@@ -370,6 +395,23 @@ impl Drop for AudioPipe {
 
 #[cfg(test)]
 mod tests {
+    use super::{MAX_PLAYBACK_SPEED, MIN_PLAYBACK_SPEED, atempo_filter};
+
+    #[test]
+    fn atempo_chain_covers_the_whole_range() {
+        // Inside one instance's 0.5–2.0 the filter stays single.
+        assert_eq!(atempo_filter(1.0), "atempo=1.000");
+        assert_eq!(atempo_filter(2.0), "atempo=2.000");
+        assert_eq!(atempo_filter(0.5), "atempo=0.500");
+        // Outside it, instances chain (each within 0.5–2.0).
+        assert_eq!(atempo_filter(4.0), "atempo=2,atempo=2.000");
+        assert_eq!(atempo_filter(3.0), "atempo=2,atempo=1.500");
+        assert_eq!(atempo_filter(0.25), "atempo=0.5,atempo=0.500");
+        // Beyond the player's range the value is clamped, not extrapolated.
+        assert_eq!(atempo_filter(10.0), atempo_filter(MAX_PLAYBACK_SPEED));
+        assert_eq!(atempo_filter(0.05), atempo_filter(MIN_PLAYBACK_SPEED));
+    }
+
     use super::*;
 
     #[test]
