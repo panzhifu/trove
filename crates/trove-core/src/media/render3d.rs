@@ -1153,14 +1153,18 @@ pub fn axis_triangles(mesh: &Mesh) -> Vec<([f32; 3], [f32; 3])> {
     let span = sub(bounds.max, bounds.min);
     // The bounding-sphere radius: every gizmo size derives from it, so the
     // gizmo keeps its proportions whatever the model's aspect.
-    let radius =
-        0.5 * (span[0] * span[0] + span[1] * span[1] + span[2] * span[2]).sqrt().max(1e-6);
+    let radius = 0.5
+        * (span[0] * span[0] + span[1] * span[1] + span[2] * span[2])
+            .sqrt()
+            .max(1e-6);
     let half = radius * 0.006;
     let reach = radius * 1.25;
     let mut out = Vec::new();
-    for (axis, color) in
-        [([1.0, 0.0, 0.0], AXIS_X), ([0.0, 1.0, 0.0], AXIS_Y), ([0.0, 0.0, 1.0], AXIS_Z)]
-    {
+    for (axis, color) in [
+        ([1.0, 0.0, 0.0], AXIS_X),
+        ([0.0, 1.0, 0.0], AXIS_Y),
+        ([0.0, 0.0, 1.0], AXIS_Z),
+    ] {
         push_rod(
             &mut out,
             sub(center, scale(axis, reach)),
@@ -1243,16 +1247,21 @@ fn push_ring(
     let v = cross(normal, u);
     let point = |s: usize| {
         let angle = (s as f32) * (std::f32::consts::TAU / SEGMENTS as f32);
-        add(center, add(scale(u, angle.cos() * radius), scale(v, angle.sin() * radius)))
+        add(
+            center,
+            add(
+                scale(u, angle.cos() * radius),
+                scale(v, angle.sin() * radius),
+            ),
+        )
     };
     for i in 0..SEGMENTS {
         let j = (i + 1) % SEGMENTS;
         let (pi, pj) = (point(i), point(j));
         let r = normalize(sub(pi, center));
         let t = normalize(sub(pj, pi));
-        let corner = |p: [f32; 3], dr: f32, dt: f32| {
-            add(p, add(scale(r, dr * half), scale(t, dt * half)))
-        };
+        let corner =
+            |p: [f32; 3], dr: f32, dt: f32| add(p, add(scale(r, dr * half), scale(t, dt * half)));
         let qa = [
             corner(pi, -1.0, -1.0),
             corner(pi, 1.0, -1.0),
