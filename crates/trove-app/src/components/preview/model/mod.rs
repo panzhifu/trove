@@ -198,8 +198,6 @@ pub struct ModelViewport {
     pending: Option<Arc<RenderImage>>,
     /// Frame currently on screen.
     shown: Option<Arc<RenderImage>>,
-    /// Wall time of the last completed frame, in milliseconds.
-    frame_ms: f32,
     /// Instant the last frame finished rendering. Gates `pump` to ~60 fps.
     last_frame: Option<std::time::Instant>,
     /// A frame is waiting for the rate limit to expire; exactly one retry is
@@ -301,7 +299,6 @@ impl ModelViewport {
                 in_flight: false,
                 pending: None,
                 shown: None,
-                frame_ms: 0.0,
                 last_frame: None,
                 retry_pending: false,
                 mesh_winding: Winding::default(),
@@ -325,12 +322,6 @@ impl ModelViewport {
     /// The model's display name, for the host panel's title bar.
     pub(crate) fn name(&self) -> &str {
         &self.name
-    }
-
-    /// Primitives and vertices of the loaded geometry, for the status line.
-    /// Primitives are triangles for a mesh, points for a cloud.
-    pub fn stats(&self) -> (usize, usize) {
-        (self.mesh.primitive_count(), self.mesh.vertex_count())
     }
 
     /// What is drawing the model, for the status bar: the adapter for a GPU

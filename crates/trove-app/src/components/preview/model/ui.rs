@@ -417,27 +417,17 @@ impl ModelViewport {
             .into_any_element()
     }
 
-    /// The toolbar: what the model is, how it is being drawn, and the way out.
-    /// The viewport's title-bar controls: name, geometry stats, and the
-    /// reset / close buttons.
+    /// The viewport's title-bar controls: the reset / close buttons.
     ///
     /// Rendered by the host panel's title bar while a model preview is open —
     /// see `WorkspacePanel::title_suffix` — so the canvas below is nothing but
     /// the picture. The title bar supplies the chrome, so this carries no
     /// padding or border of its own.
     ///
-    /// The backend used to be listed here too. It now lives in the status bar
-    /// (see `ModelViewport::backend_text`), which left this row with room for
-    /// the tools that will come after it.
+    /// Geometry stats, the frame time and the MSAA factor used to be listed
+    /// here, and the backend before that. All gone — the row now stays free
+    /// for the tools that will come after it.
     pub(crate) fn title_tools(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let (primitives, vertices) = self.stats();
-        let count_label = if self.mesh.is_point_cloud() {
-            rust_i18n::t!("viewport.points", count = primitives)
-        } else {
-            rust_i18n::t!("viewport.triangles", count = primitives)
-        };
-        let frame_ms = self.frame_ms;
-
         // Deliberately *not* `w_full`: this renders in the panel's title bar,
         // which is a row shared with the title and the window controls. Asking
         // for the full width there pushes the row past the panel's edge; the
@@ -446,38 +436,6 @@ impl ModelViewport {
             .min_w_0()
             .gap_2()
             .items_center()
-            .child(
-                div()
-                    .flex_none()
-                    .text_xs()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(format!(
-                        "{} · {}",
-                        count_label,
-                        rust_i18n::t!("viewport.vertices", count = vertices)
-                    )),
-            )
-            .child(
-                div()
-                    .flex_none()
-                    .text_xs()
-                    .text_color(cx.theme().muted_foreground)
-                    .when(frame_ms > 0.0, |element| {
-                        // Two decimals: at 60 fps the number is small and the
-                        // difference between 1.2 and 1.9 ms is what the user
-                        // is watching.
-                        element.child(format!("{frame_ms:.2} ms"))
-                    }),
-            )
-            .when(self.samples() > 1, |element| {
-                element.child(
-                    div()
-                        .flex_none()
-                        .text_xs()
-                        .text_color(cx.theme().muted_foreground)
-                        .child(format!("{}×", self.samples())),
-                )
-            })
             .child(
                 Button::new("model-reset")
                     .ghost()
