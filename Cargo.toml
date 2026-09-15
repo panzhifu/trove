@@ -48,6 +48,14 @@ thiserror = "2"
 uuid = { version = "1", features = ["v4", "serde"] }
 dirs = "5"
 
+# Logging. `tracing` is the facade in both crates; `trove-app` installs the
+# single global subscriber (stderr + a file under the config dir, filtered
+# by RUST_LOG). tracing-subscriber already rides in the graph via gpui-pre
+# (ashpd/zbus); declaring it here only turns on the `env-filter`/`registry`
+# features the subscriber needs (they add the small `matchers` crate).
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "registry"] }
+
 # Media probing
 ttf-parser = "0.25"
 fontdue = "0.9"

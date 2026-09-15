@@ -16,6 +16,8 @@ serde_json = { workspace = true }
 uuid = { workspace = true }
 rust-i18n = { workspace = true }
 sys-locale = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
 bytemuck = { version = "1", features = ["derive"] }
 rodio = { workspace = true }
 
