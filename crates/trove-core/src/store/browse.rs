@@ -13,7 +13,7 @@ use uuid::Uuid;
 
 use super::{assets, smart, smart_collections, view_history};
 use crate::error::{Error, Result};
-use crate::model::{Asset, AssetKind, AssetQuery, AssetSort, Orientation, Page};
+use crate::model::{AspectPreset, Asset, AssetKind, AssetQuery, AssetSort, Orientation, Page};
 
 /// How the workspace grid is currently browsing the library.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -37,6 +37,9 @@ pub struct BrowseContext {
     pub kind: Option<AssetKind>,
     pub is_favorite: bool,
     pub orientation: Option<Orientation>,
+    /// Media aspect-ratio preset the dimensions must fall into. Composes
+    /// with `orientation` (a 2.35:1 cover is also a landscape).
+    pub aspect: Option<AspectPreset>,
     /// Minimum star rating (unrated assets match nothing).
     pub min_rating: Option<u8>,
     pub ext: Option<String>,
@@ -100,6 +103,7 @@ impl BrowseContext {
                 kind: self.kind,
                 is_favorite: self.is_favorite.then_some(true),
                 orientation: self.orientation,
+                aspect: self.aspect,
                 min_rating: self.min_rating,
                 ext: self.ext.clone(),
                 source_path_prefix: self.folder.clone(),
@@ -134,6 +138,7 @@ impl BrowseContext {
                 .filter(|a| {
                     self.orientation
                         .is_none_or(|o| orientation_of(a) == Some(o))
+                        && self.aspect.is_none_or(|p| aspect_matches(a, p))
                         && self
                             .min_rating
                             .is_none_or(|r| a.rating.is_some_and(|v| v >= r))
@@ -159,6 +164,7 @@ impl BrowseContext {
                 } else {
                     self.orientation
                 },
+                aspect: if self.in_trash { None } else { self.aspect },
                 min_rating: if self.in_trash { None } else { self.min_rating },
                 ext: if self.in_trash {
                     None
@@ -199,6 +205,19 @@ fn orientation_of(a: &Asset) -> Option<Orientation> {
             }
         }
         _ => None,
+    }
+}
+
+/// Aspect-preset test for one asset row, mirroring the SQL ratio-band CASE
+/// in `assets::build_where`: rows without usable dimensions match nothing.
+fn aspect_matches(a: &Asset, preset: AspectPreset) -> bool {
+    match (a.width, a.height) {
+        (Some(w), Some(h)) if w > 0 && h > 0 => {
+            let ratio = w as f32 / h as f32;
+            let (lo, hi) = preset.ratio_range();
+            ratio >= lo && ratio <= hi
+        }
+        _ => false,
     }
 }
 
@@ -336,6 +355,99 @@ mod tests {
         assert_eq!(
             page.items.iter().map(|a| a.id).collect::<Vec<_>>(),
             vec![doc.id]
+        );
+    }
+
+    #[test]
+    fn aspect_preset_filters_plain_and_smart_views() {
+        let store = Store::in_memory().unwrap();
+        let conn = store.conn();
+        let idx = crate::search::TextIndex::in_ram().unwrap();
+        let ctx = |mutate: &dyn Fn(&mut BrowseContext)| {
+            let mut c = BrowseContext::default();
+            mutate(&mut c);
+            c
+        };
+        // One asset per preset band, plus a no-dimensions row that must
+        // match nothing.
+        let sizes: &[(&str, Option<(u32, u32)>)] = &[
+            ("cover.png", Some((900, 383))),      // 2.3499… → WechatCover
+            ("wide.png", Some((1920, 1080))),     // 1.777…  → VideoWide
+            ("vertical.png", Some((1080, 1920))), // 0.5625 → VideoVertical
+            ("photo.png", Some((640, 480))),      // 1.333…  → PhotoLandscape
+            ("portrait.png", Some((480, 640))),   // 0.75    → PhotoPortrait
+            ("square.png", Some((64, 64))),       // 1.0     → Square
+            ("nodims.png", None),
+        ];
+        let mut ids = std::collections::HashMap::new();
+        for (name, dims) in sizes {
+            let mut a = test_asset(name, AssetKind::Image, Uuid::new_v4());
+            (a.width, a.height) = dims
+                .map(|(w, h)| (Some(w), Some(h)))
+                .unwrap_or((None, None));
+            assets::insert(conn, &a).unwrap();
+            ids.insert(name.to_string(), a.id);
+            idx.index_asset(conn, a.id).unwrap();
+        }
+        idx.commit().unwrap();
+
+        let expected =
+            |names: &[&str]| -> Vec<Uuid> { names.iter().map(|n| ids[*n]).collect::<Vec<_>>() };
+        for (preset, names) in [
+            (AspectPreset::WechatCover, vec!["cover.png"]),
+            (AspectPreset::VideoWide, vec!["wide.png"]),
+            (AspectPreset::VideoVertical, vec!["vertical.png"]),
+            (AspectPreset::PhotoLandscape, vec!["photo.png"]),
+            (AspectPreset::PhotoPortrait, vec!["portrait.png"]),
+            (AspectPreset::Square, vec!["square.png"]),
+        ] {
+            let want = expected(&names);
+            // Plain view: the SQL ratio-band CASE.
+            let page = ctx(&|c: &mut BrowseContext| c.aspect = Some(preset))
+                .run(conn, &idx, None)
+                .unwrap();
+            assert_eq!(
+                page.items.iter().map(|a| a.id).collect::<Vec<_>>(),
+                want,
+                "{preset:?} via SQL"
+            );
+            // Smart view: the in-memory mirror.
+            let sc = smart_collections::create(
+                conn,
+                &crate::model::NewSmartCollection {
+                    parent_id: None,
+                    name: format!("smart-{preset:?}"),
+                    query: serde_json::json!({
+                        "op": "match", "field": "kind", "value": "image"
+                    }),
+                    color: None,
+                    position: 0,
+                },
+            )
+            .unwrap();
+            let page = ctx(&|c: &mut BrowseContext| {
+                c.smart = Some(sc.id);
+                c.aspect = Some(preset);
+            })
+            .run(conn, &idx, None)
+            .unwrap();
+            assert_eq!(
+                page.items.iter().map(|a| a.id).collect::<Vec<_>>(),
+                want,
+                "{preset:?} in memory"
+            );
+        }
+
+        // The presets compose with the orientation filter.
+        let page = ctx(&|c: &mut BrowseContext| {
+            c.aspect = Some(AspectPreset::WechatCover);
+            c.orientation = Some(Orientation::Landscape);
+        })
+        .run(conn, &idx, None)
+        .unwrap();
+        assert_eq!(
+            page.items.iter().map(|a| a.id).collect::<Vec<_>>(),
+            expected(&["cover.png"])
         );
     }
 }

@@ -42,6 +42,53 @@ pub enum Orientation {
     Square,
 }
 
+/// Media-industry aspect-ratio presets for the shape filter: a width/height
+/// band the asset's dimensions must fall into. Standard canvases vary a pixel
+/// or two around the nominal ratio, so matching is tolerant — see
+/// [`AspectPreset::ratio_range`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AspectPreset {
+    /// WeChat Official Account cover canvas (900×383, 2.35:1).
+    WechatCover,
+    /// Wide video cover / thumbnail (16:9).
+    VideoWide,
+    /// Vertical short-video canvas (9:16).
+    VideoVertical,
+    /// Classic photo landscape (4:3).
+    PhotoLandscape,
+    /// Classic photo portrait (3:4).
+    PhotoPortrait,
+    /// Square canvas (1:1).
+    Square,
+}
+
+/// Relative tolerance around a preset's nominal ratio. Standard canvases
+/// ship at slightly rounded sizes (e.g. a "2.35:1" cover at 900×383 is
+/// 2.3499…), so an exact comparison would miss real matches.
+pub const ASPECT_TOLERANCE: f32 = 0.03;
+
+impl AspectPreset {
+    /// The nominal width/height ratio of the preset.
+    pub fn ratio(self) -> f32 {
+        match self {
+            AspectPreset::WechatCover => 2.35,
+            AspectPreset::VideoWide => 16.0 / 9.0,
+            AspectPreset::VideoVertical => 9.0 / 16.0,
+            AspectPreset::PhotoLandscape => 4.0 / 3.0,
+            AspectPreset::PhotoPortrait => 3.0 / 4.0,
+            AspectPreset::Square => 1.0,
+        }
+    }
+
+    /// The inclusive width/height band an asset matches: the nominal ratio
+    /// shrunk/grown by [`ASPECT_TOLERANCE`] on each side.
+    pub fn ratio_range(self) -> (f32, f32) {
+        let r = self.ratio();
+        ((1.0 - ASPECT_TOLERANCE) * r, (1.0 + ASPECT_TOLERANCE) * r)
+    }
+}
+
 /// Where the asset stands in the user's workflow.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -178,5 +225,68 @@ impl AssetPatch {
             ));
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod aspect_tests {
+    use super::{ASPECT_TOLERANCE, AspectPreset};
+
+    #[test]
+    fn ratio_ranges_around_nominal_with_tolerance() {
+        for preset in [
+            AspectPreset::WechatCover,
+            AspectPreset::VideoWide,
+            AspectPreset::VideoVertical,
+            AspectPreset::PhotoLandscape,
+            AspectPreset::PhotoPortrait,
+            AspectPreset::Square,
+        ] {
+            let r = preset.ratio();
+            let (lo, hi) = preset.ratio_range();
+            assert!((lo - (1.0 - ASPECT_TOLERANCE) * r).abs() < 1e-6);
+            assert!((hi - (1.0 + ASPECT_TOLERANCE) * r).abs() < 1e-6);
+            assert!(lo < r && r < hi);
+        }
+    }
+
+    #[test]
+    fn nominal_canvases_land_inside_their_band() {
+        // Real-world canvas sizes, including the rounded ones.
+        let cases = [
+            (AspectPreset::WechatCover, 900, 383),
+            (AspectPreset::WechatCover, 1000, 424), // 2.358…, +0.4% off
+            (AspectPreset::VideoWide, 1920, 1080),
+            (AspectPreset::VideoVertical, 1080, 1920),
+            (AspectPreset::PhotoLandscape, 640, 480),
+            (AspectPreset::PhotoPortrait, 480, 640),
+            (AspectPreset::Square, 64, 64),
+        ];
+        for (preset, w, h) in cases {
+            let ratio = w as f32 / h as f32;
+            let (lo, hi) = preset.ratio_range();
+            assert!((lo..=hi).contains(&ratio), "{preset:?}: {ratio}");
+        }
+    }
+
+    #[test]
+    fn the_bands_stay_disjoint() {
+        // Ordered by nominal ratio; neighbouring presets must not overlap,
+        // or one canvas could match two menus at once.
+        let mut presets = [
+            AspectPreset::Square,
+            AspectPreset::PhotoLandscape,
+            AspectPreset::VideoWide,
+            AspectPreset::WechatCover,
+        ];
+        presets.sort_by(|a, b| a.ratio().total_cmp(&b.ratio()));
+        for pair in presets.windows(2) {
+            assert!(
+                pair[0].ratio_range().1 < pair[1].ratio_range().0,
+                "{:?} and {:?} overlap",
+                pair[0],
+                pair[1]
+            );
+        }
     }
 }

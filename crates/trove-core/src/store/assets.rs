@@ -549,8 +549,9 @@ impl WhereMode {
 /// through an index — see [`WhereMode`].
 ///
 /// Conditions that are not plain column comparisons (`EXISTS (…)` subqueries
-/// correlated on `assets.id`, `json_extract`, the orientation `CASE`, the
-/// `LOWER(ext)` comparison) are never index sources, so they need no prefix.
+/// correlated on `assets.id`, `json_extract`, the orientation and aspect-ratio
+/// `CASE`s, the `LOWER(ext)` comparison) are never index sources, so they need
+/// no prefix.
 pub(super) fn build_where(
     conn: &Connection,
     q: &AssetQuery,
@@ -632,6 +633,23 @@ pub(super) fn build_where(
         // Unrated assets (NULL) fail the comparison naturally.
         conds.push(format!("{ni}rating >= ?{}", args.len() + 1));
         args.push(Value::Integer(min_rating as i64));
+    }
+    if let Some(aspect) = q.aspect {
+        // Ratio band from the media preset. The CASE maps rows without
+        // usable dimensions to -1.0, which falls outside every preset's
+        // band, so they match nothing — same contract as the orientation
+        // CASE above. `width * 1.0 / height` because SQLite divides two
+        // INTEGERs as integers.
+        let (lo, hi) = aspect.ratio_range();
+        conds.push(format!(
+            "CASE \
+             WHEN width IS NULL OR height IS NULL OR width = 0 OR height = 0 THEN -1.0 \
+             ELSE width * 1.0 / height END BETWEEN ?{} AND ?{}",
+            args.len() + 1,
+            args.len() + 2
+        ));
+        args.push(Value::Real(lo as f64));
+        args.push(Value::Real(hi as f64));
     }
     if let Some(ext) = &q.ext {
         conds.push(format!("LOWER(ext) = LOWER(?{})", args.len() + 1));
