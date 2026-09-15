@@ -17,6 +17,7 @@ uuid = { workspace = true }
 rust-i18n = { workspace = true }
 sys-locale = { workspace = true }
 bytemuck = { version = "1", features = ["derive"] }
+rodio = { workspace = true }
 
 [dev-dependencies]
 # Used only to parse and validate `gpu3d.wgsl` on machines without a GPU.
