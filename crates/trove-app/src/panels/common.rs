@@ -264,11 +264,21 @@ fn cached_font_sample() -> String {
     cache.1.clone()
 }
 
-/// The configured font sample text, for callers that have to size it rather
-/// than just draw it — the preview dialog picks a text size that fits its
-/// width, which it can only do knowing how long the sample is.
-pub(crate) fn font_sample() -> String {
-    cached_font_sample()
+/// The configured font sample text with fontmatrix-style placeholders
+/// expanded: `{name}` / `{family}` become the font's own family name. An
+/// empty setting falls back to the family name itself — the classic
+/// type-foundry specimen line.
+pub(crate) fn font_sample_for(family: &str) -> String {
+    let sample = cached_font_sample();
+    let sample = sample.trim();
+    if sample.is_empty() {
+        return family.to_string();
+    }
+    if sample.contains("{name}") || sample.contains("{family}") {
+        sample.replace("{name}", family).replace("{family}", family)
+    } else {
+        sample.to_string()
+    }
 }
 
 /// One live specimen line for a registered font: the sample text rendered
@@ -286,7 +296,39 @@ pub(crate) fn font_live_preview(family: &str, cx: &App) -> Div {
                 .font_family(family.to_string())
                 .whitespace_nowrap()
                 .text_color(cx.theme().foreground)
-                .child(cached_font_sample()),
+                .child(font_sample_for(family)),
+        )
+}
+
+/// A grid font cell, fontmatrix style: the sample line rendered in the font
+/// itself with a small UI-font family label pinned to the top-left corner
+/// (the "subtitled preview" mode), so every specimen stays attributable no
+/// matter what the sample text shows.
+pub(crate) fn font_specimen_card(family: &str, cx: &App) -> Div {
+    div()
+        .relative()
+        .flex()
+        .items_center()
+        .justify_center()
+        .overflow_hidden()
+        .bg(cx.theme().secondary)
+        .child(
+            div()
+                .font_family(family.to_string())
+                .whitespace_nowrap()
+                .text_color(cx.theme().foreground)
+                .child(font_sample_for(family)),
+        )
+        .child(
+            div()
+                .absolute()
+                .top(px(3.))
+                .left(px(7.))
+                .right(px(7.))
+                .truncate()
+                .text_xs()
+                .text_color(cx.theme().muted_foreground)
+                .child(family.to_string()),
         )
 }
 
