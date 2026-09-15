@@ -116,8 +116,10 @@ impl WorkspacePanel {
         // rebuilt outside this panel's own render, and every branch below
         // allocates, so a per-frame recompute is wasted work even for the
         // branches that never reach SQLite. Everything the label depends on
-        // is covered by the generation — view switches bump it, and renames
-        // do too.
+        // is covered by the generation — browse switches (trash / recent /
+        // collection / smart) bump it, and renames do too. The grid/list/
+        // timeline presentation switch does not (and must not — it changes
+        // nothing this label reads).
         let generation = self.controller.read(cx).generation;
         if let Some((cached, label)) = &self.title_cache
             && *cached == generation
