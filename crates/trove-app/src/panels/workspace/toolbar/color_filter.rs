@@ -78,8 +78,9 @@ pub(crate) fn color_filter(
 }
 
 /// The popover body: the two panels, over a preview of whatever colour the
-/// pointer or the text field is currently showing.
-fn color_panel(
+/// pointer or the text field is currently showing. Shared with the
+/// smart-collection editor, which embeds it as its color column.
+pub(crate) fn color_panel(
     state: &Entity<ColorPickerState>,
     featured: Vec<Hsla>,
     cx: &App,
@@ -385,7 +386,8 @@ fn gradient_track(start: Hsla, end: Hsla) -> AnyElement {
 }
 
 /// The colours the feature row falls back to: one shade per family, for a
-/// library whose history has no colours yet.
+/// library whose history has no colours yet. Ten slots: at 20px + gap that is
+/// the widest row the `w_72` popover fits without spilling.
 fn default_featured(cx: &App) -> Vec<Hsla> {
     let theme = cx.theme();
     vec![
@@ -399,8 +401,6 @@ fn default_featured(cx: &App) -> Vec<Hsla> {
         theme.cyan_light,
         theme.blue,
         theme.blue_light,
-        theme.magenta,
-        theme.magenta_light,
     ]
 }
 

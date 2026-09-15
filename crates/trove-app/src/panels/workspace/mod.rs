@@ -64,11 +64,15 @@ mod toolbar;
 use cells::{build_cell_element, build_list_row_element, model_source};
 use data::{
     Cell, DataKey, Direction, Row, TIMELINE_HEADER_HEIGHT, ViewData, ViewKey, hsla_to_hex,
-    recent_picker_colors, total_identity,
+    total_identity,
 };
+// Re-exported for the smart-collection editor: it embeds the colour-filter
+// panel as its color column, fed by the same recently-used colours.
+pub(crate) use data::recent_picker_colors;
 use rows::{
     materialize_rows, next_cell_row, prev_cell_row, refill_rows, timeline_header, timeline_rows,
 };
+pub(crate) use toolbar::color_panel;
 use toolbar::{
     add_filter_button, color_filter, format_filter, kind_filter, kind_key, rating_filter,
     selection_toolbar, shape_filter, tag_filter, title_controls,
