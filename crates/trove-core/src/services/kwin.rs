@@ -10,13 +10,20 @@
 //! `height`, `stride`). This module is that client, which makes capture
 //! work in-process on KDE without shelling out to Spectacle.
 //!
-//! KWin gates the interface behind KDE's restricted-D-Bus mechanism: a
-//! caller is authorized only when its desktop entry declares
-//! `X-KDE-DBUS-Restricted-Interfaces=org.kde.KWin.ScreenShot2` (the way
-//! Spectacle does). Without it KWin rejects the call with
-//! `org.kde.KWin.ScreenShot2.Error.NoAuthorized` — which is what the
-//! error chain reports, pointing at the missing desktop-file line rather
-//! than at anything in this module.
+//! KWin gates the interface behind KDE's restricted-D-Bus mechanism, and
+//! the check is picky about identity: it resolves the caller by reading
+//! `/proc/<pid>/exe`, then looks for a desktop entry whose `Exec` first
+//! token has the *same canonical path* (`utils/serviceutils.h`), and only
+//! then reads `X-KDE-DBUS-Restricted-Interfaces` from it. So a desktop
+//! entry has to name the exact binary: an installed `trove-app` entry
+//! does not authorize a `target/debug/trove-app` run (see
+//! `packaging/linux/trove.desktop`, which uses an absolute path for this
+//! reason, and the hidden `trove-dev.desktop` that points at the debug
+//! binary). Anything else answers
+//! `org.kde.KWin.ScreenShot2.Error.NoAuthorized` — which is a
+//! desktop-entry problem, not a problem in this module. The compositor
+//! also honours `KWIN_SCREENSHOT_NO_PERMISSION_CHECKS=1`, but that has to
+//! be set for KWin's own process, not for us.
 
 use std::collections::HashMap;
 use std::io::Read as _;
