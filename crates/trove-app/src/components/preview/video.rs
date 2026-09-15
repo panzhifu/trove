@@ -28,7 +28,7 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use gpui_kit::assets::IconName as MediaIcon;
 use gpui_kit::base::POPUP_PRIORITY;
@@ -370,6 +370,15 @@ impl VideoPlayer {
 
         cx.spawn(async move |weak, cx| {
             let mut pipe: Option<FramePipe> = None;
+            // Frame delivery is scheduled against the wall clock: frame `n`
+            // is due one period after frame `n - 1`. Sleeping a fixed
+            // interval *after* each frame's work would add that work time to
+            // every period, so the picture would run slower than the file —
+            // which reads as juddering, and gets worse the more expensive a
+            // painted frame is (fullscreen). Falling behind simply skips the
+            // wait: `pending` keeps only the newest frame, so late frames
+            // are dropped instead of replayed in slow motion.
+            let mut due = Instant::now();
             loop {
                 let state = weak.update(cx, |this, _cx| {
                     (
@@ -388,11 +397,13 @@ impl VideoPlayer {
                     if pipe.take().is_some() {
                         let _ = weak.update(cx, |_this, cx| cx.notify());
                     }
+                    due = Instant::now();
                     cx.background_executor().timer(IDLE_POLL).await;
                     continue;
                 }
                 if let Some(target) = seek {
                     pipe = None;
+                    due = Instant::now();
                     if weak
                         .update(cx, |this, _| this.position_ms = target as f64)
                         .is_err()
@@ -459,10 +470,18 @@ impl VideoPlayer {
                         {
                             break;
                         }
-                        let paced = (frame_ms / f64::from(speed.max(0.1))).max(1.0) as u64;
-                        cx.background_executor()
-                            .timer(Duration::from_millis(paced))
-                            .await;
+                        let period = Duration::from_secs_f64(
+                            (frame_ms / f64::from(speed.max(0.1)) / 1000.0).max(0.001),
+                        );
+                        due += period;
+                        let now = Instant::now();
+                        if due > now {
+                            cx.background_executor().timer(due - now).await;
+                        } else {
+                            // Late: re-anchor so a burst of lag does not make
+                            // the loop sprint through a backlog of waits.
+                            due = now;
+                        }
                     }
                     None => {
                         // End of stream (or a dead decoder): loop from zero.
