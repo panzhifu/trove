@@ -11,9 +11,14 @@
 //! Audio rides a second ffmpeg pipe ([`AudioPipe`], signed 16-bit stereo at
 //! 44.1 kHz) into rodio. It exists only when the file carries an audio
 //! stream and the audio device opens; speed changes ride ffmpeg's `atempo`
-//! filter so the pitch holds. Audio and video are two independent pipes
-//! aligned at the start point — a preview does not need sample-accurate
-//! lip sync, so there is no clock correction between them.
+//! filter so the pitch holds. The two pipes are kept together by the audio
+//! clock: rodio only reports the position inside the chunk it is playing,
+//! so the player reconstructs the soundtrack's timeline itself (chunks fed
+//! minus chunks still queued, plus that position) and the decode loop
+//! presents frames against it — waiting for a frame that is early for the
+//! clock, dropping one the clock has already passed. That is mpv's
+//! `--video-sync=audio` plus `--framedrop`; without audio (or while it is
+//! paused, seeking or restarting) frames fall back to wall-clock pacing.
 //!
 //! Speed re-paces the frame loop (`frame_ms / speed`) and rebuilds the
 //! audio pipe; volume and mute apply on the rodio sink directly. Fullscreen
@@ -58,6 +63,19 @@ const CONTROLS_WATCH_INTERVAL: Duration = Duration::from_millis(400);
 /// Bottom band of the fullscreen window that counts as "on the controls":
 /// the pointer inside it keeps the floating row visible.
 const CONTROLS_BAND: f32 = 96.;
+
+/// Duration of one audio chunk, in milliseconds — must match
+/// `trove_core::media::video`'s `AUDIO_CHUNK_BYTES` (100 ms of 44.1 kHz
+/// stereo i16). The audio clock counts finished chunks with it.
+const AUDIO_CHUNK_MS: f64 = 100.0;
+
+/// How early (relative to the master clock) a frame may be shown. A few
+/// milliseconds early is invisible; late is judder.
+const SYNC_LEAD_MS: f64 = 8.0;
+
+/// A frame further behind the master clock than this many frame periods is
+/// dropped instead of shown late — mpv's `--framedrop`.
+const DROP_LATE_FRAMES: f64 = 1.5;
 
 /// The playback speeds offered in the menu. The range matches what
 /// [`video::atempo_filter`] can chain for the audio side, so the pitch
@@ -225,6 +243,13 @@ pub(super) struct VideoPlayer {
     fullscreen_mode: bool,
     /// Whether the volume popup (vertical slider above the button) is open.
     volume_open: bool,
+    /// The audio clock: where the soundtrack is (milliseconds on the
+    /// timeline) and when that reading was taken, so the decode loop can
+    /// extrapolate between updates. `None` while there is nothing to sync
+    /// against — no audio stream, a dead device, a paused or restarting
+    /// pipe — and then frames are paced against the wall clock instead.
+    /// This is mpv's `--video-sync=audio`: the sound is the master.
+    audio_clock: Option<(f64, Instant)>,
     /// Set while the user drags the scrubber: the playhead previews the
     /// drag and the loop stops feeding it, so the thumb is not yanked back
     /// to the playing position every frame.
@@ -345,6 +370,7 @@ impl VideoPlayer {
             synced_volume: if resume.muted { 0. } else { resume.volume },
             sink: None,
             fullscreen_mode: false,
+            audio_clock: None,
             seeking: false,
             volume_open: false,
             controls_shown: true,
@@ -387,9 +413,10 @@ impl VideoPlayer {
                         this.seek_to.take(),
                         this.position_ms,
                         this.speed,
+                        this.audio_clock_ms(),
                     )
                 });
-                let Ok((playing, seeking, seek, position, speed)) = state else {
+                let Ok((playing, seeking, seek, position, speed, clock)) = state else {
                     break;
                 };
                 if !playing || seeking {
@@ -453,9 +480,53 @@ impl VideoPlayer {
                         let Some(image) = frame_image(width, height, bytes) else {
                             break;
                         };
+                        // Present at the frame's due time, mpv's way: when
+                        // audio is running its clock is the master, so a
+                        // frame early for the clock waits and one the clock
+                        // has already passed is dropped instead of shown
+                        // late. Without audio the wall-clock deadline below
+                        // plays the same role.
+                        let late =
+                            clock.is_some_and(|ms| ms - position > frame_ms * DROP_LATE_FRAMES);
+                        if !late {
+                            match clock {
+                                Some(ms) => {
+                                    let wait = position - SYNC_LEAD_MS - ms;
+                                    if wait > 0.0 {
+                                        cx.background_executor()
+                                            .timer(Duration::from_secs_f64(wait / 1000.0))
+                                            .await;
+                                    }
+                                }
+                                None => {
+                                    let period = Duration::from_secs_f64(
+                                        (frame_ms / f64::from(speed.max(0.1)) / 1000.0).max(0.001),
+                                    );
+                                    due += period;
+                                    let now = Instant::now();
+                                    if due > now {
+                                        cx.background_executor().timer(due - now).await;
+                                    } else {
+                                        // Late: re-anchor so a burst of lag
+                                        // cannot make the loop sprint through
+                                        // a backlog of waits.
+                                        due = now;
+                                    }
+                                }
+                            }
+                        } else {
+                            tracing::debug!(
+                                position,
+                                clock,
+                                "dropped a late frame to stay with the audio"
+                            );
+                        }
+                        let delivered = if late { None } else { Some(image) };
                         if weak
                             .update(cx, |this, cx| {
-                                this.pending = Some(image);
+                                if let Some(image) = delivered {
+                                    this.pending = Some(image);
+                                }
                                 this.position_ms += frame_ms;
                                 if duration_ms > 0.0 && this.position_ms >= duration_ms {
                                     // Loop like the animated GIF preview.
@@ -464,23 +535,13 @@ impl VideoPlayer {
                                     // The audio pipe restarts from zero too.
                                     this.audio_seq += 1;
                                 }
+                                // The playhead moved either way (a dropped
+                                // frame still advances the timeline).
                                 cx.notify();
                             })
                             .is_err()
                         {
                             break;
-                        }
-                        let period = Duration::from_secs_f64(
-                            (frame_ms / f64::from(speed.max(0.1)) / 1000.0).max(0.001),
-                        );
-                        due += period;
-                        let now = Instant::now();
-                        if due > now {
-                            cx.background_executor().timer(due - now).await;
-                        } else {
-                            // Late: re-anchor so a burst of lag does not make
-                            // the loop sprint through a backlog of waits.
-                            due = now;
                         }
                     }
                     None => {
@@ -520,6 +581,13 @@ impl VideoPlayer {
             let mut pipe: Option<AudioPipe> = None;
             let mut sink: Option<Arc<rodio::Sink>> = None;
             let mut seq: u64 = 0;
+            // Audio clock bookkeeping: the timeline position this pipe
+            // started from, and how many chunks have been fed into it. The
+            // sink reports only the position inside the chunk it is playing
+            // (rodio tracks each appended source separately), so the clock
+            // is reconstructed from finished chunks plus that position.
+            let mut base_ms = 0.0f64;
+            let mut appended: u64 = 0;
             loop {
                 let state = weak.update(cx, |this, _cx| {
                     Some((
@@ -542,6 +610,11 @@ impl VideoPlayer {
                 let playing = playing && !seeking;
                 if new_seq != seq {
                     seq = new_seq;
+                    base_ms = position;
+                    appended = 0;
+                    // The pipe is restarting: no clock to sync against until
+                    // the first chunk is queued again.
+                    let _ = weak.update(cx, |this, _| this.audio_clock = None);
                     // Kill the old pipe before opening the new one.
                     drop(pipe.take());
                     match &sink {
@@ -577,8 +650,19 @@ impl VideoPlayer {
                 // that require a live pipe.
                 if playing {
                     s.play();
+                    // Publish the audio clock for the decode loop: chunks
+                    // that have played out, plus the progress inside the one
+                    // still playing. `len()` counts the current chunk too.
+                    let queued = s.len() as u64;
+                    let finished = appended.saturating_sub(queued);
+                    let within = (s.get_pos().as_secs_f64() * 1000.0).min(AUDIO_CHUNK_MS);
+                    let reading = base_ms + finished as f64 * AUDIO_CHUNK_MS + within;
+                    let _ = weak.update(cx, |this, _| {
+                        this.audio_clock = Some((reading, Instant::now()));
+                    });
                 } else {
                     s.pause();
+                    let _ = weak.update(cx, |this, _| this.audio_clock = None);
                 }
                 // Take the pipe out so `read_chunk` can run on a 'static
                 // background task; hand it back below.
@@ -607,6 +691,7 @@ impl VideoPlayer {
                                 .map(|b| i16::from_le_bytes(*b))
                                 .collect();
                             s.append(rodio::buffer::SamplesBuffer::new(2, 44_100, samples));
+                            appended += 1;
                         }
                         None => {
                             // Stream end: idle until the loop wrap bumps seq.
@@ -722,6 +807,15 @@ impl VideoPlayer {
             }
         })
         .detach();
+    }
+
+    /// Where the soundtrack is right now, extrapolated from the last
+    /// reading — the master timeline the picture follows. `None` when the
+    /// clock is not running, i.e. there is no audio to sync against.
+    fn audio_clock_ms(&self) -> Option<f64> {
+        let (reading, at) = self.audio_clock?;
+        let since = at.elapsed().as_secs_f64() * 1000.0;
+        Some(reading + since)
     }
 
     /// The probed stream facts; the fullscreen window reuses them instead
