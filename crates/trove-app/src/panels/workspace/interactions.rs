@@ -116,13 +116,17 @@ impl WorkspacePanel {
         // rebuilt outside this panel's own render, and every branch below
         // allocates, so a per-frame recompute is wasted work even for the
         // branches that never reach SQLite. Everything the label depends on
-        // is covered by the generation — browse switches (trash / recent /
-        // collection / smart) bump it, and renames do too. The grid/list/
-        // timeline presentation switch does not (and must not — it changes
-        // nothing this label reads).
-        let generation = self.controller.read(cx).generation;
-        if let Some((cached, label)) = &self.title_cache
-            && *cached == generation
+        // is covered by the two counters — browse switches (trash / recent /
+        // collection / smart) and renames bump the data generation, and the
+        // favorites label reads the favorite filter, which bumps the filter
+        // generation. The remaining filters change neither.
+        let (generation, filter_generation) = {
+            let ctl = self.controller.read(cx);
+            (ctl.generation, ctl.filter_generation)
+        };
+        if let Some((cached_gen, cached_filter, label)) = &self.title_cache
+            && *cached_gen == generation
+            && *cached_filter == filter_generation
         {
             return label.clone();
         }
@@ -161,7 +165,7 @@ impl WorkspacePanel {
         } else {
             rust_i18n::t!("app.all_assets").to_string()
         };
-        self.title_cache = Some((generation, label.clone()));
+        self.title_cache = Some((generation, filter_generation, label.clone()));
         label
     }
 
