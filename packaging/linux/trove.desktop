@@ -3,7 +3,10 @@ Type=Application
 Name=Trove
 GenericName=Asset Manager
 Comment=Local-first asset library: images, video, fonts, 3D models
-Exec=trove-app
+# Absolute path on purpose: KWin authorizes the screenshot D-Bus interface
+# by matching the calling process's executable (via /proc/<pid>/exe) against
+# this `Exec` value, and a bare command name never resolves.
+Exec=/usr/bin/trove-app
 Icon=trove
 Categories=Graphics;Utility;FileManager;
 StartupWMClass=trove
