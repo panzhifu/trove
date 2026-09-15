@@ -61,9 +61,10 @@ cargo run -p trove-app
 | | |
 |---|---|
 | **三视图** | 网格（对齐布局）/ 列表 / 时间线，带密度缩放滑杆、多选 + 浮动工具栏 |
+| **形状与比例筛选** | 工具栏形状筛选（横 / 竖 / 方）内置媒体人常用比例预设 —— 公众号封面 2.35:1、视频封面 16:9、短视频竖屏 9:16、照片 4:3 / 3:4、方形 1:1，3% 容差匹配圆整尺寸 |
 | **检查器** | 缩略图 + 标签 + 色板 + 行内编辑（标题 / 描述 / 来源链接 / 评分），属性页显示 MIME / 大小 / 尺寸 / SHA-256，一键定位源文件 |
 | **动图播放** | GIF / 动态 WebP / APNG 在预览与检查器中逐帧播放；网格缩略图保持静态以保证性能 |
-| **字体实况预览** | 导入时用字体自身渲染「样张卡片」缩略图，样张文字可在设置自定义；左栏「字体」系统视图一键浏览，检查器可安装 / 卸载到系统 |
+| **字体实况预览** | 导入时用字体自身渲染「样张卡片」缩略图，样卡带家族名副标题；样张文字支持 `{name}` / `{family}` 占位符、可在设置自定义；左栏「字体」系统视图一键浏览，检查器可安装 / 卸载到系统 |
 | **最近查看** | 左栏侧边最近 200 个资产，入回收站自动隐藏、恢复后回归 |
 
 ### 3D 模型预览
@@ -81,7 +82,7 @@ cargo run -p trove-app
 | | |
 |---|---|
 | **无声预览** | ffmpeg 管线逐帧解码，播放 / 暂停 / 跳转 / 时间线，无音频管线 |
-| **截图采集** | 全屏或交互式框选，直接入库 PNG；平台原生后端（gnome-screenshot / scrot / macOS screencapture / Windows snippingtool），可自定义命令 |
+| **截图采集** | 全屏或交互式框选，直接入库 PNG；全屏走进程内捕获（xcap：Wayland wlr-screencopy / X11 / macOS / Windows），免 portal 弹窗；框选回落外部工具（grim+slurp / scrot / macOS screencapture），命令可自定义 |
 | **批量格式转换** | 图片重新编码为 JPEG / PNG / WebP / BMP / TFT，可选长边限制，可重新导入转换后文件 |
 
 ### 维护与安全
@@ -182,7 +183,7 @@ cargo test -p trove-core
 cargo run -p trove-app
 ```
 
-**当前测试基线：`trove-core` 310 + `trove-app` 22 全部通过；`cargo fmt --check` 干净；clippy 全工作区 0 告警。** `trove-app` 含 2 个真机 GPU 冒烟测试（EDL、meshlet 剔除），无显卡的机器自动跳过。
+**当前测试基线：`trove-core` 339 + `trove-app` 23 全部通过；`cargo fmt --check` 干净；clippy 全工作区 0 告警。** `trove-app` 含 2 个真机 GPU 冒烟测试（EDL、meshlet 剔除），无显卡的机器自动跳过。
 
 对标同类软件的功能差距与路线图见 [docs/FEATURE-GAPS.md](docs/FEATURE-GAPS.md)。
 
