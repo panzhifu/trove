@@ -454,12 +454,19 @@ impl LibraryController {
         }
     }
 
-    /// Switch the asset-area presentation. Re-layouts the frozen rows.
+    /// Switch the asset-area presentation (grid / list / timeline).
+    ///
+    /// Pure presentation: it changes no query result, so it must not bump
+    /// [`Self::generation`] — that counter keys the data caches (the
+    /// explorer snapshot, the folder/tag/extension scans, the workspace
+    /// data pass), and a bump would re-run every COUNT and re-query the
+    /// page for nothing. The reset pagination cursor already changes the
+    /// data key when a deeper page was loaded, and the grid relayout is
+    /// keyed on the `ViewMode` through the workspace's `ViewKey`.
     pub fn set_view_mode(&mut self, mode: ViewMode) {
         if self.view_mode != mode {
             self.view_mode = mode;
             self.reset_grid_page();
-            self.generation += 1;
         }
     }
 
