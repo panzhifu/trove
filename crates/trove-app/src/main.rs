@@ -23,6 +23,7 @@ use gpui_kit::component::Root;
 use gpui_kit::*;
 
 mod app;
+mod assets;
 mod components;
 mod dialogs;
 mod fonts;
@@ -41,6 +42,12 @@ const WORKSPACE_CONTEXT: &str = "Workspace";
 /// is Escape: the inline add/rename editor's input lets the key propagate,
 /// so the panel can dismiss the editor.
 const EXPLORER_CONTEXT: &str = "Explorer";
+
+/// Key context of the fullscreen video window. Its only binding is Escape:
+/// leaving hands playback back to the main window. The context lives only
+/// on that window's root, so the main window's Escape handlers are
+/// untouched.
+const VIDEO_FULLSCREEN_CONTEXT: &str = "VideoFullscreen";
 
 pub(crate) fn register_keys(cx: &mut App) {
     use trove_core::config::AppConfig;
@@ -115,6 +122,13 @@ pub(crate) fn register_keys(cx: &mut App) {
         CancelEditor,
         Some(EXPLORER_CONTEXT),
     ));
+    // Esc leaves the fullscreen video window. Only that window's root
+    // carries the VideoFullscreen context.
+    bindings.push(KeyBinding::new(
+        "escape",
+        ExitVideoFullscreen,
+        Some(VIDEO_FULLSCREEN_CONTEXT),
+    ));
 
     // Screenshots are global (like paste import), not grid-scoped.
     macro_rules! bind_global {
@@ -156,7 +170,7 @@ fn slim_scrollbars(cx: &mut App) {
 fn main() {
     app::i18n::init_from_config();
     gpui_kit::application()
-        .with_assets(gpui_kit::assets::Assets)
+        .with_assets(assets::TroveAssets)
         .run(|cx| {
             gpui_kit::init(cx);
             // Themes before the first paint: the registry has to know every

@@ -44,5 +44,7 @@ gpui_kit::actions!(
         OpenPreview,
         // -- Inline editor (ExplorerPanel only) ------------------------------
         CancelEditor,
+        // -- Fullscreen video window ----------------------------------------
+        ExitVideoFullscreen,
     ]
 );
