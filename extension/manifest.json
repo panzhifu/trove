@@ -1,8 +1,14 @@
 {
   "manifest_version": 3,
-  "name": "Trove Collector",
+  "name": "Trove 采集器",
   "version": "1.0.0",
-  "description": "Save images from any website straight into your local Trove asset library.",
+  "description": "把网页图片一键存进本地 Trove 素材库。",
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "trove-collector@trove.local",
+      "strict_min_version": "121.0"
+    }
+  },
   "permissions": [
     "contextMenus",
     "storage",
@@ -12,11 +18,12 @@
     "<all_urls>"
   ],
   "background": {
+    "scripts": ["background.js"],
     "service_worker": "background.js"
   },
   "action": {
     "default_popup": "popup.html",
-    "default_title": "Trove Collector",
+    "default_title": "Trove 采集器",
     "default_icon": {
       "16": "icons/icon16.png",
       "32": "icons/icon32.png",

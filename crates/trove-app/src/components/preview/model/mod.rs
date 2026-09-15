@@ -237,6 +237,12 @@ pub struct ModelViewport {
     /// Whether the model is painted by height, cached from the same config
     /// read as `enhance_points`.
     height_color: bool,
+    /// Whether the scene's X/Y/Z axes are drawn, cached from the same config
+    /// read. Independent of `height_color` — see [`ModelViewport::axis_toggle`].
+    show_scene_axes: bool,
+    /// Whether the corner trihedron is drawn, cached from the same config
+    /// read.
+    show_corner_axis: bool,
     /// When `enhance_points` was last re-read.
     enhance_checked: Option<Instant>,
 }
@@ -259,6 +265,8 @@ impl ModelViewport {
             // something valid to hold until the real parse lands. The true
             // mesh arrives via `set_mesh` from the background task below.
             let loading_mesh = Arc::new(Mesh::default());
+            // One config read for every setting the viewport starts with.
+            let cfg = trove_core::config::AppConfig::load();
             let mut this = Self {
                 name,
                 tasks,
@@ -304,7 +312,9 @@ impl ModelViewport {
                 last_camera_move: None,
                 gesture_armed: false,
                 enhance_points: true,
-                height_color: trove_core::config::AppConfig::load().height_color(),
+                height_color: cfg.height_color(),
+                show_scene_axes: cfg.scene_axes(),
+                show_corner_axis: cfg.corner_axis(),
                 enhance_checked: None,
             };
             this.start_load(path, cx);
@@ -321,6 +331,54 @@ impl ModelViewport {
     /// Primitives are triangles for a mesh, points for a cloud.
     pub fn stats(&self) -> (usize, usize) {
         (self.mesh.primitive_count(), self.mesh.vertex_count())
+    }
+
+    /// What is drawing the model, for the status bar: the adapter for a GPU
+    /// frame, the reason for a CPU one, or the progress of a load that is
+    /// still running.
+    ///
+    /// It lives here rather than in the status bar so the wording stays beside
+    /// the state it describes, and so the main panel's title bar can stop
+    /// carrying it — which is what freed that row for the preview's own tools.
+    pub(crate) fn backend_text(&self) -> String {
+        match &self.backend {
+            Backend::Loading => rust_i18n::t!("viewport.backend_loading").to_string(),
+            Backend::Starting => rust_i18n::t!("viewport.backend_starting").to_string(),
+            Backend::Gpu(adapter) => {
+                rust_i18n::t!("viewport.backend_gpu", adapter = adapter).to_string()
+            }
+            Backend::Cpu(reason) => {
+                rust_i18n::t!("viewport.backend_cpu", reason = reason).to_string()
+            }
+            Backend::Streaming => {
+                // Progress comes from the fields the background step updates:
+                // the streamer itself is off-thread while a step is running.
+                let loaded = self.stream_read;
+                let total = self.stream_total;
+                if total > 0 {
+                    let pct = (loaded as f32 / total as f32 * 100.0) as u32;
+                    // Progress is counted in points *read*: once the resident
+                    // budget starts thinning the cloud, the kept count stops
+                    // tracking the file.
+                    rust_i18n::t!(
+                        "viewport.backend_streaming",
+                        percent = pct,
+                        loaded = loaded,
+                        total = total,
+                        kept = self.stream_kept
+                    )
+                    .to_string()
+                } else {
+                    rust_i18n::t!("viewport.backend_streaming_starting").to_string()
+                }
+            }
+            Backend::Indexed => rust_i18n::t!(
+                "viewport.backend_indexed",
+                chunks = self.index_chunks_read,
+                total = self.index_chunks_total
+            )
+            .to_string(),
+        }
     }
 
     /// Hand this viewport's frames back to the window.
