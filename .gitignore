@@ -6,6 +6,9 @@
 .agents/
 .workbuddy/skills/
 
+# 工作记忆（逐日日志 + MEMORY.md），只属于本机会话，不进仓库。
+.workbuddy/memory/
+
 # 无关项目的本地打包文件，不属于 trove。
 tty7-bin/
 
