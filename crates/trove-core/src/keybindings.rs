@@ -128,6 +128,14 @@ pub fn default_keybindings() -> Vec<KeyBindingConfig> {
             key: "f",
             context: Some("VideoPreview"),
         },
+        KeyBindingConfig {
+            // The same letter while the stage is up, so `f` toggles — the
+            // stage replaces the preview, so the enter binding is out of the
+            // dispatch path there and the exit needs its own key.
+            action: "ExitVideoFullscreen",
+            key: "f",
+            context: Some("VideoFullscreen"),
+        },
     ]
 }
 
@@ -171,6 +179,22 @@ mod tests {
             .expect("EnterVideoFullscreen must stay configurable");
         assert_eq!(binding.key, "f");
         assert_eq!(binding.context, Some("VideoPreview"));
+    }
+
+    #[test]
+    fn the_fullscreen_keys_mirror_each_other() {
+        // `f` toggles: the same letter enters the stage and leaves it, so a
+        // rebind of one without the other breaks the pairing.
+        let defaults = default_keybindings();
+        let enter = defaults
+            .iter()
+            .find(|b| b.action == "EnterVideoFullscreen")
+            .expect("enter binding");
+        let exit = defaults
+            .iter()
+            .find(|b| b.action == "ExitVideoFullscreen")
+            .expect("exit binding");
+        assert_eq!(enter.key, exit.key, "f must toggle fullscreen both ways");
     }
 
     #[test]
