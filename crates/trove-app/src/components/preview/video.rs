@@ -34,6 +34,7 @@ use gpui_kit::assets::IconName as MediaIcon;
 use gpui_kit::base::{h_flex, v_flex};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
+use gpui_kit::component::popover::Popover;
 use gpui_kit::component::slider::{Slider, SliderEvent, SliderState};
 use gpui_kit::component::{ActiveTheme, Sizable};
 use gpui_kit::prelude::FluentBuilder as _;
@@ -241,18 +242,28 @@ impl VideoPlayer {
             SliderState::new()
                 .min(0.)
                 .max(1.)
+                // The default step is 1.0 — on a 0..1 slider that rounds
+                // every drag to plain 0 or 1, so the volume would never
+                // actually follow the thumb.
+                .step(0.01)
                 .default_value(if resume.muted { 0. } else { resume.volume })
         });
         // The volume slider outlives the struct field list: detaching keeps
         // the subscription alive for the entity's lifetime.
         cx.subscribe(&volume_slider, |this, _slider, event: &SliderEvent, cx| {
-            if let SliderEvent::Release(value) = event {
-                // Dragging the volume unmutes, like every desktop player.
-                this.volume = value.start().clamp(0., 1.);
-                this.muted = false;
-                this.apply_volume();
-                cx.notify();
-            }
+            // Both events carry a value: Change streams live while dragging
+            // (audible immediately), Release is the final one.
+            let value = match event {
+                SliderEvent::Change(value) | SliderEvent::Release(value) => {
+                    value.start().clamp(0., 1.)
+                }
+            };
+            // Dragging the volume unmutes, like every desktop player.
+            this.volume = value;
+            this.muted = false;
+            this.synced_volume = value;
+            this.apply_volume();
+            cx.notify();
         })
         .detach();
         let mut this = Self {
@@ -518,13 +529,6 @@ impl VideoPlayer {
         }
     }
 
-    /// Toggle mute, applying it on the sink immediately.
-    fn toggle_mute(&mut self, cx: &mut Context<Self>) {
-        self.muted = !self.muted;
-        self.apply_volume();
-        cx.notify();
-    }
-
     /// Change playback speed: re-pace the video loop and rebuild the audio
     /// pipe with the new tempo on its next pass.
     fn set_speed(&mut self, speed: f32, cx: &mut Context<Self>) {
@@ -606,9 +610,7 @@ impl VideoPlayer {
                     )),
             )
             .child(self.speed_control(speed, cx))
-            .when(self.has_audio, |row| {
-                row.child(self.volume_control(muted, cx))
-            })
+            .when(self.has_audio, |row| row.child(self.volume_control(muted)))
             .child(
                 Button::new("video-fullscreen")
                     .ghost()
@@ -668,9 +670,11 @@ impl VideoPlayer {
             })
     }
 
-    /// Mute toggle plus a compact volume slider (only when the file has
-    /// audio).
-    fn volume_control(&self, muted: bool, cx: &mut Context<Self>) -> impl IntoElement {
+    /// The volume control: the mute-state button opens a popover with a
+    /// vertical slider above the control row (only when the file has
+    /// audio). Muting happens by dragging the slider to zero — the Change
+    /// subscription unmutes as soon as it moves again.
+    fn volume_control(&self, muted: bool) -> impl IntoElement {
         let volume_icon = if muted || self.volume == 0. {
             MediaIcon::VolumeX
         } else if self.volume < 0.5 {
@@ -678,26 +682,23 @@ impl VideoPlayer {
         } else {
             MediaIcon::Volume2
         };
-        h_flex()
-            .gap_1()
-            .items_center()
-            .child(
+        let volume_slider = self.volume_slider.clone();
+        Popover::new("volume-popover")
+            .anchor(gpui::Anchor::TopCenter)
+            .trigger(
                 Button::new("video-mute")
                     .ghost()
                     .xsmall()
                     .icon(volume_icon)
-                    .tooltip(if muted {
-                        rust_i18n::t!("video.unmute").to_string()
-                    } else {
-                        rust_i18n::t!("video.mute").to_string()
-                    })
-                    .on_click(cx.listener(|this, _, _, cx| this.toggle_mute(cx))),
+                    .tooltip(rust_i18n::t!("video.volume").to_string()),
             )
-            .child(
+            .content(move |_state, _window, _cx| {
                 div()
-                    .w(px(64.))
-                    .child(Slider::new(&self.volume_slider).horizontal()),
-            )
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(Slider::new(&volume_slider).vertical().h(px(96.)))
+            })
     }
 
     /// Hand the decoded frames back to the window before the entity is
