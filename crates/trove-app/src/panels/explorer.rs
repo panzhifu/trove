@@ -272,8 +272,11 @@ pub struct ExplorerPanel {
     /// Reused inline editor for add / rename.
     editor_input: Entity<InputState>,
     mode: EditorMode,
-    /// Row/count snapshot keyed by the controller generation it was taken at.
-    snapshot_cache: Option<(u64, Snapshot)>,
+    /// Row/count snapshot keyed by the controller generation it was taken
+    /// at, plus the kind filter the kind highlight reads. Filter changes
+    /// that do not touch the kind (favorite, shape, rating, format) leave
+    /// the snapshot valid — the counts behind it never read them.
+    snapshot_cache: Option<(u64, Option<AssetKind>, Snapshot)>,
 }
 
 impl ExplorerPanel {
@@ -521,14 +524,20 @@ impl Render for ExplorerPanel {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let mode = self.mode;
         let explorer = cx.entity();
-        // Reuse the cached snapshot while the generation is unchanged; the
-        // COUNT queries behind it only need to re-run after a mutation.
-        let generation = self.controller.read(cx).generation;
+        // Reuse the cached snapshot while the generation and the kind filter
+        // are unchanged; the COUNT queries behind it only need to re-run
+        // after a mutation (or a kind change, which the highlight reads).
+        let ctl = self.controller.read(cx);
+        let (generation, filter_kind) = (ctl.generation, ctl.filter_kind);
         let snapshot = match &self.snapshot_cache {
-            Some((cached_gen, snap)) if *cached_gen == generation => snap.clone(),
+            Some((cached_gen, cached_kind, snap))
+                if *cached_gen == generation && *cached_kind == filter_kind =>
+            {
+                snap.clone()
+            }
             _ => {
-                let snap = Snapshot::take(self.controller.read(cx));
-                self.snapshot_cache = Some((generation, snap.clone()));
+                let snap = Snapshot::take(ctl);
+                self.snapshot_cache = Some((generation, filter_kind, snap.clone()));
                 snap
             }
         };
