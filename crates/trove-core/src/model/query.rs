@@ -4,7 +4,7 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use super::{AssetKind, Orientation, UsageStatus};
+use super::{AspectPreset, AssetKind, Orientation, UsageStatus};
 
 /// Sort key of an asset listing. The Tantivy search path always sorts by
 /// relevance and ignores this.
@@ -44,6 +44,10 @@ pub struct AssetQuery {
     /// Only images in this orientation (derived from width vs height;
     /// assets without dimensions match nothing).
     pub orientation: Option<Orientation>,
+    /// Only assets whose width/height falls in this media preset's band
+    /// (see [`AspectPreset`]; assets without dimensions match nothing).
+    /// Independent of [`AssetQuery::orientation`] — the two compose.
+    pub aspect: Option<AspectPreset>,
     /// Only assets rated `min_rating` or higher (unrated assets match
     /// nothing).
     pub min_rating: Option<u8>,

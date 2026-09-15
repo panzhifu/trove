@@ -9,7 +9,7 @@ use uuid::Uuid;
 
 use trove_core::config::AppConfig;
 use trove_core::library::Library;
-use trove_core::model::{AssetKind, AssetSort, Orientation};
+use trove_core::model::{AspectPreset, AssetKind, AssetSort, Orientation};
 use trove_core::store::view_history;
 
 /// Current import activity, shown by the Explorer panel.
@@ -114,6 +114,10 @@ pub struct LibraryController {
     pub filter_kind: Option<AssetKind>,
     pub filter_favorite: bool,
     pub filter_orientation: Option<Orientation>,
+    /// Media aspect-ratio preset (WeChat cover, 4:3 photo, …). The UI keeps
+    /// this mutually exclusive with [`Self::filter_orientation`] — picking
+    /// one clears the other — but both compose at the query layer.
+    pub filter_aspect: Option<AspectPreset>,
     pub filter_min_rating: Option<u8>,
     pub filter_ext: Option<String>,
     /// Grid or list presentation of the asset area.
@@ -211,6 +215,7 @@ impl LibraryController {
             filter_kind: None,
             filter_favorite: false,
             filter_orientation: None,
+            filter_aspect: None,
             filter_min_rating: None,
             filter_ext: None,
             view_mode: ViewMode::default(),
@@ -393,6 +398,22 @@ impl LibraryController {
     pub fn set_filter_orientation(&mut self, orientation: Option<Orientation>) {
         if self.filter_orientation != orientation {
             self.filter_orientation = orientation;
+            // The shape menu presents the two shape filters as one choice;
+            // a concrete shape clears the preset (and vice versa below).
+            if orientation.is_some() {
+                self.filter_aspect = None;
+            }
+            self.reset_grid_page();
+            self.generation += 1;
+        }
+    }
+
+    pub fn set_filter_aspect(&mut self, aspect: Option<AspectPreset>) {
+        if self.filter_aspect != aspect {
+            self.filter_aspect = aspect;
+            if aspect.is_some() {
+                self.filter_orientation = None;
+            }
             self.reset_grid_page();
             self.generation += 1;
         }
@@ -418,11 +439,13 @@ impl LibraryController {
         let changed = self.filter_kind.is_some()
             || self.filter_favorite
             || self.filter_orientation.is_some()
+            || self.filter_aspect.is_some()
             || self.filter_min_rating.is_some()
             || self.filter_ext.is_some();
         self.filter_kind = None;
         self.filter_favorite = false;
         self.filter_orientation = None;
+        self.filter_aspect = None;
         self.filter_min_rating = None;
         self.filter_ext = None;
         if changed {
@@ -492,6 +515,7 @@ impl LibraryController {
         self.filter_kind = None;
         self.filter_favorite = false;
         self.filter_orientation = None;
+        self.filter_aspect = None;
         self.filter_min_rating = None;
         self.filter_ext = None;
         self.import_phase = ImportPhase::Idle;

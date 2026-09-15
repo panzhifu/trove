@@ -10,7 +10,7 @@ use gpui_kit::*;
 use gpui_kit::{Anchor, App};
 
 use trove_core::config::{AppConfig, FILTER_TOOLS};
-use trove_core::model::{AssetKind, AssetSort, Orientation};
+use trove_core::model::{AspectPreset, AssetKind, AssetSort, Orientation};
 use trove_core::store::tags;
 
 use crate::library::{LibraryController, ViewMode};
@@ -254,35 +254,93 @@ pub(crate) fn tag_filter(controller: &Entity<LibraryController>, cx: &App) -> im
         })
 }
 
-/// The shape filter.
+/// The shape filter: coarse orientation plus media aspect-ratio presets
+/// (WeChat cover, 4:3 photo, …) in one single-choice menu. The controller
+/// keeps the two mutually exclusive; "all shapes" clears both.
 pub(crate) fn shape_filter(controller: &Entity<LibraryController>, cx: &App) -> impl IntoElement {
-    let current = controller.read(cx).filter_orientation;
+    let (orientation, aspect) = {
+        let ctl = controller.read(cx);
+        (ctl.filter_orientation, ctl.filter_aspect)
+    };
     let t = |k: &str| rust_i18n::t!(k).to_string();
 
-    let options: Vec<(Option<Orientation>, String)> = vec![
-        (None, t("workspace.filter_all_shapes")),
+    let shape_options: Vec<(Option<Orientation>, String)> = vec![
         (Some(Orientation::Landscape), t("workspace.shape_landscape")),
         (Some(Orientation::Portrait), t("workspace.shape_portrait")),
         (Some(Orientation::Square), t("workspace.shape_square")),
+    ];
+    let aspect_presets = [
+        (AspectPreset::WechatCover, "workspace.aspect_wechat_cover"),
+        (AspectPreset::VideoWide, "workspace.aspect_video_wide"),
+        (
+            AspectPreset::VideoVertical,
+            "workspace.aspect_video_vertical",
+        ),
+        (
+            AspectPreset::PhotoLandscape,
+            "workspace.aspect_photo_landscape",
+        ),
+        (
+            AspectPreset::PhotoPortrait,
+            "workspace.aspect_photo_portrait",
+        ),
+        (AspectPreset::Square, "workspace.aspect_square"),
     ];
     Button::new("filter-shape")
         .ghost()
         .xsmall()
         .icon(IconName::Maximize)
         .label(t("workspace.filter_shape"))
-        .selected(current.is_some())
+        .selected(orientation.is_some() || aspect.is_some())
         .dropdown_menu_with_anchor(Anchor::TopLeft, {
             let controller = controller.clone();
             move |menu, _, _| {
-                let mut menu = menu.min_w(px(150.));
-                for (value, label) in &options {
-                    let checked = *value == current;
+                let mut menu = menu.min_w(px(180.));
+                // "All shapes" clears both shape filters.
+                let all_clear = orientation.is_none() && aspect.is_none();
+                let all_controller = controller.clone();
+                menu = menu.item(
+                    PopupMenuItem::new(t("workspace.filter_all_shapes"))
+                        .checked(all_clear)
+                        .on_click(move |_, _, cx| {
+                            all_controller.update(cx, |ctl, cx| {
+                                ctl.set_filter_orientation(None);
+                                ctl.set_filter_aspect(None);
+                                cx.notify();
+                            });
+                        }),
+                );
+                for (value, label) in &shape_options {
+                    let checked = *value == orientation;
                     let value = *value;
                     let controller = controller.clone();
                     menu = menu.item(PopupMenuItem::new(label.clone()).checked(checked).on_click(
                         move |_, _, cx| {
                             controller.update(cx, |ctl, cx| {
                                 ctl.set_filter_orientation(value);
+                                // A concrete shape replaces a preset; "all
+                                // shapes" also drops the preset.
+                                if value.is_none() {
+                                    ctl.set_filter_aspect(None);
+                                }
+                                cx.notify();
+                            });
+                        },
+                    ));
+                }
+                menu = menu.separator();
+                menu = menu.item(PopupMenuItem::label(t("workspace.aspect_section")));
+                for (preset, key) in &aspect_presets {
+                    let checked = aspect == Some(*preset);
+                    let preset = *preset;
+                    let label = t(key);
+                    let controller = controller.clone();
+                    menu = menu.item(PopupMenuItem::new(label).checked(checked).on_click(
+                        move |_, _, cx| {
+                            controller.update(cx, |ctl, cx| {
+                                // The setter clears the orientation filter
+                                // (a preset supersedes a coarse shape).
+                                ctl.set_filter_aspect(Some(preset));
                                 cx.notify();
                             });
                         },
