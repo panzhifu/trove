@@ -216,42 +216,153 @@ impl ModelViewport {
                 Some(frame) => frame_element(frame),
                 None => self.placeholder(cx),
             })
-            .child(self.height_toggle(cx))
+            // The corner trihedron is a coverage layer over the picture, so it
+            // is painted after the frame and before the buttons — the controls
+            // stay clickable where they overlap it.
+            .child(self.corner_axis(cx))
+            .child(self.axis_controls(cx))
             .child(self.shortcuts_hint(cx))
     }
 
-    /// The height-colouring switch, in the canvas's top-left corner.
+    /// The axis switches, in the canvas's top-left corner: height colouring,
+    /// the scene's X/Y/Z axes, and the corner trihedron.
     ///
-    /// On the canvas rather than in the toolbar because it changes what is
-    /// drawn, not the panel's chrome. Switching it also draws a frame, since
-    /// the axis gizmo appears and disappears with it.
-    fn height_toggle(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let on = self.height_color;
-        div().absolute().top_2().left_2().child(
-            Button::new("height-color")
-                .xsmall()
-                .when(on, |button| button.primary())
-                .when(!on, |button| button.ghost())
-                .icon(IconName::Palette)
-                .label(rust_i18n::t!("viewport.height_color").to_string())
-                .tooltip(rust_i18n::t!("viewport.height_color_tip").to_string())
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.height_color = !this.height_color;
-                    // Persisted, so the choice survives the viewport — and so
-                    // the frame loop's periodic re-read agrees with what is on
-                    // screen instead of flicking it back.
-                    let mut config = trove_core::config::AppConfig::load();
-                    config.height_color = Some(this.height_color);
-                    let _ = config.save();
-                    this.enhance_checked = None;
-                    this.dirty = true;
-                    this.pump(cx);
-                    cx.notify();
-                })),
-        )
+    /// On the canvas rather than in the toolbar because each one changes what
+    /// is drawn, not the panel's chrome. Each is a persisted toggle: flipping
+    /// it redraws, and the frame loop's periodic config re-read agrees with
+    /// what is on screen instead of flicking it back. The scene axes used to
+    /// follow the height switch — that pairing is gone; the two now answer
+    /// different questions (what the colours mean, and where the axes are).
+    fn axis_controls(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let (height_on, scene_on, corner_on) = (
+            self.height_color,
+            self.show_scene_axes,
+            self.show_corner_axis,
+        );
+        h_flex()
+            .absolute()
+            .top_2()
+            .left_2()
+            .gap_1()
+            .child(
+                Button::new("height-color")
+                    .xsmall()
+                    .when(height_on, |button| button.primary())
+                    .when(!height_on, |button| button.ghost())
+                    .icon(IconName::Palette)
+                    .label(rust_i18n::t!("viewport.height_color").to_string())
+                    .tooltip(rust_i18n::t!("viewport.height_color_tip").to_string())
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.height_color = !this.height_color;
+                        let mut config = trove_core::config::AppConfig::load();
+                        config.height_color = Some(this.height_color);
+                        let _ = config.save();
+                        this.enhance_checked = None;
+                        this.dirty = true;
+                        this.pump(cx);
+                        cx.notify();
+                    })),
+            )
+            .child(
+                Button::new("scene-axes")
+                    .xsmall()
+                    .when(scene_on, |button| button.primary())
+                    .when(!scene_on, |button| button.ghost())
+                    .icon(gpui_kit::assets::IconName::Axis3d)
+                    .label(rust_i18n::t!("viewport.scene_axes").to_string())
+                    .tooltip(rust_i18n::t!("viewport.scene_axes_tip").to_string())
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.show_scene_axes = !this.show_scene_axes;
+                        let mut config = trove_core::config::AppConfig::load();
+                        config.scene_axes = Some(this.show_scene_axes);
+                        let _ = config.save();
+                        this.enhance_checked = None;
+                        this.dirty = true;
+                        this.pump(cx);
+                        cx.notify();
+                    })),
+            )
+            .child(
+                Button::new("corner-axis")
+                    .xsmall()
+                    .when(corner_on, |button| button.primary())
+                    .when(!corner_on, |button| button.ghost())
+                    .icon(gpui_kit::assets::IconName::LocateFixed)
+                    .label(rust_i18n::t!("viewport.corner_axis").to_string())
+                    .tooltip(rust_i18n::t!("viewport.corner_axis_tip").to_string())
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.show_corner_axis = !this.show_corner_axis;
+                        let mut config = trove_core::config::AppConfig::load();
+                        config.corner_axis = Some(this.show_corner_axis);
+                        let _ = config.save();
+                        // A pure UI-layer overlay: no frame to redraw, the
+                        // render below is untouched.
+                        cx.notify();
+                    })),
+            )
     }
 
-    /// A small panel in the top-right corner listing the keyboard shortcuts.
+    /// The corner trihedron: a small X/Y/Z axis indicator pinned to the
+    /// viewport's bottom-right corner, turning with the camera —
+    /// CloudCompare's `drawTrihedron`, minus the OpenGL.
+    ///
+    /// Painted as a UI layer over the rendered frame rather than inside it.
+    /// One implementation then covers both renderers (GPU and CPU fallback),
+    /// and the labels come out as real text at the window's own resolution
+    /// instead of being baked into whatever resolution the frame happened to
+    /// be drawn at. It also stays a pure overlay: the picture below is
+    /// untouched, which is exactly the contract CloudCompare gets from
+    /// clearing the depth buffer before it draws its own.
+    fn corner_axis(&self, _cx: &mut Context<Self>) -> impl IntoElement {
+        if !self.show_corner_axis {
+            return div().into_any_element();
+        }
+        let (width, height) = self.logical;
+        // Not on screen yet, or nothing to relate the axes to: the geometry
+        // below needs a framing, and a framing needs real bounds.
+        if width <= 0.0 || height <= 0.0 || self.scene_bounds.is_empty() {
+            return div().into_any_element();
+        }
+        let framing = self
+            .camera
+            .framing(self.scene_bounds, width / height.max(1.0));
+        let (rods, labels) = corner_axis_geometry(&framing, (width, height));
+
+        div()
+            .absolute()
+            .inset_0()
+            .child(gpui::canvas(
+                |_, _, _| {},
+                move |bounds, _, window, _| {
+                    // The rods go down in back-to-front order, which is what
+                    // gives three flat quads the depth relationship a real
+                    // 3D draw would get from its depth test.
+                    for rod in &rods {
+                        if let Some(path) = quad_path(bounds.origin, &rod.quad) {
+                            window.paint_path(path, gpui::rgb(rod.color));
+                        }
+                    }
+                },
+            ))
+            .children(labels.into_iter().map(|label| {
+                // Half a `text_xs` letter each way: a fixed nudge standing in
+                // for the font metrics CloudCompare measures, because a
+                // single bold letter is close enough at this size.
+                div()
+                    .absolute()
+                    .left(px(label.pos[0] - 4.0))
+                    .top(px(label.pos[1] - 6.0))
+                    .text_xs()
+                    .font_weight(FontWeight::BOLD)
+                    .text_color(gpui::rgb(label.color))
+                    .child(label.letter)
+            }))
+            .into_any_element()
+    }
+
+    /// A small panel in the canvas's bottom-left corner listing the keyboard
+    /// shortcuts. Bottom-left rather than the top corners, which belong to
+    /// the axis switches and the trihedron.
     fn shortcuts_hint(&self, cx: &mut Context<Self>) -> impl IntoElement {
         use gpui_kit::base::v_flex;
         let line = |text: String| {
@@ -262,8 +373,8 @@ impl ModelViewport {
         };
         v_flex()
             .absolute()
-            .top_2()
-            .right_2()
+            .bottom_2()
+            .left_2()
             .gap_1()
             .p_2()
             .rounded(cx.theme().radius)
@@ -307,57 +418,23 @@ impl ModelViewport {
     }
 
     /// The toolbar: what the model is, how it is being drawn, and the way out.
-    /// The viewport's title-bar controls: name, geometry stats, backend, and
-    /// the reset / close buttons.
+    /// The viewport's title-bar controls: name, geometry stats, and the
+    /// reset / close buttons.
     ///
     /// Rendered by the host panel's title bar while a model preview is open —
     /// see `WorkspacePanel::title_suffix` — so the canvas below is nothing but
     /// the picture. The title bar supplies the chrome, so this carries no
     /// padding or border of its own.
+    ///
+    /// The backend used to be listed here too. It now lives in the status bar
+    /// (see `ModelViewport::backend_text`), which left this row with room for
+    /// the tools that will come after it.
     pub(crate) fn title_tools(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let (primitives, vertices) = self.stats();
         let count_label = if self.mesh.is_point_cloud() {
             rust_i18n::t!("viewport.points", count = primitives)
         } else {
             rust_i18n::t!("viewport.triangles", count = primitives)
-        };
-        let backend = match &self.backend {
-            Backend::Loading => rust_i18n::t!("viewport.backend_loading").to_string(),
-            Backend::Starting => rust_i18n::t!("viewport.backend_starting").to_string(),
-            Backend::Gpu(adapter) => {
-                rust_i18n::t!("viewport.backend_gpu", adapter = adapter).to_string()
-            }
-            Backend::Cpu(reason) => {
-                rust_i18n::t!("viewport.backend_cpu", reason = reason).to_string()
-            }
-            Backend::Streaming => {
-                // Progress comes from the fields the background step updates:
-                // the streamer itself is off-thread while a step is running.
-                let loaded = self.stream_read;
-                let total = self.stream_total;
-                if total > 0 {
-                    let pct = (loaded as f32 / total as f32 * 100.0) as u32;
-                    // Progress is counted in points *read*: once the resident
-                    // budget starts thinning the cloud, the kept count stops
-                    // tracking the file.
-                    rust_i18n::t!(
-                        "viewport.backend_streaming",
-                        percent = pct,
-                        loaded = loaded,
-                        total = total,
-                        kept = self.stream_kept
-                    )
-                    .to_string()
-                } else {
-                    rust_i18n::t!("viewport.backend_streaming_starting").to_string()
-                }
-            }
-            Backend::Indexed => rust_i18n::t!(
-                "viewport.backend_indexed",
-                chunks = self.index_chunks_read,
-                total = self.index_chunks_total
-            )
-            .to_string(),
         };
         let frame_ms = self.frame_ms;
 
@@ -402,15 +479,6 @@ impl ModelViewport {
                 )
             })
             .child(
-                div()
-                    .flex_none()
-                    .max_w(px(220.0))
-                    .truncate()
-                    .text_xs()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(backend),
-            )
-            .child(
                 Button::new("model-reset")
                     .ghost()
                     .xsmall()
@@ -451,4 +519,140 @@ fn frame_element(frame: Arc<RenderImage>) -> AnyElement {
         .size_full()
         .object_fit(ObjectFit::Fill)
         .into_any_element()
+}
+
+// ============================================================================
+// Corner trihedron geometry
+// ============================================================================
+
+/// Length of one corner-axis rod, in logical pixels. Close to CloudCompare's
+/// 25 px, so the proportion reads the same.
+const CORNER_AXIS_LEN: f32 = 26.0;
+/// Thickness of one rod, in logical pixels.
+const CORNER_AXIS_WIDTH: f32 = 2.0;
+/// Distance from the viewport's bottom-right corner to the trihedron's
+/// origin, along both edges.
+const CORNER_AXIS_MARGIN: f32 = 14.0;
+/// How far past a rod's tip its letter sits.
+const CORNER_AXIS_LABEL_GAP: f32 = 8.0;
+/// A rod this short on screen is pointing at the viewer; its letter would
+/// pile up on the trihedron's origin, so it is skipped.
+const CORNER_AXIS_MIN_PROJECTION: f32 = 2.0;
+
+/// One screen-space rod of the corner trihedron, ready to paint.
+struct CornerRod {
+    /// The rod as a closed quad — origin and tip, widened to
+    /// [`CORNER_AXIS_WIDTH`] — in canvas-local pixels.
+    quad: [[f32; 2]; 4],
+    /// View-space depth: larger means closer to the eye. Used only to sort.
+    depth: f32,
+    /// Fill colour, packed `0xRRGGBB`.
+    color: u32,
+}
+
+/// One X/Y/Z letter of the corner trihedron, positioned past its rod's tip.
+struct CornerLabel {
+    /// The letter itself.
+    letter: &'static str,
+    /// Centre of the letter, in canvas-local pixels.
+    pos: [f32; 2],
+    /// Letter colour, packed `0xRRGGBB`.
+    color: u32,
+}
+
+/// The corner trihedron's geometry for one camera pose, anchored at the
+/// viewport's bottom-right corner.
+///
+/// This is CloudCompare's `drawTrihedron` arithmetic with the OpenGL taken
+/// out. Each world axis is projected onto the screen plane through the
+/// camera's `right`/`up` basis — the same thing multiplying a world direction
+/// by the view matrix's rotation does before an orthographic projection — so
+/// a rod pointing at the viewer shortens towards a dot exactly as an
+/// orthographic view of it would, and the trihedron reads as 3D without any
+/// perspective maths. The view-space depth of each axis (its dot with the
+/// `forward` basis) sorts the rods back to front, which is what stands in for
+/// the depth buffer CloudCompare clears and tests: the rod in front covers
+/// the ones behind it.
+fn corner_axis_geometry(
+    framing: &trove_core::media::render3d::Framing,
+    canvas: (f32, f32),
+) -> (Vec<CornerRod>, Vec<CornerLabel>) {
+    use trove_core::media::render3d::{AXIS_X, AXIS_Y, AXIS_Z};
+
+    let dot3 = |a: [f32; 3], b: [f32; 3]| a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+    // The origin sits a margin plus one rod's length inside the corner, so a
+    // rod pointing straight down or right still ends on screen.
+    let origin = [
+        canvas.0 - CORNER_AXIS_MARGIN - CORNER_AXIS_LEN,
+        canvas.1 - CORNER_AXIS_MARGIN - CORNER_AXIS_LEN,
+    ];
+    let mut rods = Vec::with_capacity(3);
+    let mut labels = Vec::with_capacity(3);
+    for (axis, color, letter) in [
+        ([1.0, 0.0, 0.0], AXIS_X, "X"),
+        ([0.0, 1.0, 0.0], AXIS_Y, "Y"),
+        ([0.0, 0.0, 1.0], AXIS_Z, "Z"),
+    ] {
+        // Screen direction of the world axis. y is flipped because pixel y
+        // grows downwards while view-space y grows upwards.
+        let dir = [dot3(axis, framing.right), -dot3(axis, framing.up)];
+        let length = (dir[0] * dir[0] + dir[1] * dir[1]).sqrt();
+        if length < CORNER_AXIS_MIN_PROJECTION {
+            continue;
+        }
+        let tip = [
+            origin[0] + dir[0] * CORNER_AXIS_LEN,
+            origin[1] + dir[1] * CORNER_AXIS_LEN,
+        ];
+        // View-space z of the rod's tip relative to the trihedron's origin:
+        // smaller is closer to the eye, which is the sort key.
+        let depth = dot3(axis, framing.forward);
+        // A unit normal across the rod, so it is a `CORNER_AXIS_WIDTH`-wide
+        // quad instead of a hairline.
+        let normal = [-dir[1] / length, dir[0] / length];
+        let half = CORNER_AXIS_WIDTH * 0.5;
+        rods.push(CornerRod {
+            quad: [
+                [origin[0] + normal[0] * half, origin[1] + normal[1] * half],
+                [origin[0] - normal[0] * half, origin[1] - normal[1] * half],
+                [tip[0] - normal[0] * half, tip[1] - normal[1] * half],
+                [tip[0] + normal[0] * half, tip[1] + normal[1] * half],
+            ],
+            depth,
+            color: axis_color(color),
+        });
+        let unit = [dir[0] / length, dir[1] / length];
+        labels.push(CornerLabel {
+            letter,
+            pos: [
+                tip[0] + unit[0] * CORNER_AXIS_LABEL_GAP,
+                tip[1] + unit[1] * CORNER_AXIS_LABEL_GAP,
+            ],
+            color: axis_color(color),
+        });
+    }
+    // Far first: painting near over far gives three flat quads the same
+    // front-to-back look a depth-tested 3D draw has.
+    rods.sort_by(|a, b| b.depth.total_cmp(&a.depth));
+    (rods, labels)
+}
+
+/// Pack a linear `render3d` axis colour as `0xRRGGBB`. The trihedron reads
+/// its colours from the same constants the scene gizmo uses, so the two
+/// cannot disagree about which axis is which.
+fn axis_color(color: [f32; 3]) -> u32 {
+    let to8 = |value: f32| (value * 255.0).round().clamp(0.0, 255.0) as u32;
+    (to8(color[0]) << 16) | (to8(color[1]) << 8) | to8(color[2])
+}
+
+/// A closed quad through the four corners, offset into window coordinates.
+/// `paint_path` fills it; `build` returns `None` when the platform refused
+/// the path, in which case the rod is skipped for the frame.
+fn quad_path(origin: Point<Pixels>, quad: &[[f32; 2]; 4]) -> Option<gpui::Path<Pixels>> {
+    let mut builder = gpui::PathBuilder::fill();
+    builder.move_to(origin + gpui::point(px(quad[0][0]), px(quad[0][1])));
+    for corner in quad.iter().skip(1) {
+        builder.line_to(origin + gpui::point(px(corner[0]), px(corner[1])));
+    }
+    builder.build().ok()
 }

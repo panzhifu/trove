@@ -95,12 +95,40 @@ pub struct AppConfig {
     /// default so a model looks the way the file intended.
     #[serde(default)]
     pub height_color: Option<bool>,
+    /// Draw the scene's X/Y/Z axes on the model's bounding box. On by
+    /// default: a model viewer whose axes cannot be told apart is measuring
+    /// nothing. Independent of `height_color`, which used to be the only way
+    /// to get them.
+    #[serde(default)]
+    pub scene_axes: Option<bool>,
+    /// Draw the corner trihedron — a small X/Y/Z axis indicator pinned to the
+    /// viewport's bottom-right corner, turning with the camera. On by default,
+    /// the way every 3D viewer ships it.
+    #[serde(default)]
+    pub corner_axis: Option<bool>,
+    /// Check GitHub for a newer release on launch. On by default. The check
+    /// only reads the newest tag and offers a link; Trove never downloads or
+    /// replaces its own binary (see [`crate::services::update`]).
+    #[serde(default)]
+    pub update_check: Option<bool>,
+    /// Unix seconds when a check last finished, so relaunching does not probe
+    /// GitHub again before [`UPDATE_CHECK_INTERVAL_SECS`] has passed.
+    #[serde(default)]
+    pub last_update_check: Option<i64>,
+    /// A release the user asked not to be told about again, without the
+    /// leading `v` (e.g. "0.5.0"). Only that exact version stays quiet — the
+    /// next release after it is announced as usual.
+    #[serde(default)]
+    pub skipped_version: Option<String>,
 }
 
 /// Default minimum preview zoom (0.25×).
 pub const DEFAULT_MIN_PREVIEW_ZOOM: f32 = 0.25;
 /// Default maximum preview zoom (32×).
 pub const DEFAULT_MAX_PREVIEW_ZOOM: f32 = 32.0;
+/// How long a completed release check keeps a fresh relaunch from probing
+/// GitHub again.
+pub const UPDATE_CHECK_INTERVAL_SECS: i64 = 24 * 60 * 60;
 
 /// Which light/dark appearance the UI uses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -281,6 +309,54 @@ impl AppConfig {
         self.height_color.unwrap_or(false)
     }
 
+    /// Whether the 3D preview draws the scene's X/Y/Z axes (on by default).
+    pub fn scene_axes(&self) -> bool {
+        self.scene_axes.unwrap_or(true)
+    }
+
+    /// Whether the 3D preview draws the corner trihedron (on by default).
+    pub fn corner_axis(&self) -> bool {
+        self.corner_axis.unwrap_or(true)
+    }
+
+    /// Whether to look for a newer release on launch (on by default).
+    pub fn update_check(&self) -> bool {
+        self.update_check.unwrap_or(true)
+    }
+
+    /// Whether a launch should check for updates: on when no check has ever
+    /// run, or when the last one is at least
+    /// [`UPDATE_CHECK_INTERVAL_SECS`] old. `now` is Unix seconds
+    /// ([`crate::services::update::now_unix`]) so this stays testable.
+    pub fn update_check_due(&self, now: i64) -> bool {
+        match self.last_update_check {
+            // A clock that jumped backwards must not latch the check off, so
+            // the difference is taken as an absolute value.
+            Some(last) => (now - last).abs() >= UPDATE_CHECK_INTERVAL_SECS,
+            None => true,
+        }
+    }
+
+    /// Record that a check just finished (successful or not) and persist.
+    ///
+    /// Failed checks count too: a machine that is offline should not probe
+    /// GitHub again on every single launch.
+    pub fn record_update_check(&mut self, now: i64) -> Result<()> {
+        self.last_update_check = Some(now);
+        self.save()
+    }
+
+    /// The release the user asked not to hear about again.
+    pub fn skipped_version(&self) -> Option<&str> {
+        self.skipped_version.as_deref()
+    }
+
+    /// Stop announcing `version` and persist.
+    pub fn skip_version(&mut self, version: &str) -> Result<()> {
+        self.skipped_version = Some(version.to_string());
+        self.save()
+    }
+
     /// How manual imports treat source files: `true` = link to the original
     /// location (no copy), `false` = copy into the library (default).
     pub fn import_linked(&self) -> bool {
@@ -344,4 +420,40 @@ pub fn ensure_config_dir() -> Result<PathBuf> {
     let dir = AppConfig::config_dir().unwrap_or_else(|| PathBuf::from(".trove"));
     fs::create_dir_all(&dir)?;
     Ok(dir)
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_launch_check_waits_a_day_between_probes() {
+        let mut config = AppConfig::default();
+        assert!(config.update_check_due(1_000), "no timestamp yet → due");
+        config.last_update_check = Some(1_000);
+        assert!(!config.update_check_due(1_000 + UPDATE_CHECK_INTERVAL_SECS - 1));
+        assert!(config.update_check_due(1_000 + UPDATE_CHECK_INTERVAL_SECS));
+        // A clock that jumped backwards must not latch the check off.
+        assert!(config.update_check_due(1_000 - UPDATE_CHECK_INTERVAL_SECS));
+    }
+
+    #[test]
+    fn the_launch_check_is_on_until_switched_off() {
+        let mut config = AppConfig::default();
+        assert!(config.update_check());
+        config.update_check = Some(false);
+        assert!(!config.update_check());
+    }
+
+    #[test]
+    fn a_skipped_release_is_remembered() {
+        let mut config = AppConfig::default();
+        assert_eq!(config.skipped_version(), None);
+        config.skipped_version = Some("0.5.0".into());
+        assert_eq!(config.skipped_version(), Some("0.5.0"));
+    }
 }

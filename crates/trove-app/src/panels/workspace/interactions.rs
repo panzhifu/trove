@@ -298,12 +298,25 @@ impl WorkspacePanel {
                 this.forget_preview(cx);
             }
         });
+        // The status bar shows which renderer is painting the model. The
+        // viewport notifies on every frame, so this watcher only carries the
+        // change over when the description it renders actually moved on —
+        // during a drag that check runs every frame but almost never fires.
+        let observer = cx.observe(&viewport, |this, viewport, cx| {
+            let backend = viewport.read(cx).backend_text();
+            if this.viewport_backend.as_deref() != Some(backend.as_str()) {
+                this.viewport_backend = Some(backend);
+                cx.notify();
+            }
+        });
         // Enter on another asset while one is already showing: let the old
         // preview hand its frame back before it is dropped.
+        self.viewport_backend = Some(viewport.read(cx).backend_text());
         if let Some(previous) = self.preview.replace(MainPreview::Model(viewport)) {
             previous.release(window, cx);
         }
         self.preview_subscription = Some(subscription);
+        self.viewport_observer = Some(observer);
         cx.notify();
     }
 
@@ -325,6 +338,8 @@ impl WorkspacePanel {
         if let Some(previous) = self.preview.replace(MainPreview::Asset(preview)) {
             previous.release(window, cx);
         }
+        self.viewport_backend = None;
+        self.viewport_observer = None;
         self.preview_subscription = Some(subscription);
         cx.notify();
     }
@@ -343,6 +358,8 @@ impl WorkspacePanel {
         if let Some(previous) = self.preview.replace(MainPreview::Asset(preview)) {
             previous.release(window, cx);
         }
+        self.viewport_backend = None;
+        self.viewport_observer = None;
         self.preview_subscription = Some(subscription);
         cx.notify();
     }
@@ -352,6 +369,8 @@ impl WorkspacePanel {
         if let Some(preview) = self.preview.take() {
             preview.release(window, cx);
             self.preview_subscription = None;
+            self.viewport_backend = None;
+            self.viewport_observer = None;
             cx.notify();
         }
     }
@@ -362,6 +381,8 @@ impl WorkspacePanel {
     fn forget_preview(&mut self, cx: &mut Context<Self>) {
         if self.preview.take().is_some() {
             self.preview_subscription = None;
+            self.viewport_backend = None;
+            self.viewport_observer = None;
             cx.notify();
         }
     }

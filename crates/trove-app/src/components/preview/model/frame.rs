@@ -142,6 +142,8 @@ impl ModelViewport {
             let cfg = trove_core::config::AppConfig::load();
             self.enhance_points = cfg.point_enhance();
             self.height_color = cfg.height_color();
+            self.show_scene_axes = cfg.scene_axes();
+            self.show_corner_axis = cfg.corner_axis();
             // The zoom limits live in the same file: clamp so lowering the
             // range while a model is open pulls the camera back in, instead
             // of leaving it parked outside the configured limits.
@@ -168,11 +170,11 @@ impl ModelViewport {
             // they are worth it on a settled frame and wasted on a draft the
             // user is dragging past.
             enhance_points: !interactive && self.enhance_points,
-            // Height colouring and the axis gizmo are set together: the
-            // gizmo is what makes a height band readable as a size, so it
-            // has nothing to add when the colouring is off.
+            // Height colouring and the scene axes are separate switches now:
+            // the axes answer "where is X/Y/Z" whether or not the model is
+            // painted by height, so each follows its own config value.
             height_color: self.height_color,
-            show_axes: self.height_color,
+            show_axes: self.show_scene_axes,
         };
 
         self.dirty = false;

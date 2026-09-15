@@ -79,6 +79,45 @@ pub fn open(path: &Path, target: OpenTarget<'_>) -> Result<(), String> {
         .map_err(|e| format!("{e}"))
 }
 
+/// Build the command that opens `url` in the user's browser.
+///
+/// Same platform split as [`plan`] — `xdg-open`, `open` and `start` all take
+/// a URL as happily as a path. Windows is the one that needs care: `start`
+/// reads its first quoted argument as a window title, so the (empty) title
+/// has to be passed explicitly or the URL is swallowed as one.
+pub fn plan_url(url: &str) -> Command {
+    if cfg!(target_os = "windows") {
+        let mut cmd = Command::new("cmd");
+        cmd.arg("/c").arg("start").arg("").arg(url);
+        cmd
+    } else if cfg!(target_os = "macos") {
+        let mut cmd = Command::new("open");
+        cmd.arg(url);
+        cmd
+    } else {
+        let mut cmd = Command::new("xdg-open");
+        cmd.arg(url);
+        cmd
+    }
+}
+
+/// Open `url` in the system browser (detached, like [`open`]; failures come
+/// back as a string).
+///
+/// Only `http(s)` is accepted. Everything reachable from here is a link Trove
+/// itself produced, and this keeps a path — or a `file:`/`javascript:`
+/// payload smuggled into one — from being handed to the OS opener, which
+/// would happily run it.
+pub fn open_url(url: &str) -> Result<(), String> {
+    if !url.starts_with("http://") && !url.starts_with("https://") {
+        return Err(format!("refusing to open a non-http(s) url: {url}"));
+    }
+    plan_url(url)
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| format!("{e}"))
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -99,5 +138,25 @@ mod tests {
             Path::new("/tmp/file.png"),
             OpenTarget::With(Path::new("/usr/bin/gimp")),
         );
+    }
+
+    #[test]
+    fn url_plan_carries_the_link_as_an_argument() {
+        let url = "https://github.com/panzhifu/trove/releases/latest";
+        let args: Vec<String> = plan_url(url)
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            args.iter().any(|arg| arg == url),
+            "the url must survive as its own argument: {args:?}"
+        );
+    }
+
+    #[test]
+    fn only_http_urls_reach_the_opener() {
+        assert!(open_url("file:///etc/passwd").is_err());
+        assert!(open_url("javascript:alert(1)").is_err());
+        assert!(open_url("/etc/passwd").is_err());
     }
 }

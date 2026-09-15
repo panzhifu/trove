@@ -146,10 +146,11 @@ fn build_menus() -> Vec<Menu> {
         },
         Menu {
             name: rust_i18n::t!("app.help").into_owned().into(),
-            items: vec![MenuItem::action(
-                rust_i18n::t!("app.about").to_string(),
-                About,
-            )],
+            items: vec![
+                MenuItem::action(rust_i18n::t!("app.check_updates").to_string(), CheckUpdates),
+                MenuItem::separator(),
+                MenuItem::action(rust_i18n::t!("app.about").to_string(), About),
+            ],
             disabled: false,
         },
     ]

@@ -18,3 +18,7 @@ tty7-bin/
 # PLY 基准测试的生成数据（最大单文件 573MB，超过 GitHub 限制），由
 # crates/trove-core/examples/ply_bench.rs 生成，不进仓库。
 bench-data/
+
+# 第三方参考实现（CloudCompare / gpui-kit / fontmatrix 的浅克隆），
+# 只供本地查阅借鉴，体积大且非本项目源码，不进仓库。
+reference/

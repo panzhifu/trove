@@ -13,6 +13,13 @@
 //! URL; the importer writes it into `assets.source_url` and deletes both.
 //! The server never touches the database: it only writes files, so it can
 //! run on its own thread while the UI stays single-threaded.
+//!
+//! All responses carry `Access-Control-Allow-Origin: *` and OPTIONS
+//! preflights are answered: the browser extension calls us from
+//! `moz-extension://` / `chrome-extension://` origins, and without CORS its
+//! `POST /add` (octet-stream) preflight would never pass. The listener is
+//! 127.0.0.1-only and the worst case is a file landing in the inbox, so the
+//! wildcard origin is acceptable here.
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -107,6 +114,9 @@ fn handle(mut stream: TcpStream, inbox: &Path) -> std::io::Result<()> {
     };
 
     match (request.method.as_str(), request.target.split('?').next()) {
+        // CORS preflight: browsers send OPTIONS before the octet-stream
+        // POST /add; without a 2xx the actual upload never fires.
+        ("OPTIONS", _) => respond(stream, 204, ""),
         ("GET", Some("/") | Some("")) => respond_html(stream, 200, &index_page()),
         ("GET", Some("/ping")) => respond(stream, 200, "trove ok"),
         ("POST", Some("/add")) => {
@@ -400,6 +410,9 @@ fn respond_html(mut stream: TcpStream, status: u16, body: &str) -> std::io::Resu
     let head = format!(
         "HTTP/1.1 {status} OK
 Content-Type: text/html; charset=utf-8
+Access-Control-Allow-Origin: *
+Access-Control-Allow-Methods: GET, POST, OPTIONS
+Access-Control-Allow-Headers: Content-Type
 Content-Length: {}
 Connection: close
 
@@ -413,13 +426,14 @@ Connection: close
 fn respond(mut stream: TcpStream, status: u16, body: &str) -> std::io::Result<()> {
     let reason = match status {
         200 => "OK",
+        204 => "No Content",
         400 => "Bad Request",
         404 => "Not Found",
         502 => "Bad Gateway",
         _ => "Internal Server Error",
     };
     let head = format!(
-        "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type\r\nAccess-Control-Max-Age: 86400\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
     );
     stream.write_all(head.as_bytes())?;
@@ -478,6 +492,37 @@ mod tests {
         assert_eq!(meta["source_url"], "https://example.com/pic");
 
         std::fs::remove_dir_all(&inbox_for_assert).unwrap();
+    }
+
+    #[test]
+    fn cors_headers_and_preflight() {
+        let inbox = std::env::temp_dir().join(format!("trove-inbox-{}", uuid::Uuid::new_v4()));
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let _ = handle(stream, &inbox);
+            }
+        });
+
+        // Preflight for the extension's POST /add must pass with CORS headers.
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        stream
+            .write_all(b"OPTIONS /add HTTP/1.1\r\nOrigin: moz-extension://abc\r\n\r\n")
+            .unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).unwrap();
+        assert!(response.contains("204"), "{response}");
+        assert!(response.contains("Access-Control-Allow-Origin: *"), "{response}");
+        assert!(response.contains("Access-Control-Allow-Methods: GET, POST, OPTIONS"));
+
+        // Plain requests (e.g. the popup's ping) expose the headers too.
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        stream.write_all(b"GET /ping HTTP/1.1\r\n\r\n").unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).unwrap();
+        assert!(response.contains("trove ok"));
+        assert!(response.contains("Access-Control-Allow-Origin: *"));
     }
 
     #[test]

@@ -36,6 +36,7 @@ gpui_kit::actions!(
         RefreshLibrary,
         // -- Help menu -----------------------------------------------------
         About,
+        CheckUpdates,
         // -- Grid navigation (WorkspacePanel only) --------------------------
         MoveLeft,
         MoveRight,

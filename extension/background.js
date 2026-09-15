@@ -14,23 +14,28 @@ function endpoint(path, query = '') {
 }
 
 function notify(message) {
-  chrome.notifications.create({
-    type: 'basic',
-    iconUrl: 'icon.png',
-    title: 'Trove Collector',
-    message,
-  });
+  try {
+    chrome.notifications?.create({
+      type: 'basic',
+      iconUrl: 'icon.png',
+      title: 'Trove 采集器',
+      message,
+    });
+  } catch {
+    // Notifications may be unavailable (no libnotify, restricted env);
+    // never let a failed toast mask a successful save.
+  }
 }
 
 chrome.runtime.onInstalled.addListener(() => {
   chrome.contextMenus.create({
     id: 'trove-save-image',
-    title: 'Save image to Trove',
+    title: '保存图片到 Trove',
     contexts: ['image'],
   });
   chrome.contextMenus.create({
     id: 'trove-save-link',
-    title: 'Save linked file to Trove',
+    title: '保存链接文件到 Trove',
     contexts: ['link'],
   });
 });
@@ -53,9 +58,9 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
       body: bytes,
     });
     const result = await saved.json();
-    if (result.ok) notify(`Saved to Trove: ${name}`);
-    else notify(`Trove refused: ${result.error || 'unknown error'}`);
+    if (result.ok) notify(`已保存到 Trove：${name}`);
+    else notify(`Trove 拒绝：${result.error || '未知错误'}`);
   } catch (error) {
-    notify(`Could not reach Trove (is it running?): ${error.message}`);
+    notify(`无法连接 Trove（是否在运行？）：${error.message}`);
   }
 });
