@@ -602,3 +602,9 @@ alpha = "透明度"
 [dock]
 collapse = "收起侧栏"
 expand = "展开侧栏"
+
+[tray]
+show_window = "显示 Trove 主窗口"
+import_files = "导入文件…"
+open_settings = "设置…"
+quit = "退出 Trove"

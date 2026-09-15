@@ -20,6 +20,13 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 bytemuck = { version = "1", features = ["derive"] }
 rodio = { workspace = true }
+# System tray, one API for all three platforms. The default features must stay
+# off: they pull in GTK, libappindicator and libxdo, none of which the tray
+# needs on Linux — `ksni` is a pure D-Bus StatusNotifierItem (which is also
+# what KDE Plasma speaks natively), and it reuses the zbus already in the
+# tree through gpui. The feature is target-gated inside the crate, so it is
+# inert on macOS and Windows.
+tray-icon = { version = "0.25", default-features = false, features = ["ksni"] }
 
 [dev-dependencies]
 # Used only to parse and validate `gpu3d.wgsl` on machines without a GPU.
