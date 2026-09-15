@@ -120,6 +120,14 @@ pub fn default_keybindings() -> Vec<KeyBindingConfig> {
             key: "",
             context: Some("Workspace"),
         },
+        KeyBindingConfig {
+            // `f`, as in mpv/VLC/YouTube. The context is the video preview's,
+            // not `Workspace`: a bare letter bound there would shadow typing
+            // in the search box, which lives in the same context.
+            action: "EnterVideoFullscreen",
+            key: "f",
+            context: Some("VideoPreview"),
+        },
     ]
 }
 
@@ -152,6 +160,37 @@ mod tests {
         dedup.sort();
         dedup.dedup();
         assert_eq!(dedup.len(), actions.len(), "duplicate actions in defaults");
+    }
+
+    #[test]
+    fn fullscreen_key_is_scoped_to_the_video_preview() {
+        let defaults = default_keybindings();
+        let binding = defaults
+            .iter()
+            .find(|b| b.action == "EnterVideoFullscreen")
+            .expect("EnterVideoFullscreen must stay configurable");
+        assert_eq!(binding.key, "f");
+        assert_eq!(binding.context, Some("VideoPreview"));
+    }
+
+    #[test]
+    fn no_bare_letter_in_the_workspace_context() {
+        // The search box shares the `Workspace` context, so a single-letter
+        // binding there would eat that letter while typing. The fullscreen
+        // key is scoped to `VideoPreview` for exactly this reason.
+        let offenders: Vec<&str> = default_keybindings()
+            .iter()
+            .filter(|b| b.context == Some("Workspace"))
+            .filter(|b| {
+                let mut chars = b.key.chars();
+                matches!(chars.next(), Some(c) if c.is_ascii_alphabetic()) && chars.next().is_none()
+            })
+            .map(|b| b.action)
+            .collect();
+        assert!(
+            offenders.is_empty(),
+            "bare letter(s) in Workspace: {offenders:?}"
+        );
     }
 
     #[test]

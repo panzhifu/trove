@@ -118,6 +118,9 @@ fn action_label(action: &str) -> String {
         "BatchRename" => rust_i18n::t!("shortcuts.actions.BatchRename").to_string(),
         "BatchConvert" => rust_i18n::t!("shortcuts.actions.BatchConvert").to_string(),
         "CopyImage" => rust_i18n::t!("shortcuts.actions.CopyImage").to_string(),
+        "EnterVideoFullscreen" => {
+            rust_i18n::t!("shortcuts.actions.EnterVideoFullscreen").to_string()
+        }
         other => other.to_string(),
     }
 }
@@ -126,6 +129,7 @@ fn action_label(action: &str) -> String {
 fn context_label(context: &str) -> String {
     match context {
         "Workspace" => rust_i18n::t!("shortcuts.context.Workspace").to_string(),
+        "VideoPreview" => rust_i18n::t!("shortcuts.context.VideoPreview").to_string(),
         _ => rust_i18n::t!("shortcuts.context.global").to_string(),
     }
 }

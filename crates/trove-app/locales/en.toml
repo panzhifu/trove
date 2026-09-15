@@ -533,7 +533,7 @@ corner_axis_tip = "Pin a small X/Y/Z indicator to the corner — it turns with t
 shortcut_reset = "R · Double-click: Reset view"
 
 [video]
-fullscreen = "Fullscreen"
+fullscreen = "Fullscreen (F)"
 exit_fullscreen = "Exit fullscreen"
 
 [shortcuts]
@@ -568,9 +568,11 @@ RefreshLibrary = "Refresh library"
 BatchRename = "Batch rename"
 BatchConvert = "Batch convert"
 CopyImage = "Copy image to clipboard"
+EnterVideoFullscreen = "Play video fullscreen"
 
 [shortcuts.context]
 Workspace = "Workspace"
+VideoPreview = "Video preview"
 global = "Global"
 
 [sysfonts]

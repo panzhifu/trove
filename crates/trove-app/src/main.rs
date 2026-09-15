@@ -44,6 +44,12 @@ const WORKSPACE_CONTEXT: &str = "Workspace";
 /// so the panel can dismiss the editor.
 const EXPLORER_CONTEXT: &str = "Explorer";
 
+/// Key context of the video preview (a video is open in the main area). It
+/// exists only while a video is previewed, so a bare letter bound here — the
+/// fullscreen key — never shadows typing in the search box, which sits in the
+/// `Workspace` context.
+const VIDEO_PREVIEW_CONTEXT: &str = "VideoPreview";
+
 /// Key context of the fullscreen video window. Its only binding is Escape:
 /// leaving hands playback back to the main window. The context lives only
 /// on that window's root, so the main window's Escape handlers are
@@ -142,6 +148,22 @@ pub(crate) fn register_keys(cx: &mut App) {
         CancelScreenshotRegion,
         Some(REGION_SELECT_CONTEXT),
     ));
+
+    // `f` puts the video preview into the fullscreen stage. Its context is
+    // the preview's, not `Workspace`, so the letter is only live while a
+    // video is on screen — the search box shares the `Workspace` context and
+    // would lose the letter otherwise. Configurable: the key comes from
+    // `default_keybindings` (Settings ▸ Shortcuts).
+    if let Some(k) = default_key("EnterVideoFullscreen") {
+        let k = key_for("EnterVideoFullscreen", &k);
+        if !k.is_empty() {
+            bindings.push(KeyBinding::new(
+                &k,
+                EnterVideoFullscreen,
+                Some(VIDEO_PREVIEW_CONTEXT),
+            ));
+        }
+    }
 
     // Screenshots are global (like paste import), not grid-scoped.
     macro_rules! bind_global {
