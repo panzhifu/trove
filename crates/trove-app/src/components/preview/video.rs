@@ -31,10 +31,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use gpui_kit::assets::IconName as MediaIcon;
+use gpui_kit::base::POPUP_PRIORITY;
 use gpui_kit::base::{h_flex, v_flex};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
-use gpui_kit::component::popover::Popover;
 use gpui_kit::component::slider::{Slider, SliderEvent, SliderState};
 use gpui_kit::component::{ActiveTheme, Sizable};
 use gpui_kit::prelude::FluentBuilder as _;
@@ -47,6 +47,17 @@ use crate::app::actions::ExitVideoFullscreen;
 
 /// How long the decode loops sleep while paused before looking again.
 const IDLE_POLL: Duration = Duration::from_millis(120);
+
+/// Fullscreen chrome: how long the pointer must rest before the floating
+/// transport row hides itself.
+const CONTROLS_HIDE_AFTER: Duration = Duration::from_millis(2500);
+
+/// How often the fullscreen auto-hide watcher checks that countdown.
+const CONTROLS_WATCH_INTERVAL: Duration = Duration::from_millis(400);
+
+/// Bottom band of the fullscreen window that counts as "on the controls":
+/// the pointer inside it keeps the floating row visible.
+const CONTROLS_BAND: f32 = 96.;
 
 /// The playback speeds offered in the menu. All inside the 0.5–2.0
 /// single-instance range of ffmpeg's `atempo`, so no filter chain.
@@ -138,6 +149,7 @@ pub(super) fn spawn_fullscreen(
     let player = VideoPlayer::spawn(path, resume, cx)?;
     player.update(cx, |this, cx| {
         this.fullscreen_mode = true;
+        this.start_controls_watcher(cx);
         cx.notify();
     });
     Some(player)
@@ -197,6 +209,19 @@ pub(super) struct VideoPlayer {
     /// Whether this instance lives in the fullscreen window (its control
     /// row then shows an exit-fullscreen button).
     fullscreen_mode: bool,
+    /// Whether the volume popup (vertical slider above the button) is open.
+    volume_open: bool,
+    /// Fullscreen chrome: whether the floating transport row is showing.
+    /// Always true outside fullscreen, where the row lives in the layout.
+    controls_shown: bool,
+    /// Pointer is on the floating row (or its volume popup): the auto-hide
+    /// watcher leaves it alone then.
+    controls_hovered: bool,
+    /// When the pointer last moved in fullscreen; `None` starts the
+    /// countdown afresh.
+    controls_revealed_at: Option<std::time::Instant>,
+    /// Whether the auto-hide watcher was spawned (fullscreen only).
+    watcher_started: bool,
     _subscription: Subscription,
 }
 
@@ -285,6 +310,11 @@ impl VideoPlayer {
             synced_volume: if resume.muted { 0. } else { resume.volume },
             sink: None,
             fullscreen_mode: false,
+            volume_open: false,
+            controls_shown: true,
+            controls_hovered: false,
+            controls_revealed_at: None,
+            watcher_started: false,
             _subscription: subscription,
         };
         this.start_decoding(cx);
@@ -420,8 +450,10 @@ impl VideoPlayer {
 
     /// The audio loop: streams ~100 ms PCM chunks from the [`AudioPipe`]
     /// into rodio. The pipe restarts whenever `audio_seq` moves (seek,
-    /// speed change, loop wrap); pause stops reading, which backpressures
-    /// ffmpeg instead of drifting.
+    /// speed change, loop wrap); the play/pause state is pushed onto the
+    /// sink on every turn (and immediately from [`VideoPlayer::set_playing`]),
+    /// while pausing also stops reading, which backpressures ffmpeg
+    /// instead of drifting.
     fn start_audio(&mut self, cx: &mut Context<Self>) {
         let path = self.path.clone();
         let Some(host) = audio_handle(cx) else {
@@ -475,6 +507,17 @@ impl VideoPlayer {
                     cx.background_executor().timer(IDLE_POLL).await;
                     continue;
                 };
+                // Apply the play state before any pipe work. The whole
+                // soundtrack is queued as fast as ffmpeg decodes it, so the
+                // pipe is often already gone (or never comes back) while
+                // the sink still holds minutes of audio — a pause must
+                // reach the sink from here, not only from the branches
+                // that require a live pipe.
+                if playing {
+                    s.play();
+                } else {
+                    s.pause();
+                }
                 // Take the pipe out so `read_chunk` can run on a 'static
                 // background task; hand it back below.
                 let Some(mut p) = pipe.take() else {
@@ -485,7 +528,6 @@ impl VideoPlayer {
                 };
 
                 if playing {
-                    s.play();
                     let (returned, chunk) = cx
                         .background_executor()
                         .spawn(async move {
@@ -514,7 +556,6 @@ impl VideoPlayer {
                     // Paused: stop reading so ffmpeg blocks on a full pipe
                     // instead of drifting ahead.
                     pipe = Some(p);
-                    s.pause();
                     cx.background_executor().timer(IDLE_POLL).await;
                 }
             }
@@ -548,10 +589,71 @@ impl VideoPlayer {
         cx.notify();
     }
 
+    /// Play/pause: flip the flag *and* apply it to the audio sink at once.
+    ///
+    /// The audio loop re-applies the state on every turn, but it can be a
+    /// chunk read away from noticing — and once the whole soundtrack has
+    /// been queued up front there is no pipe left to loop around, so a
+    /// paused picture would keep singing. Acting on the shared sink here
+    /// makes the pause immediate and independent of the loop's position.
+    fn set_playing(&mut self, playing: bool, cx: &mut Context<Self>) {
+        self.playing = playing;
+        if let Some(sink) = &self.sink {
+            if playing {
+                sink.play();
+            } else {
+                sink.pause();
+            }
+        }
+        cx.notify();
+    }
+
     /// Pause playback (used while the fullscreen window holds the stage).
     pub(crate) fn pause(&mut self, cx: &mut Context<Self>) {
-        self.playing = false;
-        cx.notify();
+        self.set_playing(false, cx);
+    }
+
+    /// Show the fullscreen controls and restart the auto-hide countdown.
+    fn reveal_controls(&mut self, cx: &mut Context<Self>) {
+        self.controls_revealed_at = Some(std::time::Instant::now());
+        if !self.controls_shown {
+            self.controls_shown = true;
+            cx.notify();
+        }
+    }
+
+    /// Spawn the watcher that hides the fullscreen controls once the
+    /// pointer has rested off them. Only the fullscreen player starts it,
+    /// so nothing ticks outside fullscreen.
+    fn start_controls_watcher(&mut self, cx: &mut Context<Self>) {
+        if self.watcher_started {
+            return;
+        }
+        self.watcher_started = true;
+        cx.spawn(async move |weak, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(CONTROLS_WATCH_INTERVAL)
+                    .await;
+                let hide = weak.update(cx, |this, _| {
+                    this.controls_shown
+                        && !this.controls_hovered
+                        && !this.volume_open
+                        && this
+                            .controls_revealed_at
+                            .is_some_and(|at| at.elapsed() >= CONTROLS_HIDE_AFTER)
+                });
+                let Ok(hide) = hide else { break };
+                if hide {
+                    let _ = weak.update(cx, |this, cx| {
+                        this.controls_shown = false;
+                        this.controls_revealed_at = None;
+                        cx.notify();
+                    });
+                }
+            }
+        })
+        .detach();
     }
 
     /// Position and playing flag, read by the fullscreen host on exit to
@@ -594,8 +696,8 @@ impl VideoPlayer {
                         MediaIcon::Play
                     })
                     .on_click(cx.listener(|this, _, _, cx| {
-                        this.playing = !this.playing;
-                        cx.notify();
+                        let playing = this.playing;
+                        this.set_playing(!playing, cx);
                     })),
             )
             .child(div().flex_1().child(Slider::new(&self.slider).horizontal()))
@@ -610,7 +712,9 @@ impl VideoPlayer {
                     )),
             )
             .child(self.speed_control(speed, cx))
-            .when(self.has_audio, |row| row.child(self.volume_control(muted)))
+            .when(self.has_audio, |row| {
+                row.child(self.volume_control(muted, cx))
+            })
             .child(
                 Button::new("video-fullscreen")
                     .ghost()
@@ -670,11 +774,13 @@ impl VideoPlayer {
             })
     }
 
-    /// The volume control: the mute-state button opens a popover with a
-    /// vertical slider above the control row (only when the file has
-    /// audio). Muting happens by dragging the slider to zero — the Change
-    /// subscription unmutes as soon as it moves again.
-    fn volume_control(&self, muted: bool) -> impl IntoElement {
+    /// The volume control: the state button toggles a vertical slider that
+    /// pops up above the control row (only when the file has audio).
+    /// Muting happens by dragging the slider to zero — the Change
+    /// subscription unmutes as soon as it moves again. The component
+    /// `Popover` can't open upwards (its corner placement always extends
+    /// down-right from the anchor), so the popup is positioned by hand.
+    fn volume_control(&self, muted: bool, cx: &mut Context<Self>) -> impl IntoElement {
         let volume_icon = if muted || self.volume == 0. {
             MediaIcon::VolumeX
         } else if self.volume < 0.5 {
@@ -683,21 +789,44 @@ impl VideoPlayer {
             MediaIcon::Volume2
         };
         let volume_slider = self.volume_slider.clone();
-        Popover::new("volume-popover")
-            .anchor(gpui::Anchor::TopCenter)
-            .trigger(
+        div()
+            .id("volume-anchor")
+            .relative()
+            .child(
                 Button::new("video-mute")
                     .ghost()
                     .xsmall()
                     .icon(volume_icon)
-                    .tooltip(rust_i18n::t!("video.volume").to_string()),
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.volume_open = !this.volume_open;
+                        cx.notify();
+                    })),
             )
-            .content(move |_state, _window, _cx| {
-                div()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .child(Slider::new(&volume_slider).vertical().h(px(96.)))
+            .when(self.volume_open, |anchor| {
+                // Hangs off the button's top edge, centred on it; deferred
+                // so it paints above the click-away overlay.
+                anchor.child(
+                    deferred(
+                        div()
+                            .absolute()
+                            .bottom_full()
+                            .left(px(-4.))
+                            .p_1()
+                            .rounded(cx.theme().radius)
+                            .bg(cx.theme().popover)
+                            .border_1()
+                            .border_color(cx.theme().border)
+                            .shadow_lg()
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .child(Slider::new(&volume_slider).vertical().h(px(96.))),
+                            ),
+                    )
+                    .with_priority(POPUP_PRIORITY),
+                )
             })
     }
 
@@ -742,9 +871,69 @@ impl Render for VideoPlayer {
             self.volume_slider
                 .update(cx, |slider, cx| slider.set_value(volume, window, cx));
         }
+        // Fullscreen is a bare picture: the transport row floats over the
+        // bottom edge and hides itself while the pointer rests, revealed by
+        // movement or by hovering it. Outside fullscreen the row stays in
+        // the flow, under the video.
+        if self.fullscreen_mode {
+            let controls = div()
+                .absolute()
+                .bottom_0()
+                .left_0()
+                .right_0()
+                .px_3()
+                .py_2()
+                .bg(black().opacity(0.55))
+                .child(self.controls(cx));
+            let mut root = div()
+                .relative()
+                .size_full()
+                .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, window, cx| {
+                    // The pointer resting on the row (or reaching for it)
+                    // counts as hovering: the watcher then leaves it alone.
+                    let bottom = f32::from(window.bounds().size.height);
+                    let hovering = f32::from(event.position.y) >= bottom - CONTROLS_BAND;
+                    this.controls_hovered = hovering;
+                    if hovering {
+                        this.reveal_controls(cx);
+                    } else {
+                        this.controls_revealed_at = Some(std::time::Instant::now());
+                    }
+                }))
+                .child(
+                    div()
+                        .absolute()
+                        .inset_0()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .overflow_hidden()
+                        .child(self.frame_element()),
+                );
+            if self.controls_shown {
+                root = root.child(controls);
+            }
+            return root
+                .when(self.volume_open, |root| {
+                    root.child(div().absolute().inset_0().on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| {
+                            this.volume_open = false;
+                            cx.notify();
+                        }),
+                    ))
+                })
+                .into_any_element();
+        }
+
         // Fill the hosting stage: the frame takes all the height the
         // transport controls leave, and the picture contains itself inside.
+        // The volume popup is anchored inside, so the root is positioned.
+        // While the popup is open a click-away overlay paints over
+        // everything (the deferred popup paints above it): any click closes
+        // it, exactly like a menu.
         v_flex()
+            .relative()
             .flex_1()
             .min_h_0()
             .w_full()
@@ -762,6 +951,16 @@ impl Render for VideoPlayer {
                     .child(self.frame_element()),
             )
             .child(self.controls(cx))
+            .when(self.volume_open, |root| {
+                root.child(div().absolute().inset_0().on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _, _, cx| {
+                        this.volume_open = false;
+                        cx.notify();
+                    }),
+                ))
+            })
+            .into_any_element()
     }
 }
 
