@@ -564,10 +564,19 @@ impl Render for WorkspacePanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // The action handlers are shared by both modes, so the shell is built
         // before the branch below picks what goes inside it.
+        //
+        // `VideoPreview` rides along only while a video is open: the `f`
+        // binding for fullscreen lives there, so the letter is dead in the
+        // grid (where the search box would otherwise lose it) and live the
+        // moment the preview replaces the grid.
+        let video_preview = self.preview_player(cx).is_some();
         let shell = v_flex()
             .size_full()
             .gap_1()
             .key_context("Workspace")
+            .when(video_preview, |shell| {
+                shell.key_context(crate::VIDEO_PREVIEW_CONTEXT)
+            })
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(|this, _: &MoveLeft, _, cx| {
                 this.move_selection(Direction::Left, cx);
