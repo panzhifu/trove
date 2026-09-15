@@ -26,7 +26,7 @@ cargo run -p trove-app
 
 > Needs the [Rust toolchain](https://www.rust-lang.org/tools/install). First launch creates a library under your platform's config directory; open **Settings** to relocate it.
 
-This README summarizes what ships. The **[Chinese README](./README.zh.md)** is the canonical, most up-to-date document.
+This README summarizes what ships. The **[Chinese README](./README.md)** is the canonical, most up-to-date document.
 
 [docs/](docs/README.md) · [Feature gaps](docs/FEATURE-GAPS.md)
 
@@ -56,9 +56,10 @@ This README summarizes what ships. The **[Chinese README](./README.zh.md)** is t
 ### Browse & inspect
 
 - **Three views** — grid (justified layout) / list / timeline, with density slider, multi-select and a floating toolbar.
+- **Shape & aspect filters** — the toolbar shape filter (landscape / portrait / square) carries media aspect presets — WeChat cover 2.35:1, video 16:9, vertical video 9:16, photo 4:3 / 3:4, square 1:1 — matched with 3% tolerance so rounded dimensions still hit.
 - **Inspector** — thumbnail + tags + color palette + inline editing (title / description / source URL / rating); properties page shows MIME / size / dimensions / SHA-256; one-click reveal of the underlying file.
 - **Animated images** — GIF / animated WebP / APNG play frame-by-frame in the preview dialog and Inspector; grid thumbnails stay static for performance.
-- **Font live previews** — specimen-card thumbnails rasterized in the font itself at import; sample text customizable in Settings; a Fonts system view and per-font system install / uninstall from the Inspector.
+- **Font live previews** — specimen-card thumbnails rasterized in the font itself at import, with a family-name caption; sample text supports `{name}` / `{family}` placeholders and is customizable in Settings; a Fonts system view and per-font system install / uninstall from the Inspector.
 - **Recently viewed** — sidebar of the last 200 assets; trashed assets drop out until restored.
 
 ### 3D model preview
@@ -72,7 +73,7 @@ This README summarizes what ships. The **[Chinese README](./README.zh.md)** is t
 ### Video & screenshots
 
 - **Silent preview** — frame-by-frame ffmpeg decode with play / pause / seek / timeline; no audio pipeline.
-- **Screenshot capture** — full screen or interactive region, imported as PNG. Platform-native backends (gnome-screenshot / scrot / macOS screencapture / Windows snippingtool), user-overridable.
+- **Screenshot capture** — full screen or interactive region, imported as PNG. Full-screen shots are captured in-process via xcap (wlr-screencopy on Wayland, XCB on X11, ScreenCaptureKit on macOS, Windows) with no portal dialogs; region picking falls back to external tools (grim+slurp / scrot / macOS screencapture); custom command override.
 - **Batch conversion** — re-encode images to JPEG / PNG / WebP / BMP / TIFF, optional longest-edge cap, optional re-import.
 
 ### Maintenance & safety
@@ -111,7 +112,7 @@ cargo test -p trove-core
 cargo run -p trove-app
 ```
 
-**Baseline: `trove-core` 310 + `trove-app` 22 all pass; `cargo fmt --check` clean; clippy 0 warnings workspace-wide.** Two real-GPU smoke tests live in `trove-app` (EDL, meshlet culling) and skip automatically on headless machines.
+**Baseline: `trove-core` 339 + `trove-app` 23 all pass; `cargo fmt --check` clean; clippy 0 warnings workspace-wide.** Two real-GPU smoke tests live in `trove-app` (EDL, meshlet culling) and skip automatically on headless machines.
 
 What is still missing vs. Eagle / Billfish / digiKam / Adobe Bridge is mapped in [docs/FEATURE-GAPS.md](docs/FEATURE-GAPS.md).
 
