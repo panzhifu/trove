@@ -851,11 +851,6 @@ impl GpuRenderer {
         }
     }
 
-    /// MSAA sample count a settled frame is drawn with (1 = none).
-    pub fn samples(&self) -> u32 {
-        self.samples
-    }
-
     /// Largest mesh the GPU upload is allowed to hold. Above this the
     /// viewport falls back to the CPU rasterizer, which renders at a
     /// bounded resolution regardless of how many triangles the model has.

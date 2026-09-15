@@ -180,7 +180,6 @@ impl ModelViewport {
         self.dirty = false;
         self.in_flight = true;
         cx.spawn(async move |weak, cx| {
-            let started = Instant::now();
             let outcome = cx
                 .background_executor()
                 .spawn(async move {
@@ -197,14 +196,12 @@ impl ModelViewport {
                     })
                 })
                 .await;
-            let elapsed = started.elapsed().as_secs_f32() * 1000.0;
 
             weak.update(cx, |this, cx| {
                 this.in_flight = false;
                 match outcome {
                     Rendered::Frame(frame) => {
                         this.error = None;
-                        this.frame_ms = elapsed;
                         this.pending = Some(frame);
                         this.last_frame = Some(std::time::Instant::now());
                     }
@@ -219,7 +216,6 @@ impl ModelViewport {
                         this.gpu_demoted = true;
                         this.backend = Backend::Cpu(reason.clone());
                         this.error = Some(reason);
-                        this.frame_ms = elapsed;
                         this.pending = Some(frame);
                         this.last_frame = Some(std::time::Instant::now());
                     }
@@ -255,12 +251,6 @@ impl ModelViewport {
         let width = (width * factor).round().max(MIN_FRAME_EDGE) as u32;
         let height = (height * factor).round().max(MIN_FRAME_EDGE) as u32;
         (width, height)
-    }
-
-    /// MSAA samples a frame gets. Informational: the GPU's pipelines are
-    /// built with it once, the CPU picks its own supersampling.
-    pub fn samples(&self) -> u32 {
-        self.gpu.as_ref().map_or(1, |gpu| gpu.samples())
     }
 
     /// Whether a gesture is in progress, i.e. whether this frame is a draft.
