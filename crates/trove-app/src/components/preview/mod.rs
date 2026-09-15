@@ -40,7 +40,7 @@ use uuid::Uuid;
 const ZOOM_FACTOR: f32 = 1.15;
 
 use crate::library::LibraryController;
-use video::{PlayerResume, VideoPlayer, VideoPlayerEvent};
+use video::{FullscreenSeed, PlayerResume, VideoPlayer, VideoPlayerEvent};
 
 /// Which placement renders the preview; the kinds differ in what "as large
 /// as useful" means for them.
@@ -266,6 +266,18 @@ impl AssetPreviewPanel {
                         let Some(original) = this.data.original.clone() else {
                             return;
                         };
+                        // Hand over what the panel already knows: the
+                        // probed facts (no second ffprobe on the click
+                        // path) and the frame on screen (the fullscreen
+                        // window opens on a picture, not on black).
+                        let seed = {
+                            let player = player.read(cx);
+                            FullscreenSeed {
+                                facts: player.facts(),
+                                has_audio: player.has_audio(),
+                                frame: player.current_frame(),
+                            }
+                        };
                         let host = cx.weak_entity();
                         fullscreen::open(
                             host,
@@ -277,6 +289,7 @@ impl AssetPreviewPanel {
                                 muted,
                                 playing: true,
                             },
+                            seed,
                             cx,
                         );
                     },

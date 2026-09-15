@@ -59,9 +59,10 @@ const CONTROLS_WATCH_INTERVAL: Duration = Duration::from_millis(400);
 /// the pointer inside it keeps the floating row visible.
 const CONTROLS_BAND: f32 = 96.;
 
-/// The playback speeds offered in the menu. All inside the 0.5–2.0
-/// single-instance range of ffmpeg's `atempo`, so no filter chain.
-const SPEEDS: [f32; 6] = [0.5, 0.75, 1.0, 1.25, 1.5, 2.0];
+/// The playback speeds offered in the menu. The range matches what
+/// [`video::atempo_filter`] can chain for the audio side, so the pitch
+/// holds at every preset.
+const SPEEDS: [f32; 9] = [0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 2.0, 3.0, 4.0];
 
 /// The process-wide audio output. `OutputStream` has to stay alive for as
 /// long as any player might make sound, so it lives in a global; the sink
@@ -126,6 +127,16 @@ impl Default for PlayerResume {
     }
 }
 
+/// What the panel hands to the fullscreen player: the facts it already
+/// probed — so opening the window does not run ffprobe a second time on
+/// the click path — and the frame it is showing, so the window opens on a
+/// picture instead of a black gap until its own first decode lands.
+pub(crate) struct FullscreenSeed {
+    pub facts: VideoStreamFacts,
+    pub has_audio: bool,
+    pub frame: Option<Arc<RenderImage>>,
+}
+
 /// Spawn the live player for `data`, or `None` when the kind is not video,
 /// ffmpeg is unavailable, or the file cannot be probed.
 pub(super) fn spawn_player(data: &AssetPreviewData, cx: &mut App) -> Option<Entity<VideoPlayer>> {
@@ -144,15 +155,18 @@ pub(super) fn spawn_player(data: &AssetPreviewData, cx: &mut App) -> Option<Enti
 pub(super) fn spawn_fullscreen(
     path: PathBuf,
     resume: PlayerResume,
+    seed: FullscreenSeed,
     cx: &mut App,
-) -> Option<Entity<VideoPlayer>> {
-    let player = VideoPlayer::spawn(path, resume, cx)?;
+) -> Entity<VideoPlayer> {
+    let player = cx.new(|cx| {
+        VideoPlayer::with_facts(path, seed.facts, seed.has_audio, seed.frame, resume, cx)
+    });
     player.update(cx, |this, cx| {
         this.fullscreen_mode = true;
         this.start_controls_watcher(cx);
         cx.notify();
     });
-    Some(player)
+    player
 }
 
 /// The cover: the library thumbnail at the inspector card's aspect height,
@@ -237,13 +251,14 @@ impl VideoPlayer {
     fn spawn(path: PathBuf, resume: PlayerResume, cx: &mut App) -> Option<Entity<Self>> {
         let facts = video::probe(&path)?;
         let has_audio = video::has_audio_track(&path);
-        Some(cx.new(|cx| Self::with_facts(path, facts, has_audio, resume, cx)))
+        Some(cx.new(|cx| Self::with_facts(path, facts, has_audio, None, resume, cx)))
     }
 
     fn with_facts(
         path: PathBuf,
         facts: VideoStreamFacts,
         has_audio: bool,
+        first_frame: Option<Arc<RenderImage>>,
         resume: PlayerResume,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -313,7 +328,9 @@ impl VideoPlayer {
             path,
             facts,
             pending: None,
-            shown: None,
+            // The fullscreen window is seeded with the frame the panel was
+            // showing; a fresh panel player starts black.
+            shown: first_frame,
             playing: resume.playing,
             position_ms: resume.position_ms,
             seek_to: None,
@@ -686,6 +703,23 @@ impl VideoPlayer {
             }
         })
         .detach();
+    }
+
+    /// The probed stream facts; the fullscreen window reuses them instead
+    /// of probing the file a second time.
+    pub(crate) fn facts(&self) -> VideoStreamFacts {
+        self.facts
+    }
+
+    /// Whether the file carries an audio stream.
+    pub(crate) fn has_audio(&self) -> bool {
+        self.has_audio
+    }
+
+    /// The frame currently on screen, used to seed the fullscreen window so
+    /// it opens on a picture instead of black.
+    pub(crate) fn current_frame(&self) -> Option<Arc<RenderImage>> {
+        self.shown.clone()
     }
 
     /// Position and playing flag, read by the fullscreen host on exit to
