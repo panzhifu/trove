@@ -45,6 +45,7 @@ use uuid::Uuid;
 use crate::app::actions::{ClearSelection, MoveDown, MoveLeft, MoveRight, MoveUp, OpenPreview};
 use crate::components::preview::{
     AssetPreviewData, AssetPreviewEvent, AssetPreviewPanel, ModelViewport, ModelViewportEvent,
+    VideoPlayer,
 };
 use crate::library::{GRID_PAGE_SIZE, LibraryController, ViewMode};
 
@@ -216,6 +217,15 @@ pub struct WorkspacePanel {
 }
 
 impl WorkspacePanel {
+    /// The live video player of the preview, when the preview is showing a
+    /// video. The app view renders it as its fullscreen stage.
+    pub(crate) fn preview_player(&self, cx: &App) -> Option<Entity<VideoPlayer>> {
+        match &self.preview {
+            Some(MainPreview::Asset(panel)) => panel.read(cx).video_player(),
+            _ => None,
+        }
+    }
+
     /// Which renderer is painting an open model viewport, for the status
     /// bar. `None` when no model preview is open.
     pub(crate) fn viewport_backend(&self) -> Option<&str> {
