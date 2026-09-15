@@ -15,18 +15,18 @@
 //! cannot own state). Every mutation bumps [`RuleDraft::revision`]; the
 //! dialog recomputes the live match count whenever the revision moved.
 //!
-//! The accent color is picked with the gpui-kit base [`ColorPickerState`]
-//! (hex field + HSL sliders kept in sync by the component itself); the
-//! swatch row is built from base [`ColorSwatch`]s over a curated palette.
+//! The accent color is picked with the gpui-kit base [`ColorPickerState`],
+//! reusing the workspace colour filter's panels (`color_panel`): a
+//! palette / HSLA tab pair over the shared picker state. The dialog is a
+//! two-column layout — conditions on the left, the color column on the right.
 
 use gpui::{Hsla, Rgba};
-use gpui_kit::base::{ColorPickerEvent, ColorPickerState, ColorSwatch};
+use gpui_kit::base::{ColorPickerEvent, ColorPickerState};
 use gpui_kit::base::{h_flex, v_flex};
 use gpui_kit::component::WindowExt as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
-use gpui_kit::component::slider::{Slider, SliderState};
 use gpui_kit::component::{ActiveTheme, IconName, Sizable};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -36,6 +36,7 @@ use trove_core::store::{smart, smart_collections, tags};
 use uuid::Uuid;
 
 use crate::library::LibraryController;
+use crate::panels::workspace::{color_panel, recent_picker_colors};
 
 // ============================ draft state ====================================
 
@@ -423,12 +424,6 @@ fn join_tree(inter_and: bool, groups: &[(bool, Vec<SmartNode>)]) -> SmartNode {
 
 // ============================ color helpers ==================================
 
-/// Curated palette for smart-collection colors.
-const COLOR_PALETTE: [u32; 16] = [
-    0xef4444, 0xf97316, 0xeab308, 0x84cc16, 0x22c55e, 0x14b8a6, 0x06b6d4, 0x3b82f6, 0x6366f1,
-    0xa855f7, 0xec4899, 0xf43f5e, 0x78716c, 0x57534e, 0x1f2937, 0x0f172a,
-];
-
 fn u32_to_hsla(n: u32) -> Hsla {
     Rgba {
         r: ((n >> 16) & 0xff) as f32 / 255.,
@@ -655,7 +650,7 @@ pub fn open_rule_editor(
                 })
                 .to_string(),
             )
-            .width(px(680.))
+            .width(px(760.))
             .child(render_body(&draft, status, cx))
             .on_ok({
                 let draft = draft.clone();
@@ -751,21 +746,22 @@ fn render_body(
         (d.name_input.clone(), d.inter_and_mode, d.groups.len())
     };
 
-    let mut body = v_flex()
+    // Left column: the name and every condition group.
+    let mut conditions = v_flex()
         .gap_3()
-        .w_full()
+        .flex_1()
+        .min_w_0()
         .child(
             v_flex()
                 .gap_1()
                 .child(field_label(cx, "rules.name"))
                 .child(Input::new(&name_input).small().appearance(true)),
         )
-        .child(render_color_section(draft, cx))
         .child(field_label(cx, "rules.conditions"));
 
     for gix in 0..group_count {
         if gix == 1 {
-            body = body.child(render_inter_separator(draft, inter_and_mode, cx));
+            conditions = conditions.child(render_inter_separator(draft, inter_and_mode, cx));
         }
         let (and_mode, rows): (bool, Vec<(usize, SmartField, SmartCompare)>) = {
             let d = draft.read(cx);
@@ -780,7 +776,7 @@ fn render_body(
                     .collect(),
             )
         };
-        body = body.child(render_group(
+        conditions = conditions.child(render_group(
             draft,
             gix,
             and_mode,
@@ -790,7 +786,7 @@ fn render_body(
         ));
     }
 
-    body.child(
+    let conditions = conditions.child(
         h_flex()
             .items_center()
             .gap_2()
@@ -811,60 +807,50 @@ fn render_body(
                 (_, Some(err)) => div().text_xs().text_color(cx.theme().danger).child(err),
                 (None, None) => div(),
             }),
+    );
+
+    // Two columns: conditions on the left, the color column on the right.
+    v_flex().w_full().child(
+        h_flex()
+            .items_start()
+            .gap_4()
+            .child(conditions)
+            .child(render_color_panel(draft, cx)),
     )
 }
 
-/// Accent color: preview swatch + editable hex field + three HSL sliders +
-/// curated swatch row, all synced through the picker state.
-fn render_color_section(draft: &Entity<RuleDraft>, cx: &mut App) -> Div {
-    let (picker, color) = {
-        let d = draft.read(cx);
-        (d.picker.clone(), d.color.clone())
-    };
-    let displayed = picker.read(cx).displayed_color();
-    let hex_input = picker.read(cx).hex_input().clone();
-    let sliders = picker.read(cx).sliders().clone();
+/// Right column: the accent color, rendered with the same panels as the
+/// workspace colour filter (palette / HSLA tabs over the shared picker
+/// state). A smart collection's color is optional, so a clear button sits
+/// beside the label.
+fn render_color_panel(draft: &Entity<RuleDraft>, cx: &mut App) -> Div {
+    let picker = draft.read(cx).picker.clone();
+    let featured = recent_picker_colors(cx);
+    let d = draft.clone();
 
     v_flex()
-        .gap_1p5()
-        .child(field_label(cx, "rules.color"))
-        // Current pick, editable as hex; right-click copies the value (same
-        // as the Inspector swatches).
+        .w(px(300.))
+        .flex_shrink_0()
+        .gap_2()
+        .border_l_1()
+        .border_color(cx.theme().border)
+        .pl_4()
         .child(
             h_flex()
+                .justify_between()
                 .items_center()
-                .gap_1p5()
-                .child(match displayed {
-                    Some(c) => div()
-                        .id("pick-preview")
-                        .size_5()
-                        .rounded_full()
-                        .bg(c)
-                        .border_1()
-                        .border_color(cx.theme().border)
-                        .on_mouse_down(gpui::MouseButton::Right, {
-                            let hex = color.clone();
-                            move |_, _, cx| {
-                                if let Some(hex) = &hex {
-                                    cx.write_to_clipboard(gpui::ClipboardItem::new_string(
-                                        hex.clone(),
-                                    ));
-                                }
-                            }
+                .child(field_label(cx, "rules.color"))
+                .child(
+                    Button::new("color-clear")
+                        .xsmall()
+                        .ghost()
+                        .label(rust_i18n::t!("tags.no_color").to_string())
+                        .on_click(move |_, window, cx| {
+                            d.update(cx, |d, cx| d.set_color(None, window, cx));
                         }),
-                    None => div()
-                        .id("pick-none")
-                        .size_5()
-                        .rounded_full()
-                        .border_1()
-                        .border_color(cx.theme().border),
-                })
-                .child(Input::new(&hex_input).small().w(px(92.)).appearance(true)),
+                ),
         )
-        .child(slider_row("rules.hue", sliders.hue(), cx))
-        .child(slider_row("rules.saturation", sliders.saturation(), cx))
-        .child(slider_row("rules.lightness", sliders.lightness(), cx))
-        .child(color_swatches_row(draft, color, cx))
+        .child(color_panel(&picker, featured, cx))
 }
 
 /// The separator between condition groups: two rules with the switchable
@@ -1138,52 +1124,6 @@ fn render_row(
     })
 }
 
-/// Curated palette rendered as gpui-kit base swatches (radio semantics,
-/// accessible hex names).
-fn color_swatches_row(draft: &Entity<RuleDraft>, color: Option<String>, cx: &App) -> Div {
-    let mut row = h_flex().flex_wrap().gap_1().child({
-        // "No color" clears the accent.
-        let d = draft.clone();
-        let selected = color.is_none();
-        div()
-            .id("swatch-none")
-            .cursor_pointer()
-            .size_5()
-            .rounded_full()
-            .border_1()
-            .border_color(if selected {
-                cx.theme().foreground
-            } else {
-                cx.theme().border
-            })
-            .when(selected, |this| this.border_2())
-            .on_click(move |_, window, cx| {
-                d.update(cx, |d, cx| d.set_color(None, window, cx));
-            })
-    });
-    for (ix, c) in COLOR_PALETTE.iter().enumerate() {
-        let hex = format!("#{c:06x}");
-        let selected = color.as_deref() == Some(hex.as_str());
-        let d = draft.clone();
-        let hex_click = hex.clone();
-        row = row.child(
-            ColorSwatch::new(("swatch", ix), u32_to_hsla(*c))
-                .selected(selected)
-                .h_5()
-                .w_5()
-                .rounded_full()
-                .bg(u32_to_hsla(*c))
-                .border_1()
-                .border_color(cx.theme().border)
-                .when(selected, |this| this.border_2())
-                .on_click(move |_, _, window, cx| {
-                    d.update(cx, |d, cx| d.set_color(Some(hex_click.clone()), window, cx));
-                }),
-        );
-    }
-    row
-}
-
 // ---- small widget helpers ---------------------------------------------------
 
 /// A button whose dropdown lets the user pick one of `options`
@@ -1214,20 +1154,6 @@ fn dropdown_button<T: PartialEq + Clone + 'static>(
             }
             menu
         })
-}
-
-fn slider_row(label_key: &'static str, state: &Entity<SliderState>, cx: &App) -> Div {
-    h_flex()
-        .items_center()
-        .gap_2()
-        .child(
-            div()
-                .w(px(36.))
-                .text_xs()
-                .text_color(cx.theme().muted_foreground)
-                .child(rust_i18n::t!(label_key).to_string()),
-        )
-        .child(Slider::new(state).horizontal().flex_1())
 }
 
 fn field_label(cx: &App, key: &'static str) -> Div {

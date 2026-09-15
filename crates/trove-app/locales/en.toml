@@ -253,10 +253,6 @@ f_aspect = "Aspect ratio"
 f_orientation = "Orientation"
 
 color = "Color"
-hue = "Hue"
-saturation = "Sat"
-lightness = "Light"
-
 op_eq = "is"
 op_ne = "is not"
 op_gt = ">"
