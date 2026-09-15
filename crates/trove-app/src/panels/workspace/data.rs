@@ -219,6 +219,8 @@ impl WorkspacePanel {
             debounce_timer: None,
             preview: None,
             preview_subscription: None,
+            viewport_backend: None,
+            viewport_observer: None,
             fonts_scan_task: None,
             total_refresh: None,
             count_recheck: false,

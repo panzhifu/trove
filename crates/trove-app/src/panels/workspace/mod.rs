@@ -171,6 +171,16 @@ pub struct WorkspacePanel {
     preview: Option<MainPreview>,
     /// Kept so the preview's close event stops arriving when it is dropped.
     preview_subscription: Option<Subscription>,
+    /// Which renderer is painting an open model viewport, as the status bar
+    /// shows it. `None` when no model preview is open. Carried here — rather
+    /// than read on demand by the app view, which cannot reach through the
+    /// dock to the panel — and refreshed by the viewport observer, which
+    /// only forwards actual changes, so a drag that notifies every frame
+    /// costs one string comparison.
+    viewport_backend: Option<String>,
+    /// The live viewport watcher behind [`WorkspacePanel::viewport_backend`];
+    /// dropped with the preview.
+    viewport_observer: Option<Subscription>,
     /// In-flight system-font scan for the fonts view; `None` once started
     /// and finished (the result lives on the controller).
     fonts_scan_task: Option<gpui::Task<()>>,
@@ -200,6 +210,12 @@ pub struct WorkspacePanel {
 }
 
 impl WorkspacePanel {
+    /// Which renderer is painting an open model viewport, for the status
+    /// bar. `None` when no model preview is open.
+    pub(crate) fn viewport_backend(&self) -> Option<&str> {
+        self.viewport_backend.as_deref()
+    }
+
     /// Schedule one exact re-count of the grid total after a refresh that
     /// reused the cached number, so the displayed count catches up once the
     /// churn (import burst, one-off edit) settles.

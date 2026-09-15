@@ -1,5 +1,5 @@
 <!doctype html>
-<html>
+<html lang="zh-CN">
 <head>
   <meta charset="utf-8" />
   <style>
@@ -9,16 +9,19 @@
     input { flex: 1; background: #1f1f1f; border: 1px solid #333; color: #eee; border-radius: 6px; padding: 4px 8px; }
     button { background: #2563eb; border: 0; color: white; border-radius: 6px; padding: 5px 10px; cursor: pointer; }
     #status { min-height: 18px; color: #9a9a9a; }
+    .hint { color: #777; line-height: 1.5; margin: 8px 0 0; }
+    .hint b { color: #aaa; font-weight: normal; }
   </style>
 </head>
 <body>
-  <h1>Trove Collector</h1>
+  <h1>Trove 采集器</h1>
   <div class="row">
-    <input id="port" type="number" placeholder="port" />
-    <button id="save">Save</button>
+    <input id="port" type="number" placeholder="端口" />
+    <button id="save">保存</button>
   </div>
-  <div class="row"><button id="ping">Test connection</button><span id="status"></span></div>
-  <p style="color:#777">Right-click any image → "Save image to Trove". The Trove app must be running.</p>
+  <div class="row"><button id="ping">测试连接</button><span id="status"></span></div>
+  <p class="hint">右键网页图片 →「保存图片到 Trove」。需先启动 Trove 桌面应用。<br>
+  连不上时：确认 Trove 正在运行；Firefox 还需在 <b>about:addons ▸ Trove 采集器 ▸ 权限</b> 里勾选「访问所有网站的数据」。</p>
   <script src="popup.js"></script>
 </body>
 </html>

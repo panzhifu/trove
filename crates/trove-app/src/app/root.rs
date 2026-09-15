@@ -29,6 +29,7 @@ use crate::library::{ImportPhase, LibraryController, SelectionSource};
 use crate::panels::{ExplorerPanel, FoldersPanel, InspectorPanel, TagsPanel, WorkspacePanel};
 use trove_core::config::AppConfig;
 use trove_core::library::Library;
+use trove_core::services::update;
 use uuid::Uuid;
 
 fn default_library_path() -> PathBuf {
@@ -37,10 +38,63 @@ fn default_library_path() -> PathBuf {
     AppConfig::load().resolved_library_path()
 }
 
+/// The release worth telling the user about, or `None`.
+///
+/// The status bar asks on every frame, so the config file is only read when a
+/// newer release is actually on the table — and a version the user already
+/// waved off is filtered out here rather than inside the update service,
+/// which knows nothing about preferences.
+fn pending_update() -> Option<(String, String)> {
+    let (version, page) = update::available()?;
+    let skipped = AppConfig::load().skipped_version().map(str::to_string);
+    if skipped.as_deref() == Some(version.as_str()) {
+        return None;
+    }
+    Some((version, page))
+}
+
+/// Ask GitHub for the newest release on the background executor, then stamp
+/// the check and repaint.
+///
+/// `delay` keeps the launch path from competing with the first paint and the
+/// startup library scan; the Help menu and Settings pass zero.
+///
+/// Every surface reads the same state out of [`trove_core::services::update`],
+/// so one `refresh_windows` updates the status bar, the About dialog and the
+/// Settings row together. The timestamp is written even when the check fails:
+/// an offline machine should not probe GitHub again on every single launch.
+fn spawn_update_check(cx: &mut App, delay: std::time::Duration) {
+    cx.spawn(async move |cx| {
+        if !delay.is_zero() {
+            cx.background_executor().timer(delay).await;
+        }
+        cx.background_executor()
+            .spawn(async { update::check_now(env!("CARGO_PKG_VERSION")) })
+            .await;
+        cx.update(|cx| {
+            let mut config = AppConfig::load();
+            let _ = config.record_update_check(update::now_unix());
+            cx.refresh_windows();
+        });
+    })
+    .detach();
+}
+
+/// Help ▸ Check for Updates… and the Settings button: the same probe, run the
+/// moment the user asks for it.
+pub(crate) fn run_update_check(cx: &mut App) {
+    spawn_update_check(cx, std::time::Duration::ZERO);
+}
+
 /// Root view: owns the controller and hosts the dock area, plus a drop
 /// surface that imports any dropped files into the current collection.
 pub struct AppView {
     controller: Entity<LibraryController>,
+    /// The renderer description last seen on the workspace panel, carried
+    /// into the status bar. The panel only notifies when it changes, and this
+    /// copy is compared against again on each notify so a redundant one can
+    /// never re-render the whole app view.
+    viewport_backend: Option<String>,
     dock: Entity<gpui_kit::component::dock::DockArea>,
     /// The inspector panel entity, kept so the selection observer can switch
     /// the right dock to its tab (see [`AppView::show_inspector`]).
@@ -75,9 +129,25 @@ impl AppView {
         let tags = cx.new(|cx| TagsPanel::new(cx, controller.clone()));
         let inspector = cx.new(|cx| InspectorPanel::new(window, cx, controller.clone()));
 
+        // Status bar ← model renderer: the workspace panel watches its model
+        // viewport and only speaks up when the renderer description changes
+        // (GPU adapter name, CPU fallback reason, stream progress), so this
+        // observer does not fire on every drag frame.
+        cx.observe(&workspace, |this, workspace, cx| {
+            let backend = workspace.read(cx).viewport_backend().map(str::to_string);
+            if backend != this.viewport_backend {
+                this.viewport_backend = backend;
+                cx.notify();
+            }
+        })
+        .detach();
+
         // Trove draws its own title bar (see `app::dock_skin`): the framework
         // skin always appends a "⋯" menu, and there is no switch for it.
         let dock = crate::app::dock_skin::dock_area("trove", None, window, cx);
+        // The dock keeps its own handle on the panel; this clone is what the
+        // status bar reads through.
+        let workspace_view = workspace.clone();
         dock.update(cx, |area, cx| {
             // Panels must be registered through `panel_handle` + `panel_view`:
             // a bare entity (`DockLayout::panel`) cannot be downcast back into
@@ -130,8 +200,24 @@ impl AppView {
         crate::library::jobs::start_watch_service(&controller, window.window_handle(), cx);
         start_collect_server(cx);
 
+        // At most one release check a day, well after the window is up (see
+        // `update_check_due`). An unreachable GitHub is silent by design:
+        // offline is the normal case for a local-first app.
+        let config = AppConfig::load();
+        if config.update_check() && config.update_check_due(update::now_unix()) {
+            spawn_update_check(cx, update::STARTUP_DELAY);
+        }
+
+        // Read the panel's initial state here: the observe registration
+        // above only speaks up on a change, so the first value has to be
+        // picked up by hand.
+        let initial_backend = workspace_view
+            .read(cx)
+            .viewport_backend()
+            .map(str::to_string);
         Self {
             controller,
+            viewport_backend: initial_backend,
             dock,
             inspector,
             last_selection: Vec::new(),
@@ -400,7 +486,42 @@ impl AppView {
                     .truncate()
                     .child(rust_i18n::t!("statusbar.library", path = root).to_string()),
             )
+            // Which renderer is drawing an open 3D model: the GPU adapter, a
+            // CPU fallback reason, or the progress of a load that is still
+            // running. The model viewport used to carry this in the panel's
+            // title bar; the status bar is where machine-level facts belong,
+            // and the vacated title-bar room is where the preview's next
+            // tools go.
+            .when_some(self.viewport_backend.clone(), |bar, backend| {
+                bar.child(div().max_w(px(360.)).truncate().child(backend))
+            })
             .child(import)
+            // The release badge: the only place a pending update is announced
+            // without the user asking. Clicking it opens the release page —
+            // installing is the user's call, not ours.
+            .when_some(pending_update(), |bar, (version, page)| {
+                bar.child(
+                    div()
+                        .id("statusbar-update")
+                        .cursor_pointer()
+                        .text_color(cx.theme().info)
+                        .hover(|style| style.underline())
+                        .child(
+                            rust_i18n::t!("statusbar.update_available", version = version)
+                                .to_string(),
+                        )
+                        .tooltip({
+                            let hint = rust_i18n::t!("statusbar.update_hint").to_string();
+                            move |window, cx| {
+                                gpui_kit::component::tooltip::Tooltip::new(hint.clone())
+                                    .build(window, cx)
+                            }
+                        })
+                        .on_click(move |_, _, _| {
+                            let _ = trove_core::services::open_external::open_url(&page);
+                        }),
+                )
+            })
             .when_some(notice, |bar, notice| {
                 bar.child(
                     div()
@@ -642,7 +763,27 @@ impl AppView {
                         .child(
                             rust_i18n::t!("app.version", version = env!("CARGO_PKG_VERSION"))
                                 .to_string(),
-                        ),
+                        )
+                        // A pending release, offered where new versions are
+                        // usually looked for. Nothing appears here when the
+                        // build is current or the last check failed.
+                        .when_some(pending_update(), |column, (version, page)| {
+                            column.child(
+                                div()
+                                    .id("about-update")
+                                    .cursor_pointer()
+                                    .text_color(rgb(0x185fa5))
+                                    .hover(|style| style.underline())
+                                    .child(
+                                        rust_i18n::t!("app.update_available", version = version)
+                                            .to_string(),
+                                    )
+                                    .on_click(move |_, _, _| {
+                                        let _ =
+                                            trove_core::services::open_external::open_url(&page);
+                                    }),
+                            )
+                        }),
                 ))
         });
     }
@@ -777,6 +918,9 @@ impl Render for AppView {
             }))
             .on_action(cx.listener(|this, _: &About, window, cx| {
                 this.show_about(window, cx);
+            }))
+            .on_action(cx.listener(|_, _: &CheckUpdates, _, cx| {
+                run_update_check(cx);
             }))
             .child(self.title_bar.clone())
             .child(div().flex_1().min_h_0().child(self.dock.clone()))

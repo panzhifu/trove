@@ -11,3 +11,4 @@ pub mod title_bar;
 mod root;
 
 pub use root::AppView;
+pub(crate) use root::run_update_check;

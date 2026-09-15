@@ -1,8 +1,10 @@
 //! General page: library location, import mode, recents, watched
-//! folders, collect service, preview zoom limits and library statistics.
+//! folders, collect service, preview zoom limits, library statistics and
+//! the release check.
 
 use super::*;
 use gpui_kit::component::setting::NumberFieldOptions;
+use trove_core::services::update::{self, UpdateState};
 
 // ============================ general page ===================================
 
@@ -118,6 +120,7 @@ pub(super) fn general_page(
         .group(recent_libraries_group(&controller))
         .group(watch_folders_group())
         .group(collect_group())
+        .group(update_group())
         .group(stats_group(stats))
         .group(zoom_group())
 }
@@ -615,4 +618,138 @@ fn zoom_group() -> SettingGroup {
             )
             .description(rust_i18n::t!("settings.preview_zoom_max_desc").to_string()),
         )
+}
+
+// ================================ updates ===================================
+
+/// General ▸ Updates: the daily release check, what the last one found, and a
+/// button to ask right now.
+///
+/// The check only reads the newest tag from GitHub and offers the release
+/// page — installing the new build is left to the user (or to their package
+/// manager), which is why there is no "install" button here.
+fn update_group() -> SettingGroup {
+    let state = update::state();
+    SettingGroup::new()
+        .title(rust_i18n::t!("settings.updates").to_string())
+        .item(
+            SettingItem::new(
+                rust_i18n::t!("settings.update_check").to_string(),
+                SettingField::render(|_, _, cx| update_toggle_row(cx)),
+            )
+            .description(rust_i18n::t!("settings.update_check_desc").to_string()),
+        )
+        .item(SettingItem::new(
+            rust_i18n::t!("settings.update_status").to_string(),
+            SettingField::render(move |_, _, cx| update_status_row(&state, cx)),
+        ))
+        .item(SettingItem::new(
+            rust_i18n::t!("settings.update_now").to_string(),
+            SettingField::render(|_, _, cx| update_now_row(cx)),
+        ))
+}
+
+/// The check-on-launch switch. Turning it back on clears the timestamp, so
+/// the next render of the app checks immediately instead of tomorrow.
+fn update_toggle_row(_cx: &mut App) -> Div {
+    let enabled = AppConfig::load().update_check();
+    h_flex().w_full().justify_end().child(
+        Button::new("update-check-toggle")
+            .outline()
+            .small()
+            .label(if enabled {
+                rust_i18n::t!("settings.update_on").to_string()
+            } else {
+                rust_i18n::t!("settings.update_off").to_string()
+            })
+            .on_click(|_, _, cx| {
+                let mut config = AppConfig::load();
+                let enabled = !config.update_check();
+                config.update_check = Some(enabled);
+                if enabled {
+                    // A missing timestamp reads as "never checked", which is
+                    // due at once — so switching back on checks on the next
+                    // launch rather than in 24 hours.
+                    config.last_update_check = None;
+                }
+                let _ = config.save();
+                cx.refresh_windows();
+            }),
+    )
+}
+
+/// What the last check found, plus the two things to do about it.
+///
+/// The state is read once when the page is built: a check started from here
+/// repaints the whole window when it lands, which rebuilds this row.
+fn update_status_row(state: &UpdateState, cx: &mut App) -> Div {
+    let (label, tone) = match state {
+        UpdateState::Unknown => (rust_i18n::t!("settings.update_idle").to_string(), None),
+        UpdateState::Checking => (rust_i18n::t!("settings.update_checking").to_string(), None),
+        UpdateState::Current { version } => (
+            rust_i18n::t!("settings.update_current", version = version).to_string(),
+            None,
+        ),
+        UpdateState::Available { version, .. } => (
+            rust_i18n::t!("settings.update_available", version = version).to_string(),
+            Some(cx.theme().info),
+        ),
+        UpdateState::Failed { error } => (
+            rust_i18n::t!("settings.update_failed", error = error).to_string(),
+            Some(cx.theme().warning),
+        ),
+    };
+    let mut column = v_flex().gap_1().w_full().child(
+        div()
+            .w_full()
+            .text_sm()
+            .text_color(tone.unwrap_or(cx.theme().muted_foreground))
+            .child(label),
+    );
+    if let UpdateState::Available { version, url } = state {
+        column = column.child(
+            h_flex()
+                .w_full()
+                .justify_end()
+                .gap_2()
+                .child(
+                    Button::new("update-open-page")
+                        .outline()
+                        .small()
+                        .label(rust_i18n::t!("settings.update_open_page").to_string())
+                        .on_click({
+                            let url = url.clone();
+                            move |_, _, _| {
+                                let _ = trove_core::services::open_external::open_url(&url);
+                            }
+                        }),
+                )
+                .child(
+                    Button::new("update-skip")
+                        .ghost()
+                        .small()
+                        .label(rust_i18n::t!("settings.update_skip").to_string())
+                        .on_click({
+                            let version = version.clone();
+                            move |_, _, cx| {
+                                let mut config = AppConfig::load();
+                                let _ = config.skip_version(&version);
+                                cx.refresh_windows();
+                            }
+                        }),
+                ),
+        );
+    }
+    column
+}
+
+/// Ask GitHub right now, without waiting for the next launch.
+fn update_now_row(_cx: &mut App) -> Div {
+    h_flex().w_full().justify_end().child(
+        Button::new("update-check-now")
+            .outline()
+            .small()
+            .label(rust_i18n::t!("settings.update_check_now").to_string())
+            .on_click(|_, _, cx| crate::app::run_update_check(cx)),
+    )
 }
