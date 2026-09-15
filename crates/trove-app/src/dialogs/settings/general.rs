@@ -95,22 +95,6 @@ pub(super) fn general_page(
                 )
                 .item(
                     SettingItem::new(
-                        rust_i18n::t!("settings.screenshot_command").to_string(),
-                        SettingField::input(
-                            |_cx| SharedString::from(AppConfig::load().screenshot_command_text()),
-                            |value, _cx| {
-                                let mut config = AppConfig::load();
-                                let value = value.trim().to_string();
-                                config.screenshot_command =
-                                    if value.is_empty() { None } else { Some(value) };
-                                let _ = config.save();
-                            },
-                        ),
-                    )
-                    .description(rust_i18n::t!("settings.screenshot_command_desc").to_string()),
-                )
-                .item(
-                    SettingItem::new(
                         rust_i18n::t!("settings.point_enhance").to_string(),
                         SettingField::render(|_, _, cx| point_enhance_row(cx)),
                     )
