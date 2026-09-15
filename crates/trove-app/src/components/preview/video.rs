@@ -211,6 +211,10 @@ pub(super) struct VideoPlayer {
     fullscreen_mode: bool,
     /// Whether the volume popup (vertical slider above the button) is open.
     volume_open: bool,
+    /// Set while the user drags the scrubber: the playhead previews the
+    /// drag and the loop stops feeding it, so the thumb is not yanked back
+    /// to the playing position every frame.
+    seeking: bool,
     /// Fullscreen chrome: whether the floating transport row is showing.
     /// Always true outside fullscreen, where the row lives in the layout.
     controls_shown: bool,
@@ -250,17 +254,31 @@ impl VideoPlayer {
                 .default_value(resume.position_ms as f32)
         });
         let subscription = cx.subscribe(&slider, |this, _slider, event: &SliderEvent, cx| {
-            // Dragging only shows the target; the seek happens on release.
-            if let SliderEvent::Release(value) = event {
-                let target = value.start().max(0.);
-                this.seek_to = Some(target as u64);
-                // Reflect immediately: the audio pipe rebuilds from
-                // `position_ms`, so a pause-drag-resume would otherwise
-                // start the sound at the pre-drag position.
-                this.position_ms = target as f64;
-                // The audio pipe restarts at the new position too.
-                this.audio_seq += 1;
-                cx.notify();
+            match event {
+                // Dragging previews the target and freezes the playhead: the
+                // decode loop leaves `position_ms` alone while `seeking`, so
+                // the thumb follows the pointer instead of being reset to
+                // the playing position on every frame. The seek itself
+                // happens on release, like every other desktop player.
+                SliderEvent::Change(value) => {
+                    this.seeking = true;
+                    this.position_ms = (value.start().max(0.)) as f64;
+                    this.apply_playing_state();
+                    cx.notify();
+                }
+                SliderEvent::Release(value) => {
+                    let target = value.start().max(0.);
+                    this.seeking = false;
+                    this.seek_to = Some(target as u64);
+                    // Reflect immediately: the audio pipe rebuilds from
+                    // `position_ms`, so a pause-drag-resume would otherwise
+                    // start the sound at the pre-drag position.
+                    this.position_ms = target as f64;
+                    // The audio pipe restarts at the new position too.
+                    this.audio_seq += 1;
+                    this.apply_playing_state();
+                    cx.notify();
+                }
             }
         });
         let volume_slider = cx.new(|_| {
@@ -310,6 +328,7 @@ impl VideoPlayer {
             synced_volume: if resume.muted { 0. } else { resume.volume },
             sink: None,
             fullscreen_mode: false,
+            seeking: false,
             volume_open: false,
             controls_shown: true,
             controls_hovered: false,
@@ -338,15 +357,16 @@ impl VideoPlayer {
                 let state = weak.update(cx, |this, _cx| {
                     (
                         this.playing,
+                        this.seeking,
                         this.seek_to.take(),
                         this.position_ms,
                         this.speed,
                     )
                 });
-                let Ok((playing, seek, position, speed)) = state else {
+                let Ok((playing, seeking, seek, position, speed)) = state else {
                     break;
                 };
-                if !playing {
+                if !playing || seeking {
                     // Paused: stop consuming so ffmpeg blocks on a full pipe.
                     if pipe.take().is_some() {
                         let _ = weak.update(cx, |_this, cx| cx.notify());
@@ -468,6 +488,7 @@ impl VideoPlayer {
                 let state = weak.update(cx, |this, _cx| {
                     Some((
                         this.playing,
+                        this.seeking,
                         this.audio_seq,
                         this.position_ms,
                         this.speed,
@@ -475,9 +496,14 @@ impl VideoPlayer {
                         this.muted,
                     ))
                 });
-                let Ok(Some((playing, new_seq, position, speed, volume, muted))) = state else {
+                let Ok(Some((playing, seeking, new_seq, position, speed, volume, muted))) = state
+                else {
                     break;
                 };
+                // Scrubbing counts as paused: the sink goes quiet while the
+                // user drags, and the release bumps `audio_seq`, which
+                // restarts the pipe at the new position.
+                let playing = playing && !seeking;
                 if new_seq != seq {
                     seq = new_seq;
                     // Kill the old pipe before opening the new one.
@@ -598,14 +624,20 @@ impl VideoPlayer {
     /// makes the pause immediate and independent of the loop's position.
     fn set_playing(&mut self, playing: bool, cx: &mut Context<Self>) {
         self.playing = playing;
+        self.apply_playing_state();
+        cx.notify();
+    }
+
+    /// Push the effective play state (playing, but not while scrubbing)
+    /// onto the shared sink, if one is live.
+    fn apply_playing_state(&self) {
         if let Some(sink) = &self.sink {
-            if playing {
+            if self.playing && !self.seeking {
                 sink.play();
             } else {
                 sink.pause();
             }
         }
-        cx.notify();
     }
 
     /// Pause playback (used while the fullscreen window holds the stage).
@@ -860,7 +892,10 @@ impl Render for VideoPlayer {
         // notifies every frame while playing, so render runs constantly).
         // Release events are the user's seek/apply; this is the mirror back.
         let position = self.position_ms as f32;
-        if (position - self.synced_position).abs() >= 0.5 {
+        // Never mirror while the user is dragging the thumb: the decode loop
+        // notifies every frame, so the value would be reset under the
+        // pointer and the drag would never take.
+        if !self.seeking && (position - self.synced_position).abs() >= 0.5 {
             self.synced_position = position;
             self.slider
                 .update(cx, |slider, cx| slider.set_value(position, window, cx));
@@ -883,7 +918,13 @@ impl Render for VideoPlayer {
                 .right_0()
                 .px_3()
                 .py_2()
-                .bg(black().opacity(0.55))
+                // The theme's own surface instead of a translucent black
+                // scrim: buttons, slider and time label keep the contrast
+                // they were designed for (a scrim leaves them dark-on-dark
+                // in a light theme).
+                .bg(cx.theme().popover)
+                .border_t_1()
+                .border_color(cx.theme().border)
                 .child(self.controls(cx));
             let mut root = div()
                 .relative()
