@@ -604,3 +604,9 @@ alpha = "Alpha"
 [dock]
 collapse = "Collapse Sidebar"
 expand = "Expand Sidebar"
+
+[tray]
+show_window = "Show Trove"
+import_files = "Import Files…"
+open_settings = "Settings…"
+quit = "Quit Trove"

@@ -24,6 +24,7 @@ use gpui_kit::*;
 
 use crate::app::actions::*;
 use crate::app::title_bar::TitleBarView;
+use crate::app::tray;
 use crate::library::jobs;
 use crate::library::{ImportPhase, LibraryController, SelectionSource};
 use crate::panels::{ExplorerPanel, FoldersPanel, InspectorPanel, TagsPanel, WorkspacePanel};
@@ -125,6 +126,13 @@ pub struct AppView {
     /// dead. Watching globally removes that dependency. Dropped on leave,
     /// which unregisters it.
     video_escape: Option<Subscription>,
+    /// The tray icon, when the desktop has a tray that took it. `None` means
+    /// no tray: the app then closes the old-fashioned way.
+    tray: Option<tray::Tray>,
+    /// Set while the app is quitting, so the close guard lets the window go.
+    /// Shared with the `on_window_should_close` closure, which cannot reach
+    /// the view itself.
+    quitting: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Kept alive for the life of the view: dropping it would unregister the
     /// OS light/dark observer that re-applies the appearance.
     _appearance: Subscription,
@@ -221,6 +229,44 @@ impl AppView {
         crate::library::jobs::start_watch_service(&controller, window.window_handle(), cx);
         start_collect_server(cx);
 
+        let tray = tray::Tray::install();
+        // Whether the app is on its way out: while it is, closing the window
+        // must actually close it, or the guard below would keep a quitting
+        // app alive with no window to show. Shared with that closure, which
+        // cannot reach the view.
+        let quitting = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // Closing the window minimizes it instead of ending the app — but
+        // only when there is a tray to come back from, or the close button
+        // would become a way to strand the process with no window at all.
+        // The flag is the way out: while quitting, a close is a close.
+        let has_tray = tray.is_some();
+        let quitting_for_close = quitting.clone();
+        window.on_window_should_close(cx, move |window, _cx| {
+            if quitting_for_close.load(std::sync::atomic::Ordering::Relaxed) {
+                true
+            } else if has_tray {
+                window.minimize_window();
+                false
+            } else {
+                true
+            }
+        });
+        if has_tray {
+            // The tray's own thread cannot touch windows or the library, so
+            // its commands are queued and drained here, where they can.
+            cx.spawn_in(window, async move |view, cx| {
+                loop {
+                    cx.background_executor().timer(tray::POLL).await;
+                    let _ = view.update_in(cx, |this, window, cx| {
+                        if let Some(command) = this.tray.as_ref().and_then(tray::Tray::poll) {
+                            this.run_tray_command(command, window, cx);
+                        }
+                    });
+                }
+            })
+            .detach();
+        }
+
         // At most one release check a day, well after the window is up (see
         // `update_check_due`). An unreachable GitHub is silent by design:
         // offline is the normal case for a local-first app.
@@ -247,7 +293,55 @@ impl AppView {
             video_fullscreen: false,
             video_stage_focus: cx.focus_handle(),
             video_escape: None,
+            tray,
+            quitting,
             _appearance,
+        }
+    }
+
+    /// Answer a click from the tray menu. Everything here runs on the main
+    /// thread, which is the only place a window or the library may be
+    /// touched.
+    fn run_tray_command(
+        &mut self,
+        command: tray::TrayCommand,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match command {
+            tray::TrayCommand::ShowWindow => {
+                // The window was only minimized, never closed, so it is
+                // still there to bring back.
+                window.activate_window();
+                cx.activate(true);
+            }
+            // Deliberately not `dispatch_action`: that starts at whatever
+            // holds the focus, and a minimized window may hold none — in
+            // which case the dispatch falls back to the window root and
+            // never reaches this view's handlers. Calling the same two
+            // functions the actions call keeps the tray independent of
+            // where the focus happens to be.
+            tray::TrayCommand::ImportFiles => {
+                // The window has to be back before a picker opens over it.
+                window.activate_window();
+                cx.activate(true);
+                self.prompt_import(window, cx);
+            }
+            tray::TrayCommand::OpenSettings => {
+                window.activate_window();
+                cx.activate(true);
+                crate::dialogs::settings::open(cx, self.controller.clone());
+            }
+            tray::TrayCommand::Quit => {
+                // Drop the icon first: the app must not stay in the shell
+                // after it has gone, nor look alive while it is closing.
+                self.tray = None;
+                // Let the window go, or the close guard below would keep a
+                // quitting app alive with nothing on screen.
+                self.quitting
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                cx.quit();
+            }
         }
     }
 
