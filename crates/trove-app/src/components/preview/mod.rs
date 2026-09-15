@@ -15,6 +15,7 @@
 //! content area over — the same contract [`model::ModelViewport`] offers
 //! for 3D models.
 
+mod audio;
 mod fallback;
 mod font;
 mod fullscreen;
@@ -262,7 +263,11 @@ impl AssetPreviewPanel {
                             volume,
                             muted,
                         } = *event;
-                        player.update(cx, |player, cx| player.pause(cx));
+                        // Only the picture stops here: the soundtrack is
+                        // handed to the fullscreen window through the seed,
+                        // so pausing it would cut the sound for as long as a
+                        // fresh audio pipe takes to start.
+                        player.update(cx, |player, cx| player.pause_video(cx));
                         let Some(original) = this.data.original.clone() else {
                             return;
                         };
@@ -274,8 +279,8 @@ impl AssetPreviewPanel {
                             let player = player.read(cx);
                             FullscreenSeed {
                                 facts: player.facts(),
-                                has_audio: player.has_audio(),
                                 frame: player.current_frame(),
+                                audio: player.audio(),
                             }
                         };
                         let host = cx.weak_entity();

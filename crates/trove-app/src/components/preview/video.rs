@@ -8,10 +8,11 @@
 //! probed it returns `None`, and the host falls back to the still, the
 //! same picture [`cover`] shows in the inspector.
 //!
-//! Audio rides a second ffmpeg pipe ([`AudioPipe`], signed 16-bit stereo at
-//! 44.1 kHz) into rodio. It exists only when the file carries an audio
-//! stream and the audio device opens; speed changes ride ffmpeg's `atempo`
-//! filter so the pitch holds. The two pipes are kept together by the audio
+//! Audio rides a second ffmpeg pipe (signed 16-bit stereo at 44.1 kHz) into
+//! rodio — owned by [`AudioEngine`] rather than by this player, so the
+//! soundtrack outlives any one window: opening or closing the fullscreen
+//! window never interrupts it. Speed changes ride ffmpeg's `atempo` filter
+//! so the pitch holds. The two pipes are kept together by the audio
 //! clock: rodio only reports the position inside the chunk it is playing,
 //! so the player reconstructs the soundtrack's timeline itself (chunks fed
 //! minus chunks still queued, plus that position) and the decode loop
@@ -45,14 +46,15 @@ use gpui_kit::component::slider::{Slider, SliderEvent, SliderState};
 use gpui_kit::component::{ActiveTheme, Sizable};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
-use trove_core::media::video::{self, AudioPipe, FramePipe, VideoStreamFacts};
+use trove_core::media::video::{self, FramePipe, VideoStreamFacts};
 use trove_core::model::AssetKind;
 
+use super::audio::AudioEngine;
 use super::{AssetPreviewData, fallback};
 use crate::app::actions::ExitVideoFullscreen;
 
 /// How long the decode loops sleep while paused before looking again.
-const IDLE_POLL: Duration = Duration::from_millis(120);
+pub(super) const IDLE_POLL: Duration = Duration::from_millis(120);
 
 /// Fullscreen chrome: how long the pointer must rest before the floating
 /// transport row hides itself.
@@ -64,11 +66,6 @@ const CONTROLS_WATCH_INTERVAL: Duration = Duration::from_millis(400);
 /// Bottom band of the fullscreen window that counts as "on the controls":
 /// the pointer inside it keeps the floating row visible.
 const CONTROLS_BAND: f32 = 96.;
-
-/// Duration of one audio chunk, in milliseconds — must match
-/// `trove_core::media::video`'s `AUDIO_CHUNK_BYTES` (100 ms of 44.1 kHz
-/// stereo i16). The audio clock counts finished chunks with it.
-const AUDIO_CHUNK_MS: f64 = 100.0;
 
 /// How early (relative to the master clock) a frame may be shown. A few
 /// milliseconds early is invisible; late is judder.
@@ -87,31 +84,6 @@ const PRESENT_POLL: Duration = Duration::from_millis(4);
 /// [`video::atempo_filter`] can chain for the audio side, so the pitch
 /// holds at every preset.
 const SPEEDS: [f32; 9] = [0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 2.0, 3.0, 4.0];
-
-/// The process-wide audio output. `OutputStream` has to stay alive for as
-/// long as any player might make sound, so it lives in a global; the sink
-/// per player is created from its handle.
-struct AudioHost {
-    _stream: rodio::OutputStream,
-    handle: rodio::OutputStreamHandle,
-}
-
-impl Global for AudioHost {}
-
-/// The audio output handle, opening the device on first use. `None` when
-/// the device cannot be opened — the player then keeps playing silently
-/// (same as the pre-audio behavior) instead of erroring.
-fn audio_handle(cx: &mut App) -> Option<rodio::OutputStreamHandle> {
-    if let Some(host) = cx.try_global::<AudioHost>() {
-        return Some(host.handle.clone());
-    }
-    let (stream, handle) = rodio::OutputStream::try_default().ok()?;
-    cx.set_global(AudioHost {
-        _stream: stream,
-        handle: handle.clone(),
-    });
-    Some(handle)
-}
 
 /// What the player tells its host panel: the user wants fullscreen, so the
 /// host pauses this player and opens the fullscreen window from this
@@ -157,8 +129,10 @@ impl Default for PlayerResume {
 /// picture instead of a black gap until its own first decode lands.
 pub(crate) struct FullscreenSeed {
     pub facts: VideoStreamFacts,
-    pub has_audio: bool,
     pub frame: Option<Arc<RenderImage>>,
+    /// The panel's soundtrack: the fullscreen window continues it instead of
+    /// building a second one, which is what used to cut the sound.
+    pub audio: Option<Entity<AudioEngine>>,
 }
 
 /// Spawn the live player for `data`, or `None` when the kind is not video,
@@ -170,7 +144,11 @@ pub(super) fn spawn_player(data: &AssetPreviewData, cx: &mut App) -> Option<Enti
     if !trove_core::media::video::ffmpeg_available() {
         return None;
     }
-    VideoPlayer::spawn(data.original.as_ref()?.clone(), PlayerResume::default(), cx)
+    let path = data.original.as_ref()?.clone();
+    // One engine per playback, owned by the panel: windows come and go
+    // without touching the soundtrack.
+    let audio = AudioEngine::spawn(path.clone(), cx);
+    VideoPlayer::spawn(path, audio, PlayerResume::default(), cx)
 }
 
 /// Spawn the player for the fullscreen window: continues from `resume`
@@ -182,9 +160,8 @@ pub(super) fn spawn_fullscreen(
     seed: FullscreenSeed,
     cx: &mut App,
 ) -> Entity<VideoPlayer> {
-    let player = cx.new(|cx| {
-        VideoPlayer::with_facts(path, seed.facts, seed.has_audio, seed.frame, resume, cx)
-    });
+    let player =
+        cx.new(|cx| VideoPlayer::with_facts(path, seed.facts, seed.audio, seed.frame, resume, cx));
     player.update(cx, |this, cx| {
         this.fullscreen_mode = true;
         this.start_controls_watcher(cx);
@@ -234,9 +211,6 @@ struct PlaybackShared {
     speed: f32,
     /// A seek the loop has not served yet.
     seek_to: Option<u64>,
-    /// The audio clock plus the moment it was read; the loop extrapolates
-    /// between updates. Published by the audio task.
-    clock: Option<(f64, Instant)>,
     /// The newest frame, taken by the render.
     arrived: Option<FrameArrival>,
 }
@@ -259,26 +233,22 @@ pub(super) struct VideoPlayer {
     position_ms: f64,
     slider: Entity<SliderState>,
     volume_slider: Entity<SliderState>,
-    /// Whether the file carries an audio stream (volume controls show).
-    has_audio: bool,
+    /// The soundtrack, shared with every window showing this video: it is
+    /// what survives entering and leaving fullscreen without a cut.
+    audio: Option<Entity<AudioEngine>>,
+    /// The engine's clock, held as the shared slot so the decode loop can
+    /// read it without borrowing the engine (or the app).
+    clock: Option<super::audio::Clock>,
     /// Playback speed; re-paces the frame loop and re-tempos the audio pipe.
     speed: f32,
     /// Output volume 0.0–1.0, applied on the rodio sink.
     volume: f32,
     muted: bool,
-    /// Bumped whenever the audio pipe must restart: after a seek, a speed
-    /// change, or the loop wrapping back to zero. The audio task watches it.
-    audio_seq: u64,
     /// Last values pushed into the slider states. The states are
     /// user-draggable: re-pushing an unchanged external value every frame
     /// would yank the thumb back mid-drag, so sync only on real changes.
     synced_position: f32,
     synced_volume: f32,
-    /// The rodio sink, created by the audio task and shared with the UI so
-    /// volume changes apply immediately. `None` until the device opens.
-    /// (`Sink` itself is not `Clone` in rodio 0.19 — the `Arc` lets the
-    /// task and the entity hold the same voice.)
-    sink: Option<Arc<rodio::Sink>>,
     /// Whether this instance lives in the fullscreen window (its control
     /// row then shows an exit-fullscreen button).
     fullscreen_mode: bool,
@@ -321,16 +291,20 @@ impl Drop for VideoPlayer {
 impl VideoPlayer {
     /// Build a player entity for `path`, or `None` when the file cannot be
     /// probed (caller keeps showing the static poster).
-    fn spawn(path: PathBuf, resume: PlayerResume, cx: &mut App) -> Option<Entity<Self>> {
+    fn spawn(
+        path: PathBuf,
+        audio: Option<Entity<AudioEngine>>,
+        resume: PlayerResume,
+        cx: &mut App,
+    ) -> Option<Entity<Self>> {
         let facts = video::probe(&path)?;
-        let has_audio = video::has_audio_track(&path);
-        Some(cx.new(|cx| Self::with_facts(path, facts, has_audio, None, resume, cx)))
+        Some(cx.new(|cx| Self::with_facts(path, facts, audio, None, resume, cx)))
     }
 
     fn with_facts(
         path: PathBuf,
         facts: VideoStreamFacts,
-        has_audio: bool,
+        audio: Option<Entity<AudioEngine>>,
         first_frame: Option<Arc<RenderImage>>,
         resume: PlayerResume,
         cx: &mut Context<Self>,
@@ -351,7 +325,7 @@ impl VideoPlayer {
                 SliderEvent::Change(value) => {
                     this.seeking = true;
                     this.position_ms = (value.start().max(0.)) as f64;
-                    this.apply_playing_state();
+                    this.apply_playing_state(cx);
                     this.publish_controls();
                     cx.notify();
                 }
@@ -361,13 +335,16 @@ impl VideoPlayer {
                     if let Ok(mut shared) = this.shared.lock() {
                         shared.seek_to = Some(target as u64);
                     }
+                    // The soundtrack jumps with the picture, at once.
+                    if let Some(audio) = &this.audio {
+                        audio.read(cx).restart_at(f64::from(target));
+                    }
                     // Reflect immediately: the audio pipe rebuilds from
                     // `position_ms`, so a pause-drag-resume would otherwise
                     // start the sound at the pre-drag position.
                     this.position_ms = target as f64;
                     // The audio pipe restarts at the new position too.
-                    this.audio_seq += 1;
-                    this.apply_playing_state();
+                    this.apply_playing_state(cx);
                     this.publish_controls();
                     cx.notify();
                 }
@@ -397,10 +374,11 @@ impl VideoPlayer {
             this.volume = value;
             this.muted = false;
             this.synced_volume = value;
-            this.apply_volume();
+            this.apply_volume(cx);
             cx.notify();
         })
         .detach();
+        let clock = audio.as_ref().map(|audio| audio.read(cx).clock());
         let shared = Arc::new(Mutex::new(PlaybackShared {
             playing: resume.playing,
             speed: resume.speed.clamp(SPEEDS[0], SPEEDS[SPEEDS.len() - 1]),
@@ -417,14 +395,13 @@ impl VideoPlayer {
             position_ms: resume.position_ms,
             slider,
             volume_slider,
-            has_audio,
+            audio,
+            clock,
             speed: resume.speed.clamp(SPEEDS[0], SPEEDS[SPEEDS.len() - 1]),
             volume: resume.volume.clamp(0., 1.),
             muted: resume.muted,
-            audio_seq: 1,
             synced_position: resume.position_ms as f32,
             synced_volume: if resume.muted { 0. } else { resume.volume },
-            sink: None,
             fullscreen_mode: false,
             seeking: false,
             volume_open: false,
@@ -438,9 +415,10 @@ impl VideoPlayer {
         };
         this.start_decoding(cx);
         this.start_presenter(cx);
-        if has_audio && audio_handle(cx).is_some() {
-            this.start_audio(cx);
-        }
+        // The engine may be shared with other windows: it follows this
+        // player's state from the start, so playing here plays everywhere.
+        this.apply_volume(cx);
+        this.apply_playing_state(cx);
         this
     }
 
@@ -454,6 +432,7 @@ impl VideoPlayer {
 
         let shared = self.shared.clone();
         let alive = self.alive.clone();
+        let clock = self.clock.clone();
         let start_ms = self.position_ms;
         cx.spawn(async move |weak, cx| {
             let mut pipe: Option<FramePipe> = None;
@@ -475,18 +454,18 @@ impl VideoPlayer {
                 }
                 // Controls come from the shared block: no `App` borrow, so
                 // this loop is never paced by whatever the UI thread paints.
-                let (playing, speed, clock, seek) = {
+                let (playing, speed, seek) = {
                     let Ok(mut shared) = shared.lock() else {
                         break;
                     };
-                    (
-                        shared.playing,
-                        shared.speed,
-                        shared.clock,
-                        shared.seek_to.take(),
-                    )
+                    (shared.playing, shared.speed, shared.seek_to.take())
                 };
-                let clock = clock.map(|(ms, at)| ms + at.elapsed().as_secs_f64() * 1000.0);
+                // The clock lives with the engine; reading its slot keeps
+                // this loop free of app borrows.
+                let clock = clock
+                    .as_ref()
+                    .and_then(|clock| clock.lock().ok().and_then(|reading| *reading))
+                    .map(|(ms, at)| ms + at.elapsed().as_secs_f64() * 1000.0);
                 if !playing {
                     // Paused (or scrubbing): let go of the pipe so ffmpeg
                     // blocks on a full one instead of running ahead.
@@ -587,14 +566,16 @@ impl VideoPlayer {
                         if duration_ms > 0.0 && playhead >= duration_ms {
                             // Loop like the animated GIF preview: back to the
                             // top, request a restart from the loop itself and
-                            // let the audio task know through `audio_seq`.
+                            // have the soundtrack jump there too.
                             playhead = 0.0;
                             if let Ok(mut shared) = shared.lock() {
                                 shared.seek_to = Some(0);
                             }
                             if weak
                                 .update(cx, |this, cx| {
-                                    this.audio_seq += 1;
+                                    if let Some(audio) = &this.audio {
+                                        audio.read(cx).restart_at(0.0);
+                                    }
                                     cx.notify();
                                 })
                                 .is_err()
@@ -618,7 +599,9 @@ impl VideoPlayer {
                         }
                         if weak
                             .update(cx, |this, cx| {
-                                this.audio_seq += 1;
+                                if let Some(audio) = &this.audio {
+                                    audio.read(cx).restart_at(0.0);
+                                }
                                 cx.notify();
                             })
                             .is_err()
@@ -632,175 +615,10 @@ impl VideoPlayer {
         .detach();
     }
 
-    /// The audio loop: streams ~100 ms PCM chunks from the [`AudioPipe`]
-    /// into rodio. The pipe restarts whenever `audio_seq` moves (seek,
-    /// speed change, loop wrap); the play/pause state is pushed onto the
-    /// sink on every turn (and immediately from [`VideoPlayer::set_playing`]),
-    /// while pausing also stops reading, which backpressures ffmpeg
-    /// instead of drifting.
-    fn start_audio(&mut self, cx: &mut Context<Self>) {
-        let path = self.path.clone();
-        let Some(host) = audio_handle(cx) else {
-            return;
-        };
-        let shared = self.shared.clone();
-
-        cx.spawn(async move |weak, cx| {
-            let mut pipe: Option<AudioPipe> = None;
-            let mut sink: Option<Arc<rodio::Sink>> = None;
-            let mut seq: u64 = 0;
-            // Audio clock bookkeeping: the timeline position this pipe
-            // started from, and how many chunks have been fed into it. The
-            // sink reports only the position inside the chunk it is playing
-            // (rodio tracks each appended source separately), so the clock
-            // is reconstructed from finished chunks plus that position.
-            let mut base_ms = 0.0f64;
-            let mut appended: u64 = 0;
-            let mut last_published: Option<(f64, Instant)> = None;
-            loop {
-                let state = weak.update(cx, |this, _cx| {
-                    Some((
-                        this.playing,
-                        this.seeking,
-                        this.audio_seq,
-                        this.position_ms,
-                        this.speed,
-                        this.volume,
-                        this.muted,
-                    ))
-                });
-                let Ok(Some((playing, seeking, new_seq, position, speed, volume, muted))) = state
-                else {
-                    break;
-                };
-                // Scrubbing counts as paused: the sink goes quiet while the
-                // user drags, and the release bumps `audio_seq`, which
-                // restarts the pipe at the new position.
-                let playing = playing && !seeking;
-                if new_seq != seq {
-                    seq = new_seq;
-                    base_ms = position;
-                    appended = 0;
-                    last_published = None;
-                    // The pipe is restarting: no clock to sync against until
-                    // the first chunk is queued again.
-                    if let Ok(mut shared) = shared.lock() {
-                        shared.clock = None;
-                    }
-                    // Kill the old pipe before opening the new one.
-                    drop(pipe.take());
-                    match &sink {
-                        Some(s) => s.clear(),
-                        None => {
-                            let Ok(s) = rodio::Sink::try_new(&host) else {
-                                break;
-                            };
-                            s.set_volume(if muted { 0. } else { volume });
-                            let s = Arc::new(s);
-                            weak.update(cx, |this, _| this.sink = Some(s.clone())).ok();
-                            sink = Some(s);
-                        }
-                    }
-                    let open_path = path.clone();
-                    pipe = cx
-                        .background_executor()
-                        .spawn(async move { AudioPipe::open(&open_path, position as u64, speed) })
-                        .await;
-                }
-
-                let Some(s) = &sink else {
-                    // No sink (device died): idle until the next seq bump
-                    // or the player goes away.
-                    cx.background_executor().timer(IDLE_POLL).await;
-                    continue;
-                };
-                // Apply the play state before any pipe work. The whole
-                // soundtrack is queued as fast as ffmpeg decodes it, so the
-                // pipe is often already gone (or never comes back) while
-                // the sink still holds minutes of audio — a pause must
-                // reach the sink from here, not only from the branches
-                // that require a live pipe.
-                if playing {
-                    s.play();
-                    // Publish the audio clock for the decode loop: chunks
-                    // that have played out, plus the progress inside the one
-                    // still playing. `len()` counts the current chunk too.
-                    let queued = s.len() as u64;
-                    let finished = appended.saturating_sub(queued);
-                    let within = (s.get_pos().as_secs_f64() * 1000.0).min(AUDIO_CHUNK_MS);
-                    let mut reading = base_ms + finished as f64 * AUDIO_CHUNK_MS + within;
-                    // `len()` and `get_pos()` are read one after the other,
-                    // so a chunk boundary landing between the two reads
-                    // counts one chunk twice and reports the clock a whole
-                    // chunk ahead — which made the decode loop skip frames in
-                    // bursts. The soundtrack cannot advance faster than real
-                    // time, so the reading is clamped to that (with a little
-                    // slack) and held monotonic: a spike is absorbed instead
-                    // of costing frames.
-                    if let Some((last, at)) = last_published {
-                        let ceiling = last + at.elapsed().as_secs_f64() * 1000.0 * 1.05 + 5.0;
-                        reading = reading.clamp(last, ceiling);
-                    }
-                    last_published = Some((reading, Instant::now()));
-                    if let Ok(mut shared) = shared.lock() {
-                        shared.clock = Some((reading, Instant::now()));
-                    }
-                } else {
-                    s.pause();
-                    if let Ok(mut shared) = shared.lock() {
-                        shared.clock = None;
-                    }
-                }
-                // Take the pipe out so `read_chunk` can run on a 'static
-                // background task; hand it back below.
-                let Some(mut p) = pipe.take() else {
-                    // No pipe (stream ended): idle until the loop wrap
-                    // bumps seq.
-                    cx.background_executor().timer(IDLE_POLL).await;
-                    continue;
-                };
-
-                if playing {
-                    let (returned, chunk) = cx
-                        .background_executor()
-                        .spawn(async move {
-                            let chunk = p.read_chunk();
-                            (p, chunk)
-                        })
-                        .await;
-                    pipe = Some(returned);
-                    match chunk {
-                        Some(bytes) => {
-                            let samples: Vec<i16> = bytes
-                                .as_chunks::<2>()
-                                .0
-                                .iter()
-                                .map(|b| i16::from_le_bytes(*b))
-                                .collect();
-                            s.append(rodio::buffer::SamplesBuffer::new(2, 44_100, samples));
-                            appended += 1;
-                        }
-                        None => {
-                            // Stream end: idle until the loop wrap bumps seq.
-                            pipe = None;
-                            cx.background_executor().timer(IDLE_POLL).await;
-                        }
-                    }
-                } else {
-                    // Paused: stop reading so ffmpeg blocks on a full pipe
-                    // instead of drifting ahead.
-                    pipe = Some(p);
-                    cx.background_executor().timer(IDLE_POLL).await;
-                }
-            }
-        })
-        .detach();
-    }
-
-    /// Push the current volume/mute onto the rodio sink, if one is live.
-    fn apply_volume(&mut self) {
-        if let Some(sink) = &self.sink {
-            sink.set_volume(if self.muted { 0. } else { self.volume });
+    /// Push the current volume/mute onto the shared engine, if there is one.
+    fn apply_volume(&self, cx: &App) {
+        if let Some(audio) = &self.audio {
+            audio.read(cx).set_volume(self.volume, self.muted);
         }
     }
 
@@ -809,7 +627,9 @@ impl VideoPlayer {
     fn set_speed(&mut self, speed: f32, cx: &mut Context<Self>) {
         if self.speed != speed {
             self.speed = speed;
-            self.audio_seq += 1;
+            if let Some(audio) = &self.audio {
+                audio.read(cx).set_speed(speed);
+            }
             // The decode loop paces by `shared.speed`: a speed change that
             // is not published there would leave the picture on the old
             // tempo while the sound followed the new one.
@@ -822,11 +642,12 @@ impl VideoPlayer {
     pub(crate) fn resume_from(&mut self, position_ms: f64, playing: bool, cx: &mut Context<Self>) {
         self.position_ms = position_ms;
         self.playing = playing;
-        self.audio_seq += 1;
         if let Ok(mut shared) = self.shared.lock() {
             shared.seek_to = Some(position_ms.max(0.) as u64);
         }
-        self.apply_playing_state();
+        // The soundtrack played straight through the fullscreen window, so
+        // it is already where the picture should be: only the video jumps.
+        self.apply_playing_state(cx);
         self.publish_controls();
         cx.notify();
     }
@@ -840,26 +661,28 @@ impl VideoPlayer {
     /// makes the pause immediate and independent of the loop's position.
     fn set_playing(&mut self, playing: bool, cx: &mut Context<Self>) {
         self.playing = playing;
-        self.apply_playing_state();
+        self.apply_playing_state(cx);
         self.publish_controls();
         cx.notify();
     }
 
     /// Push the effective play state (playing, but not while scrubbing)
     /// onto the shared sink, if one is live.
-    fn apply_playing_state(&self) {
-        if let Some(sink) = &self.sink {
-            if self.playing && !self.seeking {
-                sink.play();
-            } else {
-                sink.pause();
-            }
+    fn apply_playing_state(&self, cx: &App) {
+        if let Some(audio) = &self.audio {
+            // Scrubbing counts as paused: the engine holds the sound while
+            // the user drags, and picks it up again from the new position.
+            audio.read(cx).set_playing(self.playing && !self.seeking);
         }
     }
 
-    /// Pause playback (used while the fullscreen window holds the stage).
-    pub(crate) fn pause(&mut self, cx: &mut Context<Self>) {
-        self.set_playing(false, cx);
+    /// Stop the picture without touching the soundtrack: what the panel does
+    /// when the fullscreen window takes the stage over. The engine keeps
+    /// playing, so the sound never stops.
+    pub(crate) fn pause_video(&mut self, cx: &mut Context<Self>) {
+        self.playing = false;
+        self.publish_controls();
+        cx.notify();
     }
 
     /// Take the frames the decode task left in the mailbox: a tick on the
@@ -954,7 +777,12 @@ impl VideoPlayer {
 
     /// Whether the file carries an audio stream.
     pub(crate) fn has_audio(&self) -> bool {
-        self.has_audio
+        self.audio.is_some()
+    }
+
+    /// The soundtrack, for the fullscreen window to share.
+    pub(crate) fn audio(&self) -> Option<Entity<AudioEngine>> {
+        self.audio.clone()
     }
 
     /// The frame currently on screen, used to seed the fullscreen window so
@@ -1019,7 +847,7 @@ impl VideoPlayer {
                     )),
             )
             .child(self.speed_control(speed, cx))
-            .when(self.has_audio, |row| {
+            .when(self.has_audio(), |row| {
                 row.child(self.volume_control(muted, cx))
             })
             .child(
