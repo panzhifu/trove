@@ -1,17 +1,16 @@
 //! Screenshots: capture the screen (or a region of it) into a PNG that the
 //! app then imports like any other file.
 //!
-//! Full-screen capture runs in-process — no external tool has to be
-//! installed: on Wayland via [`grim_rs`] (ext-image-copy-capture-v1 — the
-//! protocol niri speaks — with a wlr-screencopy fallback), elsewhere via
-//! [`xcap`] (XCB on X11, ScreenCaptureKit on macOS, Windows Graphics
-//! Capture on Windows). Region picking stays with the platform tools: an
-//! interactive selection overlay is out of scope here. Whatever the
-//! in-process libraries cannot do falls back to the external toolchain
-//! (grim/slurp, scrot, screencapture, PowerShell), and the user can
-//! override the whole thing with a custom command in Settings ▸ General.
-//! Planning that chain is a pure function ([`plan_for`]) so it stays
-//! unit-testable without a display.
+//! Full-screen capture runs in-process via [`xcap`] (XCB on X11,
+//! ScreenCaptureKit on macOS, Windows Graphics Capture on Windows) — no
+//! external tool has to be installed. On Wayland xcap only speaks
+//! wlr-screencopy (libwayshot), so compositors that do not implement that
+//! protocol (KWin) have no in-process path here and fall through to the
+//! external toolchain ([`plan_for`]). Region picking stays with the
+//! platform tools: an interactive selection overlay is out of scope here.
+//! The user can override the whole thing with a custom command in
+//! Settings ▸ General. Planning that chain is a pure function
+//! ([`plan_for`]) so it stays unit-testable without a display.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -131,11 +130,11 @@ pub fn plan_for(
     }
 }
 
-/// Run the capture: custom command → in-process (grim-rs on Wayland, then
-/// xcap) → the external toolchain. The PNG must exist on disk when `Ok`
-/// comes back. Every in-process failure reason rides along in the error
-/// that finally surfaces, so the root cause stays diagnosable. Every step
-/// emits `tracing` events (default level `info`; `RUST_LOG` adjusts).
+/// Run the capture: custom command → in-process xcap (full screen) → the
+/// external toolchain. The PNG must exist on disk when `Ok` comes back.
+/// xcap's failure reason rides along in the error that finally surfaces,
+/// so the root cause stays diagnosable. Every step emits `tracing` events
+/// (default level `info`; `RUST_LOG` adjusts).
 pub fn capture(mode: ScreenshotMode, custom: Option<&str>, dest: &Path) -> Result<(), String> {
     tracing::info!(
         mode = ?mode,
@@ -148,47 +147,14 @@ pub fn capture(mode: ScreenshotMode, custom: Option<&str>, dest: &Path) -> Resul
     if let Some(command) = custom.map(str::trim).filter(|c| !c.is_empty()) {
         return run_custom(command, dest);
     }
-    // In-process reasons accumulate and ride along in whatever error finally
-    // surfaces, so a failed capture reads `grim-rs: …; screenshots: …; xcap:
-    // …; grim: …` in one line.
     let mut in_process_error: Option<String> = None;
     if mode == ScreenshotMode::Full {
-        // Wayland first: grim-rs speaks ext-image-copy-capture-v1, which is
-        // what niri implements — xcap's libwayshot only offers
-        // wlr-screencopy there.
-        #[cfg(target_os = "linux")]
-        {
-            let attempt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                capture_via_grim_rs(dest)
-            }));
-            match attempt.unwrap_or_else(|payload| Err(panic_message(payload))) {
-                Ok(()) => return Ok(()),
-                Err(reason) => {
-                    tracing::warn!(reason, "grim-rs capture failed; falling back");
-                    in_process_error = Some(format!("grim-rs: {reason}"));
-                }
-            }
-            // Portal probe: the `screenshots` crate asks the
-            // xdg-desktop-portal Screenshot interface instead of a capture
-            // protocol — success means the session has a portal backend
-            // (KDE's xdg-desktop-portal-kde implements one).
-            let attempt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                capture_via_screenshots(dest)
-            }));
-            match attempt.unwrap_or_else(|payload| Err(panic_message(payload))) {
-                Ok(()) => return Ok(()),
-                Err(reason) => {
-                    tracing::warn!(reason, "screenshots (portal) capture failed; falling back");
-                    in_process_error = match in_process_error {
-                        Some(previous) => Some(format!("{previous}; screenshots: {reason}")),
-                        None => Some(format!("screenshots: {reason}")),
-                    };
-                }
-            }
-        }
         // xcap talks to the display server and can panic on hostile
         // environments; the unwind guard keeps such a failure a fallback
-        // instead of taking the caller's task down.
+        // instead of taking the caller's task down. Its Wayland path is
+        // libwayshot (wlr-screencopy), which KWin does not implement, so
+        // on KDE the in-process step fails and the external toolchain
+        // takes over.
         let attempt =
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| capture_via_xcap(dest)));
         match attempt.unwrap_or_else(|payload| Err(panic_message(payload))) {
@@ -198,10 +164,7 @@ pub fn capture(mode: ScreenshotMode, custom: Option<&str>, dest: &Path) -> Resul
                     reason,
                     "xcap capture failed; falling back to external tools"
                 );
-                in_process_error = Some(match in_process_error {
-                    Some(previous) => format!("{previous}; xcap: {reason}"),
-                    None => format!("xcap: {reason}"),
-                });
+                in_process_error = Some(format!("xcap: {reason}"));
             }
         }
     }
@@ -237,136 +200,13 @@ fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
     }
 }
 
-/// Capture the whole desktop in-process with `grim-rs` and write a PNG.
-///
-/// Wayland-only (Wayland-only backends, so callers on X11 fall through to
-/// xcap's XCB path). Unlike xcap's primary-monitor capture this composites
-/// every connected output at its physical position. Backends are tried in
-/// order — ext-image-copy-capture-v1 (niri, sway ≥ 2025, hyprland, COSMIC)
-/// then wlr-screencopy (wlroots) — and the chosen one is logged.
-#[cfg(target_os = "linux")]
-fn capture_via_grim_rs(dest: &Path) -> Result<(), String> {
-    use grim_rs::Grim;
-
-    let mut grim = match Grim::new_ext() {
-        Ok(grim) => {
-            tracing::info!("grim-rs: backend ext-image-copy-capture-v1");
-            grim
-        }
-        Err(ext_err) => {
-            tracing::debug!(
-                error = %ext_err,
-                "grim-rs: ext-image-copy-capture-v1 unavailable"
-            );
-            let grim = Grim::new_wlr()
-                .map_err(|e| format!("ext-image-copy-capture: {ext_err}; wlr-screencopy: {e}"))?;
-            tracing::info!("grim-rs: backend wlr-screencopy");
-            grim
-        }
-    };
-    let started = std::time::Instant::now();
-    let result = grim.capture_all().map_err(|e| {
-        tracing::error!(
-            error = %e,
-            elapsed_ms = started.elapsed().as_millis() as u64,
-            "grim-rs: capture_all failed"
-        );
-        e.to_string()
-    })?;
-    tracing::info!(
-        width = result.width(),
-        height = result.height(),
-        elapsed_ms = started.elapsed().as_millis() as u64,
-        "grim-rs: frame captured"
-    );
-    if let Some(parent) = dest.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| {
-            tracing::error!(
-                dir = %parent.display(),
-                error = %e,
-                "could not create output dir"
-            );
-            e.to_string()
-        })?;
-    }
-    grim.save_png(result.data(), result.width(), result.height(), dest)
-        .map_err(|e| {
-            tracing::error!(dest = %dest.display(), error = %e, "grim-rs: could not save png");
-            format!("{}: {e}", dest.display())
-        })?;
-    tracing::info!(dest = %dest.display(), "grim-rs: png written");
-    Ok(())
-}
-
-/// Capture the primary screen in-process with the `screenshots` crate and
-/// write a PNG.
-///
-/// Probe layer: on Wayland this asks the xdg-desktop-portal `Screenshot`
-/// D-Bus interface (not a capture protocol), so it succeeds only when the
-/// session runs a portal backend that implements it. The crate is
-/// deprecated upstream and returns an `image` 0.24 buffer, which is
-/// re-wrapped into this workspace's `image` 0.25 type for saving.
-#[cfg(target_os = "linux")]
-fn capture_via_screenshots(dest: &Path) -> Result<(), String> {
-    use screenshots::Screen;
-
-    let started = std::time::Instant::now();
-    let screens = Screen::all().map_err(|e| {
-        tracing::error!(error = %e, "screenshots: could not enumerate screens");
-        e.to_string()
-    })?;
-    let screen = screens.into_iter().next().ok_or_else(|| {
-        tracing::error!("screenshots: no screen found");
-        "no screen found".to_string()
-    })?;
-    tracing::info!(
-        width = screen.display_info.width,
-        height = screen.display_info.height,
-        "screenshots: capturing primary screen"
-    );
-    let image = screen.capture().map_err(|e| {
-        tracing::error!(
-            error = %e,
-            elapsed_ms = started.elapsed().as_millis() as u64,
-            "screenshots: capture failed"
-        );
-        e.to_string()
-    })?;
-    tracing::info!(
-        width = image.width(),
-        height = image.height(),
-        elapsed_ms = started.elapsed().as_millis() as u64,
-        "screenshots: frame captured"
-    );
-    if let Some(parent) = dest.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| {
-            tracing::error!(
-                dir = %parent.display(),
-                error = %e,
-                "could not create output dir"
-            );
-            e.to_string()
-        })?;
-    }
-    let rgba = image::RgbaImage::from_raw(image.width(), image.height(), image.into_raw())
-        .ok_or_else(|| {
-            tracing::error!("screenshots: captured buffer does not match its dimensions");
-            "invalid captured buffer".to_string()
-        })?;
-    rgba.save(dest).map_err(|e| {
-        tracing::error!(dest = %dest.display(), error = %e, "screenshots: could not save png");
-        format!("{}: {e}", dest.display())
-    })?;
-    tracing::info!(dest = %dest.display(), "screenshots: png written");
-    Ok(())
-}
-
 /// Capture the primary screen in-process with `xcap` and write a PNG.
 ///
 /// `Monitor::all()` sorts by position; the first monitor is the primary.
 /// The image comes back as an RGBA buffer, so saving is all that is left.
-/// On Wayland this sits behind grim-rs (its libwayshot backend only speaks
-/// wlr-screencopy, which niri rejects); on X11 it is the primary path.
+/// On Wayland this only succeeds where wlr-screencopy exists (wlroots
+/// compositors); KWin does not implement it, so KDE falls through to the
+/// external toolchain.
 fn capture_via_xcap(dest: &Path) -> Result<(), String> {
     use xcap::Monitor;
 
