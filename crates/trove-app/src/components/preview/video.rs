@@ -183,6 +183,11 @@ pub(super) struct VideoPlayer {
     /// Bumped whenever the audio pipe must restart: after a seek, a speed
     /// change, or the loop wrapping back to zero. The audio task watches it.
     audio_seq: u64,
+    /// Last values pushed into the slider states. The states are
+    /// user-draggable: re-pushing an unchanged external value every frame
+    /// would yank the thumb back mid-drag, so sync only on real changes.
+    synced_position: f32,
+    synced_volume: f32,
     /// The rodio sink, created by the audio task and shared with the UI so
     /// volume changes apply immediately. `None` until the device opens.
     /// (`Sink` itself is not `Clone` in rodio 0.19 — the `Arc` lets the
@@ -221,7 +226,12 @@ impl VideoPlayer {
         let subscription = cx.subscribe(&slider, |this, _slider, event: &SliderEvent, cx| {
             // Dragging only shows the target; the seek happens on release.
             if let SliderEvent::Release(value) = event {
-                this.seek_to = Some(value.start().max(0.) as u64);
+                let target = value.start().max(0.);
+                this.seek_to = Some(target as u64);
+                // Reflect immediately: the audio pipe rebuilds from
+                // `position_ms`, so a pause-drag-resume would otherwise
+                // start the sound at the pre-drag position.
+                this.position_ms = target as f64;
                 // The audio pipe restarts at the new position too.
                 this.audio_seq += 1;
                 cx.notify();
@@ -260,6 +270,8 @@ impl VideoPlayer {
             volume: resume.volume.clamp(0., 1.),
             muted: resume.muted,
             audio_seq: 1,
+            synced_position: resume.position_ms as f32,
+            synced_volume: if resume.muted { 0. } else { resume.volume },
             sink: None,
             fullscreen_mode: false,
             _subscription: subscription,
@@ -712,14 +724,23 @@ impl Render for VideoPlayer {
             }
             self.shown = Some(frame);
         }
-        // Keep the scrubber on the playhead (release events are seeks, this
-        // programmatic update is not).
+        // Keep the scrubber on the playhead and the volume slider on the
+        // applied level — but only when the external value actually moved.
+        // Pushing every frame would fight a mid-drag thumb (the decode loop
+        // notifies every frame while playing, so render runs constantly).
+        // Release events are the user's seek/apply; this is the mirror back.
         let position = self.position_ms as f32;
-        self.slider
-            .update(cx, |slider, cx| slider.set_value(position, window, cx));
+        if (position - self.synced_position).abs() >= 0.5 {
+            self.synced_position = position;
+            self.slider
+                .update(cx, |slider, cx| slider.set_value(position, window, cx));
+        }
         let volume = if self.muted { 0. } else { self.volume };
-        self.volume_slider
-            .update(cx, |slider, cx| slider.set_value(volume, window, cx));
+        if (volume - self.synced_volume).abs() >= f32::EPSILON {
+            self.synced_volume = volume;
+            self.volume_slider
+                .update(cx, |slider, cx| slider.set_value(volume, window, cx));
+        }
         // Fill the hosting stage: the frame takes all the height the
         // transport controls leave, and the picture contains itself inside.
         v_flex()
