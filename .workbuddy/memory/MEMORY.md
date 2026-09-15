@@ -74,7 +74,10 @@
 - `panel!` 宏第三段可选字段已扩；宏参数里用 `//` 别用 `///`。只有 FoldersPanel 走宏。
 
 ## 截图 / 日志（基础设施，2026-09-15）
-- 用户桌面 niri **无 zwlr_screencopy**（只有 ext-image-copy-capture-v1）→ grim 稳定版与 xcap(libwayshot) 在 niri 全挂。全屏捕获链：grim-rs（`Grim::new_ext`→`new_wlr`，target-gated Linux）→ xcap（X11/mac/win）→ 外部工具链 → 自定义命令；失败原因逐级拼接进最终错误。Region 交互选区仍是 slurp+grim 外部路径，niri 上会挂在 grim（待办：slurp 几何 + `grim_rs capture_region`）。
+- **当前桌面是 KDE / KWin 6.7.5**（niri 只是装了没在跑 —— 排查时别被 niri 带偏）。KWin 既无 zwlr_screencopy 也无 ext-image-copy-capture → xcap(libwayshot)、grim、grim-rs 在 KDE 上**必然全挂**（已实测）。KDE 的截图由 **KWin 自己抓**、经 D-Bus 接口 `org.kde.KWin.ScreenShot2` 暴露（实现在 `/usr/lib/qt6/plugins/kwin/plugins/screenshot.so`；方法 CaptureWorkspace/Screen/ActiveScreen/ActiveWindow/Window/Area/Interactive），Spectacle 与 xdg-desktop-portal-kde 都只是它的客户端。
+- 全屏捕获链（trove）：grim-rs → screenshots(portal 探测层，deprecated，定性后可删) → xcap → 外部工具链 → 自定义命令（Settings ▸ General）。失败原因逐级拼接进最终错误。
+- ⚠️ libwayshot 0.2（`screenshots` 库的第三级 fallback）`get_all_outputs()` 里 bind `zxdg_output_manager_v1` 失败即 `panic!("{:#?}")`，`or_else` 不捕 panic → 整条链被炸掉、portal 真实错误被吞（trove 已加 `panic_message()` 提取 panic 原文）。
+- **KDE 上可行路径**：自定义命令 `spectacle -b -n -f -o {file}`（选区换 `-r`），或自行实现 `org.kde.KWin.ScreenShot2` D-Bus 调用（zbus 已在树里）。第三方协议路线在 KDE 无解。
 - 日志：tracing 门面 + `logging::init()`（main 第一行）；双 sink = stderr + `<config>/trove/logs/trove.log`（追加，8MB 轮转 `.old`）；`RUST_LOG` 控制级别，默认 info。`registry().with()` 需要 `tracing_subscriber::prelude::*`（SubscriberExt 不在 scope 报 E0599）。
 
 ## 历史 / 已修正
