@@ -13,7 +13,7 @@
 use gpui_kit::*;
 
 use super::AssetPreviewData;
-use crate::panels::common::{ensure_font_registered, font_live_preview, font_sample};
+use crate::panels::common::{ensure_font_registered, font_live_preview, font_sample_for};
 
 /// Width the main area typically leaves for text, inside the stage's
 /// padding.
@@ -29,7 +29,9 @@ pub(super) fn specimen(data: &AssetPreviewData, cx: &mut App) -> Option<AnyEleme
     if !ensure_font_registered(family, data.original.as_deref(), cx) {
         return None;
     }
-    let glyphs = font_sample().chars().count().max(1) as f32;
+    // Size against the expanded sample (placeholders resolve to the family
+    // name, which changes its length).
+    let glyphs = font_sample_for(family).chars().count().max(1) as f32;
     let size = (TEXT_WIDTH / (glyphs * GLYPH_RATIO)).clamp(32.0, 160.0);
     Some(
         font_live_preview(family, cx)
