@@ -531,7 +531,7 @@ corner_axis_tip = "在角落固定一个随相机转动的小 X/Y/Z 指示器。
 shortcut_reset = "R · 双击：重置视角"
 
 [video]
-fullscreen = "全屏播放"
+fullscreen = "全屏播放（F）"
 exit_fullscreen = "退出全屏"
 
 [shortcuts]
@@ -566,9 +566,11 @@ RefreshLibrary = "刷新素材库"
 BatchRename = "批量重命名"
 BatchConvert = "批量转换格式"
 CopyImage = "复制图片到剪贴板"
+EnterVideoFullscreen = "全屏播放视频"
 
 [shortcuts.context]
 Workspace = "工作区"
+VideoPreview = "视频预览"
 global = "全局"
 
 [sysfonts]
