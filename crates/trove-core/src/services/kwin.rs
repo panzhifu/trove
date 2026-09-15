@@ -9,6 +9,14 @@
 //! (`type` = `"raw"`, `format` = a `QImage::Format` value, `width`,
 //! `height`, `stride`). This module is that client, which makes capture
 //! work in-process on KDE without shelling out to Spectacle.
+//!
+//! KWin gates the interface behind KDE's restricted-D-Bus mechanism: a
+//! caller is authorized only when its desktop entry declares
+//! `X-KDE-DBUS-Restricted-Interfaces=org.kde.KWin.ScreenShot2` (the way
+//! Spectacle does). Without it KWin rejects the call with
+//! `org.kde.KWin.ScreenShot2.Error.NoAuthorized` — which is what the
+//! error chain reports, pointing at the missing desktop-file line rather
+//! than at anything in this module.
 
 use std::collections::HashMap;
 use std::io::Read as _;
@@ -26,6 +34,28 @@ const INTERFACE: &str = "org.kde.KWin.ScreenShot2";
 /// caller's fallback chain — a missing KWin (non-KDE session) is not an
 /// error worth surfacing, just a fallthrough.
 pub fn capture_workspace(dest: &Path) -> Result<(), String> {
+    let image = capture_workspace_image()?;
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| {
+            tracing::error!(
+                dir = %parent.display(),
+                error = %e,
+                "could not create output dir"
+            );
+            e.to_string()
+        })?;
+    }
+    image.save(dest).map_err(|e| {
+        tracing::error!(dest = %dest.display(), error = %e, "kwin: could not save png");
+        format!("{}: {e}", dest.display())
+    })?;
+    tracing::info!(dest = %dest.display(), "kwin: png written");
+    Ok(())
+}
+
+/// [`capture_workspace`] without the file: the frame itself, for callers
+/// that crop it (the region picker) before anything is written.
+pub fn capture_workspace_image() -> Result<image::RgbaImage, String> {
     let started = std::time::Instant::now();
     let (mut reader, writer) = std::io::pipe().map_err(|e| format!("pipe: {e}"))?;
     let connection = Connection::session().map_err(|e| format!("session bus: {e}"))?;
@@ -79,24 +109,8 @@ pub fn capture_workspace(dest: &Path) -> Result<(), String> {
     );
 
     let rgba = to_rgba(&raw, width, height, stride, format)?;
-    if let Some(parent) = dest.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| {
-            tracing::error!(
-                dir = %parent.display(),
-                error = %e,
-                "could not create output dir"
-            );
-            e.to_string()
-        })?;
-    }
-    let image = image::RgbaImage::from_raw(width, height, rgba)
-        .ok_or_else(|| "kwin: captured buffer does not match its dimensions".to_string())?;
-    image.save(dest).map_err(|e| {
-        tracing::error!(dest = %dest.display(), error = %e, "kwin: could not save png");
-        format!("{}: {e}", dest.display())
-    })?;
-    tracing::info!(dest = %dest.display(), "kwin: png written");
-    Ok(())
+    image::RgbaImage::from_raw(width, height, rgba)
+        .ok_or_else(|| "kwin: captured buffer does not match its dimensions".to_string())
 }
 
 /// One `u` entry of the metadata map.
