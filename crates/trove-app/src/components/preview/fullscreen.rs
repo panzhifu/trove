@@ -107,10 +107,10 @@ impl Render for FullscreenPlayer {
             self.focused = true;
             cx.focus_self(window);
         }
+        // Edge to edge: the player draws its own chrome over the picture.
         div()
             .size_full()
             .bg(black())
-            .p_4()
             .key_context(crate::VIDEO_FULLSCREEN_CONTEXT)
             .track_focus(&self.focus)
             .on_action(cx.listener(Self::exit))

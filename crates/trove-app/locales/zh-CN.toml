@@ -531,7 +531,6 @@ corner_axis_tip = "在角落固定一个随相机转动的小 X/Y/Z 指示器。
 shortcut_reset = "R · 双击：重置视角"
 
 [video]
-volume = "音量"
 fullscreen = "全屏播放"
 exit_fullscreen = "退出全屏"
 
