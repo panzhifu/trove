@@ -28,6 +28,7 @@ mod components;
 mod dialogs;
 mod fonts;
 mod library;
+mod logging;
 mod panels;
 
 use app::AppView;
@@ -168,6 +169,8 @@ fn slim_scrollbars(cx: &mut App) {
 }
 
 fn main() {
+    // Logging first: everything after this point can emit events.
+    logging::init();
     app::i18n::init_from_config();
     gpui_kit::application()
         .with_assets(assets::TroveAssets)
