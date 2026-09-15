@@ -360,9 +360,9 @@ impl ModelViewport {
             .into_any_element()
     }
 
-    /// A small panel in the canvas's bottom-left corner listing the keyboard
-    /// shortcuts. Bottom-left rather than the top corners, which belong to
-    /// the axis switches and the trihedron.
+    /// A small panel in the canvas's top-right corner listing the keyboard
+    /// shortcuts. The top-left belongs to the axis switches and the
+    /// bottom-right to the trihedron; the top-right corner is the free one.
     fn shortcuts_hint(&self, cx: &mut Context<Self>) -> impl IntoElement {
         use gpui_kit::base::v_flex;
         let line = |text: String| {
@@ -373,8 +373,8 @@ impl ModelViewport {
         };
         v_flex()
             .absolute()
-            .bottom_2()
-            .left_2()
+            .top_2()
+            .right_2()
             .gap_1()
             .p_2()
             .rounded(cx.theme().radius)
