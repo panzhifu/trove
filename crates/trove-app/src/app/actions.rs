@@ -46,5 +46,7 @@ gpui_kit::actions!(
         CancelEditor,
         // -- Fullscreen video window ----------------------------------------
         ExitVideoFullscreen,
+        // -- Region screenshot overlay ---------------------------------------
+        CancelScreenshotRegion,
     ]
 );

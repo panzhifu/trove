@@ -50,6 +50,11 @@ const EXPLORER_CONTEXT: &str = "Explorer";
 /// untouched.
 const VIDEO_FULLSCREEN_CONTEXT: &str = "VideoFullscreen";
 
+/// Key context of the region-screenshot overlay. Its only binding is
+/// Escape: it cancels the picker. The context lives only on the overlay's
+/// root, so nothing else sees it.
+const REGION_SELECT_CONTEXT: &str = "ScreenshotRegion";
+
 pub(crate) fn register_keys(cx: &mut App) {
     use trove_core::config::AppConfig;
     use trove_core::keybindings::default_keybindings;
@@ -129,6 +134,13 @@ pub(crate) fn register_keys(cx: &mut App) {
         "escape",
         ExitVideoFullscreen,
         Some(VIDEO_FULLSCREEN_CONTEXT),
+    ));
+    // Esc cancels the region-screenshot overlay; only the overlay's root
+    // carries that context.
+    bindings.push(KeyBinding::new(
+        "escape",
+        CancelScreenshotRegion,
+        Some(REGION_SELECT_CONTEXT),
     ));
 
     // Screenshots are global (like paste import), not grid-scoped.

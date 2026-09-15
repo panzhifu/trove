@@ -334,9 +334,10 @@ impl AppView {
         .detach();
     }
 
-    /// File ▸ Take Screenshot (full screen / region): run the platform
-    /// capture tool on the background executor, then import the PNG it
-    /// wrote. Region tools are interactive, so the child keeps our stdio.
+    /// File ▸ Take Screenshot (full screen / region): import the PNG the
+    /// in-process capture produced, or hand the job to the external
+    /// toolchain when there is no in-process path. Region tools are
+    /// interactive, so a spawned child keeps our stdio.
     fn take_screenshot(
         &mut self,
         mode: trove_core::services::screenshot::ScreenshotMode,
@@ -356,11 +357,64 @@ impl AppView {
             Notification::info(rust_i18n::t!("notice.screenshot_started").to_string()),
             cx,
         );
-        cx.spawn(async move |_, cx| {
+
+        // Region on Linux: capture the workspace in-process and pick the
+        // area in our own overlay, because no compositor-side region picker
+        // is reachable (KWin offers none over D-Bus, and the KDE Screenshot
+        // portal has no region option). Any failure falls back to the
+        // external toolchain.
+        #[cfg(target_os = "linux")]
+        if mode == screenshot::ScreenshotMode::Region {
+            let fallback = {
+                let dest = dest.clone();
+                let controller = controller.clone();
+                // `handle` is `Copy`, so the closure takes its own copy and
+                // the path below can still use the original.
+                move |cx: &mut App| {
+                    Self::capture_with_toolchain(controller, mode, dest, handle, cx);
+                }
+            };
+            cx.spawn(async move |_, cx| {
+                let frame = cx
+                    .background_executor()
+                    .spawn(async { trove_core::services::kwin::capture_workspace_image() })
+                    .await;
+                match frame {
+                    Ok(frame) => {
+                        let _ = handle.update(cx, |_, _, cx| {
+                            crate::components::region_select::open(frame, dest, controller, cx);
+                        });
+                    }
+                    Err(reason) => {
+                        tracing::warn!(
+                            reason,
+                            "no in-process region capture; using the external toolchain"
+                        );
+                        let _ = handle.update(cx, |_, _, cx| fallback(cx));
+                    }
+                }
+            })
+            .detach();
+            return;
+        }
+
+        Self::capture_with_toolchain(controller, mode, dest, handle, cx);
+    }
+
+    /// The external-toolchain capture: run it on the background executor and
+    /// import the PNG it wrote (or report why it did not).
+    fn capture_with_toolchain(
+        controller: Entity<LibraryController>,
+        mode: trove_core::services::screenshot::ScreenshotMode,
+        dest: PathBuf,
+        handle: AnyWindowHandle,
+        cx: &mut App,
+    ) {
+        cx.spawn(async move |cx| {
             let target = dest.clone();
             let outcome = cx
                 .background_executor()
-                .spawn(async move { screenshot::capture(mode, &target) })
+                .spawn(async move { trove_core::services::screenshot::capture(mode, &target) })
                 .await;
             let _ = handle.update(cx, |_, window, cx| match outcome {
                 Ok(()) => {
