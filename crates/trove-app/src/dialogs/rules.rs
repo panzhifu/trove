@@ -1,22 +1,32 @@
 //! Smart-collection rule editor: a dialog that builds the JSON condition
 //! tree stored in a smart collection.
 //!
-//! The editor covers the flat shape — one group (`and`/`or`) over N match
-//! conditions — which is everything the save-search flow produces and the
-//! overwhelming majority of hand-written rules. Deeper nesting round-trips
-//! through [`load_rows`]: only the top-level match conditions are surfaced.
+//! The editor covers a two-layer shape: N condition groups, each holding M
+//! match conditions. Every group picks its own combination
+//! ([`RuleGroup::and_mode`]) and the groups combine under a switchable
+//! top-level operator (match any group / match all groups). A single group
+//! is stored flat — `{"op": …, "children": [matches…]}`, exactly the shape
+//! earlier one-group versions wrote — so existing rules round-trip.
+//! Deeper nesting is out of scope: [`split_tree`] keeps only match leaves
+//! below the second layer, and the editor itself never produces such trees.
 //!
 //! Draft state lives in a [`RuleDraft`] entity created before the dialog
 //! opens (the dialog's content closure is a re-run-per-frame `Fn` and
 //! cannot own state). Every mutation bumps [`RuleDraft::revision`]; the
 //! dialog recomputes the live match count whenever the revision moved.
+//!
+//! The accent color is picked with the gpui-kit base [`ColorPickerState`]
+//! (hex field + HSL sliders kept in sync by the component itself); the
+//! swatch row is built from base [`ColorSwatch`]s over a curated palette.
 
+use gpui::{Hsla, Rgba};
+use gpui_kit::base::{ColorPickerEvent, ColorPickerState, ColorSwatch};
 use gpui_kit::base::{h_flex, v_flex};
 use gpui_kit::component::WindowExt as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
-use gpui_kit::component::slider::{Slider, SliderEvent, SliderState};
+use gpui_kit::component::slider::{Slider, SliderState};
 use gpui_kit::component::{ActiveTheme, IconName, Sizable};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -26,7 +36,6 @@ use trove_core::store::{smart, smart_collections, tags};
 use uuid::Uuid;
 
 use crate::library::LibraryController;
-use crate::panels::common::color_swatch;
 
 // ============================ draft state ====================================
 
@@ -81,7 +90,14 @@ impl ConditionRow {
     }
 }
 
-/// The editor's draft: group mode, condition rows and the live match status.
+/// A group of conditions with its own combination operator.
+struct RuleGroup {
+    /// `true` = all conditions in this group must match, `false` = any.
+    and_mode: bool,
+    rows: Vec<ConditionRow>,
+}
+
+/// The editor's draft: group layout, condition rows and the live match status.
 struct RuleDraft {
     controller: Entity<LibraryController>,
     /// `Some(id)` while editing an existing smart collection.
@@ -91,19 +107,19 @@ struct RuleDraft {
     /// — [`open_rule_editor`] never moves the edited row.
     parent: Option<Uuid>,
     name_input: Entity<InputState>,
-    and_mode: bool,
-    rows: Vec<ConditionRow>,
+    /// How groups combine: `false` = match any group (or), `true` = match
+    /// all groups (and). Meaningless while only one group exists.
+    inter_and_mode: bool,
+    groups: Vec<RuleGroup>,
     /// Tag names for the tag dropdown (snapshot at open).
     tag_names: Vec<String>,
     /// Display color of the smart collection itself (`#rrggbb` or none).
     color: Option<String>,
-    /// HSL pickers feeding [`Self::color`] (kept in sync both ways).
-    pick: (f32, f32, f32),
-    hue: Entity<SliderState>,
-    sat: Entity<SliderState>,
-    lig: Entity<SliderState>,
+    /// gpui-kit picker state: owns the hex field and the HSL sliders and
+    /// keeps them synced with [`Self::color`].
+    picker: Entity<ColorPickerState>,
     /// Lives with the draft: when the dialog closes the draft (and these)
-    /// drop, unsubscribing the sliders.
+    /// drop, unsubscribing the picker.
     _subs: Vec<Subscription>,
     /// Bumped by every mutation; the dialog recomputes the match count when
     /// it drifts from `evaluated`.
@@ -119,97 +135,132 @@ impl RuleDraft {
         cx.notify();
     }
 
-    fn add_row(&mut self, field: SmartField, window: &mut Window, cx: &mut Context<Self>) {
-        self.rows.push(ConditionRow::new(window, cx, field));
+    fn add_row(
+        &mut self,
+        gix: usize,
+        field: SmartField,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(group) = self.groups.get_mut(gix) {
+            group.rows.push(ConditionRow::new(window, cx, field));
+        }
         self.touch(cx);
     }
 
-    fn remove_row(&mut self, ix: usize, cx: &mut Context<Self>) {
-        if ix < self.rows.len() {
-            self.rows.remove(ix);
-            self.touch(cx);
+    fn remove_row(&mut self, gix: usize, ix: usize, cx: &mut Context<Self>) {
+        if let Some(group) = self.groups.get_mut(gix)
+            && ix < group.rows.len()
+        {
+            group.rows.remove(ix);
         }
+        self.touch(cx);
     }
 
-    fn set_field(&mut self, ix: usize, field: SmartField, cx: &mut Context<Self>) {
-        if let Some(row) = self.rows.get_mut(ix)
+    fn add_group(&mut self, cx: &mut Context<Self>) {
+        self.groups.push(RuleGroup {
+            and_mode: true,
+            rows: Vec::new(),
+        });
+        self.touch(cx);
+    }
+
+    /// Removes a group; the last remaining group is kept so the editor never
+    /// ends up with nothing to edit.
+    fn remove_group(&mut self, gix: usize, cx: &mut Context<Self>) {
+        if self.groups.len() > 1 && gix < self.groups.len() {
+            self.groups.remove(gix);
+        }
+        self.touch(cx);
+    }
+
+    fn set_group_and_mode(&mut self, gix: usize, and_mode: bool, cx: &mut Context<Self>) {
+        if let Some(group) = self.groups.get_mut(gix) {
+            group.and_mode = and_mode;
+        }
+        self.touch(cx);
+    }
+
+    fn set_inter_and_mode(&mut self, inter_and_mode: bool, cx: &mut Context<Self>) {
+        self.inter_and_mode = inter_and_mode;
+        self.touch(cx);
+    }
+
+    fn set_field(&mut self, gix: usize, ix: usize, field: SmartField, cx: &mut Context<Self>) {
+        // Pulled out first: borrowing the row mutably would conflict with
+        // reading `tag_names` below.
+        let default_tag = self.tag_names.first().cloned().unwrap_or_default();
+        if let Some(row) = self.groups.get_mut(gix).and_then(|g| g.rows.get_mut(ix))
             && row.field != field
         {
             row.field = field;
             row.op = SmartCompare::Eq;
             row.kind = AssetKind::Image;
             row.favorite = true;
-            row.tag = self.tag_names.first().cloned().unwrap_or_default();
+            row.tag = default_tag;
             row.rating = 3;
             row.orientation = String::new();
         }
         self.touch(cx);
     }
 
-    fn set_op(&mut self, ix: usize, op: SmartCompare, cx: &mut Context<Self>) {
-        if let Some(row) = self.rows.get_mut(ix) {
+    fn set_op(&mut self, gix: usize, ix: usize, op: SmartCompare, cx: &mut Context<Self>) {
+        if let Some(row) = self.groups.get_mut(gix).and_then(|g| g.rows.get_mut(ix)) {
             row.op = op;
         }
         self.touch(cx);
     }
 
-    fn set_kind(&mut self, ix: usize, kind: AssetKind, cx: &mut Context<Self>) {
-        if let Some(row) = self.rows.get_mut(ix) {
+    fn set_kind(&mut self, gix: usize, ix: usize, kind: AssetKind, cx: &mut Context<Self>) {
+        if let Some(row) = self.groups.get_mut(gix).and_then(|g| g.rows.get_mut(ix)) {
             row.kind = kind;
         }
         self.touch(cx);
     }
 
-    fn set_favorite(&mut self, ix: usize, favorite: bool, cx: &mut Context<Self>) {
-        if let Some(row) = self.rows.get_mut(ix) {
+    fn set_favorite(&mut self, gix: usize, ix: usize, favorite: bool, cx: &mut Context<Self>) {
+        if let Some(row) = self.groups.get_mut(gix).and_then(|g| g.rows.get_mut(ix)) {
             row.favorite = favorite;
         }
         self.touch(cx);
     }
 
-    fn set_tag(&mut self, ix: usize, tag: String, cx: &mut Context<Self>) {
-        if let Some(row) = self.rows.get_mut(ix) {
+    fn set_tag(&mut self, gix: usize, ix: usize, tag: String, cx: &mut Context<Self>) {
+        if let Some(row) = self.groups.get_mut(gix).and_then(|g| g.rows.get_mut(ix)) {
             row.tag = tag;
         }
         self.touch(cx);
     }
 
-    fn set_rating(&mut self, ix: usize, rating: u8, cx: &mut Context<Self>) {
-        if let Some(row) = self.rows.get_mut(ix) {
+    fn set_rating(&mut self, gix: usize, ix: usize, rating: u8, cx: &mut Context<Self>) {
+        if let Some(row) = self.groups.get_mut(gix).and_then(|g| g.rows.get_mut(ix)) {
             row.rating = rating;
         }
         self.touch(cx);
     }
 
-    fn set_orientation(&mut self, ix: usize, orientation: String, cx: &mut Context<Self>) {
-        if let Some(row) = self.rows.get_mut(ix) {
+    fn set_orientation(
+        &mut self,
+        gix: usize,
+        ix: usize,
+        orientation: String,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(row) = self.groups.get_mut(gix).and_then(|g| g.rows.get_mut(ix)) {
             row.orientation = orientation;
         }
         self.touch(cx);
     }
 
-    fn set_and_mode(&mut self, and_mode: bool, cx: &mut Context<Self>) {
-        self.and_mode = and_mode;
-        self.touch(cx);
-    }
-
-    /// Set the color from a preset swatch (or clear it) and sync the HSL
-    /// sliders to the new value.
+    /// Set the color from a preset swatch (or clear it) and sync the picker
+    /// state (hex field + sliders follow automatically).
     fn set_color(&mut self, color: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
         self.color = color.clone();
-        self.pick = color.as_deref().and_then(hex_to_hsl).unwrap_or(self.pick);
-        let (h, sat, lig) = self.pick;
-        self.hue.update(cx, |st, cx| st.set_value(h, window, cx));
-        self.sat.update(cx, |st, cx| st.set_value(sat, window, cx));
-        self.lig.update(cx, |st, cx| st.set_value(lig, window, cx));
-        self.touch(cx);
-    }
-
-    /// Set the color from the slider panel (no slider sync — they are the
-    /// source).
-    fn set_pick(&mut self, h: f32, s: f32, l: f32, cx: &mut Context<Self>) {
-        self.pick = (h, s, l);
-        self.color = Some(hsl_to_hex(h, s, l));
+        let hsla = color.as_deref().and_then(hex_to_hsla);
+        self.picker.update(cx, |picker, cx| match hsla {
+            Some(c) => picker.set_value(c, window, cx),
+            None => picker.clear_value(window, cx),
+        });
         self.touch(cx);
     }
 
@@ -217,56 +268,28 @@ impl RuleDraft {
     /// skipped; an empty result is an error the dialog surfaces.
     fn build_json(&self, cx: &App) -> Result<serde_json::Value, String> {
         let t = |k: &str| rust_i18n::t!(k).to_string();
-        let mut children = Vec::new();
-        for row in &self.rows {
-            if !row.is_complete(cx) {
-                continue;
-            }
-            // The `op` tag is required by the internally-tagged SmartNode
-            // enum — omitting it makes node_from_json fail with
-            // "missing field `op`".
-            let mut node = serde_json::json!({ "op": "match", "field": field_json(row.field) });
-            if row.op != SmartCompare::Eq {
-                node["compare"] = serde_json::json!(compare_json(row.op));
-            }
-            node["value"] = match row.field {
-                SmartField::Text => serde_json::json!(row.text.read(cx).value().trim()),
-                SmartField::Extension => {
-                    serde_json::json!(normalize_extension(row.text.read(cx).value().trim()))
+        let mut groups: Vec<(bool, Vec<SmartNode>)> = Vec::new();
+        for group in &self.groups {
+            let mut children = Vec::new();
+            for row in &group.rows {
+                if !row.is_complete(cx) {
+                    continue;
                 }
-                SmartField::Color => match normalize_color(&row.text.read(cx).value()) {
-                    Some(hex) => serde_json::json!(hex),
-                    None => return Err(t("rules.invalid_color")),
-                },
-                SmartField::SizeBytes => match row.text.read(cx).value().trim().parse::<i64>() {
-                    Ok(n) if n > 0 => serde_json::json!(n),
-                    _ => return Err(t("rules.invalid_bytes")),
-                },
-                SmartField::CapturedAt => {
-                    let s = row.text.read(cx).value().trim().to_string();
-                    if smart::valid_date(&s) {
-                        serde_json::json!(s)
-                    } else {
-                        return Err(t("rules.invalid_date"));
-                    }
-                }
-                SmartField::AspectRatio => match row.text.read(cx).value().trim().parse::<f64>() {
-                    Ok(v) if v > 0.0 && v.is_finite() => serde_json::json!(v),
-                    _ => return Err(t("rules.invalid_aspect")),
-                },
-                SmartField::Orientation => serde_json::json!(row.orientation),
-                SmartField::Tag => serde_json::json!(row.tag),
-                SmartField::Rating => serde_json::json!(row.rating),
-                SmartField::Kind => serde_json::json!(row.kind),
-                SmartField::IsFavorite => serde_json::json!(row.favorite),
-            };
-            children.push(node);
+                children.push(SmartNode::Match {
+                    field: row.field,
+                    op: row.op,
+                    value: row_value(row, cx)?,
+                });
+            }
+            if !children.is_empty() {
+                groups.push((group.and_mode, children));
+            }
         }
-        if children.is_empty() {
+        if groups.is_empty() {
             return Err(t("rules.need_condition"));
         }
-        let op = if self.and_mode { "and" } else { "or" };
-        Ok(serde_json::json!({ "op": op, "children": children }))
+        serde_json::to_value(join_tree(self.inter_and_mode, &groups))
+            .map_err(|_| t("rules.match_error"))
     }
 
     /// Re-run the live match count when the draft moved since last draw.
@@ -300,75 +323,144 @@ impl RuleDraft {
     }
 }
 
-fn normalize_extension(raw: &str) -> String {
-    raw.trim().trim_start_matches('.').to_lowercase()
+/// The stored value side of one condition row.
+fn row_value(row: &ConditionRow, cx: &App) -> Result<serde_json::Value, String> {
+    let t = |k: &str| rust_i18n::t!(k).to_string();
+    Ok(match row.field {
+        SmartField::Text => serde_json::json!(row.text.read(cx).value().trim()),
+        SmartField::Extension => {
+            serde_json::json!(normalize_extension(row.text.read(cx).value().trim()))
+        }
+        SmartField::Color => match normalize_color(&row.text.read(cx).value()) {
+            Some(hex) => serde_json::json!(hex),
+            None => return Err(t("rules.invalid_color")),
+        },
+        SmartField::SizeBytes => match row.text.read(cx).value().trim().parse::<i64>() {
+            Ok(n) if n > 0 => serde_json::json!(n),
+            _ => return Err(t("rules.invalid_bytes")),
+        },
+        SmartField::CapturedAt => {
+            let s = row.text.read(cx).value().trim().to_string();
+            if smart::valid_date(&s) {
+                serde_json::json!(s)
+            } else {
+                return Err(t("rules.invalid_date"));
+            }
+        }
+        SmartField::AspectRatio => match row.text.read(cx).value().trim().parse::<f64>() {
+            Ok(v) if v > 0.0 && v.is_finite() => serde_json::json!(v),
+            _ => return Err(t("rules.invalid_aspect")),
+        },
+        SmartField::Orientation => serde_json::json!(row.orientation),
+        SmartField::Tag => serde_json::json!(row.tag),
+        SmartField::Rating => serde_json::json!(row.rating),
+        SmartField::Kind => serde_json::json!(row.kind),
+        SmartField::IsFavorite => serde_json::json!(row.favorite),
+    })
 }
 
-/// HSL (h 0–360, s/l 0–100) → `#rrggbb`.
-fn hsl_to_hex(h: f32, s: f32, l: f32) -> String {
-    let (r, g, b) = hsl_to_rgb(h, s, l);
-    format!("#{r:02x}{g:02x}{b:02x}")
-}
+// ============================ tree ⇄ groups (pure) ===========================
 
-fn hsl_to_rgb(h: f32, s: f32, l: f32) -> (u8, u8, u8) {
-    let h = h.rem_euclid(360.) / 360.;
-    let s = (s / 100.).clamp(0., 1.);
-    let l = (l / 100.).clamp(0., 1.);
-    if s == 0. {
-        let v = (l * 255.).round() as u8;
-        return (v, v, v);
-    }
-    let q = if l < 0.5 { l * (1. + s) } else { l + s - l * s };
-    let p = 2. * l - q;
-    let channel = |mut t: f32| -> u8 {
-        if t < 0. {
-            t += 1.;
+/// Splits a stored tree into `(groups combine with and, groups)`. The top
+/// level is `and`/`or`; each child group keeps its own operator. Matches
+/// sitting directly at the top level collapse into one group with the
+/// top-level operator — that is the flat shape earlier one-group versions
+/// wrote, and it must come back as one group. A bare match becomes a
+/// single-condition `and` group. Non-match nodes below the second layer
+/// cannot be surfaced by the flat editor and are dropped (the editor itself
+/// never produces such trees).
+fn split_tree(node: SmartNode) -> (bool, Vec<(bool, Vec<SmartNode>)>) {
+    let (and_mode, children) = match node {
+        SmartNode::And { children } => (true, children),
+        SmartNode::Or { children } => (false, children),
+        match_node @ SmartNode::Match { .. } => {
+            return (true, vec![(true, vec![match_node])]);
         }
-        if t > 1. {
-            t -= 1.;
-        }
-        let v = if t < 1. / 6. {
-            p + (q - p) * 6. * t
-        } else if t < 1. / 2. {
-            q
-        } else if t < 2. / 3. {
-            p + (q - p) * (2. / 3. - t) * 6.
-        } else {
-            p
-        };
-        (v * 255.).round() as u8
     };
-    (channel(h + 1. / 3.), channel(h), channel(h - 1. / 3.))
+    let mut top_level: Vec<SmartNode> = Vec::new();
+    let mut groups: Vec<(bool, Vec<SmartNode>)> = Vec::new();
+    for child in children {
+        match child {
+            SmartNode::And { children } => groups.push((true, keep_matches(children))),
+            SmartNode::Or { children } => groups.push((false, keep_matches(children))),
+            match_node @ SmartNode::Match { .. } => top_level.push(match_node),
+        }
+    }
+    if !top_level.is_empty() {
+        groups.insert(0, (and_mode, top_level));
+    }
+    (and_mode, groups)
 }
 
-fn hex_to_hsl(hex: &str) -> Option<(f32, f32, f32)> {
+fn keep_matches(children: Vec<SmartNode>) -> Vec<SmartNode> {
+    children
+        .into_iter()
+        .filter(|child| matches!(child, SmartNode::Match { .. }))
+        .collect()
+}
+
+/// Joins groups back into a tree. A single group is stored flat (the
+/// top-level operator would be redundant); multiple groups are wrapped in
+/// `inter_and`'s operator.
+fn join_tree(inter_and: bool, groups: &[(bool, Vec<SmartNode>)]) -> SmartNode {
+    let wrap = |and_mode: bool, children: Vec<SmartNode>| {
+        if and_mode {
+            SmartNode::And { children }
+        } else {
+            SmartNode::Or { children }
+        }
+    };
+    if groups.len() == 1 {
+        let (and_mode, children) = &groups[0];
+        return wrap(*and_mode, children.clone());
+    }
+    let children = groups
+        .iter()
+        .map(|(and_mode, children)| wrap(*and_mode, children.clone()))
+        .collect();
+    wrap(inter_and, children)
+}
+
+// ============================ color helpers ==================================
+
+/// Curated palette for smart-collection colors.
+const COLOR_PALETTE: [u32; 16] = [
+    0xef4444, 0xf97316, 0xeab308, 0x84cc16, 0x22c55e, 0x14b8a6, 0x06b6d4, 0x3b82f6, 0x6366f1,
+    0xa855f7, 0xec4899, 0xf43f5e, 0x78716c, 0x57534e, 0x1f2937, 0x0f172a,
+];
+
+fn u32_to_hsla(n: u32) -> Hsla {
+    Rgba {
+        r: ((n >> 16) & 0xff) as f32 / 255.,
+        g: ((n >> 8) & 0xff) as f32 / 255.,
+        b: (n & 0xff) as f32 / 255.,
+        a: 1.,
+    }
+    .into()
+}
+
+/// `#rrggbb` → opaque [`Hsla`], for feeding the picker state.
+fn hex_to_hsla(hex: &str) -> Option<Hsla> {
     let hex = normalize_color(hex)?;
     let n = u32::from_str_radix(hex.trim_start_matches('#'), 16).ok()?;
-    let (r, g, b) = (
-        ((n >> 16) & 0xff) as f32 / 255.,
-        ((n >> 8) & 0xff) as f32 / 255.,
-        (n & 0xff) as f32 / 255.,
-    );
-    let max = r.max(g).max(b);
-    let min = r.min(g).min(b);
-    let l = (max + min) / 2.;
-    if (max - min).abs() < f32::EPSILON {
-        return Some((0., 0., l * 100.));
-    }
-    let d = max - min;
-    let s = if l > 0.5 {
-        d / (2. - max - min)
-    } else {
-        d / (max + min)
-    };
-    let h = if max == r {
-        (g - b) / d + if g < b { 6. } else { 0. }
-    } else if max == g {
-        (b - r) / d + 2.
-    } else {
-        (r - g) / d + 4.
-    } * 60.;
-    Some((h, s * 100., l * 100.))
+    Some(u32_to_hsla(n))
+}
+
+/// [`Hsla`] → `#rrggbb` (lowercase). Alpha is dropped: smart-collection
+/// colors have no transparency semantics.
+fn picker_hex(color: Hsla) -> String {
+    let rgba = Rgba::from(color);
+    let channel = |value: f32| (value * 255.) as u8;
+    format!(
+        "#{:02x}{:02x}{:02x}",
+        channel(rgba.r),
+        channel(rgba.g),
+        channel(rgba.b)
+    )
+}
+
+fn normalize_extension(raw: &str) -> String {
+    raw.trim().trim_start_matches('.').to_lowercase()
 }
 
 fn normalize_color(raw: &str) -> Option<String> {
@@ -376,108 +468,94 @@ fn normalize_color(raw: &str) -> Option<String> {
     (s.len() == 6 && s.chars().all(|c| c.is_ascii_hexdigit())).then_some(format!("#{s}"))
 }
 
-// ============================ json (de)serialization =========================
+// ============================ load ===========================================
 
-fn field_json(field: SmartField) -> &'static str {
-    match field {
-        SmartField::Kind => "kind",
-        SmartField::IsFavorite => "is_favorite",
-        SmartField::Rating => "rating",
-        SmartField::Tag => "tag",
-        SmartField::Text => "text",
-        SmartField::Extension => "extension",
-        SmartField::SizeBytes => "size_bytes",
-        SmartField::Color => "color",
-        SmartField::CapturedAt => "captured_at",
-        SmartField::AspectRatio => "aspect_ratio",
-        SmartField::Orientation => "orientation",
-    }
-}
-
-fn compare_json(op: SmartCompare) -> &'static str {
-    match op {
-        SmartCompare::Eq => "eq",
-        SmartCompare::Ne => "ne",
-        SmartCompare::Gt => "gt",
-        SmartCompare::Gte => "gte",
-        SmartCompare::Lt => "lt",
-        SmartCompare::Lte => "lte",
-    }
-}
-
-/// Load a stored tree into `(and_mode, rows)`. Only top-level match
-/// conditions are surfaced (see the module docs); a bare match becomes a
-/// single-condition `and` group.
-fn load_rows(
+/// Load a stored tree into `(inter-group and mode, groups)`. Groups whose
+/// children all vanish (non-match nodes below layer two) are kept as empty
+/// groups so the structure stays visible; a tree with no groups at all
+/// falls back to one empty `and` group.
+fn load_groups(
     json: &serde_json::Value,
     window: &mut Window,
     cx: &mut App,
-) -> (bool, Vec<ConditionRow>) {
+) -> (bool, Vec<RuleGroup>) {
     let node = smart::node_from_json(json).unwrap_or(SmartNode::And {
         children: Vec::new(),
     });
-    let (and_mode, matches) = match node {
-        SmartNode::And { children } => (true, children),
-        SmartNode::Or { children } => (false, children),
-        match_node @ SmartNode::Match { .. } => (true, vec![match_node]),
-    };
-
-    let mut rows = Vec::new();
-    for child in matches {
-        let SmartNode::Match { field, op, value } = child else {
-            continue;
-        };
-        let mut row = ConditionRow::new(window, cx, field);
-        row.op = op;
-        match field {
-            SmartField::Text | SmartField::Extension | SmartField::Color => {
-                let s = value.as_str().unwrap_or_default().to_string();
-                row.text
-                    .update(cx, |state, cx| state.set_value(s, window, cx));
-            }
-            SmartField::SizeBytes => {
-                let s = value.as_i64().map(|n| n.to_string()).unwrap_or_default();
-                row.text
-                    .update(cx, |state, cx| state.set_value(s, window, cx));
-            }
-            SmartField::CapturedAt => {
-                let s = value.as_str().unwrap_or_default().to_string();
-                row.text
-                    .update(cx, |state, cx| state.set_value(s, window, cx));
-            }
-            SmartField::AspectRatio => {
-                let s = value
-                    .as_f64()
-                    .map(|v| {
-                        if v.fract() == 0.0 {
-                            format!("{v:.0}")
-                        } else {
-                            format!("{v}")
-                        }
-                    })
-                    .unwrap_or_default();
-                row.text
-                    .update(cx, |state, cx| state.set_value(s, window, cx));
-            }
-            SmartField::Orientation => {
-                row.orientation = value.as_str().unwrap_or_default().to_string();
-            }
-            SmartField::Rating => {
-                row.rating = value.as_u64().map(|n| n.clamp(0, 5) as u8).unwrap_or(3);
-            }
-            SmartField::Kind => {
-                row.kind = serde_json::from_value(value).unwrap_or(AssetKind::Image);
-            }
-            SmartField::IsFavorite => {
-                row.favorite = value.as_bool().unwrap_or(true);
-            }
-            SmartField::Tag => {
-                row.tag = value.as_str().unwrap_or_default().to_string();
-            }
-        }
-        rows.push(row);
+    let (inter_and, layout) = split_tree(node);
+    let mut groups: Vec<RuleGroup> = layout
+        .into_iter()
+        .map(|(and_mode, matches)| RuleGroup {
+            and_mode,
+            rows: matches
+                .into_iter()
+                .filter_map(|node| match_row(node, window, cx))
+                .collect(),
+        })
+        .collect();
+    if groups.is_empty() {
+        groups.push(RuleGroup {
+            and_mode: true,
+            rows: Vec::new(),
+        });
     }
-    (and_mode, rows)
+    (inter_and, groups)
+}
+
+/// Builds one condition row from a stored match node.
+fn match_row(node: SmartNode, window: &mut Window, cx: &mut App) -> Option<ConditionRow> {
+    let SmartNode::Match { field, op, value } = node else {
+        return None;
+    };
+    let mut row = ConditionRow::new(window, cx, field);
+    row.op = op;
+    match field {
+        SmartField::Text | SmartField::Extension | SmartField::Color => {
+            let s = value.as_str().unwrap_or_default().to_string();
+            row.text
+                .update(cx, |state, cx| state.set_value(s, window, cx));
+        }
+        SmartField::SizeBytes => {
+            let s = value.as_i64().map(|n| n.to_string()).unwrap_or_default();
+            row.text
+                .update(cx, |state, cx| state.set_value(s, window, cx));
+        }
+        SmartField::CapturedAt => {
+            let s = value.as_str().unwrap_or_default().to_string();
+            row.text
+                .update(cx, |state, cx| state.set_value(s, window, cx));
+        }
+        SmartField::AspectRatio => {
+            let s = value
+                .as_f64()
+                .map(|v| {
+                    if v.fract() == 0.0 {
+                        format!("{v:.0}")
+                    } else {
+                        format!("{v}")
+                    }
+                })
+                .unwrap_or_default();
+            row.text
+                .update(cx, |state, cx| state.set_value(s, window, cx));
+        }
+        SmartField::Orientation => {
+            row.orientation = value.as_str().unwrap_or_default().to_string();
+        }
+        SmartField::Rating => {
+            row.rating = value.as_u64().map(|n| n.clamp(0, 5) as u8).unwrap_or(3);
+        }
+        SmartField::Kind => {
+            row.kind = serde_json::from_value(value).unwrap_or(AssetKind::Image);
+        }
+        SmartField::IsFavorite => {
+            row.favorite = value.as_bool().unwrap_or(true);
+        }
+        SmartField::Tag => {
+            row.tag = value.as_str().unwrap_or_default().to_string();
+        }
+    }
+    Some(row)
 }
 
 // ============================ the dialog =====================================
@@ -503,9 +581,15 @@ pub fn open_rule_editor(
     if let Some(name) = editing.as_ref().map(|sc| sc.name.clone()) {
         name_input.update(cx, |state, cx| state.set_value(name, window, cx));
     }
-    let (and_mode, rows) = match &editing {
-        Some(sc) => load_rows(&sc.query, window, cx),
-        None => (true, Vec::new()),
+    let (inter_and_mode, groups) = match &editing {
+        Some(sc) => load_groups(&sc.query, window, cx),
+        None => (
+            true,
+            vec![RuleGroup {
+                and_mode: true,
+                rows: Vec::new(),
+            }],
+        ),
     };
     let tag_names = {
         let conn = controller.read(cx).library.store().conn();
@@ -517,26 +601,26 @@ pub fn open_rule_editor(
         .as_ref()
         .and_then(|sc| sc.color.clone())
         .and_then(|c| normalize_color(&c));
-    let pick = color
-        .as_deref()
-        .and_then(hex_to_hsl)
-        .unwrap_or((210., 75., 55.));
-    let hue = cx.new(|_| SliderState::new().min(0.).max(360.).default_value(pick.0));
-    let sat = cx.new(|_| SliderState::new().min(0.).max(100.).default_value(pick.1));
-    let lig = cx.new(|_| SliderState::new().min(0.).max(100.).default_value(pick.2));
+    let init = color.as_deref().and_then(hex_to_hsla);
+    let picker = cx.new(|cx| {
+        let state = ColorPickerState::new(window, cx);
+        match init {
+            Some(hsla) => state.default_value(hsla),
+            None => state,
+        }
+    });
+    // Flush the builder-supplied value into the hex field and sliders.
+    picker.update(cx, |picker, cx| picker.sync_pending_value(window, cx));
     let draft = cx.new(|_| RuleDraft {
         controller,
         editing: editing.map(|sc| sc.id),
         parent,
         name_input,
-        and_mode,
-        rows,
+        inter_and_mode,
+        groups,
         tag_names,
         color,
-        pick,
-        hue: hue.clone(),
-        sat: sat.clone(),
-        lig: lig.clone(),
+        picker: picker.clone(),
         _subs: Vec::new(),
         revision: 1,
         evaluated: 0,
@@ -544,49 +628,22 @@ pub fn open_rule_editor(
         error: None,
     });
 
-    // Slider → draft: pick channels update the color live while dragging.
-    #[derive(Clone, Copy)]
-    enum Channel {
-        H,
-        S,
-        L,
-    }
-    let mut subs = Vec::new();
-    let sliders = [
-        (hue.clone(), Channel::H),
-        (sat.clone(), Channel::S),
-        (lig.clone(), Channel::L),
-    ];
-    for (slider, channel) in &sliders {
-        let channel = *channel;
-        let d = draft.clone();
-        subs.push(
-            cx.subscribe(slider, move |_slider, event: &SliderEvent, cx| {
-                let value = match event {
-                    SliderEvent::Change(v) | SliderEvent::Release(v) => v.start(),
-                };
-                d.update(cx, |d, cx| {
-                    let (h, s, l) = d.pick;
-                    match channel {
-                        Channel::H => d.set_pick(value.clamp(0., 360.), s, l, cx),
-                        Channel::S => d.set_pick(h, value.clamp(0., 100.), l, cx),
-                        Channel::L => d.set_pick(h, s, value.clamp(0., 100.), cx),
-                    }
-                });
-            }),
-        );
-    }
-    draft.update(cx, |d, _| d._subs = subs);
+    // Picker → draft: the component keeps hex field and sliders in sync and
+    // reports the committed color here. The color does not touch the rule
+    // tree, so the revision is left alone.
+    let d = draft.clone();
+    let sub = cx.subscribe(&picker, move |_, event: &ColorPickerEvent, cx| {
+        d.update(cx, |d, _| match event {
+            ColorPickerEvent::Change(color) => d.color = color.map(picker_hex),
+        });
+    });
+    draft.update(cx, |d, _| d._subs = vec![sub]);
 
     window.open_dialog(cx, move |dialog, _, cx| {
         draft.update(cx, RuleDraft::recompute_if_stale);
-        let (and_mode, status, _color) = {
+        let status = {
             let d = draft.read(cx);
-            (
-                d.and_mode,
-                (d.match_total, d.error.clone()),
-                d.color.clone(),
-            )
+            (d.match_total, d.error.clone())
         };
 
         dialog
@@ -599,7 +656,7 @@ pub fn open_rule_editor(
                 .to_string(),
             )
             .width(px(680.))
-            .child(render_body(&draft, and_mode, status, cx))
+            .child(render_body(&draft, status, cx))
             .on_ok({
                 let draft = draft.clone();
                 move |_, _, cx| save_draft(&draft, cx)
@@ -685,12 +742,14 @@ fn save_draft(draft: &Entity<RuleDraft>, cx: &mut App) -> bool {
 
 fn render_body(
     draft: &Entity<RuleDraft>,
-    and_mode: bool,
     status: (Option<u64>, Option<String>),
     cx: &mut App,
 ) -> Div {
     let t = |k: &str| rust_i18n::t!(k).to_string();
-    let name_input = draft.read(cx).name_input.clone();
+    let (name_input, inter_and_mode, group_count) = {
+        let d = draft.read(cx);
+        (d.name_input.clone(), d.inter_and_mode, d.groups.len())
+    };
 
     let mut body = v_flex()
         .gap_3()
@@ -701,106 +760,48 @@ fn render_body(
                 .child(field_label(cx, "rules.name"))
                 .child(Input::new(&name_input).small().appearance(true)),
         )
-        .child(
-            h_flex()
-                .gap_1()
-                .child({
-                    let d = draft.clone();
-                    Button::new("mode-and")
-                        .xsmall()
-                        .when(and_mode, |b| b.primary())
-                        .when(!and_mode, |b| b.ghost())
-                        .label(t("rules.match_all"))
-                        .on_click(move |_, _, cx| {
-                            d.update(cx, |d, cx| d.set_and_mode(true, cx));
-                        })
-                })
-                .child({
-                    let d = draft.clone();
-                    Button::new("mode-or")
-                        .xsmall()
-                        .when(!and_mode, |b| b.primary())
-                        .when(and_mode, |b| b.ghost())
-                        .label(t("rules.match_any"))
-                        .on_click(move |_, _, cx| {
-                            d.update(cx, |d, cx| d.set_and_mode(false, cx));
-                        })
-                }),
-        )
-        .child({
-            let (hue, sat, lig, color) = {
-                let d = draft.read(cx);
-                (d.hue.clone(), d.sat.clone(), d.lig.clone(), d.color.clone())
-            };
-            let hex = color.clone();
-            v_flex()
-                .gap_1p5()
-                .child(field_label(cx, "rules.color"))
-                // Current pick + hex, right-click copies the value (same as
-                // the Inspector swatches).
-                .child({
-                    h_flex()
-                        .items_center()
-                        .gap_1p5()
-                        .child(match &color {
-                            Some(hex) => {
-                                color_swatch(cx, "pick-preview".into(), hex, false, |_, _, _| {})
-                                    .on_mouse_down(gpui::MouseButton::Right, {
-                                        let hex = hex.clone();
-                                        move |_, _, cx| {
-                                            cx.write_to_clipboard(gpui::ClipboardItem::new_string(
-                                                hex.clone(),
-                                            ));
-                                        }
-                                    })
-                            }
-                            None => div()
-                                .id("pick-none")
-                                .size_5()
-                                .rounded_full()
-                                .border_1()
-                                .border_color(cx.theme().border),
-                        })
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(cx.theme().muted_foreground)
-                                .child(hex.unwrap_or_else(|| "—".into())),
-                        )
-                })
-                .child(slider_row("rules.hue", &hue, cx))
-                .child(slider_row("rules.saturation", &sat, cx))
-                .child(slider_row("rules.lightness", &lig, cx))
-                .child(color_swatch_row(draft, color, cx))
-        })
+        .child(render_color_section(draft, cx))
         .child(field_label(cx, "rules.conditions"));
 
-    let rows: Vec<(usize, SmartField, SmartCompare)> = {
-        let d = draft.read(cx);
-        d.rows
-            .iter()
-            .enumerate()
-            .map(|(ix, row)| (ix, row.field, row.op))
-            .collect()
-    };
-    for (ix, field, op) in rows {
-        body = body.child(render_row(draft, ix, field, op, cx));
+    for gix in 0..group_count {
+        if gix == 1 {
+            body = body.child(render_inter_separator(draft, inter_and_mode, cx));
+        }
+        let (and_mode, rows): (bool, Vec<(usize, SmartField, SmartCompare)>) = {
+            let d = draft.read(cx);
+            let group = &d.groups[gix];
+            (
+                group.and_mode,
+                group
+                    .rows
+                    .iter()
+                    .enumerate()
+                    .map(|(ix, row)| (ix, row.field, row.op))
+                    .collect(),
+            )
+        };
+        body = body.child(render_group(
+            draft,
+            gix,
+            and_mode,
+            rows,
+            group_count > 1,
+            cx,
+        ));
     }
 
-    body = body.child(
+    body.child(
         h_flex()
             .items_center()
             .gap_2()
             .child({
                 let d = draft.clone();
-                Button::new("add-condition")
+                Button::new("add-group")
                     .xsmall()
                     .ghost()
                     .icon(IconName::Plus)
-                    .label(t("rules.add_condition"))
-                    .on_click(move |_, window, cx| {
-                        d.update(cx, |d, cx| d.add_row(SmartField::Text, window, cx));
-                    })
+                    .label(t("rules.add_group"))
+                    .on_click(move |_, _, cx| d.update(cx, |d, cx| d.add_group(cx)))
             })
             .child(match status {
                 (Some(total), None) => div()
@@ -810,13 +811,155 @@ fn render_body(
                 (_, Some(err)) => div().text_xs().text_color(cx.theme().danger).child(err),
                 (None, None) => div(),
             }),
-    );
+    )
+}
 
-    body
+/// Accent color: preview swatch + editable hex field + three HSL sliders +
+/// curated swatch row, all synced through the picker state.
+fn render_color_section(draft: &Entity<RuleDraft>, cx: &mut App) -> Div {
+    let (picker, color) = {
+        let d = draft.read(cx);
+        (d.picker.clone(), d.color.clone())
+    };
+    let displayed = picker.read(cx).displayed_color();
+    let hex_input = picker.read(cx).hex_input().clone();
+    let sliders = picker.read(cx).sliders().clone();
+
+    v_flex()
+        .gap_1p5()
+        .child(field_label(cx, "rules.color"))
+        // Current pick, editable as hex; right-click copies the value (same
+        // as the Inspector swatches).
+        .child(
+            h_flex()
+                .items_center()
+                .gap_1p5()
+                .child(match displayed {
+                    Some(c) => div()
+                        .id("pick-preview")
+                        .size_5()
+                        .rounded_full()
+                        .bg(c)
+                        .border_1()
+                        .border_color(cx.theme().border)
+                        .on_mouse_down(gpui::MouseButton::Right, {
+                            let hex = color.clone();
+                            move |_, _, cx| {
+                                if let Some(hex) = &hex {
+                                    cx.write_to_clipboard(gpui::ClipboardItem::new_string(
+                                        hex.clone(),
+                                    ));
+                                }
+                            }
+                        }),
+                    None => div()
+                        .id("pick-none")
+                        .size_5()
+                        .rounded_full()
+                        .border_1()
+                        .border_color(cx.theme().border),
+                })
+                .child(Input::new(&hex_input).small().w(px(92.)).appearance(true)),
+        )
+        .child(slider_row("rules.hue", sliders.hue(), cx))
+        .child(slider_row("rules.saturation", sliders.saturation(), cx))
+        .child(slider_row("rules.lightness", sliders.lightness(), cx))
+        .child(color_swatches_row(draft, color, cx))
+}
+
+/// The separator between condition groups: two rules with the switchable
+/// inter-group operator in the middle. Only rendered with 2+ groups.
+fn render_inter_separator(draft: &Entity<RuleDraft>, inter_and: bool, cx: &mut App) -> Div {
+    let t = |k: &str| rust_i18n::t!(k).to_string();
+    let d = draft.clone();
+    h_flex()
+        .items_center()
+        .gap_2()
+        .child(div().flex_1().h(px(1.)).bg(cx.theme().border))
+        .child(dropdown_button(
+            "inter-mode",
+            t(if inter_and {
+                "rules.inter_all"
+            } else {
+                "rules.inter_any"
+            }),
+            vec![(false, t("rules.inter_any")), (true, t("rules.inter_all"))],
+            inter_and,
+            move |picked: bool, cx| d.update(cx, |d, cx| d.set_inter_and_mode(picked, cx)),
+        ))
+        .child(div().flex_1().h(px(1.)).bg(cx.theme().border))
+}
+
+fn render_group(
+    draft: &Entity<RuleDraft>,
+    gix: usize,
+    and_mode: bool,
+    rows: Vec<(usize, SmartField, SmartCompare)>,
+    show_remove: bool,
+    cx: &mut App,
+) -> Div {
+    let t = |k: &str| rust_i18n::t!(k).to_string();
+
+    let mut header = h_flex()
+        .items_center()
+        .gap_1()
+        .child({
+            let d = draft.clone();
+            Button::new(format!("group-{gix}-mode-and"))
+                .xsmall()
+                .when(and_mode, |b| b.primary())
+                .when(!and_mode, |b| b.ghost())
+                .label(t("rules.match_all"))
+                .on_click(move |_, _, cx| d.update(cx, |d, cx| d.set_group_and_mode(gix, true, cx)))
+        })
+        .child({
+            let d = draft.clone();
+            Button::new(format!("group-{gix}-mode-or"))
+                .xsmall()
+                .when(!and_mode, |b| b.primary())
+                .when(and_mode, |b| b.ghost())
+                .label(t("rules.match_any"))
+                .on_click(move |_, _, cx| {
+                    d.update(cx, |d, cx| d.set_group_and_mode(gix, false, cx))
+                })
+        });
+    if show_remove {
+        header = header.child(div().flex_1()).child({
+            let d = draft.clone();
+            Button::new(format!("group-{gix}-remove"))
+                .xsmall()
+                .ghost()
+                .icon(IconName::Close)
+                .on_click(move |_, _, cx| d.update(cx, |d, cx| d.remove_group(gix, cx)))
+        });
+    }
+
+    let mut group = v_flex()
+        .gap_1p5()
+        .p_2()
+        .border_1()
+        .border_color(cx.theme().border)
+        .rounded(cx.theme().radius)
+        .child(header);
+    for (ix, field, op) in rows {
+        group = group.child(render_row(draft, gix, ix, field, op, cx));
+    }
+    group.child({
+        let d = draft.clone();
+        Button::new(format!("group-{gix}-add"))
+            .xsmall()
+            .ghost()
+            .icon(IconName::Plus)
+            .label(t("rules.add_condition"))
+            .on_click(move |_, window, cx| {
+                d.update(cx, |d, cx| d.add_row(gix, SmartField::Text, window, cx));
+            })
+    })
 }
 
 fn render_row(
     draft: &Entity<RuleDraft>,
+    gix: usize,
     ix: usize,
     field: SmartField,
     op: SmartCompare,
@@ -825,7 +968,7 @@ fn render_row(
     let t = |k: &str| rust_i18n::t!(k).to_string();
     let (kind, favorite, tag, rating, orientation, tag_names, text_input) = {
         let d = draft.read(cx);
-        let row = &d.rows[ix];
+        let row = &d.groups[gix].rows[ix];
         (
             row.kind,
             row.favorite,
@@ -842,7 +985,7 @@ fn render_row(
         .gap_1()
         // Field picker.
         .child(dropdown_button(
-            format!("row-{ix}-field"),
+            format!("row-{gix}-{ix}-field"),
             t(field_key(field)),
             [
                 (SmartField::Text, "rules.f_text"),
@@ -863,7 +1006,7 @@ fn render_row(
             field,
             {
                 let d = draft.clone();
-                move |picked: SmartField, cx| d.update(cx, |d, cx| d.set_field(ix, picked, cx))
+                move |picked: SmartField, cx| d.update(cx, |d, cx| d.set_field(gix, ix, picked, cx))
             },
         ));
 
@@ -880,13 +1023,13 @@ fn render_row(
         );
     } else {
         row_el = row_el.child(dropdown_button(
-            format!("row-{ix}-op"),
+            format!("row-{gix}-{ix}-op"),
             t(op_key(field, op)),
             ops.iter().map(|&op| (op, t(op_key(field, op)))).collect(),
             op,
             {
                 let d = draft.clone();
-                move |picked: SmartCompare, cx| d.update(cx, |d, cx| d.set_op(ix, picked, cx))
+                move |picked: SmartCompare, cx| d.update(cx, |d, cx| d.set_op(gix, ix, picked, cx))
             },
         ));
     }
@@ -903,7 +1046,7 @@ fn render_row(
             .min_w_0()
             .child(Input::new(&text_input).small().appearance(true)),
         SmartField::Kind => h_flex().flex_1().min_w_0().child(dropdown_button(
-            format!("row-{ix}-kind"),
+            format!("row-{gix}-{ix}-kind"),
             t(kind_key(kind)),
             [
                 AssetKind::Image,
@@ -921,21 +1064,21 @@ fn render_row(
             kind,
             {
                 let d = draft.clone();
-                move |picked: AssetKind, cx| d.update(cx, |d, cx| d.set_kind(ix, picked, cx))
+                move |picked: AssetKind, cx| d.update(cx, |d, cx| d.set_kind(gix, ix, picked, cx))
             },
         )),
         SmartField::IsFavorite => h_flex().flex_1().min_w_0().child(dropdown_button(
-            format!("row-{ix}-fav"),
+            format!("row-{gix}-{ix}-fav"),
             t(if favorite { "rules.yes" } else { "rules.no" }),
             vec![(true, t("rules.yes")), (false, t("rules.no"))],
             favorite,
             {
                 let d = draft.clone();
-                move |picked: bool, cx| d.update(cx, |d, cx| d.set_favorite(ix, picked, cx))
+                move |picked: bool, cx| d.update(cx, |d, cx| d.set_favorite(gix, ix, picked, cx))
             },
         )),
         SmartField::Tag => h_flex().flex_1().min_w_0().child(dropdown_button(
-            format!("row-{ix}-tag"),
+            format!("row-{gix}-{ix}-tag"),
             if tag.is_empty() {
                 t("rules.has_tag")
             } else {
@@ -945,11 +1088,11 @@ fn render_row(
             tag,
             {
                 let d = draft.clone();
-                move |picked: String, cx| d.update(cx, |d, cx| d.set_tag(ix, picked, cx))
+                move |picked: String, cx| d.update(cx, |d, cx| d.set_tag(gix, ix, picked, cx))
             },
         )),
         SmartField::Orientation => h_flex().flex_1().min_w_0().child(dropdown_button(
-            format!("row-{ix}-orientation"),
+            format!("row-{gix}-{ix}-orientation"),
             if orientation.is_empty() {
                 t("rules.f_orientation")
             } else {
@@ -967,17 +1110,19 @@ fn render_row(
             orientation,
             {
                 let d = draft.clone();
-                move |picked: String, cx| d.update(cx, |d, cx| d.set_orientation(ix, picked, cx))
+                move |picked: String, cx| {
+                    d.update(cx, |d, cx| d.set_orientation(gix, ix, picked, cx))
+                }
             },
         )),
         SmartField::Rating => h_flex().flex_1().min_w_0().child(dropdown_button(
-            format!("row-{ix}-rating"),
+            format!("row-{gix}-{ix}-rating"),
             format!("{rating} ★"),
             (0..=5u8).map(|n| (n, format!("{n} ★"))).collect(),
             rating,
             {
                 let d = draft.clone();
-                move |picked: u8, cx| d.update(cx, |d, cx| d.set_rating(ix, picked, cx))
+                move |picked: u8, cx| d.update(cx, |d, cx| d.set_rating(gix, ix, picked, cx))
             },
         )),
     };
@@ -985,35 +1130,17 @@ fn render_row(
 
     row_el.child({
         let d = draft.clone();
-        Button::new(format!("row-{ix}-remove"))
+        Button::new(format!("row-{gix}-{ix}-remove"))
             .xsmall()
             .ghost()
             .icon(IconName::Close)
-            .on_click(move |_, _, cx| d.update(cx, |d, cx| d.remove_row(ix, cx)))
+            .on_click(move |_, _, cx| d.update(cx, |d, cx| d.remove_row(gix, ix, cx)))
     })
 }
 
-/// Curated palette for smart-collection colors.
-const COLOR_PALETTE: &[&str] = &[
-    "#ef4444", "#f97316", "#eab308", "#84cc16", "#22c55e", "#14b8a6", "#06b6d4", "#3b82f6",
-    "#6366f1", "#a855f7", "#ec4899", "#f43f5e", "#78716c", "#57534e", "#1f2937", "#0f172a",
-];
-
-fn slider_row(label_key: &'static str, state: &Entity<SliderState>, cx: &App) -> Div {
-    h_flex()
-        .items_center()
-        .gap_2()
-        .child(
-            div()
-                .w(px(36.))
-                .text_xs()
-                .text_color(cx.theme().muted_foreground)
-                .child(rust_i18n::t!(label_key).to_string()),
-        )
-        .child(Slider::new(state).horizontal().flex_1())
-}
-
-fn color_swatch_row(draft: &Entity<RuleDraft>, color: Option<String>, cx: &App) -> Div {
+/// Curated palette rendered as gpui-kit base swatches (radio semantics,
+/// accessible hex names).
+fn color_swatches_row(draft: &Entity<RuleDraft>, color: Option<String>, cx: &App) -> Div {
     let mut row = h_flex().flex_wrap().gap_1().child({
         // "No color" clears the accent.
         let d = draft.clone();
@@ -1034,21 +1161,25 @@ fn color_swatch_row(draft: &Entity<RuleDraft>, color: Option<String>, cx: &App) 
                 d.update(cx, |d, cx| d.set_color(None, window, cx));
             })
     });
-    for hex in COLOR_PALETTE {
-        let d = draft.clone();
-        let hex = hex.to_string();
+    for (ix, c) in COLOR_PALETTE.iter().enumerate() {
+        let hex = format!("#{c:06x}");
         let selected = color.as_deref() == Some(hex.as_str());
-        let id = format!("swatch-{hex}");
-        let hex_arg = hex.clone();
-        row = row.child(color_swatch(
-            cx,
-            id,
-            &hex_arg,
-            selected,
-            move |_, window, cx| {
-                d.update(cx, |d, cx| d.set_color(Some(hex.clone()), window, cx));
-            },
-        ));
+        let d = draft.clone();
+        let hex_click = hex.clone();
+        row = row.child(
+            ColorSwatch::new(("swatch", ix), u32_to_hsla(*c))
+                .selected(selected)
+                .h_5()
+                .w_5()
+                .rounded_full()
+                .bg(u32_to_hsla(*c))
+                .border_1()
+                .border_color(cx.theme().border)
+                .when(selected, |this| this.border_2())
+                .on_click(move |_, _, window, cx| {
+                    d.update(cx, |d, cx| d.set_color(Some(hex_click.clone()), window, cx));
+                }),
+        );
     }
     row
 }
@@ -1059,7 +1190,7 @@ fn color_swatch_row(draft: &Entity<RuleDraft>, color: Option<String>, cx: &App) 
 /// (`(value, label)`); the current value is check-marked, `on_pick` fires
 /// with the picked value.
 fn dropdown_button<T: PartialEq + Clone + 'static>(
-    id: String,
+    id: impl Into<ElementId>,
     label: String,
     options: Vec<(T, String)>,
     current: T,
@@ -1083,6 +1214,20 @@ fn dropdown_button<T: PartialEq + Clone + 'static>(
             }
             menu
         })
+}
+
+fn slider_row(label_key: &'static str, state: &Entity<SliderState>, cx: &App) -> Div {
+    h_flex()
+        .items_center()
+        .gap_2()
+        .child(
+            div()
+                .w(px(36.))
+                .text_xs()
+                .text_color(cx.theme().muted_foreground)
+                .child(rust_i18n::t!(label_key).to_string()),
+        )
+        .child(Slider::new(state).horizontal().flex_1())
 }
 
 fn field_label(cx: &App, key: &'static str) -> Div {
@@ -1155,5 +1300,113 @@ fn allowed_ops(field: SmartField) -> &'static [SmartCompare] {
             SmartCompare::Lt,
             SmartCompare::Lte,
         ],
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{join_tree, split_tree};
+    use trove_core::model::{SmartCompare, SmartField, SmartNode};
+    use trove_core::store::smart;
+
+    fn m(field: SmartField, value: i64) -> SmartNode {
+        SmartNode::Match {
+            field,
+            op: SmartCompare::Eq,
+            value: serde_json::json!(value),
+        }
+    }
+
+    fn round_trip(node: SmartNode) -> (bool, Vec<(bool, Vec<SmartNode>)>) {
+        let json = serde_json::to_value(&node).unwrap();
+        split_tree(smart::node_from_json(&json).unwrap())
+    }
+
+    #[test]
+    fn bare_match_loads_as_single_and_group() {
+        let (inter_and, groups) = split_tree(m(SmartField::Rating, 4));
+        assert!(inter_and);
+        assert_eq!(groups.len(), 1);
+        assert!(groups[0].0);
+        assert_eq!(groups[0].1.len(), 1);
+    }
+
+    #[test]
+    fn single_flat_group_round_trips() {
+        let groups = [(true, vec![m(SmartField::Rating, 4), m(SmartField::Kind, 1)])];
+        let (inter, loaded) = round_trip(join_tree(true, &groups));
+        assert!(loaded.len() == 1 && loaded[0].0);
+        assert_eq!(loaded[0].1.len(), 2);
+        // A single group carries no inter-group semantics.
+        assert!(inter);
+    }
+
+    #[test]
+    fn or_of_ands_round_trips() {
+        let groups = [
+            (
+                true,
+                vec![m(SmartField::Rating, 4), m(SmartField::IsFavorite, 1)],
+            ),
+            (true, vec![m(SmartField::Kind, 2)]),
+        ];
+        let json = serde_json::to_value(join_tree(false, &groups)).unwrap();
+        // Top level must be `or`; each branch its own `and`.
+        assert_eq!(json["op"], "or");
+        assert_eq!(json["children"][0]["op"], "and");
+        assert_eq!(json["children"][1]["op"], "and");
+
+        let (inter, loaded) = split_tree(smart::node_from_json(&json).unwrap());
+        assert!(!inter);
+        assert_eq!(loaded.len(), 2);
+        assert!(loaded.iter().all(|(and_mode, _)| *and_mode));
+        assert_eq!(loaded[0].1.len(), 2);
+        assert_eq!(loaded[1].1.len(), 1);
+    }
+
+    #[test]
+    fn inter_all_wraps_groups_in_and() {
+        let groups = [
+            (false, vec![m(SmartField::Kind, 2)]),
+            (false, vec![m(SmartField::Rating, 3)]),
+        ];
+        let json = serde_json::to_value(join_tree(true, &groups)).unwrap();
+        assert_eq!(json["op"], "and");
+        assert_eq!(json["children"][0]["op"], "or");
+
+        let (inter, loaded) = split_tree(smart::node_from_json(&json).unwrap());
+        assert!(inter);
+        assert_eq!(loaded.len(), 2);
+        assert!(loaded.iter().all(|(and_mode, _)| !*and_mode));
+    }
+
+    #[test]
+    fn mixed_group_modes_survive_a_round_trip() {
+        let groups = [
+            (true, vec![m(SmartField::Rating, 4)]),
+            (false, vec![m(SmartField::Kind, 1), m(SmartField::Kind, 3)]),
+            (true, vec![m(SmartField::IsFavorite, 1)]),
+        ];
+        let (inter, loaded) = round_trip(join_tree(false, &groups));
+        assert!(!inter);
+        let modes: Vec<bool> = loaded.iter().map(|(and_mode, _)| *and_mode).collect();
+        assert_eq!(modes, vec![true, false, true]);
+        let sizes: Vec<usize> = loaded.iter().map(|(_, rows)| rows.len()).collect();
+        assert_eq!(sizes, vec![1, 2, 1]);
+    }
+
+    #[test]
+    fn non_match_nodes_below_layer_two_are_dropped() {
+        // Or[ And[ Or[m] ] ] — the innermost Or cannot be surfaced.
+        let node = SmartNode::Or {
+            children: vec![SmartNode::And {
+                children: vec![SmartNode::Or {
+                    children: vec![m(SmartField::Rating, 4)],
+                }],
+            }],
+        };
+        let (_, loaded) = split_tree(node);
+        assert_eq!(loaded.len(), 1);
+        assert!(loaded[0].1.is_empty(), "the unsurfable node is dropped");
     }
 }
