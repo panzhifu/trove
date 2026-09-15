@@ -8,3 +8,6 @@ Icon=trove
 Categories=Graphics;Utility;FileManager;
 StartupWMClass=trove
 Keywords=assets;images;fonts;collection;
+# KWin authorizes `org.kde.KWin.ScreenShot2` (in-process capture on KDE)
+# only for applications whose desktop entry declares the interface here.
+X-KDE-DBUS-Restricted-Interfaces=org.kde.KWin.ScreenShot2
