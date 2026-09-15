@@ -151,11 +151,7 @@ fn preview_block(draft: &Entity<RenameDraft>, cx: &mut App) -> Div {
     if !pattern.is_empty() {
         for (ix, id) in selection.iter().take(4).enumerate() {
             if let Ok(Some(asset)) = assets::get(conn, *id) {
-                let stem = std::path::Path::new(&asset.file_name)
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or(&asset.file_name)
-                    .to_string();
+                let stem = asset.file_stem();
                 rows.push(format!(
                     "{} → {}",
                     asset.file_name,

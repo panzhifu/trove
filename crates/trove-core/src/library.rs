@@ -531,11 +531,7 @@ impl Library {
             let Some(asset) = assets::get(conn, *id)? else {
                 continue;
             };
-            let stem = std::path::Path::new(&asset.file_name)
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or(&asset.file_name)
-                .to_string();
+            let stem = asset.file_stem();
             let title = pattern
                 .replace("{n}", &n.to_string())
                 .replace("{name}", &stem);

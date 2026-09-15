@@ -135,13 +135,7 @@ impl ConvertDraft {
                 Some(ConvertItem {
                     asset_id: asset.id,
                     source,
-                    title: asset.title.clone().unwrap_or_else(|| {
-                        std::path::Path::new(&asset.file_name)
-                            .file_stem()
-                            .and_then(|s| s.to_str())
-                            .unwrap_or(&asset.file_name)
-                            .to_string()
-                    }),
+                    title: asset.title.clone().unwrap_or_else(|| asset.file_stem()),
                 })
             })
             .collect();
