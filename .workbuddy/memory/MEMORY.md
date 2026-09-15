@@ -13,7 +13,7 @@
 - 测试/基准必须 `TMPDIR=/home/noke/Code/trove/target/tmp`（/tmp 仅 10 MB tmpfs，否则几十个测试假失败）。
 - trove-app 链接吃内存：`RUSTFLAGS="-C link-arg=-Wl,--threads=1"`（`--` 后的参数归 libtest，要放 RUSTFLAGS）。
 - 沙箱内 `git push` 不可用（出口代理 502）→ 推送交用户在真实终端执行。
-- clippy 基线生产代码 **0 告警**；测试基线 trove-core 322 + trove-app 20（跳过 2 个真机 GPU）。
+- clippy 基线生产代码 **0 告警**；测试基线 trove-core 343 + trove-app 27（跳过 2 个真机 GPU）。
 - 依赖硬约束：`resvg` ^0.46、`tantivy` = 0.26（升 `INDEX_VERSION` 才可升）、`image` 特性只在 workspace 声明一处、`sha2` 留 0.10（oo7/ashpd 要求）、gpui-kit 跟 main 分支。
 - Conventional Commits（英文），按功能拆粒度；`.workbuddy/memory/*.md` 被 git 追踪。
 - 版本号在 `crates/trove-app/Cargo.toml`（现 0.4.2），UI 用 `env!("CARGO_PKG_VERSION")`。
@@ -72,6 +72,10 @@
 - `trove_core::media::mesh::Bounds` 遮蔽 gpui 的，同文件 `use …::Bounds as MeshBounds`。
 - 面板模块测试别 `use super::*`（gpui prelude 带进 test 宏 → recursion limit），显式列名。
 - `panel!` 宏第三段可选字段已扩；宏参数里用 `//` 别用 `///`。只有 FoldersPanel 走宏。
+
+## 截图 / 日志（基础设施，2026-09-15）
+- 用户桌面 niri **无 zwlr_screencopy**（只有 ext-image-copy-capture-v1）→ grim 稳定版与 xcap(libwayshot) 在 niri 全挂。全屏捕获链：grim-rs（`Grim::new_ext`→`new_wlr`，target-gated Linux）→ xcap（X11/mac/win）→ 外部工具链 → 自定义命令；失败原因逐级拼接进最终错误。Region 交互选区仍是 slurp+grim 外部路径，niri 上会挂在 grim（待办：slurp 几何 + `grim_rs capture_region`）。
+- 日志：tracing 门面 + `logging::init()`（main 第一行）；双 sink = stderr + `<config>/trove/logs/trove.log`（追加，8MB 轮转 `.old`）；`RUST_LOG` 控制级别，默认 info。`registry().with()` 需要 `tracing_subscriber::prelude::*`（SubscriberExt 不在 scope 报 E0599）。
 
 ## 历史 / 已修正
 - Open With 删的是 `.desktop` 扫描 + 复制到 `<config>/edit/`；`services/open_external.rs`（`plan`/`open`）仍在用。
