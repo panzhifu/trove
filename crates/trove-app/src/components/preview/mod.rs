@@ -18,7 +18,6 @@
 mod audio;
 mod fallback;
 mod font;
-mod fullscreen;
 mod gpu3d;
 mod image;
 pub(crate) mod model;
@@ -40,8 +39,9 @@ use uuid::Uuid;
 /// Zoom factor per wheel notch.
 const ZOOM_FACTOR: f32 = 1.15;
 
+pub(crate) use video::VideoPlayer;
+
 use crate::library::LibraryController;
-use video::{FullscreenSeed, PlayerResume, VideoPlayer, VideoPlayerEvent};
 
 /// Which placement renders the preview; the kinds differ in what "as large
 /// as useful" means for them.
@@ -205,10 +205,6 @@ pub(crate) struct AssetPreviewPanel {
     data: AssetPreviewData,
     /// Live player for videos; `None` renders the still variants instead.
     video: Option<Entity<VideoPlayer>>,
-    /// Watches the player for the fullscreen request: the panel pauses it
-    /// and opens the fullscreen window from its state. `None` when there
-    /// is no player.
-    _video_events: Option<Subscription>,
     /// Applied zoom for the still (1.0 = fit the viewport).
     zoom: f32,
     /// Measured content-viewport size; the fit base for the zoom math.
@@ -244,78 +240,26 @@ impl AssetPreviewPanel {
         // undecodable file (or no ffmpeg) keeps the poster still.
         let video = video::spawn_player(&data, cx);
         let viewport = cx.new(|_| size(px(0.), px(0.)));
-        cx.new(|cx| {
-            // Fullscreen hand-off: the player pauses here and a fresh
-            // player in a fullscreen OS window continues from its state.
-            // Leaving fullscreen comes back through the action, which the
-            // fullscreen host answers with `resume_from` on this player.
-            let _video_events = video.as_ref().map(|video| {
-                cx.subscribe(
-                    video,
-                    |this: &mut AssetPreviewPanel,
-                     player: Entity<VideoPlayer>,
-                     event: &VideoPlayerEvent,
-                     cx| {
-                        // Single-variant event: irrefutable destructure.
-                        let VideoPlayerEvent::EnterFullscreen {
-                            position_ms,
-                            speed,
-                            volume,
-                            muted,
-                        } = *event;
-                        // Only the picture stops here: the soundtrack is
-                        // handed to the fullscreen window through the seed,
-                        // so pausing it would cut the sound for as long as a
-                        // fresh audio pipe takes to start.
-                        player.update(cx, |player, cx| player.pause_video(cx));
-                        let Some(original) = this.data.original.clone() else {
-                            return;
-                        };
-                        // Hand over what the panel already knows: the
-                        // probed facts (no second ffprobe on the click
-                        // path) and the frame on screen (the fullscreen
-                        // window opens on a picture, not on black).
-                        let seed = {
-                            let player = player.read(cx);
-                            FullscreenSeed {
-                                facts: player.facts(),
-                                frame: player.current_frame(),
-                                audio: player.audio(),
-                            }
-                        };
-                        let host = cx.weak_entity();
-                        fullscreen::open(
-                            host,
-                            original,
-                            PlayerResume {
-                                position_ms,
-                                speed,
-                                volume,
-                                muted,
-                                playing: true,
-                            },
-                            seed,
-                            cx,
-                        );
-                    },
-                )
-            });
-            Self {
-                data,
-                video,
-                _video_events,
-                zoom: 1.0,
-                viewport,
-                drag_from: Point::default(),
-                dragging: false,
-                scroll_offset: Point::default(),
-            }
+        cx.new(|_| Self {
+            data,
+            video,
+            zoom: 1.0,
+            viewport,
+            drag_from: Point::default(),
+            dragging: false,
+            scroll_offset: Point::default(),
         })
     }
 
     /// Stills can be zoomed while the live video plays in its own player.
     pub(crate) fn zoomable(&self) -> bool {
         self.video.is_none() && self.data.dimensions.is_some()
+    }
+
+    /// The live player, for the app view to render as a fullscreen stage in
+    /// its own window (nothing is handed over: the same player keeps going).
+    pub(crate) fn video_player(&self) -> Option<Entity<VideoPlayer>> {
+        self.video.clone()
     }
 
     /// Expose the asset name so the title bar can render it.

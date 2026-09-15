@@ -44,7 +44,8 @@ gpui_kit::actions!(
         OpenPreview,
         // -- Inline editor (ExplorerPanel only) ------------------------------
         CancelEditor,
-        // -- Fullscreen video window ----------------------------------------
+        // -- Fullscreen video stage -----------------------------------------
+        EnterVideoFullscreen,
         ExitVideoFullscreen,
         // -- Region screenshot overlay ---------------------------------------
         CancelScreenshotRegion,
