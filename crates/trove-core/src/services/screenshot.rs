@@ -179,7 +179,9 @@ fn capture_via_xcap(dest: &Path) -> Result<(), String> {
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
-    image.save(dest).map_err(|e| format!("{}: {e}", dest.display()))
+    image
+        .save(dest)
+        .map_err(|e| format!("{}: {e}", dest.display()))
 }
 
 /// Run a custom capture command: `{file}` is substituted with the
