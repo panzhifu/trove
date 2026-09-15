@@ -14,11 +14,20 @@ mp4 = { workspace = true }
 ttf-parser = { workspace = true }
 fontdue = { workspace = true }
 rusqlite = { workspace = true }
-# In-process screen capture for the screenshot import (Linux: wlr-screencopy
-# via libwayshot on Wayland and XCB on X11; macOS ScreenCaptureKit; Windows
-# Graphics Capture). The external-tool chain in services/screenshot.rs stays
-# as the fallback, so a failed capture degrades instead of failing.
+# In-process screen capture for the screenshot import (macOS
+# ScreenCaptureKit, Windows Graphics Capture, Linux XCB). The external-tool
+# chain in services/screenshot.rs stays as the last fallback, so a failed
+# capture degrades instead of failing.
 xcap = "0.9.8"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# Wayland in-process capture, primary on Linux. Pure-Rust grim that prefers
+# ext-image-copy-capture-v1 — what niri implements; xcap's libwayshot
+# backend only speaks wlr-screencopy, which niri rejects — and falls back
+# to wlr-screencopy for wlroots compositors. Its whole stack (wayland-client
+# 0.31, image, chrono, …) is already in the graph via gpui, so this adds no
+# compiled crates here.
+grim-rs = "0.2"
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
