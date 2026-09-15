@@ -75,6 +75,9 @@ pub const HEIGHT_BAND: f32 = 10.0;
 pub const AXIS_X: [f32; 3] = [0.87, 0.28, 0.28];
 pub const AXIS_Y: [f32; 3] = [0.30, 0.74, 0.34];
 pub const AXIS_Z: [f32; 3] = [0.30, 0.47, 0.90];
+/// Amber marker at the gizmo's centre — the origin, standing apart from the
+/// three axis colours.
+pub const AXIS_ORIGIN: [f32; 3] = [0.95, 0.76, 0.25];
 
 /// Hue step between neighbouring height bands, in turns.
 ///
@@ -1135,28 +1138,45 @@ impl Target<'_> {
 /// three vertices per triangle.
 ///
 /// Shared by both renderers — the CPU rasterises this list, the GPU uploads
-/// it — so the gizmo cannot drift between the two pictures. The rods rise from
-/// the bounding box's floor corner: X and Z reach equally far so the floor
-/// reads square, and Y spans the model's full height so it doubles as the
-/// height-band legend.
+/// it — so the gizmo cannot drift between the two pictures. The gizmo is
+/// centred on the scene: a long rod per axis through the middle, one ring
+/// orthogonal to each axis (largest on X, shrinking towards Z, so the three
+/// stay tellable apart at any angle) and a small octahedron marking the
+/// origin. Everything runs through the model's depth test, so the model
+/// occludes the far half of the rings just like a real object would.
 pub fn axis_triangles(mesh: &Mesh) -> Vec<([f32; 3], [f32; 3])> {
     let bounds = mesh.bounds;
     if bounds.is_empty() {
         return Vec::new();
     }
-    let origin = bounds.min;
+    let center = scale(add(bounds.min, bounds.max), 0.5);
     let span = sub(bounds.max, bounds.min);
-    let floor = span[0].max(span[2]).max(1e-6);
-    let height = span[1].max(1e-6);
-    let half = floor.max(height) * 0.006;
-    let mut out = Vec::with_capacity(3 * 8 * 3);
-    for (tip, color) in [
-        (add(origin, [floor, 0.0, 0.0]), AXIS_X),
-        (add(origin, [0.0, height, 0.0]), AXIS_Y),
-        (add(origin, [0.0, 0.0, floor]), AXIS_Z),
-    ] {
-        push_rod(&mut out, origin, tip, half, color);
+    // The bounding-sphere radius: every gizmo size derives from it, so the
+    // gizmo keeps its proportions whatever the model's aspect.
+    let radius =
+        0.5 * (span[0] * span[0] + span[1] * span[1] + span[2] * span[2]).sqrt().max(1e-6);
+    let half = radius * 0.006;
+    let reach = radius * 1.25;
+    let mut out = Vec::new();
+    for (axis, color) in
+        [([1.0, 0.0, 0.0], AXIS_X), ([0.0, 1.0, 0.0], AXIS_Y), ([0.0, 0.0, 1.0], AXIS_Z)]
+    {
+        push_rod(
+            &mut out,
+            sub(center, scale(axis, reach)),
+            add(center, scale(axis, reach)),
+            half,
+            color,
+        );
     }
+    for (normal, ring_radius, color) in [
+        ([1.0, 0.0, 0.0], radius, AXIS_X),
+        ([0.0, 1.0, 0.0], radius * 0.72, AXIS_Y),
+        ([0.0, 0.0, 1.0], radius * 0.45, AXIS_Z),
+    ] {
+        push_ring(&mut out, center, normal, ring_radius, half * 0.8, color);
+    }
+    push_octahedron(&mut out, center, half * 4.0, AXIS_ORIGIN);
     out
 }
 
@@ -1196,6 +1216,96 @@ fn push_rod(
         for corner in [ra[i], rb[j], rb[i]] {
             out.push((corner, color));
         }
+    }
+}
+
+/// Append one square-section ring — a circle of `radius` around `normal`,
+/// centred on `center` — as two triangles per segment. The section frame is
+/// the radial direction plus the local tangent, so the tube stays an even
+/// thickness all the way round and the seam at segment zero closes on shared
+/// corner positions.
+fn push_ring(
+    out: &mut Vec<([f32; 3], [f32; 3])>,
+    center: [f32; 3],
+    normal: [f32; 3],
+    radius: f32,
+    half: f32,
+    color: [f32; 3],
+) {
+    const SEGMENTS: usize = 64;
+    // Any axis not parallel to the normal; same flip as `push_rod`.
+    let seed = if normal[1].abs() < 0.9 {
+        [0.0, 1.0, 0.0]
+    } else {
+        [1.0, 0.0, 0.0]
+    };
+    let u = normalize(cross(normal, seed));
+    let v = cross(normal, u);
+    let point = |s: usize| {
+        let angle = (s as f32) * (std::f32::consts::TAU / SEGMENTS as f32);
+        add(center, add(scale(u, angle.cos() * radius), scale(v, angle.sin() * radius)))
+    };
+    for i in 0..SEGMENTS {
+        let j = (i + 1) % SEGMENTS;
+        let (pi, pj) = (point(i), point(j));
+        let r = normalize(sub(pi, center));
+        let t = normalize(sub(pj, pi));
+        let corner = |p: [f32; 3], dr: f32, dt: f32| {
+            add(p, add(scale(r, dr * half), scale(t, dt * half)))
+        };
+        let qa = [
+            corner(pi, -1.0, -1.0),
+            corner(pi, 1.0, -1.0),
+            corner(pi, 1.0, 1.0),
+            corner(pi, -1.0, 1.0),
+        ];
+        let qb = [
+            corner(pj, -1.0, -1.0),
+            corner(pj, 1.0, -1.0),
+            corner(pj, 1.0, 1.0),
+            corner(pj, -1.0, 1.0),
+        ];
+        for k in 0..4 {
+            let n = (k + 1) % 4;
+            for corner in [qa[k], qa[n], qb[n]] {
+                out.push((corner, color));
+            }
+            for corner in [qa[k], qb[n], qb[k]] {
+                out.push((corner, color));
+            }
+        }
+    }
+}
+
+/// Append a small octahedron marking the origin. Eight triangles, wound
+/// consistently but irrelevant — neither renderer culls backfaces here.
+fn push_octahedron(
+    out: &mut Vec<([f32; 3], [f32; 3])>,
+    center: [f32; 3],
+    size: f32,
+    color: [f32; 3],
+) {
+    let apex = [
+        add(center, [size, 0.0, 0.0]),
+        add(center, [-size, 0.0, 0.0]),
+        add(center, [0.0, size, 0.0]),
+        add(center, [0.0, -size, 0.0]),
+        add(center, [0.0, 0.0, size]),
+        add(center, [0.0, 0.0, -size]),
+    ];
+    for (a, b, c) in [
+        (4, 0, 2),
+        (4, 2, 1),
+        (4, 1, 3),
+        (4, 3, 0),
+        (5, 0, 2),
+        (5, 2, 1),
+        (5, 1, 3),
+        (5, 3, 0),
+    ] {
+        out.push((apex[a], color));
+        out.push((apex[b], color));
+        out.push((apex[c], color));
     }
 }
 
@@ -1924,7 +2034,7 @@ mod tests {
     }
 
     #[test]
-    fn the_axis_gizmo_spans_the_bounds_in_three_colours() {
+    fn the_axis_gizmo_is_centred_with_rings_in_three_colours() {
         let mesh = Mesh {
             positions: vec![[0.0, 0.0, 0.0], [3.0, 4.0, 5.0]],
             triangles: Vec::new(),
@@ -1937,22 +2047,47 @@ mod tests {
         let triangles = axis_triangles(&mesh);
         assert!(!triangles.is_empty());
         assert_eq!(triangles.len() % 3, 0, "three vertices per triangle");
-        // Every vertex carries one of the three axis colours.
+        // Every vertex carries one of the three axis colours or the origin
+        // marker — and each axis colour really shows up.
         for (_, color) in &triangles {
             assert!(
-                [AXIS_X, AXIS_Y, AXIS_Z].contains(color),
+                [AXIS_X, AXIS_Y, AXIS_Z, AXIS_ORIGIN].contains(color),
                 "unexpected colour {color:?}"
             );
         }
-        // The rods stay inside the bounding box, and the Y rod reaches the
-        // model's top — which is what makes it a height legend.
-        let top = triangles.iter().map(|(p, _)| p[1]).fold(f32::MIN, f32::max);
-        assert!(top >= 3.9, "the Y rod reaches the top, got {top}");
-        for (p, _) in &triangles {
+        for color in [AXIS_X, AXIS_Y, AXIS_Z, AXIS_ORIGIN] {
             assert!(
-                p.iter().all(|c| *c >= -0.1 && *c <= 5.1),
-                "inside bounds: {p:?}"
+                triangles.iter().any(|(_, c)| c == &color),
+                "colour {color:?} missing"
             );
+        }
+        // Centred on the scene: the rods cross the middle and overshoot the
+        // bounding box by a fixed reach in both directions.
+        let center = [1.5f32, 2.0, 2.5];
+        let radius = 0.5 * (9.0f32 + 16.0 + 25.0).sqrt();
+        let reach = radius * 1.25;
+        let extreme = |ix: usize, fold: fn(f32, f32) -> f32, seed: f32| {
+            triangles.iter().map(|(p, _)| p[ix]).fold(seed, fold)
+        };
+        for (ix, c) in center.iter().enumerate() {
+            let hi = extreme(ix, f32::max, f32::NEG_INFINITY);
+            let lo = extreme(ix, f32::min, f32::INFINITY);
+            assert!(
+                (hi - (c + reach)).abs() < 1e-3 * radius,
+                "axis {ix} reaches +{reach} from the centre, got {hi}"
+            );
+            assert!(
+                (lo - (c - reach)).abs() < 1e-3 * radius,
+                "axis {ix} reaches -{reach} from the centre, got {lo}"
+            );
+        }
+        // Nothing flies further than the rods.
+        for (p, _) in &triangles {
+            let d = ((p[0] - center[0]).powi(2)
+                + (p[1] - center[1]).powi(2)
+                + (p[2] - center[2]).powi(2))
+            .sqrt();
+            assert!(d <= radius * 1.3, "within reach: {p:?}");
         }
     }
 
