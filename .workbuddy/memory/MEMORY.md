@@ -75,7 +75,9 @@
 
 ## 截图 / 日志（基础设施，2026-09-15）
 - **当前桌面是 KDE / KWin 6.7.5**（niri 只是装了没在跑 —— 排查时别被 niri 带偏）。KWin 既无 zwlr_screencopy 也无 ext-image-copy-capture → xcap(libwayshot)、grim、grim-rs 在 KDE 上**必然全挂**（已实测）。KDE 的截图由 **KWin 自己抓**、经 D-Bus 接口 `org.kde.KWin.ScreenShot2` 暴露（实现在 `/usr/lib/qt6/plugins/kwin/plugins/screenshot.so`；方法 CaptureWorkspace/Screen/ActiveScreen/ActiveWindow/Window/Area/Interactive），Spectacle 与 xdg-desktop-portal-kde 都只是它的客户端。
-- 全屏捕获链（trove）：grim-rs → screenshots(portal 探测层，deprecated，定性后可删) → xcap → 外部工具链 → 自定义命令（Settings ▸ General）。失败原因逐级拼接进最终错误。
+- 全屏捕获链（trove）：**xcap only**（grim-rs / screenshots 已按用户要求移除）→ 外部工具链 → 自定义命令（Settings ▸ General）。
+- 🔴 **xcap 在 KWin 上不可能成功**（不是配置问题，别再试）：`src/linux/utils.rs::wayland_detect()` = `XDG_SESSION_TYPE==wayland || WAYLAND_DISPLAY 含 wayland` → 为真即强制走 libwayshot(zwlr_screencopy)；而 KWin 6.7.5 的库/插件里 **zwlr_screencopy_manager_v1、ext_image_copy_capture_manager_v1、ext_output_image_capture_source_manager_v1 全部没有**（grep 零命中 + 运行时日志双证）。xcap 0.9.8（2026-08）已是最新版，无升级出路 —— 它的设计目标是 wlroots 系（sway/hyprland/niri）。
+- **KDE 上唯一可行的进程内通道**：KWin 自己的 D-Bus 接口 `org.kde.KWin.ScreenShot2`（CaptureWorkspace/Screen/ActiveScreen/ActiveWindow/Window/Area/Interactive），或零代码自定义命令 `spectacle -b -n -f -o {file}`（选区 `-r`）。
 - ⚠️ libwayshot 0.2（`screenshots` 库的第三级 fallback）`get_all_outputs()` 里 bind `zxdg_output_manager_v1` 失败即 `panic!("{:#?}")`，`or_else` 不捕 panic → 整条链被炸掉、portal 真实错误被吞（trove 已加 `panic_message()` 提取 panic 原文）。
 - **KDE 上可行路径**：自定义命令 `spectacle -b -n -f -o {file}`（选区换 `-r`），或自行实现 `org.kde.KWin.ScreenShot2` D-Bus 调用（zbus 已在树里）。第三方协议路线在 KDE 无解。
 - 日志：tracing 门面 + `logging::init()`（main 第一行）；双 sink = stderr + `<config>/trove/logs/trove.log`（追加，8MB 轮转 `.old`）；`RUST_LOG` 控制级别，默认 info。`registry().with()` 需要 `tracing_subscriber::prelude::*`（SubscriberExt 不在 scope 报 E0599）。
