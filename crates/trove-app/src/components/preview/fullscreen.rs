@@ -15,7 +15,7 @@ use gpui_kit::component::Root;
 use gpui_kit::*;
 
 use super::AssetPreviewPanel;
-use super::video::{PlayerResume, VideoPlayer};
+use super::video::{FullscreenSeed, PlayerResume, VideoPlayer};
 use crate::app::actions::ExitVideoFullscreen;
 
 /// Restore size of the fullscreen window: where it would sit if it were
@@ -29,18 +29,22 @@ pub(crate) fn open(
     host: WeakEntity<AssetPreviewPanel>,
     path: PathBuf,
     resume: PlayerResume,
+    seed: FullscreenSeed,
     cx: &mut App,
 ) {
-    let Some(player) = super::video::spawn_fullscreen(path, resume, cx) else {
-        return;
-    };
+    let player = super::video::spawn_fullscreen(path, resume, seed, cx);
+    // A bare stage: no client-side titlebar (the main window's chrome would
+    // only give KWin's fullscreen handling something to argue with) and no
+    // decorations of our own.
     let options = gpui_kit::WindowOptions {
         window_bounds: Some(WindowBounds::Fullscreen(Bounds::centered(
             None,
             RESTORE_SIZE,
             cx,
         ))),
-        ..crate::app::title_bar::window_options()
+        titlebar: None,
+        app_id: Some("trove".to_string()),
+        ..Default::default()
     };
     let _ = cx.open_window(options, |window, cx| {
         let view = cx.new(|cx| FullscreenPlayer::new(host, player, cx));
