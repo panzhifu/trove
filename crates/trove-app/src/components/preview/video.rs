@@ -588,6 +588,7 @@ impl VideoPlayer {
             // is reconstructed from finished chunks plus that position.
             let mut base_ms = 0.0f64;
             let mut appended: u64 = 0;
+            let mut last_published: Option<(f64, Instant)> = None;
             loop {
                 let state = weak.update(cx, |this, _cx| {
                     Some((
@@ -612,6 +613,7 @@ impl VideoPlayer {
                     seq = new_seq;
                     base_ms = position;
                     appended = 0;
+                    last_published = None;
                     // The pipe is restarting: no clock to sync against until
                     // the first chunk is queued again.
                     let _ = weak.update(cx, |this, _| this.audio_clock = None);
@@ -656,7 +658,20 @@ impl VideoPlayer {
                     let queued = s.len() as u64;
                     let finished = appended.saturating_sub(queued);
                     let within = (s.get_pos().as_secs_f64() * 1000.0).min(AUDIO_CHUNK_MS);
-                    let reading = base_ms + finished as f64 * AUDIO_CHUNK_MS + within;
+                    let mut reading = base_ms + finished as f64 * AUDIO_CHUNK_MS + within;
+                    // `len()` and `get_pos()` are read one after the other,
+                    // so a chunk boundary landing between the two reads
+                    // counts one chunk twice and reports the clock a whole
+                    // chunk ahead — which made the decode loop skip frames in
+                    // bursts. The soundtrack cannot advance faster than real
+                    // time, so the reading is clamped to that (with a little
+                    // slack) and held monotonic: a spike is absorbed instead
+                    // of costing frames.
+                    if let Some((last, at)) = last_published {
+                        let ceiling = last + at.elapsed().as_secs_f64() * 1000.0 * 1.05 + 5.0;
+                        reading = reading.clamp(last, ceiling);
+                    }
+                    last_published = Some((reading, Instant::now()));
                     let _ = weak.update(cx, |this, _| {
                         this.audio_clock = Some((reading, Instant::now()));
                     });
