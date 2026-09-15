@@ -17,7 +17,10 @@ mod query;
 mod smart_query;
 mod tag;
 
-pub use asset::{Asset, AssetKind, AssetPatch, NewAsset, Orientation, Origin, UsageStatus};
+pub use asset::{
+    ASPECT_TOLERANCE, AspectPreset, Asset, AssetKind, AssetPatch, NewAsset, Orientation, Origin,
+    UsageStatus,
+};
 pub use collection::{Collection, NewCollection, NewSmartCollection, SmartCollection};
 pub use facts::{AssetFacts, FontFacts, MediaTagsFacts, PhotoFacts, VisualFacts};
 pub use query::{AssetQuery, AssetSort, Page};
