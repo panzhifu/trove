@@ -168,6 +168,22 @@ pub fn capture(mode: ScreenshotMode, custom: Option<&str>, dest: &Path) -> Resul
                     in_process_error = Some(format!("grim-rs: {reason}"));
                 }
             }
+            // Portal probe: the `screenshots` crate asks the
+            // xdg-desktop-portal Screenshot interface instead of a capture
+            // protocol — success means the session has a portal backend.
+            let attempt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                capture_via_screenshots(dest)
+            }));
+            match attempt.unwrap_or_else(|_| Err("the capture library panicked".into())) {
+                Ok(()) => return Ok(()),
+                Err(reason) => {
+                    tracing::warn!(reason, "screenshots (portal) capture failed; falling back");
+                    in_process_error = match in_process_error {
+                        Some(previous) => Some(format!("{previous}; screenshots: {reason}")),
+                        None => Some(format!("screenshots: {reason}")),
+                    };
+                }
+            }
         }
         // xcap talks to the display server and can panic on hostile
         // environments; the unwind guard keeps such a failure a fallback
@@ -265,6 +281,69 @@ fn capture_via_grim_rs(dest: &Path) -> Result<(), String> {
             format!("{}: {e}", dest.display())
         })?;
     tracing::info!(dest = %dest.display(), "grim-rs: png written");
+    Ok(())
+}
+
+/// Capture the primary screen in-process with the `screenshots` crate and
+/// write a PNG.
+///
+/// Probe layer: on Wayland this asks the xdg-desktop-portal `Screenshot`
+/// D-Bus interface (not a capture protocol), so it succeeds only when the
+/// session runs a portal backend that implements it. The crate is
+/// deprecated upstream and returns an `image` 0.24 buffer, which is
+/// re-wrapped into this workspace's `image` 0.25 type for saving.
+#[cfg(target_os = "linux")]
+fn capture_via_screenshots(dest: &Path) -> Result<(), String> {
+    use screenshots::Screen;
+
+    let started = std::time::Instant::now();
+    let screens = Screen::all().map_err(|e| {
+        tracing::error!(error = %e, "screenshots: could not enumerate screens");
+        e.to_string()
+    })?;
+    let screen = screens.into_iter().next().ok_or_else(|| {
+        tracing::error!("screenshots: no screen found");
+        "no screen found".to_string()
+    })?;
+    tracing::info!(
+        width = screen.display_info.width,
+        height = screen.display_info.height,
+        "screenshots: capturing primary screen"
+    );
+    let image = screen.capture().map_err(|e| {
+        tracing::error!(
+            error = %e,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "screenshots: capture failed"
+        );
+        e.to_string()
+    })?;
+    tracing::info!(
+        width = image.width(),
+        height = image.height(),
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "screenshots: frame captured"
+    );
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| {
+            tracing::error!(
+                dir = %parent.display(),
+                error = %e,
+                "could not create output dir"
+            );
+            e.to_string()
+        })?;
+    }
+    let rgba = image::RgbaImage::from_raw(image.width(), image.height(), image.into_raw())
+        .ok_or_else(|| {
+            tracing::error!("screenshots: captured buffer does not match its dimensions");
+            "invalid captured buffer".to_string()
+        })?;
+    rgba.save(dest).map_err(|e| {
+        tracing::error!(dest = %dest.display(), error = %e, "screenshots: could not save png");
+        format!("{}: {e}", dest.display())
+    })?;
+    tracing::info!(dest = %dest.display(), "screenshots: png written");
     Ok(())
 }
 

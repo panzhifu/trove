@@ -28,6 +28,12 @@ xcap = "0.9.8"
 # 0.31, image, chrono, …) is already in the graph via gpui, so this adds no
 # compiled crates here.
 grim-rs = "0.2"
+# Probe layer: the `screenshots` crate's Wayland path is the
+# xdg-desktop-portal Screenshot D-Bus interface rather than a capture
+# protocol, so this tells us whether the user session has a working
+# Screenshot portal backend. Deprecated upstream (moved to xcap) and drags
+# in image 0.24 + dbus — remove once the portal question is answered.
+screenshots = "0.8"
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
