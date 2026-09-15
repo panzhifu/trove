@@ -477,8 +477,10 @@ fn virtual_font_id(path: &Path) -> Uuid {
 /// The picker wants `Hsla`; the history stores `#rrggbb` (what the colour
 /// search consumes and what survives a config round-trip). Only the front of
 /// the list is shown — the featured row is one strip, not a scroll region.
-pub(super) fn recent_picker_colors(_: &App) -> Vec<Hsla> {
-    const FEATURED: usize = 12;
+pub(crate) fn recent_picker_colors(_: &App) -> Vec<Hsla> {
+    // Ten: the featured row in the colour-filter popover must fit without
+    // spilling, and the default ramp below keeps to the same width.
+    const FEATURED: usize = 10;
 
     trove_core::history::AppHistory::load()
         .colors()

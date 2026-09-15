@@ -6,7 +6,7 @@ mod filters;
 mod selection;
 mod title;
 
-pub(crate) use color_filter::color_filter;
+pub(crate) use color_filter::{color_filter, color_panel};
 pub(crate) use filters::{
     add_filter_button, format_filter, kind_filter, kind_key, rating_filter, shape_filter,
     tag_filter, title_controls,
