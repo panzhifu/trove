@@ -172,7 +172,7 @@ fn compile_match(
             }
         }
         SmartField::Text => {
-            require_eq(op)?;
+            require_eq_ne(op)?;
             let s = string_value(value, "text")?;
             // Candidates come from the Tantivy index (words, typo-tolerant
             // fuzzy, gram substrings, pinyin); the SQL fragment narrows to
@@ -184,8 +184,17 @@ fn compile_match(
             };
             let json = serde_json::to_string(&candidates)
                 .map_err(|e| Error::Validation(format!("text candidates: {e}")))?;
+            // `contains` matches the ids that hit the query, `not contains`
+            // everything else. The empty candidate set is correct for both
+            // without special-casing: the subquery returns no rows, so
+            // `IN` is false and `NOT IN` true for every asset.
+            let verb = if op == SmartCompare::Eq {
+                "IN"
+            } else {
+                "NOT IN"
+            };
             Ok((
-                "assets.id IN (SELECT value FROM json_each(?))".into(),
+                format!("assets.id {verb} (SELECT value FROM json_each(?))"),
                 vec![Value::from(json)],
             ))
         }
@@ -382,14 +391,6 @@ fn require_eq_ne(op: SmartCompare) -> Result<()> {
     }
 }
 
-fn require_eq(op: SmartCompare) -> Result<()> {
-    if op == SmartCompare::Eq {
-        Ok(())
-    } else {
-        Err(Error::Validation("this field only supports ==".into()))
-    }
-}
-
 fn string_value(v: &Json, what: &str) -> Result<String> {
     v.as_str()
         .map(ToString::to_string)
@@ -453,5 +454,75 @@ fn kind_sql(kind: AssetKind) -> &'static str {
         AssetKind::Font => "font",
         AssetKind::Model => "model",
         AssetKind::Other => "other",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::test_asset;
+    use crate::store::{Store, assets};
+
+    fn node_text(op: SmartCompare, text: &str) -> SmartNode {
+        SmartNode::Match {
+            field: SmartField::Text,
+            op,
+            value: serde_json::json!(text),
+        }
+    }
+
+    #[test]
+    fn text_not_contains_matches_assets_outside_the_candidate_set() {
+        let store = Store::in_memory().unwrap();
+        let conn = store.conn();
+        let mut img = test_asset("sunset.png", AssetKind::Image, Uuid::new_v4());
+        img.title = Some("golden sunset".into());
+        assets::insert(conn, &img).unwrap();
+        let doc = test_asset("tax.txt", AssetKind::Document, Uuid::new_v4());
+        assets::insert(conn, &doc).unwrap();
+
+        let idx = crate::search::TextIndex::in_ram().unwrap();
+        idx.index_asset(conn, img.id).unwrap();
+        idx.commit().unwrap();
+
+        // contains: only the asset whose indexed text hits the query.
+        let page = evaluate(
+            conn,
+            Some(&idx),
+            &node_text(SmartCompare::Eq, "sunset"),
+            None,
+            0,
+        )
+        .unwrap();
+        assert_eq!(page.total, 1);
+        assert_eq!(page.items[0], img.id);
+
+        // not contains: everything else — including assets with no indexed
+        // text at all, since none of them match the query.
+        let page = evaluate(
+            conn,
+            Some(&idx),
+            &node_text(SmartCompare::Ne, "sunset"),
+            None,
+            0,
+        )
+        .unwrap();
+        assert_eq!(page.total, 1);
+        assert_eq!(page.items[0], doc.id);
+
+        // Without an index the candidate set is empty: contains matches
+        // nothing and not-contains degrades to every asset.
+        let page = evaluate(conn, None, &node_text(SmartCompare::Eq, "sunset"), None, 0).unwrap();
+        assert_eq!(page.total, 0);
+        let page = evaluate(conn, None, &node_text(SmartCompare::Ne, "sunset"), None, 0).unwrap();
+        assert_eq!(page.total, 2);
+    }
+
+    #[test]
+    fn text_rejects_comparison_operators() {
+        let store = Store::in_memory().unwrap();
+        let conn = store.conn();
+        let outcome = evaluate(conn, None, &node_text(SmartCompare::Lt, "x"), None, 0);
+        assert!(outcome.is_err());
     }
 }
