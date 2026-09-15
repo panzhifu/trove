@@ -345,10 +345,8 @@ impl AppView {
     ) {
         use trove_core::services::screenshot;
 
-        let config = AppConfig::load();
         let dir = AppConfig::config_dir().unwrap_or_else(std::env::temp_dir);
         let dest = screenshot::destination(&dir);
-        let custom = config.screenshot_command.clone();
         let controller = self.controller.clone();
         let handle = window.window_handle();
 
@@ -362,7 +360,7 @@ impl AppView {
             let target = dest.clone();
             let outcome = cx
                 .background_executor()
-                .spawn(async move { screenshot::capture(mode, custom.as_deref(), &target) })
+                .spawn(async move { screenshot::capture(mode, &target) })
                 .await;
             let _ = handle.update(cx, |_, window, cx| match outcome {
                 Ok(()) => {

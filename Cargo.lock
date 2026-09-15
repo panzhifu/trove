@@ -8623,6 +8623,7 @@ dependencies = [
  "ureq",
  "uuid",
  "xcap",
+ "zbus",
 ]
 
 [[package]]

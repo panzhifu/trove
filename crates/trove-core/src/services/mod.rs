@@ -5,6 +5,8 @@
 pub mod backup;
 pub mod collect;
 pub mod font_manager;
+#[cfg(target_os = "linux")]
+pub mod kwin;
 pub mod maintenance;
 pub mod open_external;
 pub mod screenshot;

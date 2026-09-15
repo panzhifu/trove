@@ -8,9 +8,8 @@
 //! protocol (KWin) have no in-process path here and fall through to the
 //! external toolchain ([`plan_for`]). Region picking stays with the
 //! platform tools: an interactive selection overlay is out of scope here.
-//! The user can override the whole thing with a custom command in
-//! Settings ▸ General. Planning that chain is a pure function
-//! ([`plan_for`]) so it stays unit-testable without a display.
+//! Planning the external chain is a pure function ([`plan_for`]) so it
+//! stays unit-testable without a display.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -48,27 +47,15 @@ impl Platform {
     }
 }
 
-/// Build the capture command for `mode`, writing PNG to `dest`.
-///
-/// Priority: a non-empty `custom` command (it may contain `{file}`, which is
-/// replaced by `dest`; otherwise `dest` is appended as `$1`), then the
-/// platform toolchain. `None` when no strategy applies.
-pub fn plan(mode: ScreenshotMode, custom: Option<&str>, dest: &Path) -> Option<CapturePlan> {
-    plan_for(mode, custom, dest, Platform::detect())
+/// Build the capture command for `mode`, writing PNG to `dest`: the
+/// platform toolchain, or `None` when no strategy applies.
+pub fn plan(mode: ScreenshotMode, dest: &Path) -> Option<CapturePlan> {
+    plan_for(mode, dest, Platform::detect())
 }
 
 /// [`plan`] with an explicit session type — the unit-testable core.
 #[allow(unused_variables)]
-pub fn plan_for(
-    mode: ScreenshotMode,
-    custom: Option<&str>,
-    dest: &Path,
-    platform: Platform,
-) -> Option<CapturePlan> {
-    if let Some(command) = custom.map(str::trim).filter(|c| !c.is_empty()) {
-        return Some(shell(command.replace("{file}", &quotable(dest)), dest));
-    }
-
+pub fn plan_for(mode: ScreenshotMode, dest: &Path, platform: Platform) -> Option<CapturePlan> {
     #[cfg(target_os = "macos")]
     {
         Some(CapturePlan {
@@ -130,31 +117,43 @@ pub fn plan_for(
     }
 }
 
-/// Run the capture: custom command → in-process xcap (full screen) → the
-/// external toolchain. The PNG must exist on disk when `Ok` comes back.
-/// xcap's failure reason rides along in the error that finally surfaces,
-/// so the root cause stays diagnosable. Every step emits `tracing` events
-/// (default level `info`; `RUST_LOG` adjusts).
-pub fn capture(mode: ScreenshotMode, custom: Option<&str>, dest: &Path) -> Result<(), String> {
+/// Run the capture: in-process (KWin on Plasma, else xcap) → the external
+/// toolchain. The PNG must exist on disk when `Ok` comes back. Every
+/// in-process failure reason rides along in the error that finally
+/// surfaces, so the root cause stays diagnosable. Every step emits
+/// `tracing` events (default level `info`; `RUST_LOG` adjusts).
+pub fn capture(mode: ScreenshotMode, dest: &Path) -> Result<(), String> {
     tracing::info!(
         mode = ?mode,
         dest = %dest.display(),
-        custom = ?custom,
         wayland = ?std::env::var_os("WAYLAND_DISPLAY"),
         x11 = ?std::env::var_os("DISPLAY"),
         "screenshot capture requested"
     );
-    if let Some(command) = custom.map(str::trim).filter(|c| !c.is_empty()) {
-        return run_custom(command, dest);
-    }
     let mut in_process_error: Option<String> = None;
     if mode == ScreenshotMode::Full {
+        // KWin first: Plasma implements neither wlr-screencopy nor
+        // ext-image-copy-capture, so KWin's own D-Bus interface is the only
+        // in-process capture there. On other sessions the call simply finds
+        // no such service and we fall through.
+        #[cfg(target_os = "linux")]
+        {
+            let attempt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                crate::services::kwin::capture_workspace(dest)
+            }));
+            match attempt.unwrap_or_else(|payload| Err(panic_message(payload))) {
+                Ok(()) => return Ok(()),
+                Err(reason) => {
+                    tracing::debug!(reason, "kwin capture unavailable; falling back");
+                    in_process_error = Some(format!("kwin: {reason}"));
+                }
+            }
+        }
         // xcap talks to the display server and can panic on hostile
         // environments; the unwind guard keeps such a failure a fallback
         // instead of taking the caller's task down. Its Wayland path is
-        // libwayshot (wlr-screencopy), which KWin does not implement, so
-        // on KDE the in-process step fails and the external toolchain
-        // takes over.
+        // libwayshot (wlr-screencopy), so it covers the wlroots compositors
+        // and X11, not KWin.
         let attempt =
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| capture_via_xcap(dest)));
         match attempt.unwrap_or_else(|payload| Err(panic_message(payload))) {
@@ -164,11 +163,14 @@ pub fn capture(mode: ScreenshotMode, custom: Option<&str>, dest: &Path) -> Resul
                     reason,
                     "xcap capture failed; falling back to external tools"
                 );
-                in_process_error = Some(format!("xcap: {reason}"));
+                in_process_error = Some(match in_process_error {
+                    Some(previous) => format!("{previous}; xcap: {reason}"),
+                    None => format!("xcap: {reason}"),
+                });
             }
         }
     }
-    let Some(plan) = plan_for(mode, custom, dest, Platform::detect()) else {
+    let Some(plan) = plan_for(mode, dest, Platform::detect()) else {
         tracing::error!(
             in_process_error = ?in_process_error,
             "no external screenshot tool for this platform"
@@ -265,13 +267,6 @@ fn capture_via_xcap(dest: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// Run a custom capture command: `{file}` is substituted with the
-/// destination, which is also available as `$1`.
-fn run_custom(command: &str, dest: &Path) -> Result<(), String> {
-    let plan = shell(command.replace("{file}", &quotable(dest)), dest);
-    run_plan(&plan, dest)
-}
-
 /// Execute a capture step and verify the PNG showed up.
 fn run_plan(plan: &CapturePlan, dest: &Path) -> Result<(), String> {
     tracing::info!(program = %plan.program, args = ?plan.args, "running capture tool");
@@ -298,10 +293,7 @@ fn run_plan(plan: &CapturePlan, dest: &Path) -> Result<(), String> {
     tracing::debug!(program = %plan.program, status = %status, "capture tool exited");
     if !status.success() {
         tracing::error!(program = %plan.program, status = %status, "capture tool failed");
-        return Err(format!(
-            "{} exited with {status} (set a custom command in Settings ▸ General)",
-            plan.program
-        ));
+        return Err(format!("{} exited with {status}", plan.program));
     }
     if !dest.is_file() {
         tracing::error!(dest = %dest.display(), "capture tool wrote no file");
@@ -369,37 +361,6 @@ mod tests {
         PathBuf::from("/tmp/shot.png")
     }
 
-    #[test]
-    fn custom_command_wins_and_substitutes_the_file() {
-        let plan = plan_for(
-            ScreenshotMode::Full,
-            Some("grim {file}"),
-            &dest(),
-            Platform::default(),
-        )
-        .expect("custom command always plans");
-        assert_eq!(plan.program, "sh");
-        assert!(plan.args.contains(&"grim /tmp/shot.png".to_string()));
-        // The destination is also available as `$1`.
-        assert_eq!(plan.args.last().unwrap(), "/tmp/shot.png");
-    }
-
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-    #[test]
-    fn blank_custom_command_falls_through() {
-        let plan = plan_for(
-            ScreenshotMode::Full,
-            Some("   "),
-            &dest(),
-            Platform {
-                wayland: true,
-                x11: false,
-            },
-        )
-        .expect("wayland plans");
-        assert_eq!(plan.program, "grim");
-    }
-
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     #[test]
     fn wayland_uses_grim_and_slurp() {
@@ -407,11 +368,11 @@ mod tests {
             wayland: true,
             x11: false,
         };
-        let full = plan_for(ScreenshotMode::Full, None, &dest(), wayland).unwrap();
+        let full = plan_for(ScreenshotMode::Full, &dest(), wayland).unwrap();
         assert_eq!(full.program, "grim");
         assert_eq!(full.args, vec!["/tmp/shot.png".to_string()]);
 
-        let region = plan_for(ScreenshotMode::Region, None, &dest(), wayland).unwrap();
+        let region = plan_for(ScreenshotMode::Region, &dest(), wayland).unwrap();
         assert_eq!(region.program, "sh");
         assert!(region.args[1].contains("slurp"));
         assert!(region.args[1].contains("/tmp/shot.png"));
@@ -424,10 +385,10 @@ mod tests {
             wayland: false,
             x11: true,
         };
-        let full = plan_for(ScreenshotMode::Full, None, &dest(), x11).unwrap();
+        let full = plan_for(ScreenshotMode::Full, &dest(), x11).unwrap();
         assert_eq!((full.program.as_str(), full.args.len()), ("scrot", 1));
 
-        let region = plan_for(ScreenshotMode::Region, None, &dest(), x11).unwrap();
+        let region = plan_for(ScreenshotMode::Region, &dest(), x11).unwrap();
         assert_eq!(
             region.args,
             vec!["-s".to_string(), "/tmp/shot.png".to_string()]
@@ -437,7 +398,7 @@ mod tests {
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     #[test]
     fn no_session_has_no_default_plan() {
-        assert!(plan_for(ScreenshotMode::Full, None, &dest(), Platform::default()).is_none());
+        assert!(plan_for(ScreenshotMode::Full, &dest(), Platform::default()).is_none());
     }
 
     #[test]
