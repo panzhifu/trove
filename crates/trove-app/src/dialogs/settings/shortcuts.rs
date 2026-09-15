@@ -121,6 +121,7 @@ fn action_label(action: &str) -> String {
         "EnterVideoFullscreen" => {
             rust_i18n::t!("shortcuts.actions.EnterVideoFullscreen").to_string()
         }
+        "ExitVideoFullscreen" => rust_i18n::t!("shortcuts.actions.ExitVideoFullscreen").to_string(),
         other => other.to_string(),
     }
 }

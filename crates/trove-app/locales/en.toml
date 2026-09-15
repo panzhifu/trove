@@ -534,7 +534,7 @@ shortcut_reset = "R · Double-click: Reset view"
 
 [video]
 fullscreen = "Fullscreen (F)"
-exit_fullscreen = "Exit fullscreen"
+exit_fullscreen = "Exit fullscreen (F)"
 
 [shortcuts]
 keyboard = "Keyboard Shortcuts"
@@ -569,6 +569,7 @@ BatchRename = "Batch rename"
 BatchConvert = "Batch convert"
 CopyImage = "Copy image to clipboard"
 EnterVideoFullscreen = "Play video fullscreen"
+ExitVideoFullscreen = "Exit video fullscreen"
 
 [shortcuts.context]
 Workspace = "Workspace"

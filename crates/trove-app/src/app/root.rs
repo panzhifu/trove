@@ -456,17 +456,17 @@ impl AppView {
         // element leaves the frame, which strands the stage (see
         // [`AppView::video_stage_focus`]).
         window.focus(&self.video_stage_focus, cx);
-        // Belt and braces for Esc: this watch fires only when the keystroke
-        // resolved to nothing (the docs: after everything else, skipped if
-        // propagation stopped) — that is, exactly when the stage's own key
-        // binding could not see the focus. It then leaves through the same
-        // action the button uses.
+        // Belt and braces for Esc and the fullscreen key: this watch fires
+        // only when a keystroke resolved to nothing (the docs: after
+        // everything else, skipped if propagation stopped) — that is,
+        // exactly when the stage's own key bindings could not see the
+        // focus. It then leaves through the same action the button uses.
         self.video_escape = Some(cx.observe_keystrokes(
             |_this: &mut Self,
              event: &KeystrokeEvent,
              window: &mut Window,
              cx: &mut Context<Self>| {
-                if event.keystroke.key == "escape" {
+                if matches!(event.keystroke.key.as_str(), "escape" | "f") {
                     window.dispatch_action(Box::new(ExitVideoFullscreen), cx);
                 }
             },

@@ -532,7 +532,7 @@ shortcut_reset = "R · 双击：重置视角"
 
 [video]
 fullscreen = "全屏播放（F）"
-exit_fullscreen = "退出全屏"
+exit_fullscreen = "退出全屏（F）"
 
 [shortcuts]
 keyboard = "键盘快捷键"
@@ -567,6 +567,7 @@ BatchRename = "批量重命名"
 BatchConvert = "批量转换格式"
 CopyImage = "复制图片到剪贴板"
 EnterVideoFullscreen = "全屏播放视频"
+ExitVideoFullscreen = "退出视频全屏"
 
 [shortcuts.context]
 Workspace = "工作区"

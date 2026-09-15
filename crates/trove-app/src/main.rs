@@ -141,6 +141,19 @@ pub(crate) fn register_keys(cx: &mut App) {
         ExitVideoFullscreen,
         Some(VIDEO_FULLSCREEN_CONTEXT),
     ));
+    // `f` leaves it too, mirroring the enter key: the stage replaces the
+    // preview, so the enter binding is out of the dispatch path there and
+    // the toggle needs its own binding.
+    if let Some(k) = default_key("ExitVideoFullscreen") {
+        let k = key_for("ExitVideoFullscreen", &k);
+        if !k.is_empty() {
+            bindings.push(KeyBinding::new(
+                &k,
+                ExitVideoFullscreen,
+                Some(VIDEO_FULLSCREEN_CONTEXT),
+            ));
+        }
+    }
     // Esc cancels the region-screenshot overlay; only the overlay's root
     // carries that context.
     bindings.push(KeyBinding::new(
