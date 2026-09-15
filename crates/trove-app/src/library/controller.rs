@@ -85,9 +85,18 @@ pub enum SelectionSource {
 /// are re-rendered when a mutation bumps [`generation`](Self::generation).
 pub struct LibraryController {
     pub library: Library,
-    /// Monotonic revision; any change that should refresh the panels
-    /// increments it.
+    /// Monotonic revision of the library *contents* (imports, edits, trash,
+    /// renames, collection/tag mutations, browse switches). Keys every data
+    /// cache: the explorer snapshot, the folder/tag/extension scans, the
+    /// title cache and the workspace data pass.
     pub generation: u64,
+    /// Monotonic revision of the browse *filters* (kind / favorite / shape /
+    /// aspect / rating / extension). Filters change no library content, so
+    /// caches that do not read them (the sidebar counts, the folder and tag
+    /// scans) must stay valid across a filter change; only caches that
+    /// actually read a filter key on this counter or on the filter value
+    /// itself (the title's favorites label, the explorer's kind highlight).
+    pub filter_generation: u64,
     /// The collection being browsed in the workspace view (`None` = all).
     pub current_collection: Option<Uuid>,
     /// Selected assets; the last entry is the primary (shown in Inspector).
@@ -204,6 +213,7 @@ impl LibraryController {
         Self {
             library,
             generation: 0,
+            filter_generation: 0,
             current_collection: None,
             selected_assets: Rc::new(Vec::new()),
             showing_trash: false,
@@ -376,14 +386,15 @@ impl LibraryController {
         self.generation += 1;
     }
 
-    /// Set the full-text search term. Any non-empty term takes over the
-    /// browsed view; clearing it restores the previous context.
-    /// Grid filters; each change resets the pagination cursor.
+    /// Grid filters; each change resets the pagination cursor. A filter
+    /// change bumps [`Self::filter_generation`], not the data generation:
+    /// the sidebar counts and the folder/tag/extension scans do not read
+    /// the filters and must stay valid.
     pub fn set_filter_kind(&mut self, kind: Option<AssetKind>) {
         if self.filter_kind != kind {
             self.filter_kind = kind;
             self.reset_grid_page();
-            self.generation += 1;
+            self.filter_generation += 1;
         }
     }
 
@@ -391,7 +402,7 @@ impl LibraryController {
         if self.filter_favorite != favorite {
             self.filter_favorite = favorite;
             self.reset_grid_page();
-            self.generation += 1;
+            self.filter_generation += 1;
         }
     }
 
@@ -404,7 +415,7 @@ impl LibraryController {
                 self.filter_aspect = None;
             }
             self.reset_grid_page();
-            self.generation += 1;
+            self.filter_generation += 1;
         }
     }
 
@@ -415,7 +426,7 @@ impl LibraryController {
                 self.filter_orientation = None;
             }
             self.reset_grid_page();
-            self.generation += 1;
+            self.filter_generation += 1;
         }
     }
 
@@ -423,7 +434,7 @@ impl LibraryController {
         if self.filter_min_rating != rating {
             self.filter_min_rating = rating;
             self.reset_grid_page();
-            self.generation += 1;
+            self.filter_generation += 1;
         }
     }
 
@@ -431,7 +442,7 @@ impl LibraryController {
         if self.filter_ext != ext {
             self.filter_ext = ext;
             self.reset_grid_page();
-            self.generation += 1;
+            self.filter_generation += 1;
         }
     }
 
@@ -450,7 +461,7 @@ impl LibraryController {
         self.filter_ext = None;
         if changed {
             self.reset_grid_page();
-            self.generation += 1;
+            self.filter_generation += 1;
         }
     }
 

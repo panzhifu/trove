@@ -197,11 +197,13 @@ pub struct WorkspacePanel {
     /// the live rows and the toolbar is rebuilt every frame, so it may only
     /// run when the generation moves.
     filter_exts: Option<(u64, Vec<String>)>,
-    /// Title-bar label, keyed by the controller generation it was resolved
-    /// at. The dock asks for the title outside this panel's own render, so
-    /// the collection / smart-collection name lookup behind it would
-    /// otherwise run once per frame.
-    title_cache: Option<(u64, String)>,
+    /// Title-bar label, keyed by the controller generation and filter
+    /// generation it was resolved at (the favorites label branch reads the
+    /// favorite filter, which bumps only the latter). The dock asks for the
+    /// title outside this panel's own render, so the collection /
+    /// smart-collection name lookup behind it would otherwise run once per
+    /// frame.
+    title_cache: Option<(u64, u64, String)>,
     /// Infinite-scroll guard: the `grid_loaded` cursor the last page request
     /// was issued for. Held across frames on purpose — see the paging trigger
     /// in `render` for why a per-frame flag pages eagerly. `usize::MAX` means
