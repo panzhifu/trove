@@ -1,14 +1,13 @@
 //! Smart-collection rule editor: a dialog that builds the JSON condition
 //! tree stored in a smart collection.
 //!
-//! The editor covers a two-layer shape: N condition groups, each holding M
-//! match conditions. Every group picks its own combination
-//! ([`RuleGroup::and_mode`]) and the groups combine under a switchable
-//! top-level operator (match any group / match all groups). A single group
-//! is stored flat — `{"op": …, "children": [matches…]}`, exactly the shape
-//! earlier one-group versions wrote — so existing rules round-trip.
-//! Deeper nesting is out of scope: [`split_tree`] keeps only match leaves
-//! below the second layer, and the editor itself never produces such trees.
+//! The editor covers a flat shape: one list of match conditions combined
+//! under a single switchable operator (match all / match any), every row
+//! free to negate (text *not contains*, tag *is not*, …). The stored JSON
+//! is `{"op": "and"|"or", "children": [matches…]}`, which earlier
+//! one-group versions also round-trip. Deeper nesting is out of scope:
+//! [`split_tree`] rejects trees whose children are not all matches, and
+//! such collections open in a read-only state instead of being mangled.
 //!
 //! Draft state lives in a [`RuleDraft`] entity created before the dialog
 //! opens (the dialog's content closure is a re-run-per-frame `Fn` and
@@ -91,14 +90,8 @@ impl ConditionRow {
     }
 }
 
-/// A group of conditions with its own combination operator.
-struct RuleGroup {
-    /// `true` = all conditions in this group must match, `false` = any.
-    and_mode: bool,
-    rows: Vec<ConditionRow>,
-}
-
-/// The editor's draft: group layout, condition rows and the live match status.
+/// The editor's draft: the condition rows, the combination operator and
+/// the live match status.
 struct RuleDraft {
     controller: Entity<LibraryController>,
     /// `Some(id)` while editing an existing smart collection.
@@ -108,10 +101,14 @@ struct RuleDraft {
     /// — [`open_rule_editor`] never moves the edited row.
     parent: Option<Uuid>,
     name_input: Entity<InputState>,
-    /// How groups combine: `false` = match any group (or), `true` = match
-    /// all groups (and). Meaningless while only one group exists.
-    inter_and_mode: bool,
-    groups: Vec<RuleGroup>,
+    /// How the rows combine: `true` = all conditions must match (and),
+    /// `false` = any (or).
+    match_all: bool,
+    rows: Vec<ConditionRow>,
+    /// Set when the stored tree cannot be surfaced as a flat list (nested
+    /// groups from older editors): rows stay empty, editing and saving are
+    /// blocked, and the dialog explains why.
+    readonly: bool,
     /// Tag names for the tag dropdown (snapshot at open).
     tag_names: Vec<String>,
     /// Display color of the smart collection itself (`#rrggbb` or none).
@@ -136,62 +133,28 @@ impl RuleDraft {
         cx.notify();
     }
 
-    fn add_row(
-        &mut self,
-        gix: usize,
-        field: SmartField,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if let Some(group) = self.groups.get_mut(gix) {
-            group.rows.push(ConditionRow::new(window, cx, field));
+    fn add_row(&mut self, field: SmartField, window: &mut Window, cx: &mut Context<Self>) {
+        self.rows.push(ConditionRow::new(window, cx, field));
+        self.touch(cx);
+    }
+
+    fn remove_row(&mut self, ix: usize, cx: &mut Context<Self>) {
+        if ix < self.rows.len() {
+            self.rows.remove(ix);
         }
         self.touch(cx);
     }
 
-    fn remove_row(&mut self, gix: usize, ix: usize, cx: &mut Context<Self>) {
-        if let Some(group) = self.groups.get_mut(gix)
-            && ix < group.rows.len()
-        {
-            group.rows.remove(ix);
-        }
+    fn set_match_all(&mut self, match_all: bool, cx: &mut Context<Self>) {
+        self.match_all = match_all;
         self.touch(cx);
     }
 
-    fn add_group(&mut self, cx: &mut Context<Self>) {
-        self.groups.push(RuleGroup {
-            and_mode: true,
-            rows: Vec::new(),
-        });
-        self.touch(cx);
-    }
-
-    /// Removes a group; the last remaining group is kept so the editor never
-    /// ends up with nothing to edit.
-    fn remove_group(&mut self, gix: usize, cx: &mut Context<Self>) {
-        if self.groups.len() > 1 && gix < self.groups.len() {
-            self.groups.remove(gix);
-        }
-        self.touch(cx);
-    }
-
-    fn set_group_and_mode(&mut self, gix: usize, and_mode: bool, cx: &mut Context<Self>) {
-        if let Some(group) = self.groups.get_mut(gix) {
-            group.and_mode = and_mode;
-        }
-        self.touch(cx);
-    }
-
-    fn set_inter_and_mode(&mut self, inter_and_mode: bool, cx: &mut Context<Self>) {
-        self.inter_and_mode = inter_and_mode;
-        self.touch(cx);
-    }
-
-    fn set_field(&mut self, gix: usize, ix: usize, field: SmartField, cx: &mut Context<Self>) {
+    fn set_field(&mut self, ix: usize, field: SmartField, cx: &mut Context<Self>) {
         // Pulled out first: borrowing the row mutably would conflict with
         // reading `tag_names` below.
         let default_tag = self.tag_names.first().cloned().unwrap_or_default();
-        if let Some(row) = self.groups.get_mut(gix).and_then(|g| g.rows.get_mut(ix))
+        if let Some(row) = self.rows.get_mut(ix)
             && row.field != field
         {
             row.field = field;
@@ -205,49 +168,43 @@ impl RuleDraft {
         self.touch(cx);
     }
 
-    fn set_op(&mut self, gix: usize, ix: usize, op: SmartCompare, cx: &mut Context<Self>) {
-        if let Some(row) = self.groups.get_mut(gix).and_then(|g| g.rows.get_mut(ix)) {
+    fn set_op(&mut self, ix: usize, op: SmartCompare, cx: &mut Context<Self>) {
+        if let Some(row) = self.rows.get_mut(ix) {
             row.op = op;
         }
         self.touch(cx);
     }
 
-    fn set_kind(&mut self, gix: usize, ix: usize, kind: AssetKind, cx: &mut Context<Self>) {
-        if let Some(row) = self.groups.get_mut(gix).and_then(|g| g.rows.get_mut(ix)) {
+    fn set_kind(&mut self, ix: usize, kind: AssetKind, cx: &mut Context<Self>) {
+        if let Some(row) = self.rows.get_mut(ix) {
             row.kind = kind;
         }
         self.touch(cx);
     }
 
-    fn set_favorite(&mut self, gix: usize, ix: usize, favorite: bool, cx: &mut Context<Self>) {
-        if let Some(row) = self.groups.get_mut(gix).and_then(|g| g.rows.get_mut(ix)) {
+    fn set_favorite(&mut self, ix: usize, favorite: bool, cx: &mut Context<Self>) {
+        if let Some(row) = self.rows.get_mut(ix) {
             row.favorite = favorite;
         }
         self.touch(cx);
     }
 
-    fn set_tag(&mut self, gix: usize, ix: usize, tag: String, cx: &mut Context<Self>) {
-        if let Some(row) = self.groups.get_mut(gix).and_then(|g| g.rows.get_mut(ix)) {
+    fn set_tag(&mut self, ix: usize, tag: String, cx: &mut Context<Self>) {
+        if let Some(row) = self.rows.get_mut(ix) {
             row.tag = tag;
         }
         self.touch(cx);
     }
 
-    fn set_rating(&mut self, gix: usize, ix: usize, rating: u8, cx: &mut Context<Self>) {
-        if let Some(row) = self.groups.get_mut(gix).and_then(|g| g.rows.get_mut(ix)) {
+    fn set_rating(&mut self, ix: usize, rating: u8, cx: &mut Context<Self>) {
+        if let Some(row) = self.rows.get_mut(ix) {
             row.rating = rating;
         }
         self.touch(cx);
     }
 
-    fn set_orientation(
-        &mut self,
-        gix: usize,
-        ix: usize,
-        orientation: String,
-        cx: &mut Context<Self>,
-    ) {
-        if let Some(row) = self.groups.get_mut(gix).and_then(|g| g.rows.get_mut(ix)) {
+    fn set_orientation(&mut self, ix: usize, orientation: String, cx: &mut Context<Self>) {
+        if let Some(row) = self.rows.get_mut(ix) {
             row.orientation = orientation;
         }
         self.touch(cx);
@@ -266,36 +223,35 @@ impl RuleDraft {
     }
 
     /// Compile the draft into the stored JSON tree. Incomplete rows are
-    /// skipped; an empty result is an error the dialog surfaces.
+    /// skipped; an empty result is an error the dialog surfaces. A
+    /// read-only draft (unrepresentable stored tree) never compiles.
     fn build_json(&self, cx: &App) -> Result<serde_json::Value, String> {
         let t = |k: &str| rust_i18n::t!(k).to_string();
-        let mut groups: Vec<(bool, Vec<SmartNode>)> = Vec::new();
-        for group in &self.groups {
-            let mut children = Vec::new();
-            for row in &group.rows {
-                if !row.is_complete(cx) {
-                    continue;
-                }
-                children.push(SmartNode::Match {
+        if self.readonly {
+            return Err(t("rules.readonly_complex"));
+        }
+        let children: Vec<SmartNode> = self
+            .rows
+            .iter()
+            .filter(|row| row.is_complete(cx))
+            .map(|row| {
+                Ok(SmartNode::Match {
                     field: row.field,
                     op: row.op,
                     value: row_value(row, cx)?,
-                });
-            }
-            if !children.is_empty() {
-                groups.push((group.and_mode, children));
-            }
-        }
-        if groups.is_empty() {
+                })
+            })
+            .collect::<Result<Vec<SmartNode>, String>>()?;
+        if children.is_empty() {
             return Err(t("rules.need_condition"));
         }
-        serde_json::to_value(join_tree(self.inter_and_mode, &groups))
+        serde_json::to_value(join_tree(self.match_all, children))
             .map_err(|_| t("rules.match_error"))
     }
 
     /// Re-run the live match count when the draft moved since last draw.
     fn recompute_if_stale(&mut self, cx: &mut Context<Self>) {
-        if self.revision == self.evaluated {
+        if self.revision == self.evaluated || self.readonly {
             return;
         }
         self.evaluated = self.revision;
@@ -360,66 +316,35 @@ fn row_value(row: &ConditionRow, cx: &App) -> Result<serde_json::Value, String> 
     })
 }
 
-// ============================ tree ⇄ groups (pure) ===========================
+// ============================ tree ⇄ rows (pure) ============================
 
-/// Splits a stored tree into `(groups combine with and, groups)`. The top
-/// level is `and`/`or`; each child group keeps its own operator. Matches
-/// sitting directly at the top level collapse into one group with the
-/// top-level operator — that is the flat shape earlier one-group versions
-/// wrote, and it must come back as one group. A bare match becomes a
-/// single-condition `and` group. Non-match nodes below the second layer
-/// cannot be surfaced by the flat editor and are dropped (the editor itself
-/// never produces such trees).
-fn split_tree(node: SmartNode) -> (bool, Vec<(bool, Vec<SmartNode>)>) {
-    let (and_mode, children) = match node {
+/// Splits a stored tree into `(combine with and, matches)`. The top level
+/// is `and`/`or`; every child must be a match leaf — anything nested
+/// (groups inside groups from older two-layer editors) yields `Err`, which
+/// the dialog turns into a read-only view. A bare match becomes a single
+/// `and` condition.
+fn split_tree(node: SmartNode) -> Result<(bool, Vec<SmartNode>), ()> {
+    let (all, children) = match node {
         SmartNode::And { children } => (true, children),
         SmartNode::Or { children } => (false, children),
-        match_node @ SmartNode::Match { .. } => {
-            return (true, vec![(true, vec![match_node])]);
-        }
+        match_node @ SmartNode::Match { .. } => return Ok((true, vec![match_node])),
     };
-    let mut top_level: Vec<SmartNode> = Vec::new();
-    let mut groups: Vec<(bool, Vec<SmartNode>)> = Vec::new();
-    for child in children {
-        match child {
-            SmartNode::And { children } => groups.push((true, keep_matches(children))),
-            SmartNode::Or { children } => groups.push((false, keep_matches(children))),
-            match_node @ SmartNode::Match { .. } => top_level.push(match_node),
-        }
-    }
-    if !top_level.is_empty() {
-        groups.insert(0, (and_mode, top_level));
-    }
-    (and_mode, groups)
-}
-
-fn keep_matches(children: Vec<SmartNode>) -> Vec<SmartNode> {
-    children
-        .into_iter()
-        .filter(|child| matches!(child, SmartNode::Match { .. }))
-        .collect()
-}
-
-/// Joins groups back into a tree. A single group is stored flat (the
-/// top-level operator would be redundant); multiple groups are wrapped in
-/// `inter_and`'s operator.
-fn join_tree(inter_and: bool, groups: &[(bool, Vec<SmartNode>)]) -> SmartNode {
-    let wrap = |and_mode: bool, children: Vec<SmartNode>| {
-        if and_mode {
-            SmartNode::And { children }
-        } else {
-            SmartNode::Or { children }
-        }
-    };
-    if groups.len() == 1 {
-        let (and_mode, children) = &groups[0];
-        return wrap(*and_mode, children.clone());
-    }
-    let children = groups
+    if children
         .iter()
-        .map(|(and_mode, children)| wrap(*and_mode, children.clone()))
-        .collect();
-    wrap(inter_and, children)
+        .any(|c| !matches!(c, SmartNode::Match { .. }))
+    {
+        return Err(());
+    }
+    Ok((all, children))
+}
+
+/// Joins rows back into a tree: one `and`/`or` node over the matches.
+fn join_tree(match_all: bool, matches: Vec<SmartNode>) -> SmartNode {
+    if match_all {
+        SmartNode::And { children: matches }
+    } else {
+        SmartNode::Or { children: matches }
+    }
 }
 
 // ============================ color helpers ==================================
@@ -465,36 +390,27 @@ fn normalize_color(raw: &str) -> Option<String> {
 
 // ============================ load ===========================================
 
-/// Load a stored tree into `(inter-group and mode, groups)`. Groups whose
-/// children all vanish (non-match nodes below layer two) are kept as empty
-/// groups so the structure stays visible; a tree with no groups at all
-/// falls back to one empty `and` group.
-fn load_groups(
+/// Load a stored tree into `(combine with and, rows, read-only)`. A tree
+/// the flat editor cannot surface (nested groups) opens read-only with no
+/// rows; an empty tree falls back to no rows and editable.
+fn load_rules(
     json: &serde_json::Value,
     window: &mut Window,
     cx: &mut App,
-) -> (bool, Vec<RuleGroup>) {
+) -> (bool, Vec<ConditionRow>, bool) {
     let node = smart::node_from_json(json).unwrap_or(SmartNode::And {
         children: Vec::new(),
     });
-    let (inter_and, layout) = split_tree(node);
-    let mut groups: Vec<RuleGroup> = layout
-        .into_iter()
-        .map(|(and_mode, matches)| RuleGroup {
-            and_mode,
-            rows: matches
+    match split_tree(node) {
+        Ok((match_all, matches)) => {
+            let rows = matches
                 .into_iter()
                 .filter_map(|node| match_row(node, window, cx))
-                .collect(),
-        })
-        .collect();
-    if groups.is_empty() {
-        groups.push(RuleGroup {
-            and_mode: true,
-            rows: Vec::new(),
-        });
+                .collect();
+            (match_all, rows, false)
+        }
+        Err(()) => (true, Vec::new(), true),
     }
-    (inter_and, groups)
 }
 
 /// Builds one condition row from a stored match node.
@@ -576,15 +492,9 @@ pub fn open_rule_editor(
     if let Some(name) = editing.as_ref().map(|sc| sc.name.clone()) {
         name_input.update(cx, |state, cx| state.set_value(name, window, cx));
     }
-    let (inter_and_mode, groups) = match &editing {
-        Some(sc) => load_groups(&sc.query, window, cx),
-        None => (
-            true,
-            vec![RuleGroup {
-                and_mode: true,
-                rows: Vec::new(),
-            }],
-        ),
+    let (match_all, rows, readonly) = match &editing {
+        Some(sc) => load_rules(&sc.query, window, cx),
+        None => (true, Vec::new(), false),
     };
     let tag_names = {
         let conn = controller.read(cx).library.store().conn();
@@ -611,8 +521,9 @@ pub fn open_rule_editor(
         editing: editing.map(|sc| sc.id),
         parent,
         name_input,
-        inter_and_mode,
-        groups,
+        match_all,
+        rows,
+        readonly,
         tag_names,
         color,
         picker: picker.clone(),
@@ -741,12 +652,21 @@ fn render_body(
     cx: &mut App,
 ) -> Div {
     let t = |k: &str| rust_i18n::t!(k).to_string();
-    let (name_input, inter_and_mode, group_count) = {
+    let (name_input, match_all, readonly, rows) = {
         let d = draft.read(cx);
-        (d.name_input.clone(), d.inter_and_mode, d.groups.len())
+        (
+            d.name_input.clone(),
+            d.match_all,
+            d.readonly,
+            d.rows
+                .iter()
+                .enumerate()
+                .map(|(ix, row)| (ix, row.field, row.op))
+                .collect::<Vec<_>>(),
+        )
     };
 
-    // Left column: the name and every condition group.
+    // Left column: the name, the condition rows and the live match status.
     let mut conditions = v_flex()
         .gap_3()
         .flex_1()
@@ -757,56 +677,66 @@ fn render_body(
                 .child(field_label(cx, "rules.name"))
                 .child(Input::new(&name_input).small().appearance(true)),
         )
-        .child(field_label(cx, "rules.conditions"));
+        .child(
+            h_flex()
+                .items_center()
+                .justify_between()
+                .gap_2()
+                .child(field_label(cx, "rules.conditions"))
+                // The single combination operator over all rows. Hidden
+                // while read-only: the stored tree is not a flat list and
+                // saving is blocked anyway.
+                .when(!readonly, |header| {
+                    let d = draft.clone();
+                    header.child(dropdown_button(
+                        "match-mode",
+                        t(if match_all {
+                            "rules.match_all"
+                        } else {
+                            "rules.match_any"
+                        }),
+                        vec![(true, t("rules.match_all")), (false, t("rules.match_any"))],
+                        match_all,
+                        move |picked: bool, cx| d.update(cx, |d, cx| d.set_match_all(picked, cx)),
+                    ))
+                }),
+        );
 
-    for gix in 0..group_count {
-        if gix == 1 {
-            conditions = conditions.child(render_inter_separator(draft, inter_and_mode, cx));
-        }
-        let (and_mode, rows): (bool, Vec<(usize, SmartField, SmartCompare)>) = {
-            let d = draft.read(cx);
-            let group = &d.groups[gix];
-            (
-                group.and_mode,
-                group
-                    .rows
-                    .iter()
-                    .enumerate()
-                    .map(|(ix, row)| (ix, row.field, row.op))
-                    .collect(),
-            )
-        };
-        conditions = conditions.child(render_group(
-            draft,
-            gix,
-            and_mode,
-            rows,
-            group_count > 1,
-            cx,
-        ));
+    if readonly {
+        conditions = conditions.child(
+            div()
+                .text_xs()
+                .text_color(cx.theme().danger)
+                .child(t("rules.readonly_complex")),
+        );
+    }
+    for (ix, field, op) in rows {
+        conditions = conditions.child(render_row(draft, ix, field, op, cx));
     }
 
+    let mut footer = h_flex().items_center().gap_2();
+    if !readonly {
+        let d = draft.clone();
+        footer = footer.child(
+            Button::new("add-condition")
+                .xsmall()
+                .ghost()
+                .icon(IconName::Plus)
+                .label(t("rules.add_condition"))
+                .on_click(move |_, window, cx| {
+                    d.update(cx, |d, cx| d.add_row(SmartField::Text, window, cx));
+                }),
+        );
+    }
     let conditions = conditions.child(
-        h_flex()
-            .items_center()
-            .gap_2()
-            .child({
-                let d = draft.clone();
-                Button::new("add-group")
-                    .xsmall()
-                    .ghost()
-                    .icon(IconName::Plus)
-                    .label(t("rules.add_group"))
-                    .on_click(move |_, _, cx| d.update(cx, |d, cx| d.add_group(cx)))
-            })
-            .child(match status {
-                (Some(total), None) => div()
-                    .text_xs()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(rust_i18n::t!("rules.match_count", count = total).to_string()),
-                (_, Some(err)) => div().text_xs().text_color(cx.theme().danger).child(err),
-                (None, None) => div(),
-            }),
+        footer.child(match status {
+            (Some(total), None) => div()
+                .text_xs()
+                .text_color(cx.theme().muted_foreground)
+                .child(rust_i18n::t!("rules.match_count", count = total).to_string()),
+            (_, Some(err)) => div().text_xs().text_color(cx.theme().danger).child(err),
+            (None, None) => div(),
+        }),
     );
 
     // Two columns: conditions on the left, the color column on the right.
@@ -853,99 +783,8 @@ fn render_color_panel(draft: &Entity<RuleDraft>, cx: &mut App) -> Div {
         .child(color_panel(&picker, featured, cx))
 }
 
-/// The separator between condition groups: two rules with the switchable
-/// inter-group operator in the middle. Only rendered with 2+ groups.
-fn render_inter_separator(draft: &Entity<RuleDraft>, inter_and: bool, cx: &mut App) -> Div {
-    let t = |k: &str| rust_i18n::t!(k).to_string();
-    let d = draft.clone();
-    h_flex()
-        .items_center()
-        .gap_2()
-        .child(div().flex_1().h(px(1.)).bg(cx.theme().border))
-        .child(dropdown_button(
-            "inter-mode",
-            t(if inter_and {
-                "rules.inter_all"
-            } else {
-                "rules.inter_any"
-            }),
-            vec![(false, t("rules.inter_any")), (true, t("rules.inter_all"))],
-            inter_and,
-            move |picked: bool, cx| d.update(cx, |d, cx| d.set_inter_and_mode(picked, cx)),
-        ))
-        .child(div().flex_1().h(px(1.)).bg(cx.theme().border))
-}
-
-fn render_group(
-    draft: &Entity<RuleDraft>,
-    gix: usize,
-    and_mode: bool,
-    rows: Vec<(usize, SmartField, SmartCompare)>,
-    show_remove: bool,
-    cx: &mut App,
-) -> Div {
-    let t = |k: &str| rust_i18n::t!(k).to_string();
-
-    let mut header = h_flex()
-        .items_center()
-        .gap_1()
-        .child({
-            let d = draft.clone();
-            Button::new(format!("group-{gix}-mode-and"))
-                .xsmall()
-                .when(and_mode, |b| b.primary())
-                .when(!and_mode, |b| b.ghost())
-                .label(t("rules.match_all"))
-                .on_click(move |_, _, cx| d.update(cx, |d, cx| d.set_group_and_mode(gix, true, cx)))
-        })
-        .child({
-            let d = draft.clone();
-            Button::new(format!("group-{gix}-mode-or"))
-                .xsmall()
-                .when(!and_mode, |b| b.primary())
-                .when(and_mode, |b| b.ghost())
-                .label(t("rules.match_any"))
-                .on_click(move |_, _, cx| {
-                    d.update(cx, |d, cx| d.set_group_and_mode(gix, false, cx))
-                })
-        });
-    if show_remove {
-        header = header.child(div().flex_1()).child({
-            let d = draft.clone();
-            Button::new(format!("group-{gix}-remove"))
-                .xsmall()
-                .ghost()
-                .icon(IconName::Close)
-                .on_click(move |_, _, cx| d.update(cx, |d, cx| d.remove_group(gix, cx)))
-        });
-    }
-
-    let mut group = v_flex()
-        .gap_1p5()
-        .p_2()
-        .border_1()
-        .border_color(cx.theme().border)
-        .rounded(cx.theme().radius)
-        .child(header);
-    for (ix, field, op) in rows {
-        group = group.child(render_row(draft, gix, ix, field, op, cx));
-    }
-    group.child({
-        let d = draft.clone();
-        Button::new(format!("group-{gix}-add"))
-            .xsmall()
-            .ghost()
-            .icon(IconName::Plus)
-            .label(t("rules.add_condition"))
-            .on_click(move |_, window, cx| {
-                d.update(cx, |d, cx| d.add_row(gix, SmartField::Text, window, cx));
-            })
-    })
-}
-
 fn render_row(
     draft: &Entity<RuleDraft>,
-    gix: usize,
     ix: usize,
     field: SmartField,
     op: SmartCompare,
@@ -954,7 +793,7 @@ fn render_row(
     let t = |k: &str| rust_i18n::t!(k).to_string();
     let (kind, favorite, tag, rating, orientation, tag_names, text_input) = {
         let d = draft.read(cx);
-        let row = &d.groups[gix].rows[ix];
+        let row = &d.rows[ix];
         (
             row.kind,
             row.favorite,
@@ -971,7 +810,7 @@ fn render_row(
         .gap_1()
         // Field picker.
         .child(dropdown_button(
-            format!("row-{gix}-{ix}-field"),
+            format!("row-{ix}-field"),
             t(field_key(field)),
             [
                 (SmartField::Text, "rules.f_text"),
@@ -992,7 +831,7 @@ fn render_row(
             field,
             {
                 let d = draft.clone();
-                move |picked: SmartField, cx| d.update(cx, |d, cx| d.set_field(gix, ix, picked, cx))
+                move |picked: SmartField, cx| d.update(cx, |d, cx| d.set_field(ix, picked, cx))
             },
         ));
 
@@ -1009,13 +848,13 @@ fn render_row(
         );
     } else {
         row_el = row_el.child(dropdown_button(
-            format!("row-{gix}-{ix}-op"),
+            format!("row-{ix}-op"),
             t(op_key(field, op)),
             ops.iter().map(|&op| (op, t(op_key(field, op)))).collect(),
             op,
             {
                 let d = draft.clone();
-                move |picked: SmartCompare, cx| d.update(cx, |d, cx| d.set_op(gix, ix, picked, cx))
+                move |picked: SmartCompare, cx| d.update(cx, |d, cx| d.set_op(ix, picked, cx))
             },
         ));
     }
@@ -1032,7 +871,7 @@ fn render_row(
             .min_w_0()
             .child(Input::new(&text_input).small().appearance(true)),
         SmartField::Kind => h_flex().flex_1().min_w_0().child(dropdown_button(
-            format!("row-{gix}-{ix}-kind"),
+            format!("row-{ix}-kind"),
             t(kind_key(kind)),
             [
                 AssetKind::Image,
@@ -1050,21 +889,21 @@ fn render_row(
             kind,
             {
                 let d = draft.clone();
-                move |picked: AssetKind, cx| d.update(cx, |d, cx| d.set_kind(gix, ix, picked, cx))
+                move |picked: AssetKind, cx| d.update(cx, |d, cx| d.set_kind(ix, picked, cx))
             },
         )),
         SmartField::IsFavorite => h_flex().flex_1().min_w_0().child(dropdown_button(
-            format!("row-{gix}-{ix}-fav"),
+            format!("row-{ix}-fav"),
             t(if favorite { "rules.yes" } else { "rules.no" }),
             vec![(true, t("rules.yes")), (false, t("rules.no"))],
             favorite,
             {
                 let d = draft.clone();
-                move |picked: bool, cx| d.update(cx, |d, cx| d.set_favorite(gix, ix, picked, cx))
+                move |picked: bool, cx| d.update(cx, |d, cx| d.set_favorite(ix, picked, cx))
             },
         )),
         SmartField::Tag => h_flex().flex_1().min_w_0().child(dropdown_button(
-            format!("row-{gix}-{ix}-tag"),
+            format!("row-{ix}-tag"),
             if tag.is_empty() {
                 t("rules.has_tag")
             } else {
@@ -1074,11 +913,11 @@ fn render_row(
             tag,
             {
                 let d = draft.clone();
-                move |picked: String, cx| d.update(cx, |d, cx| d.set_tag(gix, ix, picked, cx))
+                move |picked: String, cx| d.update(cx, |d, cx| d.set_tag(ix, picked, cx))
             },
         )),
         SmartField::Orientation => h_flex().flex_1().min_w_0().child(dropdown_button(
-            format!("row-{gix}-{ix}-orientation"),
+            format!("row-{ix}-orientation"),
             if orientation.is_empty() {
                 t("rules.f_orientation")
             } else {
@@ -1096,19 +935,17 @@ fn render_row(
             orientation,
             {
                 let d = draft.clone();
-                move |picked: String, cx| {
-                    d.update(cx, |d, cx| d.set_orientation(gix, ix, picked, cx))
-                }
+                move |picked: String, cx| d.update(cx, |d, cx| d.set_orientation(ix, picked, cx))
             },
         )),
         SmartField::Rating => h_flex().flex_1().min_w_0().child(dropdown_button(
-            format!("row-{gix}-{ix}-rating"),
+            format!("row-{ix}-rating"),
             format!("{rating} ★"),
             (0..=5u8).map(|n| (n, format!("{n} ★"))).collect(),
             rating,
             {
                 let d = draft.clone();
-                move |picked: u8, cx| d.update(cx, |d, cx| d.set_rating(gix, ix, picked, cx))
+                move |picked: u8, cx| d.update(cx, |d, cx| d.set_rating(ix, picked, cx))
             },
         )),
     };
@@ -1116,11 +953,11 @@ fn render_row(
 
     row_el.child({
         let d = draft.clone();
-        Button::new(format!("row-{gix}-{ix}-remove"))
+        Button::new(format!("row-{ix}-remove"))
             .xsmall()
             .ghost()
             .icon(IconName::Close)
-            .on_click(move |_, _, cx| d.update(cx, |d, cx| d.remove_row(gix, ix, cx)))
+            .on_click(move |_, _, cx| d.update(cx, |d, cx| d.remove_row(ix, cx)))
     })
 }
 
@@ -1194,7 +1031,8 @@ fn kind_key(kind: AssetKind) -> &'static str {
 
 fn op_key(field: SmartField, op: SmartCompare) -> &'static str {
     match (field, op) {
-        (SmartField::Text, _) => "rules.op_match",
+        (SmartField::Text, SmartCompare::Eq) => "rules.op_contains",
+        (SmartField::Text, _) => "rules.op_excludes",
         (SmartField::Tag, SmartCompare::Eq) => "rules.has_tag",
         (SmartField::Tag, _) => "rules.no_tag",
         (_, SmartCompare::Eq) => "rules.op_eq",
@@ -1208,7 +1046,7 @@ fn op_key(field: SmartField, op: SmartCompare) -> &'static str {
 
 fn allowed_ops(field: SmartField) -> &'static [SmartCompare] {
     match field {
-        SmartField::Text => &[SmartCompare::Eq],
+        SmartField::Text => &[SmartCompare::Eq, SmartCompare::Ne],
         SmartField::Tag
         | SmartField::Kind
         | SmartField::IsFavorite
@@ -1243,96 +1081,71 @@ mod tests {
         }
     }
 
-    fn round_trip(node: SmartNode) -> (bool, Vec<(bool, Vec<SmartNode>)>) {
+    fn round_trip(node: SmartNode) -> Result<(bool, Vec<SmartNode>), ()> {
         let json = serde_json::to_value(&node).unwrap();
         split_tree(smart::node_from_json(&json).unwrap())
     }
 
     #[test]
-    fn bare_match_loads_as_single_and_group() {
-        let (inter_and, groups) = split_tree(m(SmartField::Rating, 4));
-        assert!(inter_and);
-        assert_eq!(groups.len(), 1);
-        assert!(groups[0].0);
-        assert_eq!(groups[0].1.len(), 1);
+    fn bare_match_loads_as_single_and_condition() {
+        let (match_all, rows) = split_tree(m(SmartField::Rating, 4)).unwrap();
+        assert!(match_all);
+        assert_eq!(rows.len(), 1);
     }
 
     #[test]
-    fn single_flat_group_round_trips() {
-        let groups = [(true, vec![m(SmartField::Rating, 4), m(SmartField::Kind, 1)])];
-        let (inter, loaded) = round_trip(join_tree(true, &groups));
-        assert!(loaded.len() == 1 && loaded[0].0);
-        assert_eq!(loaded[0].1.len(), 2);
-        // A single group carries no inter-group semantics.
-        assert!(inter);
+    fn flat_list_round_trips() {
+        for all in [true, false] {
+            let json = serde_json::to_value(join_tree(
+                all,
+                vec![m(SmartField::Rating, 4), m(SmartField::Kind, 1)],
+            ))
+            .unwrap();
+            assert_eq!(json["op"], if all { "and" } else { "or" });
+            let (loaded_all, rows) = round_trip(smart::node_from_json(&json).unwrap()).unwrap();
+            assert_eq!(loaded_all, all);
+            assert_eq!(rows.len(), 2);
+        }
     }
 
     #[test]
-    fn or_of_ands_round_trips() {
-        let groups = [
-            (
-                true,
-                vec![m(SmartField::Rating, 4), m(SmartField::IsFavorite, 1)],
-            ),
-            (true, vec![m(SmartField::Kind, 2)]),
-        ];
-        let json = serde_json::to_value(join_tree(false, &groups)).unwrap();
-        // Top level must be `or`; each branch its own `and`.
-        assert_eq!(json["op"], "or");
-        assert_eq!(json["children"][0]["op"], "and");
-        assert_eq!(json["children"][1]["op"], "and");
-
-        let (inter, loaded) = split_tree(smart::node_from_json(&json).unwrap());
-        assert!(!inter);
-        assert_eq!(loaded.len(), 2);
-        assert!(loaded.iter().all(|(and_mode, _)| *and_mode));
-        assert_eq!(loaded[0].1.len(), 2);
-        assert_eq!(loaded[1].1.len(), 1);
-    }
-
-    #[test]
-    fn inter_all_wraps_groups_in_and() {
-        let groups = [
-            (false, vec![m(SmartField::Kind, 2)]),
-            (false, vec![m(SmartField::Rating, 3)]),
-        ];
-        let json = serde_json::to_value(join_tree(true, &groups)).unwrap();
-        assert_eq!(json["op"], "and");
-        assert_eq!(json["children"][0]["op"], "or");
-
-        let (inter, loaded) = split_tree(smart::node_from_json(&json).unwrap());
-        assert!(inter);
-        assert_eq!(loaded.len(), 2);
-        assert!(loaded.iter().all(|(and_mode, _)| !*and_mode));
-    }
-
-    #[test]
-    fn mixed_group_modes_survive_a_round_trip() {
-        let groups = [
-            (true, vec![m(SmartField::Rating, 4)]),
-            (false, vec![m(SmartField::Kind, 1), m(SmartField::Kind, 3)]),
-            (true, vec![m(SmartField::IsFavorite, 1)]),
-        ];
-        let (inter, loaded) = round_trip(join_tree(false, &groups));
-        assert!(!inter);
-        let modes: Vec<bool> = loaded.iter().map(|(and_mode, _)| *and_mode).collect();
-        assert_eq!(modes, vec![true, false, true]);
-        let sizes: Vec<usize> = loaded.iter().map(|(_, rows)| rows.len()).collect();
-        assert_eq!(sizes, vec![1, 2, 1]);
-    }
-
-    #[test]
-    fn non_match_nodes_below_layer_two_are_dropped() {
-        // Or[ And[ Or[m] ] ] — the innermost Or cannot be surfaced.
+    fn nested_group_tree_is_rejected() {
+        // Two-layer groups from older editors: Or[ And[ m ] ] — the inner
+        // group cannot be surfaced as a flat list.
         let node = SmartNode::Or {
             children: vec![SmartNode::And {
-                children: vec![SmartNode::Or {
-                    children: vec![m(SmartField::Rating, 4)],
-                }],
+                children: vec![m(SmartField::Rating, 4)],
             }],
         };
-        let (_, loaded) = split_tree(node);
-        assert_eq!(loaded.len(), 1);
-        assert!(loaded[0].1.is_empty(), "the unsurfable node is dropped");
+        assert!(round_trip(node).is_err());
+    }
+
+    #[test]
+    fn any_nested_group_tree_is_rejected() {
+        // Two-layer shapes from older editors, even when every leaf is a
+        // match: the flat list cannot represent the inner operator, so the
+        // tree opens read-only instead of being silently reshaped.
+        for node in [
+            SmartNode::Or {
+                children: vec![SmartNode::And {
+                    children: vec![m(SmartField::Rating, 4)],
+                }],
+            },
+            SmartNode::Or {
+                children: vec![SmartNode::And {
+                    children: vec![m(SmartField::Rating, 4), m(SmartField::Kind, 1)],
+                }],
+            },
+            SmartNode::And {
+                children: vec![
+                    m(SmartField::Rating, 4),
+                    SmartNode::Or {
+                        children: vec![m(SmartField::Kind, 1)],
+                    },
+                ],
+            },
+        ] {
+            assert!(round_trip(node).is_err());
+        }
     }
 }
