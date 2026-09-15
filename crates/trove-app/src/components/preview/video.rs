@@ -51,7 +51,7 @@ use trove_core::model::AssetKind;
 
 use super::audio::AudioEngine;
 use super::{AssetPreviewData, fallback};
-use crate::app::actions::ExitVideoFullscreen;
+use crate::app::actions::{EnterVideoFullscreen, ExitVideoFullscreen};
 
 /// How long the decode loops sleep while paused before looking again.
 pub(super) const IDLE_POLL: Duration = Duration::from_millis(120);
@@ -85,56 +85,6 @@ const PRESENT_POLL: Duration = Duration::from_millis(4);
 /// holds at every preset.
 const SPEEDS: [f32; 9] = [0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 2.0, 3.0, 4.0];
 
-/// What the player tells its host panel: the user wants fullscreen, so the
-/// host pauses this player and opens the fullscreen window from this
-/// state. Leaving fullscreen does not come back as an event — the
-/// fullscreen host owns that window and exits via the
-/// [`ExitVideoFullscreen`] action.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub(crate) enum VideoPlayerEvent {
-    EnterFullscreen {
-        position_ms: f64,
-        speed: f32,
-        volume: f32,
-        muted: bool,
-    },
-}
-
-/// Playback state carried into a fresh player (the fullscreen window
-/// continues where the main-area player was).
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct PlayerResume {
-    pub position_ms: f64,
-    pub speed: f32,
-    pub volume: f32,
-    pub muted: bool,
-    pub playing: bool,
-}
-
-impl Default for PlayerResume {
-    fn default() -> Self {
-        Self {
-            position_ms: 0.0,
-            speed: 1.0,
-            volume: 1.0,
-            muted: false,
-            playing: true,
-        }
-    }
-}
-
-/// What the panel hands to the fullscreen player: the facts it already
-/// probed — so opening the window does not run ffprobe a second time on
-/// the click path — and the frame it is showing, so the window opens on a
-/// picture instead of a black gap until its own first decode lands.
-pub(crate) struct FullscreenSeed {
-    pub facts: VideoStreamFacts,
-    pub frame: Option<Arc<RenderImage>>,
-    /// The panel's soundtrack: the fullscreen window continues it instead of
-    /// building a second one, which is what used to cut the sound.
-    pub audio: Option<Entity<AudioEngine>>,
-}
-
 /// Spawn the live player for `data`, or `None` when the kind is not video,
 /// ffmpeg is unavailable, or the file cannot be probed.
 pub(super) fn spawn_player(data: &AssetPreviewData, cx: &mut App) -> Option<Entity<VideoPlayer>> {
@@ -148,28 +98,8 @@ pub(super) fn spawn_player(data: &AssetPreviewData, cx: &mut App) -> Option<Enti
     // One engine per playback, owned by the panel: windows come and go
     // without touching the soundtrack.
     let audio = AudioEngine::spawn(path.clone(), cx);
-    VideoPlayer::spawn(path, audio, PlayerResume::default(), cx)
+    VideoPlayer::spawn(path, audio, cx)
 }
-
-/// Spawn the player for the fullscreen window: continues from `resume`
-/// and its control row shows the exit-fullscreen button instead of the
-/// enter one.
-pub(super) fn spawn_fullscreen(
-    path: PathBuf,
-    resume: PlayerResume,
-    seed: FullscreenSeed,
-    cx: &mut App,
-) -> Entity<VideoPlayer> {
-    let player =
-        cx.new(|cx| VideoPlayer::with_facts(path, seed.facts, seed.audio, seed.frame, resume, cx));
-    player.update(cx, |this, cx| {
-        this.fullscreen_mode = true;
-        this.start_controls_watcher(cx);
-        cx.notify();
-    });
-    player
-}
-
 /// The cover: the library thumbnail at the inspector card's aspect height,
 /// falling back to the kind icon when no thumbnail exists.
 pub(super) fn cover(data: &AssetPreviewData, cx: &App) -> AnyElement {
@@ -218,7 +148,7 @@ struct PlaybackShared {
 /// A video player: frames piped out of ffmpeg plus audio, speed and
 /// fullscreen controls. Dropping the entity ends the loops, which kill the
 /// ffmpeg processes.
-pub(super) struct VideoPlayer {
+pub(crate) struct VideoPlayer {
     path: PathBuf,
     facts: VideoStreamFacts,
     /// The decode task's controls and mailbox — see [`PlaybackShared`].
@@ -278,8 +208,6 @@ pub(super) struct VideoPlayer {
     _subscription: Subscription,
 }
 
-impl EventEmitter<VideoPlayerEvent> for VideoPlayer {}
-
 impl Drop for VideoPlayer {
     fn drop(&mut self) {
         // The decode and audio tasks watch this instead of borrowing the
@@ -294,26 +222,23 @@ impl VideoPlayer {
     fn spawn(
         path: PathBuf,
         audio: Option<Entity<AudioEngine>>,
-        resume: PlayerResume,
         cx: &mut App,
     ) -> Option<Entity<Self>> {
         let facts = video::probe(&path)?;
-        Some(cx.new(|cx| Self::with_facts(path, facts, audio, None, resume, cx)))
+        Some(cx.new(|cx| Self::with_facts(path, facts, audio, cx)))
     }
 
     fn with_facts(
         path: PathBuf,
         facts: VideoStreamFacts,
         audio: Option<Entity<AudioEngine>>,
-        first_frame: Option<Arc<RenderImage>>,
-        resume: PlayerResume,
         cx: &mut Context<Self>,
     ) -> Self {
         let slider = cx.new(|_| {
             SliderState::new()
                 .min(0.)
                 .max(facts.duration_ms.max(1) as f32)
-                .default_value(resume.position_ms as f32)
+                .default_value(0.)
         });
         let subscription = cx.subscribe(&slider, |this, _slider, event: &SliderEvent, cx| {
             match event {
@@ -358,7 +283,7 @@ impl VideoPlayer {
                 // every drag to plain 0 or 1, so the volume would never
                 // actually follow the thumb.
                 .step(0.01)
-                .default_value(if resume.muted { 0. } else { resume.volume })
+                .default_value(1.)
         });
         // The volume slider outlives the struct field list: detaching keeps
         // the subscription alive for the entity's lifetime.
@@ -380,28 +305,27 @@ impl VideoPlayer {
         .detach();
         let clock = audio.as_ref().map(|audio| audio.read(cx).clock());
         let shared = Arc::new(Mutex::new(PlaybackShared {
-            playing: resume.playing,
-            speed: resume.speed.clamp(SPEEDS[0], SPEEDS[SPEEDS.len() - 1]),
+            playing: true,
+            speed: 1.0,
             ..Default::default()
         }));
         let alive = Arc::new(AtomicBool::new(true));
         let mut this = Self {
             path,
             facts,
-            // The fullscreen window is seeded with the frame the panel was
-            // showing; a fresh panel player starts black.
-            shown: first_frame,
-            playing: resume.playing,
-            position_ms: resume.position_ms,
+            // A fresh player starts black on the first decoded frame.
+            shown: None,
+            playing: true,
+            position_ms: 0.0,
             slider,
             volume_slider,
             audio,
             clock,
-            speed: resume.speed.clamp(SPEEDS[0], SPEEDS[SPEEDS.len() - 1]),
-            volume: resume.volume.clamp(0., 1.),
-            muted: resume.muted,
-            synced_position: resume.position_ms as f32,
-            synced_volume: if resume.muted { 0. } else { resume.volume },
+            speed: 1.0,
+            volume: 1.0,
+            muted: false,
+            synced_position: 0.,
+            synced_volume: 1.,
             fullscreen_mode: false,
             seeking: false,
             volume_open: false,
@@ -638,20 +562,6 @@ impl VideoPlayer {
         }
     }
 
-    /// Resume from `position_ms` after the fullscreen window closed.
-    pub(crate) fn resume_from(&mut self, position_ms: f64, playing: bool, cx: &mut Context<Self>) {
-        self.position_ms = position_ms;
-        self.playing = playing;
-        if let Ok(mut shared) = self.shared.lock() {
-            shared.seek_to = Some(position_ms.max(0.) as u64);
-        }
-        // The soundtrack played straight through the fullscreen window, so
-        // it is already where the picture should be: only the video jumps.
-        self.apply_playing_state(cx);
-        self.publish_controls();
-        cx.notify();
-    }
-
     /// Play/pause: flip the flag *and* apply it to the audio sink at once.
     ///
     /// The audio loop re-applies the state on every turn, but it can be a
@@ -676,12 +586,17 @@ impl VideoPlayer {
         }
     }
 
-    /// Stop the picture without touching the soundtrack: what the panel does
-    /// when the fullscreen window takes the stage over. The engine keeps
-    /// playing, so the sound never stops.
-    pub(crate) fn pause_video(&mut self, cx: &mut Context<Self>) {
-        self.playing = false;
-        self.publish_controls();
+    /// Fullscreen chrome on or off: the app view calls this when it takes its
+    /// window over (or gives it back), so the control row floats and
+    /// auto-hides only while it is the whole picture.
+    pub(crate) fn set_fullscreen_mode(&mut self, on: bool, cx: &mut Context<Self>) {
+        if self.fullscreen_mode != on {
+            self.fullscreen_mode = on;
+            if on {
+                self.start_controls_watcher(cx);
+                self.reveal_controls(cx);
+            }
+        }
         cx.notify();
     }
 
@@ -769,32 +684,9 @@ impl VideoPlayer {
         .detach();
     }
 
-    /// The probed stream facts; the fullscreen window reuses them instead
-    /// of probing the file a second time.
-    pub(crate) fn facts(&self) -> VideoStreamFacts {
-        self.facts
-    }
-
     /// Whether the file carries an audio stream.
     pub(crate) fn has_audio(&self) -> bool {
         self.audio.is_some()
-    }
-
-    /// The soundtrack, for the fullscreen window to share.
-    pub(crate) fn audio(&self) -> Option<Entity<AudioEngine>> {
-        self.audio.clone()
-    }
-
-    /// The frame currently on screen, used to seed the fullscreen window so
-    /// it opens on a picture instead of black.
-    pub(crate) fn current_frame(&self) -> Option<Arc<RenderImage>> {
-        self.shown.clone()
-    }
-
-    /// Position and playing flag, read by the fullscreen host on exit to
-    /// hand the playback state back here.
-    pub(crate) fn playback_state(&self) -> (f64, bool) {
-        (self.position_ms, self.playing)
     }
 
     /// The frame element: the current frame, or a dark placeholder until the
@@ -865,18 +757,15 @@ impl VideoPlayer {
                         rust_i18n::t!("video.fullscreen").to_string()
                     })
                     .on_click(cx.listener(|this, _, window, cx| {
+                        // Both directions are actions the app view answers by
+                        // taking its own window over (or giving it back):
+                        // this player is the one that keeps playing, so
+                        // neither the picture nor the sound is handed
+                        // anywhere.
                         if this.fullscreen_mode {
-                            // Leave via the action so the fullscreen host
-                            // (which owns the window) handles the exit —
-                            // the same path Esc takes.
                             window.dispatch_action(Box::new(ExitVideoFullscreen), cx);
                         } else {
-                            cx.emit(VideoPlayerEvent::EnterFullscreen {
-                                position_ms: this.position_ms,
-                                speed: this.speed,
-                                volume: this.volume,
-                                muted: this.muted,
-                            });
+                            window.dispatch_action(Box::new(EnterVideoFullscreen), cx);
                         }
                     })),
             )
