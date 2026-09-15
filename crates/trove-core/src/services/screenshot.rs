@@ -149,8 +149,8 @@ pub fn capture(mode: ScreenshotMode, custom: Option<&str>, dest: &Path) -> Resul
         return run_custom(command, dest);
     }
     // In-process reasons accumulate and ride along in whatever error finally
-    // surfaces, so a failed niri capture reads `grim-rs: …; xcap: …; grim: …`
-    // in one line.
+    // surfaces, so a failed capture reads `grim-rs: …; screenshots: …; xcap:
+    // …; grim: …` in one line.
     let mut in_process_error: Option<String> = None;
     if mode == ScreenshotMode::Full {
         // Wayland first: grim-rs speaks ext-image-copy-capture-v1, which is
@@ -161,7 +161,7 @@ pub fn capture(mode: ScreenshotMode, custom: Option<&str>, dest: &Path) -> Resul
             let attempt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 capture_via_grim_rs(dest)
             }));
-            match attempt.unwrap_or_else(|_| Err("the capture library panicked".into())) {
+            match attempt.unwrap_or_else(|payload| Err(panic_message(payload))) {
                 Ok(()) => return Ok(()),
                 Err(reason) => {
                     tracing::warn!(reason, "grim-rs capture failed; falling back");
@@ -170,11 +170,12 @@ pub fn capture(mode: ScreenshotMode, custom: Option<&str>, dest: &Path) -> Resul
             }
             // Portal probe: the `screenshots` crate asks the
             // xdg-desktop-portal Screenshot interface instead of a capture
-            // protocol — success means the session has a portal backend.
+            // protocol — success means the session has a portal backend
+            // (KDE's xdg-desktop-portal-kde implements one).
             let attempt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 capture_via_screenshots(dest)
             }));
-            match attempt.unwrap_or_else(|_| Err("the capture library panicked".into())) {
+            match attempt.unwrap_or_else(|payload| Err(panic_message(payload))) {
                 Ok(()) => return Ok(()),
                 Err(reason) => {
                     tracing::warn!(reason, "screenshots (portal) capture failed; falling back");
@@ -190,7 +191,7 @@ pub fn capture(mode: ScreenshotMode, custom: Option<&str>, dest: &Path) -> Resul
         // instead of taking the caller's task down.
         let attempt =
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| capture_via_xcap(dest)));
-        match attempt.unwrap_or_else(|_| Err("the capture library panicked".into())) {
+        match attempt.unwrap_or_else(|payload| Err(panic_message(payload))) {
             Ok(()) => return Ok(()),
             Err(reason) => {
                 tracing::warn!(
@@ -221,6 +222,19 @@ pub fn capture(mode: ScreenshotMode, custom: Option<&str>, dest: &Path) -> Resul
         Some(reason) => format!("{reason}; {e}"),
         None => e,
     })
+}
+
+/// Pull a readable message out of a caught panic payload. The default
+/// panic hook writes to stderr, which the file log never sees, so the
+/// unwind guards turn panics into regular `Err` strings instead.
+fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
+    if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else if let Some(message) = payload.downcast_ref::<&str>() {
+        (*message).to_string()
+    } else {
+        "unknown panic payload".into()
+    }
 }
 
 /// Capture the whole desktop in-process with `grim-rs` and write a PNG.
