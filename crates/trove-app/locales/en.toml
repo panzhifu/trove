@@ -537,6 +537,12 @@ corner_axis = "Trihedron"
 corner_axis_tip = "Pin a small X/Y/Z indicator to the corner — it turns with the camera."
 shortcut_reset = "R · Double-click: Reset view"
 
+[video]
+fullscreen = "Fullscreen"
+exit_fullscreen = "Exit fullscreen"
+mute = "Mute"
+unmute = "Unmute"
+
 [shortcuts]
 keyboard = "Keyboard Shortcuts"
 shortcut_desc = "Description"

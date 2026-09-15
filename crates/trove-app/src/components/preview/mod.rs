@@ -17,6 +17,7 @@
 
 mod fallback;
 mod font;
+mod fullscreen;
 mod gpu3d;
 mod image;
 pub(crate) mod model;
@@ -39,7 +40,7 @@ use uuid::Uuid;
 const ZOOM_FACTOR: f32 = 1.15;
 
 use crate::library::LibraryController;
-use video::VideoPlayer;
+use video::{PlayerResume, VideoPlayer, VideoPlayerEvent};
 
 /// Which placement renders the preview; the kinds differ in what "as large
 /// as useful" means for them.
@@ -203,6 +204,10 @@ pub(crate) struct AssetPreviewPanel {
     data: AssetPreviewData,
     /// Live player for videos; `None` renders the still variants instead.
     video: Option<Entity<VideoPlayer>>,
+    /// Watches the player for the fullscreen request: the panel pauses it
+    /// and opens the fullscreen window from its state. `None` when there
+    /// is no player.
+    _video_events: Option<Subscription>,
     /// Applied zoom for the still (1.0 = fit the viewport).
     zoom: f32,
     /// Measured content-viewport size; the fit base for the zoom math.
@@ -238,14 +243,55 @@ impl AssetPreviewPanel {
         // undecodable file (or no ffmpeg) keeps the poster still.
         let video = video::spawn_player(&data, cx);
         let viewport = cx.new(|_| size(px(0.), px(0.)));
-        cx.new(|_cx| Self {
-            data,
-            video,
-            zoom: 1.0,
-            viewport,
-            drag_from: Point::default(),
-            dragging: false,
-            scroll_offset: Point::default(),
+        cx.new(|cx| {
+            // Fullscreen hand-off: the player pauses here and a fresh
+            // player in a fullscreen OS window continues from its state.
+            // Leaving fullscreen comes back through the action, which the
+            // fullscreen host answers with `resume_from` on this player.
+            let _video_events = video.as_ref().map(|video| {
+                cx.subscribe(
+                    video,
+                    |this: &mut AssetPreviewPanel,
+                     player: Entity<VideoPlayer>,
+                     event: &VideoPlayerEvent,
+                     cx| {
+                        // Single-variant event: irrefutable destructure.
+                        let VideoPlayerEvent::EnterFullscreen {
+                            position_ms,
+                            speed,
+                            volume,
+                            muted,
+                        } = *event;
+                        player.update(cx, |player, cx| player.pause(cx));
+                        let Some(original) = this.data.original.clone() else {
+                            return;
+                        };
+                        let host = cx.weak_entity();
+                        fullscreen::open(
+                            host,
+                            original,
+                            PlayerResume {
+                                position_ms,
+                                speed,
+                                volume,
+                                muted,
+                                playing: true,
+                            },
+                            cx,
+                        );
+                    },
+                )
+            });
+            Self {
+                data,
+                video,
+                _video_events,
+                zoom: 1.0,
+                viewport,
+                drag_from: Point::default(),
+                dragging: false,
+                scroll_offset: Point::default(),
+            }
         })
     }
 

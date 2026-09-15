@@ -67,6 +67,12 @@ image = { version = "0.25", default-features = false, features = [
 ] }
 smallvec = "1"
 
+# Audio playback for the video preview (PCM out of the ffmpeg pipe).
+# `default-features = false` drops the symphonia/claxon decoders: every
+# media format is already handled by the ffmpeg subprocess, so the crate
+# only has to carry the cpal output path.
+rodio = { version = "0.19", default-features = false }
+
 # Local collect service: URL fetching for the inbox (extension / curl)
 ureq = "3"
 

@@ -535,6 +535,12 @@ corner_axis = "方向轴"
 corner_axis_tip = "在角落固定一个随相机转动的小 X/Y/Z 指示器。"
 shortcut_reset = "R · 双击：重置视角"
 
+[video]
+fullscreen = "全屏播放"
+exit_fullscreen = "退出全屏"
+mute = "静音"
+unmute = "取消静音"
+
 [shortcuts]
 keyboard = "键盘快捷键"
 shortcut_desc = "说明"

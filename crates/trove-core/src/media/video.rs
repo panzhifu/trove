@@ -254,6 +254,120 @@ impl Drop for FramePipe {
     }
 }
 
+/// Whether the file carries at least one audio stream. Probed with
+/// `ffprobe`; `false` when it is unavailable or the file has no audio —
+/// the player then hides its volume controls instead of faking silence.
+pub fn has_audio_track(path: &Path) -> bool {
+    let Ok(output) = Command::new("ffprobe")
+        .args([
+            "-v",
+            "error",
+            "-select_streams",
+            "a:0",
+            "-show_entries",
+            "stream=codec_type",
+            "-of",
+            "csv=p=0",
+        ])
+        .arg(path)
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+    else {
+        return false;
+    };
+    output.status.success() && !output.stdout.is_empty()
+}
+
+/// A one-way pipe of raw PCM frames decoded by ffmpeg: signed 16-bit LE,
+/// 44.1 kHz, interleaved stereo, tempo-adjusted so playback speed changes
+/// keep the pitch (ffmpeg's `atempo`, 0.5–2.0 per instance).
+///
+/// Same backpressure contract as [`FramePipe`]: the consumer paces the
+/// stream, dropping the pipe kills the process.
+pub struct AudioPipe {
+    child: Child,
+    reader: BufReader<ChildStdout>,
+}
+
+/// Bytes per ~100 ms chunk: 44100 samples × 2 channels × 2 bytes ÷ 10.
+const AUDIO_CHUNK_BYTES: usize = 44100 * 2 * 2 / 10;
+
+impl AudioPipe {
+    /// Start decoding audio at `seek_ms`, resampled to 44.1 kHz stereo and
+    /// tempo-scaled by `speed` (clamped to 0.5–2.0, the single-instance
+    /// range of `atempo`). `None` when ffmpeg cannot be spawned.
+    pub fn open(path: &Path, seek_ms: u64, speed: f32) -> Option<Self> {
+        let seek = format!("{:.3}", seek_ms as f64 / 1000.0);
+        // atempo only spans 0.5–2.0 per instance; the player's presets stay
+        // inside that range, and anything else is clamped rather than
+        // chained (the preview never plays faster than 2×).
+        let tempo = speed.clamp(0.5, 2.0);
+        let mut child = Command::new("ffmpeg")
+            .args(["-v", "error", "-ss", &seek, "-i"])
+            .arg(path)
+            .args([
+                "-vn",
+                "-sn",
+                "-map",
+                "0:a:0?",
+                "-af",
+                &format!("atempo={:.2}", tempo),
+                "-f",
+                "s16le",
+                "-acodec",
+                "pcm_s16le",
+                "-ar",
+                "44100",
+                "-ac",
+                "2",
+                "pipe:1",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .ok()?;
+        let stdout = child.stdout.take()?;
+        Some(Self {
+            child,
+            reader: BufReader::with_capacity(AUDIO_CHUNK_BYTES, stdout),
+        })
+    }
+
+    /// Read the next ~100 ms of interleaved stereo samples, or `None` at
+    /// end of stream (or when the decoder died).
+    pub fn read_chunk(&mut self) -> Option<Vec<u8>> {
+        let mut buffer = vec![0u8; AUDIO_CHUNK_BYTES];
+        // Short reads only happen at the very end of the stream; a partial
+        // chunk is still real audio, so it is returned as-is.
+        let mut filled = 0;
+        while filled < AUDIO_CHUNK_BYTES {
+            let n = self
+                .reader
+                .read(&mut buffer[filled..AUDIO_CHUNK_BYTES])
+                .ok()?;
+            if n == 0 {
+                break;
+            }
+            filled += n;
+        }
+        if filled == 0 {
+            None
+        } else {
+            buffer.truncate(filled);
+            Some(buffer)
+        }
+    }
+}
+
+impl Drop for AudioPipe {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -286,6 +400,93 @@ mod tests {
             duration_ms: 1000,
         };
         assert_eq!(facts.frame_ms(), 40);
+    }
+
+    /// End-to-end: generate a tiny clip *with audio*, then stream PCM out of
+    /// the audio pipe. Skipped when ffmpeg/ffprobe are not installed.
+    #[test]
+    fn audio_pipe_streams_pcm_when_ffmpeg_present() {
+        if !ffmpeg_available() || !ffprobe_available() {
+            eprintln!("skipping: ffmpeg/ffprobe not on PATH");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("trove-video-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let clip = dir.join("clip-with-audio.mp4");
+        let status = Command::new("ffmpeg")
+            .args([
+                "-v",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=size=320x240:rate=10:duration=1",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=440:duration=1",
+                "-pix_fmt",
+                "yuv420p",
+                "-c:a",
+                "aac",
+                "-shortest",
+            ])
+            .arg(&clip)
+            .status()
+            .expect("ffmpeg runs");
+        assert!(status.success(), "failed to generate the test clip");
+
+        assert!(has_audio_track(&clip), "the clip reports an audio track");
+
+        let mut pipe = AudioPipe::open(&clip, 0, 1.0).expect("audio pipe opens");
+        let chunk = pipe.read_chunk().expect("first chunk decodes");
+        assert!(!chunk.is_empty());
+        assert!(chunk.len() <= 44100 * 2 * 2 / 10);
+
+        // The stream ends within a few hundred chunks (1 s of audio).
+        let mut count = 1usize;
+        while pipe.read_chunk().is_some() {
+            count += 1;
+            assert!(count < 200, "audio stream never ended");
+        }
+        assert!(count >= 5, "only {count} chunks of a 1 s stream");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// End-to-end: the same clip reads fine at 2× tempo (the atempo clamp
+    /// stays inside ffmpeg's single-instance range).
+    #[test]
+    fn audio_pipe_opens_at_extreme_tempo_when_ffmpeg_present() {
+        if !ffmpeg_available() || !ffprobe_available() {
+            eprintln!("skipping: ffmpeg/ffprobe not on PATH");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("trove-video-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let clip = dir.join("clip-tempo.mp4");
+        let status = Command::new("ffmpeg")
+            .args([
+                "-v",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=440:duration=1",
+                "-c:a",
+                "aac",
+            ])
+            .arg(&clip)
+            .status()
+            .expect("ffmpeg runs");
+        assert!(status.success(), "failed to generate the test clip");
+
+        let mut pipe = AudioPipe::open(&clip, 0, 2.0).expect("2× pipe opens");
+        assert!(pipe.read_chunk().is_some(), "2× stream yields audio");
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// End-to-end: generate a tiny clip, probe it and read a frame. Skipped
