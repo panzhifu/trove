@@ -6,8 +6,9 @@
 //! free to negate (text *not contains*, tag *is not*, …). The stored JSON
 //! is `{"op": "and"|"or", "children": [matches…]}`, which earlier
 //! one-group versions also round-trip. Deeper nesting is out of scope:
-//! [`split_tree`] rejects trees whose children are not all matches, and
-//! such collections open in a read-only state instead of being mangled.
+//! [`split_tree`] rejects trees whose children are not all matches, so
+//! such trees load as an empty row list instead of being silently
+//! reshaped (saving without conditions is blocked).
 //!
 //! Draft state lives in a [`RuleDraft`] entity created before the dialog
 //! opens (the dialog's content closure is a re-run-per-frame `Fn` and
@@ -27,7 +28,6 @@ use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::{ActiveTheme, IconName, Sizable};
-use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use trove_core::model::{AssetKind, SmartCollection, SmartCompare, SmartField, SmartNode};
@@ -105,10 +105,6 @@ struct RuleDraft {
     /// `false` = any (or).
     match_all: bool,
     rows: Vec<ConditionRow>,
-    /// Set when the stored tree cannot be surfaced as a flat list (nested
-    /// groups from older editors): rows stay empty, editing and saving are
-    /// blocked, and the dialog explains why.
-    readonly: bool,
     /// Tag names for the tag dropdown (snapshot at open).
     tag_names: Vec<String>,
     /// Display color of the smart collection itself (`#rrggbb` or none).
@@ -223,13 +219,9 @@ impl RuleDraft {
     }
 
     /// Compile the draft into the stored JSON tree. Incomplete rows are
-    /// skipped; an empty result is an error the dialog surfaces. A
-    /// read-only draft (unrepresentable stored tree) never compiles.
+    /// skipped; an empty result is an error the dialog surfaces.
     fn build_json(&self, cx: &App) -> Result<serde_json::Value, String> {
         let t = |k: &str| rust_i18n::t!(k).to_string();
-        if self.readonly {
-            return Err(t("rules.readonly_complex"));
-        }
         let children: Vec<SmartNode> = self
             .rows
             .iter()
@@ -251,7 +243,7 @@ impl RuleDraft {
 
     /// Re-run the live match count when the draft moved since last draw.
     fn recompute_if_stale(&mut self, cx: &mut Context<Self>) {
-        if self.revision == self.evaluated || self.readonly {
+        if self.revision == self.evaluated {
             return;
         }
         self.evaluated = self.revision;
@@ -321,7 +313,7 @@ fn row_value(row: &ConditionRow, cx: &App) -> Result<serde_json::Value, String> 
 /// Splits a stored tree into `(combine with and, matches)`. The top level
 /// is `and`/`or`; every child must be a match leaf — anything nested
 /// (groups inside groups from older two-layer editors) yields `Err`, which
-/// the dialog turns into a read-only view. A bare match becomes a single
+/// the loader turns into an empty row list. A bare match becomes a single
 /// `and` condition.
 fn split_tree(node: SmartNode) -> Result<(bool, Vec<SmartNode>), ()> {
     let (all, children) = match node {
@@ -390,14 +382,14 @@ fn normalize_color(raw: &str) -> Option<String> {
 
 // ============================ load ===========================================
 
-/// Load a stored tree into `(combine with and, rows, read-only)`. A tree
-/// the flat editor cannot surface (nested groups) opens read-only with no
-/// rows; an empty tree falls back to no rows and editable.
+/// Load a stored tree into `(combine with and, rows)`. A tree the flat
+/// editor cannot surface (nested groups) loads as no rows; an empty tree
+/// also falls back to no rows.
 fn load_rules(
     json: &serde_json::Value,
     window: &mut Window,
     cx: &mut App,
-) -> (bool, Vec<ConditionRow>, bool) {
+) -> (bool, Vec<ConditionRow>) {
     let node = smart::node_from_json(json).unwrap_or(SmartNode::And {
         children: Vec::new(),
     });
@@ -407,9 +399,9 @@ fn load_rules(
                 .into_iter()
                 .filter_map(|node| match_row(node, window, cx))
                 .collect();
-            (match_all, rows, false)
+            (match_all, rows)
         }
-        Err(()) => (true, Vec::new(), true),
+        Err(()) => (true, Vec::new()),
     }
 }
 
@@ -492,9 +484,9 @@ pub fn open_rule_editor(
     if let Some(name) = editing.as_ref().map(|sc| sc.name.clone()) {
         name_input.update(cx, |state, cx| state.set_value(name, window, cx));
     }
-    let (match_all, rows, readonly) = match &editing {
+    let (match_all, rows) = match &editing {
         Some(sc) => load_rules(&sc.query, window, cx),
-        None => (true, Vec::new(), false),
+        None => (true, Vec::new()),
     };
     let tag_names = {
         let conn = controller.read(cx).library.store().conn();
@@ -523,7 +515,6 @@ pub fn open_rule_editor(
         name_input,
         match_all,
         rows,
-        readonly,
         tag_names,
         color,
         picker: picker.clone(),
@@ -652,12 +643,11 @@ fn render_body(
     cx: &mut App,
 ) -> Div {
     let t = |k: &str| rust_i18n::t!(k).to_string();
-    let (name_input, match_all, readonly, rows) = {
+    let (name_input, match_all, rows) = {
         let d = draft.read(cx);
         (
             d.name_input.clone(),
             d.match_all,
-            d.readonly,
             d.rows
                 .iter()
                 .enumerate()
@@ -683,12 +673,10 @@ fn render_body(
                 .justify_between()
                 .gap_2()
                 .child(field_label(cx, "rules.conditions"))
-                // The single combination operator over all rows. Hidden
-                // while read-only: the stored tree is not a flat list and
-                // saving is blocked anyway.
-                .when(!readonly, |header| {
+                // The single combination operator over all rows.
+                .child({
                     let d = draft.clone();
-                    header.child(dropdown_button(
+                    dropdown_button(
                         "match-mode",
                         t(if match_all {
                             "rules.match_all"
@@ -698,26 +686,17 @@ fn render_body(
                         vec![(true, t("rules.match_all")), (false, t("rules.match_any"))],
                         match_all,
                         move |picked: bool, cx| d.update(cx, |d, cx| d.set_match_all(picked, cx)),
-                    ))
+                    )
                 }),
         );
 
-    if readonly {
-        conditions = conditions.child(
-            div()
-                .text_xs()
-                .text_color(cx.theme().danger)
-                .child(t("rules.readonly_complex")),
-        );
-    }
     for (ix, field, op) in rows {
         conditions = conditions.child(render_row(draft, ix, field, op, cx));
     }
 
-    let mut footer = h_flex().items_center().gap_2();
-    if !readonly {
+    let footer = {
         let d = draft.clone();
-        footer = footer.child(
+        h_flex().items_center().gap_2().child(
             Button::new("add-condition")
                 .xsmall()
                 .ghost()
@@ -726,8 +705,8 @@ fn render_body(
                 .on_click(move |_, window, cx| {
                     d.update(cx, |d, cx| d.add_row(SmartField::Text, window, cx));
                 }),
-        );
-    }
+        )
+    };
     let conditions = conditions.child(
         footer.child(match status {
             (Some(total), None) => div()
@@ -1124,7 +1103,7 @@ mod tests {
     fn any_nested_group_tree_is_rejected() {
         // Two-layer shapes from older editors, even when every leaf is a
         // match: the flat list cannot represent the inner operator, so the
-        // tree opens read-only instead of being silently reshaped.
+        // tree is rejected instead of being silently reshaped.
         for node in [
             SmartNode::Or {
                 children: vec![SmartNode::And {
