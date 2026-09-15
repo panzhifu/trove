@@ -352,6 +352,8 @@ impl AppView {
         let controller = self.controller.clone();
         let handle = window.window_handle();
 
+        tracing::info!(mode = ?mode, dest = %dest.display(), "take screenshot");
+
         window.push_notification(
             Notification::info(rust_i18n::t!("notice.screenshot_started").to_string()),
             cx,
@@ -364,9 +366,11 @@ impl AppView {
                 .await;
             let _ = handle.update(cx, |_, window, cx| match outcome {
                 Ok(()) => {
+                    tracing::info!(dest = %dest.display(), "screenshot captured; importing");
                     jobs::import_paths_app(&controller, vec![dest], window, cx);
                 }
                 Err(error) => {
+                    tracing::error!(error = %error, "screenshot capture failed");
                     window.push_notification(
                         Notification::warning(
                             rust_i18n::t!("notice.screenshot_failed", error = error).to_string(),

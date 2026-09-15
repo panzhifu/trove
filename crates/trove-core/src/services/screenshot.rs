@@ -132,8 +132,17 @@ pub fn plan_for(
 /// Run the capture: custom command → in-process xcap (full screen) → the
 /// external toolchain. The PNG must exist on disk when `Ok` comes back.
 /// When xcap fails and the fallback takes over, xcap's own reason rides
-/// along in the returned error so the root cause stays diagnosable.
+/// along in the returned error so the root cause stays diagnosable. Every
+/// step emits `tracing` events (default level `info`; `RUST_LOG` adjusts).
 pub fn capture(mode: ScreenshotMode, custom: Option<&str>, dest: &Path) -> Result<(), String> {
+    tracing::info!(
+        mode = ?mode,
+        dest = %dest.display(),
+        custom = ?custom,
+        wayland = ?std::env::var_os("WAYLAND_DISPLAY"),
+        x11 = ?std::env::var_os("DISPLAY"),
+        "screenshot capture requested"
+    );
     if let Some(command) = custom.map(str::trim).filter(|c| !c.is_empty()) {
         return run_custom(command, dest);
     }
@@ -146,10 +155,20 @@ pub fn capture(mode: ScreenshotMode, custom: Option<&str>, dest: &Path) -> Resul
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| capture_via_xcap(dest)));
         match attempt.unwrap_or_else(|_| Err("the capture library panicked".into())) {
             Ok(()) => return Ok(()),
-            Err(reason) => xcap_error = Some(format!("in-process capture failed: {reason}")),
+            Err(reason) => {
+                tracing::warn!(
+                    reason,
+                    "in-process xcap capture failed; falling back to external tools"
+                );
+                xcap_error = Some(format!("in-process capture failed: {reason}"));
+            }
         }
     }
     let Some(plan) = plan_for(mode, custom, dest, Platform::detect()) else {
+        tracing::error!(
+            xcap_error = ?xcap_error,
+            "no external screenshot tool for this platform"
+        );
         return Err(match xcap_error {
             Some(reason) => {
                 format!("{reason}; no external screenshot tool for this platform")
@@ -157,6 +176,7 @@ pub fn capture(mode: ScreenshotMode, custom: Option<&str>, dest: &Path) -> Resul
             None => "no screenshot tool for this platform".into(),
         });
     };
+    tracing::debug!(program = %plan.program, args = ?plan.args, "external capture plan");
     run_plan(&plan, dest).map_err(|e| match xcap_error {
         Some(reason) => format!("{reason}; {e}"),
         None => e,
@@ -170,18 +190,59 @@ pub fn capture(mode: ScreenshotMode, custom: Option<&str>, dest: &Path) -> Resul
 fn capture_via_xcap(dest: &Path) -> Result<(), String> {
     use xcap::Monitor;
 
-    let monitor = Monitor::all()
-        .map_err(|e| e.to_string())?
-        .into_iter()
-        .next()
-        .ok_or("no monitor found")?;
-    let image = monitor.capture_image().map_err(|e| e.to_string())?;
-    if let Some(parent) = dest.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    let monitors = Monitor::all().map_err(|e| {
+        tracing::error!(error = %e, "xcap: could not enumerate monitors");
+        e.to_string()
+    })?;
+    for monitor in &monitors {
+        tracing::debug!(
+            name = monitor.name().unwrap_or_else(|_| "?".into()),
+            width = monitor.width().ok(),
+            height = monitor.height().ok(),
+            "xcap: monitor found"
+        );
     }
-    image
-        .save(dest)
-        .map_err(|e| format!("{}: {e}", dest.display()))
+    let monitor = monitors.into_iter().next().ok_or_else(|| {
+        tracing::error!("xcap: no monitor found");
+        "no monitor found".to_string()
+    })?;
+    tracing::info!(
+        name = monitor.name().unwrap_or_else(|_| "?".into()),
+        width = monitor.width().ok(),
+        height = monitor.height().ok(),
+        "xcap: capturing primary monitor"
+    );
+    let started = std::time::Instant::now();
+    let image = monitor.capture_image().map_err(|e| {
+        tracing::error!(
+            error = %e,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "xcap: capture_image failed"
+        );
+        e.to_string()
+    })?;
+    tracing::info!(
+        width = image.width(),
+        height = image.height(),
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "xcap: frame captured"
+    );
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| {
+            tracing::error!(
+                dir = %parent.display(),
+                error = %e,
+                "xcap: could not create output dir"
+            );
+            e.to_string()
+        })?;
+    }
+    image.save(dest).map_err(|e| {
+        tracing::error!(dest = %dest.display(), error = %e, "xcap: could not save png");
+        format!("{}: {e}", dest.display())
+    })?;
+    tracing::info!(dest = %dest.display(), "xcap: png written");
+    Ok(())
 }
 
 /// Run a custom capture command: `{file}` is substituted with the
@@ -193,8 +254,16 @@ fn run_custom(command: &str, dest: &Path) -> Result<(), String> {
 
 /// Execute a capture step and verify the PNG showed up.
 fn run_plan(plan: &CapturePlan, dest: &Path) -> Result<(), String> {
+    tracing::info!(program = %plan.program, args = ?plan.args, "running capture tool");
     if let Some(parent) = dest.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        std::fs::create_dir_all(parent).map_err(|e| {
+            tracing::error!(
+                dir = %parent.display(),
+                error = %e,
+                "could not create output dir"
+            );
+            e.to_string()
+        })?;
     }
     // Interactive tools inherit the desktop: keep stdio open so region
     // pickers can draw, but never block on a hung child forever — the
@@ -202,15 +271,29 @@ fn run_plan(plan: &CapturePlan, dest: &Path) -> Result<(), String> {
     let status = Command::new(&plan.program)
         .args(&plan.args)
         .status()
-        .map_err(|e| format!("{}: {e}", plan.program))?;
+        .map_err(|e| {
+            tracing::error!(program = %plan.program, error = %e, "could not spawn capture tool");
+            format!("{}: {e}", plan.program)
+        })?;
+    tracing::debug!(program = %plan.program, status = %status, "capture tool exited");
     if !status.success() {
+        tracing::error!(program = %plan.program, status = %status, "capture tool failed");
         return Err(format!(
             "{} exited with {status} (set a custom command in Settings ▸ General)",
             plan.program
         ));
     }
     if !dest.is_file() {
+        tracing::error!(dest = %dest.display(), "capture tool wrote no file");
         return Err("the screenshot tool wrote no file".into());
+    }
+    match std::fs::metadata(dest) {
+        Ok(meta) => {
+            tracing::info!(dest = %dest.display(), bytes = meta.len(), "screenshot file verified")
+        }
+        Err(_) => {
+            tracing::warn!(dest = %dest.display(), "screenshot file exists but metadata unavailable")
+        }
     }
     Ok(())
 }
