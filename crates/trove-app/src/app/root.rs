@@ -827,11 +827,6 @@ impl Render for AppView {
             .on_action(cx.listener(|this, _: &OpenSettings, _, cx| {
                 crate::dialogs::settings::open(cx, this.controller.clone());
             }))
-            .on_action(cx.listener(|this, _: &SystemFonts, _, cx| {
-                // System fonts live in the fonts view itself (virtual
-                // entries next to the imported ones) — no popup browser.
-                this.controller.update(cx, |ctl, _cx| ctl.select_fonts());
-            }))
             .on_action(cx.listener(|this, _: &FindDuplicates, window, cx| {
                 crate::dialogs::duplicates::DuplicateDialog::open(
                     window,

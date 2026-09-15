@@ -12,7 +12,6 @@ gpui_kit::actions!(
         // -- File menu ----------------------------------------------------
         ImportFiles,
         ImportUrl,
-        SystemFonts,
         ScreenshotFull,
         ScreenshotRegion,
         ExportLibrary,

@@ -75,7 +75,6 @@ fn build_menus() -> Vec<Menu> {
             items: vec![
                 MenuItem::action(rust_i18n::t!("app.import_files").to_string(), ImportFiles),
                 MenuItem::action(rust_i18n::t!("app.import_url").to_string(), ImportUrl),
-                MenuItem::action(rust_i18n::t!("app.system_fonts").to_string(), SystemFonts),
                 MenuItem::action(rust_i18n::t!("app.screenshot").to_string(), ScreenshotFull),
                 MenuItem::action(
                     rust_i18n::t!("app.screenshot_region").to_string(),

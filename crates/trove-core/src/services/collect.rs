@@ -513,7 +513,10 @@ mod tests {
         let mut response = String::new();
         stream.read_to_string(&mut response).unwrap();
         assert!(response.contains("204"), "{response}");
-        assert!(response.contains("Access-Control-Allow-Origin: *"), "{response}");
+        assert!(
+            response.contains("Access-Control-Allow-Origin: *"),
+            "{response}"
+        );
         assert!(response.contains("Access-Control-Allow-Methods: GET, POST, OPTIONS"));
 
         // Plain requests (e.g. the popup's ping) expose the headers too.
