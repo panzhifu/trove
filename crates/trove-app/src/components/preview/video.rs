@@ -32,7 +32,8 @@
 //! atlas never evicts entries by itself.
 
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use gpui_kit::assets::IconName as MediaIcon;
@@ -76,6 +77,11 @@ const SYNC_LEAD_MS: f64 = 8.0;
 /// A frame further behind the master clock than this many frame periods is
 /// dropped instead of shown late — mpv's `--framedrop`.
 const DROP_LATE_FRAMES: f64 = 1.5;
+
+/// How often the presenter looks for a frame the decode task left behind:
+/// well under a display refresh, and it notifies only when there is one, so
+/// an idle player does not repaint.
+const PRESENT_POLL: Duration = Duration::from_millis(4);
 
 /// The playback speeds offered in the menu. The range matches what
 /// [`video::atempo_filter`] can chain for the audio side, so the pitch
@@ -201,21 +207,56 @@ pub(super) fn cover(data: &AssetPreviewData, cx: &App) -> AnyElement {
     }
 }
 
+/// One decoded frame on its way to the screen.
+struct FrameArrival {
+    frame: Arc<RenderImage>,
+    /// The playhead after showing it, already wrapped at the end of the
+    /// stream.
+    position_ms: f64,
+}
+
+/// What the decode task shares with the entity instead of borrowing the
+/// `App`.
+///
+/// `AsyncApp::update` takes a `RefCell` borrow of the whole app and runs the
+/// closure on the caller's thread, so a decode loop that hopped to the
+/// entity once per frame was in practice paced by the UI thread — it waited
+/// for whatever the main thread was doing, and painting (worst in
+/// fullscreen) is the main thing a UI thread does. The loop now reads its
+/// controls and leaves its frames here without touching a borrow at all;
+/// the entity mirrors the controls in, and a presenter tick on the UI
+/// thread takes the frames out.
+#[derive(Default)]
+struct PlaybackShared {
+    /// Produce frames? `playing` folded with `seeking` (scrubbing counts as
+    /// paused).
+    playing: bool,
+    speed: f32,
+    /// A seek the loop has not served yet.
+    seek_to: Option<u64>,
+    /// The audio clock plus the moment it was read; the loop extrapolates
+    /// between updates. Published by the audio task.
+    clock: Option<(f64, Instant)>,
+    /// The newest frame, taken by the render.
+    arrived: Option<FrameArrival>,
+}
+
 /// A video player: frames piped out of ffmpeg plus audio, speed and
 /// fullscreen controls. Dropping the entity ends the loops, which kill the
 /// ffmpeg processes.
 pub(super) struct VideoPlayer {
     path: PathBuf,
     facts: VideoStreamFacts,
-    /// Frame decoded by the background loop, waiting for its first paint.
-    pending: Option<Arc<RenderImage>>,
+    /// The decode task's controls and mailbox — see [`PlaybackShared`].
+    shared: Arc<Mutex<PlaybackShared>>,
+    /// Cleared when this entity drops: how the decode task learns to stop
+    /// without borrowing the app to look for it.
+    alive: Arc<AtomicBool>,
     /// Frame currently on screen.
     shown: Option<Arc<RenderImage>>,
     playing: bool,
     /// Playhead in milliseconds.
     position_ms: f64,
-    /// Restart the pipe at this position (seek request).
-    seek_to: Option<u64>,
     slider: Entity<SliderState>,
     volume_slider: Entity<SliderState>,
     /// Whether the file carries an audio stream (volume controls show).
@@ -249,7 +290,6 @@ pub(super) struct VideoPlayer {
     /// against — no audio stream, a dead device, a paused or restarting
     /// pipe — and then frames are paced against the wall clock instead.
     /// This is mpv's `--video-sync=audio`: the sound is the master.
-    audio_clock: Option<(f64, Instant)>,
     /// Set while the user drags the scrubber: the playhead previews the
     /// drag and the loop stops feeding it, so the thumb is not yanked back
     /// to the playing position every frame.
@@ -269,6 +309,14 @@ pub(super) struct VideoPlayer {
 }
 
 impl EventEmitter<VideoPlayerEvent> for VideoPlayer {}
+
+impl Drop for VideoPlayer {
+    fn drop(&mut self) {
+        // The decode and audio tasks watch this instead of borrowing the
+        // app to notice the entity is gone.
+        self.alive.store(false, Ordering::Relaxed);
+    }
+}
 
 impl VideoPlayer {
     /// Build a player entity for `path`, or `None` when the file cannot be
@@ -304,12 +352,15 @@ impl VideoPlayer {
                     this.seeking = true;
                     this.position_ms = (value.start().max(0.)) as f64;
                     this.apply_playing_state();
+                    this.publish_controls();
                     cx.notify();
                 }
                 SliderEvent::Release(value) => {
                     let target = value.start().max(0.);
                     this.seeking = false;
-                    this.seek_to = Some(target as u64);
+                    if let Ok(mut shared) = this.shared.lock() {
+                        shared.seek_to = Some(target as u64);
+                    }
                     // Reflect immediately: the audio pipe rebuilds from
                     // `position_ms`, so a pause-drag-resume would otherwise
                     // start the sound at the pre-drag position.
@@ -317,6 +368,7 @@ impl VideoPlayer {
                     // The audio pipe restarts at the new position too.
                     this.audio_seq += 1;
                     this.apply_playing_state();
+                    this.publish_controls();
                     cx.notify();
                 }
             }
@@ -349,16 +401,20 @@ impl VideoPlayer {
             cx.notify();
         })
         .detach();
+        let shared = Arc::new(Mutex::new(PlaybackShared {
+            playing: resume.playing,
+            speed: resume.speed.clamp(SPEEDS[0], SPEEDS[SPEEDS.len() - 1]),
+            ..Default::default()
+        }));
+        let alive = Arc::new(AtomicBool::new(true));
         let mut this = Self {
             path,
             facts,
-            pending: None,
             // The fullscreen window is seeded with the frame the panel was
             // showing; a fresh panel player starts black.
             shown: first_frame,
             playing: resume.playing,
             position_ms: resume.position_ms,
-            seek_to: None,
             slider,
             volume_slider,
             has_audio,
@@ -370,16 +426,18 @@ impl VideoPlayer {
             synced_volume: if resume.muted { 0. } else { resume.volume },
             sink: None,
             fullscreen_mode: false,
-            audio_clock: None,
             seeking: false,
             volume_open: false,
             controls_shown: true,
             controls_hovered: false,
             controls_revealed_at: None,
             watcher_started: false,
+            shared,
+            alive,
             _subscription: subscription,
         };
         this.start_decoding(cx);
+        this.start_presenter(cx);
         if has_audio && audio_handle(cx).is_some() {
             this.start_audio(cx);
         }
@@ -394,36 +452,45 @@ impl VideoPlayer {
         let frame_ms = self.facts.frame_ms() as f64;
         let duration_ms = self.facts.duration_ms as f64;
 
+        let shared = self.shared.clone();
+        let alive = self.alive.clone();
+        let start_ms = self.position_ms;
         cx.spawn(async move |weak, cx| {
             let mut pipe: Option<FramePipe> = None;
+            // The loop's own playhead, seeded where the player stands and
+            // advanced frame by frame; it travels back to the entity with
+            // each arrival, so no frame has to borrow the app to report one.
+            let mut playhead = start_ms;
             // Frame delivery is scheduled against the wall clock: frame `n`
             // is due one period after frame `n - 1`. Sleeping a fixed
             // interval *after* each frame's work would add that work time to
             // every period, so the picture would run slower than the file —
-            // which reads as juddering, and gets worse the more expensive a
-            // painted frame is (fullscreen). Falling behind simply skips the
-            // wait: `pending` keeps only the newest frame, so late frames
-            // are dropped instead of replayed in slow motion.
+            // which reads as juddering. Falling behind simply skips the
+            // wait: only the newest frame is kept, so late frames are
+            // dropped instead of replayed in slow motion.
             let mut due = Instant::now();
             loop {
-                let state = weak.update(cx, |this, _cx| {
-                    (
-                        this.playing,
-                        this.seeking,
-                        this.seek_to.take(),
-                        this.position_ms,
-                        this.speed,
-                        this.audio_clock_ms(),
-                    )
-                });
-                let Ok((playing, seeking, seek, position, speed, clock)) = state else {
+                if !alive.load(Ordering::Relaxed) {
                     break;
+                }
+                // Controls come from the shared block: no `App` borrow, so
+                // this loop is never paced by whatever the UI thread paints.
+                let (playing, speed, clock, seek) = {
+                    let Ok(mut shared) = shared.lock() else {
+                        break;
+                    };
+                    (
+                        shared.playing,
+                        shared.speed,
+                        shared.clock,
+                        shared.seek_to.take(),
+                    )
                 };
-                if !playing || seeking {
-                    // Paused: stop consuming so ffmpeg blocks on a full pipe.
-                    if pipe.take().is_some() {
-                        let _ = weak.update(cx, |_this, cx| cx.notify());
-                    }
+                let clock = clock.map(|(ms, at)| ms + at.elapsed().as_secs_f64() * 1000.0);
+                if !playing {
+                    // Paused (or scrubbing): let go of the pipe so ffmpeg
+                    // blocks on a full one instead of running ahead.
+                    pipe = None;
                     due = Instant::now();
                     cx.background_executor().timer(IDLE_POLL).await;
                     continue;
@@ -431,18 +498,11 @@ impl VideoPlayer {
                 if let Some(target) = seek {
                     pipe = None;
                     due = Instant::now();
-                    if weak
-                        .update(cx, |this, _| this.position_ms = target as f64)
-                        .is_err()
-                    {
-                        break;
-                    }
+                    playhead = target as f64;
                 }
 
                 if pipe.is_none() {
-                    let at = weak
-                        .update(cx, |this, _| this.position_ms)
-                        .unwrap_or(position) as u64;
+                    let at = playhead.max(0.) as u64;
                     let open_path = path.clone();
                     let opened =
                         cx.background_executor()
@@ -456,6 +516,7 @@ impl VideoPlayer {
                             // Undecodable: stop instead of spinning.
                             let _ = weak.update(cx, |this, cx| {
                                 this.playing = false;
+                                this.publish_controls();
                                 cx.notify();
                             });
                             break;
@@ -486,12 +547,13 @@ impl VideoPlayer {
                         // has already passed is dropped instead of shown
                         // late. Without audio the wall-clock deadline below
                         // plays the same role.
+                        // The frame just read is the one due at `playhead`.
                         let late =
-                            clock.is_some_and(|ms| ms - position > frame_ms * DROP_LATE_FRAMES);
+                            clock.is_some_and(|ms| ms - playhead > frame_ms * DROP_LATE_FRAMES);
                         if !late {
                             match clock {
                                 Some(ms) => {
-                                    let wait = position - SYNC_LEAD_MS - ms;
+                                    let wait = playhead - SYNC_LEAD_MS - ms;
                                     if wait > 0.0 {
                                         cx.background_executor()
                                             .timer(Duration::from_secs_f64(wait / 1000.0))
@@ -516,41 +578,46 @@ impl VideoPlayer {
                             }
                         } else {
                             tracing::debug!(
-                                position,
+                                position = playhead,
                                 clock,
                                 "dropped a late frame to stay with the audio"
                             );
                         }
-                        let delivered = if late { None } else { Some(image) };
-                        if weak
-                            .update(cx, |this, cx| {
-                                if let Some(image) = delivered {
-                                    this.pending = Some(image);
-                                }
-                                this.position_ms += frame_ms;
-                                if duration_ms > 0.0 && this.position_ms >= duration_ms {
-                                    // Loop like the animated GIF preview.
-                                    this.position_ms = 0.0;
-                                    this.seek_to = Some(0);
-                                    // The audio pipe restarts from zero too.
+                        playhead += frame_ms;
+                        if duration_ms > 0.0 && playhead >= duration_ms {
+                            // Loop like the animated GIF preview: back to the
+                            // top, request a restart from the loop itself and
+                            // let the audio task know through `audio_seq`.
+                            playhead = 0.0;
+                            if let Ok(mut shared) = shared.lock() {
+                                shared.seek_to = Some(0);
+                            }
+                            if weak
+                                .update(cx, |this, cx| {
                                     this.audio_seq += 1;
-                                }
-                                // The playhead moved either way (a dropped
-                                // frame still advances the timeline).
-                                cx.notify();
-                            })
-                            .is_err()
-                        {
-                            break;
+                                    cx.notify();
+                                })
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                        if !late && let Ok(mut shared) = shared.lock() {
+                            shared.arrived = Some(FrameArrival {
+                                frame: image,
+                                position_ms: playhead,
+                            });
                         }
                     }
                     None => {
                         // End of stream (or a dead decoder): loop from zero.
                         pipe = None;
+                        playhead = 0.0;
+                        if let Ok(mut shared) = shared.lock() {
+                            shared.seek_to = Some(0);
+                        }
                         if weak
                             .update(cx, |this, cx| {
-                                this.position_ms = 0.0;
-                                this.seek_to = Some(0);
                                 this.audio_seq += 1;
                                 cx.notify();
                             })
@@ -576,6 +643,7 @@ impl VideoPlayer {
         let Some(host) = audio_handle(cx) else {
             return;
         };
+        let shared = self.shared.clone();
 
         cx.spawn(async move |weak, cx| {
             let mut pipe: Option<AudioPipe> = None;
@@ -616,7 +684,9 @@ impl VideoPlayer {
                     last_published = None;
                     // The pipe is restarting: no clock to sync against until
                     // the first chunk is queued again.
-                    let _ = weak.update(cx, |this, _| this.audio_clock = None);
+                    if let Ok(mut shared) = shared.lock() {
+                        shared.clock = None;
+                    }
                     // Kill the old pipe before opening the new one.
                     drop(pipe.take());
                     match &sink {
@@ -672,12 +742,14 @@ impl VideoPlayer {
                         reading = reading.clamp(last, ceiling);
                     }
                     last_published = Some((reading, Instant::now()));
-                    let _ = weak.update(cx, |this, _| {
-                        this.audio_clock = Some((reading, Instant::now()));
-                    });
+                    if let Ok(mut shared) = shared.lock() {
+                        shared.clock = Some((reading, Instant::now()));
+                    }
                 } else {
                     s.pause();
-                    let _ = weak.update(cx, |this, _| this.audio_clock = None);
+                    if let Ok(mut shared) = shared.lock() {
+                        shared.clock = None;
+                    }
                 }
                 // Take the pipe out so `read_chunk` can run on a 'static
                 // background task; hand it back below.
@@ -738,6 +810,10 @@ impl VideoPlayer {
         if self.speed != speed {
             self.speed = speed;
             self.audio_seq += 1;
+            // The decode loop paces by `shared.speed`: a speed change that
+            // is not published there would leave the picture on the old
+            // tempo while the sound followed the new one.
+            self.publish_controls();
             cx.notify();
         }
     }
@@ -745,9 +821,13 @@ impl VideoPlayer {
     /// Resume from `position_ms` after the fullscreen window closed.
     pub(crate) fn resume_from(&mut self, position_ms: f64, playing: bool, cx: &mut Context<Self>) {
         self.position_ms = position_ms;
-        self.seek_to = Some(position_ms.max(0.) as u64);
         self.playing = playing;
         self.audio_seq += 1;
+        if let Ok(mut shared) = self.shared.lock() {
+            shared.seek_to = Some(position_ms.max(0.) as u64);
+        }
+        self.apply_playing_state();
+        self.publish_controls();
         cx.notify();
     }
 
@@ -761,6 +841,7 @@ impl VideoPlayer {
     fn set_playing(&mut self, playing: bool, cx: &mut Context<Self>) {
         self.playing = playing;
         self.apply_playing_state();
+        self.publish_controls();
         cx.notify();
     }
 
@@ -779,6 +860,47 @@ impl VideoPlayer {
     /// Pause playback (used while the fullscreen window holds the stage).
     pub(crate) fn pause(&mut self, cx: &mut Context<Self>) {
         self.set_playing(false, cx);
+    }
+
+    /// Take the frames the decode task left in the mailbox: a tick on the
+    /// UI thread, so presenting costs no cross-thread borrow — the decode
+    /// loop no longer waits for a paint, and a paint no longer waits for the
+    /// loop. It notifies only when there is something to show, and slows to
+    /// a crawl while paused so an idle player stays idle.
+    fn start_presenter(&mut self, cx: &mut Context<Self>) {
+        cx.spawn(async move |weak, cx| {
+            loop {
+                let Ok(playing) = weak.update(cx, |this, cx| {
+                    let ready = this
+                        .shared
+                        .lock()
+                        .map(|shared| shared.arrived.is_some())
+                        .unwrap_or(false);
+                    if ready {
+                        cx.notify();
+                    }
+                    this.playing
+                }) else {
+                    break;
+                };
+                let tick = if playing {
+                    PRESENT_POLL
+                } else {
+                    Duration::from_millis(250)
+                };
+                cx.background_executor().timer(tick).await;
+            }
+        })
+        .detach();
+    }
+
+    /// Mirror the controls the decode task reads into the shared block. Any
+    /// user action that changes them calls this.
+    fn publish_controls(&self) {
+        if let Ok(mut shared) = self.shared.lock() {
+            shared.playing = self.playing && !self.seeking;
+            shared.speed = self.speed;
+        }
     }
 
     /// Show the fullscreen controls and restart the auto-hide countdown.
@@ -822,15 +944,6 @@ impl VideoPlayer {
             }
         })
         .detach();
-    }
-
-    /// Where the soundtrack is right now, extrapolated from the last
-    /// reading — the master timeline the picture follows. `None` when the
-    /// clock is not running, i.e. there is no audio to sync against.
-    fn audio_clock_ms(&self) -> Option<f64> {
-        let (reading, at) = self.audio_clock?;
-        let since = at.elapsed().as_secs_f64() * 1000.0;
-        Some(reading + since)
     }
 
     /// The probed stream facts; the fullscreen window reuses them instead
@@ -1029,8 +1142,13 @@ impl VideoPlayer {
     /// dropping the player would leave the last frame resident. Same
     /// contract as the 3D viewport's `release`.
     pub(super) fn release(&mut self, window: &mut Window) {
-        if let Some(frame) = self.pending.take() {
-            let _ = window.drop_image(frame);
+        if let Some(arrival) = self
+            .shared
+            .lock()
+            .ok()
+            .and_then(|mut shared| shared.arrived.take())
+        {
+            let _ = window.drop_image(arrival.frame);
         }
         if let Some(frame) = self.shown.take() {
             let _ = window.drop_image(frame);
@@ -1040,13 +1158,21 @@ impl VideoPlayer {
 
 impl Render for VideoPlayer {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        // Swap in the new frame and hand the old one back to the window so
-        // its atlas entry is freed.
-        if let Some(frame) = self.pending.take() {
+        // Swap in whatever the decode task left behind and hand the old
+        // frame back to the window so its atlas entry is freed. The playhead
+        // travels with the frame, so the timeline advances without the loop
+        // borrowing the app to report it.
+        let arrival = self
+            .shared
+            .lock()
+            .ok()
+            .and_then(|mut shared| shared.arrived.take());
+        if let Some(arrival) = arrival {
             if let Some(old) = self.shown.take() {
                 let _ = window.drop_image(old);
             }
-            self.shown = Some(frame);
+            self.shown = Some(arrival.frame);
+            self.position_ms = arrival.position_ms;
         }
         // Keep the scrubber on the playhead and the volume slider on the
         // applied level — but only when the external value actually moved.
