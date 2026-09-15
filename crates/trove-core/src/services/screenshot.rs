@@ -1,10 +1,15 @@
 //! Screenshots: capture the screen (or a region of it) into a PNG that the
 //! app then imports like any other file.
 //!
-//! Trove never talks to a display server directly: it shells out to whatever
-//! the platform offers, and lets the user override the whole thing with a
-//! custom command in Settings ▸ General. Planning is a pure function
-//! ([`plan`]) so the strategy chain is unit-testable without a display.
+//! Full-screen capture runs in-process via [`xcap`] (wlr-screencopy over
+//! libwayshot on Wayland and XCB on X11, ScreenCaptureKit on macOS, Windows
+//! Graphics Capture on Windows) — no external tool has to be installed.
+//! Region picking stays with the platform tools: an interactive selection
+//! overlay is not something xcap offers. Whatever xcap cannot do falls back
+//! to the external toolchain (grim/slurp, scrot, screencapture, PowerShell),
+//! and the user can override the whole thing with a custom command in
+//! Settings ▸ General. Planning that chain is a pure function ([`plan_for`])
+//! so it stays unit-testable without a display.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -124,11 +129,68 @@ pub fn plan_for(
     }
 }
 
-/// Run the capture: plan it, execute it, and verify the PNG showed up.
+/// Run the capture: custom command → in-process xcap (full screen) → the
+/// external toolchain. The PNG must exist on disk when `Ok` comes back.
+/// When xcap fails and the fallback takes over, xcap's own reason rides
+/// along in the returned error so the root cause stays diagnosable.
 pub fn capture(mode: ScreenshotMode, custom: Option<&str>, dest: &Path) -> Result<(), String> {
-    let Some(plan) = plan(mode, custom, dest) else {
-        return Err("no screenshot tool for this platform".into());
+    if let Some(command) = custom.map(str::trim).filter(|c| !c.is_empty()) {
+        return run_custom(command, dest);
+    }
+    let mut xcap_error: Option<String> = None;
+    if mode == ScreenshotMode::Full {
+        // xcap talks to the display server and can panic on hostile
+        // environments; the unwind guard keeps such a failure a fallback
+        // instead of taking the caller's task down.
+        let attempt =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| capture_via_xcap(dest)));
+        match attempt.unwrap_or_else(|_| Err("the capture library panicked".into())) {
+            Ok(()) => return Ok(()),
+            Err(reason) => xcap_error = Some(format!("in-process capture failed: {reason}")),
+        }
+    }
+    let Some(plan) = plan_for(mode, custom, dest, Platform::detect()) else {
+        return Err(match xcap_error {
+            Some(reason) => {
+                format!("{reason}; no external screenshot tool for this platform")
+            }
+            None => "no screenshot tool for this platform".into(),
+        });
     };
+    run_plan(&plan, dest).map_err(|e| match xcap_error {
+        Some(reason) => format!("{reason}; {e}"),
+        None => e,
+    })
+}
+
+/// Capture the primary screen in-process with `xcap` and write a PNG.
+///
+/// `Monitor::all()` sorts by position; the first monitor is the primary.
+/// The image comes back as an RGBA buffer, so saving is all that is left.
+fn capture_via_xcap(dest: &Path) -> Result<(), String> {
+    use xcap::Monitor;
+
+    let monitor = Monitor::all()
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .next()
+        .ok_or("no monitor found")?;
+    let image = monitor.capture_image().map_err(|e| e.to_string())?;
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    image.save(dest).map_err(|e| format!("{}: {e}", dest.display()))
+}
+
+/// Run a custom capture command: `{file}` is substituted with the
+/// destination, which is also available as `$1`.
+fn run_custom(command: &str, dest: &Path) -> Result<(), String> {
+    let plan = shell(command.replace("{file}", &quotable(dest)), dest);
+    run_plan(&plan, dest)
+}
+
+/// Execute a capture step and verify the PNG showed up.
+fn run_plan(plan: &CapturePlan, dest: &Path) -> Result<(), String> {
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }

@@ -14,6 +14,11 @@ mp4 = { workspace = true }
 ttf-parser = { workspace = true }
 fontdue = { workspace = true }
 rusqlite = { workspace = true }
+# In-process screen capture for the screenshot import (Linux: wlr-screencopy
+# via libwayshot on Wayland and XCB on X11; macOS ScreenCaptureKit; Windows
+# Graphics Capture). The external-tool chain in services/screenshot.rs stays
+# as the fallback, so a failed capture degrades instead of failing.
+xcap = "0.9.8"
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
