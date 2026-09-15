@@ -100,6 +100,18 @@ pub struct Asset {
     pub trashed_at: Option<DateTime<Utc>>,
 }
 
+impl Asset {
+    /// The file name without its extension: the `{name}` rename token and
+    /// the display fallback when no title is set.
+    pub fn file_stem(&self) -> String {
+        std::path::Path::new(&self.file_name)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or(&self.file_name)
+            .to_string()
+    }
+}
+
 /// Input describing a new asset, before the importer fills media facts.
 #[derive(Debug, Clone)]
 pub struct NewAsset {

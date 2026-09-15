@@ -248,7 +248,9 @@ impl InspectorPanel {
             .flatten()
             .map(|a| {
                 (
-                    a.title.unwrap_or_else(|| a.file_name.clone()),
+                    // The title edit box shows the file name without the
+                    // extension — the suffix is not part of the editable name.
+                    a.title.clone().unwrap_or_else(|| a.file_stem()),
                     a.description.unwrap_or_default(),
                     a.source_url.unwrap_or_default(),
                 )
