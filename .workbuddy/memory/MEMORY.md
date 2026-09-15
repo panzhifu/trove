@@ -7,6 +7,7 @@
 - `reference/` 放第三方参考仓库：`CloudCompare/`（稀疏浅克隆，只取 `libs/qCC_glWindow`+`libs/qCC_db`+`cmake`）、`gpui-kit/`、`fontmatrix/`、`snippets/`。已在 `.gitignore` 忽略，不进仓库、不参与构建。索引见 `reference/README.md`。
 - 拉取/更新一律走 ssh：`GIT_SSH_COMMAND="ssh -F /dev/null -i /home/noke/.ssh/id_ed25519 -o IdentitiesOnly=yes -o UserKnownHostsFile=/home/noke/.ssh/known_hosts"`（绕过 777 的 `ssh_config.d` 软链）；https 走代理 502，但 `curl` 直连 raw/codeload 可用。
 - CloudCompare 三维轴定论：角落那个是 `ccGLWindowInterface::drawTrihedron()`（像素正交空间 + 借 `viewMat` 旋转 + 清深度后开深度测试 + display list 缓存），场景内是 `ccCoordinateSystem` 实体；**没有 view cube**。解析与摘录在 `reference/snippets/cloudcompare-trihedron/`。
+- trove 已落地（145942f）：角落 trihedron 画在 **gpui UI 层**（一份实现覆盖 GPU/CPU 两路径，字标为原生文本）；场景轴从 height_color 解耦为独立开关；两者均可持久化关闭。渲染后端描述已迁到状态栏（panel/AppView 双层去重 observe）。
 
 ## 构建 / 环境（硬约束）
 - 测试/基准必须 `TMPDIR=/home/noke/Code/trove/target/tmp`（/tmp 仅 10 MB tmpfs，否则几十个测试假失败）。
