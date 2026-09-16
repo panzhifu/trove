@@ -108,6 +108,20 @@ impl ModelViewport {
             }
         }
 
+        // A `.blend` is converted by Blender, and the task channel carries a
+        // mesh or nothing — "Blender is not installed" would otherwise reach
+        // the viewport as the generic load failure, which tells the user
+        // nothing they can act on. Asking here is what turns it into a
+        // sentence naming what to install, and it costs a walk over `PATH`
+        // and a few known locations.
+        if ext == "blend" && trove_core::media::formats::blend::find_blender().is_none() {
+            let reason = rust_i18n::t!("viewport.blend_needs_blender").to_string();
+            self.error = Some(reason.clone());
+            self.backend = Backend::Unavailable(reason);
+            cx.notify();
+            return;
+        }
+
         let started = self.tasks.start(
             trove_core::tasks::TaskKind::ModelPreview,
             format!("parse {}", path.display()),
@@ -129,10 +143,13 @@ impl ModelViewport {
                 .await;
             weak.update(cx, |this, cx| match result {
                 Some(mesh) => this.set_mesh(mesh, cx),
-                // Failed or cancelled — the task event carries the details.
+                // Failed or cancelled — the task event carries the details,
+                // and all the channel itself can say is that nothing came
+                // back for this file.
                 None => {
-                    this.error = Some("load failed".into());
-                    this.backend = Backend::Cpu("load failed".into());
+                    let reason = rust_i18n::t!("viewport.load_failed").to_string();
+                    this.error = Some(reason.clone());
+                    this.backend = Backend::Cpu(reason);
                     cx.notify();
                 }
             })

@@ -63,6 +63,11 @@ pub enum Backend {
     Streaming,
     /// Reading a large point cloud from its index — loading incrementally.
     Indexed,
+    /// Nothing can be drawn, and not for a reason the viewport can work
+    /// around: the file needs something this machine has not got. A `.blend`
+    /// with no Blender installed is the case this exists for, and the string
+    /// is what to tell the user about it.
+    Unavailable(String),
 }
 
 /// What the viewport tells its host, the workspace panel.
@@ -369,6 +374,9 @@ impl ModelViewport {
                 total = self.index_chunks_total
             )
             .to_string(),
+            Backend::Unavailable(reason) => {
+                rust_i18n::t!("viewport.backend_unavailable", reason = reason).to_string()
+            }
         }
     }
 

@@ -90,7 +90,10 @@ impl ModelViewport {
     /// still parsing the viewport shows a loading indicator and renders
     /// nothing.
     pub(super) fn pump(&mut self, cx: &mut Context<Self>) {
-        if matches!(self.backend, Backend::Loading) {
+        // Nothing to draw, and nothing that drawing could fix. Without this
+        // the placeholder mesh would be rendered into a blank frame and
+        // painted over the very message explaining why there is no model.
+        if matches!(self.backend, Backend::Loading | Backend::Unavailable(_)) {
             return;
         }
         // While streaming, keep one step in flight. Each finished step swaps
