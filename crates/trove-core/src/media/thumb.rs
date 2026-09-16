@@ -144,6 +144,21 @@ fn script_row(ch: char) -> Option<ScriptRow> {
     }
 }
 
+/// The built-in specimen text — Latin, CJK, digits, the three rows the
+/// specimen card stacks. It used to be configurable in Settings; it is now
+/// fixed, so the card never depends on config file I/O.
+pub const DEFAULT_FONT_SAMPLE: &str = "AaBbGg 永 0123456789";
+
+/// Built-in lines filling a category the sample text never mentions.
+const SPECIMEN_FALLBACKS: [&str; 3] = ["AaBbGg", "永", "0123456789"];
+
+/// The built-in specimen rows: what [`specimen_rows`] reduces
+/// [`DEFAULT_FONT_SAMPLE`] to. This is the card's content everywhere the
+/// user's sample text used to be configurable.
+pub fn default_specimen_rows() -> [String; 3] {
+    std::array::from_fn(|i| SPECIMEN_FALLBACKS[i].to_string())
+}
+
 /// Split a specimen text into the three card rows — Latin, CJK, digits —
 /// keeping first occurrences in order and dropping everything else (spaces,
 /// punctuation, other scripts). A category the sample does not cover falls
@@ -153,7 +168,6 @@ fn script_row(ch: char) -> Option<ScriptRow> {
 /// Shared by the rasterized font card and the app's live specimen cells, so
 /// both paths show the same three rows.
 pub fn specimen_rows(sample: &str) -> [String; 3] {
-    const FALLBACKS: [&str; 3] = ["AaBbGg", "永", "0123456789"];
     let mut picked: [Vec<char>; 3] = [Vec::new(), Vec::new(), Vec::new()];
     let mut seen = [
         std::collections::HashSet::new(),
@@ -171,7 +185,7 @@ pub fn specimen_rows(sample: &str) -> [String; 3] {
     let mut rows: [String; 3] = Default::default();
     for (i, row) in rows.iter_mut().enumerate() {
         *row = if picked[i].is_empty() {
-            FALLBACKS[i].to_string()
+            SPECIMEN_FALLBACKS[i].to_string()
         } else {
             picked[i].iter().collect()
         };
@@ -181,20 +195,19 @@ pub fn specimen_rows(sample: &str) -> [String; 3] {
 
 /// Render a "font specimen card" for a font blob: three rows stacked like a
 /// type founder's specimen — Latin letters on top, CJK in the middle, digits
-/// at the bottom — taken from the configured sample text (Settings ▸ General)
-/// and set in the font itself on a light card. Characters the font does not
-/// cover are dropped, and a row left empty by that disappears so the
-/// remaining rows re-centre. Returns `None` when the bytes are not a
-/// parseable TTF/OTF (the asset keeps its icon).
+/// at the bottom — taken from the built-in sample text and set in the font
+/// itself on a light card. Characters the font does not cover are dropped,
+/// and a row left empty by that disappears so the remaining rows re-centre.
+/// Returns `None` when the bytes are not a parseable TTF/OTF (the asset
+/// keeps its icon).
 fn write_font_card(blob_path: &Path, out: &Path) -> Option<PathBuf> {
     let bytes = std::fs::read(blob_path).ok()?;
     let font = fontdue::Font::from_bytes(bytes, fontdue::FontSettings::default()).ok()?;
-    let sample = crate::config::AppConfig::load().font_sample_text();
 
     let (w, h) = FONT_CARD_SIZE;
     let mut card = image::RgbaImage::from_pixel(w, h, image::Rgba([0xF7, 0xF6, 0xF3, 0xFF]));
     let ink = [0x20_u8, 0x21, 0x24];
-    let lines = specimen_rows(&sample);
+    let lines = default_specimen_rows();
 
     // Rasterize every usable glyph up front: a row is dropped entirely when
     // the font covers none of its characters, so the visible rows can share

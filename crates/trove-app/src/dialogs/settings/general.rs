@@ -77,24 +77,6 @@ pub(super) fn general_page(
                 )
                 .item(
                     SettingItem::new(
-                        rust_i18n::t!("settings.font_sample").to_string(),
-                        SettingField::input(
-                            |_cx| SharedString::from(AppConfig::load().font_sample_text()),
-                            |value, cx| {
-                                let mut config = AppConfig::load();
-                                let value = value.trim().to_string();
-                                config.font_sample =
-                                    if value.is_empty() { None } else { Some(value) };
-                                if config.save().is_ok() {
-                                    cx.refresh_windows();
-                                }
-                            },
-                        ),
-                    )
-                    .description(rust_i18n::t!("settings.font_sample_desc").to_string()),
-                )
-                .item(
-                    SettingItem::new(
                         rust_i18n::t!("settings.point_enhance").to_string(),
                         SettingField::render(|_, _, cx| point_enhance_row(cx)),
                     )
