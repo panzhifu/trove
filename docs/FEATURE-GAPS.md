@@ -93,7 +93,7 @@
 | 3 | 元数据模板（保存字段组，批量追加/替换应用） | 无 | Bridge/IMatch | P2 |
 | 4 | 多选时元数据差异高亮 | 无 | Bridge | P3 |
 | 5 | 版本管理（派生文件元数据自动传播、堆栈） | 无 | IMatch Smart Versioning | P3 |
-| 6 | XMP/IPTC 元数据写回文件或 sidecar | 无（仅 JSON 导出） | IMatch/ACDSee/digiKam/XnView | P2 |
+| 6 | XMP/IPTC 元数据写回文件或 sidecar | **sidecar 后端已实现**（`services::xmp` 标准 packet 生成 + `Library::export_xmp_sidecars`：标题/描述/标签/评分写到媒体文件旁的 .xmp（存储 blob 或链接原文件），原子写入、全转义；不破坏原文件，无嵌入/IPTC-IIM 写回；UI 待接） | IMatch/ACDSee/digiKam/XnView | ✅ sidecar 后端 |
 
 ### 3.5 AI 自动化
 
@@ -118,7 +118,7 @@
 |---|---|---|---|---|
 | 1 | **批量重命名**（模板 + 序号） | **已实现**（`{n}`/`{name}` 模板 + 预览，整批一次撤销） | 全部竞品标配 | ✅ |
 | 2 | 批量格式转换/压缩（导出向） | **已实现**（编辑 ▸ 转换…：JPEG/PNG/WebP/BMP/TIFF，可选长边限制，可选重新导入） | XnView/digiKam BQM | ✅ |
-| 3 | 旋转/翻转/裁剪、JPEG 无损变换 | 无 | digiKam/XnView | P2 |
+| 3 | 旋转/翻转/裁剪、JPEG 无损变换 | **后端已实现**（`media::edit` 纯像素变换 + `Library::batch_edit_images` 批量应用、内容寻址换 blob、缩略图/视觉指纹重算、逐资产失败报告；JPEG 走质量参数重编码，无损变换不做；UI 待接） | digiKam/XnView | ✅ 后端 |
 | 4 | 图片标注（箭头/框选/涂鸦，非破坏图层） | 无 | Eagle 标注/Billfish | P3 |
 | 5 | 水印（批量文字/图片水印） | 无 | Bridge/XnView | P3 |
 | 6 | 拍摄时间批量校正（时区/偏移） | 无 | digiKam | P3 |
@@ -234,6 +234,6 @@
 
 ## 五、路线图建议
 
-- **下一迭代**：XMP 写回 → 对比视图 → 浏览器扩展增强（网页批量保存按尺寸/格式过滤）→ 标签别名与自动补全 → 元数据模板
-- **中期（P2）**：OCR / 物体自动打标 / 人脸聚类（需重建本地推理基建，建议 opt-in 模型分发）、语义搜索（opt-in 回归，对位 Eagle AI Search）、旋转/裁剪/无损变换、Contact Sheet / PDF 输出（对位 Billfish 2.5）、开放 Web API（对位 Eagle Web API v2）
+- **下一迭代**：编辑批处理 / XMP 导出的 UI 接线（多选工具栏与检查器入口）→ 对比视图 → 浏览器扩展增强（网页批量保存按尺寸/格式过滤）→ 标签别名与自动补全 → 元数据模板
+- **中期（P2）**：OCR / 物体自动打标 / 人脸聚类（需重建本地推理基建，建议 opt-in 模型分发）、语义搜索（opt-in 回归，对位 Eagle AI Search）、Contact Sheet / PDF 输出（对位 Billfish 2.5）、开放 Web API（对位 Eagle Web API v2）
 - **远期（P3）**：地图、标注/水印、月历视图、AI 批量整理（对位 Eagle AI Action）、MCP/Agent 接入、插件系统、协作同步、CLI、多主窗口
