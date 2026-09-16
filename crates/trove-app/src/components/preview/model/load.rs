@@ -1,13 +1,15 @@
 //! Getting a model's geometry onto the screen.
 //!
 //! Three sources, one outcome: a [`Mesh`] the renderers understand. A stock
-//! parse for the small files that fit in memory, a streaming octree for a
-//! point cloud too large to hold, a chunked PLY loader for a mesh that is, and
-//! an index reader when one of those clouds has a sidecar beside it. On top of
-//! that sits what the viewport does with the result: swap it in, pick an LOD
-//! from the camera distance, and hand it to the GPU.
+//! parse for the formats that have one reader, a streaming octree for a point
+//! cloud that can be walked incrementally, a chunked PLY loader for one that
+//! cannot, and an index reader when there is a sidecar beside the file. Which
+//! one is used is decided from the file — what the header declares and what
+//! the reader can walk — rather than from its size. On top of that sits what
+//! the viewport does with the result: swap it in, pick an LOD from the camera
+//! distance, and hand it to the GPU.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use gpui_kit::*;
@@ -22,21 +24,43 @@ use trove_core::media::render3d;
 use super::super::gpu3d::{GpuRenderer, GpuUnavailable};
 use super::{Backend, ModelViewport, STREAM_REFINEMENTS, reason_text};
 
+/// Parsed geometry the chunked PLY loader may hold.
+///
+/// This bounds *quality*, not whether a file opens: a PLY whose geometry does
+/// not fit is sampled down to this rather than refused, and one that does fit
+/// is read vertex for vertex. The file itself is memory-mapped, so what is
+/// capped is the mesh in memory, not the model.
+const CHUNKED_MEMORY_BUDGET: usize = 128 << 20;
+
+/// GPU buffer size above which an upload is worth a line in the log.
+///
+/// Not a limit — the upload happens either way — but the number has to be
+/// written down somewhere, and this is the only place that knows it before
+/// the allocation that may fail.
+const LARGE_UPLOAD_LOG_BYTES: usize = 256 << 20;
+
 impl ModelViewport {
     /// Parse the mesh through the backend task manager (registered, visible
     /// in the task list, cancelled when the viewport closes), then hand it
     /// back to the viewport.
     pub(super) fn start_load(&mut self, path: PathBuf, cx: &mut Context<Self>) {
-        // Detect if this is a large point cloud that should use streaming.
-        const STREAMING_THRESHOLD: u64 = 64 << 20; // 64 MiB
-        let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
         let ext = path
             .extension()
             .and_then(|e| e.to_str())
             .map(|e| e.to_ascii_lowercase())
             .unwrap_or_default();
 
-        if ext == "ply" && size > STREAMING_THRESHOLD {
+        if ext == "ply" {
+            // A PLY is the one format with readers that do not need the whole
+            // file, and which one to use is decided from the *file* rather
+            // than from its size. Each reader refuses what it cannot walk — a
+            // PLY with faces is not a point cloud, an unreadable layout is not
+            // streamable — so a size threshold could only ever be a worse
+            // version of that check: it sends a small cloud down the
+            // whole-file path and a large mesh into a reader that does not
+            // fit it. The chunked loader behind `load_mesh` covers whatever
+            // the two below decline.
+            //
             // An index beside the file turns "read twenty gigabytes" into
             // "read the chunks on screen". One is used only when it already
             // exists: building is a separate, offline step (the `index_build`
@@ -389,23 +413,27 @@ impl ModelViewport {
         }
     }
 
-    /// Load a mesh, dispatching on the file size. Files over 512 MiB go
-    /// through the chunked LOD loader with a 128 MiB parsed-geometry budget;
-    /// smaller files take the stock loader, which keeps every vertex.
-    fn load_mesh(path: &PathBuf) -> Result<Mesh, String> {
-        const CHUNKED_THRESHOLD: u64 = 512 << 20;
-        let size = std::fs::metadata(path).map_err(|e| e.to_string())?.len();
-        // Only a PLY has a chunked reader. Routing every large file here used
-        // to send a big OBJ or STL into a loader that only understands PLY,
-        // which failed with a parse error about a format the file never was —
-        // the whole-file loader has its own ceiling and its own message.
+    /// Load a mesh: a PLY through the chunked reader, everything else through
+    /// the stock one.
+    ///
+    /// There is no size test here, and deliberately so. The chunked loader
+    /// chooses its own level of detail from what the header declares — a file
+    /// whose geometry fits the budget is read in full, vertex for vertex, and
+    /// one that does not is sampled to fit instead of being refused — so the
+    /// decision belongs to the reader that can count the vertices, not to a
+    /// number read off the directory entry.
+    ///
+    /// Only a PLY has a chunked reader: routing every file here used to send a
+    /// big OBJ or STL into a loader that only understands PLY, which failed
+    /// with a parse error about a format the file never was.
+    fn load_mesh(path: &Path) -> Result<Mesh, String> {
         let is_ply = path
             .extension()
             .and_then(|e| e.to_str())
             .is_some_and(|e| e.eq_ignore_ascii_case("ply"));
-        if is_ply && size > CHUNKED_THRESHOLD {
+        if is_ply {
             let config = LodConfig {
-                memory_budget: 128 << 20,
+                memory_budget: CHUNKED_MEMORY_BUDGET,
             };
             chunked::load_ply_chunked(path, config)
         } else {
@@ -416,10 +444,12 @@ impl ModelViewport {
     /// Bring the GPU up on a background thread and upload the mesh. Until it
     /// finishes — or forever, if it fails — the CPU renders the viewport.
     ///
-    /// When the mesh is larger than [`GpuRenderer::GPU_UPLOAD_BUDGET`] the
-    /// upload is skipped and the viewport falls back to the CPU rasterizer:
-    /// a few-hundred-pixel software preview costs a bounded amount of work
-    /// regardless of how many triangles the model has.
+    /// Every mesh is uploaded, however large. There used to be a 256 MiB
+    /// ceiling above which the upload was skipped and the viewport quietly
+    /// became a software render; it spared a machine that could not hold the
+    /// geometry at the cost of making every machine that could look like a
+    /// broken GPU. The size goes to the log instead, so a genuine
+    /// out-of-video-memory failure has a line naming the model and the figure.
     ///
     /// A device that is already up is reused: only the geometry is re-uploaded.
     /// Building a second device and a second set of pipelines for every LOD
@@ -443,7 +473,16 @@ impl ModelViewport {
                         Some(renderer) => renderer,
                         None => Arc::new(GpuRenderer::new()?),
                     };
-                    let uploaded = renderer.upload_capped(&mesh);
+                    let wanted = GpuRenderer::estimate_gpu_bytes(&mesh);
+                    if wanted >= LARGE_UPLOAD_LOG_BYTES {
+                        tracing::info!(
+                            bytes = wanted,
+                            vertices = mesh.vertex_count(),
+                            triangles = mesh.triangle_count(),
+                            "uploading a large mesh to the GPU"
+                        );
+                    }
+                    let uploaded = renderer.upload(&mesh);
                     Ok::<_, GpuUnavailable>((renderer, uploaded))
                 })
                 .await;
@@ -454,19 +493,10 @@ impl ModelViewport {
                     return;
                 }
                 match built {
-                    Ok((renderer, Some(uploaded))) => {
+                    Ok((renderer, uploaded)) => {
                         this.backend = Backend::Gpu(renderer.adapter.clone());
                         this.gpu = Some(renderer);
                         this.gpu_mesh = Some(Arc::new(uploaded));
-                    }
-                    Ok((renderer, None)) => {
-                        // The mesh exceeded the GPU budget; keep the renderer
-                        // for its adapter info but fall back to CPU.
-                        this.backend = Backend::Cpu(format!(
-                            "mesh exceeds the {} MiB GPU preview limit",
-                            GpuRenderer::GPU_UPLOAD_BUDGET >> 20
-                        ));
-                        this.gpu = Some(renderer);
                     }
                     Err(unavailable) => this.backend = Backend::Cpu(reason_text(&unavailable)),
                 }

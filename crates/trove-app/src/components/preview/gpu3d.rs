@@ -851,33 +851,23 @@ impl GpuRenderer {
         }
     }
 
-    /// Largest mesh the GPU upload is allowed to hold. Above this the
-    /// viewport falls back to the CPU rasterizer, which renders at a
-    /// bounded resolution regardless of how many triangles the model has.
-    pub const GPU_UPLOAD_BUDGET: usize = 256 << 20;
-
-    /// Move a mesh or cloud into GPU buffers, choosing indexed (smooth),
-    /// expanded (flat) or instanced-point geometry exactly as the CPU path
-    /// does. Returns `None` when the mesh is larger than
-    /// [`GPU_UPLOAD_BUDGET`], so the caller can fall back to CPU.
-    pub fn upload_capped(&self, mesh: &Mesh) -> Option<GpuMesh> {
-        let estimated = Self::estimate_gpu_bytes(mesh);
-        if estimated > Self::GPU_UPLOAD_BUDGET {
-            return None;
-        }
-        Some(self.upload(mesh))
-    }
-
     /// Bytes of GPU buffer a mesh will occupy: interleaved vertices plus
     /// the index list.
+    ///
+    /// Reported rather than enforced. This used to gate the upload — a mesh
+    /// over 256 MiB was refused and the whole viewport fell back to the CPU
+    /// rasterizer — which turned a model the GPU could in fact hold into a
+    /// software render for a reason the user could not see. The number is
+    /// still worth having: it is logged before a large upload, so a machine
+    /// that does run out of video memory has a line saying which model did it
+    /// and what it was expected to cost.
     ///
     /// The three layouts have to be counted as [`render3d::vertex_data`]
     /// and [`render3d::point_data`] actually build them. A flat-shaded mesh
     /// is expanded per face, so its vertex buffer is `triangles × 3` —
     /// counting the source vertices instead under-reports a soup with more
-    /// triangles than vertices by a factor of three or more, which is how a
-    /// mesh gets past [`Self::upload_capped`] and then fails to allocate.
-    fn estimate_gpu_bytes(mesh: &Mesh) -> usize {
+    /// triangles than vertices by a factor of three or more.
+    pub fn estimate_gpu_bytes(mesh: &Mesh) -> usize {
         if mesh.is_point_cloud() {
             return mesh.vertex_count() * render3d::PointData::STRIDE as usize;
         }
@@ -1413,9 +1403,7 @@ mod tests {
             positions.push([r * cos, y, r * sin]);
         }
         let mesh = Mesh::from_parts(positions, Vec::new(), Vec::new(), Vec::new()).expect("cloud");
-        let uploaded = renderer
-            .upload_capped(&mesh)
-            .expect("the cloud fits the GPU");
+        let uploaded = renderer.upload(&mesh);
         let framing = render3d::Camera::default().framing(mesh.bounds, 1.0);
         let size = (160, 120);
 
@@ -1473,9 +1461,7 @@ mod tests {
         };
         let mesh = grid_mesh(256); // 131 072 triangles
         assert!(mesh.triangle_count() >= meshlet::MIN_MESHLET_TRIANGLES);
-        let uploaded = renderer
-            .upload_capped(&mesh)
-            .expect("the mesh fits the GPU");
+        let uploaded = renderer.upload(&mesh);
         assert!(
             uploaded.meshlets.len() > 1,
             "a large mesh has to be partitioned"

@@ -27,11 +27,6 @@ pub use streaming_point_cloud::StreamingPointCloud;
 
 pub use types::{Bounds, Mesh};
 
-/// Ceiling on a model file read whole into memory: the parsed mesh costs a
-/// multiple of the file, so a stray multi-gigabyte export must fail fast
-/// instead of dragging the machine into swap.
-const MAX_MODEL_FILE_BYTES: u64 = 2 << 30;
-
 /// Extensions this module can parse (lowercase, without the dot).
 pub const MODEL_EXTENSIONS: [&str; 6] = ["obj", "stl", "ply", "gltf", "glb", "blend"];
 
@@ -41,12 +36,17 @@ pub fn is_model_ext(ext: &str) -> bool {
 }
 
 /// Load a mesh, dispatching on the file extension.
+///
+/// There is deliberately no file-size ceiling here. There used to be one — a
+/// 2 GiB cap that refused a file before opening it — and it was the wrong
+/// place to draw the line: the formats that actually grow past it have a
+/// large-file reader of their own (a PLY goes to [`super::chunked`], which
+/// bounds its *parsed* size rather than refusing the file), the caller routes
+/// those by reading a header rather than the whole file, and a model a
+/// machine *can* open should not be refused because a default chosen for a
+/// smaller machine says so. What is left is the honest failure: a file too
+/// large for the memory it is read into fails when it is read.
 pub fn load(path: &Path) -> Result<Mesh, String> {
-    load_capped(path, MAX_MODEL_FILE_BYTES)
-}
-
-/// [`load`] with an overridable size cap, so the limit itself can be tested.
-fn load_capped(path: &Path, limit: u64) -> Result<Mesh, String> {
     let ext = path
         .extension()
         .and_then(|e| e.to_str())
@@ -54,13 +54,6 @@ fn load_capped(path: &Path, limit: u64) -> Result<Mesh, String> {
         .unwrap_or_default();
     if !is_model_ext(&ext) {
         return Err(format!("unsupported model format: .{ext}"));
-    }
-    let size = std::fs::metadata(path).map_err(|e| e.to_string())?.len();
-    if size > limit {
-        return Err(format!(
-            "the model file is larger than the {} GiB preview limit",
-            limit >> 30
-        ));
     }
     match ext.as_str() {
         "obj" => {
@@ -98,15 +91,12 @@ mod tests {
         assert!(!is_model_ext("png"));
     }
 
-    /// The size cap in `load`: a file past the limit is refused before it
-    /// is read, without needing a multi-gigabyte fixture.
+    /// The extension is the whole dispatch: an unknown one is refused by name
+    /// rather than by attempting a parse that cannot work.
     #[test]
-    fn oversized_model_files_are_refused() {
-        let path = std::env::temp_dir().join("trove-ply-cap-test.ply");
-        std::fs::write(&path, b"ply\nformat ascii 1.0\nend_header\n").unwrap();
-        let err = load_capped(&path, 4).expect_err("a file over the cap is refused");
-        std::fs::remove_file(&path).ok();
-        assert!(err.contains("larger than"));
+    fn an_unknown_extension_is_refused_with_its_name() {
+        let error = load(Path::new("/nowhere/model.xyz")).expect_err("xyz is not a model");
+        assert!(error.contains(".xyz"), "{error}");
     }
 
     /// `.blend` reaches the Blender-backed loader rather than the
@@ -119,5 +109,17 @@ mod tests {
     fn a_blend_extension_reaches_the_blender_loader() {
         let error = load(Path::new("/nowhere/absent.blend")).expect_err("there is no such file");
         assert!(!error.contains("unsupported model format"), "{error}");
+    }
+
+    /// A known extension reaches its parser — there is no longer a size for
+    /// it to be turned away by first.
+    #[test]
+    fn a_known_extension_reaches_its_parser() {
+        let path = std::env::temp_dir().join("trove-model-dispatch-test.obj");
+        std::fs::write(&path, b"v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n").unwrap();
+        let mesh = load(&path).expect("a small OBJ parses");
+        std::fs::remove_file(&path).ok();
+        assert_eq!(mesh.vertex_count(), 3);
+        assert_eq!(mesh.triangle_count(), 1);
     }
 }
