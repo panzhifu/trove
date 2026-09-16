@@ -29,12 +29,16 @@ pub(super) fn build_cell_element(
             crate::panels::common::ensure_font_registered(family, cell.font_blob.as_deref(), cx)
                 .then(|| {
                     // Subtitled specimen card (fontmatrix style): three
-                    // stacked rows (Latin / CJK / digits) under the label,
-                    // so the rows size down more than the old single line
-                    // did to fit the strip the label owns.
+                    // stacked rows (Latin / CJK / digits) under the label.
+                    // The font size derives from the height actually left
+                    // for the rows — card height minus the label strip,
+                    // over the three-line line-height factor — so the zoom
+                    // slider keeps steering it across its whole travel;
+                    // only the very top of the range clamps out.
+                    let size = ((h - 24.0) / 3.6).clamp(12.0, 72.0);
                     crate::panels::common::font_specimen_card(family, cx)
                         .size_full()
-                        .text_size(px((h * 0.20).clamp(11.0, 34.0)))
+                        .text_size(px(size))
                         .into_any_element()
                 })
         })
