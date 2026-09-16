@@ -172,6 +172,24 @@ pub struct PurgeReport {
     pub thumbs_removed: u64,
 }
 
+/// Outcome of a batch image edit. `skipped` counts assets the batch had no
+/// business touching (not an image, in the trash, no stored blob);
+/// `failures` carries per-asset errors so one bad file cannot sink the
+/// whole batch.
+#[derive(Debug, Clone, Default)]
+pub struct BatchEditReport {
+    pub edited: u64,
+    pub skipped: u64,
+    pub failures: Vec<(Uuid, String)>,
+}
+
+/// Outcome of a metadata export run.
+#[derive(Debug, Clone, Default)]
+pub struct XmpExportReport {
+    pub written: u64,
+    pub skipped: u64,
+}
+
 /// A Trove library on disk:
 ///
 /// ```text
@@ -783,6 +801,171 @@ impl Library {
             },
         )?;
         Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // In-place image edits & metadata export
+    // -----------------------------------------------------------------------
+
+    /// Apply pixel edits (rotate / flip / crop, see
+    /// [`media::edit::ImageEdit`]) to a batch of image assets and swap the
+    /// re-encoded results in as the assets' new media content. Identity and
+    /// organization (id, title, tags, collections, captured-at) survive the
+    /// edit; hash, size, dimensions, thumbnail and visual fingerprint are
+    /// recomputed. Linked assets are rejected — their files belong to the
+    /// user, the library only references them.
+    pub fn batch_edit_images(
+        &self,
+        ids: &[Uuid],
+        edits: &[media::edit::ImageEdit],
+        jpeg_quality: u8,
+    ) -> Result<BatchEditReport> {
+        if edits.is_empty() {
+            return Err(crate::Error::Validation("no edits requested".into()));
+        }
+        let mut report = BatchEditReport::default();
+        for &id in ids {
+            match self.edit_one(id, edits, jpeg_quality) {
+                Ok(true) => report.edited += 1,
+                Ok(false) => report.skipped += 1,
+                Err(e) => report.failures.push((id, e.to_string())),
+            }
+        }
+        Ok(report)
+    }
+
+    /// Edit one asset: decode, transform, re-encode, stage the new content
+    /// and swap it in. `Ok(false)` marks an asset the batch skips silently.
+    fn edit_one(
+        &self,
+        id: Uuid,
+        edits: &[media::edit::ImageEdit],
+        jpeg_quality: u8,
+    ) -> Result<bool> {
+        let conn = self.store.conn();
+        let Some(asset) = assets::get(conn, id)? else {
+            return Ok(false);
+        };
+        if asset.trashed_at.is_some() || asset.kind != crate::model::AssetKind::Image {
+            return Ok(false);
+        }
+        if asset.origin != crate::model::Origin::Linked && asset.rel_path.is_none() {
+            return Ok(false);
+        }
+        if asset.origin == crate::model::Origin::Linked {
+            return Err(crate::Error::Validation(
+                "linked assets cannot be edited in place (the file stays with its owner)".into(),
+            ));
+        }
+
+        let source = self
+            .root
+            .join(asset.rel_path.as_deref().unwrap_or_default());
+        let out = media::edit::apply(&source, edits, jpeg_quality)?;
+
+        // Park the re-encoded bytes where blob::stage expects a source, then
+        // let the normal content-addressing path take over.
+        let tmp = self
+            .root
+            .join("media")
+            .join(format!(".edit-{}", uuid::Uuid::new_v4()));
+        let result = (|| -> Result<()> {
+            std::fs::write(&tmp, &out.bytes)?;
+            self.replace_media_staged(id, &asset, &tmp, out.width, out.height)
+        })();
+        let _ = std::fs::remove_file(&tmp);
+        result?;
+        Ok(true)
+    }
+
+    /// Swap an asset's media content for the (already transformed) file at
+    /// `new_file`. The old blob is deleted once nothing else references it;
+    /// thumbnail and visual fingerprint are rebuilt from the new content.
+    fn replace_media_staged(
+        &self,
+        id: Uuid,
+        asset: &crate::model::Asset,
+        new_file: &Path,
+        width: u32,
+        height: u32,
+    ) -> Result<()> {
+        let staged = media::blob::stage(new_file, self.root(), &asset.ext)?;
+        let old_sha = asset.sha256.clone().unwrap_or_default();
+        let old_rel = asset.rel_path.clone();
+        if staged.sha256.eq_ignore_ascii_case(&old_sha) {
+            // The edits produced byte-identical content: the blob in place
+            // is already correct.
+            return Ok(());
+        }
+
+        let new_blob = self.root.join(&staged.rel_path);
+        assets::set_media_columns(
+            self.store.conn(),
+            id,
+            &staged.sha256,
+            &staged.rel_path,
+            staged.size,
+            Some(width),
+            Some(height),
+        )?;
+
+        // Free the old content when this was the last reference to it.
+        if assets::count_by_sha256(self.store.conn(), &old_sha)? == 0
+            && let Some(rel) = &old_rel
+        {
+            self.remove_blob_files(rel, &old_sha);
+        }
+
+        // Thumbnail and visual fingerprint describe the old pixels; both
+        // must follow the content to its new hash.
+        media::thumb::regenerate(self.root(), &staged.sha256, asset.kind, &new_blob);
+        crate::store::visual_search::compute_and_store_signature(&self.store, &self.root, id)?;
+        Ok(())
+    }
+
+    /// Export the library metadata of `ids` as XMP sidecars next to each
+    /// asset's media file (the stored blob, or the external original for
+    /// linked assets). Title, description, tag names and rating are
+    /// exported; trashed assets and assets without a file are skipped.
+    pub fn export_xmp_sidecars(&self, ids: &[Uuid]) -> Result<XmpExportReport> {
+        let conn = self.store.conn();
+        let mut report = XmpExportReport::default();
+        for &id in ids {
+            let Some(asset) = assets::get(conn, id)? else {
+                report.skipped += 1;
+                continue;
+            };
+            if asset.trashed_at.is_some() {
+                report.skipped += 1;
+                continue;
+            }
+            let target = match asset.origin {
+                crate::model::Origin::Stored => {
+                    asset.rel_path.as_ref().map(|rel| self.root.join(rel))
+                }
+                crate::model::Origin::Linked => asset.facts.source_path.as_ref().map(PathBuf::from),
+            };
+            let Some(target) = target else {
+                report.skipped += 1;
+                continue;
+            };
+            let tag_names = tags::for_asset(conn, id)?
+                .into_iter()
+                .map(|t| t.name)
+                .collect();
+            let data = crate::services::xmp::XmpData {
+                title: asset.title.clone(),
+                description: asset.description.clone(),
+                tags: tag_names,
+                rating: asset.rating,
+            };
+            if crate::services::xmp::write_sidecar(&target, &data).is_ok() {
+                report.written += 1;
+            } else {
+                report.skipped += 1;
+            }
+        }
+        Ok(report)
     }
 
     /// Replace one asset's whole tag group (missing tags must already exist —
@@ -2342,5 +2525,152 @@ mod tests {
         assert!(asset.width.unwrap_or(0) > 0);
         let thumb = thumb::abs_path(lib.root(), asset.sha256.as_deref().unwrap());
         assert!(thumb.is_file(), "raw thumbnail missing");
+    }
+
+    /// A 4×3 red PNG on disk — wide enough that a rotation visibly swaps
+    /// the reported dimensions (a square would not).
+    fn write_wide_png(dir: &Path, name: &str) -> PathBuf {
+        let mut img = image::RgbaImage::new(4, 3);
+        for y in 0..3 {
+            for x in 0..4 {
+                img.put_pixel(x, y, image::Rgba([200, 30, 30, 255]));
+            }
+        }
+        let path = dir.join(name);
+        img.save_with_format(&path, image::ImageFormat::Png)
+            .unwrap();
+        path
+    }
+
+    #[test]
+    fn batch_edit_rotates_and_swaps_content_in_place() {
+        let (lib, root) = temp_library("batch-edit");
+        let src = write_wide_png(&root, "wide.png");
+        let report = lib.import_files(std::slice::from_ref(&src), None).unwrap();
+        let id = report.imported[0].asset_id;
+        let conn = lib.store().conn();
+        let before = assets::get(conn, id).unwrap().unwrap();
+        let old_sha = before.sha256.clone().unwrap();
+        let old_rel = before.rel_path.clone().unwrap();
+        let old_thumb = thumb::abs_path(lib.root(), &old_sha);
+        assert!(old_thumb.is_file(), "precondition: thumbnail exists");
+
+        let out = lib
+            .batch_edit_images(&[id], &[crate::media::edit::ImageEdit::Rotate90], 90)
+            .unwrap();
+        assert_eq!(out.edited, 1, "failures: {:?}", out.failures);
+        assert_eq!(out.skipped, 0);
+
+        let after = assets::get(conn, id).unwrap().unwrap();
+        // Identity survives; content does not.
+        assert_eq!(after.file_name, before.file_name);
+        assert_eq!(after.title, before.title);
+        assert_ne!(after.sha256, before.sha256);
+        assert_eq!((after.width, after.height), (Some(3), Some(4)));
+        assert_eq!(after.ext, before.ext);
+        assert_eq!(after.mime, "image/png");
+
+        // The old blob and its thumbnail are gone, the new ones exist.
+        assert!(!lib.resolve(&old_rel).is_file(), "old blob removed");
+        assert!(!old_thumb.is_file(), "old thumbnail removed");
+        let new_rel = after.rel_path.as_ref().unwrap();
+        assert!(lib.resolve(new_rel).is_file(), "new blob exists");
+        let new_thumb = thumb::abs_path(lib.root(), after.sha256.as_deref().unwrap());
+        assert!(new_thumb.is_file(), "new thumbnail generated");
+
+        // The pixel content is really rotated: decoding the new blob gives
+        // the swapped geometry.
+        use image::GenericImageView as _;
+        let decoded = image::open(lib.resolve(new_rel)).unwrap();
+        assert_eq!(decoded.dimensions(), (3, 4));
+    }
+
+    #[test]
+    fn batch_edit_skips_and_rejects_appropriately() {
+        let (lib, root) = temp_library("batch-edit-mixed");
+        let src = write_wide_png(&root, "wide.png");
+        let report = lib.import_files(std::slice::from_ref(&src), None).unwrap();
+        let stored_id = report.imported[0].asset_id;
+
+        // A linked asset: its file belongs to the user, editing is refused
+        // (as a per-asset failure, not a batch abort).
+        let linked_src = write_source(&root, "linked.png", PNG_1X1);
+        use crate::media::import::{ImportPolicy, commit_staged_all, stage_all};
+        use crate::model::Origin;
+        let staged = stage_all(
+            &root,
+            std::slice::from_ref(&linked_src),
+            ImportPolicy {
+                link_all: true,
+                ..Default::default()
+            },
+        );
+        commit_staged_all(lib.store().conn(), None, staged);
+        let conn = lib.store().conn();
+        let linked_id = {
+            let page = assets::query(conn, &AssetQuery::default()).unwrap();
+            page.items
+                .into_iter()
+                .find(|a| a.origin == Origin::Linked)
+                .expect("linked asset imported")
+                .id
+        };
+
+        let out = lib
+            .batch_edit_images(
+                &[stored_id, linked_id, Uuid::new_v4()],
+                &[crate::media::edit::ImageEdit::FlipHorizontal],
+                90,
+            )
+            .unwrap();
+        assert_eq!(out.edited, 1);
+        // The missing id is skipped (no record), the linked one is a failure.
+        assert_eq!(out.skipped, 1);
+        assert_eq!(out.failures.len(), 1);
+        assert_eq!(out.failures[0].0, linked_id);
+        assert!(out.failures[0].1.contains("linked"));
+    }
+
+    #[test]
+    fn xmp_sidecar_export_writes_next_to_the_blob() {
+        let (lib, root) = temp_library("xmp-export");
+        let src = write_wide_png(&root, "wide.png");
+        let report = lib.import_files(std::slice::from_ref(&src), None).unwrap();
+        let id = report.imported[0].asset_id;
+        let conn = lib.store().conn();
+
+        lib.patch_asset(
+            id,
+            &crate::model::AssetPatch {
+                title: Some(Some("Sunset & <beach>".into())),
+                description: Some(Some("Golden hour".into())),
+                rating: Some(Some(5)),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let tag = lib.ensure_tag("sea").unwrap();
+        lib.tag_assets(&[id], tag.id, true).unwrap();
+
+        let out = lib.export_xmp_sidecars(&[id]).unwrap();
+        assert_eq!(out.written, 1);
+        assert_eq!(out.skipped, 0);
+
+        let asset = assets::get(conn, id).unwrap().unwrap();
+        let sidecar = lib
+            .resolve(asset.rel_path.as_ref().unwrap())
+            .with_extension("xmp");
+        let body = std::fs::read_to_string(&sidecar).unwrap();
+        assert!(body.contains("Sunset &amp; &lt;beach&gt;"));
+        assert!(body.contains("Golden hour"));
+        assert!(body.contains("<rdf:li>sea</rdf:li>"));
+        assert!(body.contains("<xmp:Rating>5</xmp:Rating>"));
+
+        // Re-export overwrites in place; a trashed asset is skipped.
+        assert_eq!(lib.export_xmp_sidecars(&[id]).unwrap().written, 1);
+        lib.trash_assets(&[id]).unwrap();
+        let out = lib.export_xmp_sidecars(&[id]).unwrap();
+        assert_eq!(out.written, 0);
+        assert_eq!(out.skipped, 1);
     }
 }

@@ -11,3 +11,4 @@ pub mod maintenance;
 pub mod open_external;
 pub mod screenshot;
 pub mod update;
+pub mod xmp;
