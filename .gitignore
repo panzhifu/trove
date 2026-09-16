@@ -25,3 +25,6 @@ bench-data/
 # 第三方参考实现（CloudCompare / gpui-kit / fontmatrix 的浅克隆），
 # 只供本地查阅借鉴，体积大且非本项目源码，不进仓库。
 reference/
+
+# 各 crate 内相对路径 TMPDIR 产生的测试临时目录（正确用法是绝对路径 TMPDIR）
+crates/*/target/
