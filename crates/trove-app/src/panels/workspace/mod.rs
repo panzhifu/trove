@@ -428,19 +428,6 @@ impl WorkspacePanel {
             .when(!in_trash && !in_recent, |row| {
                 row.child(add_filter_button(&controller))
             })
-            .when(in_recent, |row| {
-                row.child(
-                    Button::new("clear-history")
-                        .ghost()
-                        .danger()
-                        .xsmall()
-                        .label(rust_i18n::t!("workspace.clear_history").to_string())
-                        .tooltip(rust_i18n::t!("workspace.clear_history_tooltip").to_string())
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.clear_view_history(cx);
-                        })),
-                )
-            })
             .when(search_active, |row| {
                 row.child(
                     Button::new("save-smart")
