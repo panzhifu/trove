@@ -5,6 +5,7 @@ pub mod blob;
 pub mod chunked;
 pub mod color;
 pub mod convert;
+pub mod edit;
 pub mod formats;
 pub mod gpu;
 pub mod import;

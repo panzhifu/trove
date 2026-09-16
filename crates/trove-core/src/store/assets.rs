@@ -306,6 +306,35 @@ pub fn set_rel_path(conn: &Connection, id: Uuid, rel_path: &str) -> Result<()> {
     Ok(())
 }
 
+/// Point an asset at a new content-addressed blob after an in-place edit:
+/// new hash, path, size and dimensions, all in one statement. Identity
+/// columns (title, tags, collections, timestamps) are untouched — an edit
+/// rewrites what the asset *is*, not how it is organized.
+pub fn set_media_columns(
+    conn: &Connection,
+    id: Uuid,
+    sha256: &str,
+    rel_path: &str,
+    size_bytes: u64,
+    width: Option<u32>,
+    height: Option<u32>,
+) -> Result<()> {
+    rows::execute(
+        conn,
+        "UPDATE assets SET sha256 = ?1, rel_path = ?2, size_bytes = ?3, width = ?4, height = ?5 \
+         WHERE id = ?6",
+        vec![
+            Value::Text(sha256.to_string()),
+            Value::Text(rel_path.to_string()),
+            Value::Integer(size_bytes as i64),
+            rows::bind_opt_int(width.map(i64::from)),
+            rows::bind_opt_int(height.map(i64::from)),
+            rows::uuid(id).into(),
+        ],
+    )?;
+    Ok(())
+}
+
 /// Move an asset into (or out of) the trash.
 pub fn set_trashed(conn: &Connection, id: Uuid, trashed: bool) -> Result<bool> {
     let changed = rows::execute(
