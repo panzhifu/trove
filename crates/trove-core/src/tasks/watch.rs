@@ -22,10 +22,10 @@ use std::sync::mpsc::Sender;
 use std::time::Duration;
 
 use super::JobContext;
-use crate::config::AppConfig;
+use crate::config::{AppConfig, LibraryConfig};
 
-/// Sweep cadence. The config is re-read every sweep, so changes in Settings
-/// apply without a restart.
+/// Sweep cadence. Both configs are re-read every sweep, so changes in
+/// Settings apply without a restart.
 pub const WATCH_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Something discovered on a sweep that the embedder should act on.
@@ -39,8 +39,13 @@ pub enum WatchSignal {
 
 /// Run the resident watch loop until cancelled. Sends every discovery to
 /// `signals`; sleeps in small cancellable slices between sweeps.
+///
+/// `library_dir` is the open library's data directory: its `library.json`
+/// holds the watched-root list, which belongs to that library rather than to
+/// the application.
 pub fn run(
     interval: Duration,
+    library_dir: std::path::PathBuf,
     inbox_dir: std::path::PathBuf,
     signals: Sender<WatchSignal>,
     ctx: &JobContext,
@@ -52,6 +57,7 @@ pub fn run(
             return Ok(());
         }
         let config = AppConfig::load();
+        let library = LibraryConfig::load(&library_dir);
 
         if config.collect_enabled()
             && !crate::services::collect::inbox_items_in(&inbox_dir).is_empty()
@@ -60,8 +66,8 @@ pub fn run(
             return Ok(()); // embedder hung up; stop watching
         }
 
-        if config.watch_folders_enabled() {
-            let roots = config.watched_folders.clone();
+        if library.watch_folders_enabled() {
+            let roots = library.watched_folders.clone();
             for signal in sweep(&roots, inbox_dir.as_path(), &mut seen, &mut baselined) {
                 if signals.send(signal).is_err() {
                     return Ok(());

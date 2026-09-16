@@ -33,11 +33,15 @@ pub const DEFAULT_PORT: u16 = 23916;
 /// Largest accepted upload/download (512 MB).
 const MAX_BODY: u64 = 512 * 1024 * 1024;
 
-/// Where collected files wait for the importer.
+/// Where collected files land.
+///
+/// This is not a staging area to be swept clean: the library *links* whatever
+/// it imports, so a collected file has to stay exactly where it is. The
+/// importer consumes each file's `*.meta.json` sidecar and leaves the file
+/// alone — deleting it, as the copy-based pipeline used to, would leave the
+/// asset pointing at nothing.
 pub fn inbox_dir() -> PathBuf {
-    AppConfig::config_dir()
-        .unwrap_or_else(std::env::temp_dir)
-        .join("inbox")
+    crate::paths::incoming_dir()
 }
 
 /// Files waiting in the inbox, each with its optional `*.meta.json` sidecar

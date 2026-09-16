@@ -338,6 +338,7 @@ impl Render for InspectorPanel {
             .map(|s| s.chars().take(12).collect())
             .unwrap_or_else(|| "—".into());
         let library_root = ctl.library.root().to_path_buf();
+        let cache_root = ctl.library.cache().to_path_buf();
         // The mined color palette (`dominant_color` + `dominant_colors`).
         let swatches: Vec<(u32, String)> = asset
             .facts
@@ -398,7 +399,7 @@ impl Render for InspectorPanel {
         // compact inspector variant: videos show their cover thumbnail,
         // animated images play, everything else falls back to the static
         // thumbnail and then a kind icon.
-        let preview: AnyElement = AssetPreviewData::from_asset(&asset, &library_root)
+        let preview: AnyElement = AssetPreviewData::from_asset(&asset, &library_root, &cache_root)
             .element(PreviewContext::Inspector, cx);
         // Card frame per the reference layout: the image floats on the panel
         // background with a format badge pinned to its top-left corner.

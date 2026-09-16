@@ -626,6 +626,7 @@ impl Render for WorkspacePanel {
             )
         };
         let library_root = self.controller.read(cx).library.root().to_path_buf();
+        let cache_root = self.controller.read(cx).library.cache().to_path_buf();
 
         // --- data pass (cached) ---------------------------------------------
         // The query is the most expensive step in this function and the cell
@@ -652,6 +653,7 @@ impl Render for WorkspacePanel {
             sort_desc,
             grid_loaded,
             library_root: library_root.clone(),
+            cache_root: cache_root.clone(),
             generation: self.controller.read(cx).generation,
             visual: visual_ids.clone(),
         };

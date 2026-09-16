@@ -75,18 +75,24 @@ impl AssetPreviewData {
     /// the asset no longer exists.
     pub(crate) fn load(controller: &LibraryController, id: Uuid) -> Option<Self> {
         let library_root = controller.library.root().to_path_buf();
+        let cache_root = controller.library.cache().to_path_buf();
         let conn = controller.library.store().conn();
         let asset = trove_core::store::assets::get(conn, id).ok().flatten()?;
-        Some(Self::from_asset(&asset, &library_root))
+        Some(Self::from_asset(&asset, &library_root, &cache_root))
     }
 
     /// Build from a record the caller already holds (the inspector renders
     /// from its own fetch; a second query per frame would be waste).
-    pub(crate) fn from_asset(asset: &trove_core::model::Asset, library_root: &Path) -> Self {
+    /// `library_root` locates stored blobs, `cache_root` the thumbnail.
+    pub(crate) fn from_asset(
+        asset: &trove_core::model::Asset,
+        library_root: &Path,
+        cache_root: &Path,
+    ) -> Self {
         let thumb = asset
             .sha256
             .as_deref()
-            .map(|sha| trove_core::media::thumb::abs_path(library_root, sha))
+            .map(|sha| trove_core::media::thumb::abs_path(cache_root, sha))
             .filter(|p| p.is_file());
         let original = if asset.origin == trove_core::model::Origin::Linked {
             asset

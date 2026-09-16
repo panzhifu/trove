@@ -4,7 +4,7 @@
 //! sinks:
 //!
 //! - **stderr** — the terminal the app was launched from;
-//! - **`<config>/trove/logs/trove.log`** — survives launcher starts where
+//! - **`<state>/trove/logs/trove.log`** — survives launcher starts where
 //!   no terminal is attached. Appended across runs; rotated to
 //!   `trove.log.old` once it grows past [`MAX_LOG_BYTES`].
 //!
@@ -64,9 +64,9 @@ pub fn init() {
 }
 
 /// Open the log file for appending, rotating a bloated one aside first.
-/// `None` = logging stays on stderr only (e.g. no config directory).
+/// `None` = logging stays on stderr only (e.g. a read-only state directory).
 fn open_log_file() -> Option<(File, PathBuf)> {
-    let dir = trove_core::config::AppConfig::config_dir()?.join("logs");
+    let dir = trove_core::paths::logs_dir();
     std::fs::create_dir_all(&dir).ok()?;
     let path = dir.join("trove.log");
     rotate_bloated(&path);

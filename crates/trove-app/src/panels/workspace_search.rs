@@ -25,6 +25,7 @@ pub(crate) fn open_image_search(
         let ctl = controller.read(cx);
         let conn = ctl.library.store().conn();
         let library_root = ctl.library.root().to_path_buf();
+        let cache_root = ctl.library.cache().to_path_buf();
         let asset = trove_core::store::assets::get(conn, asset_id)
             .ok()
             .flatten();
@@ -36,7 +37,7 @@ pub(crate) fn open_image_search(
         let thumb = asset
             .sha256
             .as_deref()
-            .map(|sha| trove_core::media::thumb::abs_path(&library_root, sha));
+            .map(|sha| trove_core::media::thumb::abs_path(&cache_root, sha));
         let path = thumb.filter(|p| p.is_file()).or_else(|| {
             asset
                 .rel_path

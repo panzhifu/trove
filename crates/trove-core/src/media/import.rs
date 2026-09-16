@@ -1,12 +1,17 @@
-//! File import pipeline: copy sources into the content-addressed media store
-//! and record them as assets.
+//! File import pipeline: hash, probe and record a source file as an asset.
 //!
-//! The pipeline is split into two phases so a UI can do the slow part (copy +
-//! hash + probe, pure filesystem work) on a background thread and the fast
+//! A user import **links**: the file stays where the user keeps it, and the
+//! record remembers the path. The library therefore holds no copy of the
+//! user's media — only what it derived from it (a thumbnail in the cache root,
+//! mined metadata in the database). [`ImportStorage::Copy`] exists for the
+//! narrow case of a source Trove owns and is about to delete or overwrite.
+//!
+//! The pipeline is split into two phases so a UI can do the slow part (hash +
+//! probe + thumbnail, pure filesystem work) on a background thread and the fast
 //! part (database commit, which must not race the UI thread's reads) back on
 //! the main thread:
 //!
-//! - [`stage_source`] — background: copy into `media/…`, hash, probe
+//! - [`stage_source`] — background: hash, probe, thumbnail under the cache root
 //! - [`commit_staged`] — foreground: dedupe against the store, insert rows
 
 use std::path::{Path, PathBuf};
@@ -85,8 +90,10 @@ pub struct StagedFile {
 /// Imported assets go directly to "All Assets" unless `into_collection` is set.
 pub fn import_files(
     store: &Store,
-    root: &Path,
+    data_root: &Path,
+    cache_root: &Path,
     sources: &[PathBuf],
+    storage: ImportStorage,
     into_collection: Option<Uuid>,
 ) -> Result<ImportReport> {
     if let Some(cid) = into_collection
@@ -97,41 +104,31 @@ pub fn import_files(
     Ok(commit_staged_all(
         store.conn(),
         into_collection,
-        stage_all(root, sources, ImportPolicy::default()),
+        stage_all(data_root, cache_root, sources, storage),
     ))
 }
 
-/// Size from which a source is linked where it lies instead of being copied
-/// into the library, in MiB.
+/// How an import treats its sources.
 ///
-/// A twenty-gigabyte model duplicated into the store costs the user twenty
-/// gigabytes of disk for nothing: the thumbnail and the viewport both read the
-/// original, and the library only needs to remember where it is.
-pub const LINK_OVER_MB_DEFAULT: u64 = 500;
-
-/// How an import stores its sources.
+/// A user import always links: the file stays where it is, the library only
+/// remembers where. Copying is reserved for the two cases where Trove owns
+/// the source and will delete or overwrite it — the temporary extraction of a
+/// media package, and the re-encoded output of an in-place edit. Copying a
+/// user's file into the library would duplicate their disk usage for nothing,
+/// since every reader opens the original anyway.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ImportPolicy {
-    /// Link everything, never copy — the user's own preference.
-    pub link_all: bool,
-    /// Link anything at least this large, whatever the preference says. `0`
-    /// turns the rule off.
-    pub link_over: u64,
+pub enum ImportStorage {
+    /// Leave the file where it is; the record points at it.
+    Link,
+    /// Copy into the data root's `media/` store and record a library-relative
+    /// path. For sources that are about to disappear.
+    Copy,
 }
 
-impl Default for ImportPolicy {
-    fn default() -> Self {
-        Self {
-            link_all: false,
-            link_over: LINK_OVER_MB_DEFAULT << 20,
-        }
-    }
-}
-
-impl ImportPolicy {
-    /// Whether one source file is referenced where it is rather than copied.
-    pub fn links(&self, size: u64) -> bool {
-        self.link_all || (self.link_over > 0 && size >= self.link_over)
+impl ImportStorage {
+    /// Whether the source is copied into the store.
+    pub fn copies(self) -> bool {
+        matches!(self, Self::Copy)
     }
 }
 
@@ -177,14 +174,16 @@ pub fn stage_thread_count() -> usize {
     )
 }
 
-/// Phase one for a batch: stage every source file (copy + hash + probe + thumbnail).
+/// Phase one for a batch: stage every source file (hash + probe + thumbnail).
 /// Pure filesystem work, safe to run on a background thread. Individual
 /// failures never abort the batch; they are collected as [`ImportSkip`]s.
-/// Sources the policy links are hashed + probed but *not* copied.
+/// Sources are hashed + probed where they lie; only [`ImportStorage::Copy`]
+/// writes a blob into `data_root`.
 pub fn stage_all(
-    root: &Path,
+    data_root: &Path,
+    cache_root: &Path,
     sources: &[PathBuf],
-    policy: ImportPolicy,
+    storage: ImportStorage,
 ) -> Vec<std::result::Result<StagedFile, ImportSkip>> {
     use rayon::prelude::*;
 
@@ -198,7 +197,7 @@ pub fn stage_all(
         sources
             .par_iter()
             .map(|src| {
-                stage_source(root, src, policy).map_err(|e| ImportSkip {
+                stage_source(data_root, cache_root, src, storage).map_err(|e| ImportSkip {
                     path: src.clone(),
                     reason: e.to_string(),
                 })
@@ -232,15 +231,17 @@ pub fn commit_staged_all(
     report
 }
 
-/// Phase one (slow, pure I/O): hash + probe one source file, copying it into
-/// the media store unless the policy links it (then the file stays where it is
-/// and the record points at its original location).
-pub fn stage_source(root: &Path, src: &Path, policy: ImportPolicy) -> Result<StagedFile> {
+/// Phase one (slow, pure I/O): hash + probe one source file.
+/// [`ImportStorage::Link`] leaves the file where it is and the record points
+/// at it; `Copy` writes a content-addressed blob into `data_root` first. The
+/// thumbnail is always written under `cache_root`.
+pub fn stage_source(
+    data_root: &Path,
+    cache_root: &Path,
+    src: &Path,
+    storage: ImportStorage,
+) -> Result<StagedFile> {
     let file_name = file_name_of(src)?;
-    // The decision needs the size, which costs one stat: a huge model is
-    // linked even when the user's preference is to copy everything.
-    let size = std::fs::metadata(src).map(|m| m.len()).unwrap_or(0);
-    let linked = policy.links(size);
     let ext = probe::normalize_ext(
         &src.extension()
             .map(|e| e.to_string_lossy().to_string())
@@ -249,13 +250,13 @@ pub fn stage_source(root: &Path, src: &Path, policy: ImportPolicy) -> Result<Sta
 
     // Linked mode: hash the source in place; no blob is written. The probe
     // and thumbnail generation read the original file directly.
-    let (sha256, size, rel_path, blob_path) = if linked {
+    let (sha256, size, rel_path, blob_path) = if storage.copies() {
+        let staged = blob::stage(src, data_root, &ext)?;
+        let blob_path = data_root.join(&staged.rel_path);
+        (staged.sha256, staged.size, staged.rel_path, blob_path)
+    } else {
         let (sha256, size) = blob::hash_file(src)?;
         (sha256, size, String::new(), src.to_path_buf())
-    } else {
-        let staged = blob::stage(src, root, &ext)?;
-        let blob_path = root.join(&staged.rel_path);
-        (staged.sha256, staged.size, staged.rel_path, blob_path)
     };
     let p = probe::probe(&ext);
     let (width, height, video_duration_ms) = match p.kind {
@@ -272,7 +273,7 @@ pub fn stage_source(root: &Path, src: &Path, policy: ImportPolicy) -> Result<Sta
         _ => (None, None, None),
     };
     // Generate (or confirm) the thumbnail cache entry on the background thread.
-    let thumb_path = thumb::ensure(root, &sha256, p.kind, &blob_path);
+    let thumb_path = thumb::ensure(cache_root, &sha256, p.kind, &blob_path);
     // Mine rich metadata (EXIF camera fields, audio tags/duration, font
     // tables, video container). Best-effort. The palette is read from the
     // thumbnail: the original has already been decoded once for the thumbnail,
@@ -307,7 +308,7 @@ pub fn stage_source(root: &Path, src: &Path, policy: ImportPolicy) -> Result<Sta
         width,
         height,
         mined,
-        linked,
+        linked: !storage.copies(),
     })
 }
 
@@ -441,6 +442,7 @@ mod tests {
     #[test]
     fn batch_pipeline_collects_skips_and_dedupes() {
         let root = temp_root("batch");
+        let cache = root.join("cache");
         let store = Store::in_memory().unwrap();
 
         let good = root.join("pic.png");
@@ -450,8 +452,9 @@ mod tests {
         // Phase one: staging collects failures instead of aborting the batch.
         let staged = stage_all(
             &root,
+            &cache,
             &[good.clone(), missing.clone()],
-            ImportPolicy::default(),
+            ImportStorage::Link,
         );
         assert_eq!(staged.len(), 2);
         assert!(staged[0].is_ok());
@@ -470,7 +473,7 @@ mod tests {
         assert_eq!(roots.len(), 0, "no auto-collection should be created");
 
         // Re-importing identical content dedupes (reused = true).
-        let staged2 = stage_all(&root, &[good], ImportPolicy::default());
+        let staged2 = stage_all(&root, &cache, &[good], ImportStorage::Link);
         let report2 = commit_staged_all(store.conn(), None, staged2);
         assert_eq!(report2.imported_count(), 1);
         assert!(report2.imported[0].reused);
@@ -481,6 +484,7 @@ mod tests {
     #[test]
     fn linked_import_keeps_the_file_in_place() {
         let root = temp_root("linked");
+        let cache = root.join("cache");
         let store = Store::in_memory().unwrap();
 
         // The source lives OUTSIDE the library root.
@@ -491,11 +495,9 @@ mod tests {
 
         let staged = stage_all(
             &root,
+            &cache,
             std::slice::from_ref(&src),
-            ImportPolicy {
-                link_all: true,
-                ..Default::default()
-            },
+            ImportStorage::Link,
         );
         assert!(staged[0].is_ok(), "{:?}", staged[0].as_ref().err());
         let report = commit_staged_all(store.conn(), None, staged);
@@ -516,15 +518,55 @@ mod tests {
         let (src_sha, _) = super::super::blob::hash_file(&src).unwrap();
         assert_eq!(asset.sha256.as_deref(), Some(src_sha.as_str()));
 
-        // The thumbnail was generated from the original file.
-        let thumb = super::super::thumb::abs_path(&root, asset.sha256.as_deref().unwrap());
+        // The thumbnail was generated from the original file, into the cache
+        // root — not next to the database.
+        let thumb = super::super::thumb::abs_path(&cache, asset.sha256.as_deref().unwrap());
         assert!(thumb.is_file());
+        assert!(
+            !super::super::thumb::abs_path(&root, asset.sha256.as_deref().unwrap()).exists(),
+            "thumbnails must not land in the data root"
+        );
 
         // The source file was never modified or moved.
         assert!(src.is_file());
 
         std::fs::remove_dir_all(&root).ok();
         std::fs::remove_dir_all(&outside).ok();
+    }
+
+    /// The one storage mode that still copies: a source Trove owns and is
+    /// about to delete (a media package's extraction) must end up in the
+    /// store, not as a link to a directory that is about to vanish.
+    #[test]
+    fn copied_import_writes_a_blob_into_the_data_root() {
+        let root = temp_root("copied");
+        let cache = root.join("cache");
+        let store = Store::in_memory().unwrap();
+
+        let src = root.join("packaged.png");
+        std::fs::write(&src, PNG_1X1).unwrap();
+
+        let staged = stage_all(
+            &root,
+            &cache,
+            std::slice::from_ref(&src),
+            ImportStorage::Copy,
+        );
+        assert!(staged[0].is_ok(), "{:?}", staged[0].as_ref().err());
+        let report = commit_staged_all(store.conn(), None, staged);
+        assert_eq!(report.imported_count(), 1);
+
+        let all = assets::query(store.conn(), &AssetQuery::default()).unwrap();
+        let asset = &all.items[0];
+        assert_eq!(asset.origin, Origin::Stored);
+        assert!(asset.rel_path.is_some());
+        // The blob is inside the data root, so deleting the source afterwards
+        // leaves the asset intact.
+        assert_eq!(walk_blobs(&root.join("media")).len(), 1);
+        std::fs::remove_file(&src).unwrap();
+        assert!(root.join(asset.rel_path.as_deref().unwrap()).is_file());
+
+        std::fs::remove_dir_all(&root).ok();
     }
 
     /// Collect every file under the media store.

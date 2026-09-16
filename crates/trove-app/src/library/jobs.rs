@@ -43,10 +43,12 @@ pub fn start_watch_service(
     cx: &mut App,
 ) -> bool {
     let manager = controller.read(cx).library.tasks().clone();
+    let library_dir = controller.read(cx).library.root().to_path_buf();
     let (tx, rx) = std::sync::mpsc::channel();
     let started = manager.start(TaskKind::WatchScan, "watch", move |ctx| {
         watch::run(
             watch::WATCH_INTERVAL,
+            library_dir,
             trove_core::services::collect::inbox_dir(),
             tx,
             ctx,
@@ -180,13 +182,11 @@ pub fn import_paths_app_into(
             return false;
         }
         let total = expanded.len();
-        let library_root = ctl.library.root().to_path_buf();
-        // The import mode (copy vs link) is read at call time from the config.
-        let policy = trove_core::config::AppConfig::load().import_policy();
         let options = ImportOptions {
-            db_path: library_root.join("library.db"),
-            library_root,
-            policy,
+            data_root: ctl.library.root().to_path_buf(),
+            cache_root: ctl.library.cache().to_path_buf(),
+            // A user import links: the file stays where the user keeps it.
+            storage: trove_core::media::import::ImportStorage::Link,
             source: ImportSource::Paths {
                 paths: expanded,
                 into_collection,
@@ -251,14 +251,12 @@ pub fn collect_inbox_app(
         if ctl.is_importing() {
             return false;
         }
-        let library_root = ctl.library.root().to_path_buf();
-        // Collect-inbox files are transient copies; they are always stored.
         let options = ImportOptions {
-            db_path: library_root.join("library.db"),
-            library_root,
-            // Collected files are already inside the library's own inbox, so
-            // there is nothing to copy and nothing to link.
-            policy: trove_core::media::import::ImportPolicy::default(),
+            data_root: ctl.library.root().to_path_buf(),
+            cache_root: ctl.library.cache().to_path_buf(),
+            // A collected file lives in the incoming directory, which is not a
+            // scratch area — the import leaves it there and links it.
+            storage: trove_core::media::import::ImportStorage::Link,
             source: ImportSource::CollectInbox { items },
         };
         (ctl.library.tasks().clone(), options)

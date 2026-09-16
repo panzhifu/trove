@@ -502,14 +502,18 @@ impl LibraryController {
         }
     }
 
-    /// Swap the open library for another one at `path` (hot switch from
-    /// Settings). Resets every view state; refused mid-import so a running
-    /// job cannot keep writing into the previous store.
-    pub fn swap_library(&mut self, path: PathBuf) -> Result<(), trove_core::Error> {
+    /// Swap the open library for another one (hot switch from Settings): the
+    /// new library's data and cache roots. Resets every view state; refused
+    /// mid-import so a running job cannot keep writing into the previous store.
+    pub fn swap_library(
+        &mut self,
+        data_root: PathBuf,
+        cache_root: PathBuf,
+    ) -> Result<(), trove_core::Error> {
         if self.is_importing() {
             return Err(trove_core::Error::Validation("import in progress".into()));
         }
-        let library = Library::open(path)?;
+        let library = Library::open(data_root, cache_root)?;
         self.library = library;
         self.current_collection = None;
         self.showing_trash = false;

@@ -18,7 +18,7 @@
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use trove_core::media::import::{self, ImportPolicy};
+use trove_core::media::import::{self, ImportStorage};
 use trove_core::store::Store;
 
 /// One measured round: stage every file into a fresh root, then commit.
@@ -27,7 +27,7 @@ fn one_round(paths: &[PathBuf], root: &PathBuf, stage_only: bool) -> (Duration, 
     std::fs::create_dir_all(root).unwrap();
 
     let t0 = Instant::now();
-    let staged = import::stage_all(root, paths, ImportPolicy::default());
+    let staged = import::stage_all(root, &root.join("cache"), paths, ImportStorage::Link);
     let stage_time = t0.elapsed();
 
     if stage_only {

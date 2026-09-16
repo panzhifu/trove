@@ -33,10 +33,14 @@ use trove_core::library::Library;
 use trove_core::services::update;
 use uuid::Uuid;
 
-fn default_library_path() -> PathBuf {
-    // `TROVE_LIBRARY_DIR` overrides, then the persisted choice, then the
-    // default — resolution lives in `trove-core::config`.
-    AppConfig::load().resolved_library_path()
+/// The library to open at startup: the recorded one, or a freshly registered
+/// default on a first run. Both directories are created on the way out.
+fn open_library_at_startup() -> Library {
+    let mut config = AppConfig::load();
+    let entry = config
+        .ensure_active_library()
+        .unwrap_or_else(|e| panic!("prepare library: {e}"));
+    Library::open(entry.dir(), entry.cache_dir()).unwrap_or_else(|e| panic!("open library: {e}"))
 }
 
 /// The release worth telling the user about, or `None`.
@@ -145,10 +149,7 @@ impl AppView {
         let _appearance = window.observe_window_appearance(|window, cx| {
             crate::app::theme::apply_from_settings(Some(window), cx);
         });
-        let library =
-            Library::open(default_library_path()).unwrap_or_else(|e| panic!("open library: {e}"));
-        // Record the library for Settings ▸ recent libraries (best-effort).
-        let _ = trove_core::history::AppHistory::load().push_library(library.root());
+        let library = open_library_at_startup();
         let controller = cx.new(|_cx| LibraryController::new(library));
         let title_bar = cx.new(|cx| TitleBarView::new(controller.clone(), cx));
 
@@ -465,8 +466,9 @@ impl AppView {
     ) {
         use trove_core::services::screenshot;
 
-        let dir = AppConfig::config_dir().unwrap_or_else(std::env::temp_dir);
-        let dest = screenshot::destination(&dir);
+        // The capture lands in the incoming directory and stays there: the
+        // import links it, so this is its permanent home.
+        let dest = screenshot::destination(&trove_core::paths::incoming_dir());
         let controller = self.controller.clone();
         let handle = window.window_handle();
 
