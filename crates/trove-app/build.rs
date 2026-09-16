@@ -21,6 +21,11 @@ use std::{env, fs};
 
 fn main() {
     println!("cargo:rerun-if-env-changed=TROVE_THEMES_DIR");
+    // The catalogs are read by `rust_i18n::i18n!` at compile time, and cargo
+    // has no way to know that on its own: without this line, editing a `.toml`
+    // leaves the previous strings baked into the binary until some other
+    // source change happens to trigger a rebuild.
+    println!("cargo:rerun-if-changed=locales");
 
     let out = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR is set by cargo"));
     let mut generated = String::from(
