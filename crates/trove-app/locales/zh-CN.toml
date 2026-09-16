@@ -377,7 +377,6 @@ preview_zoom_min_desc = "图片和 3D 预览的最小缩放级别（0.1–1.0）
 preview_zoom_max = "最大缩放"
 preview_zoom_max_desc = "图片和 3D 预览的最大缩放级别（2.0–100.0）。值越大，能放得越近。默认：32×。"
 update_check = "检查更新"
-update_check_desc = "每天检查一次新版本，有新版本时在状态栏给出链接。Trove 不会自行下载或安装任何东西，升级由你自己（或包管理器）决定。"
 update_checking = "正在检查…"
 update_available = "有新版本 %{version} 可用"
 update_failed = "检查失败：%{error}"

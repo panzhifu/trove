@@ -31,28 +31,25 @@ pub(super) fn about_page(controller: &Entity<LibraryController>) -> SettingPage 
                     )
                     .description(rust_i18n::t!("settings.about_version_desc").to_string()),
                 )
-                .item(
-                    SettingItem::new(
-                        rust_i18n::t!("settings.update_check").to_string(),
-                        SettingField::switch(
-                            |_cx| AppConfig::load().update_check(),
-                            |enabled, cx| {
-                                let mut config = AppConfig::load();
-                                config.update_check = Some(enabled);
-                                if enabled {
-                                    // A missing timestamp reads as "never
-                                    // checked", which is due at once — so
-                                    // switching back on checks on the next
-                                    // launch rather than in 24 hours.
-                                    config.last_update_check = None;
-                                }
-                                let _ = config.save();
-                                cx.refresh_windows();
-                            },
-                        ),
-                    )
-                    .description(rust_i18n::t!("settings.update_check_desc").to_string()),
-                ),
+                .item(SettingItem::new(
+                    rust_i18n::t!("settings.update_check").to_string(),
+                    SettingField::switch(
+                        |_cx| AppConfig::load().update_check(),
+                        |enabled, cx| {
+                            let mut config = AppConfig::load();
+                            config.update_check = Some(enabled);
+                            if enabled {
+                                // A missing timestamp reads as "never
+                                // checked", which is due at once — so
+                                // switching back on checks on the next
+                                // launch rather than in 24 hours.
+                                config.last_update_check = None;
+                            }
+                            let _ = config.save();
+                            cx.refresh_windows();
+                        },
+                    ),
+                )),
         )
         .group(language_group(controller))
 }
