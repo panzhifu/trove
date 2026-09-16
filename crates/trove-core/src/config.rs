@@ -300,16 +300,14 @@ impl AppConfig {
         }
     }
 
-    /// Make sure a library exists to open: register the default when the
-    /// registry is empty, record the active choice, and create both
-    /// directories. Returns the entry to open.
+    /// Make sure the recorded library exists on disk and return it.
+    ///
+    /// The registry itself is never filled in here: the welcome window makes
+    /// the user create a library before the main window opens, so inventing
+    /// one behind their back would only produce an empty library they did not
+    /// ask for. A registry that is somehow empty still resolves to the default
+    /// entry rather than panicking.
     pub fn ensure_active_library(&mut self) -> Result<LibraryEntry> {
-        if self.libraries.is_empty() {
-            self.libraries.push(LibraryEntry {
-                slug: paths::DEFAULT_LIBRARY_SLUG.to_string(),
-                name: DEFAULT_LIBRARY_NAME.to_string(),
-            });
-        }
         let entry = self.active_entry();
         if self.active_library.as_deref() != Some(entry.slug.as_str()) {
             self.active_library = Some(entry.slug.clone());

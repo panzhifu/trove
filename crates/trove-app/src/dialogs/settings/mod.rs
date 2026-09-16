@@ -25,8 +25,8 @@
 
 mod about;
 mod appearance;
-mod general;
-mod maintenance;
+mod files;
+mod model;
 mod search;
 mod shortcuts;
 
@@ -63,12 +63,15 @@ pub enum SettingsPage {
     /// Light/dark mode, the named themes, and the custom-theme folder.
     #[expect(dead_code, reason = "deep-link target; no entry point wired yet")]
     Appearance,
+    /// Disk usage, the libraries, watched folders and the maintenance jobs.
     #[expect(dead_code, reason = "deep-link target; no entry point wired yet")]
-    General,
+    Files,
+    /// How the 3D preview draws a model.
+    #[expect(dead_code, reason = "deep-link target; no entry point wired yet")]
+    Model,
+    /// The full-text index and the visual fingerprints.
     #[expect(dead_code, reason = "deep-link target; no entry point wired yet")]
     Search,
-    #[expect(dead_code, reason = "deep-link target; no entry point wired yet")]
-    Maintenance,
     #[expect(dead_code, reason = "deep-link target; no entry point wired yet")]
     Shortcuts,
 }
@@ -79,9 +82,9 @@ impl SettingsPage {
         match self {
             Self::About => 0,
             Self::Appearance => 1,
-            Self::General => 2,
-            Self::Search => 3,
-            Self::Maintenance => 4,
+            Self::Files => 2,
+            Self::Model => 3,
+            Self::Search => 4,
             Self::Shortcuts => 5,
         }
     }
@@ -150,6 +153,9 @@ pub struct SettingsView {
     /// Snapshot of the stats / fingerprint-coverage queries (see
     /// [`StatsSnapshot`]).
     stats: StatsSnapshot,
+    /// Disk usage, measured on the background executor. `None` until the
+    /// first walk finishes; the Files page shows a measuring line meanwhile.
+    storage: Option<trove_core::services::storage::StorageReport>,
     /// Last-seen `busy` flag and library root: a transition means a job
     /// finished or the library changed, both of which stale the snapshot.
     last_busy: bool,
@@ -180,23 +186,54 @@ impl SettingsView {
                 this.last_busy = busy;
                 this.last_root = root;
                 this.stats = this.refresh_snapshots(cx);
+                // A finished job (a rebuild, a backup) changes the numbers on
+                // the Files page, and so does a different library.
+                this.measure_storage(cx);
             }
             cx.notify();
         })
         .detach();
         let stats = Self::compute_snapshots(&controller, cx);
         let last_root = controller.read(cx).library.root().to_path_buf();
-        let this = Self {
+        let mut this = Self {
             controller,
             focus_handle: cx.focus_handle(),
             initial_page: Some(page),
             stats,
+            storage: None,
             last_busy: false,
             last_root,
             _appearance,
         };
         this.focus_handle.focus(window, cx);
+        this.measure_storage(cx);
         this
+    }
+
+    /// Walk the application's directories on the background executor. The
+    /// measurements are IO over trees that can hold thousands of files, so
+    /// they must not run under a render.
+    fn measure_storage(&mut self, cx: &mut Context<Self>) {
+        let (data_root, cache_root) = {
+            let ctl = self.controller.read(cx);
+            (
+                ctl.library.root().to_path_buf(),
+                ctl.library.cache().to_path_buf(),
+            )
+        };
+        cx.spawn(async move |this, cx| {
+            let report = cx
+                .background_executor()
+                .spawn(
+                    async move { trove_core::services::storage::report(&data_root, &cache_root) },
+                )
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.storage = Some(report);
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     fn compute_snapshots(controller: &Entity<LibraryController>, cx: &App) -> StatsSnapshot {
@@ -233,12 +270,13 @@ impl Render for SettingsView {
         let settings = settings
             .page(about::about_page(&self.controller))
             .page(appearance::appearance_page(&self.controller, cx))
-            .page(general::general_page(
+            .page(files::files_page(
                 &self.controller,
                 stats.library.clone(),
+                self.storage,
             ))
+            .page(model::model_page())
             .page(search::search_page(&self.controller, stats.sig_coverage))
-            .page(maintenance::maintenance_page(&self.controller))
             .page(shortcuts::shortcuts_page());
 
         // Client-side decorations are forced app-wide, so this window draws

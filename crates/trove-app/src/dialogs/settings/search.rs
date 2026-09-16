@@ -1,14 +1,14 @@
-//! Search page: visual-fingerprint coverage and the backfill action
-//! for images imported before fingerprints existed.
+//! Search page: the full-text index, and the visual fingerprints (pHash +
+//! colour histogram) that power "search by image" and "search by colour".
 
+use super::files::{finish_job, start_job};
 use super::*;
 
 // ============================ search page ===================================
 
-/// Search ▸ per-image visual fingerprints (pHash + colour histogram) that
-/// power "search by image" and "search by colour", plus a backfill button
-/// for libraries imported before fingerprints were computed. The coverage
-/// number is the [`StatsSnapshot`] value, not a live query.
+/// Search ▸ the full-text index, and the per-image fingerprints that power
+/// "search by image" and "search by colour". The coverage number is the
+/// [`StatsSnapshot`] value, not a live query.
 pub(super) fn search_page(
     controller: &Entity<LibraryController>,
     sig_coverage: (u64, u64),
@@ -18,6 +18,21 @@ pub(super) fn search_page(
         .resettable(false)
         .group(
             SettingGroup::new()
+                .title(rust_i18n::t!("settings.search_index").to_string())
+                .item(
+                    SettingItem::new(
+                        rust_i18n::t!("settings.rebuild_index").to_string(),
+                        SettingField::render({
+                            let controller = controller.clone();
+                            move |_, _, cx| index_row(&controller, cx)
+                        }),
+                    )
+                    .description(rust_i18n::t!("settings.rebuild_index_desc").to_string()),
+                ),
+        )
+        .group(
+            SettingGroup::new()
+                .title(rust_i18n::t!("settings.search_fingerprints").to_string())
                 .item(
                     SettingItem::new(
                         rust_i18n::t!("settings.sig_coverage").to_string(),
@@ -114,6 +129,39 @@ fn backfill_row(controller: Entity<LibraryController>, cx: &mut App) -> Div {
                     });
                 })
                 .detach();
+            }),
+    )
+}
+
+/// Search-index row: a synchronous rebuild (database-bound, quick).
+fn index_row(controller: &Entity<LibraryController>, cx: &mut App) -> Div {
+    let busy = controller.read(cx).busy;
+    h_flex().flex_1().justify_end().child(
+        Button::new("rebuild-index")
+            .outline()
+            .small()
+            .disabled(busy)
+            .label(rust_i18n::t!("settings.rebuild_index").to_string())
+            .on_click({
+                let controller = controller.clone();
+                move |_, _, cx| {
+                    if !start_job(&controller, cx) {
+                        return;
+                    }
+                    let result = {
+                        let library = &controller.read(cx).library;
+                        trove_core::services::maintenance::rebuild_search_index(library)
+                    };
+                    let message = match result {
+                        Ok(count) => {
+                            rust_i18n::t!("settings.rebuild_index_done", count = count).to_string()
+                        }
+                        Err(e) => {
+                            rust_i18n::t!("settings.job_failed", error = e.to_string()).to_string()
+                        }
+                    };
+                    finish_job(&controller, message, cx);
+                }
             }),
     )
 }

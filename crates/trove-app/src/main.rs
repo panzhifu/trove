@@ -243,8 +243,17 @@ fn main() {
                     ..crate::app::title_bar::window_options()
                 });
                 cx.open_window(options, |window, cx| {
-                    let view = cx.new(|cx| AppView::new(window, cx));
-                    cx.new(|cx| Root::new(view, window, cx))
+                    // With no library there is nothing to open, so the welcome
+                    // window is the whole application until one exists.
+                    // Both branches return the same `Root` type, so the
+                    // window's root is decided here and nowhere else.
+                    if trove_core::config::AppConfig::load().libraries.is_empty() {
+                        let view = cx.new(|cx| app::WelcomeView::new(window, cx));
+                        cx.new(|cx| Root::new(view, window, cx))
+                    } else {
+                        let view = cx.new(|cx| AppView::new(window, cx));
+                        cx.new(|cx| Root::new(view, window, cx))
+                    }
                 })
                 .expect("failed to open window");
             })
