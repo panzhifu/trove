@@ -86,10 +86,83 @@ pub(crate) fn uninstall(sha: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// One entry in a mass-activation report: a font that was skipped (already in
+/// the target state) or that failed, with the reason.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ActivationIssue {
+    AlreadyActive,
+    AlreadyInactive,
+    Failed(String),
+}
+
+/// Result of a mass activate / deactivate run. Mirrors FontMatrix's
+/// activation report: counts plus per-font issues, so the UI can show a
+/// dialog summarising what was done, skipped and failed.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct ActivationReport {
+    pub activated: usize,
+    pub deactivated: usize,
+    /// sha → problem, for fonts not in the desired state after the run.
+    pub issues: Vec<(String, ActivationIssue)>,
+}
+
+impl ActivationReport {
+    /// Activate every font in `sources`, returning a report. Activation is
+    /// idempotent and transactional: fonts already active are counted as
+    /// skipped, fonts that copy/registration fail carry the reason.
+    pub(crate) fn activate_all(sources: &[(&Path, &str)]) -> Self {
+        let mut report = ActivationReport::default();
+        for (source, sha) in sources {
+            if is_installed(sha) {
+                report
+                    .issues
+                    .push((sha.to_string(), ActivationIssue::AlreadyActive));
+                continue;
+            }
+            match install(source, sha) {
+                Ok(_) => report.activated += 1,
+                Err(e) => report
+                    .issues
+                    .push((sha.to_string(), ActivationIssue::Failed(e))),
+            }
+        }
+        report
+    }
+
+    /// Deactivate every font in `shas`, returning a report. Already-installed
+    /// fonts are skipped with [ActivationIssue::AlreadyInactive]; failures
+    /// carry the underlying error.
+    pub(crate) fn deactivate_all(shas: &[&str]) -> Self {
+        let mut report = ActivationReport::default();
+        for sha in shas {
+            if !is_installed(sha) {
+                report
+                    .issues
+                    .push((sha.to_string(), ActivationIssue::AlreadyInactive));
+                continue;
+            }
+            match uninstall(sha) {
+                Ok(_) => report.deactivated += 1,
+                Err(e) => report
+                    .issues
+                    .push((sha.to_string(), ActivationIssue::Failed(e))),
+            }
+        }
+        report
+    }
+}
+
 /// Best-effort font-cache refresh so applications pick the change up.
+/// Runs in a background thread: `fc-cache -f` scans the whole font directory
+/// and blocks for hundreds of ms to seconds on large collections —
+/// waiting on it on the main thread is what made installation feel
+/// sluggish. Font files are already on disk before this runs; the cache
+/// just needs to catch up.
 fn refresh_cache() {
     if cfg!(target_os = "linux") {
-        let _ = std::process::Command::new("fc-cache").arg("-f").output();
+        std::thread::spawn(|| {
+            let _ = std::process::Command::new("fc-cache").arg("-f").output();
+        });
     }
 }
 
