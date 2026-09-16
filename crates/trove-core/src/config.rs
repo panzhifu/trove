@@ -66,12 +66,6 @@ pub struct AppConfig {
     /// off for a flatter, marginally cheaper picture.
     #[serde(default)]
     pub point_enhance: Option<bool>,
-    /// Sample text rendered on font-specimen thumbnails (font cards). The
-    /// card splits it by script into three stacked rows — Latin, CJK, digits
-    /// — and characters missing from a given font are skipped while
-    /// rendering.
-    #[serde(default)]
-    pub font_sample: Option<String>,
     /// Light/dark appearance. `System` follows the OS and is the default.
     #[serde(default)]
     pub appearance: Appearance,
@@ -376,15 +370,6 @@ impl AppConfig {
                 .unwrap_or(crate::media::import::LINK_OVER_MB_DEFAULT)
                 .saturating_mul(1 << 20),
         }
-    }
-
-    /// Sample text for font-specimen thumbnails (`font_sample` or the
-    /// built-in default).
-    pub fn font_sample_text(&self) -> String {
-        self.font_sample
-            .clone()
-            .filter(|s| !s.trim().is_empty())
-            .unwrap_or_else(|| "AaBbGg 永 0123456789".into())
     }
 
     /// Resolved library path: the `TROVE_LIBRARY_DIR` override when set,

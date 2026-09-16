@@ -243,47 +243,9 @@ pub(crate) fn ensure_font_registered(
     }
 }
 
-/// Cached copy of the user's font sample text (config reads are file I/O,
-/// and every visible font cell asks for it on every render). TTL keeps the
-/// settings change visible without wiring invalidation.
-fn cached_font_sample() -> String {
-    static CACHE: OnceLock<Mutex<(std::time::Instant, String)>> = OnceLock::new();
-    let mut cache = CACHE
-        .get_or_init(|| {
-            Mutex::new((
-                std::time::Instant::now() - std::time::Duration::from_secs(10),
-                String::new(),
-            ))
-        })
-        .lock()
-        .unwrap();
-    if cache.0.elapsed() > std::time::Duration::from_secs(2) {
-        cache.1 = trove_core::config::AppConfig::load().font_sample_text();
-        cache.0 = std::time::Instant::now();
-    }
-    cache.1.clone()
-}
-
-/// The configured font sample text with fontmatrix-style placeholders
-/// expanded: `{name}` / `{family}` become the font's own family name. An
-/// empty setting falls back to the family name itself — the classic
-/// type-foundry specimen line.
-pub(crate) fn font_sample_for(family: &str) -> String {
-    let sample = cached_font_sample();
-    let sample = sample.trim();
-    if sample.is_empty() {
-        return family.to_string();
-    }
-    if sample.contains("{name}") || sample.contains("{family}") {
-        sample.replace("{name}", family).replace("{family}", family)
-    } else {
-        sample.to_string()
-    }
-}
-
-/// One live specimen line for a registered font: the sample text rendered
-/// in the font itself, centered on a soft card background, single row. The
-/// caller sizes it (grid cells stretch, list leads get fixed dims).
+/// One live specimen line for a registered font: the built-in sample text
+/// rendered in the font itself, centered on a soft card background, single
+/// row. The caller sizes it (grid cells stretch, list leads get fixed dims).
 pub(crate) fn font_live_preview(family: &str, cx: &App) -> Div {
     div()
         .flex()
@@ -296,16 +258,15 @@ pub(crate) fn font_live_preview(family: &str, cx: &App) -> Div {
                 .font_family(family.to_string())
                 .whitespace_nowrap()
                 .text_color(cx.theme().foreground)
-                .child(font_sample_for(family)),
+                .child(trove_core::media::thumb::DEFAULT_FONT_SAMPLE),
         )
 }
 
-/// A grid font cell, fontmatrix style: the sample rendered in the font
-/// itself as three stacked rows — Latin on top, CJK in the middle, digits at
-/// the bottom, the same split the rasterized font card uses — with a small
-/// UI-font family label pinned to the top-left corner (the "subtitled
-/// preview" mode), so every specimen stays attributable no matter what the
-/// sample text shows.
+/// A grid font cell, fontmatrix style: the built-in specimen rendered in the
+/// font itself as three stacked rows — Latin on top, CJK in the middle,
+/// digits at the bottom, the same rows the rasterized font card stacks —
+/// with a small UI-font family label pinned to the top-left corner (the
+/// "subtitled preview" mode), so every specimen stays attributable.
 pub(crate) fn font_specimen_card(family: &str, cx: &App) -> Div {
     div()
         .relative()
@@ -322,15 +283,17 @@ pub(crate) fn font_specimen_card(family: &str, cx: &App) -> Div {
                 .justify_center()
                 .w_full()
                 .h_full()
-                .children(font_specimen_lines(family).map(|line| {
-                    div()
-                        .font_family(family.to_string())
-                        .whitespace_nowrap()
-                        .truncate()
-                        .max_w_full()
-                        .text_color(cx.theme().foreground)
-                        .child(line)
-                })),
+                .children(
+                    trove_core::media::thumb::default_specimen_rows().map(|line| {
+                        div()
+                            .font_family(family.to_string())
+                            .whitespace_nowrap()
+                            .truncate()
+                            .max_w_full()
+                            .text_color(cx.theme().foreground)
+                            .child(line)
+                    }),
+                ),
         )
         .child(
             div()
@@ -343,15 +306,6 @@ pub(crate) fn font_specimen_card(family: &str, cx: &App) -> Div {
                 .text_color(cx.theme().muted_foreground)
                 .child(family.to_string()),
         )
-}
-
-/// The three live specimen lines for a registered font: the configured
-/// sample text (after `{name}` / `{family}` expansion) split by script —
-/// Latin, CJK, digits — exactly the rows the rasterized font card stacks.
-/// Rows the sample never mentions carry the built-in lines, and characters
-/// a font lacks are resolved by gpui's own fallback chain.
-pub(crate) fn font_specimen_lines(family: &str) -> [String; 3] {
-    trove_core::media::thumb::specimen_rows(&font_sample_for(family))
 }
 
 // ---------------------------------------------------------------------------
