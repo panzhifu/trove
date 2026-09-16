@@ -10,6 +10,8 @@ pub mod title_bar;
 
 mod root;
 mod tray;
+pub mod welcome;
 
 pub use root::AppView;
 pub(crate) use root::run_update_check;
+pub use welcome::WelcomeView;

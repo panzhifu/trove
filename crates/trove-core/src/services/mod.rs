@@ -10,5 +10,6 @@ pub mod kwin;
 pub mod maintenance;
 pub mod open_external;
 pub mod screenshot;
+pub mod storage;
 pub mod update;
 pub mod xmp;
