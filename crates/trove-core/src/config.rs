@@ -66,8 +66,10 @@ pub struct AppConfig {
     /// off for a flatter, marginally cheaper picture.
     #[serde(default)]
     pub point_enhance: Option<bool>,
-    /// Sample text rendered on font-specimen thumbnails (font cards).
-    /// Characters missing from a given font are skipped while rendering.
+    /// Sample text rendered on font-specimen thumbnails (font cards). The
+    /// card splits it by script into three stacked rows — Latin, CJK, digits
+    /// — and characters missing from a given font are skipped while
+    /// rendering.
     #[serde(default)]
     pub font_sample: Option<String>,
     /// Light/dark appearance. `System` follows the OS and is the default.
@@ -382,7 +384,7 @@ impl AppConfig {
         self.font_sample
             .clone()
             .filter(|s| !s.trim().is_empty())
-            .unwrap_or_else(|| "Aa 允 123".into())
+            .unwrap_or_else(|| "AaBbGg 永 0123456789".into())
     }
 
     /// Resolved library path: the `TROVE_LIBRARY_DIR` override when set,

@@ -100,14 +100,89 @@ fn card_source(path: &Path, size: u64) -> CardSource {
 
 /// Size of the font-specimen card, in pixels (landscape, thumbnail-scale).
 const FONT_CARD_SIZE: (u32, u32) = (512, 256);
-/// Pixel size used to rasterize the sample text on the card.
-const FONT_CARD_PX: f32 = 88.0;
 
-/// Render a "font specimen card" for a font blob: the configured sample text
-/// (Settings ▸ General) set in the font itself on a light card. Characters
-/// the font does not cover are skipped, so CJK fonts show the CJK sample
-/// glyph and Latin-only fonts fall back to "Aa 123". Returns `None` when the
-/// bytes are not a parseable TTF/OTF (the asset keeps its icon).
+/// Horizontal margin kept clear on both sides of the card.
+const FONT_CARD_MARGIN: f32 = 28.0;
+/// Pixel size for the specimen rows, by how many rows the card shows: one
+/// row gets the card to itself and renders larger than three sharing it.
+const FONT_CARD_PX: [f32; 4] = [0.0, 96.0, 72.0, 64.0];
+
+/// Which specimen row a character belongs to. The card stacks the three
+/// scripts the way a type founder's specimen does: Latin on top, CJK in the
+/// middle, digits at the bottom.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScriptRow {
+    Latin,
+    Cjk,
+    Digit,
+}
+
+/// CJK ideographs, kana, hangul and the fullwidth forms that travel with
+/// them — everything the middle row is allowed to show.
+fn is_cjk(ch: char) -> bool {
+    matches!(
+        ch as u32,
+        0x2E80..=0x9FFF // radicals, CJK symbols, kana, ideographs
+            | 0xAC00..=0xD7AF // hangul syllables
+            | 0xF900..=0xFAFF // CJK compatibility ideographs
+            | 0xFF00..=0xFFEF // fullwidth forms
+            | 0x1100..=0x11FF // hangul jamo
+            | 0x20000..=0x2FA1F // ideograph extensions B..F
+            | 0x30000..=0x323AF // ideograph extensions G..H
+    )
+}
+
+fn script_row(ch: char) -> Option<ScriptRow> {
+    if ch.is_ascii_digit() {
+        Some(ScriptRow::Digit)
+    } else if ch.is_ascii_alphabetic() {
+        Some(ScriptRow::Latin)
+    } else if is_cjk(ch) {
+        Some(ScriptRow::Cjk)
+    } else {
+        None
+    }
+}
+
+/// Split the configured sample text into the three specimen rows — Latin,
+/// CJK, digits — keeping first occurrences in order and dropping everything
+/// else (spaces, punctuation, other scripts). A category the sample does not
+/// cover falls back to its built-in line, so a fresh card always reads
+/// Latin / CJK / digits from top to bottom.
+fn specimen_rows(sample: &str) -> [String; 3] {
+    const FALLBACKS: [&str; 3] = ["AaBbGg", "永", "0123456789"];
+    let mut picked: [Vec<char>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+    let mut seen = [
+        std::collections::HashSet::new(),
+        std::collections::HashSet::new(),
+        std::collections::HashSet::new(),
+    ];
+    for ch in sample.chars() {
+        if let Some(row) = script_row(ch) {
+            let i = row as usize;
+            if seen[i].insert(ch) {
+                picked[i].push(ch);
+            }
+        }
+    }
+    let mut rows: [String; 3] = Default::default();
+    for (i, row) in rows.iter_mut().enumerate() {
+        *row = if picked[i].is_empty() {
+            FALLBACKS[i].to_string()
+        } else {
+            picked[i].iter().collect()
+        };
+    }
+    rows
+}
+
+/// Render a "font specimen card" for a font blob: three rows stacked like a
+/// type founder's specimen — Latin letters on top, CJK in the middle, digits
+/// at the bottom — taken from the configured sample text (Settings ▸ General)
+/// and set in the font itself on a light card. Characters the font does not
+/// cover are dropped, and a row left empty by that disappears so the
+/// remaining rows re-centre. Returns `None` when the bytes are not a
+/// parseable TTF/OTF (the asset keeps its icon).
 fn write_font_card(blob_path: &Path, out: &Path) -> Option<PathBuf> {
     let bytes = std::fs::read(blob_path).ok()?;
     let font = fontdue::Font::from_bytes(bytes, fontdue::FontSettings::default()).ok()?;
@@ -116,50 +191,106 @@ fn write_font_card(blob_path: &Path, out: &Path) -> Option<PathBuf> {
     let (w, h) = FONT_CARD_SIZE;
     let mut card = image::RgbaImage::from_pixel(w, h, image::Rgba([0xF7, 0xF6, 0xF3, 0xFF]));
     let ink = [0x20_u8, 0x21, 0x24];
-    let mut pen_x = 28.0_f32;
-    let baseline = 152.0_f32;
+    let lines = specimen_rows(&sample);
 
-    for ch in sample.chars() {
-        if pen_x + FONT_CARD_PX > w as f32 {
-            break;
-        }
-        if font.lookup_glyph_index(ch) == 0 {
-            // Glyph missing from this font; keep word gaps sensible.
-            if ch == ' ' {
-                pen_x += FONT_CARD_PX * 0.35;
+    // Rasterize every usable glyph up front: a row is dropped entirely when
+    // the font covers none of its characters, so the visible rows can share
+    // the card height evenly instead of leaving an empty band behind. Rows
+    // are collected at the smallest per-row size first — how many survive
+    // decides the final pixel size, and the survivors are re-rasterized at
+    // it (a cheap second pass over a handful of glyphs).
+    let collect = |px: f32| -> Vec<Vec<(fontdue::Metrics, Vec<u8>)>> {
+        let mut rows = Vec::new();
+        for line in &lines {
+            let mut glyphs = Vec::new();
+            let mut pen_x = 0.0_f32;
+            for ch in line.chars() {
+                if font.lookup_glyph_index(ch) == 0 {
+                    continue;
+                }
+                // Overflowing rows are truncated by advance width, keeping
+                // the horizontal margins clear on both sides.
+                if pen_x + px > w as f32 - 2.0 * FONT_CARD_MARGIN {
+                    break;
+                }
+                let (metrics, bitmap) = font.rasterize(ch, px);
+                if metrics.width == 0 || metrics.height == 0 {
+                    continue;
+                }
+                pen_x += metrics.advance_width;
+                glyphs.push((metrics, bitmap));
             }
-            continue;
+            if !glyphs.is_empty() {
+                rows.push(glyphs);
+            }
         }
-        let (metrics, bitmap) = font.rasterize(ch, FONT_CARD_PX);
-        if metrics.width == 0 || metrics.height == 0 {
+        rows
+    };
+    let mut rows = collect(FONT_CARD_PX[3]);
+    let px = FONT_CARD_PX[rows.len().clamp(1, 3)];
+    if px != FONT_CARD_PX[3] {
+        rows = collect(px);
+    }
+
+    let band = h as f32 / rows.len() as f32;
+    let blend = |c: u8, ink: u8, a: u32| ((ink as u32 * a + c as u32 * (255 - a)) / 255) as u8;
+    for (row, glyphs) in rows.iter().enumerate() {
+        // The row's ink extent relative to its baseline (fontdue works
+        // y-up), used to centre the band and the line itself.
+        let ink_top = glyphs
+            .iter()
+            .map(|(m, _)| m.ymin as f32 + m.height as f32)
+            .fold(f32::MIN, f32::max);
+        let ink_bottom = glyphs
+            .iter()
+            .map(|(m, _)| m.ymin as f32)
+            .fold(f32::MAX, f32::min);
+        let ink_left = glyphs
+            .iter()
+            .scan(0.0_f32, |pen, (m, _)| {
+                let left = *pen + m.xmin as f32;
+                *pen += m.advance_width;
+                Some(left)
+            })
+            .fold(f32::MAX, f32::min);
+        let ink_right = glyphs
+            .iter()
+            .scan(0.0_f32, |pen, (m, _)| {
+                let right = *pen + m.xmin as f32 + m.width as f32;
+                *pen += m.advance_width;
+                Some(right)
+            })
+            .fold(f32::MIN, f32::max);
+
+        let baseline = band * (row as f32 + 0.5) + (ink_top + ink_bottom) * 0.5;
+        let offset = (w as f32 - (ink_right - ink_left)) * 0.5 - ink_left;
+
+        let mut pen_x = 0.0_f32;
+        for (metrics, bitmap) in glyphs {
+            let left = (pen_x + metrics.xmin as f32 + offset).round() as i32;
+            let top = (baseline - (metrics.ymin as f32 + metrics.height as f32)).round() as i32;
+            for row_px in 0..metrics.height {
+                for col in 0..metrics.width {
+                    let a = bitmap[row_px * metrics.width + col] as u32;
+                    if a == 0 {
+                        continue;
+                    }
+                    let x = left + col as i32;
+                    let y = top + row_px as i32;
+                    if x < 0 || y < 0 || x >= w as i32 || y >= h as i32 {
+                        continue;
+                    }
+                    let p = card.get_pixel_mut(x as u32, y as u32);
+                    *p = image::Rgba([
+                        blend(p[0], ink[0], a),
+                        blend(p[1], ink[1], a),
+                        blend(p[2], ink[2], a),
+                        255,
+                    ]);
+                }
+            }
             pen_x += metrics.advance_width;
-            continue;
         }
-        // fontdue works y-up; the bitmap's top row is the glyph's ymax.
-        let left = (pen_x + metrics.xmin as f32).round() as i32;
-        let top = (baseline - (metrics.ymin as f32 + metrics.height as f32)).round() as i32;
-        for row in 0..metrics.height {
-            for col in 0..metrics.width {
-                let a = bitmap[row * metrics.width + col] as u32;
-                if a == 0 {
-                    continue;
-                }
-                let x = left + col as i32;
-                let y = top + row as i32;
-                if x < 0 || y < 0 || x >= w as i32 || y >= h as i32 {
-                    continue;
-                }
-                let p = card.get_pixel_mut(x as u32, y as u32);
-                let blend = |c: u8, ink: u8| ((ink as u32 * a + c as u32 * (255 - a)) / 255) as u8;
-                *p = image::Rgba([
-                    blend(p[0], ink[0]),
-                    blend(p[1], ink[1]),
-                    blend(p[2], ink[2]),
-                    255,
-                ]);
-            }
-        }
-        pen_x += metrics.advance_width;
     }
 
     if let Some(parent) = out.parent() {
@@ -462,6 +593,46 @@ mod tests {
             .output()
             .map(|o| o.status.success())
             .unwrap_or(false)
+    }
+
+    /// The card's three rows: the sample text splits by script (Latin, CJK,
+    /// digits), duplicates collapse, non-script characters drop, and a
+    /// category the sample never mentions falls back to its built-in line.
+    #[test]
+    fn specimen_rows_split_by_script() {
+        let [latin, cjk, digits] = specimen_rows("AaBbGg 永 0123456789");
+        assert_eq!(latin, "AaBbGg");
+        assert_eq!(cjk, "永");
+        assert_eq!(digits, "0123456789");
+
+        // First occurrences win; repeats drop, CJK punctuation travels with
+        // the CJK row.
+        let [latin, cjk, digits] = specimen_rows("bA aB、漢字 A1");
+        assert_eq!(latin, "bAaB");
+        assert_eq!(cjk, "、漢字");
+        assert_eq!(digits, "1");
+
+        // A category absent from the sample gets its built-in line.
+        let [latin, cjk, digits] = specimen_rows("The quick brown fox");
+        assert_eq!(latin, "Thequickbrownfx");
+        assert_eq!(cjk, "永");
+        assert_eq!(digits, "0123456789");
+    }
+
+    /// Script classification: digits and Latin by ASCII, the CJK row takes
+    /// ideographs, kana, hangul and fullwidth forms, everything else is out.
+    #[test]
+    fn script_rows_classify_cjk_ranges() {
+        assert_eq!(script_row('5'), Some(ScriptRow::Digit));
+        assert_eq!(script_row('z'), Some(ScriptRow::Latin));
+        assert_eq!(script_row('Z'), Some(ScriptRow::Latin));
+        assert_eq!(script_row('永'), Some(ScriptRow::Cjk));
+        assert_eq!(script_row('あ'), Some(ScriptRow::Cjk));
+        assert_eq!(script_row('한'), Some(ScriptRow::Cjk));
+        assert_eq!(script_row('Ａ'), Some(ScriptRow::Cjk)); // fullwidth
+        assert_eq!(script_row('é'), None);
+        assert_eq!(script_row(' '), None);
+        assert_eq!(script_row('!'), None);
     }
 
     /// End-to-end poster-frame extraction, skipped when the optional ffmpeg
