@@ -28,12 +28,13 @@ pub(super) fn build_cell_element(
         cell.font_family.as_ref().and_then(|family| {
             crate::panels::common::ensure_font_registered(family, cell.font_blob.as_deref(), cx)
                 .then(|| {
-                    // Subtitled specimen card (fontmatrix style): the label
-                    // owns the top strip, so the sample line sizes down a
-                    // little to stay clear of it.
+                    // Subtitled specimen card (fontmatrix style): three
+                    // stacked rows (Latin / CJK / digits) under the label,
+                    // so the rows size down more than the old single line
+                    // did to fit the strip the label owns.
                     crate::panels::common::font_specimen_card(family, cx)
                         .size_full()
-                        .text_size(px((h * 0.34).clamp(16.0, 60.0)))
+                        .text_size(px((h * 0.20).clamp(11.0, 34.0)))
                         .into_any_element()
                 })
         })
