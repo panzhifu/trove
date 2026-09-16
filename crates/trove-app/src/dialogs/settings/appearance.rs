@@ -142,13 +142,17 @@ fn stored_theme(cx: &App, mode: ThemeMode) -> SharedString {
     }
 }
 
-/// Custom-themes row: the folder path, a reveal button and a reload button
-/// that re-scans the folder and re-applies the appearance.
+/// Custom-themes row: the folder path, and one button — a folder icon — that
+/// opens it.
+///
+/// Opening also re-scans. The reason to open that folder is to drop a `.json`
+/// into it, and a second button that only reloads would be a step nobody
+/// expects to take; the rescan happens either way, so a theme added while the
+/// window was open is in the picker the moment the user comes back.
 fn theme_dir_row(controller: &Entity<LibraryController>, cx: &mut App) -> Div {
     let dir = crate::app::theme::themes_dir();
     let path = dir.display().to_string();
     let controller = controller.clone();
-    let reveal = dir.clone();
 
     h_flex()
         .w_full()
@@ -166,30 +170,25 @@ fn theme_dir_row(controller: &Entity<LibraryController>, cx: &mut App) -> Div {
         .child(
             Button::new("open-theme-dir")
                 .ghost()
-                .xsmall()
+                .small()
                 .icon(IconName::Folder)
                 .tooltip(rust_i18n::t!("settings.theme_dir_open").to_string())
-                .on_click(move |_, _, _cx| {
-                    // Created on demand so the folder exists to drop files in.
-                    let _ = std::fs::create_dir_all(&reveal);
-                    crate::panels::common::reveal_path(&reveal);
-                }),
-        )
-        .child(
-            Button::new("reload-themes")
-                .outline()
-                .small()
-                .label(rust_i18n::t!("settings.theme_dir_reload").to_string())
                 .on_click(move |_, _, cx| {
+                    // Created on demand, so there is always a folder to open
+                    // and to drop files into.
+                    let _ = std::fs::create_dir_all(&dir);
                     let loaded = crate::app::theme::register_user_themes(cx);
                     crate::app::theme::apply_from_settings(None, cx);
-                    controller.update(cx, |ctl, cx| {
-                        ctl.notice = Some(
-                            rust_i18n::t!("settings.theme_dir_reloaded", count = loaded)
-                                .to_string(),
-                        );
-                        cx.notify();
-                    });
+                    if loaded > 0 {
+                        controller.update(cx, |ctl, cx| {
+                            ctl.notice = Some(
+                                rust_i18n::t!("settings.theme_dir_reloaded", count = loaded)
+                                    .to_string(),
+                            );
+                            cx.notify();
+                        });
+                    }
+                    crate::panels::common::reveal_path(&dir);
                 }),
         )
 }
