@@ -379,7 +379,6 @@ preview_zoom_min_desc = "Smallest zoom level for image and 3D previews (0.1–1.
 preview_zoom_max = "Maximum zoom"
 preview_zoom_max_desc = "Largest zoom level for image and 3D previews (2.0–100.0). Higher = can zoom in closer. Default: 32×."
 update_check = "Check for updates"
-update_check_desc = "Look for a newer release once a day and show a link in the status bar. Trove never downloads or installs anything by itself — the upgrade is yours (or your package manager's) to make."
 update_checking = "Checking…"
 update_available = "Version %{version} is available"
 update_failed = "Check failed: %{error}"
