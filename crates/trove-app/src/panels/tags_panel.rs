@@ -153,128 +153,190 @@ impl Render for TagsPanel {
         let mut flat: Vec<(&trove_core::model::Tag, usize)> = Vec::new();
         tag_rows(Uuid::nil(), &children_of, 0, &self.collapsed, &mut flat);
 
-        v_flex().size_full().p_2().gap_1().child(
-            div().flex_1().min_h_0().overflow_y_scrollbar().child(
-                v_flex()
-                    .gap_0p5()
-                    .w_full()
-                    .children(flat.into_iter().map(|(tag, depth)| {
-                        let id = tag.id;
-                        let count = counts.get(&id).copied().unwrap_or(0);
-                        let color = tag.color.clone();
-                        let name = tag.name.clone();
-                        let name_for_menu = name.clone();
-                        let controller = self.controller.clone();
-                        // Only parents with children get the fold chevron.
-                        let has_children =
-                            children_of.get(&id).is_some_and(|kids| !kids.is_empty());
-                        let is_folded = self.collapsed.contains(&id);
-                        // No explicit width: the flex column stretches the
-                        // row. `w_full` here would add the indent margin
-                        // on top of 100% and push the count off-panel.
-                        let mut row = div()
-                            .id(format!("tag-row-{id}"))
-                            .ml(px(14. * depth as f32))
-                            .cursor_pointer()
-                            .px_2()
-                            .py_1()
-                            .rounded(cx.theme().radius)
-                            .on_click(move |_ev: &ClickEvent, _window, cx| {
-                                controller.update(cx, move |ctl, cx| {
-                                    if ctl.active_tag == Some(id) {
-                                        ctl.select_tag(None);
-                                    } else {
-                                        ctl.select_tag(Some(id));
-                                    }
-                                    cx.notify();
-                                });
-                            })
-                            .child(
-                                h_flex()
-                                    .w_full()
-                                    .items_center()
-                                    .gap_1p5()
-                                    .when(has_children, |row| {
-                                        row.child(
-                                            div()
-                                                .id(format!("tag-fold-{id}"))
-                                                .cursor_pointer()
-                                                .flex_none()
-                                                .on_click(cx.listener(move |this, _, _, cx| {
-                                                    // Toggle membership: remove
-                                                    // when folded, insert when open.
-                                                    if !this.collapsed.remove(&id) {
-                                                        this.collapsed.insert(id);
-                                                    }
-                                                    cx.notify();
-                                                }))
-                                                .child(
-                                                    Icon::new(if is_folded {
-                                                        IconName::ChevronRight
-                                                    } else {
-                                                        IconName::ChevronDown
-                                                    })
-                                                    .size_3()
-                                                    .text_color(cx.theme().muted_foreground),
-                                                ),
-                                        )
-                                    })
-                                    .when_some(color, |row, hex| {
-                                        // Small color dot when the tag has one.
-                                        let rgb = hex_to_rgb(&hex);
-                                        row.child(
-                                            div()
-                                                .size_2()
-                                                .rounded_full()
-                                                .when_some(rgb, |dot, rgb| dot.bg(gpui::rgb(rgb))),
-                                        )
-                                    })
-                                    .child(
-                                        div()
-                                            .flex_1()
-                                            .min_w_0()
-                                            .truncate()
-                                            .text_sm()
-                                            .text_color(cx.theme().foreground)
-                                            .child(name),
-                                    )
-                                    .child(
-                                        div()
-                                            .flex_none()
-                                            .text_xs()
-                                            .text_color(cx.theme().muted_foreground)
-                                            .child(count.to_string()),
-                                    ),
-                            );
-                        if active == Some(id) {
-                            row = row.bg(cx.theme().secondary);
-                        }
-                        let ctl_tag = self.controller.clone();
-                        row = row
-                            .drag_over::<AssetsDrag>(|this, _, _, cx| this.bg(cx.theme().secondary))
-                            .on_drop(move |payload: &AssetsDrag, _window, cx| {
-                                ctl_tag.update(cx, move |ctl, cx| {
-                                    let _ = ctl.library.tag_assets(&payload.0, id, true);
-                                    ctl.generation += 1;
-                                    cx.notify();
-                                });
-                            });
-                        let controller = self.controller.clone();
-                        row.context_menu(move |menu, _window, cx| {
-                            tag_context_menu(
-                                menu,
-                                _window,
-                                cx,
-                                &controller,
-                                id,
-                                name_for_menu.clone(),
-                            )
-                        })
-                        .into_any_element()
-                    })),
-            ),
-        )
+        // Frequent tags: the highest rows by the same recursive count the
+        // rows display, flat (no nesting, no fold chevrons). Hidden entirely
+        // when nothing is tagged yet.
+        let controller = self.controller.clone();
+        let collapsed = &self.collapsed;
+        let mut frequent: Vec<(&trove_core::model::Tag, u64)> = all_tags
+            .iter()
+            .filter_map(|t| {
+                counts
+                    .get(&t.id)
+                    .copied()
+                    .filter(|c| *c > 0)
+                    .map(|c| (t, c))
+            })
+            .collect();
+        frequent.sort_by(|a, b| {
+            b.1.cmp(&a.1)
+                .then_with(|| a.0.name.to_lowercase().cmp(&b.0.name.to_lowercase()))
+        });
+        frequent.truncate(FREQUENT_TAGS_LIMIT);
+
+        let mut list = v_flex().gap_0p5().w_full();
+        if !frequent.is_empty() {
+            list = list
+                .child(
+                    div()
+                        .px_2()
+                        .pt_1()
+                        .pb_0p5()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(rust_i18n::t!("tags.frequent").to_string()),
+                )
+                .children(frequent.iter().map(|(tag, count)| {
+                    render_tag_row(&controller, tag, 0, *count, active, false, false, cx)
+                }))
+                .child(div().mt_1().border_t_1().border_color(cx.theme().border));
+        }
+        list = list.children(flat.into_iter().map(|(tag, depth)| {
+            let id = tag.id;
+            // Only parents with children get the fold chevron.
+            let has_children = children_of.get(&id).is_some_and(|kids| !kids.is_empty());
+            let is_folded = collapsed.contains(&id);
+            let count = counts.get(&id).copied().unwrap_or(0);
+            render_tag_row(
+                &controller,
+                tag,
+                depth,
+                count,
+                active,
+                has_children,
+                is_folded,
+                cx,
+            )
+        }));
+
+        v_flex()
+            .size_full()
+            .p_2()
+            .gap_1()
+            .child(div().flex_1().min_h_0().overflow_y_scrollbar().child(list))
     }
+}
+
+/// How many tags the "frequent" section shows at most.
+const FREQUENT_TAGS_LIMIT: usize = 8;
+
+/// One tag row, shared by the frequent section and the full tree. `depth`
+/// drives the indent; `has_children`/`is_folded` control the fold chevron
+/// (the frequent section passes `false`/`false` to stay flat).
+#[allow(clippy::too_many_arguments)]
+fn render_tag_row(
+    controller: &Entity<LibraryController>,
+    tag: &trove_core::model::Tag,
+    depth: usize,
+    count: u64,
+    active: Option<Uuid>,
+    has_children: bool,
+    is_folded: bool,
+    cx: &mut Context<TagsPanel>,
+) -> AnyElement {
+    let id = tag.id;
+    let color = tag.color.clone();
+    let name = tag.name.clone();
+    let name_for_menu = name.clone();
+    // The event closures below are 'static: hand them an owned handle.
+    let controller = controller.clone();
+    // The indent is padding, not margin: the row stretches to the panel
+    // edge (flex cross-axis), and a margin-left does not move a stretched
+    // row in Taffy — the same `ROW_PAD + ROW_INDENT * depth` scheme the
+    // explorer uses for its tree.
+    let ctl_click = controller.clone();
+    let mut row = div()
+        .id(format!("tag-row-{id}"))
+        .cursor_pointer()
+        .pl(px(8. + 14. * depth as f32))
+        .pr_2()
+        .py_1()
+        .rounded(cx.theme().radius)
+        .on_click(move |_ev: &ClickEvent, _window, cx| {
+            ctl_click.update(cx, move |ctl, cx| {
+                if ctl.active_tag == Some(id) {
+                    ctl.select_tag(None);
+                } else {
+                    ctl.select_tag(Some(id));
+                }
+                cx.notify();
+            });
+        })
+        .child(
+            h_flex()
+                .w_full()
+                .items_center()
+                .gap_1p5()
+                .when(has_children, |row| {
+                    row.child(
+                        div()
+                            .id(format!("tag-fold-{id}"))
+                            .cursor_pointer()
+                            .flex_none()
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                // Toggle membership: remove when folded,
+                                // insert when open.
+                                if !this.collapsed.remove(&id) {
+                                    this.collapsed.insert(id);
+                                }
+                                cx.notify();
+                            }))
+                            .child(
+                                Icon::new(if is_folded {
+                                    IconName::ChevronRight
+                                } else {
+                                    IconName::ChevronDown
+                                })
+                                .size_3()
+                                .text_color(cx.theme().muted_foreground),
+                            ),
+                    )
+                })
+                .when_some(color, |row, hex| {
+                    // Small color dot when the tag has one.
+                    let rgb = hex_to_rgb(&hex);
+                    row.child(
+                        div()
+                            .size_2()
+                            .rounded_full()
+                            .when_some(rgb, |dot, rgb| dot.bg(gpui::rgb(rgb))),
+                    )
+                })
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .text_sm()
+                        .text_color(cx.theme().foreground)
+                        .child(name),
+                )
+                .child(
+                    div()
+                        .flex_none()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(count.to_string()),
+                ),
+        );
+    if active == Some(id) {
+        row = row.bg(cx.theme().secondary);
+    }
+    let ctl_tag = controller.clone();
+    row = row
+        .drag_over::<AssetsDrag>(|this, _, _, cx| this.bg(cx.theme().secondary))
+        .on_drop(move |payload: &AssetsDrag, _window, cx| {
+            ctl_tag.update(cx, move |ctl, cx| {
+                let _ = ctl.library.tag_assets(&payload.0, id, true);
+                ctl.generation += 1;
+                cx.notify();
+            });
+        });
+    let controller = controller.clone();
+    row.context_menu(move |menu, _window, cx| {
+        tag_context_menu(menu, _window, cx, &controller, id, name_for_menu.clone())
+    })
+    .into_any_element()
 }
 
 /// Right-click menu for a tag row: filter, rename (inline dialog), color,
