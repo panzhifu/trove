@@ -1,20 +1,21 @@
-//! General page: library location, import mode, recents, watched
-//! folders, collect service, preview zoom limits, library statistics and
-//! the release check.
+//! General page: libraries, watched folders, collect service, preview zoom
+//! limits, library statistics and the release check.
 
 use super::*;
 use gpui_kit::component::setting::NumberFieldOptions;
+use trove_core::config::LibraryConfig;
 use trove_core::services::update::{self, UpdateState};
 
 // ============================ general page ===================================
 
-/// General ▸ Library: where the library lives, hot-switchable.
+/// General ▸ Libraries: which one is open, how to make another, where they
+/// live. The path is not the user's to choose — Trove keeps every library in
+/// the platform's data directory.
 pub(super) fn general_page(
     controller: &Entity<LibraryController>,
     stats: LibraryStats,
 ) -> SettingPage {
     let controller = controller.clone();
-    let location = controller.clone();
     SettingPage::new(rust_i18n::t!("settings.general").to_string())
         .icon(IconName::Settings)
         .resettable(false)
@@ -23,57 +24,29 @@ pub(super) fn general_page(
                 .title(rust_i18n::t!("settings.library").to_string())
                 .item(
                     SettingItem::new(
-                        rust_i18n::t!("settings.library_location").to_string(),
-                        SettingField::render(move |_, _, cx| library_location_row(&location, cx)),
-                    )
-                    .description(rust_i18n::t!("settings.library_location_desc").to_string()),
-                )
-                .item(
-                    SettingItem::new(
-                        rust_i18n::t!("settings.import_mode").to_string(),
-                        SettingField::dropdown(
-                            import_mode_options(),
-                            |_cx| {
-                                let linked = AppConfig::load().import_linked();
-                                SharedString::from(if linked { "link" } else { "copy" })
-                            },
+                        rust_i18n::t!("settings.library_name").to_string(),
+                        SettingField::input(
+                            |_cx| SharedString::from(AppConfig::load().active_entry().name),
                             |value, cx| {
                                 let mut config = AppConfig::load();
-                                config.import_mode = Some(value.to_string());
-                                if config.save().is_ok() {
+                                let slug = config.active_slug();
+                                if config.rename_library(&slug, &value).is_ok() {
                                     cx.refresh_windows();
                                 }
                             },
                         ),
                     )
-                    .description(rust_i18n::t!("settings.import_mode_desc").to_string()),
+                    .description(rust_i18n::t!("settings.library_name_desc").to_string()),
                 )
                 .item(
                     SettingItem::new(
-                        rust_i18n::t!("settings.import_link_over").to_string(),
-                        SettingField::input(
-                            |_cx| {
-                                SharedString::from(
-                                    AppConfig::load()
-                                        .import_link_over_mb
-                                        .unwrap_or(trove_core::media::import::LINK_OVER_MB_DEFAULT)
-                                        .to_string(),
-                                )
-                            },
-                            |value, cx| {
-                                let mut config = AppConfig::load();
-                                // An unparsable box keeps the stored value
-                                // rather than silently turning the rule off.
-                                if let Ok(mb) = value.trim().parse::<u64>() {
-                                    config.import_link_over_mb = Some(mb);
-                                    if config.save().is_ok() {
-                                        cx.refresh_windows();
-                                    }
-                                }
-                            },
-                        ),
+                        rust_i18n::t!("settings.library_current").to_string(),
+                        SettingField::render({
+                            let controller = controller.clone();
+                            move |_, _, cx| library_current_row(&controller, cx)
+                        }),
                     )
-                    .description(rust_i18n::t!("settings.import_link_over_desc").to_string()),
+                    .description(rust_i18n::t!("settings.library_current_desc").to_string()),
                 )
                 .item(
                     SettingItem::new(
@@ -83,7 +56,7 @@ pub(super) fn general_page(
                     .description(rust_i18n::t!("settings.point_enhance_desc").to_string()),
                 ),
         )
-        .group(recent_libraries_group(&controller))
+        .group(libraries_group(&controller))
         .group(watch_folders_group())
         .group(collect_group())
         .group(update_group())
@@ -91,87 +64,70 @@ pub(super) fn general_page(
         .group(zoom_group())
 }
 
-// ========================= recent libraries ==================================
+// ================================ libraries ==================================
 
-/// The two import modes: copy the file into the library, or link to it in
-/// place (values match `AppConfig.import_mode`).
-fn import_mode_options() -> Vec<(SharedString, SharedString)> {
-    vec![
-        (
-            SharedString::from("copy"),
-            rust_i18n::t!("settings.import_mode_copy")
-                .into_owned()
-                .into(),
-        ),
-        (
-            SharedString::from("link"),
-            rust_i18n::t!("settings.import_mode_link")
-                .into_owned()
-                .into(),
-        ),
-    ]
-}
-
-/// General ▸ Recent libraries: every previously opened library, one click to
-/// hot-switch (excluding the currently open one, which is marked instead).
-fn recent_libraries_group(controller: &Entity<LibraryController>) -> SettingGroup {
-    let controller = controller.clone();
+/// General ▸ Libraries: every registered library, one click to switch. The
+/// directories are Trove's business — a library is a name, not a path the
+/// user has to think about.
+fn libraries_group(controller: &Entity<LibraryController>) -> SettingGroup {
     let config = AppConfig::load();
-    let current = config.resolved_library_path();
-    let mut group =
-        SettingGroup::new().title(rust_i18n::t!("settings.recent_libraries").to_string());
-    let recent: Vec<PathBuf> = trove_core::history::AppHistory::load().libraries().to_vec();
-    if recent.is_empty() {
+    let current = config.active_slug();
+    let mut group = SettingGroup::new().title(rust_i18n::t!("settings.libraries").to_string());
+    let others: Vec<trove_core::config::LibraryEntry> = config
+        .libraries
+        .iter()
+        .filter(|l| l.slug != current)
+        .cloned()
+        .collect();
+    if others.is_empty() {
         group = group.item(SettingItem::new(
-            rust_i18n::t!("settings.no_recent").to_string(),
+            rust_i18n::t!("settings.no_other_libraries").to_string(),
             SettingField::render(|_, _, _| div()),
         ));
-        return group;
     }
-    for path in recent {
-        let is_current = path == current;
+    for entry in others {
         group = group.item(SettingItem::new(
-            path.display().to_string(),
+            entry.name.clone(),
             SettingField::render({
                 let controller = controller.clone();
-                move |_, _, cx| recent_library_row(&controller, path.clone(), is_current, cx)
+                move |_, _, cx| library_row(&controller, entry.clone(), cx)
             }),
         ));
     }
-    group
+    group.item(
+        SettingItem::new(
+            rust_i18n::t!("settings.new_library").to_string(),
+            SettingField::render({
+                let controller = controller.clone();
+                move |_, _, cx| new_library_row(&controller, cx)
+            }),
+        )
+        .description(rust_i18n::t!("settings.new_library_desc").to_string()),
+    )
 }
 
-/// One recent-library row: switch / remove buttons (the current library
-/// cannot be switched to or removed).
-fn recent_library_row(
+/// One library row: switch to it, or drop it from the registry. Deleting a
+/// library deletes its database; not one user file, because every asset is a
+/// link to something that lives outside.
+fn library_row(
     controller: &Entity<LibraryController>,
-    path: PathBuf,
-    is_current: bool,
-    cx: &mut App,
+    entry: trove_core::config::LibraryEntry,
+    _cx: &mut App,
 ) -> Div {
-    let row_id = format!("lib-{}", path.display());
+    let row_id = format!("lib-{}", entry.slug);
     h_flex()
         .w_full()
         .justify_end()
         .gap_2()
-        .when(is_current, |row| {
-            row.child(
-                div()
-                    .text_xs()
-                    .text_color(cx.theme().success)
-                    .child(rust_i18n::t!("settings.current_library").to_string()),
-            )
-        })
         .child(
             Button::new(format!("{row_id}-open"))
                 .outline()
                 .small()
-                .disabled(is_current)
                 .label(rust_i18n::t!("settings.open_library").to_string())
                 .on_click({
                     let controller = controller.clone();
-                    let path = path.clone();
-                    move |_, _, cx| switch_library(&controller, path.clone(), cx)
+                    let entry = entry.clone();
+                    move |_, _, cx| switch_library(&controller, entry.clone(), cx)
                 }),
         )
         .child(
@@ -179,12 +135,44 @@ fn recent_library_row(
                 .ghost()
                 .small()
                 .icon(IconName::Close)
-                .tooltip(rust_i18n::t!("settings.remove_recent").to_string())
-                .on_click(move |_, _, cx| {
-                    let _ = trove_core::history::AppHistory::load().remove_library(&path);
-                    cx.refresh_windows();
+                .tooltip(rust_i18n::t!("settings.remove_library").to_string())
+                .on_click({
+                    let entry = entry.clone();
+                    move |_, _, cx| remove_library(&entry, cx)
                 }),
         )
+}
+
+/// The "new library" button. The name is generated — the row above (the
+/// current library's name field) is where it gets renamed.
+fn new_library_row(controller: &Entity<LibraryController>, _cx: &mut App) -> Div {
+    h_flex().w_full().justify_end().child(
+        Button::new("new-library")
+            .outline()
+            .small()
+            .icon(IconName::Plus)
+            .label(rust_i18n::t!("settings.new_library").to_string())
+            .on_click({
+                let controller = controller.clone();
+                move |_, _, cx| {
+                    let mut config = AppConfig::load();
+                    let count = config.libraries.len() + 1;
+                    if let Ok(entry) = config.add_library(&format!("Library {count}")) {
+                        switch_library(&controller, entry, cx);
+                    }
+                }
+            }),
+    )
+}
+
+/// Register-free removal: the entry leaves the config and its directories go
+/// with it. The library database is the only thing that disappears.
+fn remove_library(entry: &trove_core::config::LibraryEntry, cx: &mut App) {
+    let mut config = AppConfig::load();
+    let _ = config.forget_library(&entry.slug);
+    let _ = std::fs::remove_dir_all(entry.dir());
+    let _ = std::fs::remove_dir_all(entry.cache_dir());
+    cx.refresh_windows();
 }
 
 // ============================ watched folders ================================
@@ -194,7 +182,9 @@ fn recent_library_row(
 /// render, so add/remove applies immediately.
 fn watch_folders_group() -> SettingGroup {
     let mut group = SettingGroup::new().title(rust_i18n::t!("settings.watch_folders").to_string());
-    let config = AppConfig::load();
+    // The watch list belongs to the open library, not to the application: two
+    // libraries can watch different folders.
+    let config = LibraryConfig::load(&library_dir());
     let enabled = config.watch_folders_enabled();
 
     group = group.item(SettingItem::new(
@@ -214,6 +204,11 @@ fn watch_folders_group() -> SettingGroup {
     ))
 }
 
+/// The open library's data directory — where its `library.json` lives.
+fn library_dir() -> PathBuf {
+    AppConfig::load().active_entry().dir()
+}
+
 /// The master-switch row: one button flipping `watch_folders_enabled`.
 fn watch_toggle_row(enabled: bool, _cx: &mut App) -> Div {
     h_flex().w_full().justify_end().child(
@@ -226,9 +221,10 @@ fn watch_toggle_row(enabled: bool, _cx: &mut App) -> Div {
                 rust_i18n::t!("settings.watch_off").to_string()
             })
             .on_click(|_, _, cx| {
-                let mut config = AppConfig::load();
+                let dir = library_dir();
+                let mut config = LibraryConfig::load(&dir);
                 config.watch_folders_enabled = Some(!config.watch_folders_enabled());
-                let _ = config.save();
+                let _ = config.save(&dir);
                 cx.refresh_windows();
             }),
     )
@@ -267,8 +263,9 @@ fn watch_folder_row(path: PathBuf, _cx: &mut App) -> Div {
             .icon(IconName::Close)
             .tooltip(rust_i18n::t!("settings.remove_watch_folder").to_string())
             .on_click(move |_, _, cx| {
-                let mut config = AppConfig::load();
-                let _ = config.remove_watched_folder(&path);
+                let dir = library_dir();
+                let mut config = LibraryConfig::load(&dir);
+                let _ = config.remove_watched_folder(&dir, &path);
                 cx.refresh_windows();
             }),
     )
@@ -298,8 +295,9 @@ fn add_watch_folder_row(_cx: &mut App) -> Div {
                     {
                         let path = path.to_path_buf();
                         cx.update(|cx| {
-                            let mut config = AppConfig::load();
-                            let _ = config.add_watched_folder(path);
+                            let dir = library_dir();
+                            let mut config = LibraryConfig::load(&dir);
+                            let _ = config.add_watched_folder(&dir, path);
                             cx.refresh_windows();
                         });
                     }
@@ -445,20 +443,20 @@ fn stats_block(stats: &LibraryStats, cx: &mut App) -> Div {
         }))
 }
 
-/// The library-location row: the resolved path, the last switch/maintenance
-/// notice (in the danger color), plus a Browse button that persists the
-/// choice AND hot-swaps the open library without a restart.
-fn library_location_row(controller: &Entity<LibraryController>, cx: &mut App) -> Div {
-    let current = AppConfig::load().resolved_library_path();
+/// The open library: where Trove keeps it (read-only — the path is not the
+/// user's to pick), the last switch/maintenance notice, and a button to open
+/// that directory in the file manager.
+fn library_current_row(controller: &Entity<LibraryController>, cx: &mut App) -> Div {
+    let dir = AppConfig::load().active_entry().dir();
     let notice = controller.read(cx).notice.clone();
     v_flex()
         .gap_1()
         .child(
             div()
                 .w_full()
-                .text_sm()
-                .text_color(cx.theme().foreground)
-                .child(current.display().to_string()),
+                .text_xs()
+                .text_color(cx.theme().muted_foreground)
+                .child(dir.display().to_string()),
         )
         .when_some(notice, |col, notice| {
             col.child(
@@ -471,53 +469,38 @@ fn library_location_row(controller: &Entity<LibraryController>, cx: &mut App) ->
         })
         .child(
             div().w_full().flex().justify_end().child(
-                Button::new("browse-library")
+                Button::new("open-library-dir")
                     .outline()
                     .small()
-                    .label(rust_i18n::t!("settings.browse").to_string())
+                    .label(rust_i18n::t!("settings.open_data_dir").to_string())
                     .on_click({
-                        let controller = controller.clone();
-                        move |_, _, cx| {
-                            let rx = cx.prompt_for_paths(PathPromptOptions {
-                                files: false,
-                                directories: true,
-                                multiple: false,
-                                prompt: Some(
-                                    rust_i18n::t!("settings.select_folder").into_owned().into(),
-                                ),
-                            });
-                            cx.spawn({
-                                let controller = controller.clone();
-                                async move |cx| {
-                                    if let Ok(Ok(Some(paths))) = rx.await
-                                        && let Some(path) = paths.first()
-                                    {
-                                        let path: PathBuf = path.to_path_buf();
-                                        cx.update(|cx| {
-                                            switch_library(&controller, path, cx);
-                                            cx.refresh_windows();
-                                        });
-                                    }
-                                }
-                            })
-                            .detach();
+                        let dir = dir.clone();
+                        move |_, _, _| {
+                            let _ = trove_core::services::open_external::open(
+                                &dir,
+                                trove_core::services::open_external::OpenTarget::Default,
+                            );
                         }
                     }),
             ),
         )
 }
 
-/// Hot-switch the open library to `path`: swap the controller's library,
-/// and only persist the choice when the library actually opened. Any error
-/// is reported on [`LibraryController::notice`].
-fn switch_library(controller: &Entity<LibraryController>, path: PathBuf, cx: &mut App) {
+/// Hot-switch the open library to `entry`: swap the controller's library, and
+/// only record the choice when the library actually opened. Any error is
+/// reported on [`LibraryController::notice`].
+fn switch_library(
+    controller: &Entity<LibraryController>,
+    entry: trove_core::config::LibraryEntry,
+    cx: &mut App,
+) {
     controller.update(cx, |ctl, cx| {
-        let outcome = ctl.swap_library(path.clone()).and_then(|()| {
-            let mut config = AppConfig::load();
-            config.set_library_path(path.clone())?;
-            let _ = trove_core::history::AppHistory::load().push_library(&path);
-            Ok(())
-        });
+        let outcome = ctl
+            .swap_library(entry.dir(), entry.cache_dir())
+            .and_then(|()| {
+                let mut config = AppConfig::load();
+                config.set_active_library(&entry.slug)
+            });
         // The old watch task scanned for the previous library; restart the
         // resident watch on the new one.
         if outcome.is_ok()
@@ -534,6 +517,7 @@ fn switch_library(controller: &Entity<LibraryController>, path: PathBuf, cx: &mu
         };
         cx.notify();
     });
+    cx.refresh_windows();
 }
 
 // ========================= preview zoom limits ==============================

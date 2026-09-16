@@ -190,39 +190,56 @@ pub struct XmpExportReport {
     pub skipped: u64,
 }
 
-/// A Trove library on disk:
+/// A Trove library on disk. Two roots, because they have different lifetimes:
 ///
 /// ```text
-/// <root>/
+/// <data root>/            worth keeping — and worth backing up
 /// ├── library.db
-/// └── media/…            # content-addressed blobs
+/// ├── library.json        this library's own preferences
+/// ├── backups/…           database snapshots
+/// └── media/…             blobs, for assets stored before linking was the
+///                        only import mode
+///
+/// <cache root>/           regenerable — deleting it costs only time
+/// ├── thumbs/…
+/// └── search_index/
 /// ```
+///
+/// The roots come from [`crate::paths`]: `data/libraries/<slug>` and
+/// `cache/libraries/<slug>`.
 #[derive(Clone)]
 pub struct Library {
     store: Store,
     root: PathBuf,
+    /// Thumbnails and the full-text index. Always a different directory from
+    /// `root`; see [`Library::cache`].
+    cache: PathBuf,
     /// Undo/redo operation history for invertible metadata mutations (see
     /// [`crate::history`]). Bounded; the cap comes from the app config.
     undo: SharedUndoStack,
     /// Background jobs (imports, maintenance, preview work) owned by this
     /// library; see [`crate::tasks`]. Cheap to share: `Arc` inside.
     tasks: std::sync::Arc<crate::tasks::TaskManager>,
-    /// The Tantivy full-text index under `<root>/search_index` — a
+    /// The Tantivy full-text index under `<cache root>/search_index` — a
     /// disposable derivative of the asset rows, fed by the search_queue
     /// outbox (schema triggers) and drained here.
     text_index: crate::search::TextIndex,
 }
 
 impl Library {
-    /// Open (or create) the library under `root`.
-    pub fn open(root: impl AsRef<Path>) -> Result<Self> {
-        let root = root.as_ref().to_path_buf();
+    /// Open (or create) the library whose data lives under `data_root` and
+    /// whose regenerable files live under `cache_root`.
+    pub fn open(data_root: impl AsRef<Path>, cache_root: impl AsRef<Path>) -> Result<Self> {
+        let root = data_root.as_ref().to_path_buf();
+        let cache = cache_root.as_ref().to_path_buf();
         std::fs::create_dir_all(&root)?;
+        std::fs::create_dir_all(&cache)?;
         let store = Store::open(&root.join("library.db"))?;
-        let text_index = crate::search::TextIndex::open(&root.join("search_index"))?;
+        let text_index = crate::search::TextIndex::open(&cache.join("search_index"))?;
         let lib = Self {
             store,
             root,
+            cache,
             undo: SharedUndoStack::with_cap(crate::config::AppConfig::load().undo_cap()),
             tasks: std::sync::Arc::new(crate::tasks::TaskManager::new()),
             text_index,
@@ -293,15 +310,20 @@ impl Library {
         Ok(self.text_index.num_docs())
     }
 
-    /// An in-memory library whose media blobs live under `root` (tests).
+    /// An in-memory library whose blobs and cache live under `root` (tests).
+    /// The cache gets a subdirectory of its own so tests exercise the same
+    /// two-root split the app runs with.
     pub fn open_in_memory(root: impl AsRef<Path>) -> Result<Self> {
         let root = root.as_ref().to_path_buf();
+        let cache = root.join("cache");
         std::fs::create_dir_all(&root)?;
+        std::fs::create_dir_all(&cache)?;
         let store = Store::in_memory()?;
         Ok(Self {
             text_index: crate::search::TextIndex::in_ram()?,
             store,
             root,
+            cache,
             undo: SharedUndoStack::with_cap(crate::history::undo::DEFAULT_UNDO_CAP),
             tasks: std::sync::Arc::new(crate::tasks::TaskManager::new()),
         })
@@ -317,8 +339,17 @@ impl Library {
         &self.store
     }
 
+    /// The data root: database, `library.json`, backups, `media/` blobs.
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// The cache root: thumbnails and the full-text index. Every file under
+    /// it is derived from the database and the linked originals, so wiping the
+    /// directory costs a rebuild and nothing else. Never the same directory as
+    /// [`Library::root`].
+    pub fn cache(&self) -> &Path {
+        &self.cache
     }
 
     /// Absolute path of a library-relative path (e.g. a stored `rel_path`).
@@ -360,17 +391,45 @@ impl Library {
         Ok(path)
     }
 
-    /// Import files, optionally into a collection. See
-    /// [`media::import::import_files`] for semantics.
+    /// Import sources by **linking** them: the files stay where the user keeps
+    /// them and the records point at those paths. This is what every
+    /// user-facing import does — the library holds no copy of the user's
+    /// media, only what it derived from it.
     /// Imported assets are added directly to "All Assets" unless a target
     /// collection is specified. Smart collections automatically capture
     /// matching assets via their rules.
-    pub fn import_files(
+    pub fn link_files(
         &self,
         sources: &[PathBuf],
         into_collection: Option<Uuid>,
     ) -> Result<media::import::ImportReport> {
-        media::import::import_files(&self.store, &self.root, sources, into_collection)
+        media::import::import_files(
+            &self.store,
+            &self.root,
+            &self.cache,
+            sources,
+            media::import::ImportStorage::Link,
+            into_collection,
+        )
+    }
+
+    /// Import sources by **copying** them into the library's own store. Only
+    /// for content Trove owns and is about to delete or overwrite — the
+    /// extraction directory of a media package, above all. Linking a file that
+    /// is about to disappear would leave the asset pointing at nothing.
+    pub fn import_into_store(
+        &self,
+        sources: &[PathBuf],
+        into_collection: Option<Uuid>,
+    ) -> Result<media::import::ImportReport> {
+        media::import::import_files(
+            &self.store,
+            &self.root,
+            &self.cache,
+            sources,
+            media::import::ImportStorage::Copy,
+            into_collection,
+        )
     }
 
     /// Full-text search across live assets, ordered by relevance. `q` narrows
@@ -628,7 +687,7 @@ impl Library {
         let mut imported = 0u64;
         let mut skipped = 0u64;
         if !files.is_empty() {
-            let report = self.import_files(&files, None)?;
+            let report = self.import_into_store(&files, None)?;
             imported = report.imported_count() as u64;
             skipped = report.skipped_count() as u64;
         }
@@ -918,7 +977,7 @@ impl Library {
 
         // Thumbnail and visual fingerprint describe the old pixels; both
         // must follow the content to its new hash.
-        media::thumb::regenerate(self.root(), &staged.sha256, asset.kind, &new_blob);
+        media::thumb::regenerate(self.cache(), &staged.sha256, asset.kind, &new_blob);
         crate::store::visual_search::compute_and_store_signature(&self.store, &self.root, id)?;
         Ok(())
     }
@@ -1438,7 +1497,7 @@ impl Library {
         if rel.starts_with("media/") {
             let _ = std::fs::remove_file(self.root.join(rel));
         }
-        let thumb = media::thumb::abs_path(&self.root, sha);
+        let thumb = media::thumb::abs_path(&self.cache, sha);
         let _ = std::fs::remove_file(thumb);
     }
 }
@@ -1463,7 +1522,7 @@ mod tests {
 
     fn temp_library(name: &str) -> (Library, PathBuf) {
         let root = std::env::temp_dir().join(format!("trove-lib-{name}-{}", Uuid::new_v4()));
-        let lib = Library::open(&root).unwrap();
+        let lib = Library::open(&root, root.join("cache")).unwrap();
         (lib, root)
     }
 
@@ -1475,7 +1534,7 @@ mod tests {
 
     #[test]
     fn relink_asset_repoints_a_moved_file() {
-        use crate::media::import::{ImportPolicy, commit_staged_all, stage_all};
+        use crate::media::import::{ImportStorage, commit_staged_all, stage_all};
         use crate::model::Origin;
 
         let (lib, root) = temp_library("relink");
@@ -1487,11 +1546,9 @@ mod tests {
         // Import as linked (file stays in place).
         let staged = stage_all(
             &root,
+            &root.join("cache"),
             std::slice::from_ref(&src),
-            ImportPolicy {
-                link_all: true,
-                ..Default::default()
-            },
+            ImportStorage::Link,
         );
         let report = commit_staged_all(lib.store().conn(), None, staged);
         assert_eq!(report.imported_count(), 1);
@@ -1518,7 +1575,7 @@ mod tests {
 
         // Stored assets cannot be relinked.
         let stored = write_source(&root, "stored.txt", b"stored content");
-        lib.import_files(std::slice::from_ref(&stored), None)
+        lib.import_into_store(std::slice::from_ref(&stored), None)
             .unwrap();
         let all2 = assets::query(conn, &AssetQuery::default()).unwrap();
         let stored_id = all2
@@ -1541,7 +1598,9 @@ mod tests {
         std::fs::create_dir_all(&folder).unwrap();
         let src = write_source(&folder, "photo.png", PNG_1X1);
 
-        let report = lib.import_files(std::slice::from_ref(&src), None).unwrap();
+        let report = lib
+            .import_into_store(std::slice::from_ref(&src), None)
+            .unwrap();
         assert_eq!(report.imported_count(), 1);
         let _item = &report.imported[0];
 
@@ -1554,7 +1613,9 @@ mod tests {
         assert_eq!(page.total, 1);
 
         // Re-importing identical content dedupes.
-        let report2 = lib.import_files(std::slice::from_ref(&src), None).unwrap();
+        let report2 = lib
+            .import_into_store(std::slice::from_ref(&src), None)
+            .unwrap();
         assert_eq!(report2.imported_count(), 1);
         assert!(report2.imported[0].reused);
     }
@@ -1563,7 +1624,7 @@ mod tests {
         let (lib, root) = temp_library("png");
         let src = write_source(&root, "photo.png", PNG_1X1);
 
-        let report = lib.import_files(&[src], None).unwrap();
+        let report = lib.import_into_store(&[src], None).unwrap();
         assert_eq!(report.imported_count(), 1);
         assert_eq!(report.skipped_count(), 0);
         let item = &report.imported[0];
@@ -1584,7 +1645,7 @@ mod tests {
         assert!(lib.resolve(rel).is_file());
 
         // A JPEG thumbnail was generated next to it.
-        let thumb_path = thumb::abs_path(lib.root(), asset.sha256.as_deref().unwrap());
+        let thumb_path = thumb::abs_path(lib.cache(), asset.sha256.as_deref().unwrap());
         assert!(
             thumb_path.is_file(),
             "thumbnail missing at {}",
@@ -1597,8 +1658,10 @@ mod tests {
         let (lib, root) = temp_library("dedup");
         let src = write_source(&root, "same.png", PNG_1X1);
 
-        let first = lib.import_files(std::slice::from_ref(&src), None).unwrap();
-        let second = lib.import_files(&[src], None).unwrap();
+        let first = lib
+            .import_into_store(std::slice::from_ref(&src), None)
+            .unwrap();
+        let second = lib.import_into_store(&[src], None).unwrap();
         assert!(!first.imported[0].reused);
         assert!(second.imported[0].reused);
         assert_eq!(first.imported[0].asset_id, second.imported[0].asset_id);
@@ -1621,7 +1684,7 @@ mod tests {
         .unwrap();
 
         let src = write_source(&root, "a.png", PNG_1X1);
-        let report = lib.import_files(&[src], Some(c.id)).unwrap();
+        let report = lib.import_into_store(&[src], Some(c.id)).unwrap();
         assert_eq!(report.imported_count(), 1);
         assert_eq!(
             collections::count_assets(lib.store().conn(), c.id).unwrap(),
@@ -1630,7 +1693,7 @@ mod tests {
 
         // Importing into a missing collection fails up front.
         let err = lib
-            .import_files(&[root.join("nope.png")], Some(Uuid::new_v4()))
+            .import_into_store(&[root.join("nope.png")], Some(Uuid::new_v4()))
             .unwrap_err();
         assert!(err.to_string().contains("collection"));
     }
@@ -1639,14 +1702,14 @@ mod tests {
     fn plain_files_and_skipped_paths() {
         let (lib, root) = temp_library("plain");
         let txt = write_source(&root, "notes.txt", b"hello world");
-        let report = lib.import_files(&[txt], None).unwrap();
+        let report = lib.import_into_store(&[txt], None).unwrap();
         let item = &report.imported[0];
         assert_eq!(item.kind, AssetKind::Document);
 
         // A non-existent path is reported, not fatal.
         let missing = root.join("missing.bin");
         let report = lib
-            .import_files(std::slice::from_ref(&missing), None)
+            .import_into_store(std::slice::from_ref(&missing), None)
             .unwrap();
         assert_eq!(report.imported_count(), 0);
         assert_eq!(report.skipped_count(), 1);
@@ -1658,7 +1721,7 @@ mod tests {
         let (lib, root) = temp_library("purge");
         // One imported record…
         let a = write_source(&root, "a.png", PNG_1X1);
-        let report = lib.import_files(&[a], None).unwrap();
+        let report = lib.import_into_store(&[a], None).unwrap();
         assert_eq!(report.imported_count(), 1);
         let first_id = report.imported[0].asset_id;
         let stored = assets::get(lib.store().conn(), first_id).unwrap().unwrap();
@@ -1668,7 +1731,7 @@ mod tests {
         // same bytes: a second record sharing the same blob.
         assert!(assets::set_trashed(lib.store().conn(), first_id, true).unwrap());
         let b = write_source(&root, "b.png", PNG_1X1);
-        let report2 = lib.import_files(&[b], None).unwrap();
+        let report2 = lib.import_into_store(&[b], None).unwrap();
         assert_eq!(report2.imported_count(), 1);
         assert!(
             !report2.imported[0].reused,
@@ -1690,7 +1753,7 @@ mod tests {
             "blob removed after last reference is purged"
         );
         let sha = stored.sha256.unwrap();
-        assert!(!thumb::abs_path(lib.root(), &sha).exists());
+        assert!(!thumb::abs_path(lib.cache(), &sha).exists());
     }
 
     #[test]
@@ -1698,7 +1761,7 @@ mod tests {
         let (lib, root) = temp_library("empty-trash");
         let one = write_source(&root, "one.png", PNG_1X1);
         let txt = write_source(&root, "notes.txt", b"bye");
-        let r = lib.import_files(&[one, txt], None).unwrap();
+        let r = lib.import_into_store(&[one, txt], None).unwrap();
         assert_eq!(r.imported_count(), 2);
         for item in &r.imported {
             assert!(assets::set_trashed(lib.store().conn(), item.asset_id, true).unwrap());
@@ -1720,7 +1783,7 @@ mod tests {
     fn tags_are_case_insensitive_and_attach_to_assets() {
         let (lib, root) = temp_library("tags");
         let src = write_source(&root, "a.png", PNG_1X1);
-        let report = lib.import_files(&[src], None).unwrap();
+        let report = lib.import_into_store(&[src], None).unwrap();
         let asset_id = report.imported[0].asset_id;
 
         let red = tags::ensure_named(lib.store().conn(), "Red").unwrap();
@@ -1760,11 +1823,13 @@ mod tests {
     fn trash_then_reimport_creates_fresh_record() {
         let (lib, root) = temp_library("trash");
         let src = write_source(&root, "x.png", PNG_1X1);
-        let first = lib.import_files(std::slice::from_ref(&src), None).unwrap();
+        let first = lib
+            .import_into_store(std::slice::from_ref(&src), None)
+            .unwrap();
         let id = first.imported[0].asset_id;
 
         assert!(assets::set_trashed(lib.store().conn(), id, true).unwrap());
-        let second = lib.import_files(&[src], None).unwrap();
+        let second = lib.import_into_store(&[src], None).unwrap();
         assert!(!second.imported[0].reused);
         assert_ne!(second.imported[0].asset_id, id);
 
@@ -1786,9 +1851,9 @@ mod tests {
         // A title exposes a searchable token ("sunset") that no other item has.
         let (lib, root) = temp_library("facade");
         let one = write_source(&root, "photo.png", PNG_1X1);
-        lib.import_files(&[one], None).unwrap();
+        lib.import_into_store(&[one], None).unwrap();
         let two = write_source(&root, "notes.txt", b"plain");
-        lib.import_files(&[two], None).unwrap();
+        lib.import_into_store(&[two], None).unwrap();
 
         // The photo is retitled so it participates in full-text search.
         let all = assets::query(lib.store().conn(), &AssetQuery::default()).unwrap();
@@ -1854,7 +1919,7 @@ mod tests {
         // without a manual rebuild.
         let (lib, root) = temp_library("index-backfill");
         let src = write_source(&root, "photo.png", PNG_1X1);
-        lib.import_files(&[src], None).unwrap();
+        lib.import_into_store(&[src], None).unwrap();
 
         let conn = lib.store().conn();
         let all = assets::query(conn, &AssetQuery::default()).unwrap();
@@ -1883,7 +1948,7 @@ mod tests {
         // step must notice the empty index and rebuild it from the rows.
         lib.text_index().wipe().unwrap();
         drop(lib);
-        let reopened = Library::open(&root).unwrap();
+        let reopened = Library::open(&root, root.join("cache")).unwrap();
         let _conn = reopened.store().conn();
 
         let hits = reopened
@@ -1913,7 +1978,7 @@ mod tests {
 
         // Attach the tag to an asset, then delete it via the facade.
         let src = write_source(&root, "a.png", PNG_1X1);
-        let report = lib.import_files(&[src], None).unwrap();
+        let report = lib.import_into_store(&[src], None).unwrap();
         let asset_id = report.imported[0].asset_id;
         lib.tag_assets(&[asset_id], t1.id, true).unwrap();
         lib.delete_tag(t1.id).unwrap();
@@ -1948,7 +2013,7 @@ mod tests {
 
         let (lib, dir) = temp_library("usage-status");
         let src = write_source(&dir, "a.png", PNG_1X1);
-        let report = lib.import_files(&[src], None).unwrap();
+        let report = lib.import_into_store(&[src], None).unwrap();
         let id = report.imported[0].asset_id;
         let conn = lib.store().conn();
 
@@ -2009,8 +2074,10 @@ mod tests {
         // works on perceptual hashes instead.
         let (lib, dir) = temp_library("duplicates-sha");
         let src = write_source(&dir, "same.png", PNG_1X1);
-        lib.import_files(std::slice::from_ref(&src), None).unwrap();
-        lib.import_files(std::slice::from_ref(&src), None).unwrap();
+        lib.import_into_store(std::slice::from_ref(&src), None)
+            .unwrap();
+        lib.import_into_store(std::slice::from_ref(&src), None)
+            .unwrap();
         let page = assets::query(lib.store().conn(), &AssetQuery::default()).unwrap();
         assert_eq!(page.total, 1);
         assert!(lib.find_duplicates().unwrap().is_empty());
@@ -2063,8 +2130,12 @@ mod tests {
         let a = write_source(&dir, "alpha.png", PNG_1X1);
         // Different content: identical imports dedup to one record.
         let b = write_source(&dir, "beta.txt", b"beta");
-        let ra = lib.import_files(std::slice::from_ref(&a), None).unwrap();
-        let rb = lib.import_files(std::slice::from_ref(&b), None).unwrap();
+        let ra = lib
+            .import_into_store(std::slice::from_ref(&a), None)
+            .unwrap();
+        let rb = lib
+            .import_into_store(std::slice::from_ref(&b), None)
+            .unwrap();
         let ids = [ra.imported[0].asset_id, rb.imported[0].asset_id];
 
         let count = lib.batch_rename(&ids, "trip-{n} {name}", 2).unwrap();
@@ -2097,8 +2168,12 @@ mod tests {
         let (lib, dir) = temp_library("export");
         let a = write_source(&dir, "alpha.png", PNG_1X1);
         let b = write_source(&dir, "beta.txt", b"beta");
-        let ra = lib.import_files(std::slice::from_ref(&a), None).unwrap();
-        let rb = lib.import_files(std::slice::from_ref(&b), None).unwrap();
+        let ra = lib
+            .import_into_store(std::slice::from_ref(&a), None)
+            .unwrap();
+        let rb = lib
+            .import_into_store(std::slice::from_ref(&b), None)
+            .unwrap();
         let (ia, ib) = (ra.imported[0].asset_id, rb.imported[0].asset_id);
         let coll = collections::create(
             lib.store().conn(),
@@ -2242,7 +2317,8 @@ mod tests {
     fn placeholder_self_heals_on_reimport() {
         let (lib, dir) = temp_library("heal");
         let a = write_source(&dir, "alpha.png", PNG_1X1);
-        lib.import_files(std::slice::from_ref(&a), None).unwrap();
+        lib.import_into_store(std::slice::from_ref(&a), None)
+            .unwrap();
         let json = lib.export_metadata().unwrap();
 
         let (other, _) = temp_library("heal-target");
@@ -2253,7 +2329,9 @@ mod tests {
         assert!(restored.items[0].rel_path.is_none());
 
         // Re-importing the same content links the blob into the placeholder.
-        other.import_files(std::slice::from_ref(&a), None).unwrap();
+        other
+            .import_into_store(std::slice::from_ref(&a), None)
+            .unwrap();
         let healed = assets::get(conn, restored.items[0].id).unwrap().unwrap();
         assert!(healed.rel_path.is_some());
         let page = assets::query(conn, &AssetQuery::default()).unwrap();
@@ -2268,8 +2346,12 @@ mod tests {
         let (lib, dir) = temp_library("hier-tags");
         let a = write_source(&dir, "alpha.png", PNG_1X1);
         let b = write_source(&dir, "beta.txt", b"beta");
-        let ra = lib.import_files(std::slice::from_ref(&a), None).unwrap();
-        let rb = lib.import_files(std::slice::from_ref(&b), None).unwrap();
+        let ra = lib
+            .import_into_store(std::slice::from_ref(&a), None)
+            .unwrap();
+        let rb = lib
+            .import_into_store(std::slice::from_ref(&b), None)
+            .unwrap();
         let (ia, ib) = (ra.imported[0].asset_id, rb.imported[0].asset_id);
         let conn = lib.store().conn();
 
@@ -2358,7 +2440,9 @@ mod tests {
                    <rect width="640" height="480" fill="#ff8000"/>
                  </svg>"##,
         );
-        let report = lib.import_files(std::slice::from_ref(&svg), None).unwrap();
+        let report = lib
+            .import_into_store(std::slice::from_ref(&svg), None)
+            .unwrap();
         let asset = {
             let conn = lib.store().conn();
             assets::get(conn, report.imported[0].asset_id)
@@ -2369,7 +2453,7 @@ mod tests {
         assert_eq!(asset.width, Some(640));
         assert_eq!(asset.height, Some(480));
         // The rendered thumbnail is on disk.
-        let thumb = thumb::abs_path(lib.root(), asset.sha256.as_deref().unwrap());
+        let thumb = thumb::abs_path(lib.cache(), asset.sha256.as_deref().unwrap());
         assert!(thumb.is_file(), "svg thumbnail missing");
     }
     #[test]
@@ -2383,8 +2467,10 @@ mod tests {
         let b = sub.join("b.txt");
         std::fs::write(&b, b"beta").unwrap();
 
-        lib.import_files(std::slice::from_ref(&a), None).unwrap();
-        lib.import_files(std::slice::from_ref(&b), None).unwrap();
+        lib.import_into_store(std::slice::from_ref(&a), None)
+            .unwrap();
+        lib.import_into_store(std::slice::from_ref(&b), None)
+            .unwrap();
 
         // Only the direct parent folders, each with its live-asset count.
         let folders = assets::source_folders(lib.store().conn()).unwrap();
@@ -2413,8 +2499,12 @@ mod tests {
         let (lib, dir) = temp_library("pkg-export");
         let a = write_source(&dir, "alpha.png", PNG_1X1);
         let b = write_source(&dir, "beta.txt", b"beta");
-        let ra = lib.import_files(std::slice::from_ref(&a), None).unwrap();
-        let rb = lib.import_files(std::slice::from_ref(&b), None).unwrap();
+        let ra = lib
+            .import_into_store(std::slice::from_ref(&a), None)
+            .unwrap();
+        let rb = lib
+            .import_into_store(std::slice::from_ref(&b), None)
+            .unwrap();
         let (ia, ib) = (ra.imported[0].asset_id, rb.imported[0].asset_id);
         let coll = collections::create(
             lib.store().conn(),
@@ -2495,7 +2585,9 @@ mod tests {
         }
 
         let (lib, _) = temp_library("heic");
-        let report = lib.import_files(std::slice::from_ref(&heic), None).unwrap();
+        let report = lib
+            .import_into_store(std::slice::from_ref(&heic), None)
+            .unwrap();
         let asset = {
             let conn = lib.store().conn();
             assets::get(conn, report.imported[0].asset_id)
@@ -2503,7 +2595,7 @@ mod tests {
                 .unwrap()
         };
         assert_eq!(asset.kind, AssetKind::Image);
-        let thumb = thumb::abs_path(lib.root(), asset.sha256.as_deref().unwrap());
+        let thumb = thumb::abs_path(lib.cache(), asset.sha256.as_deref().unwrap());
         assert!(thumb.is_file(), "heic thumbnail missing");
     }
 
@@ -2515,7 +2607,9 @@ mod tests {
         };
         let (lib, _) = temp_library("raw-sample");
         let path = std::path::PathBuf::from(sample);
-        let report = lib.import_files(std::slice::from_ref(&path), None).unwrap();
+        let report = lib
+            .import_into_store(std::slice::from_ref(&path), None)
+            .unwrap();
         assert_eq!(report.imported_count(), 1, "skipped: {:?}", report.skipped);
         let conn = lib.store().conn();
         let asset = assets::get(conn, report.imported[0].asset_id)
@@ -2523,7 +2617,7 @@ mod tests {
             .unwrap();
         assert_eq!(asset.kind, AssetKind::Image);
         assert!(asset.width.unwrap_or(0) > 0);
-        let thumb = thumb::abs_path(lib.root(), asset.sha256.as_deref().unwrap());
+        let thumb = thumb::abs_path(lib.cache(), asset.sha256.as_deref().unwrap());
         assert!(thumb.is_file(), "raw thumbnail missing");
     }
 
@@ -2546,13 +2640,15 @@ mod tests {
     fn batch_edit_rotates_and_swaps_content_in_place() {
         let (lib, root) = temp_library("batch-edit");
         let src = write_wide_png(&root, "wide.png");
-        let report = lib.import_files(std::slice::from_ref(&src), None).unwrap();
+        let report = lib
+            .import_into_store(std::slice::from_ref(&src), None)
+            .unwrap();
         let id = report.imported[0].asset_id;
         let conn = lib.store().conn();
         let before = assets::get(conn, id).unwrap().unwrap();
         let old_sha = before.sha256.clone().unwrap();
         let old_rel = before.rel_path.clone().unwrap();
-        let old_thumb = thumb::abs_path(lib.root(), &old_sha);
+        let old_thumb = thumb::abs_path(lib.cache(), &old_sha);
         assert!(old_thumb.is_file(), "precondition: thumbnail exists");
 
         let out = lib
@@ -2575,7 +2671,7 @@ mod tests {
         assert!(!old_thumb.is_file(), "old thumbnail removed");
         let new_rel = after.rel_path.as_ref().unwrap();
         assert!(lib.resolve(new_rel).is_file(), "new blob exists");
-        let new_thumb = thumb::abs_path(lib.root(), after.sha256.as_deref().unwrap());
+        let new_thumb = thumb::abs_path(lib.cache(), after.sha256.as_deref().unwrap());
         assert!(new_thumb.is_file(), "new thumbnail generated");
 
         // The pixel content is really rotated: decoding the new blob gives
@@ -2589,21 +2685,21 @@ mod tests {
     fn batch_edit_skips_and_rejects_appropriately() {
         let (lib, root) = temp_library("batch-edit-mixed");
         let src = write_wide_png(&root, "wide.png");
-        let report = lib.import_files(std::slice::from_ref(&src), None).unwrap();
+        let report = lib
+            .import_into_store(std::slice::from_ref(&src), None)
+            .unwrap();
         let stored_id = report.imported[0].asset_id;
 
         // A linked asset: its file belongs to the user, editing is refused
         // (as a per-asset failure, not a batch abort).
         let linked_src = write_source(&root, "linked.png", PNG_1X1);
-        use crate::media::import::{ImportPolicy, commit_staged_all, stage_all};
+        use crate::media::import::{ImportStorage, commit_staged_all, stage_all};
         use crate::model::Origin;
         let staged = stage_all(
             &root,
+            &root.join("cache"),
             std::slice::from_ref(&linked_src),
-            ImportPolicy {
-                link_all: true,
-                ..Default::default()
-            },
+            ImportStorage::Link,
         );
         commit_staged_all(lib.store().conn(), None, staged);
         let conn = lib.store().conn();
@@ -2635,7 +2731,9 @@ mod tests {
     fn xmp_sidecar_export_writes_next_to_the_blob() {
         let (lib, root) = temp_library("xmp-export");
         let src = write_wide_png(&root, "wide.png");
-        let report = lib.import_files(std::slice::from_ref(&src), None).unwrap();
+        let report = lib
+            .import_into_store(std::slice::from_ref(&src), None)
+            .unwrap();
         let id = report.imported[0].asset_id;
         let conn = lib.store().conn();
 

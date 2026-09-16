@@ -334,10 +334,12 @@ fn quotable(path: &Path) -> String {
     }
 }
 
-/// Where a capture is written before import: `<config>/trove/screenshots`.
+/// Where a capture is written: the caller passes the incoming directory (see
+/// [`crate::paths::incoming_dir`]). It also stays there — the import links the
+/// file instead of copying it in, so this is its permanent home.
 pub fn destination(dir: &Path) -> PathBuf {
     let name = chrono::Local::now().format("screenshot-%Y%m%d-%H%M%S.png");
-    dir.join("screenshots").join(name.to_string())
+    dir.join(name.to_string())
 }
 
 /// .NET one-liner capturing the primary screen (Windows fallback).
@@ -402,9 +404,10 @@ mod tests {
     }
 
     #[test]
-    fn destination_lives_under_the_given_folder() {
-        let out = destination(Path::new("/home/noke/.config/trove"));
-        assert!(out.starts_with("/home/noke/.config/trove/screenshots"));
+    fn destination_lives_directly_in_the_given_folder() {
+        let out = destination(Path::new("/tmp/trove-incoming"));
+        assert!(out.starts_with("/tmp/trove-incoming"));
+        assert_eq!(out.parent().unwrap(), Path::new("/tmp/trove-incoming"));
         assert_eq!(out.extension().unwrap(), "png");
     }
 }

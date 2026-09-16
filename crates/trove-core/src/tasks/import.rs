@@ -19,7 +19,7 @@ use std::time::Duration;
 use rusqlite::Connection;
 
 use super::JobContext;
-use crate::media::import::{self, ImportPolicy, ImportReport};
+use crate::media::import::{self, ImportReport, ImportStorage};
 use crate::model::AssetPatch;
 use crate::store::assets;
 
@@ -45,9 +45,10 @@ pub enum ImportSource {
         paths: Vec<PathBuf>,
         into_collection: Option<uuid::Uuid>,
     },
-    /// The collect-service inbox: import unfiled, stamp each asset's
-    /// `source_url` from its `*.meta.json` sidecar, then delete the inbox
-    /// files on success.
+    /// Files the local collect service received: they are already sitting in
+    /// the incoming directory, each with an optional `*.meta.json` sidecar
+    /// naming the page they came from. The sidecar is deleted once the asset
+    /// is committed; the file itself stays, because the library links it.
     CollectInbox {
         items: Vec<(PathBuf, Option<PathBuf>)>,
     },
@@ -56,15 +57,22 @@ pub enum ImportSource {
 /// Everything a job needs besides the cancellation/progress context.
 #[derive(Debug, Clone)]
 pub struct ImportOptions {
-    /// Path of the library database (`<library root>/library.db`).
-    pub db_path: PathBuf,
-    /// The library root (blob + thumbnail storage).
-    pub library_root: PathBuf,
-    /// How sources are stored: copied into the library, or linked where they
-    /// already are (the user's preference, plus the size rule that keeps a
-    /// multi-gigabyte model from being duplicated).
-    pub policy: ImportPolicy,
+    /// The open library's data root: where its database lives, and where a
+    /// copied blob would land. Linking writes nothing here.
+    pub data_root: PathBuf,
+    /// The open library's cache root: thumbnails are written under it.
+    pub cache_root: PathBuf,
+    /// How sources are stored. User imports link; the one copy mode is for
+    /// sources Trove owns and is about to delete.
+    pub storage: ImportStorage,
     pub source: ImportSource,
+}
+
+impl ImportOptions {
+    /// The library database this job commits into.
+    pub fn db_path(&self) -> PathBuf {
+        self.data_root.join("library.db")
+    }
 }
 
 /// What the import job produced.
@@ -156,16 +164,20 @@ pub fn run(options: &ImportOptions, ctx: &JobContext) -> Result<ImportOutcome, S
     // Open through the store once so pending schema migrations apply, then
     // reopen a plain connection for the job (transactions need &mut, and the
     // store keeps its connection behind a RefCell).
-    crate::store::Store::open(&options.db_path)
-        .map_err(|e| format!("open library database: {e}"))?;
-    let mut conn =
-        Connection::open(&options.db_path).map_err(|e| format!("open library database: {e}"))?;
+    let db_path = options.db_path();
+    crate::store::Store::open(&db_path).map_err(|e| format!("open library database: {e}"))?;
+    let mut conn = Connection::open(&db_path).map_err(|e| format!("open library database: {e}"))?;
     conn.busy_timeout(BUSY_TIMEOUT)
         .map_err(|e| format!("set busy timeout: {e}"))?;
     conn.execute_batch("PRAGMA foreign_keys = ON;")
         .map_err(|e| format!("enable foreign keys: {e}"))?;
 
-    let staged = import::stage_all(&options.library_root, &paths, options.policy);
+    let staged = import::stage_all(
+        &options.data_root,
+        &options.cache_root,
+        &paths,
+        options.storage,
+    );
     let mut report = ImportReport::default();
     let mut done: u64 = 0;
     let mut cancelled = false;
@@ -249,12 +261,12 @@ fn stamp_collect_source(
     let _ = assets::update(conn, imported.asset_id, &patch);
 }
 
-/// Remove the processed inbox files (blobs were copied by staging). Only
-/// runs on uncancelled completions so a stopped job leaves its files queued
-/// for the next sweep.
+/// Drop the sidecars of a processed inbox batch. The files themselves stay:
+/// staging *linked* them, so removing one would leave the asset pointing at
+/// nothing. Only runs on uncancelled completions so a stopped job leaves its
+/// files queued for the next sweep.
 fn cleanup_inbox(items: &[(PathBuf, Option<PathBuf>)]) {
-    for (path, sidecar) in items {
-        let _ = std::fs::remove_file(path);
+    for (_, sidecar) in items {
         if let Some(sidecar) = sidecar {
             let _ = std::fs::remove_file(sidecar);
         }
@@ -289,9 +301,9 @@ mod tests {
         }
 
         let options = ImportOptions {
-            db_path: root.path().join("library.db"),
-            library_root: root.path().to_path_buf(),
-            policy: ImportPolicy::default(),
+            data_root: root.path().to_path_buf(),
+            cache_root: root.path().join("cache"),
+            storage: ImportStorage::Link,
             source: ImportSource::Paths {
                 paths,
                 into_collection: None,
@@ -347,9 +359,9 @@ mod tests {
         }
 
         let options = ImportOptions {
-            db_path: root.path().join("library.db"),
-            library_root: root.path().to_path_buf(),
-            policy: ImportPolicy::default(),
+            data_root: root.path().to_path_buf(),
+            cache_root: root.path().join("cache"),
+            storage: ImportStorage::Link,
             source: ImportSource::Paths {
                 paths,
                 into_collection: None,
@@ -359,6 +371,50 @@ mod tests {
         let outcome = run(&options, &JobContext::for_tests(true)).unwrap();
         assert!(outcome.cancelled);
         assert_eq!(outcome.report.imported_count(), 0);
+    }
+
+    /// A collected file has to outlive its own import: the pipeline links it,
+    /// so deleting the inbox copy — which the copy-based pipeline used to do —
+    /// would leave the asset pointing at nothing. Only the sidecar goes.
+    #[test]
+    fn a_collected_file_survives_its_own_import() {
+        let root = Temp::new("task-inbox");
+        let inbox = root.path().join("inbox");
+        fs::create_dir_all(&inbox).unwrap();
+        let file = inbox.join("shot.png");
+        fs::write(&file, PNG_1X1).unwrap();
+        let sidecar = inbox.join("shot.png.meta.json");
+        fs::write(&sidecar, r#"{"source_url":"https://example.com/a.png"}"#).unwrap();
+
+        let options = ImportOptions {
+            data_root: root.path().to_path_buf(),
+            cache_root: root.path().join("cache"),
+            storage: ImportStorage::Link,
+            source: ImportSource::CollectInbox {
+                items: vec![(file.clone(), Some(sidecar.clone()))],
+            },
+        };
+        let outcome = run(&options, &JobContext::for_tests(false)).unwrap();
+        assert_eq!(
+            outcome.report.imported_count(),
+            1,
+            "{:?}",
+            outcome.report.skipped
+        );
+        assert!(file.is_file(), "the collected file must survive the import");
+        assert!(!sidecar.exists(), "the sidecar is consumed");
+
+        let store = crate::store::Store::open(&options.db_path()).unwrap();
+        let all = assets::query(store.conn(), &crate::model::AssetQuery::default()).unwrap();
+        let asset = &all.items[0];
+        assert_eq!(
+            asset.facts.source_path.as_deref(),
+            Some(file.display().to_string().as_str())
+        );
+        assert_eq!(
+            asset.source_url.as_deref(),
+            Some("https://example.com/a.png")
+        );
     }
 
     // Small helpers so tests can build contexts without a manager thread.

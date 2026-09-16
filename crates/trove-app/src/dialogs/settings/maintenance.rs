@@ -275,13 +275,14 @@ fn rebuild_thumbs(controller: &Entity<LibraryController>, force: bool, cx: &mut 
         controller,
         "thumbnail rebuild",
         |library| {
-            let root = library.root().to_path_buf();
+            // Thumbnails live in the cache root, not beside the database.
+            let cache = library.cache().to_path_buf();
             trove_core::services::maintenance::plan_thumbnail_rebuild(library, force)
-                .map(|plan| (root, plan))
+                .map(|plan| (cache, plan))
         },
-        |(root, plan)| {
+        |(cache, plan)| {
             // Pure filesystem work.
-            trove_core::services::maintenance::run_thumbnail_plan(&root, plan)
+            trove_core::services::maintenance::run_thumbnail_plan(&cache, plan)
         },
         |ctl, report: trove_core::services::maintenance::ThumbRebuildReport| {
             ctl.notice = Some(

@@ -49,7 +49,7 @@ This README summarizes what ships. The **[Chinese README](./README.md)** is the 
 - **Paste to import** — `Ctrl+Shift+V` sends a clipboard image straight into the library.
 - **Import from URL** — downloads in the background, imports, records the source URL.
 - **Watched folders** — add a directory in Settings; new files are imported automatically.
-- **Import mode** — copy into library (default) / link to original. Linked assets stay where they are and can be re-linked by SHA-256 after moving.
+- **Import mode** — link only, never copy: files stay where you keep them and Trove records the path plus a content hash. A moved original can be re-linked after a SHA-256 check.
 - **RAW / HEIC / SVG / PSD** — camera RAW through the rawler pipeline; HEIC via system `heif-dec`; SVG rasterized, PSD composites its embedded preview.
 - **Design-format thumbnails** — mines EXIF / audio tags / font family·style·weight / MP4 dimensions; video poster when ffmpeg is present.
 
@@ -83,7 +83,7 @@ This README summarizes what ships. The **[Chinese README](./README.md)** is the 
 - **Integrity check** — re-hashes every stored file and compares with the record; one-click move-to-trash for bad ones.
 - **Auto backup** — SQLite `VACUUM INTO` snapshot into `backups/` (at most once a day, rolling 10).
 - **Duplicate finder** — clusters visually identical images by pHash; "keep newest, trash the rest" per group.
-- **Library hot-switch** — recent libraries; live statistics (counts, size, tags, collections).
+- **Multiple libraries** — create, switch and delete named libraries; each keeps its own database, watched folders and thumbnail cache, with live statistics (counts, size, tags, collections).
 
 ### Extensions
 

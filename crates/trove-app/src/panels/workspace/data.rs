@@ -133,7 +133,11 @@ pub(super) struct DataKey {
     pub(super) sort: AssetSort,
     pub(super) sort_desc: bool,
     pub(super) grid_loaded: usize,
+    /// The library's data root: where stored blobs live.
     pub(super) library_root: PathBuf,
+    /// Its cache root: where thumbnails live. Separate because the two move
+    /// independently — `rm -rf` of the cache costs a rebuild and nothing else.
+    pub(super) cache_root: PathBuf,
     pub(super) generation: u64,
     /// Active visual search: the grid shows exactly these asset ids (in
     /// rank order) instead of running the browse query.
@@ -287,7 +291,7 @@ impl WorkspacePanel {
         let cells: Vec<Cell> = list
             .iter()
             .filter(|a| key.in_trash || a.trashed_at.is_none())
-            .map(|a| cell_from_asset(&key.library_root, a))
+            .map(|a| cell_from_asset(&key.library_root, &key.cache_root, a))
             .collect();
         (total, cells)
     }
@@ -309,7 +313,7 @@ impl WorkspacePanel {
         let cells: Vec<Cell> = ids
             .iter()
             .filter_map(|id| by_id.get(id))
-            .map(|a| cell_from_asset(&key.library_root, a))
+            .map(|a| cell_from_asset(&key.library_root, &key.cache_root, a))
             .collect();
         (cells.len(), cells)
     }
@@ -339,11 +343,11 @@ pub(super) fn total_identity(key: &DataKey) -> DataKey {
 
 /// One store record → one paintable cell. Shared by the browse query pass
 /// and the visual-search pass so both grids render identically.
-fn cell_from_asset(library_root: &Path, a: &Asset) -> Cell {
+fn cell_from_asset(library_root: &Path, cache_root: &Path, a: &Asset) -> Cell {
     let thumb = a
         .sha256
         .as_deref()
-        .map(|sha| trove_core::media::thumb::abs_path(library_root, sha))
+        .map(|sha| trove_core::media::thumb::abs_path(cache_root, sha))
         .filter(|p| p.is_file());
     // Live font preview inputs: family (probed at import) plus the font
     // file to register (blob or linked source).

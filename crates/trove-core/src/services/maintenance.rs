@@ -46,6 +46,7 @@ pub struct ThumbPlan {
 pub fn plan_thumbnail_rebuild(lib: &Library, force: bool) -> Result<ThumbPlan> {
     let conn = lib.store().conn();
     let root = lib.root();
+    let cache = lib.cache();
 
     let mut plan = ThumbPlan::default();
     for kind in [AssetKind::Image, AssetKind::Font, AssetKind::Model] {
@@ -66,7 +67,7 @@ pub fn plan_thumbnail_rebuild(lib: &Library, force: bool) -> Result<ThumbPlan> {
                 continue;
             }
             // Skip existing thumbnails unless a full rewrite was requested.
-            if !force && thumb::abs_path(root, &sha).is_file() {
+            if !force && thumb::abs_path(cache, &sha).is_file() {
                 continue;
             }
             plan.items.push((blob, sha, kind));
@@ -76,14 +77,15 @@ pub fn plan_thumbnail_rebuild(lib: &Library, force: bool) -> Result<ThumbPlan> {
 }
 
 /// Execute a [`ThumbPlan`]: pure filesystem work with no database access.
-/// Designed for a background thread.
-pub fn run_thumbnail_plan(root: &Path, plan: ThumbPlan) -> ThumbRebuildReport {
+/// `cache_root` is the library's cache directory — where thumbnails live, not
+/// where the blobs do. Designed for a background thread.
+pub fn run_thumbnail_plan(cache_root: &Path, plan: ThumbPlan) -> ThumbRebuildReport {
     let mut report = ThumbRebuildReport {
         regenerated: 0,
         missing_blobs: plan.missing_blobs,
     };
     for (blob, sha, kind) in plan.items {
-        if thumb::regenerate(root, &sha, kind, &blob).is_some() {
+        if thumb::regenerate(cache_root, &sha, kind, &blob).is_some() {
             report.regenerated += 1;
         }
     }
@@ -95,9 +97,9 @@ pub fn run_thumbnail_plan(root: &Path, plan: ThumbPlan) -> ThumbRebuildReport {
 /// `force = false` only fills gaps (missing thumbnails); `force = true`
 /// rewrites every thumbnail, repairing corrupt cache entries.
 pub fn rebuild_thumbnails(lib: &Library, force: bool) -> Result<ThumbRebuildReport> {
-    let root = lib.root().to_path_buf();
+    let cache = lib.cache().to_path_buf();
     let plan = plan_thumbnail_rebuild(lib, force)?;
-    Ok(run_thumbnail_plan(&root, plan))
+    Ok(run_thumbnail_plan(&cache, plan))
 }
 
 /// Rebuild the Tantivy text index from the current asset rows (live and
@@ -125,9 +127,12 @@ pub struct OrphanReport {
 ///
 /// 1. Assets whose stored blob file is missing are moved to the trash (their
 ///    record is kept, so the blob is only freed once the user purges them).
+///    Linked assets are skipped: they have no blob, and their originals belong
+///    to the user — a missing one is reported by the integrity check, never
+///    acted on here.
 /// 2. Blob files under `media/` not referenced by any record are deleted.
-/// 3. Thumbnails whose blob is gone — or that no record references — are
-///    deleted.
+/// 3. Thumbnails under the cache root whose blob is gone — or that no record
+///    references — are deleted.
 /// 4. Empty directories under `media/` and `thumbs/` are pruned.
 ///
 /// Deleting any of these is safe: content-addressed files are derived data.
@@ -155,7 +160,7 @@ pub fn clean_orphans(lib: &Library) -> Result<OrphanReport> {
     let referenced: HashSet<String> = assets::referenced_shas(conn)?.into_iter().collect();
 
     let media_dir = root.join("media");
-    let thumbs_dir = root.join("thumbs");
+    let thumbs_dir = lib.cache().join("thumbs");
 
     let mut present: HashSet<String> = HashSet::new();
     for file in walk_files(&media_dir) {
@@ -412,14 +417,14 @@ mod tests {
     fn temp_lib(name: &str) -> (Library, std::path::PathBuf) {
         let root =
             std::env::temp_dir().join(format!("trove-maint-{name}-{}", uuid::Uuid::new_v4()));
-        let lib = Library::open(&root).unwrap();
+        let lib = Library::open(&root, root.join("cache")).unwrap();
         (lib, root)
     }
 
     fn import_png(lib: &Library, root: &Path, name: &str) -> String {
         let src = root.join(name);
         std::fs::write(&src, PNG_1X1).unwrap();
-        let report = lib.import_files(&[src], None).unwrap();
+        let report = lib.import_into_store(&[src], None).unwrap();
         let item = &report.imported[0];
         // Look the asset up to get its stored sha.
         let all = crate::store::assets::query(
@@ -442,7 +447,7 @@ mod tests {
     fn healthy_library_is_untouched_by_orphan_cleanup() {
         let (lib, root) = temp_lib("healthy");
         let sha = import_png(&lib, &root, "ok.png");
-        let thumb_path = thumb::abs_path(&root, &sha);
+        let thumb_path = thumb::abs_path(lib.cache(), &sha);
 
         let report = clean_orphans(&lib).unwrap();
         assert_eq!(report.blobs_removed, 0);
@@ -455,7 +460,7 @@ mod tests {
     fn rebuild_recreates_a_deleted_thumbnail() {
         let (lib, root) = temp_lib("rebuild");
         let sha = import_png(&lib, &root, "pic.png");
-        let thumb_path = thumb::abs_path(&root, &sha);
+        let thumb_path = thumb::abs_path(lib.cache(), &sha);
         assert!(thumb_path.is_file());
 
         std::fs::remove_file(&thumb_path).unwrap();
@@ -468,7 +473,7 @@ mod tests {
     fn rebuild_force_rewrites_existing_thumbs() {
         let (lib, root) = temp_lib("rebuild-force");
         let sha = import_png(&lib, &root, "a.png");
-        let thumb_path = thumb::abs_path(&root, &sha);
+        let thumb_path = thumb::abs_path(lib.cache(), &sha);
         let before = std::fs::read(&thumb_path).unwrap();
 
         let report = rebuild_thumbnails(&lib, true).unwrap();
@@ -481,7 +486,7 @@ mod tests {
     fn clean_orphans_removes_stray_blob_and_trashes_missing_blob_asset() {
         let (lib, root) = temp_lib("orphans");
         let sha = import_png(&lib, &root, "keep.png");
-        let thumb_path = thumb::abs_path(&root, &sha);
+        let thumb_path = thumb::abs_path(lib.cache(), &sha);
 
         // A stray blob no record references (name is a 64-hex hash).
         let stray = "b".repeat(64).to_string();

@@ -222,7 +222,7 @@ fn micro(n: usize) {
     if slow {
         let root = tmp_root("micro-insert-auto");
         roots.push(root.clone());
-        let lib = Library::open(&root).unwrap();
+        let lib = Library::open(&root, root.join("cache")).unwrap();
         let t = Instant::now();
         insert_rows(&lib, n, 0);
         line("insert rows, autocommit", t.elapsed());
@@ -231,7 +231,7 @@ fn micro(n: usize) {
 
     let root = tmp_root("micro");
     roots.push(root.clone());
-    let lib = Library::open(&root).unwrap();
+    let lib = Library::open(&root, root.join("cache")).unwrap();
     let t = Instant::now();
     insert_tx(&lib, n);
     line("insert rows, 1 transaction", t.elapsed());
@@ -283,7 +283,7 @@ fn micro(n: usize) {
     // reach.
     let root = tmp_root("micro-index");
     roots.push(root.clone());
-    let lib = Library::open(&root).unwrap();
+    let lib = Library::open(&root, root.join("cache")).unwrap();
     insert_tx(&lib, n);
     let conn = lib.store().conn();
     let t = Instant::now();
@@ -302,7 +302,7 @@ fn micro(n: usize) {
     if slow {
         let root = tmp_root("micro-drain-old");
         roots.push(root.clone());
-        let lib = Library::open(&root).unwrap();
+        let lib = Library::open(&root, root.join("cache")).unwrap();
         insert_tx(&lib, n);
         let t = Instant::now();
         drain_row_by_row(lib.store().conn(), lib.text_index()).unwrap();
@@ -315,7 +315,7 @@ fn micro(n: usize) {
     // The drain as it is now.
     let root = tmp_root("micro-drain-new");
     roots.push(root.clone());
-    let lib = Library::open(&root).unwrap();
+    let lib = Library::open(&root, root.join("cache")).unwrap();
     insert_tx(&lib, n);
     let t = Instant::now();
     trove_core::search::drain(lib.store().conn(), lib.text_index()).unwrap();
@@ -333,7 +333,7 @@ fn micro(n: usize) {
         }
         let root = tmp_root(&format!("micro-drain-batch-{batch}"));
         roots.push(root.clone());
-        let lib = Library::open(&root).unwrap();
+        let lib = Library::open(&root, root.join("cache")).unwrap();
         insert_tx(&lib, n);
         let t = Instant::now();
         drain_batched(lib.store().conn(), lib.text_index(), batch).unwrap();
@@ -564,7 +564,7 @@ fn insert_rows(lib: &Library, n: usize, offset: usize) {
 fn profile(n: usize) {
     const ROUNDS: usize = 5;
     let root = tmp_root("profile");
-    let lib = Library::open(&root).unwrap();
+    let lib = Library::open(&root, root.join("cache")).unwrap();
     insert_tx(&lib, n);
     lib.drain_search_queue().unwrap();
 
@@ -1263,7 +1263,7 @@ fn scale(n: usize) {
     let root = tmp_root("scale");
 
     let t0 = Instant::now();
-    let lib = Library::open(&root).unwrap();
+    let lib = Library::open(&root, root.join("cache")).unwrap();
     // One transaction, like the import job's batching — the row-by-row SQL cost
     // is what `--micro` measures; here the drain is the subject.
     insert_tx(&lib, n);
@@ -1380,7 +1380,7 @@ fn smoke() {
         failed: 0,
         passed: 0,
     };
-    let mut lib = Library::open(&root).unwrap();
+    let mut lib = Library::open(&root, root.join("cache")).unwrap();
     let fx = build(&lib);
 
     println!("trove full-text search smoke — root {}", root.display());
@@ -1580,7 +1580,7 @@ fn smoke() {
     // --- persistence --------------------------------------------------------
     r.section("on-disk index");
     drop(lib);
-    lib = Library::open(&root).unwrap();
+    lib = Library::open(&root, root.join("cache")).unwrap();
     r.check(r#""sunset" survives a reopen"#, hits(&lib, "sunset"), 2);
     r.check(r#""猫" survives a reopen"#, hits(&lib, "猫"), 1);
     r.check(
@@ -1601,7 +1601,7 @@ fn smoke() {
     r.section("self repair");
     drop(lib);
     std::fs::remove_dir_all(root.join("search_index")).unwrap();
-    lib = Library::open(&root).unwrap();
+    lib = Library::open(&root, root.join("cache")).unwrap();
     r.check(
         r#"wiped index rebuilds ("sunset")"#,
         hits(&lib, "sunset"),
@@ -1611,7 +1611,7 @@ fn smoke() {
 
     drop(lib);
     std::fs::write(root.join("search_index/trove-index-version"), "1").unwrap();
-    lib = Library::open(&root).unwrap();
+    lib = Library::open(&root, root.join("cache")).unwrap();
     r.check(
         r#"stale version file rebuilds ("sunset")"#,
         hits(&lib, "sunset"),
@@ -1621,7 +1621,7 @@ fn smoke() {
     // --- empty library ------------------------------------------------------
     r.section("empty library");
     let empty_root = tmp_root("empty");
-    let empty = Library::open(&empty_root).unwrap();
+    let empty = Library::open(&empty_root, empty_root.join("cache")).unwrap();
     r.check("no assets -> no hits", hits(&empty, "sunset"), 0);
     drop(empty);
 

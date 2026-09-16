@@ -33,7 +33,7 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use trove_core::media::import::{self, ImportPolicy};
+use trove_core::media::import::{self, ImportStorage};
 use trove_core::media::{blob, color, metadata, probe, search, thumb};
 use trove_core::store::Store;
 
@@ -135,7 +135,7 @@ fn full_pipeline(paths: &[PathBuf], root: &Path) -> (Duration, Duration) {
     std::fs::create_dir_all(root).unwrap();
 
     let t0 = Instant::now();
-    let staged = import::stage_all(root, paths, ImportPolicy::default());
+    let staged = import::stage_all(root, &root.join("cache"), paths, ImportStorage::Link);
     let stage = t0.elapsed();
 
     let store = Store::open(&root.join("library.db")).unwrap();
@@ -298,9 +298,19 @@ fn main() {
     let mut dup_samples = Vec::new();
     for _ in 0..rounds {
         // First pass populates the store; only the second is timed.
-        let _ = import::stage_all(&dup_root, &paths, ImportPolicy::default());
+        let _ = import::stage_all(
+            &dup_root,
+            &dup_root.join("cache"),
+            &paths,
+            ImportStorage::Link,
+        );
         let t = Instant::now();
-        let staged = import::stage_all(&dup_root, &paths, ImportPolicy::default());
+        let staged = import::stage_all(
+            &dup_root,
+            &dup_root.join("cache"),
+            &paths,
+            ImportStorage::Link,
+        );
         dup_samples.push(t.elapsed().as_secs_f64());
         drop(staged);
     }
@@ -357,7 +367,12 @@ fn main() {
         let cid = coll.map(|c| c.id);
         let mut samples = Vec::new();
         for _ in 0..rounds {
-            let staged = import::stage_all(&coll_root, &paths, ImportPolicy::default());
+            let staged = import::stage_all(
+                &coll_root,
+                &coll_root.join("cache"),
+                &paths,
+                ImportStorage::Link,
+            );
             let t = Instant::now();
             {
                 let conn = store.conn();

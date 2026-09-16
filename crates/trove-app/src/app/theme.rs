@@ -44,8 +44,8 @@ pub fn register_builtin_themes(cx: &mut App) {
 
 /// Directory the user drops their own `*.json` themes into. Created on
 /// demand; it simply does not contribute anything when missing.
-pub fn themes_dir() -> Option<PathBuf> {
-    AppConfig::config_dir().map(|d| d.join("themes"))
+pub fn themes_dir() -> PathBuf {
+    trove_core::paths::themes_dir()
 }
 
 /// Load the user's own themes on top of the bundled ones.
@@ -54,9 +54,7 @@ pub fn themes_dir() -> Option<PathBuf> {
 /// theme object or an array of them), so a file copied out of the gpui-kit
 /// `themes/` directory is a valid starting point.
 pub fn register_user_themes(cx: &mut App) -> usize {
-    let Some(dir) = themes_dir() else {
-        return 0;
-    };
+    let dir = themes_dir();
     let Ok(entries) = std::fs::read_dir(&dir) else {
         return 0;
     };

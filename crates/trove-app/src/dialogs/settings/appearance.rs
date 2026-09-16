@@ -125,7 +125,7 @@ fn stored_theme(cx: &App, mode: ThemeMode) -> SharedString {
 /// Custom-themes row: the folder path, a reveal button and a reload button
 /// that re-scans the folder and re-applies the appearance.
 fn theme_dir_row(controller: &Entity<LibraryController>, cx: &mut App) -> Div {
-    let dir = crate::app::theme::themes_dir().unwrap_or_else(std::env::temp_dir);
+    let dir = crate::app::theme::themes_dir();
     let path = dir.display().to_string();
     let controller = controller.clone();
     let reveal = dir.clone();
