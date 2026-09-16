@@ -66,6 +66,7 @@ delete = "Delete"
 
 [tags]
 all_tags = "All tags"
+frequent = "Frequent tags"
 add_tag = "Add tag"
 create_tag = "New tag"
 new_child_tag = "New sub-tag"
