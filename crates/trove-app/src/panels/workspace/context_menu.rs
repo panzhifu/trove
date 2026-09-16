@@ -234,68 +234,6 @@ pub(crate) fn asset_context_menu(
     )
 }
 
-/// Context menu for a virtual (not imported) system-font cell: import a
-/// copy into the library, install it for the current user, or reveal the
-/// file in the file manager.
-pub(crate) fn virtual_font_context_menu(
-    menu: PopupMenu,
-    _window: &mut Window,
-    cx: &mut Context<PopupMenu>,
-    controller: &Entity<LibraryController>,
-    font_id: Uuid,
-) -> PopupMenu {
-    let Some(font) = controller.read(cx).virtual_fonts.get(&font_id).cloned() else {
-        return menu;
-    };
-    let ctl_import = controller.clone();
-    let ctl_install = controller.clone();
-    let import_path = font.path.clone();
-    let install_path = font.path.clone();
-    let reveal_path = font.path.clone();
-    menu.min_w(px(200.))
-        .item(
-            PopupMenuItem::new(rust_i18n::t!("sysfonts.import").to_string()).on_click(
-                move |_, window, cx| {
-                    crate::library::jobs::import_paths_app(
-                        &ctl_import,
-                        vec![import_path.clone()],
-                        window,
-                        cx,
-                    );
-                },
-            ),
-        )
-        .item(
-            PopupMenuItem::new(rust_i18n::t!("inspector.font_install").to_string()).on_click(
-                move |_, _, cx| {
-                    // The install destination is the content hash; system
-                    // fonts have no stored sha, so compute it on click.
-                    let outcome = trove_core::media::blob::hash_file(&install_path)
-                        .map_err(|e| e.to_string())
-                        .and_then(|(sha, _)| {
-                            crate::fonts::install(&install_path, &sha).map(|_| ())
-                        });
-                    if let Err(e) = outcome {
-                        ctl_install.update(cx, |ctl, cx| {
-                            ctl.notice = Some(
-                                rust_i18n::t!("notice.font_install_failed", error = e).to_string(),
-                            );
-                            cx.notify();
-                        });
-                    }
-                    cx.refresh_windows();
-                },
-            ),
-        )
-        .separator()
-        .item(
-            PopupMenuItem::new(rust_i18n::t!("workspace.reveal_in_file_manager").to_string())
-                .on_click(move |_, _, _| {
-                    crate::panels::common::reveal_path(&reveal_path);
-                }),
-        )
-}
-
 /// Trash-only menu: restore or delete forever.
 fn trash_menu(
     menu: PopupMenu,

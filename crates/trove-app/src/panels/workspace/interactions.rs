@@ -266,19 +266,12 @@ impl WorkspacePanel {
 
     /// Enter: preview the primary selected asset full-size in the main
     /// area. A 3D model takes over the main area with the interactive
-    /// viewport; a not-imported system font shows its specimen; everything
-    /// else shows the full-size still, live video or large font specimen
-    /// from `components::preview`.
+    /// viewport; everything else shows the full-size still, live video or
+    /// large font specimen from `components::preview`.
     pub(super) fn open_preview(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(id) = self.controller.read(cx).primary() else {
             return;
         };
-        // A virtual system font has no store record: preview straight from
-        // its scanned entry.
-        if let Some(font) = self.controller.read(cx).virtual_fonts.get(&id).cloned() {
-            self.open_virtual_font_preview(font, window, cx);
-            return;
-        }
         // A mesh is worth more than a picture of a mesh: the viewport lets it
         // be turned and zoomed, and a static picture is no way to look at one.
         if let Some((name, path)) = model_source(self.controller.read(cx), id) {
@@ -323,30 +316,6 @@ impl WorkspacePanel {
         }
         self.preview_subscription = Some(subscription);
         self.viewport_observer = Some(observer);
-        cx.notify();
-    }
-
-    /// Show a not-imported system font as a full-size specimen in the main
-    /// area. The file stays where it is; nothing touches the library.
-    fn open_virtual_font_preview(
-        &mut self,
-        font: trove_core::services::font_manager::SystemFont,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let data = AssetPreviewData::for_system_font(&font);
-        let preview = AssetPreviewPanel::spawn_with_data(data, cx);
-        let subscription = cx.subscribe(&preview, |this, _, event: &AssetPreviewEvent, cx| {
-            if *event == AssetPreviewEvent::Closed {
-                this.forget_preview(cx);
-            }
-        });
-        if let Some(previous) = self.preview.replace(MainPreview::Asset(preview)) {
-            previous.release(window, cx);
-        }
-        self.viewport_backend = None;
-        self.viewport_observer = None;
-        self.preview_subscription = Some(subscription);
         cx.notify();
     }
 

@@ -8,7 +8,6 @@ use super::*;
 use std::collections::HashMap;
 use std::path::Path;
 use trove_core::model::Asset;
-use trove_core::services::font_manager::SystemFont;
 use trove_core::store::BrowseContext;
 
 #[derive(Debug, Clone)]
@@ -33,10 +32,6 @@ pub(super) struct Cell {
     /// Font assets so cells can render the sample text in the actual font.
     pub(super) font_family: Option<String>,
     pub(super) font_blob: Option<PathBuf>,
-    /// A virtual system-font entry (not an imported asset): shown only in
-    /// the fonts view, resolved through `LibraryController::virtual_fonts`
-    /// instead of the store.
-    pub(super) system_font: bool,
 }
 
 impl Cell {
@@ -222,7 +217,6 @@ impl WorkspacePanel {
             preview_subscription: None,
             viewport_backend: None,
             viewport_observer: None,
-            fonts_scan_task: None,
             total_refresh: None,
             count_recheck: false,
             count_settle: None,
@@ -290,44 +284,11 @@ impl WorkspacePanel {
         };
         let (total, list) = (page.total as usize, page.items);
 
-        let mut cells: Vec<Cell> = list
+        let cells: Vec<Cell> = list
             .iter()
             .filter(|a| key.in_trash || a.trashed_at.is_none())
             .map(|a| cell_from_asset(&key.library_root, a))
             .collect();
-
-        // The fonts view mixes in virtual entries for system fonts whose
-        // family the library has not imported. They are presentation only:
-        // nothing is copied or written to the store, so no count anywhere
-        // else is affected.
-        let mut virtual_fonts = HashMap::new();
-        let fonts_view = key.filter_kind == Some(AssetKind::Font)
-            && !key.in_trash
-            && !key.in_recent
-            && key.search.is_empty();
-        if fonts_view {
-            let imported: std::collections::HashSet<String> =
-                cells.iter().filter_map(|c| c.font_family.clone()).collect();
-            if let Some(system) = self.controller.read(cx).system_fonts.clone() {
-                let extra: Vec<Cell> = system
-                    .iter()
-                    .filter(|font| !imported.contains(&font.family))
-                    .map(|font| {
-                        let id = virtual_font_id(&font.path);
-                        virtual_fonts.insert(id, font.clone());
-                        virtual_font_cell(id, font)
-                    })
-                    .collect();
-                cells.extend(extra);
-            }
-        }
-        self.controller.update(cx, |ctl, _| {
-            ctl.virtual_fonts = virtual_fonts;
-        });
-        // The fonts view's own count describes what the grid shows (library
-        // fonts + virtual entries); every library-wide count elsewhere
-        // stays a pure store number.
-        let total = if fonts_view { cells.len() } else { total };
         (total, cells)
     }
 
@@ -350,9 +311,6 @@ impl WorkspacePanel {
             .filter_map(|id| by_id.get(id))
             .map(|a| cell_from_asset(&key.library_root, a))
             .collect();
-        self.controller.update(cx, |ctl, _| {
-            ctl.virtual_fonts.clear();
-        });
         (cells.len(), cells)
     }
 
@@ -419,57 +377,7 @@ fn cell_from_asset(library_root: &Path, a: &Asset) -> Cell {
             .to_string(),
         font_family,
         font_blob,
-        system_font: false,
     }
-}
-
-/// A virtual cell for a system font: no store record backs it — the
-/// library, inspector and preview resolve `id` through
-/// `LibraryController::virtual_fonts`.
-fn virtual_font_cell(id: Uuid, font: &SystemFont) -> Cell {
-    let style = font
-        .style
-        .clone()
-        .unwrap_or_else(|| rust_i18n::t!("sysfonts.no_style").to_string());
-    Cell {
-        id,
-        kind: AssetKind::Font,
-        thumb: None,
-        width: None,
-        height: None,
-        trashed: false,
-        name: format!("{} · {}", font.family, style),
-        size_bytes: std::fs::metadata(&font.path).map(|m| m.len()).unwrap_or(0),
-        added: rust_i18n::t!("sysfonts.system_note").to_string(),
-        // Timeline views never see these cells (they only appear in the
-        // fonts view, which is kind-filtered and undated).
-        day: String::new(),
-        font_family: Some(font.family.clone()),
-        font_blob: Some(font.path.clone()),
-        system_font: true,
-    }
-}
-
-/// Deterministic synthetic id for a system-font file. Nothing persists
-/// these ids; they only have to stay stable for the session so a selected
-/// virtual cell keeps resolving across data-pass rebuilds.
-fn virtual_font_id(path: &Path) -> Uuid {
-    use std::hash::{Hash, Hasher};
-
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    path.hash(&mut hasher);
-    let high = hasher.finish();
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    hasher.write_u64(0x9e37_79b9_7f4a_7c15);
-    path.hash(&mut hasher);
-    let low = hasher.finish();
-    let mut bytes = [0u8; 16];
-    bytes[..8].copy_from_slice(&high.to_be_bytes());
-    bytes[8..].copy_from_slice(&low.to_be_bytes());
-    // Mark as a random (v4) uuid so downstream UUID formatting stays sane.
-    bytes[6] = (bytes[6] & 0x0f) | 0x40;
-    bytes[8] = (bytes[8] & 0x3f) | 0x80;
-    Uuid::from_bytes(bytes)
 }
 
 /// The recently confirmed colours, as the picker's featured row.

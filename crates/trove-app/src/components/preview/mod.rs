@@ -112,26 +112,6 @@ impl AssetPreviewData {
         }
     }
 
-    /// Build preview inputs for a not-imported system font: the file is
-    /// previewed in place, no store record involved.
-    pub(crate) fn for_system_font(font: &trove_core::services::font_manager::SystemFont) -> Self {
-        let style = font.style.clone().unwrap_or_default();
-        let name = if style.is_empty() {
-            font.family.clone()
-        } else {
-            format!("{} · {}", font.family, style)
-        };
-        Self {
-            name,
-            kind: trove_core::model::AssetKind::Font,
-            thumb: None,
-            original: Some(font.path.clone()),
-            animated: None,
-            font_family: Some(font.family.clone()),
-            dimensions: None,
-        }
-    }
-
     /// The inspector card's height for this asset, from its aspect ratio
     /// (min 120px, max 360px; 200px when the dimensions are unknown).
     fn card_height(&self) -> f32 {

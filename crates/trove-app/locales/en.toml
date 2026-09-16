@@ -576,21 +576,6 @@ Workspace = "Workspace"
 VideoPreview = "Video preview"
 global = "Global"
 
-[sysfonts]
-scanning = "Scanning system fonts…"
-title = "System fonts"
-filter = "Filter by family or style…"
-no_match = "No fonts match the filter."
-count = "Showing %{shown} of %{total} fonts"
-empty = "No fonts found in the system font directories."
-uninstall = "Uninstall"
-import = "Import"
-import_tooltip = "Copy this font into the library"
-import_started = "Import started"
-uninstalled = "Uninstalled %{family}"
-no_style = "Regular"
-system_note = "System-owned"
-
 [color_picker]
 none = "No colour"
 confirm = "OK"
