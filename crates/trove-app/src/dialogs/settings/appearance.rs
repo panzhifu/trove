@@ -1,18 +1,29 @@
-//! Appearance page: light/dark mode and the theme picker per mode,
-//! plus the user-themes directory row.
+//! Appearance page: the light/dark mode, the named theme filling each slot,
+//! and the folder the user drops their own themes into.
 
 use super::*;
 
 // ========================== appearance page =================================
 
-/// Appearance ▸ Theme: which mode to use, and which named theme fills each
-/// slot. Every change is applied live — the framework's `Theme` global is
+/// Appearance ▸ three groups, in the order they matter: what decides light or
+/// dark, which named theme fills each side, and where to put themes that are
+/// not built in. Every change applies live — the framework's `Theme` global is
 /// swapped and all windows repaint.
 pub(super) fn appearance_page(controller: &Entity<LibraryController>, cx: &App) -> SettingPage {
     // Own the handle: the reload row outlives this frame.
     let controller = controller.clone();
 
-    let mode_options: Vec<(SharedString, SharedString)> = vec![
+    SettingPage::new(rust_i18n::t!("settings.appearance").to_string())
+        .icon(IconName::Palette)
+        .resettable(false)
+        .group(mode_group())
+        .group(themes_group(cx))
+        .group(custom_themes_group(controller))
+}
+
+/// Basics: follow the system, or pin light / dark.
+fn mode_group() -> SettingGroup {
+    let options: Vec<(SharedString, SharedString)> = vec![
         (
             SharedString::from(Appearance::System.as_str()),
             rust_i18n::t!("settings.follow_system").into_owned().into(),
@@ -31,70 +42,79 @@ pub(super) fn appearance_page(controller: &Entity<LibraryController>, cx: &App) 
         ),
     ];
 
-    SettingPage::new(rust_i18n::t!("settings.appearance").to_string())
-        .icon(IconName::Palette)
-        .resettable(false)
-        .group(
-            SettingGroup::new()
-                .title(rust_i18n::t!("settings.appearance").to_string())
-                .item(
-                    SettingItem::new(
-                        rust_i18n::t!("settings.appearance_mode").to_string(),
-                        SettingField::dropdown(
-                            mode_options,
-                            |_cx| SharedString::from(AppConfig::load().appearance.as_str()),
-                            |value, cx| {
-                                let mut config = AppConfig::load();
-                                config.appearance = Appearance::parse(&value);
-                                if config.save().is_ok() {
-                                    crate::app::theme::apply_from_settings(None, cx);
-                                }
-                            },
-                        ),
-                    )
-                    .description(rust_i18n::t!("settings.appearance_mode_desc").to_string()),
-                )
-                .item(
-                    SettingItem::new(
-                        rust_i18n::t!("settings.theme_light").to_string(),
-                        SettingField::scrollable_dropdown(
-                            theme_options(cx, ThemeMode::Light),
-                            |cx| stored_theme(cx, ThemeMode::Light),
-                            |value, cx| {
-                                let mut config = AppConfig::load();
-                                config.theme_light = Some(value.to_string());
-                                if config.save().is_ok() {
-                                    crate::app::theme::apply_from_settings(None, cx);
-                                }
-                            },
-                        ),
-                    )
-                    .description(rust_i18n::t!("settings.theme_light_desc").to_string()),
-                )
-                .item(
-                    SettingItem::new(
-                        rust_i18n::t!("settings.theme_dark").to_string(),
-                        SettingField::scrollable_dropdown(
-                            theme_options(cx, ThemeMode::Dark),
-                            |cx| stored_theme(cx, ThemeMode::Dark),
-                            |value, cx| {
-                                let mut config = AppConfig::load();
-                                config.theme_dark = Some(value.to_string());
-                                if config.save().is_ok() {
-                                    crate::app::theme::apply_from_settings(None, cx);
-                                }
-                            },
-                        ),
-                    )
-                    .description(rust_i18n::t!("settings.theme_dark_desc").to_string()),
-                )
-                .item(
-                    SettingItem::new(
-                        rust_i18n::t!("settings.theme_dir").to_string(),
-                        SettingField::render(move |_, _, cx| theme_dir_row(&controller, cx)),
-                    )
-                    .description(rust_i18n::t!("settings.theme_dir_desc").to_string()),
+    SettingGroup::new()
+        .title(rust_i18n::t!("settings.appearance_basics").to_string())
+        .item(
+            SettingItem::new(
+                rust_i18n::t!("settings.appearance_mode").to_string(),
+                SettingField::dropdown(
+                    options,
+                    |_cx| SharedString::from(AppConfig::load().appearance.as_str()),
+                    |value, cx| {
+                        let mut config = AppConfig::load();
+                        config.appearance = Appearance::parse(&value);
+                        if config.save().is_ok() {
+                            crate::app::theme::apply_from_settings(None, cx);
+                        }
+                    },
                 ),
+            )
+            .description(rust_i18n::t!("settings.appearance_mode_desc").to_string()),
+        )
+}
+
+/// Theme: one named theme per side. Both are stored even when the mode pins
+/// one of them, so switching modes later keeps the user's choice.
+fn themes_group(cx: &App) -> SettingGroup {
+    SettingGroup::new()
+        .title(rust_i18n::t!("settings.themes").to_string())
+        .item(
+            SettingItem::new(
+                rust_i18n::t!("settings.theme_light").to_string(),
+                SettingField::scrollable_dropdown(
+                    theme_options(cx, ThemeMode::Light),
+                    |cx| stored_theme(cx, ThemeMode::Light),
+                    |value, cx| {
+                        let mut config = AppConfig::load();
+                        config.theme_light = Some(value.to_string());
+                        if config.save().is_ok() {
+                            crate::app::theme::apply_from_settings(None, cx);
+                        }
+                    },
+                ),
+            )
+            .description(rust_i18n::t!("settings.theme_light_desc").to_string()),
+        )
+        .item(
+            SettingItem::new(
+                rust_i18n::t!("settings.theme_dark").to_string(),
+                SettingField::scrollable_dropdown(
+                    theme_options(cx, ThemeMode::Dark),
+                    |cx| stored_theme(cx, ThemeMode::Dark),
+                    |value, cx| {
+                        let mut config = AppConfig::load();
+                        config.theme_dark = Some(value.to_string());
+                        if config.save().is_ok() {
+                            crate::app::theme::apply_from_settings(None, cx);
+                        }
+                    },
+                ),
+            )
+            .description(rust_i18n::t!("settings.theme_dark_desc").to_string()),
+        )
+}
+
+/// Custom themes: the folder the user drops `*.json` files into, with a
+/// reveal and a rescan.
+fn custom_themes_group(controller: Entity<LibraryController>) -> SettingGroup {
+    SettingGroup::new()
+        .title(rust_i18n::t!("settings.custom_themes").to_string())
+        .item(
+            SettingItem::new(
+                rust_i18n::t!("settings.theme_dir").to_string(),
+                SettingField::render(move |_, _, cx| theme_dir_row(&controller, cx)),
+            )
+            .description(rust_i18n::t!("settings.theme_dir_desc").to_string()),
         )
 }
 

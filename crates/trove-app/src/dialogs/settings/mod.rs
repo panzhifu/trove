@@ -23,9 +23,9 @@
 //! hot-swapped (observed via `busy` / library-root transitions), never per
 //! render.
 
+mod about;
 mod appearance;
 mod general;
-mod language;
 mod maintenance;
 mod search;
 mod shortcuts;
@@ -57,16 +57,18 @@ pub(super) use trove_core::store::stats::LibraryStats;
 /// in [`SettingsView::render`].
 #[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
 pub enum SettingsPage {
+    /// What this build is, whether it is current, and the interface language.
     #[default]
-    General,
+    About,
+    /// Light/dark mode, the named themes, and the custom-theme folder.
     #[expect(dead_code, reason = "deep-link target; no entry point wired yet")]
     Appearance,
+    #[expect(dead_code, reason = "deep-link target; no entry point wired yet")]
+    General,
     #[expect(dead_code, reason = "deep-link target; no entry point wired yet")]
     Search,
     #[expect(dead_code, reason = "deep-link target; no entry point wired yet")]
     Maintenance,
-    #[expect(dead_code, reason = "deep-link target; no entry point wired yet")]
-    Language,
     #[expect(dead_code, reason = "deep-link target; no entry point wired yet")]
     Shortcuts,
 }
@@ -75,11 +77,11 @@ impl SettingsPage {
     /// Sidebar index — must track the `.page(...)` order in `render`.
     fn index(self) -> usize {
         match self {
-            Self::General => 0,
+            Self::About => 0,
             Self::Appearance => 1,
-            Self::Search => 2,
-            Self::Maintenance => 3,
-            Self::Language => 4,
+            Self::General => 2,
+            Self::Search => 3,
+            Self::Maintenance => 4,
             Self::Shortcuts => 5,
         }
     }
@@ -93,10 +95,10 @@ struct SettingsWindowState(Option<AnyWindowHandle>);
 
 impl gpui_kit::Global for SettingsWindowState {}
 
-/// Open the settings window on its default (General) page, or focus it if
-/// it is already open.
+/// Open the settings window on its default (About) page, or focus it if it
+/// is already open.
 pub fn open(cx: &mut App, controller: Entity<LibraryController>) {
-    open_at(SettingsPage::General, cx, controller);
+    open_at(SettingsPage::About, cx, controller);
 }
 
 /// Open the settings window deep-linked to `page`, or focus the existing
@@ -229,14 +231,14 @@ impl Render for SettingsView {
             });
         }
         let settings = settings
+            .page(about::about_page(&self.controller))
+            .page(appearance::appearance_page(&self.controller, cx))
             .page(general::general_page(
                 &self.controller,
                 stats.library.clone(),
             ))
-            .page(appearance::appearance_page(&self.controller, cx))
             .page(search::search_page(&self.controller, stats.sig_coverage))
             .page(maintenance::maintenance_page(&self.controller))
-            .page(language::language_page(&self.controller))
             .page(shortcuts::shortcuts_page());
 
         // Client-side decorations are forced app-wide, so this window draws
