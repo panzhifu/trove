@@ -129,6 +129,10 @@ pub fn probe(ext: &str) -> Probe {
         "ply" => "model/ply",
         "gltf" => "model/gltf+json",
         "glb" => "model/gltf-binary",
+        // Not a `model/*` type: a `.blend` is Blender's own document, and the
+        // media type the Blender packages register says so. It is still a
+        // model here because this application previews one.
+        "blend" => "application/x-blender",
         _ => "application/octet-stream",
     }
     .to_string();
@@ -326,6 +330,11 @@ mod tests {
             assert_eq!(p.kind, AssetKind::Model, "{ext}");
             assert!(p.mime.starts_with("model/"), "{ext} mime {}", p.mime);
         }
+        // `.blend` previews like a model but is not a mesh format, and its
+        // media type is the one Blender's own desktop entry registers.
+        let blend = probe(&normalize_ext("blend"));
+        assert_eq!(blend.kind, AssetKind::Model);
+        assert_eq!(blend.mime, "application/x-blender");
         // Formats we cannot parse stay unclassified rather than half-supported.
         assert_eq!(probe("fbx").kind, AssetKind::Other);
         assert_eq!(probe("dae").kind, AssetKind::Other);
