@@ -74,8 +74,8 @@ use rows::{
 };
 pub(crate) use toolbar::color_panel;
 use toolbar::{
-    add_filter_button, color_filter, font_activation, format_filter, kind_filter, kind_key,
-    rating_filter, selection_toolbar, shape_filter, tag_filter, title_controls,
+    add_filter_button, color_filter, format_filter, kind_filter, kind_key, rating_filter,
+    selection_toolbar, shape_filter, tag_filter, title_controls,
 };
 
 /// Fallback layout width before the container has been measured once
@@ -424,9 +424,6 @@ impl WorkspacePanel {
             })
             .when(tool_enabled("format"), |row| {
                 row.child(format_filter(exts, &controller, cx))
-            })
-            .when(!in_trash && !in_recent, |row| {
-                row.child(font_activation(&controller, cx))
             })
             .when(!in_trash && !in_recent, |row| {
                 row.child(add_filter_button(&controller))

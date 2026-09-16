@@ -158,55 +158,6 @@ pub(crate) fn kind_key(kind: AssetKind) -> &'static str {
     }
 }
 
-/// Font matrix–style font activation for the current filtered set.
-/// Lives in the toolbar with the other batch filters and shows a notice
-/// with the activation report after running.
-pub(crate) fn font_activation(
-    controller: &Entity<LibraryController>,
-    cx: &App,
-) -> impl IntoElement {
-    let t = |k: &str| rust_i18n::t!(k).to_string();
-    let kind = controller.read(cx).filter_kind;
-
-    Button::new("filter-font-activation")
-        .ghost()
-        .xsmall()
-        .icon(IconName::Check)
-        .label(t("workspace.font_activation"))
-        .selected(kind == Some(AssetKind::Font))
-        .dropdown_menu_with_anchor(Anchor::TopLeft, {
-            let controller = controller.clone();
-            move |menu, _, _| {
-                let mut menu = menu.min_w(px(190.));
-                for (label_key, activate) in [
-                    ("workspace.font_activate_all", true),
-                    ("workspace.font_deactivate_all", false),
-                ] {
-                    let controller = controller.clone();
-                    let label = t(label_key);
-                    menu =
-                        menu.item(PopupMenuItem::new(label).on_click(move |_, _, cx| {
-                            controller.update(cx, |ctl, cx| {
-                                let (activated, deactivated, issues) =
-                                    ctl.activate_fonts_filtered(activate);
-                                ctl.notice = Some(
-                                    rust_i18n::t!(
-                                        "notice.font_activation_report",
-                                        activated = activated,
-                                        deactivated = deactivated,
-                                        issues = issues
-                                    )
-                                    .to_string(),
-                                );
-                                cx.notify();
-                            });
-                        }));
-                }
-                menu
-            }
-        })
-}
-
 // ======================== in-panel filter tools ==============================
 
 /// The kind dropdown for the in-panel toolbar row.
