@@ -24,7 +24,7 @@ git clone https://github.com/panzhifu/trove.git && cd trove
 cargo run -p trove-app
 ```
 
-> Needs the [Rust toolchain](https://www.rust-lang.org/tools/install). First launch creates a library under your platform's config directory; open **Settings** to relocate it.
+> Needs the [Rust toolchain](https://www.rust-lang.org/tools/install). The first launch opens a **welcome window**: the libraries that already exist on the left, a name field on the right to start one. Libraries live where the platform expects them — there is no folder to pick.
 
 This README summarizes what ships. The **[Chinese README](./README.md)** is the canonical, most up-to-date document.
 
@@ -59,12 +59,12 @@ This README summarizes what ships. The **[Chinese README](./README.md)** is the 
 - **Shape & aspect filters** — the toolbar shape filter (landscape / portrait / square) carries media aspect presets — WeChat cover 2.35:1, video 16:9, vertical video 9:16, photo 4:3 / 3:4, square 1:1 — matched with 3% tolerance so rounded dimensions still hit.
 - **Inspector** — thumbnail + tags + color palette + inline editing (title / description / source URL / rating); properties page shows MIME / size / dimensions / SHA-256; one-click reveal of the underlying file.
 - **Animated images** — GIF / animated WebP / APNG play frame-by-frame in the preview dialog and Inspector; grid thumbnails stay static for performance.
-- **Font live previews** — specimen-card thumbnails rasterized in the font itself at import, with a family-name caption; sample text supports `{name}` / `{family}` placeholders and is customizable in Settings; a Fonts system view and per-font system install / uninstall from the Inspector.
+- **Font live previews** — specimen-card thumbnails rasterized in the font itself at import, with a family-name caption; sample text supports `{name}` / `{family}` placeholders and is customizable in Settings; per-font system install / uninstall from the Inspector.
 - **Recently viewed** — sidebar of the last 200 assets; trashed assets drop out until restored.
 
 ### 3D model preview
 
-- **Formats** — OBJ / STL / PLY imported as a first-class asset kind.
+- **Formats** — OBJ / STL / PLY / glTF / GLB imported as a first-class asset kind; `.blend` previews through a headless Blender conversion to GLB.
 - **GPU viewport** — wgpu-powered, orbit / zoom / pan, two-sided Lambert + Blinn-Phong shading; falls back to a CPU software rasterizer when no GPU is available.
 - **Quality** — eye-dome lighting (EDL) + gap fill + back-face culling on closed meshes.
 - **Large files** — streaming resident budget + thinning so 20 GB never OOMs; coverage-preserving sampling; smooth zoom and pan; offline spatial index optional (`.trovecloud`, 9 B/point, 60% of source).
@@ -83,6 +83,7 @@ This README summarizes what ships. The **[Chinese README](./README.md)** is the 
 - **Integrity check** — re-hashes every stored file and compares with the record; one-click move-to-trash for bad ones.
 - **Auto backup** — SQLite `VACUUM INTO` snapshot into `backups/` (at most once a day, rolling 10).
 - **Duplicate finder** — clusters visually identical images by pHash; "keep newest, trash the rest" per group.
+- **Storage breakdown** — what Trove itself has written to disk, one line per directory (settings and themes / database / backups / thumbnails and index / logs / inbox), with the parts that can be deleted and rebuilt called out.
 - **Multiple libraries** — create, switch and delete named libraries; each keeps its own database, watched folders and thumbnail cache, with live statistics (counts, size, tags, collections).
 
 ### Extensions
@@ -102,6 +103,8 @@ This README summarizes what ships. The **[Chinese README](./README.md)** is the 
 | Center | Workspace | Justified thumbnail grid + search |
 | Right | Tags + Inspector | Tag filter and per-asset details |
 
+**Settings** opens a window with six pages — About (version, release check, language) · Appearance (light/dark, themes, custom themes) · Files (storage, libraries, watched folders, thumbnails, backups, cleanup) · Model (point-cloud look, axes, preview zoom) · Search (full-text index, visual fingerprints) · Shortcuts. With no library yet, launch opens the **welcome window** instead of the main one.
+
 ---
 
 ## Build & test
@@ -112,7 +115,7 @@ cargo test -p trove-core
 cargo run -p trove-app
 ```
 
-**Baseline: `trove-core` 339 + `trove-app` 23 all pass; `cargo fmt --check` clean; clippy 0 warnings workspace-wide.** Two real-GPU smoke tests live in `trove-app` (EDL, meshlet culling) and skip automatically on headless machines.
+**Baseline: `trove-core` 382 + `trove-app` 27 all pass; `cargo fmt --check` clean; clippy 0 warnings workspace-wide.** Two real-GPU smoke tests live in `trove-app` (EDL, meshlet culling) and skip automatically on headless machines.
 
 What is still missing vs. Eagle / Billfish / digiKam / Adobe Bridge is mapped in [docs/FEATURE-GAPS.md](docs/FEATURE-GAPS.md).
 
