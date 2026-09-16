@@ -144,12 +144,15 @@ fn script_row(ch: char) -> Option<ScriptRow> {
     }
 }
 
-/// Split the configured sample text into the three specimen rows — Latin,
-/// CJK, digits — keeping first occurrences in order and dropping everything
-/// else (spaces, punctuation, other scripts). A category the sample does not
-/// cover falls back to its built-in line, so a fresh card always reads
-/// Latin / CJK / digits from top to bottom.
-fn specimen_rows(sample: &str) -> [String; 3] {
+/// Split a specimen text into the three card rows — Latin, CJK, digits —
+/// keeping first occurrences in order and dropping everything else (spaces,
+/// punctuation, other scripts). A category the sample does not cover falls
+/// back to its built-in line, so a fresh specimen always reads Latin / CJK /
+/// digits from top to bottom.
+///
+/// Shared by the rasterized font card and the app's live specimen cells, so
+/// both paths show the same three rows.
+pub fn specimen_rows(sample: &str) -> [String; 3] {
     const FALLBACKS: [&str; 3] = ["AaBbGg", "永", "0123456789"];
     let mut picked: [Vec<char>; 3] = [Vec::new(), Vec::new(), Vec::new()];
     let mut seen = [

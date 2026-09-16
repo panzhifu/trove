@@ -300,10 +300,12 @@ pub(crate) fn font_live_preview(family: &str, cx: &App) -> Div {
         )
 }
 
-/// A grid font cell, fontmatrix style: the sample line rendered in the font
-/// itself with a small UI-font family label pinned to the top-left corner
-/// (the "subtitled preview" mode), so every specimen stays attributable no
-/// matter what the sample text shows.
+/// A grid font cell, fontmatrix style: the sample rendered in the font
+/// itself as three stacked rows — Latin on top, CJK in the middle, digits at
+/// the bottom, the same split the rasterized font card uses — with a small
+/// UI-font family label pinned to the top-left corner (the "subtitled
+/// preview" mode), so every specimen stays attributable no matter what the
+/// sample text shows.
 pub(crate) fn font_specimen_card(family: &str, cx: &App) -> Div {
     div()
         .relative()
@@ -314,10 +316,21 @@ pub(crate) fn font_specimen_card(family: &str, cx: &App) -> Div {
         .bg(cx.theme().secondary)
         .child(
             div()
-                .font_family(family.to_string())
-                .whitespace_nowrap()
-                .text_color(cx.theme().foreground)
-                .child(font_sample_for(family)),
+                .flex()
+                .flex_col()
+                .items_center()
+                .justify_center()
+                .w_full()
+                .h_full()
+                .children(font_specimen_lines(family).map(|line| {
+                    div()
+                        .font_family(family.to_string())
+                        .whitespace_nowrap()
+                        .truncate()
+                        .max_w_full()
+                        .text_color(cx.theme().foreground)
+                        .child(line)
+                })),
         )
         .child(
             div()
@@ -330,6 +343,15 @@ pub(crate) fn font_specimen_card(family: &str, cx: &App) -> Div {
                 .text_color(cx.theme().muted_foreground)
                 .child(family.to_string()),
         )
+}
+
+/// The three live specimen lines for a registered font: the configured
+/// sample text (after `{name}` / `{family}` expansion) split by script —
+/// Latin, CJK, digits — exactly the rows the rasterized font card stacks.
+/// Rows the sample never mentions carry the built-in lines, and characters
+/// a font lacks are resolved by gpui's own fallback chain.
+pub(crate) fn font_specimen_lines(family: &str) -> [String; 3] {
+    trove_core::media::thumb::specimen_rows(&font_sample_for(family))
 }
 
 // ---------------------------------------------------------------------------
