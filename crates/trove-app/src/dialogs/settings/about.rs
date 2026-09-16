@@ -57,35 +57,38 @@ pub(super) fn about_page(controller: &Entity<LibraryController>) -> SettingPage 
         .group(language_group(controller))
 }
 
-/// The version line: the build this window is running, the last check's
-/// verdict beside it, and — at the right edge, where the row's action lives —
-/// the button that runs a check right now.
+/// The version line: the build this window is running, and — at the right
+/// edge, where the row's action lives — the button that runs a check now.
 ///
 /// The state is re-read here rather than captured, so the row is live: a
 /// check started from the button repaints into this line when it lands.
+///
+/// Only states the user has to be told about get a line: a check in flight, a
+/// newer release, a failure. "Not checked yet" and "up to date" stay silent —
+/// the version number beside them is the answer, and repeating it read as
+/// noise.
 fn version_row(cx: &mut App) -> Div {
     let version = env!("CARGO_PKG_VERSION");
     let state = update::state();
-    let (status, tone) = match &state {
-        UpdateState::Unknown => (rust_i18n::t!("settings.update_idle").to_string(), None),
-        UpdateState::Checking => (rust_i18n::t!("settings.update_checking").to_string(), None),
-        UpdateState::Current { version } => (
-            rust_i18n::t!("settings.update_current", version = version).to_string(),
-            None,
-        ),
-        UpdateState::Available { version, .. } => (
+    let note = match &state {
+        UpdateState::Unknown | UpdateState::Current { .. } => None,
+        UpdateState::Checking => Some((
+            rust_i18n::t!("settings.update_checking").to_string(),
+            cx.theme().muted_foreground,
+        )),
+        UpdateState::Available { version, .. } => Some((
             rust_i18n::t!("settings.update_available", version = version).to_string(),
-            Some(cx.theme().info),
-        ),
-        UpdateState::Failed { error } => (
+            cx.theme().info,
+        )),
+        UpdateState::Failed { error } => Some((
             rust_i18n::t!("settings.update_failed", error = error).to_string(),
-            Some(cx.theme().warning),
-        ),
+            cx.theme().warning,
+        )),
     };
 
     // The row's own action sits at the right edge, level with the number and
     // whatever the last check said.
-    let row = h_flex()
+    let mut row = h_flex()
         .w_full()
         .items_center()
         .justify_end()
@@ -95,20 +98,17 @@ fn version_row(cx: &mut App) -> Div {
                 .text_sm()
                 .text_color(cx.theme().foreground)
                 .child(version.to_string()),
-        )
-        .child(
-            div()
-                .text_xs()
-                .text_color(tone.unwrap_or(cx.theme().muted_foreground))
-                .child(status),
-        )
-        .child(
-            Button::new("update-check-now")
-                .outline()
-                .small()
-                .label(rust_i18n::t!("settings.update_now").to_string())
-                .on_click(|_, _, cx| crate::app::run_update_check(cx)),
         );
+    if let Some((text, tone)) = note {
+        row = row.child(div().text_xs().text_color(tone).child(text));
+    }
+    row = row.child(
+        Button::new("update-check-now")
+            .outline()
+            .small()
+            .label(rust_i18n::t!("settings.update_now").to_string())
+            .on_click(|_, _, cx| crate::app::run_update_check(cx)),
+    );
 
     let mut column = v_flex().gap_1().w_full().child(row);
 
