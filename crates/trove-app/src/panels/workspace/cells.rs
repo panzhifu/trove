@@ -19,7 +19,6 @@ pub(super) fn build_cell_element(
     h: f32,
 ) -> AnyElement {
     let (kind, thumb, id, trashed) = (cell.kind, cell.thumb.clone(), cell.id, cell.trashed);
-    let system_font = cell.system_font;
     let is_sel = controller.read(cx).selected_assets.contains(&id);
 
     // Fonts render live — the sample text set in the font itself, one row —
@@ -79,10 +78,10 @@ pub(super) fn build_cell_element(
     let base = base.on_click(move |event: &ClickEvent, window, _cx| {
         // Focus the grid so keyboard navigation applies right away.
         window.focus(&focus, _cx);
-        // A double click on a model — or a virtual system font — is the
-        // mouse way of saying "preview this one"; the grid handles the
-        // action, and only opens the viewport for a mesh.
-        if (kind == AssetKind::Model || system_font) && event.click_count() == 2 {
+        // A double click on a model is the mouse way of saying "preview
+        // this one"; the grid handles the action, and only opens the
+        // viewport for a mesh.
+        if kind == AssetKind::Model && event.click_count() == 2 {
             window.dispatch_action(Box::new(OpenPreview), _cx);
             return;
         }
@@ -135,13 +134,6 @@ pub(super) fn build_cell_element(
     });
 
     let ctl_menu = controller.clone();
-    if system_font {
-        return base
-            .context_menu(move |menu, window, cx| {
-                super::context_menu::virtual_font_context_menu(menu, window, cx, &ctl_menu, id)
-            })
-            .into_any_element();
-    }
     base.context_menu(move |menu, window, cx| {
         asset_context_menu(menu, window, cx, &ctl_menu, id, trashed)
     })
@@ -181,7 +173,6 @@ pub(super) fn build_list_row_element(
     w: f32,
 ) -> AnyElement {
     let (kind, thumb, id, trashed) = (cell.kind, cell.thumb.clone(), cell.id, cell.trashed);
-    let system_font = cell.system_font;
     let (name, size, added) = (cell.name.clone(), cell.size_bytes, cell.added.clone());
     let is_sel = controller.read(cx).selected_assets.contains(&id);
 
@@ -257,9 +248,8 @@ pub(super) fn build_list_row_element(
     let focus = focus_handle.clone();
     let base = base.on_click(move |event: &ClickEvent, window, _cx| {
         window.focus(&focus, _cx);
-        // A double click on a model — or a virtual system font — previews
-        // it (see the grid cell).
-        if (kind == AssetKind::Model || system_font) && event.click_count() == 2 {
+        // A double click on a model previews it (see the grid cell).
+        if kind == AssetKind::Model && event.click_count() == 2 {
             window.dispatch_action(Box::new(OpenPreview), _cx);
             return;
         }
@@ -307,13 +297,6 @@ pub(super) fn build_list_row_element(
     });
 
     let ctl_menu = controller.clone();
-    if system_font {
-        return base
-            .context_menu(move |menu, window, cx| {
-                super::context_menu::virtual_font_context_menu(menu, window, cx, &ctl_menu, id)
-            })
-            .into_any_element();
-    }
     base.context_menu(move |menu, window, cx| {
         asset_context_menu(menu, window, cx, &ctl_menu, id, trashed)
     })

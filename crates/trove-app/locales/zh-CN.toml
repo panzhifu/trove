@@ -574,21 +574,6 @@ Workspace = "工作区"
 VideoPreview = "视频预览"
 global = "全局"
 
-[sysfonts]
-scanning = "正在扫描系统字体…"
-title = "系统字体"
-filter = "按字体族或样式筛选…"
-no_match = "没有匹配筛选条件的字体。"
-count = "显示 %{shown} / %{total} 个字体"
-empty = "系统字体目录中没有找到字体。"
-uninstall = "卸载"
-import = "导入"
-import_tooltip = "把该字体复制进媒体库"
-import_started = "已开始导入"
-uninstalled = "已卸载 %{family}"
-no_style = "常规"
-system_note = "系统自带"
-
 [color_picker]
 none = "无颜色"
 confirm = "确定"

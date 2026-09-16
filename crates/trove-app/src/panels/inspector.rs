@@ -310,11 +310,6 @@ impl Render for InspectorPanel {
                 )
                 .into_any_element();
         };
-        // A virtual system font has no store record — it gets its own card
-        // with install / import actions instead of the editable fields.
-        if let Some(font) = ctl.virtual_fonts.get(&asset_id).cloned() {
-            return self.virtual_font_card(&font, cx);
-        }
         let conn = ctl.library.store().conn();
         let Some(asset) = assets::get(conn, asset_id).ok().flatten() else {
             return v_flex()
@@ -735,112 +730,6 @@ impl Render for InspectorPanel {
 }
 
 impl InspectorPanel {
-    /// Read-only card for a not-imported system font shown in the fonts
-    /// view: live specimen, the facts the scan found, and the two ways to
-    /// take ownership of it — install for the user, or import a copy into
-    /// the library (which turns it into a real asset on the next pass).
-    fn virtual_font_card(
-        &self,
-        font: &trove_core::services::font_manager::SystemFont,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let preview =
-            AssetPreviewData::for_system_font(font).element(PreviewContext::Inspector, cx);
-        let style = font
-            .style
-            .clone()
-            .unwrap_or_else(|| rust_i18n::t!("sysfonts.no_style").to_string());
-        let size = std::fs::metadata(&font.path).map(|m| m.len()).unwrap_or(0);
-        let ctl_install = self.controller.clone();
-        let ctl_import = self.controller.clone();
-        let install_path = font.path.clone();
-        let import_path = font.path.clone();
-        let reveal_path = font.path.clone();
-
-        v_flex()
-            .p_3()
-            .gap_2()
-            .overflow_y_scrollbar()
-            .child(preview)
-            .child(
-                div()
-                    .text_base()
-                    .font_weight(FontWeight::BOLD)
-                    .text_color(cx.theme().foreground)
-                    .child(font.family.clone()),
-            )
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(rust_i18n::t!("sysfonts.system_note").to_string()),
-            )
-            .child(property_row(cx, "inspector.font_style", style))
-            .child(property_row(cx, "inspector.size", human_bytes(size)))
-            .child(property_row(
-                cx,
-                "inspector.location",
-                font.path.display().to_string(),
-            ))
-            .child(
-                h_flex()
-                    .flex_wrap()
-                    .gap_2()
-                    .pt_1()
-                    .child(
-                        Button::new("virtual-font-install")
-                            .ghost()
-                            .xsmall()
-                            .label(rust_i18n::t!("inspector.font_install").to_string())
-                            .on_click(move |_, _, cx| {
-                                // The install destination is the content
-                                // hash; system fonts carry no stored sha.
-                                let outcome = trove_core::media::blob::hash_file(&install_path)
-                                    .map_err(|e| e.to_string())
-                                    .and_then(|(sha, _)| {
-                                        crate::fonts::install(&install_path, &sha).map(|_| ())
-                                    });
-                                if let Err(e) = outcome {
-                                    ctl_install.update(cx, |ctl, cx| {
-                                        ctl.notice = Some(
-                                            rust_i18n::t!("notice.font_install_failed", error = e)
-                                                .to_string(),
-                                        );
-                                        cx.notify();
-                                    });
-                                }
-                                cx.refresh_windows();
-                            }),
-                    )
-                    .child(
-                        Button::new("virtual-font-import")
-                            .ghost()
-                            .xsmall()
-                            .label(rust_i18n::t!("sysfonts.import").to_string())
-                            .tooltip(rust_i18n::t!("sysfonts.import_tooltip").to_string())
-                            .on_click(move |_, window, cx| {
-                                crate::library::jobs::import_paths_app(
-                                    &ctl_import,
-                                    vec![import_path.clone()],
-                                    window,
-                                    cx,
-                                );
-                            }),
-                    )
-                    .child(
-                        Button::new("virtual-font-reveal")
-                            .ghost()
-                            .xsmall()
-                            .icon(IconName::Folder)
-                            .tooltip(rust_i18n::t!("workspace.reveal_in_file_manager").to_string())
-                            .on_click(move |_, _, _| {
-                                crate::panels::common::reveal_path(&reveal_path);
-                            }),
-                    ),
-            )
-            .into_any_element()
-    }
-
     /// A titled section whose body can be collapsed. Clicking the header
     /// toggles the state stored in `self.collapsed` (keyed by `id`), so it
     /// survives re-renders and asset switches.

@@ -1,6 +1,5 @@
 //! Application-level library state shared by the dock panels.
 
-use std::collections::HashMap;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::Instant;
@@ -161,14 +160,6 @@ pub struct LibraryController {
     /// Active visual-search results shown by the grid in place of the
     /// normal browse query. `None` = not searching.
     pub visual_results: Option<VisualSearchResults>,
-    /// System fonts scanned once in the background for the fonts view.
-    /// `None` until the first scan lands; the workspace then offers
-    /// virtual cells for families the library has not imported.
-    pub system_fonts: Option<std::sync::Arc<Vec<trove_core::services::font_manager::SystemFont>>>,
-    /// The virtual (not-imported) system fonts currently shown by the
-    /// grid, keyed by the synthetic id their cells carry. The inspector
-    /// and the preview resolve a selection against this before the store.
-    pub virtual_fonts: HashMap<Uuid, trove_core::services::font_manager::SystemFont>,
     /// Status line surfaced by the Settings dialog (maintenance jobs,
     /// library switches). Set by whichever action ran last.
     pub notice: Option<String>,
@@ -239,8 +230,6 @@ impl LibraryController {
             row_height_scale: AppConfig::load().grid_zoom(),
             selection_source: SelectionSource::None,
             visual_results: None,
-            system_fonts: None,
-            virtual_fonts: HashMap::new(),
             notice: None,
             integrity_report: None,
             busy: false,

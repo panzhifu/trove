@@ -44,8 +44,7 @@ use uuid::Uuid;
 
 use crate::app::actions::{ClearSelection, MoveDown, MoveLeft, MoveRight, MoveUp, OpenPreview};
 use crate::components::preview::{
-    AssetPreviewData, AssetPreviewEvent, AssetPreviewPanel, ModelViewport, ModelViewportEvent,
-    VideoPlayer,
+    AssetPreviewEvent, AssetPreviewPanel, ModelViewport, ModelViewportEvent, VideoPlayer,
 };
 use crate::library::{GRID_PAGE_SIZE, LibraryController, ViewMode};
 
@@ -186,9 +185,6 @@ pub struct WorkspacePanel {
     /// The live viewport watcher behind [`WorkspacePanel::viewport_backend`];
     /// dropped with the preview.
     viewport_observer: Option<Subscription>,
-    /// In-flight system-font scan for the fonts view; `None` once started
-    /// and finished (the result lives on the controller).
-    fonts_scan_task: Option<gpui::Task<()>>,
     /// View identity + time of the last exact COUNT for the grid total
     /// (see `TOTAL_REFRESH_INTERVAL`).
     total_refresh: Option<(std::time::Instant, DataKey)>,
@@ -245,29 +241,6 @@ impl WorkspacePanel {
             panel.update(cx, |this, cx| {
                 this.count_settle = None;
                 this.count_recheck = true;
-                cx.notify();
-            });
-        }));
-    }
-
-    /// Kick off the system-font scan the first time the fonts view is
-    /// browsed. The scan parses the name table of every font file on the
-    /// machine, so it must run on the background executor; when it lands
-    /// the generation bump lets the data pass merge the virtual entries.
-    fn ensure_system_fonts_scan(&mut self, cx: &mut Context<Self>) {
-        let already_scanned = self.controller.read(cx).system_fonts.is_some();
-        if already_scanned || self.fonts_scan_task.is_some() {
-            return;
-        }
-        let controller = self.controller.clone();
-        self.fonts_scan_task = Some(cx.spawn(async move |_, cx| {
-            let scanned = cx
-                .background_executor()
-                .spawn(async move { trove_core::services::font_manager::scan_system_fonts() })
-                .await;
-            controller.update(cx, |ctl, cx| {
-                ctl.system_fonts = Some(std::sync::Arc::new(scanned));
-                ctl.generation += 1;
                 cx.notify();
             });
         }));
@@ -454,17 +427,6 @@ impl WorkspacePanel {
             })
             .when(!in_trash && !in_recent, |row| {
                 row.child(add_filter_button(&controller))
-            })
-            .when(in_trash, |row| {
-                row.child(
-                    Button::new("empty-trash")
-                        .ghost()
-                        .danger()
-                        .xsmall()
-                        .label(rust_i18n::t!("workspace.empty_all").to_string())
-                        .tooltip(rust_i18n::t!("workspace.empty_all_tooltip").to_string())
-                        .on_click(cx.listener(|this, _, _, cx| this.empty_trash(cx))),
-                )
             })
             .when(in_recent, |row| {
                 row.child(
@@ -664,12 +626,6 @@ impl Render for WorkspacePanel {
             )
         };
         let library_root = self.controller.read(cx).library.root().to_path_buf();
-
-        // Fonts view: make sure the system-font scan is on its way so the
-        // virtual entries can merge in once it lands.
-        if !in_trash && !in_recent && filter_kind == Some(AssetKind::Font) && visual_ids.is_none() {
-            self.ensure_system_fonts_scan(cx);
-        }
 
         // --- data pass (cached) ---------------------------------------------
         // The query is the most expensive step in this function and the cell
@@ -1145,7 +1101,6 @@ mod tests {
             day: day.to_string(),
             font_family: None,
             font_blob: None,
-            system_font: false,
         }
     }
 
