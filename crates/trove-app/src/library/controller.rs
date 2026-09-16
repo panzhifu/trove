@@ -1,6 +1,6 @@
 //! Application-level library state shared by the dock panels.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::Instant;
 
@@ -740,5 +740,42 @@ impl LibraryController {
         }
         self.generation += 1;
         ids.len()
+    }
+
+    /// Mass-activate / deactivate every font in the current filtered view.
+    /// Mirrors FontMatrix's Edit ▸ Activate all current: the operation hits
+    /// everything the grid is showing (tag / kind / search filters included),
+    /// not just the selection. Returns `(activated, deactivated, issue_count)`
+    /// for the caller's toast / report dialog.
+    pub(crate) fn activate_fonts_filtered(&mut self, activate: bool) -> (usize, usize, usize) {
+        let conn = self.library.store().conn();
+        let ids = self.visible_assets();
+        let mut sources: Vec<(String, Option<PathBuf>)> = Vec::new();
+        for id in ids {
+            if let Some(asset) = trove_core::store::assets::get(conn, *id).ok().flatten()
+                && asset.kind == AssetKind::Font {
+                    // Fonts without a content hash cannot be keyed into the
+                    // installer; they are skipped by the mass activation.
+                    if let Some(sha) = asset.sha256.clone() {
+                        let path = self.asset_file(*id);
+                        sources.push((sha, path));
+                    }
+                }
+        }
+        let report = if activate {
+            let refs: Vec<(&Path, &str)> = sources
+                .iter()
+                .filter_map(|(sha, p)| p.as_deref().map(|p| (p, sha.as_str())))
+                .collect();
+            crate::fonts::ActivationReport::activate_all(&refs)
+        } else {
+            let refs: Vec<&str> = sources.iter().map(|(sha, _)| sha.as_str()).collect();
+            crate::fonts::ActivationReport::deactivate_all(&refs)
+        };
+        for (sha, issue) in &report.issues {
+            eprintln!("font activation issue for {sha}: {issue:?}");
+        }
+        self.generation += 1;
+        (report.activated, report.deactivated, report.issues.len())
     }
 }
