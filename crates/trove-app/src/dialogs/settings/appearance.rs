@@ -104,15 +104,15 @@ fn themes_group(cx: &App) -> SettingGroup {
         )
 }
 
-/// Custom themes: the folder the user drops `*.json` files into, with a
-/// reveal and a rescan.
+/// Custom themes: the folder the user drops `*.json` files into, and the one
+/// button that opens it.
 fn custom_themes_group(controller: Entity<LibraryController>) -> SettingGroup {
     SettingGroup::new()
         .title(rust_i18n::t!("settings.custom_themes").to_string())
         .item(
             SettingItem::new(
                 rust_i18n::t!("settings.theme_dir").to_string(),
-                SettingField::render(move |_, _, cx| theme_dir_row(&controller, cx)),
+                SettingField::render(move |_, _, _| theme_dir_row(&controller)),
             )
             .description(rust_i18n::t!("settings.theme_dir_desc").to_string()),
         )
@@ -142,53 +142,39 @@ fn stored_theme(cx: &App, mode: ThemeMode) -> SharedString {
     }
 }
 
-/// Custom-themes row: the folder path, and one button — a folder icon — that
-/// opens it.
+/// Custom-themes row: one button that opens the folder, and nothing else —
+/// the path itself is not the user's to read or edit.
 ///
 /// Opening also re-scans. The reason to open that folder is to drop a `.json`
 /// into it, and a second button that only reloads would be a step nobody
 /// expects to take; the rescan happens either way, so a theme added while the
 /// window was open is in the picker the moment the user comes back.
-fn theme_dir_row(controller: &Entity<LibraryController>, cx: &mut App) -> Div {
+fn theme_dir_row(controller: &Entity<LibraryController>) -> Div {
     let dir = crate::app::theme::themes_dir();
-    let path = dir.display().to_string();
     let controller = controller.clone();
 
-    h_flex()
-        .w_full()
-        .items_center()
-        .gap_2()
-        .child(
-            div()
-                .flex_1()
-                .min_w_0()
-                .truncate()
-                .text_sm()
-                .text_color(cx.theme().muted_foreground)
-                .child(path),
-        )
-        .child(
-            Button::new("open-theme-dir")
-                .ghost()
-                .small()
-                .icon(IconName::Folder)
-                .tooltip(rust_i18n::t!("settings.theme_dir_open").to_string())
-                .on_click(move |_, _, cx| {
-                    // Created on demand, so there is always a folder to open
-                    // and to drop files into.
-                    let _ = std::fs::create_dir_all(&dir);
-                    let loaded = crate::app::theme::register_user_themes(cx);
-                    crate::app::theme::apply_from_settings(None, cx);
-                    if loaded > 0 {
-                        controller.update(cx, |ctl, cx| {
-                            ctl.notice = Some(
-                                rust_i18n::t!("settings.theme_dir_reloaded", count = loaded)
-                                    .to_string(),
-                            );
-                            cx.notify();
-                        });
-                    }
-                    crate::panels::common::reveal_path(&dir);
-                }),
-        )
+    h_flex().w_full().justify_end().child(
+        Button::new("open-theme-dir")
+            .outline()
+            .small()
+            .icon(IconName::Folder)
+            .label(rust_i18n::t!("settings.theme_dir_open").to_string())
+            .on_click(move |_, _, cx| {
+                // Created on demand, so there is always a folder to open
+                // and to drop files into.
+                let _ = std::fs::create_dir_all(&dir);
+                let loaded = crate::app::theme::register_user_themes(cx);
+                crate::app::theme::apply_from_settings(None, cx);
+                if loaded > 0 {
+                    controller.update(cx, |ctl, cx| {
+                        ctl.notice = Some(
+                            rust_i18n::t!("settings.theme_dir_reloaded", count = loaded)
+                                .to_string(),
+                        );
+                        cx.notify();
+                    });
+                }
+                crate::panels::common::reveal_path(&dir);
+            }),
+    )
 }
