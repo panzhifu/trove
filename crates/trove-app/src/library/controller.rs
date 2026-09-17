@@ -502,8 +502,8 @@ impl LibraryController {
         }
     }
 
-    /// Swap the open library for another one (hot switch from the welcome
-    /// window's library manager): the new library's data and cache roots.
+    /// Swap the open library for another one (hot switch from the asset
+    /// manager's library switch): the new library's data and cache roots.
     /// Resets every view state; refused mid-import so a running job cannot
     /// keep writing into the previous store.
     pub fn swap_library(

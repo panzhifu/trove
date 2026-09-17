@@ -587,7 +587,7 @@ import_files = "Import Files…"
 open_settings = "Settings…"
 quit = "Quit Trove"
 
-[welcome]
+[library_manager]
 title = "Library manager"
 libraries = "Libraries"
 no_libraries = "No libraries yet — create one on the right."

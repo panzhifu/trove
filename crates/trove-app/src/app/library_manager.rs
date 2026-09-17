@@ -1,5 +1,5 @@
-//! The library manager (formerly the welcome window): pick a library, make
-//! one, rename or delete the ones that exist.
+//! The asset manager: pick a library, make one, rename or delete the
+//! ones that exist.
 //!
 //! Shown *instead of* the main window while no library exists — there is no
 //! way past it, a library is where every asset record, every collection and
@@ -21,8 +21,8 @@ use gpui_kit::*;
 use super::AppView;
 use trove_core::config::{AppConfig, LibraryEntry};
 
-/// The library manager's root view.
-pub struct WelcomeView {
+/// The asset manager's root view.
+pub struct LibraryManagerView {
     focus_handle: FocusHandle,
     /// The name being typed for the new library.
     name: Entity<InputState>,
@@ -38,14 +38,14 @@ pub struct WelcomeView {
 /// Handle of the open library manager, so `open` can focus instead of
 /// stacking windows.
 #[derive(Default)]
-struct WelcomeWindowState(Option<AnyWindowHandle>);
+struct LibraryManagerWindowState(Option<AnyWindowHandle>);
 
-impl gpui_kit::Global for WelcomeWindowState {}
+impl gpui_kit::Global for LibraryManagerWindowState {}
 
 /// Open the library manager over a running session — the File menu's
 /// 「素材库」 — or focus it when it is already up.
 pub fn open(cx: &mut App) {
-    if let Some(state) = cx.try_global::<WelcomeWindowState>()
+    if let Some(state) = cx.try_global::<LibraryManagerWindowState>()
         && let Some(handle) = state.0
         && handle
             .update(cx, |_, window, _| window.activate_window())
@@ -58,8 +58,8 @@ pub fn open(cx: &mut App) {
         ..crate::app::title_bar::window_options()
     };
     let handle = cx.open_window(options, |window, cx| {
-        cx.set_global(WelcomeWindowState(Some(window.window_handle())));
-        let view = cx.new(|cx| WelcomeView::new(window, cx));
+        cx.set_global(LibraryManagerWindowState(Some(window.window_handle())));
+        let view = cx.new(|cx| LibraryManagerView::new(window, cx));
         cx.new(|cx| Root::new(view, window, cx))
     });
     if let Err(e) = handle {
@@ -67,11 +67,11 @@ pub fn open(cx: &mut App) {
     }
 }
 
-impl WelcomeView {
+impl LibraryManagerView {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let name = cx.new(|cx| {
             InputState::new(window, cx)
-                .placeholder(rust_i18n::t!("welcome.name_placeholder").to_string())
+                .placeholder(rust_i18n::t!("library_manager.name_placeholder").to_string())
         });
         let rename = cx.new(|cx| InputState::new(window, cx));
         cx.subscribe_in(&name, window, |this, _, event, window, cx| {
@@ -224,7 +224,7 @@ impl WelcomeView {
     }
 }
 
-impl Render for WelcomeView {
+impl Render for LibraryManagerView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let config = AppConfig::load();
         let libraries = config.libraries.clone();
@@ -243,14 +243,14 @@ impl Render for WelcomeView {
                 div()
                     .text_xs()
                     .text_color(cx.theme().muted_foreground)
-                    .child(rust_i18n::t!("welcome.libraries").to_string()),
+                    .child(rust_i18n::t!("library_manager.libraries").to_string()),
             );
         if libraries.is_empty() {
             list = list.child(
                 div()
                     .text_sm()
                     .text_color(cx.theme().muted_foreground)
-                    .child(rust_i18n::t!("welcome.no_libraries").to_string()),
+                    .child(rust_i18n::t!("library_manager.no_libraries").to_string()),
             );
         }
         for entry in &libraries {
@@ -274,7 +274,7 @@ impl Render for WelcomeView {
                     div()
                         .text_sm()
                         .font_weight(FontWeight::BOLD)
-                        .child(rust_i18n::t!("welcome.title").to_string()),
+                        .child(rust_i18n::t!("library_manager.title").to_string()),
                 ),
             )
             .child(
@@ -301,7 +301,7 @@ impl Render for WelcomeView {
     }
 }
 
-impl WelcomeView {
+impl LibraryManagerView {
     /// The create pane: what a library is, the name field, and the button.
     fn create_section(&mut self, cx: &mut Context<Self>) -> Div {
         v_flex()
@@ -311,14 +311,14 @@ impl WelcomeView {
                     div()
                         .text_base()
                         .font_weight(FontWeight::MEDIUM)
-                        .child(rust_i18n::t!("welcome.create").to_string()),
+                        .child(rust_i18n::t!("library_manager.create").to_string()),
                 ),
             )
             .child(
                 div()
                     .text_sm()
                     .text_color(cx.theme().muted_foreground)
-                    .child(rust_i18n::t!("welcome.create_desc").to_string()),
+                    .child(rust_i18n::t!("library_manager.create_desc").to_string()),
             )
             .child(
                 v_flex()
@@ -328,15 +328,15 @@ impl WelcomeView {
                         div()
                             .text_xs()
                             .text_color(cx.theme().muted_foreground)
-                            .child(rust_i18n::t!("welcome.name").to_string()),
+                            .child(rust_i18n::t!("library_manager.name").to_string()),
                     )
                     .child(Input::new(&self.name)),
             )
             .child(
                 h_flex().w_full().justify_end().child(
-                    Button::new("welcome-create")
+                    Button::new("manager-create")
                         .primary()
-                        .label(rust_i18n::t!("welcome.create_button").to_string())
+                        .label(rust_i18n::t!("library_manager.create_button").to_string())
                         .on_click(cx.listener(|this, _, window, cx| {
                             this.create(window, cx);
                         })),
@@ -354,7 +354,7 @@ impl WelcomeView {
                 div()
                     .text_base()
                     .font_weight(FontWeight::MEDIUM)
-                    .child(rust_i18n::t!("welcome.manage").to_string()),
+                    .child(rust_i18n::t!("library_manager.manage").to_string()),
             );
 
         let config = AppConfig::load();
@@ -369,7 +369,7 @@ impl WelcomeView {
                 div()
                     .text_sm()
                     .text_color(cx.theme().muted_foreground)
-                    .child(rust_i18n::t!("welcome.manage_none").to_string()),
+                    .child(rust_i18n::t!("library_manager.manage_none").to_string()),
             );
         };
         let in_use = entry.slug == active_slug;
@@ -384,7 +384,7 @@ impl WelcomeView {
                     .text_xs()
                     .bg(cx.theme().info.opacity(0.15))
                     .text_color(cx.theme().info)
-                    .child(rust_i18n::t!("welcome.in_use").to_string()),
+                    .child(rust_i18n::t!("library_manager.in_use").to_string()),
             );
         }
 
@@ -407,7 +407,7 @@ impl WelcomeView {
                         div()
                             .text_xs()
                             .text_color(cx.theme().muted_foreground)
-                            .child(rust_i18n::t!("welcome.rename_to").to_string()),
+                            .child(rust_i18n::t!("library_manager.rename_to").to_string()),
                     )
                     .child(
                         h_flex()
@@ -418,9 +418,9 @@ impl WelcomeView {
             )
             .child(
                 h_flex().w_full().justify_end().child(
-                    Button::new("welcome-rename")
+                    Button::new("manager-rename")
                         .outline()
-                        .label(rust_i18n::t!("welcome.rename").to_string())
+                        .label(rust_i18n::t!("library_manager.rename").to_string())
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.rename_selected(cx);
                         })),
@@ -433,10 +433,10 @@ impl WelcomeView {
                     .justify_end()
                     .gap_2()
                     .child(
-                        Button::new("welcome-open")
+                        Button::new("manager-open")
                             .primary()
                             .disabled(in_use)
-                            .label(rust_i18n::t!("welcome.open").to_string())
+                            .label(rust_i18n::t!("library_manager.open").to_string())
                             .on_click({
                                 let entry = entry.clone();
                                 cx.listener(move |this, _, window, cx| {
@@ -446,16 +446,16 @@ impl WelcomeView {
                     )
                     .child({
                         let armed = self.confirm_delete;
-                        let mut button = Button::new("welcome-delete");
+                        let mut button = Button::new("manager-delete");
                         if armed {
                             button = button
                                 .danger()
-                                .label(rust_i18n::t!("welcome.delete_confirm").to_string());
+                                .label(rust_i18n::t!("library_manager.delete_confirm").to_string());
                         } else {
                             button = button
                                 .danger()
                                 .outline()
-                                .label(rust_i18n::t!("welcome.delete").to_string());
+                                .label(rust_i18n::t!("library_manager.delete").to_string());
                         }
                         button
                             .disabled(in_use)
@@ -468,7 +468,7 @@ impl WelcomeView {
                 div()
                     .text_xs()
                     .text_color(cx.theme().muted_foreground)
-                    .child(rust_i18n::t!("welcome.delete_hint").to_string()),
+                    .child(rust_i18n::t!("library_manager.delete_hint").to_string()),
             )
     }
 }
@@ -477,15 +477,15 @@ impl WelcomeView {
 /// "in use" badge when it is the open one. Click selects it for the manage
 /// pane; a double click enters straight away.
 fn library_row(
-    view: &Entity<WelcomeView>,
+    view: &Entity<LibraryManagerView>,
     entry: LibraryEntry,
     selected: bool,
     in_use: bool,
-    cx: &mut Context<WelcomeView>,
+    cx: &mut Context<LibraryManagerView>,
 ) -> AnyElement {
     let dir = entry.dir().display().to_string();
     h_flex()
-        .id(SharedString::from(format!("welcome-{}", entry.slug)))
+        .id(SharedString::from(format!("manager-{}", entry.slug)))
         .w_full()
         .items_center()
         .justify_between()
@@ -531,7 +531,7 @@ fn library_row(
                                     .flex_shrink_0()
                                     .text_xs()
                                     .text_color(cx.theme().info)
-                                    .child(rust_i18n::t!("welcome.in_use").to_string()),
+                                    .child(rust_i18n::t!("library_manager.in_use").to_string()),
                             )
                         }),
                 )
