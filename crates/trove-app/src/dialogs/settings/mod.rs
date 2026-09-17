@@ -280,6 +280,9 @@ impl SettingsView {
             cx.stop_propagation();
             let keystroke = event.keystroke.clone();
             let _ = weak.update(cx, |this, cx| this.finish_capture(action, keystroke, cx));
+            // Outside the update, so the repaint it asks for never lands
+            // while the view is still being written.
+            cx.refresh_windows();
         }));
         self.capturing = Some(action);
         cx.notify();
@@ -287,7 +290,8 @@ impl SettingsView {
 
     /// Record what the capture caught. Esc cancels and keeps the old key;
     /// Backspace or Delete with no modifiers clears the binding; anything
-    /// else becomes the new key.
+    /// else becomes the new key. The repaint is the caller's — it runs
+    /// outside this update.
     fn finish_capture(
         &mut self,
         action: &'static str,
@@ -310,10 +314,10 @@ impl SettingsView {
             config.keybindings.insert(action.to_string(), key);
             let _ = config.save();
             // Bindings are matched latest-first, so the override wins over
-            // the default it replaces without a restart.
+            // the default it replaces without a restart. This only registers;
+            // it never reads the view, so it is safe mid-update.
             crate::register_keys(cx);
         }
-        cx.refresh_windows();
     }
 
     /// Stand down from a capture (new capture, or the old one landed).
@@ -348,7 +352,7 @@ impl Render for SettingsView {
             ))
             .page(model::model_page())
             .page(search::search_page(&self.controller, stats.sig_coverage))
-            .page(shortcuts::shortcuts_page(&view, cx));
+            .page(shortcuts::shortcuts_page(self, &view));
 
         // Client-side decorations are forced app-wide, so this window draws
         // its own (title + gpui-kit's min/max/close controls).

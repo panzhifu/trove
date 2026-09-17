@@ -42,9 +42,13 @@ struct ShortcutRow {
 
 /// Shortcuts ▸ Keyboard: the filter pills, then one row per action, then the
 /// reset.
-pub(super) fn shortcuts_page(view: &Entity<SettingsView>, cx: &App) -> SettingPage {
-    let capturing = view.read(cx).capturing;
-    let filter = view.read(cx).shortcut_filter;
+///
+/// `state` is the window's own view, borrowed for the render — reading the
+/// capture state through `view.read(cx)` here would panic, since the view is
+/// mid-update. `view` exists for the rows' callbacks, which run later.
+pub(super) fn shortcuts_page(state: &SettingsView, view: &Entity<SettingsView>) -> SettingPage {
+    let capturing = state.capturing;
+    let filter = state.shortcut_filter;
     let rows = shortcut_rows();
 
     SettingPage::new(rust_i18n::t!("settings.shortcuts").to_string())
