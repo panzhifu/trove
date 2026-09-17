@@ -39,9 +39,7 @@ pub(super) use gpui_kit::component::scroll::ScrollableElement as _;
 pub(super) use gpui_kit::component::setting::{
     SelectIndex, SettingField, SettingGroup, SettingItem, SettingPage, Settings,
 };
-pub(super) use gpui_kit::component::{
-    ActiveTheme, Disableable as _, IconName, Sizable, ThemeMode, WindowExt,
-};
+pub(super) use gpui_kit::component::{ActiveTheme, Disableable as _, IconName, Sizable, ThemeMode};
 use gpui_kit::component::{Root, TitleBar};
 pub(super) use gpui_kit::prelude::FluentBuilder as _;
 pub(super) use gpui_kit::*;
@@ -49,7 +47,7 @@ pub(super) use gpui_kit::*;
 pub(super) use crate::app::i18n::SUPPORTED;
 pub(super) use crate::library::LibraryController;
 pub(super) use trove_core::config::{AppConfig, Appearance};
-pub(super) use trove_core::keybindings::{self, KeyBindingConfig};
+pub(super) use trove_core::keybindings;
 pub(super) use trove_core::store::stats::LibraryStats;
 
 /// Which page a freshly-opened settings window shows. Menu items and other
@@ -163,6 +161,15 @@ pub struct SettingsView {
     /// Kept for the life of the view: dropping it unregisters the OS
     /// light/dark observer.
     _appearance: Subscription,
+    /// Which slice of the shortcut list the Shortcuts page shows.
+    shortcut_filter: shortcuts::ShortcutFilter,
+    /// The action waiting for its key, if any. While one waits, the
+    /// interceptor below owns every keystroke this window receives.
+    capturing: Option<&'static str>,
+    capture_interceptor: Option<Subscription>,
+    /// This window, so the interceptor records keys typed here and leaves
+    /// every other window's keystrokes alone.
+    window_id: WindowId,
 }
 
 impl SettingsView {
@@ -204,6 +211,10 @@ impl SettingsView {
             last_busy: false,
             last_root,
             _appearance,
+            shortcut_filter: Default::default(),
+            capturing: None,
+            capture_interceptor: None,
+            window_id: window.window_handle().window_id(),
         };
         this.focus_handle.focus(window, cx);
         this.measure_storage(cx);
@@ -251,6 +262,65 @@ impl SettingsView {
     fn refresh_snapshots(&self, cx: &App) -> StatsSnapshot {
         Self::compute_snapshots(&self.controller, cx)
     }
+
+    /// Wait for the next keystroke and record it as `action`'s key.
+    ///
+    /// The interceptor sits ahead of every action binding: the captured key
+    /// is recorded and swallowed instead of doing whatever it used to do.
+    /// Keys typed into other windows are left alone — only this window's
+    /// keystrokes are recorded.
+    fn start_capture(&mut self, action: &'static str, cx: &mut Context<Self>) {
+        self.stop_capture();
+        let weak = cx.weak_entity();
+        let window_id = self.window_id;
+        self.capture_interceptor = Some(cx.intercept_keystrokes(move |event, window, cx| {
+            if window.window_handle().window_id() != window_id {
+                return;
+            }
+            cx.stop_propagation();
+            let keystroke = event.keystroke.clone();
+            let _ = weak.update(cx, |this, cx| this.finish_capture(action, keystroke, cx));
+        }));
+        self.capturing = Some(action);
+        cx.notify();
+    }
+
+    /// Record what the capture caught. Esc cancels and keeps the old key;
+    /// Backspace or Delete with no modifiers clears the binding; anything
+    /// else becomes the new key.
+    fn finish_capture(
+        &mut self,
+        action: &'static str,
+        keystroke: Keystroke,
+        cx: &mut Context<Self>,
+    ) {
+        self.stop_capture();
+
+        let plain = keystroke.modifiers == Modifiers::default();
+        let key = if plain && keystroke.key == "escape" {
+            None
+        } else if plain && (keystroke.key == "backspace" || keystroke.key == "delete") {
+            Some(String::new())
+        } else {
+            Some(keystroke.to_string())
+        };
+
+        if let Some(key) = key {
+            let mut config = AppConfig::load();
+            config.keybindings.insert(action.to_string(), key);
+            let _ = config.save();
+            // Bindings are matched latest-first, so the override wins over
+            // the default it replaces without a restart.
+            crate::register_keys(cx);
+        }
+        cx.refresh_windows();
+    }
+
+    /// Stand down from a capture (new capture, or the old one landed).
+    fn stop_capture(&mut self) {
+        self.capture_interceptor.take();
+        self.capturing = None;
+    }
 }
 
 impl Render for SettingsView {
@@ -267,6 +337,7 @@ impl Render for SettingsView {
                 group_ix: None,
             });
         }
+        let view = cx.entity();
         let settings = settings
             .page(about::about_page(&self.controller))
             .page(appearance::appearance_page(&self.controller, cx))
@@ -277,7 +348,7 @@ impl Render for SettingsView {
             ))
             .page(model::model_page())
             .page(search::search_page(&self.controller, stats.sig_coverage))
-            .page(shortcuts::shortcuts_page());
+            .page(shortcuts::shortcuts_page(&view, cx));
 
         // Client-side decorations are forced app-wide, so this window draws
         // its own (title + gpui-kit's min/max/close controls).
