@@ -242,7 +242,11 @@ impl AppView {
         // The flag is the way out: while quitting, a close is a close.
         let has_tray = tray.is_some();
         let quitting_for_close = quitting.clone();
-        window.on_window_should_close(cx, move |window, _cx| {
+        window.on_window_should_close(cx, move |window, cx| {
+            // The settings window goes wherever the main window goes: it is
+            // the main window's companion, and closing (or tucking away) the
+            // main window must not leave it floating behind.
+            crate::dialogs::settings::close(cx);
             if quitting_for_close.load(std::sync::atomic::Ordering::Relaxed) {
                 true
             } else if has_tray {
