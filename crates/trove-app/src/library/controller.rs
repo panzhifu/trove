@@ -502,14 +502,10 @@ impl LibraryController {
         }
     }
 
-    /// Swap the open library for another one (hot switch from Settings): the
-    /// new library's data and cache roots. Resets every view state; refused
-    /// mid-import so a running job cannot keep writing into the previous store.
-    ///
-    /// Nothing calls this while the settings page leaves the library list to
-    /// the welcome window; the switch itself is kept whole for when an entry
-    /// point comes back.
-    #[expect(dead_code, reason = "no library switcher in the settings window")]
+    /// Swap the open library for another one (hot switch from the welcome
+    /// window's library manager): the new library's data and cache roots.
+    /// Resets every view state; refused mid-import so a running job cannot
+    /// keep writing into the previous store.
     pub fn swap_library(
         &mut self,
         data_root: PathBuf,

@@ -24,6 +24,38 @@ pub struct WelcomeView {
     name: Entity<InputState>,
 }
 
+/// Handle of the open welcome window, so `open` can focus instead of
+/// stacking windows.
+#[derive(Default)]
+struct WelcomeWindowState(Option<AnyWindowHandle>);
+
+impl gpui_kit::Global for WelcomeWindowState {}
+
+/// Open the library manager over a running session — the File menu's
+/// 「素材库」 — or focus it when it is already up.
+pub fn open(cx: &mut App) {
+    if let Some(state) = cx.try_global::<WelcomeWindowState>()
+        && let Some(handle) = state.0
+        && handle
+            .update(cx, |_, window, _| window.activate_window())
+            .is_ok()
+    {
+        return;
+    }
+    let options = WindowOptions {
+        window_bounds: Some(WindowBounds::centered(size(px(1024.), px(720.)), cx)),
+        ..crate::app::title_bar::window_options()
+    };
+    let handle = cx.open_window(options, |window, cx| {
+        cx.set_global(WelcomeWindowState(Some(window.window_handle())));
+        let view = cx.new(|cx| WelcomeView::new(window, cx));
+        cx.new(|cx| Root::new(view, window, cx))
+    });
+    if let Err(e) = handle {
+        panic!("open library manager window: {e}");
+    }
+}
+
 impl WelcomeView {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let name = cx.new(|cx| {
@@ -47,7 +79,42 @@ impl WelcomeView {
     /// Record `entry` as the open library and hand over to the main window.
     /// This window only goes away once the new one is up, so a failure to
     /// open leaves the user somewhere they can still act.
+    ///
+    /// Two ways in, decided by whether a main window is already running: if
+    /// it is, the switch hot-swaps the library inside that window — tray,
+    /// watch service and settings all stay put — and this window closes. On
+    /// first launch there is nothing to swap, so a main window is opened and
+    /// this window hands over to it.
     fn enter(&mut self, entry: LibraryEntry, window: &mut Window, cx: &mut Context<Self>) {
+        // A running session: swap the library inside its main window. The
+        // active-library record only moves when the swap actually did, so a
+        // refused switch (an import mid-flight) leaves everything consistent.
+        if let Some(state) = cx.try_global::<crate::app::root::SessionState>()
+            && let Some(controller) = state.0.as_ref().and_then(|weak| weak.upgrade())
+        {
+            let swapped = controller.update(cx, |ctl, cx| {
+                let swapped = ctl
+                    .swap_library(entry.dir(), entry.cache_dir())
+                    .and_then(|()| AppConfig::load().set_active_library(&entry.slug))
+                    .is_ok();
+                if swapped {
+                    // The old watch task scanned for the previous library;
+                    // restart the resident watch on the new one.
+                    if let Some(handle) = ctl.watch_handle {
+                        let entity = cx.entity();
+                        crate::library::jobs::start_watch_service(&entity, handle, cx);
+                    }
+                }
+                swapped
+            });
+            // A refused swap keeps this window up, so the pick can be
+            // retried or abandoned.
+            if swapped {
+                window.remove_window();
+            }
+            return;
+        }
+
         if AppConfig::load().set_active_library(&entry.slug).is_err() {
             return;
         }

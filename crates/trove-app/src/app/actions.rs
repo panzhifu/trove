@@ -10,6 +10,7 @@ gpui_kit::actions!(
     trove,
     [
         // -- File menu ----------------------------------------------------
+        ManageLibraries,
         ImportFiles,
         ImportUrl,
         ScreenshotFull,
