@@ -132,6 +132,22 @@ pub fn open_at(page: SettingsPage, cx: &mut App, controller: Entity<LibraryContr
     }
 }
 
+/// Close the settings window if it is open.
+///
+/// The settings are the main window's companion, not an independent surface:
+/// when the main window goes (closed to the tray, or the app is quitting),
+/// this takes the settings window with it instead of leaving it floating
+/// behind. Reopening later starts a fresh one — the window holds no state
+/// worth keeping.
+pub fn close(cx: &mut App) {
+    if let Some(state) = cx.try_global::<SettingsWindowState>()
+        && let Some(handle) = state.0
+    {
+        let _ = handle.update(cx, |_, window, _| window.remove_window());
+    }
+    cx.set_global(SettingsWindowState(None));
+}
+
 /// DB-backed numbers the settings pages show, snapshotted so renders never
 /// query the database. Refreshed on open and on busy / library-root
 /// transitions (job finished, library hot-swapped).
