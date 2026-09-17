@@ -1,30 +1,41 @@
-//! The welcome window: pick a library, or make one.
+//! The library manager (formerly the welcome window): pick a library, make
+//! one, rename or delete the ones that exist.
 //!
-//! Shown *instead of* the main window while no library exists. There is no
-//! way past it: a library is where every asset record, every collection and
-//! every per-library preference lives, so the application has nothing to open
-//! until one exists.
+//! Shown *instead of* the main window while no library exists — there is no
+//! way past it, a library is where every asset record, every collection and
+//! every per-library preference lives — and reachable at any time from the
+//! File menu's 「素材库」 while a session is running.
 //!
-//! Two panes, in the order the decision reads: the libraries that already
-//! exist on the left, and the one-step act of making a new one on the right.
+//! Two panes, in the order the decision reads: the library names on the
+//! left, and creating plus managing on the right. A click selects; a double
+//! click (or the Open button) enters.
 
 use gpui_kit::base::{h_flex, v_flex};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
-use gpui_kit::component::{ActiveTheme, IconName, Root, TitleBar};
+use gpui_kit::component::scroll::ScrollableElement as _;
+use gpui_kit::component::{ActiveTheme, Disableable as _, IconName, Root, TitleBar};
+use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use super::AppView;
 use trove_core::config::{AppConfig, LibraryEntry};
 
-/// The welcome window root view.
+/// The library manager's root view.
 pub struct WelcomeView {
     focus_handle: FocusHandle,
     /// The name being typed for the new library.
     name: Entity<InputState>,
+    /// The library picked in the left pane, by slug.
+    selected: Option<String>,
+    /// The new name being typed for the selected library.
+    rename: Entity<InputState>,
+    /// The delete button's two-step confirmation: the first click arms it,
+    /// the second one deletes.
+    confirm_delete: bool,
 }
 
-/// Handle of the open welcome window, so `open` can focus instead of
+/// Handle of the open library manager, so `open` can focus instead of
 /// stacking windows.
 #[derive(Default)]
 struct WelcomeWindowState(Option<AnyWindowHandle>);
@@ -62,6 +73,7 @@ impl WelcomeView {
             InputState::new(window, cx)
                 .placeholder(rust_i18n::t!("welcome.name_placeholder").to_string())
         });
+        let rename = cx.new(|cx| InputState::new(window, cx));
         cx.subscribe_in(&name, window, |this, _, event, window, cx| {
             // Enter in the name field is the same act as the button.
             if matches!(event, InputEvent::PressEnter { .. }) {
@@ -73,7 +85,13 @@ impl WelcomeView {
 
         let focus_handle = cx.focus_handle();
         focus_handle.focus(window, cx);
-        Self { focus_handle, name }
+        Self {
+            focus_handle,
+            name,
+            selected: None,
+            rename,
+            confirm_delete: false,
+        }
     }
 
     /// Record `entry` as the open library and hand over to the main window.
@@ -146,14 +164,73 @@ impl WelcomeView {
             }
         }
     }
+
+    /// Pick a library in the left pane: it becomes the manage pane's
+    /// subject, and its name is staged for renaming.
+    fn select(&mut self, slug: String, name: String, window: &mut Window, cx: &mut Context<Self>) {
+        if self.selected.as_deref() == Some(slug.as_str()) {
+            return;
+        }
+        self.selected = Some(slug);
+        self.confirm_delete = false;
+        self.rename
+            .update(cx, |input, cx| input.set_value(name, window, cx));
+        cx.notify();
+    }
+
+    /// Rename the selected library to whatever the rename field holds. An
+    /// empty field is a no-op — there is nothing to rename it to.
+    fn rename_selected(&mut self, cx: &mut Context<Self>) {
+        let Some(slug) = self.selected.clone() else {
+            return;
+        };
+        let new_name = self.rename.read(cx).value().trim().to_string();
+        if new_name.is_empty() {
+            return;
+        }
+        let mut config = AppConfig::load();
+        if let Err(error) = config.rename_library(&slug, &new_name) {
+            tracing::error!(%error, "could not rename the library");
+        }
+        cx.notify();
+    }
+
+    /// Delete the selected library — the second click of a two-step
+    /// confirmation. The registry entry goes, and with it the library's
+    /// database and cache; the media files themselves were never inside.
+    fn delete_selected(&mut self, cx: &mut Context<Self>) {
+        if !self.confirm_delete {
+            // First click: arm it. The button turns to "confirm" and the
+            // next selection change disarms.
+            self.confirm_delete = true;
+            cx.notify();
+            return;
+        }
+        let Some(slug) = self.selected.clone() else {
+            return;
+        };
+        let config = AppConfig::load();
+        let Some(entry) = config.libraries.iter().find(|l| l.slug == slug) else {
+            return;
+        };
+        let entry = entry.clone();
+        let mut config = AppConfig::load();
+        let _ = config.forget_library(&slug);
+        let _ = std::fs::remove_dir_all(entry.dir());
+        let _ = std::fs::remove_dir_all(entry.cache_dir());
+        self.selected = None;
+        self.confirm_delete = false;
+        cx.notify();
+    }
 }
 
 impl Render for WelcomeView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let libraries = AppConfig::load().libraries;
-        // An empty registry is a normal first run, not an error, so the left
-        // pane says what to do rather than showing nothing.
+        let config = AppConfig::load();
+        let libraries = config.libraries.clone();
+        let active_slug = config.active_slug().to_string();
         let view = cx.entity();
+
         let mut list = v_flex()
             .w(px(320.))
             .h_full()
@@ -176,8 +253,15 @@ impl Render for WelcomeView {
                     .child(rust_i18n::t!("welcome.no_libraries").to_string()),
             );
         }
-        for entry in libraries {
-            list = list.child(library_row(&view, entry, cx));
+        for entry in &libraries {
+            let selected = self.selected.as_deref() == Some(entry.slug.as_str());
+            list = list.child(library_row(
+                &view,
+                entry.clone(),
+                selected,
+                entry.slug == active_slug,
+                cx,
+            ));
         }
 
         v_flex()
@@ -201,59 +285,202 @@ impl Render for WelcomeView {
                     .items_stretch()
                     .child(list)
                     .child(
-                        // Making one.
                         v_flex()
                             .flex_1()
                             .h_full()
                             .min_w_0()
-                            .justify_center()
-                            .gap_3()
+                            .overflow_y_scrollbar()
+                            .gap_5()
                             .px_8()
-                            .child(
-                                h_flex().gap_2().items_center().child(IconName::Plus).child(
-                                    div()
-                                        .text_base()
-                                        .font_weight(FontWeight::MEDIUM)
-                                        .child(rust_i18n::t!("welcome.create").to_string()),
-                                ),
-                            )
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child(rust_i18n::t!("welcome.create_desc").to_string()),
-                            )
-                            .child(
-                                v_flex()
-                                    .gap_1()
-                                    .w_full()
-                                    .child(
-                                        div()
-                                            .text_xs()
-                                            .text_color(cx.theme().muted_foreground)
-                                            .child(rust_i18n::t!("welcome.name").to_string()),
-                                    )
-                                    .child(Input::new(&self.name)),
-                            )
-                            .child(
-                                h_flex().w_full().justify_end().child(
-                                    Button::new("welcome-create")
-                                        .primary()
-                                        .label(rust_i18n::t!("welcome.create_button").to_string())
-                                        .on_click(cx.listener(|this, _, window, cx| {
-                                            this.create(window, cx);
-                                        })),
-                                ),
-                            ),
+                            .py_8()
+                            .child(self.create_section(cx))
+                            .child(div().w_full().border_t_1().border_color(cx.theme().border))
+                            .child(self.manage_section(cx)),
                     ),
             )
     }
 }
 
-/// One library the user can enter: its name, and where it lives underneath.
+impl WelcomeView {
+    /// The create pane: what a library is, the name field, and the button.
+    fn create_section(&mut self, cx: &mut Context<Self>) -> Div {
+        v_flex()
+            .gap_3()
+            .child(
+                h_flex().gap_2().items_center().child(IconName::Plus).child(
+                    div()
+                        .text_base()
+                        .font_weight(FontWeight::MEDIUM)
+                        .child(rust_i18n::t!("welcome.create").to_string()),
+                ),
+            )
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(rust_i18n::t!("welcome.create_desc").to_string()),
+            )
+            .child(
+                v_flex()
+                    .gap_1()
+                    .w_full()
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(rust_i18n::t!("welcome.name").to_string()),
+                    )
+                    .child(Input::new(&self.name)),
+            )
+            .child(
+                h_flex().w_full().justify_end().child(
+                    Button::new("welcome-create")
+                        .primary()
+                        .label(rust_i18n::t!("welcome.create_button").to_string())
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.create(window, cx);
+                        })),
+                ),
+            )
+    }
+
+    /// The manage pane: the picked library, rename, open, delete.
+    fn manage_section(&mut self, cx: &mut Context<Self>) -> Div {
+        let heading = h_flex()
+            .gap_2()
+            .items_center()
+            .child(IconName::Settings)
+            .child(
+                div()
+                    .text_base()
+                    .font_weight(FontWeight::MEDIUM)
+                    .child(rust_i18n::t!("welcome.manage").to_string()),
+            );
+
+        let config = AppConfig::load();
+        let active_slug = config.active_slug().to_string();
+        let Some(entry) = self
+            .selected
+            .as_ref()
+            .and_then(|slug| config.libraries.iter().find(|l| &l.slug == slug))
+            .cloned()
+        else {
+            return v_flex().gap_3().child(heading).child(
+                div()
+                    .text_sm()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(rust_i18n::t!("welcome.manage_none").to_string()),
+            );
+        };
+        let in_use = entry.slug == active_slug;
+
+        let mut heading = heading;
+        if in_use {
+            heading = heading.child(
+                div()
+                    .rounded_full()
+                    .px_2()
+                    .py_0p5()
+                    .text_xs()
+                    .bg(cx.theme().info.opacity(0.15))
+                    .text_color(cx.theme().info)
+                    .child(rust_i18n::t!("welcome.in_use").to_string()),
+            );
+        }
+
+        v_flex()
+            .gap_3()
+            .child(heading)
+            .child(
+                div()
+                    .text_lg()
+                    .font_weight(FontWeight::MEDIUM)
+                    .child(entry.name.clone()),
+            )
+            // Rename: the field arrives pre-filled with the current name, so
+            // the edit is a change-and-confirm, not a retyping exercise.
+            .child(
+                v_flex()
+                    .gap_1()
+                    .w_full()
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(rust_i18n::t!("welcome.rename_to").to_string()),
+                    )
+                    .child(
+                        h_flex()
+                            .w_full()
+                            .gap_2()
+                            .child(div().flex_1().min_w_0().child(Input::new(&self.rename))),
+                    ),
+            )
+            .child(
+                h_flex().w_full().justify_end().child(
+                    Button::new("welcome-rename")
+                        .outline()
+                        .label(rust_i18n::t!("welcome.rename").to_string())
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.rename_selected(cx);
+                        })),
+                ),
+            )
+            .child(
+                h_flex()
+                    .w_full()
+                    .items_center()
+                    .justify_end()
+                    .gap_2()
+                    .child(
+                        Button::new("welcome-open")
+                            .primary()
+                            .disabled(in_use)
+                            .label(rust_i18n::t!("welcome.open").to_string())
+                            .on_click({
+                                let entry = entry.clone();
+                                cx.listener(move |this, _, window, cx| {
+                                    this.enter(entry.clone(), window, cx);
+                                })
+                            }),
+                    )
+                    .child({
+                        let armed = self.confirm_delete;
+                        let mut button = Button::new("welcome-delete");
+                        if armed {
+                            button = button
+                                .danger()
+                                .label(rust_i18n::t!("welcome.delete_confirm").to_string());
+                        } else {
+                            button = button
+                                .danger()
+                                .outline()
+                                .label(rust_i18n::t!("welcome.delete").to_string());
+                        }
+                        button
+                            .disabled(in_use)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.delete_selected(cx);
+                            }))
+                    }),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(rust_i18n::t!("welcome.delete_hint").to_string()),
+            )
+    }
+}
+
+/// One library in the left pane: its name, where it lives underneath, a
+/// "in use" badge when it is the open one. Click selects it for the manage
+/// pane; a double click enters straight away.
 fn library_row(
     view: &Entity<WelcomeView>,
     entry: LibraryEntry,
+    selected: bool,
+    in_use: bool,
     cx: &mut Context<WelcomeView>,
 ) -> AnyElement {
     let dir = entry.dir().display().to_string();
@@ -266,18 +493,48 @@ fn library_row(
         .p_2()
         .rounded_md()
         .cursor_pointer()
-        .hover(|row| row.bg(cx.theme().muted))
+        .when(selected, |row| row.bg(cx.theme().selection))
+        .when(!selected, |row| {
+            row.hover(|hovered| hovered.bg(cx.theme().muted))
+        })
         .on_click({
             let view = view.clone();
             let entry = entry.clone();
-            move |_, window, cx| {
-                view.update(cx, |this, cx| this.enter(entry.clone(), window, cx));
+            move |event: &ClickEvent, window, cx| {
+                // A double click enters straight away; a single click only
+                // selects. Keyboard "clicks" never enter.
+                let double_click = match event {
+                    ClickEvent::Mouse(click) => click.up.click_count >= 2,
+                    ClickEvent::Keyboard(_) | ClickEvent::Touch(_) => false,
+                };
+                view.update(cx, |this, cx| {
+                    if double_click {
+                        this.enter(entry.clone(), window, cx);
+                    } else {
+                        this.select(entry.slug.clone(), entry.name.clone(), window, cx);
+                    }
+                });
             }
         })
         .child(
             v_flex()
                 .min_w_0()
-                .child(div().text_sm().truncate().child(entry.name.clone()))
+                .child(
+                    h_flex()
+                        .min_w_0()
+                        .items_baseline()
+                        .gap_2()
+                        .child(div().text_sm().truncate().child(entry.name.clone()))
+                        .when(in_use, |line| {
+                            line.child(
+                                div()
+                                    .flex_shrink_0()
+                                    .text_xs()
+                                    .text_color(cx.theme().info)
+                                    .child(rust_i18n::t!("welcome.in_use").to_string()),
+                            )
+                        }),
+                )
                 .child(
                     div()
                         .text_xs()
@@ -285,12 +542,6 @@ fn library_row(
                         .text_color(cx.theme().muted_foreground)
                         .child(dir),
                 ),
-        )
-        .child(
-            div()
-                .text_xs()
-                .text_color(cx.theme().info)
-                .child(rust_i18n::t!("welcome.open").to_string()),
         )
         .into_any_element()
 }
