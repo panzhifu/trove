@@ -1,16 +1,16 @@
 //! Files page: where the bytes live.
 //!
-//! Three kinds of thing, in the order a user meets them: what Trove is using
-//! on disk, which libraries exist and where, and the jobs that keep the
+//! Three kinds of thing, in the order a user meets them: which libraries
+//! exist and where, what Trove is using on disk, and the jobs that keep the
 //! derived files honest — thumbnails, backups, orphans, integrity.
 
 use super::*;
-use trove_core::config::LibraryConfig;
+use gpui_kit::component::chart::PieChart;
 use trove_core::services::storage::{DirUsage, StorageReport};
 
 // =============================== files page ==================================
 
-/// Files ▸ storage, libraries, watched folders and maintenance.
+/// Files ▸ the libraries, storage and maintenance.
 pub(super) fn files_page(
     controller: &Entity<LibraryController>,
     stats: LibraryStats,
@@ -22,28 +22,20 @@ pub(super) fn files_page(
     SettingPage::new(t("settings.files"))
         .icon(IconName::HardDrive)
         .resettable(false)
+        .group(current_library_group(controller))
+        .group(libraries_group(controller))
         .group(
             SettingGroup::new()
                 .title(t("settings.storage"))
                 .item(
-                    SettingItem::new(
-                        t("settings.storage_usage"),
-                        SettingField::render(move |_, _, cx| usage_block(storage, cx)),
-                    )
-                    .description(t("settings.storage_usage_desc")),
+                    SettingItem::render(move |_, _, cx| app_data_block(storage, cx))
+                        .keywords([rust_i18n::t!("settings.storage_usage").to_string()]),
                 )
                 .item(
-                    SettingItem::new(
-                        t("settings.storage_assets"),
-                        SettingField::render(move |_, _, cx| stats_block(&assets, cx)),
-                    )
-                    .description(t("settings.storage_assets_desc")),
+                    SettingItem::render(move |_, _, cx| stats_block(&assets, cx))
+                        .keywords([rust_i18n::t!("settings.storage_assets").to_string()]),
                 ),
         )
-        .group(current_library_group(controller))
-        .group(libraries_group(controller))
-        .group(watch_folders_group())
-        .group(collect_group())
         .group(
             SettingGroup::new().title(t("settings.thumbnails")).item(
                 SettingItem::new(
@@ -87,101 +79,260 @@ pub(super) fn files_page(
         )))
 }
 
-// ============================== storage usage ================================
+// ============================== storage rings ================================
 
-/// The byte counts: one line per directory Trove owns, then the total.
+/// What Trove keeps on disk, as a ring: one slice per directory it owns, and
+/// the total in the hole.
 ///
 /// `None` while the background walk is still running — it is the first thing
 /// the page shows after opening, and a stale-looking zero would be worse than
 /// a sentence.
-fn usage_block(report: Option<StorageReport>, cx: &mut App) -> Div {
+fn app_data_block(report: Option<StorageReport>, cx: &App) -> Div {
+    let title = rust_i18n::t!("settings.storage_usage").to_string();
     let Some(report) = report else {
-        return v_flex().w_full().child(
-            div()
-                .text_sm()
-                .text_color(cx.theme().muted_foreground)
-                .child(rust_i18n::t!("settings.storage_measuring").to_string()),
-        );
+        return ring_row(title, None, cx);
     };
 
-    // (label, measurement, can be deleted and rebuilt)
-    let rows: [(String, DirUsage, bool); 6] = [
+    // (label, measurement) — one line per directory, in a stable order.
+    let rows: [(String, DirUsage); 6] = [
         (
             rust_i18n::t!("settings.storage_config").to_string(),
             report.config,
-            false,
         ),
         (
             rust_i18n::t!("settings.storage_library").to_string(),
             report.library(),
-            false,
         ),
         (
             rust_i18n::t!("settings.storage_backups").to_string(),
             report.backups,
-            false,
         ),
         (
             rust_i18n::t!("settings.storage_cache").to_string(),
             report.cache(),
-            true,
         ),
         (
             rust_i18n::t!("settings.storage_logs").to_string(),
             report.logs,
-            true,
         ),
         (
             rust_i18n::t!("settings.storage_incoming").to_string(),
             report.incoming,
-            false,
         ),
     ];
 
-    let mut column = v_flex().w_full().gap_1();
-    for (label, usage, reclaimable) in rows {
-        column = column.child(usage_row(label, usage, reclaimable, false, cx));
-    }
-    column.child(usage_row(
-        rust_i18n::t!("settings.storage_total").to_string(),
-        report.total,
-        false,
-        true,
-        cx,
-    ))
+    let slices = rows
+        .into_iter()
+        .enumerate()
+        .map(|(ix, (label, usage))| Slice {
+            label: label.into(),
+            detail: format!(
+                "{} · {} {}",
+                format_bytes(usage.bytes),
+                usage.files,
+                rust_i18n::t!("settings.storage_files")
+            ),
+            value: usage.bytes,
+            color: slice_color(cx, ix),
+        })
+        .collect();
+    ring_row(title, Some((slices, format_bytes(report.total.bytes))), cx)
 }
 
-/// One line of the breakdown: what it is, how big it is, how many files make
-/// it up, and whether deleting it would cost anything.
-fn usage_row(label: String, usage: DirUsage, reclaimable: bool, strong: bool, cx: &mut App) -> Div {
-    let tone = if strong {
-        cx.theme().foreground
-    } else {
-        cx.theme().muted_foreground
-    };
+/// What the library holds, as a ring: one slice per asset kind, by count.
+///
+/// The kinds are the only breakdown worth a ring here — how many assets are
+/// in the trash, how large they are, how many tags exist: those are numbers,
+/// not shares of a whole.
+fn stats_block(stats: &LibraryStats, cx: &App) -> Div {
+    let slices = stats
+        .by_kind
+        .iter()
+        .map(|(kind, count)| Slice {
+            label: kind_label(kind).into(),
+            detail: count.to_string(),
+            value: *count,
+            color: slice_color(cx, kind_slot(kind)),
+        })
+        .collect();
+    ring_row(
+        rust_i18n::t!("settings.storage_assets").to_string(),
+        Some((slices, stats.live.to_string())),
+        cx,
+    )
+}
+
+/// One ring row: the title where a setting's label sits, and the ring where
+/// its field would — so the row lines up with the plain ones around it.
+///
+/// `data` is `None` while a measurement is still running.
+fn ring_row(title: String, data: Option<(Vec<Slice>, String)>, cx: &App) -> Div {
+    let row = h_flex().w_full().items_center().gap_4().child(
+        div()
+            .w(px(110.))
+            .flex_shrink_0()
+            .text_sm()
+            .text_color(cx.theme().foreground)
+            .child(title),
+    );
+    match data {
+        Some((slices, center)) => row.child(ring(slices, center, cx)),
+        None => row.child(
+            div()
+                .text_sm()
+                .text_color(cx.theme().muted_foreground)
+                .child(rust_i18n::t!("settings.storage_measuring").to_string()),
+        ),
+    }
+}
+
+/// A donut with its legend: the ring on the left, one line per slice on the
+/// right, and the total in the hole — the one number the slices add up to.
+///
+/// The plot draws from the bounds it is handed, so the box around it is also
+/// what decides how big the ring comes out; the radii are given explicitly so
+/// the ring keeps its proportions whatever the row is measured at.
+fn ring(slices: Vec<Slice>, center: String, cx: &App) -> Div {
+    const SIZE: f32 = 128.;
+    const THICKNESS: f32 = 28.;
+
+    let outer = SIZE / 2. - 2.;
+    let legend = slices.clone();
+
+    h_flex()
+        .flex_1()
+        .min_w_0()
+        .items_center()
+        .gap_4()
+        .child(
+            div()
+                .relative()
+                .w(px(SIZE))
+                .h(px(SIZE))
+                .flex_shrink_0()
+                .child(
+                    PieChart::new(slices)
+                        .value(|slice| slice.value as f32)
+                        .color(|slice| slice.color)
+                        .inner_radius(outer - THICKNESS)
+                        .outer_radius(outer),
+                )
+                .child(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .size_full()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(center),
+                        ),
+                ),
+        )
+        .child(
+            v_flex()
+                .flex_1()
+                .min_w_0()
+                .gap_1()
+                .children(legend.into_iter().map(|slice| legend_row(slice, cx))),
+        )
+}
+
+/// One legend line: the slice's colour, its name, and its number.
+fn legend_row(slice: Slice, cx: &App) -> Div {
     h_flex()
         .w_full()
-        .justify_between()
+        .items_center()
         .gap_2()
         .child(
-            h_flex()
-                .gap_2()
-                .child(div().text_sm().text_color(tone).child(label))
-                .when(reclaimable, |row| {
-                    row.child(
-                        div()
-                            .text_xs()
-                            .text_color(cx.theme().info)
-                            .child(rust_i18n::t!("settings.storage_reclaimable").to_string()),
-                    )
-                }),
+            div()
+                .w(px(8.))
+                .h(px(8.))
+                .flex_shrink_0()
+                .rounded(px(2.))
+                .bg(slice.color),
         )
-        .child(div().text_sm().text_color(tone).child(format!(
-            "{} · {} {}",
-            format_bytes(usage.bytes),
-            usage.files,
-            rust_i18n::t!("settings.storage_files")
-        )))
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .truncate()
+                .text_sm()
+                .text_color(cx.theme().foreground)
+                .child(slice.label),
+        )
+        .child(
+            div()
+                .flex_shrink_0()
+                .text_xs()
+                .text_color(cx.theme().muted_foreground)
+                .child(slice.detail),
+        )
+}
+
+/// One slice of a ring: what it is, how much of the whole it holds, and the
+/// colour it takes from the palette. The ring and the legend are built from
+/// one list, so a slice's colour is never looked up twice.
+#[derive(Clone)]
+struct Slice {
+    label: SharedString,
+    /// The number, as the legend spells it out beside the label.
+    detail: String,
+    value: u64,
+    color: Hsla,
+}
+
+/// The palette a ring and its legend share. Eight entries: one per asset kind,
+/// the last of them the muted tone, so "other" reads as the leftovers.
+fn slice_color(cx: &App, ix: usize) -> Hsla {
+    let theme = cx.theme();
+    match ix % 8 {
+        0 => theme.chart_1,
+        1 => theme.green,
+        2 => theme.yellow,
+        3 => theme.magenta,
+        4 => theme.cyan,
+        5 => theme.red,
+        6 => theme.blue,
+        _ => theme.muted_foreground,
+    }
+}
+
+/// The asset kind's slot in the palette. Keyed on the kind rather than on the
+/// slice's position, so a library without audio does not repaint its images.
+fn kind_slot(kind: &trove_core::model::AssetKind) -> usize {
+    use trove_core::model::AssetKind as Kind;
+    match kind {
+        Kind::Image => 0,
+        Kind::Video => 1,
+        Kind::Audio => 2,
+        Kind::Document => 3,
+        Kind::Archive => 4,
+        Kind::Font => 5,
+        Kind::Model => 6,
+        Kind::Other => 7,
+    }
+}
+
+/// Localized name for an asset kind.
+fn kind_label(kind: &trove_core::model::AssetKind) -> String {
+    use trove_core::model::AssetKind as Kind;
+    let key = match kind {
+        Kind::Image => "asset.kind.image",
+        Kind::Video => "asset.kind.video",
+        Kind::Audio => "asset.kind.audio",
+        Kind::Document => "asset.kind.document",
+        Kind::Archive => "asset.kind.archive",
+        Kind::Font => "asset.kind.font",
+        Kind::Model => "asset.kind.model",
+        Kind::Other => "asset.kind.other",
+    };
+    rust_i18n::t!(key).to_string()
 }
 
 /// A byte count in the largest unit that keeps it readable: 1536 → "1.5 KB".
@@ -667,47 +818,39 @@ fn status_row(controller: &Entity<LibraryController>, cx: &mut App) -> Div {
         })
 }
 
-// ---------------------------------------------------------------------------
-// Moved in from the old General page: the library registry, the watched
-// folders, the collect service and the asset statistics. Every one of them is
-// about where files are, which is what this page is about.
-// ---------------------------------------------------------------------------
+// ============================== libraries ====================================
+
 /// The open library: what it is called and where Trove keeps it. The path is
-/// read-only — it is not the user's to pick.
+/// read-only — it is not the user's to pick, so the row offers the folder but
+/// never spells it out.
 fn current_library_group(controller: &Entity<LibraryController>) -> SettingGroup {
     let controller = controller.clone();
     SettingGroup::new()
         .title(rust_i18n::t!("settings.library").to_string())
-        .item(
-            SettingItem::new(
-                rust_i18n::t!("settings.library_name").to_string(),
-                SettingField::input(
-                    |_cx| SharedString::from(AppConfig::load().active_entry().name),
-                    |value, cx| {
-                        let mut config = AppConfig::load();
-                        let slug = config.active_slug();
-                        if config.rename_library(&slug, &value).is_ok() {
-                            cx.refresh_windows();
-                        }
-                    },
-                ),
-            )
-            .description(rust_i18n::t!("settings.library_name_desc").to_string()),
-        )
-        .item(
-            SettingItem::new(
-                rust_i18n::t!("settings.library_current").to_string(),
-                SettingField::render(move |_, _, cx| library_current_row(&controller, cx)),
-            )
-            .description(rust_i18n::t!("settings.library_current_desc").to_string()),
-        )
+        .item(SettingItem::new(
+            rust_i18n::t!("settings.library_name").to_string(),
+            SettingField::input(
+                |_cx| SharedString::from(AppConfig::load().active_entry().name),
+                |value, cx| {
+                    let mut config = AppConfig::load();
+                    let slug = config.active_slug();
+                    if config.rename_library(&slug, &value).is_ok() {
+                        cx.refresh_windows();
+                    }
+                },
+            ),
+        ))
+        .item(SettingItem::new(
+            rust_i18n::t!("settings.library_current").to_string(),
+            SettingField::render(move |_, _, cx| library_current_row(&controller, cx)),
+        ))
 }
 
-// ================================ libraries ==================================
+// ============================ other libraries ================================
 
-/// General ▸ Libraries: every registered library, one click to switch. The
-/// directories are Trove's business — a library is a name, not a path the
-/// user has to think about.
+/// Every other registered library, one click to switch. The directories are
+/// Trove's business — a library is a name, not a path the user has to think
+/// about.
 fn libraries_group(controller: &Entity<LibraryController>) -> SettingGroup {
     let config = AppConfig::load();
     let current = config.active_slug();
@@ -814,21 +957,16 @@ fn remove_library(entry: &trove_core::config::LibraryEntry, cx: &mut App) {
     cx.refresh_windows();
 }
 
-/// The open library: where Trove keeps it (read-only — the path is not the
-/// user's to pick), the last switch/maintenance notice, and a button to open
-/// that directory in the file manager.
+/// The open library's folder: one button that opens it, plus the last
+/// switch / maintenance notice when there is one.
+///
+/// The path is not the user's to pick, so it is not spelled out here either —
+/// the button is the whole row.
 fn library_current_row(controller: &Entity<LibraryController>, cx: &mut App) -> Div {
     let dir = AppConfig::load().active_entry().dir();
     let notice = controller.read(cx).notice.clone();
     v_flex()
         .gap_1()
-        .child(
-            div()
-                .w_full()
-                .text_xs()
-                .text_color(cx.theme().muted_foreground)
-                .child(dir.display().to_string()),
-        )
         .when_some(notice, |col, notice| {
             col.child(
                 div()
@@ -843,6 +981,7 @@ fn library_current_row(controller: &Entity<LibraryController>, cx: &mut App) -> 
                 Button::new("open-library-dir")
                     .outline()
                     .small()
+                    .icon(IconName::Folder)
                     .label(rust_i18n::t!("settings.open_data_dir").to_string())
                     .on_click({
                         let dir = dir.clone();
@@ -889,238 +1028,4 @@ fn switch_library(
         cx.notify();
     });
     cx.refresh_windows();
-}
-
-// ============================ watched folders ================================
-
-/// General ▸ Watched folders: folders scanned for new files, which import
-/// automatically (unfiled). The list re-reads the config on every settings
-/// render, so add/remove applies immediately.
-fn watch_folders_group() -> SettingGroup {
-    let mut group = SettingGroup::new().title(rust_i18n::t!("settings.watch_folders").to_string());
-    // The watch list belongs to the open library, not to the application: two
-    // libraries can watch different folders.
-    let config = LibraryConfig::load(&library_dir());
-    let enabled = config.watch_folders_enabled();
-
-    group = group.item(SettingItem::new(
-        rust_i18n::t!("settings.watch_enabled").to_string(),
-        SettingField::render(move |_, _, cx| watch_toggle_row(enabled, cx)),
-    ));
-
-    for path in config.watched_folders.clone() {
-        group = group.item(SettingItem::new(
-            path.display().to_string(),
-            SettingField::render(move |_, _, cx| watch_folder_row(path.clone(), cx)),
-        ));
-    }
-    group.item(SettingItem::new(
-        rust_i18n::t!("settings.add_watch_folder").to_string(),
-        SettingField::render(|_, _, cx| add_watch_folder_row(cx)),
-    ))
-}
-
-/// The open library's data directory — where its `library.json` lives.
-fn library_dir() -> PathBuf {
-    AppConfig::load().active_entry().dir()
-}
-
-/// The master-switch row: one button flipping `watch_folders_enabled`.
-fn watch_toggle_row(enabled: bool, _cx: &mut App) -> Div {
-    h_flex().w_full().justify_end().child(
-        Button::new("watch-toggle")
-            .outline()
-            .small()
-            .label(if enabled {
-                rust_i18n::t!("settings.watch_on").to_string()
-            } else {
-                rust_i18n::t!("settings.watch_off").to_string()
-            })
-            .on_click(|_, _, cx| {
-                let dir = library_dir();
-                let mut config = LibraryConfig::load(&dir);
-                config.watch_folders_enabled = Some(!config.watch_folders_enabled());
-                let _ = config.save(&dir);
-                cx.refresh_windows();
-            }),
-    )
-}
-
-/// One watched-folder row: stop watching.
-fn watch_folder_row(path: PathBuf, _cx: &mut App) -> Div {
-    h_flex().w_full().justify_end().child(
-        Button::new(format!("watch-remove-{}", path.display()))
-            .ghost()
-            .small()
-            .icon(IconName::Close)
-            .tooltip(rust_i18n::t!("settings.remove_watch_folder").to_string())
-            .on_click(move |_, _, cx| {
-                let dir = library_dir();
-                let mut config = LibraryConfig::load(&dir);
-                let _ = config.remove_watched_folder(&dir, &path);
-                cx.refresh_windows();
-            }),
-    )
-}
-
-/// The add-row: pick a folder to watch.
-fn add_watch_folder_row(_cx: &mut App) -> Div {
-    h_flex().w_full().justify_end().child(
-        Button::new("watch-add")
-            .outline()
-            .small()
-            .label(rust_i18n::t!("settings.add_watch_folder").to_string())
-            .on_click(|_, _, cx| {
-                let rx = cx.prompt_for_paths(PathPromptOptions {
-                    files: false,
-                    directories: true,
-                    multiple: false,
-                    prompt: Some(
-                        rust_i18n::t!("settings.select_watch_folder")
-                            .into_owned()
-                            .into(),
-                    ),
-                });
-                cx.spawn(async move |cx| {
-                    if let Ok(Ok(Some(paths))) = rx.await
-                        && let Some(path) = paths.first()
-                    {
-                        let path = path.to_path_buf();
-                        cx.update(|cx| {
-                            let dir = library_dir();
-                            let mut config = LibraryConfig::load(&dir);
-                            let _ = config.add_watched_folder(&dir, path);
-                            cx.refresh_windows();
-                        });
-                    }
-                })
-                .detach();
-            }),
-    )
-}
-
-// ============================ collect service ================================
-
-/// General ▸ Collect service: the local HTTP endpoint a browser extension
-/// (or curl) posts files to; they import automatically via the inbox.
-fn collect_group() -> SettingGroup {
-    let config = AppConfig::load();
-    let enabled = config.collect_enabled();
-    let port = config.collect_port();
-    SettingGroup::new()
-        .title(rust_i18n::t!("settings.collect").to_string())
-        .item(SettingItem::new(
-            rust_i18n::t!("settings.collect_enabled").to_string(),
-            SettingField::render(move |_, _, cx| collect_toggle_row(enabled, cx)),
-        ))
-        .item(SettingItem::new(
-            rust_i18n::t!("settings.collect_endpoint").to_string(),
-            SettingField::render(move |_, _, cx| {
-                div()
-                    .text_sm()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(format!("http://127.0.0.1:{port}"))
-            }),
-        ))
-        .item(SettingItem::new(
-            rust_i18n::t!("settings.collect_example").to_string(),
-            SettingField::render(|_, _, cx| {
-                div()
-                    .text_xs()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(rust_i18n::t!("settings.collect_example_cmd").to_string())
-            }),
-        ))
-}
-
-/// The collect master-switch row.
-fn collect_toggle_row(enabled: bool, _cx: &mut App) -> Div {
-    h_flex().w_full().justify_end().child(
-        Button::new("collect-toggle")
-            .outline()
-            .small()
-            .label(if enabled {
-                rust_i18n::t!("settings.collect_on").to_string()
-            } else {
-                rust_i18n::t!("settings.collect_off").to_string()
-            })
-            .on_click(|_, _, cx| {
-                let mut config = AppConfig::load();
-                config.collect_enabled = Some(!config.collect_enabled());
-                let _ = config.save();
-                // The server thread and watcher re-read the config each
-                // cycle; toggling needs a restart to (un)bind the port.
-                cx.refresh_windows();
-            }),
-    )
-}
-
-// ============================== statistics ===================================
-
-/// General ▸ Statistics: the library-size snapshot (see [`StatsSnapshot`]),
-/// taken when the window opened / the last job finished — not per render.
-fn stats_block(stats: &LibraryStats, cx: &mut App) -> Div {
-    let kind_label = |kind: &trove_core::model::AssetKind| {
-        let key = match kind {
-            trove_core::model::AssetKind::Image => "asset.kind.image",
-            trove_core::model::AssetKind::Video => "asset.kind.video",
-            trove_core::model::AssetKind::Audio => "asset.kind.audio",
-            trove_core::model::AssetKind::Document => "asset.kind.document",
-            trove_core::model::AssetKind::Archive => "asset.kind.archive",
-            trove_core::model::AssetKind::Font => "asset.kind.font",
-            trove_core::model::AssetKind::Model => "asset.kind.model",
-            trove_core::model::AssetKind::Other => "asset.kind.other",
-        };
-        rust_i18n::t!(key).to_string()
-    };
-
-    let mut rows: Vec<(String, String)> = vec![
-        (
-            rust_i18n::t!("stats.assets").to_string(),
-            stats.live.to_string(),
-        ),
-        (
-            rust_i18n::t!("stats.trashed").to_string(),
-            stats.trashed.to_string(),
-        ),
-    ];
-    for (kind, count) in &stats.by_kind {
-        rows.push((kind_label(kind), count.to_string()));
-    }
-    rows.push((
-        rust_i18n::t!("stats.total_size").to_string(),
-        crate::panels::common::human_bytes(stats.total_bytes),
-    ));
-    rows.push((
-        rust_i18n::t!("stats.collections").to_string(),
-        stats.collections.to_string(),
-    ));
-    rows.push((
-        rust_i18n::t!("stats.smart").to_string(),
-        stats.smart_collections.to_string(),
-    ));
-    rows.push((
-        rust_i18n::t!("stats.tags").to_string(),
-        stats.tags.to_string(),
-    ));
-
-    v_flex()
-        .gap_1()
-        .children(rows.into_iter().map(|(label, value)| {
-            h_flex()
-                .justify_between()
-                .gap_2()
-                .child(
-                    div()
-                        .text_sm()
-                        .text_color(cx.theme().muted_foreground)
-                        .child(label),
-                )
-                .child(
-                    div()
-                        .text_sm()
-                        .text_color(cx.theme().foreground)
-                        .child(value),
-                )
-        }))
 }
