@@ -1,100 +1,405 @@
-//! Shortcuts page: keybinding editor rows with per-action capture
-//! prompts and a reset-to-defaults button.
+//! Shortcuts page: every rebindable action, filterable, and captured live —
+//! click a row, press the combination, done. No typing `ctrl-shift-z` into a
+//! text field and hoping the format matches.
+
+use std::collections::HashMap;
+
+use gpui::Keystroke;
+use gpui_kit::component::kbd::Kbd;
 
 use super::*;
 
 // ============================ shortcuts page ================================
 
-/// Shortcuts ▸ Keyboard: view and customize keybindings.
-pub(super) fn shortcuts_page() -> SettingPage {
-    let page = SettingPage::new(rust_i18n::t!("settings.shortcuts").to_string())
+/// Which slice of the action list the page shows. One of the pills on top.
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub(super) enum ShortcutFilter {
+    /// Two live bindings in one context answer to the same key.
+    Conflicts,
+    #[default]
+    All,
+    /// Has a key right now.
+    Assigned,
+    /// The user has overridden or cleared the default.
+    Customized,
+    /// No key right now.
+    Unassigned,
+}
+
+/// One action as the list shows it.
+#[derive(Clone)]
+struct ShortcutRow {
+    action: &'static str,
+    label: String,
+    context: Option<&'static str>,
+    /// The key the action answers to right now; empty means unbound.
+    key: String,
+    /// The user has written an override (or a clear) into the config.
+    customized: bool,
+    /// Its key collides with another live binding in the same context.
+    conflict: bool,
+}
+
+/// Shortcuts ▸ Keyboard: the filter pills, then one row per action, then the
+/// reset.
+pub(super) fn shortcuts_page(view: &Entity<SettingsView>, cx: &App) -> SettingPage {
+    let capturing = view.read(cx).capturing;
+    let filter = view.read(cx).shortcut_filter;
+    let rows = shortcut_rows();
+
+    SettingPage::new(rust_i18n::t!("settings.shortcuts").to_string())
         .icon(IconName::Settings)
-        .resettable(false);
+        .resettable(false)
+        .group(filter_group(view, &rows, filter))
+        .group(list_group(view, &rows, capturing, filter))
+        .group(reset_group())
+}
 
-    let items = keybinding_items();
-    let mut group = SettingGroup::new();
-    for item in &items {
-        let action = item.action;
-        let default_key = item.key;
-        let ctx = item.context;
-        let label = action_label(action);
-        let ctx_label = ctx
-            .map(context_label)
-            .unwrap_or_else(|| context_label("global"));
+// ============================ shortcut rows =================================
 
-        let action_row = action.to_string();
-        let key_row = default_key.to_string();
-        let ctx_row = ctx_label.clone();
-        group = group.item(SettingItem::new(
-            label.clone(),
-            SettingField::render(move |_, _, cx| {
-                keybinding_row(&action_row, &key_row, &ctx_row, cx)
-            }),
-        ));
+/// The list the page renders from: every rebindable action with its
+/// effective key (custom override > default), sorted by action id, conflicts
+/// marked. Rebuilt per render — the config is one small file, the list is
+/// short, and the page has to follow edits the moment they land.
+fn shortcut_rows() -> Vec<ShortcutRow> {
+    let config = AppConfig::load();
+    let mut rows: Vec<ShortcutRow> = keybindings::default_keybindings()
+        .into_iter()
+        .map(|entry| {
+            let customized = config.keybindings.contains_key(entry.action);
+            let key = config
+                .keybindings
+                .get(entry.action)
+                .cloned()
+                .unwrap_or_else(|| entry.key.to_string());
+            ShortcutRow {
+                action: entry.action,
+                label: action_label(entry.action),
+                context: entry.context,
+                key,
+                customized,
+                conflict: false,
+            }
+        })
+        .collect();
+    rows.sort_by(|a, b| a.action.cmp(b.action));
+
+    // A conflict is two live bindings answering to one key inside one
+    // context. A scoped key and the global one may share a keystroke — the
+    // scoped one shadows — so context is part of the collision's address.
+    let mut first_seen: HashMap<(Option<&'static str>, String), usize> = HashMap::new();
+    for ix in 0..rows.len() {
+        if rows[ix].key.is_empty() {
+            continue;
+        }
+        let address = (rows[ix].context, rows[ix].key.clone());
+        match first_seen.get(&address) {
+            Some(first) => {
+                let first = *first;
+                rows[first].conflict = true;
+                rows[ix].conflict = true;
+            }
+            None => {
+                first_seen.insert(address, ix);
+            }
+        }
+    }
+    rows
+}
+
+/// One action line: the name (danger when its key fights another action),
+/// its scope in small print, the pill that shows — or takes — the key, and
+/// the round "+" that starts a capture.
+fn shortcut_row(view: &Entity<SettingsView>, row: &ShortcutRow, capturing: bool, cx: &App) -> Div {
+    let label = div()
+        .min_w_0()
+        .truncate()
+        .text_sm()
+        .text_color(if row.conflict {
+            cx.theme().danger
+        } else {
+            cx.theme().foreground
+        })
+        .child(row.label.clone());
+
+    let name = if capturing {
+        // The line is listening: say so under the name, where the eye
+        // already is.
+        v_flex().flex_1().min_w_0().child(label).child(
+            div()
+                .text_xs()
+                .text_color(cx.theme().muted_foreground)
+                .child(rust_i18n::t!("shortcuts.capture_hint").to_string()),
+        )
+    } else {
+        let mut line = h_flex().min_w_0().items_baseline().gap_2().child(label);
+        if let Some(context) = row.context {
+            line = line.child(
+                div()
+                    .flex_shrink_0()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(context_label(context)),
+            );
+        }
+        v_flex().flex_1().min_w_0().child(line)
+    };
+
+    h_flex()
+        .w_full()
+        .items_center()
+        .gap_2()
+        .child(name)
+        .child(key_pill(view, row, capturing, cx))
+        .child(capture_button(view, row, capturing))
+}
+
+/// The pill that shows — or takes — this action's key. Clicking it starts a
+/// capture, same as the "+" beside it; it is the wider target of the two.
+fn key_pill(
+    view: &Entity<SettingsView>,
+    row: &ShortcutRow,
+    capturing: bool,
+    cx: &App,
+) -> Stateful<Div> {
+    let view = view.clone();
+    let action = row.action;
+
+    div()
+        .id(SharedString::from(format!("key-{}", row.action)))
+        .cursor_pointer()
+        .rounded_full()
+        .px_3()
+        .py_1()
+        .border_1()
+        .flex_shrink_0()
+        .when(capturing, |pill| {
+            pill.bg(cx.theme().muted).border_color(cx.theme().muted)
+        })
+        .when(!capturing && row.conflict, |pill| {
+            pill.border_color(cx.theme().danger)
+        })
+        .when(!capturing && !row.conflict, |pill| {
+            pill.border_color(cx.theme().border)
+        })
+        .child(if capturing {
+            div()
+                .text_xs()
+                .text_color(cx.theme().muted_foreground)
+                .child(rust_i18n::t!("shortcuts.press_keys").to_string())
+                .into_any_element()
+        } else if row.key.is_empty() {
+            div()
+                .text_xs()
+                .text_color(cx.theme().muted_foreground)
+                .child(rust_i18n::t!("shortcuts.unset").to_string())
+                .into_any_element()
+        } else {
+            match Keystroke::parse(&row.key) {
+                Ok(stroke) => Kbd::new(stroke).into_any_element(),
+                Err(_) => div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(row.key.clone())
+                    .into_any_element(),
+            }
+        })
+        .on_click(move |_, _, cx| {
+            view.update(cx, |this, cx| this.start_capture(action, cx));
+        })
+}
+
+/// The round "+": start a capture for this action. While this row is the one
+/// capturing, the plus stands down — the pill is already listening.
+fn capture_button(view: &Entity<SettingsView>, row: &ShortcutRow, capturing: bool) -> Button {
+    let view = view.clone();
+    let action = row.action;
+    let mut button = Button::new(SharedString::from(format!("capture-{}", row.action)))
+        .ghost()
+        .small()
+        .icon(IconName::Plus);
+    if capturing {
+        button = button.disabled(true);
+    }
+    button.on_click(move |_, _, cx| {
+        view.update(cx, |this, cx| this.start_capture(action, cx));
+    })
+}
+
+// ============================== filter pills ================================
+
+/// The pills: conflicts first with their count, then the whole list and its
+/// slices — the shape of the thing at a glance, before any scrolling.
+fn filter_group(
+    view: &Entity<SettingsView>,
+    rows: &[ShortcutRow],
+    active: ShortcutFilter,
+) -> SettingGroup {
+    let conflicts = rows.iter().filter(|r| r.conflict).count();
+    let pills = [
+        (
+            "filter-conflicts",
+            rust_i18n::t!("shortcuts.filter_conflicts", count = conflicts).to_string(),
+            ShortcutFilter::Conflicts,
+            true,
+        ),
+        (
+            "filter-all",
+            rust_i18n::t!("shortcuts.filter_all").to_string(),
+            ShortcutFilter::All,
+            false,
+        ),
+        (
+            "filter-assigned",
+            rust_i18n::t!("shortcuts.filter_assigned").to_string(),
+            ShortcutFilter::Assigned,
+            false,
+        ),
+        (
+            "filter-customized",
+            rust_i18n::t!("shortcuts.filter_customized").to_string(),
+            ShortcutFilter::Customized,
+            false,
+        ),
+        (
+            "filter-unassigned",
+            rust_i18n::t!("shortcuts.filter_unassigned").to_string(),
+            ShortcutFilter::Unassigned,
+            false,
+        ),
+    ];
+
+    SettingGroup::new().item(SettingItem::render({
+        let view = view.clone();
+        move |_, _, cx| {
+            let mut bar = h_flex().w_full().flex_wrap().gap_2();
+            for (id, label, filter, danger) in pills.iter() {
+                bar = bar.child(filter_pill(
+                    id,
+                    label.clone(),
+                    active == *filter,
+                    *danger,
+                    *filter,
+                    &view,
+                    cx,
+                ));
+            }
+            bar
+        }
+    }))
+}
+
+/// One pill: rounded, quiet when idle, filled when the filter it names is
+/// the one showing. The conflict pill reads in the danger tone either way.
+fn filter_pill(
+    id: &'static str,
+    label: String,
+    selected: bool,
+    danger: bool,
+    filter: ShortcutFilter,
+    view: &Entity<SettingsView>,
+    cx: &App,
+) -> Stateful<Div> {
+    let view = view.clone();
+    div()
+        .id(SharedString::from(id))
+        .cursor_pointer()
+        .rounded_full()
+        .px_3()
+        .py_1()
+        .text_sm()
+        .border_1()
+        .when(selected, |pill| {
+            pill.bg(if danger {
+                cx.theme().danger
+            } else {
+                cx.theme().foreground
+            })
+            .border_color(if danger {
+                cx.theme().danger
+            } else {
+                cx.theme().foreground
+            })
+            .text_color(if danger {
+                cx.theme().danger_foreground
+            } else {
+                cx.theme().background
+            })
+        })
+        .when(!selected, |pill| {
+            pill.bg(cx.theme().background)
+                .border_color(cx.theme().border)
+                .text_color(if danger {
+                    cx.theme().danger
+                } else {
+                    cx.theme().muted_foreground
+                })
+        })
+        .child(label)
+        .on_click(move |_, _, cx| {
+            view.update(cx, |this, cx| {
+                this.shortcut_filter = filter;
+                cx.notify();
+            });
+        })
+}
+
+/// The action list under the active filter.
+fn list_group(
+    view: &Entity<SettingsView>,
+    rows: &[ShortcutRow],
+    capturing: Option<&'static str>,
+    filter: ShortcutFilter,
+) -> SettingGroup {
+    let shown: Vec<ShortcutRow> = rows
+        .iter()
+        .filter(|r| match filter {
+            ShortcutFilter::Conflicts => r.conflict,
+            ShortcutFilter::All => true,
+            ShortcutFilter::Assigned => !r.key.is_empty(),
+            ShortcutFilter::Customized => r.customized,
+            ShortcutFilter::Unassigned => r.key.is_empty(),
+        })
+        .cloned()
+        .collect();
+
+    if shown.is_empty() {
+        return SettingGroup::new().item(SettingItem::render(|_, _, cx| {
+            div()
+                .text_sm()
+                .text_color(cx.theme().muted_foreground)
+                .child(rust_i18n::t!("shortcuts.filter_empty").to_string())
+        }));
     }
 
-    // Add reset button at the bottom.
-    group = group.item(
+    let mut group = SettingGroup::new();
+    for row in shown {
+        let is_capturing = capturing == Some(row.action);
+        group = group.item(SettingItem::render({
+            let view = view.clone();
+            move |_, _, cx| shortcut_row(&view, &row, is_capturing, cx)
+        }));
+    }
+    group
+}
+
+/// The reset row: defaults for everything, one click.
+fn reset_group() -> SettingGroup {
+    SettingGroup::new().item(
         SettingItem::new(
             rust_i18n::t!("shortcuts.shortcut_reset").to_string(),
-            SettingField::render(move |_, _, _cx| {
+            SettingField::render(|_, _, _| {
                 h_flex().w_full().justify_end().child(
                     Button::new("reset-keybindings")
                         .outline()
                         .small()
                         .label(rust_i18n::t!("shortcuts.shortcut_reset").to_string())
-                        .on_click(move |_, _, cx| {
-                            reset_keybindings(cx);
-                        }),
+                        .on_click(|_, _, cx| reset_keybindings(cx)),
                 )
             }),
         )
         .description(rust_i18n::t!("shortcuts.shortcut_reset_done").to_string()),
-    );
-
-    page.group(group)
-}
-
-/// Render a single keybinding row: description + clickable key + context.
-fn keybinding_row(action: &str, default_key: &str, context_label: &str, cx: &mut App) -> Div {
-    let config = AppConfig::load();
-    let display_key = config
-        .keybindings
-        .get(action)
-        .cloned()
-        .unwrap_or_else(|| default_key.to_string());
-    let label = action_label(action);
-    let action_owned = action.to_string();
-    let default_owned = default_key.to_string();
-
-    h_flex()
-        .w_full()
-        .justify_between()
-        .gap_2()
-        .child(
-            div()
-                .flex_1()
-                .text_sm()
-                .text_color(cx.theme().foreground)
-                .child(label),
-        )
-        .child(
-            Button::new(format!("key-{action}"))
-                .ghost()
-                .xsmall()
-                .label(display_key.to_uppercase())
-                .on_click(move |_, window, cx| {
-                    prompt_keybinding_change(&action_owned, &default_owned, window, cx);
-                }),
-        )
-        .child(
-            div()
-                .text_xs()
-                .w(px(60.))
-                .text_right()
-                .text_color(cx.theme().muted_foreground)
-                .child(context_label.to_string()),
-        )
+    )
 }
 
 /// Localized label for an action id.
@@ -135,66 +440,6 @@ fn context_label(context: &str) -> String {
     }
 }
 
-/// Prompt the user for a new keybinding via keyboard capture dialog.
-fn prompt_keybinding_change(action_id: &str, default_key: &str, window: &mut Window, cx: &mut App) {
-    use gpui_kit::component::dialog::DialogButtonProps;
-    use gpui_kit::component::input::{Input, InputState};
-
-    let action_id = action_id.to_string();
-    let default = default_key.to_string();
-    let action_label_disp = action_label(&action_id);
-    window.open_dialog(cx, move |dialog, window, cx| {
-        let input_state = cx.new(|cx| InputState::new(window, cx).placeholder(default.clone()));
-        let input_clone = input_state.clone();
-        let action_ok = action_id.clone();
-        dialog
-            .title(rust_i18n::t!("shortcuts.shortcut_prompt").to_string())
-            .child(
-                v_flex()
-                    .gap_2()
-                    .child(
-                        div().text_sm().text_color(cx.theme().foreground).child(
-                            rust_i18n::t!(
-                                "shortcuts.shortcut_prompt_hint",
-                                action = action_label_disp.clone(),
-                                default = default.clone()
-                            )
-                            .to_string(),
-                        ),
-                    )
-                    .child(Input::new(&input_clone).small())
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(cx.theme().muted_foreground)
-                            .child(rust_i18n::t!("shortcuts.shortcut_prompt_note").to_string()),
-                    ),
-            )
-            .button_props(
-                DialogButtonProps::default()
-                    .ok_text(rust_i18n::t!("shortcuts.change").to_string())
-                    .show_cancel(true),
-            )
-            .on_ok(move |_, _, cx| {
-                let value: String = input_clone.read(cx).value().to_string();
-                let trimmed = value.trim().to_lowercase();
-                if !trimmed.is_empty() {
-                    let mut config = AppConfig::load();
-                    config.keybindings.insert(action_ok.clone(), trimmed);
-                    let _ = config.save();
-                    // Keybindings are registered at startup; re-register the
-                    // full set so the change applies without a restart. The
-                    // keymap matches later bindings first, so the new key
-                    // takes precedence (the replaced default keeps firing
-                    // until the next app restart).
-                    crate::register_keys(cx);
-                    cx.refresh_windows();
-                }
-                true
-            })
-    });
-}
-
 /// Reset all keybindings to defaults.
 fn reset_keybindings(cx: &mut App) {
     let mut config = AppConfig::load();
@@ -202,9 +447,4 @@ fn reset_keybindings(cx: &mut App) {
     let _ = config.save();
     crate::register_keys(cx);
     cx.refresh_windows();
-}
-
-/// Get all configurable keybindings.
-fn keybinding_items() -> Vec<KeyBindingConfig> {
-    keybindings::default_keybindings()
 }
