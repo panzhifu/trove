@@ -91,6 +91,14 @@ pub(crate) fn run_update_check(cx: &mut App) {
     spawn_update_check(cx, std::time::Duration::ZERO);
 }
 
+/// The running session's controller, registered by [`AppView::new`]. The
+/// welcome window's library switch reads it to hot-swap the open library in
+/// place instead of opening a second main window.
+#[derive(Default)]
+pub(crate) struct SessionState(pub(crate) Option<gpui::WeakEntity<LibraryController>>);
+
+impl gpui_kit::Global for SessionState {}
+
 /// Root view: owns the controller and hosts the dock area, plus a drop
 /// surface that imports any dropped files into the current collection.
 pub struct AppView {
@@ -151,6 +159,9 @@ impl AppView {
         });
         let library = open_library_at_startup();
         let controller = cx.new(|_cx| LibraryController::new(library));
+        // This window is now the running session: the welcome window's
+        // library switch swaps its library through this handle.
+        cx.set_global(crate::app::root::SessionState(Some(controller.downgrade())));
         let title_bar = cx.new(|cx| TitleBarView::new(controller.clone(), cx));
 
         let explorer = cx.new(|cx| ExplorerPanel::new(window, cx, controller.clone()));
@@ -1115,6 +1126,9 @@ impl Render for AppView {
             // is (the menu bar itself never holds the grid's focus).
             .on_action(cx.listener(|this, _: &ImportFiles, window, cx| {
                 this.prompt_import(window, cx);
+            }))
+            .on_action(cx.listener(|_: &mut Self, _: &ManageLibraries, _, cx| {
+                crate::app::welcome::open(cx);
             }))
             .on_action(cx.listener(|this, _: &ExportLibrary, window, cx| {
                 this.prompt_export(window, cx);
