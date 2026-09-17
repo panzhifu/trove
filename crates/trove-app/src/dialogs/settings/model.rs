@@ -24,14 +24,18 @@ pub(super) fn model_page() -> SettingPage {
                 .item(
                     SettingItem::new(
                         t("settings.point_enhance"),
-                        SettingField::render(|_, _, cx| point_enhance_row(cx)),
+                        config_switch(AppConfig::point_enhance, |config, on| {
+                            config.point_enhance = Some(on);
+                        }),
                     )
                     .description(t("settings.point_enhance_desc")),
                 )
                 .item(
                     SettingItem::new(
                         t("settings.height_color"),
-                        SettingField::render(|_, _, cx| height_color_row(cx)),
+                        config_switch(AppConfig::height_color, |config, on| {
+                            config.height_color = Some(on);
+                        }),
                     )
                     .description(t("settings.height_color_desc")),
                 ),
@@ -42,14 +46,18 @@ pub(super) fn model_page() -> SettingPage {
                 .item(
                     SettingItem::new(
                         t("settings.scene_axes"),
-                        SettingField::render(|_, _, cx| scene_axes_row(cx)),
+                        config_switch(AppConfig::scene_axes, |config, on| {
+                            config.scene_axes = Some(on);
+                        }),
                     )
                     .description(t("settings.scene_axes_desc")),
                 )
                 .item(
                     SettingItem::new(
                         t("settings.corner_axis"),
-                        SettingField::render(|_, _, cx| corner_axis_row(cx)),
+                        config_switch(AppConfig::corner_axis, |config, on| {
+                            config.corner_axis = Some(on);
+                        }),
                     )
                     .description(t("settings.corner_axis_desc")),
                 ),
@@ -59,99 +67,23 @@ pub(super) fn model_page() -> SettingPage {
 
 // ============================== look switches ================================
 
-/// A one-button switch: the label states what the setting currently is, and
-/// clicking flips it. Every model toggle is one of these.
-fn switch_row(
-    id: &'static str,
-    enabled: bool,
-    labels: (String, String),
-    flip: impl Fn(&mut App) + 'static,
-    _cx: &mut App,
-) -> Div {
-    let (on, off) = labels;
-    h_flex().w_full().justify_end().child(
-        Button::new(id)
-            .outline()
-            .small()
-            .label(if enabled { on } else { off })
-            .on_click(move |_, _, cx| flip(cx)),
-    )
-}
-
-/// `on` / `off` labels for a boolean setting.
-fn on_off() -> (String, String) {
-    (
-        rust_i18n::t!("settings.toggle_on").to_string(),
-        rust_i18n::t!("settings.toggle_off").to_string(),
-    )
-}
-
-/// Eye-dome lighting and gap filling on a point-cloud preview.
-fn point_enhance_row(cx: &mut App) -> Div {
-    let enabled = AppConfig::load().point_enhance();
-    switch_row(
-        "point-enhance-toggle",
-        enabled,
-        on_off(),
-        |cx| {
+/// A boolean setting, stored as `Some(value)` on one `AppConfig` field.
+///
+/// The framework's switch, the same control the About page uses for automatic
+/// updates: flipped, not labelled — the row's title already says what it is,
+/// so the control only has to say whether it is on.
+fn config_switch(
+    read: fn(&AppConfig) -> bool,
+    write: impl Fn(&mut AppConfig, bool) + 'static,
+) -> SettingField<bool> {
+    SettingField::switch(
+        move |_cx| read(&AppConfig::load()),
+        move |value, cx| {
             let mut config = AppConfig::load();
-            config.point_enhance = Some(!config.point_enhance());
+            write(&mut config, value);
             let _ = config.save();
             cx.refresh_windows();
         },
-        cx,
-    )
-}
-
-/// Paint a point cloud by height instead of by its own colours.
-fn height_color_row(cx: &mut App) -> Div {
-    let enabled = AppConfig::load().height_color();
-    switch_row(
-        "height-color-toggle",
-        enabled,
-        on_off(),
-        |cx| {
-            let mut config = AppConfig::load();
-            config.height_color = Some(!config.height_color());
-            let _ = config.save();
-            cx.refresh_windows();
-        },
-        cx,
-    )
-}
-
-/// Draw the scene's X/Y/Z axes on the model's bounding box.
-fn scene_axes_row(cx: &mut App) -> Div {
-    let enabled = AppConfig::load().scene_axes();
-    switch_row(
-        "scene-axes-toggle",
-        enabled,
-        on_off(),
-        |cx| {
-            let mut config = AppConfig::load();
-            config.scene_axes = Some(!config.scene_axes());
-            let _ = config.save();
-            cx.refresh_windows();
-        },
-        cx,
-    )
-}
-
-/// Draw the corner trihedron — the small axis indicator pinned to the
-/// viewport's bottom-right corner.
-fn corner_axis_row(cx: &mut App) -> Div {
-    let enabled = AppConfig::load().corner_axis();
-    switch_row(
-        "corner-axis-toggle",
-        enabled,
-        on_off(),
-        |cx| {
-            let mut config = AppConfig::load();
-            config.corner_axis = Some(!config.corner_axis());
-            let _ = config.save();
-            cx.refresh_windows();
-        },
-        cx,
     )
 }
 
