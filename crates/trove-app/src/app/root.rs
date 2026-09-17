@@ -92,7 +92,7 @@ pub(crate) fn run_update_check(cx: &mut App) {
 }
 
 /// The running session's controller, registered by [`AppView::new`]. The
-/// welcome window's library switch reads it to hot-swap the open library in
+/// library manager's switch reads it to hot-swap the open library in
 /// place instead of opening a second main window.
 #[derive(Default)]
 pub(crate) struct SessionState(pub(crate) Option<gpui::WeakEntity<LibraryController>>);
@@ -159,7 +159,7 @@ impl AppView {
         });
         let library = open_library_at_startup();
         let controller = cx.new(|_cx| LibraryController::new(library));
-        // This window is now the running session: the welcome window's
+        // This window is now the running session: the library manager's
         // library switch swaps its library through this handle.
         cx.set_global(crate::app::root::SessionState(Some(controller.downgrade())));
         let title_bar = cx.new(|cx| TitleBarView::new(controller.clone(), cx));
@@ -1128,7 +1128,7 @@ impl Render for AppView {
                 this.prompt_import(window, cx);
             }))
             .on_action(cx.listener(|_: &mut Self, _: &ManageLibraries, _, cx| {
-                crate::app::welcome::open(cx);
+                crate::app::library_manager::open(cx);
             }))
             .on_action(cx.listener(|this, _: &ExportLibrary, window, cx| {
                 this.prompt_export(window, cx);

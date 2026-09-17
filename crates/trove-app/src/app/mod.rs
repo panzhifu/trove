@@ -8,10 +8,10 @@ pub mod i18n;
 pub mod theme;
 pub mod title_bar;
 
+pub mod library_manager;
 mod root;
 mod tray;
-pub mod welcome;
 
+pub use library_manager::LibraryManagerView;
 pub use root::AppView;
 pub(crate) use root::run_update_check;
-pub use welcome::WelcomeView;
