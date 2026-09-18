@@ -168,9 +168,22 @@ fn stage_pool() -> &'static rayon::ThreadPool {
     })
 }
 
-/// How wide the staging pool is on this machine: [`STAGE_THREADS_MAX`], or
-/// the core count when that is smaller. Exposed for benchmarks and logs.
+/// Environment override for the staging pool width. Benchmarks sweep it to
+/// find where the filesystem stops scaling; users on an exotic mount
+/// (network, fuse) can pin a width without a rebuild.
+pub const STAGE_THREADS_ENV: &str = "TROVE_STAGE_THREADS";
+
+/// How wide the staging pool is on this machine: [`STAGE_THREADS_MAX`], the
+/// core count when that is smaller, or [`STAGE_THREADS_ENV`] when it is set to
+/// a positive integer. Exposed for benchmarks and logs.
 pub fn stage_thread_count() -> usize {
+    if let Some(n) = std::env::var(STAGE_THREADS_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        && n > 0
+    {
+        return n;
+    }
     STAGE_THREADS_MAX.min(
         std::thread::available_parallelism()
             .map(|n| n.get())
