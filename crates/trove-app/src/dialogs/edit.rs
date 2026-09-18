@@ -180,13 +180,37 @@ impl EditDialog {
     pub fn open(window: &mut Window, cx: &mut App, controller: Entity<LibraryController>) {
         let selection = controller.read(cx).selected_assets.clone();
         let conn = controller.read(cx).library.store().conn();
-        let images: Vec<Asset> = assets::by_ids(conn, &selection)
-            .map(|list| {
-                list.into_iter()
-                    .filter(|a| a.kind == AssetKind::Image && a.trashed_at.is_none())
-                    .collect()
-            })
+        let images = assets::by_ids(conn, &selection)
+            .map(live_images)
             .unwrap_or_default();
+        Self::open_batch(window, cx, controller, images);
+    }
+
+    /// Open for exactly one asset — the preview toolbar's edit entry, which
+    /// acts on the picture on screen rather than the grid selection.
+    pub fn open_for_asset(
+        window: &mut Window,
+        cx: &mut App,
+        controller: Entity<LibraryController>,
+        id: uuid::Uuid,
+    ) {
+        let conn = controller.read(cx).library.store().conn();
+        let images = assets::by_ids(conn, &[id])
+            .map(live_images)
+            .unwrap_or_default();
+        Self::open_batch(window, cx, controller, images);
+    }
+
+    /// The dialog proper over a pre-filtered set of candidate images. Empty
+    /// candidates say so up front: either nothing here is an image (or all
+    /// of it is trashed), or every image is linked and the backend would
+    /// refuse it.
+    fn open_batch(
+        window: &mut Window,
+        cx: &mut App,
+        controller: Entity<LibraryController>,
+        images: Vec<Asset>,
+    ) {
         let editable: Vec<Asset> = images
             .iter()
             .filter(|a| a.origin != Origin::Linked)
@@ -210,7 +234,6 @@ impl EditDialog {
         }
 
         let linked_skipped = images.len() - editable.len();
-        let controller = controller.clone();
         window.open_dialog(cx, move |dialog, window, cx| {
             let crop_left = cx.new(|cx| InputState::new(window, cx).placeholder("0"));
             let crop_top = cx.new(|cx| InputState::new(window, cx).placeholder("0"));
@@ -260,6 +283,58 @@ impl EditDialog {
     }
 }
 
+/// The live (non-trashed) images among a fetched list — the only things a
+/// pixel edit can act on. Applied to whatever `assets::by_ids` returned.
+fn live_images(list: Vec<Asset>) -> Vec<Asset> {
+    list.into_iter()
+        .filter(|a| a.kind == AssetKind::Image && a.trashed_at.is_none())
+        .collect()
+}
+
+/// The JPEG quality a quick edit (the preview toolbar's rotate / flip
+/// buttons) re-encodes at — the same default the dialog's quality field
+/// starts from.
+pub(crate) const DEFAULT_QUALITY: u8 = 90;
+
+/// Apply one edit list to one asset at [`DEFAULT_QUALITY`] — the preview
+/// toolbar's rotate / flip buttons. Returns whether the pixels changed, so
+/// the caller knows to refresh what is on screen; a refusal surfaces as a
+/// toast.
+pub(crate) fn apply_single_edit(
+    controller: &Entity<LibraryController>,
+    id: uuid::Uuid,
+    edits: Vec<ImageEdit>,
+    window: &mut Window,
+    cx: &mut App,
+) -> bool {
+    if edits.is_empty() {
+        return false;
+    }
+    let outcome = controller.update(cx, |ctl, _| {
+        ctl.library
+            .batch_edit_images(&[id], &edits, DEFAULT_QUALITY)
+    });
+    match outcome {
+        Ok(report) if report.edited > 0 => {
+            controller.update(cx, |ctl, cx| {
+                ctl.generation += 1;
+                cx.notify();
+            });
+            true
+        }
+        Ok(_) => false,
+        Err(error) => {
+            window.push_notification(
+                Notification::warning(
+                    rust_i18n::t!("edit.failed", error = error.to_string()).to_string(),
+                ),
+                cx,
+            );
+            false
+        }
+    }
+}
+
 /// Dialog draft: the frozen selection plus the chosen operations. Held in an
 /// entity so the content closure re-reads it every frame.
 struct EditDraft {
@@ -304,7 +379,7 @@ impl EditDraft {
             .value()
             .trim()
             .parse()
-            .unwrap_or(90)
+            .unwrap_or(DEFAULT_QUALITY)
             .clamp(1, 100);
         EditSpec {
             rotation: self.rotation,

@@ -321,7 +321,14 @@ impl WorkspacePanel {
 
     /// Show any non-model asset full-size in the main area, replacing
     /// whatever was there. No-op when the asset no longer exists.
-    fn open_asset_preview(&mut self, id: Uuid, window: &mut Window, cx: &mut Context<Self>) {
+    /// `pub(super)`: the preview toolbar re-opens the same asset after a
+    /// quick edit, so the edited result replaces the picture on screen.
+    pub(super) fn open_asset_preview(
+        &mut self,
+        id: Uuid,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(preview) = AssetPreviewPanel::spawn(&self.controller, id, cx) else {
             return;
         };

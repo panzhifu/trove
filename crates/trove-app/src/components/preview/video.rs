@@ -38,7 +38,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use gpui_kit::assets::IconName as MediaIcon;
-use gpui_kit::base::POPUP_PRIORITY;
+use gpui_kit::base::{ElementExt as _, POPUP_PRIORITY};
 use gpui_kit::base::{h_flex, v_flex};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
@@ -197,6 +197,17 @@ pub(crate) struct VideoPlayer {
     /// Fullscreen chrome: whether the floating transport row is showing.
     /// Always true outside fullscreen, where the row lives in the layout.
     controls_shown: bool,
+    /// Pan/zoom of the picture stage, the same gestures the still preview
+    /// and the 3D viewport carry: wheel zooms toward the cursor, drag pans,
+    /// double click resets. The transport row is outside the stage, so the
+    /// scrubber never fights the pan.
+    pan: super::PanZoom,
+    /// Measured picture-stage size; the fit base for the zoom math.
+    stage: Entity<Size<Pixels>>,
+    /// Where the cursor was when the pan drag started, and whether one is
+    /// running.
+    drag_from: Point<Pixels>,
+    dragging: bool,
     /// Pointer is on the floating row (or its volume popup): the auto-hide
     /// watcher leaves it alone then.
     controls_hovered: bool,
@@ -310,6 +321,7 @@ impl VideoPlayer {
             ..Default::default()
         }));
         let alive = Arc::new(AtomicBool::new(true));
+        let stage = cx.new(|_| size(px(0.), px(0.)));
         let mut this = Self {
             path,
             facts,
@@ -333,6 +345,10 @@ impl VideoPlayer {
             controls_hovered: false,
             controls_revealed_at: None,
             watcher_started: false,
+            pan: super::PanZoom::new(),
+            stage,
+            drag_from: Point::default(),
+            dragging: false,
             shared,
             alive,
             _subscription: subscription,
@@ -702,6 +718,179 @@ impl VideoPlayer {
         }
     }
 
+    /// The picture as the stage's pan/zoom wants it: at zoom 1.0 the plain
+    /// contained frame; zoomed in, the frame sized by hand from the stream's
+    /// own geometry and offset by the pan — the still preview's exact
+    /// treatment, so the two read the same.
+    fn frame_view(&self, cx: &Context<Self>) -> AnyElement {
+        if self.pan.zoom == 1.0 {
+            return self.frame_element();
+        }
+        let (vw, vh) = {
+            let stage = self.stage.read(cx);
+            (f32::from(stage.width), f32::from(stage.height))
+        };
+        let (fw, fh) = (self.facts.width as f32, self.facts.height as f32);
+        if vw <= 0.0 || vh <= 0.0 || fw <= 0.0 || fh <= 0.0 {
+            return self.frame_element();
+        }
+        // No padding here: the plain path fills the stage edge to edge, and
+        // zooming keeps that convention.
+        let fit = (vw / fw).min(vh / fh);
+        let w = fw * fit * self.pan.zoom;
+        let h = fh * fit * self.pan.zoom;
+        let left = (vw - w) / 2.0 - f32::from(self.pan.offset.x);
+        let top = (vh - h) / 2.0 - f32::from(self.pan.offset.y);
+        let frame: AnyElement = match &self.shown {
+            // The box already carries the stream's aspect, so Fill and Contain
+            // agree; Fill spares gpui a second fit decision.
+            Some(frame) => img(ImageSource::Render(frame.clone()))
+                .w(px(w))
+                .h(px(h))
+                .object_fit(ObjectFit::Fill)
+                .into_any_element(),
+            None => div().w(px(w)).h(px(h)).into_any_element(),
+        };
+        div()
+            .relative()
+            .size_full()
+            .overflow_hidden()
+            .child(
+                div()
+                    .absolute()
+                    .left(px(left))
+                    .top(px(top))
+                    .w(px(w))
+                    .h(px(h))
+                    .child(frame),
+            )
+            .into_any_element()
+    }
+
+    /// The stage's fitted base at zoom 1.0: the stream's own geometry fitted
+    /// into the measured stage.
+    fn stage_base(&self, cx: &Context<Self>) -> Option<(f32, f32)> {
+        let (vw, vh) = {
+            let stage = self.stage.read(cx);
+            (f32::from(stage.width), f32::from(stage.height))
+        };
+        let (fw, fh) = (self.facts.width as f32, self.facts.height as f32);
+        if vw <= 0.0 || vh <= 0.0 || fw <= 0.0 || fh <= 0.0 {
+            return None;
+        }
+        Some((
+            fw * (vw / fw).min(vh / fh),
+            fh * (vw / fw).min(vh / fh),
+        ))
+    }
+
+    /// Wheel over the picture: zoom toward the cursor, like every preview.
+    fn handle_stage_wheel(&mut self, event: &ScrollWheelEvent, cx: &mut Context<Self>) {
+        let (vw, vh) = {
+            let stage = self.stage.read(cx);
+            (f32::from(stage.width), f32::from(stage.height))
+        };
+        let Some(base) = self.stage_base(cx) else {
+            return;
+        };
+        let cfg = trove_core::config::AppConfig::load();
+        if self
+            .pan
+            .handle_wheel(event, (vw, vh), base, cfg.min_preview_zoom(), cfg.max_preview_zoom())
+        {
+            cx.notify();
+        }
+    }
+
+    fn begin_pan(&mut self, position: Point<Pixels>) {
+        self.dragging = true;
+        self.drag_from = position;
+    }
+
+    fn update_pan(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
+        if !self.dragging {
+            return;
+        }
+        let dx = f32::from(self.drag_from.x - position.x);
+        let dy = f32::from(self.drag_from.y - position.y);
+        self.drag_from = position;
+        if let Some(base) = self.stage_base(cx) {
+            let (vw, vh) = {
+                let stage = self.stage.read(cx);
+                (f32::from(stage.width), f32::from(stage.height))
+            };
+            self.pan.pan_by(dx, dy, (vw, vh), base);
+        }
+        cx.notify();
+    }
+
+    fn end_pan(&mut self) {
+        self.dragging = false;
+    }
+
+    /// Double click over the picture: back to the fitted view.
+    fn reset_stage(&mut self, cx: &mut Context<Self>) {
+        self.pan.reset();
+        cx.notify();
+    }
+
+    /// The picture stage with its gestures attached: wheel zoom, drag pan,
+    /// double-click reset — the same three the still preview and the model
+    /// viewport carry. `on_prepaint` measures the stage for the fit math and
+    /// therefore has to run before the element becomes stateful.
+    fn stage_container(&self, id: &'static str, cx: &mut Context<Self>) -> Stateful<Div> {
+        div()
+            .on_prepaint({
+                let stage = self.stage.clone();
+                move |bounds: Bounds<Pixels>, _, cx| {
+                    stage.update(cx, |size, cx| {
+                        if *size != bounds.size {
+                            *size = bounds.size;
+                            cx.notify();
+                        }
+                    });
+                }
+            })
+            .id(id)
+            .cursor(if self.dragging {
+                CursorStyle::ClosedHand
+            } else {
+                CursorStyle::OpenHand
+            })
+            .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, _, cx| {
+                this.handle_stage_wheel(event, cx);
+            }))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                    this.begin_pan(event.position);
+                    cx.notify();
+                }),
+            )
+            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
+                this.update_pan(event.position, cx);
+            }))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _: &MouseUpEvent, _, cx| {
+                    this.end_pan();
+                    cx.notify();
+                }),
+            )
+            .on_mouse_up_out(
+                MouseButton::Left,
+                cx.listener(|this, _: &MouseUpEvent, _, cx| {
+                    this.end_pan();
+                    cx.notify();
+                }),
+            )
+            .on_click(cx.listener(|this, event: &ClickEvent, _, cx| {
+                if event.click_count() == 2 {
+                    this.reset_stage(cx);
+                }
+            }))
+    }
+
     /// Transport row: play/pause, scrubber, elapsed / total time, speed
     /// menu, volume, fullscreen.
     fn controls(&self, cx: &mut Context<Self>) -> Div {
@@ -947,14 +1136,14 @@ impl Render for VideoPlayer {
                     }
                 }))
                 .child(
-                    div()
+                    self.stage_container("video-stage-fs", cx)
                         .absolute()
                         .inset_0()
                         .flex()
                         .items_center()
                         .justify_center()
                         .overflow_hidden()
-                        .child(self.frame_element()),
+                        .child(self.frame_view(cx)),
                 );
             if self.controls_shown {
                 root = root.child(controls);
@@ -986,7 +1175,7 @@ impl Render for VideoPlayer {
             .gap_2()
             .items_center()
             .child(
-                div()
+                self.stage_container("video-stage", cx)
                     .flex_1()
                     .min_h_0()
                     .w_full()
@@ -994,7 +1183,7 @@ impl Render for VideoPlayer {
                     .items_center()
                     .justify_center()
                     .overflow_hidden()
-                    .child(self.frame_element()),
+                    .child(self.frame_view(cx)),
             )
             .child(self.controls(cx))
             .when(self.volume_open, |root| {
