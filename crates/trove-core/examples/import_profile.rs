@@ -6,23 +6,58 @@
 //!
 //! ## What it measures
 //!
-//! `stage_source` does six things per file. This harness re-runs each of them
-//! separately over the same inputs and reports the total + per-file cost, so
-//! the numbers add up to (approximately) the staging total:
+//! Two things, deliberately separated:
+//!
+//! **The real pipeline** — `import::stage_all` (and `stage_source` for one
+//! file) as the import job runs it, plus the commit loop. This is the number
+//! to optimise and the only one to compare between builds.
+//!
+//! **The components** — each sub-step timed on its own, as a reference for
+//! where the time inside the pipeline goes:
 //!
 //!   copy+hash   `blob::stage`      — one sequential read, copy into media/
 //!   thumb       `thumb::ensure`    — full decode + resize (temp+rename)
 //!   mine        `metadata::mine`   — EXIF + dominant colours
 //!   colors      `color::dominant_colors` — the decode hidden inside `mine`
-//!   phash       `SearchSignature::from_image` on the thumbnail
+//!   phash       `search::VisualSignature::from_image`
 //!   commit      `commit_staged` in COMMIT_BATCH transactions
 //!
-//! ## The hypothesis it tests
+//! The component rows measure each step *as if it had to do its own I/O*, so
+//! they sum to more than the pipeline: the pipeline decodes once and hands the
+//! same buffer to the thumbnail writer, the palette miner and the signature
+//! (see `media::pipeline`). Read them as "what this would cost alone", and
+//! compare the pipeline rows between builds.
 //!
-//! A plain image is decoded **twice** per import: once for the thumbnail and
-//! once for the dominant-colour palette (`color.rs` calls `image::open` and
-//! only then downsamples to 24x24). This harness isolates both so the
-//! duplication is visible as two separate line items.
+//! ## Duplicate imports
+//!
+//! The last section stages the same batch twice. The second pass finds
+//! thumbnails in the cache, so the decode stage reads those instead of the
+//! originals — the gap to a batch where nothing is cached is what a re-import
+//! costs, and before the pipeline existed that pass still decoded every
+//! original once.
+//!
+//! ## What the single decode is actually worth (measured)
+//!
+//! 30 files, 3000x2000 JPEGs, 8.7 MiB, interleaved A/B of two release builds
+//! in one sitting (2026-09-18):
+//!
+//! | row                          | before | after  |
+//! |------------------------------|--------|--------|
+//! | `stage_all` (cold, per file) | 16.4 / 16.9 ms | 16.2 / 17.0 ms |
+//! | `stage_all` (2nd pass, cached) | 1.12 / 1.04 ms | 0.90 / 0.91 ms |
+//!
+//! So: a **cold** import is unchanged within noise, and a cached re-import is
+//! ~20 % cheaper. That is the honest size of this change for plain images —
+//! the two decodes it removes are of a ≤512px JPEG, which costs a fraction of
+//! a millisecond, not the ~120 ms the code comments used to quote (that number
+//! belonged to the older shape where the palette decoded the *original*).
+//!
+//! Where it does pay off beyond that, for the record: camera RAW and
+//! HEIF/AVIF, whose "header" read is itself a full decode — the decode stage
+//! is the only remaining reader, so those go from two full decodes to one.
+//! And the structural wins are not throughput at all: staging in windows
+//! bounds memory and cancellation latency, the directory walk left the UI
+//! thread, and a new pixel consumer is one stage instead of a fifth decode.
 //!
 //! ## Why medians
 //!
@@ -45,6 +80,7 @@ enum Step {
     Mine,
     Colors,
     Phash,
+    Pipeline,
 }
 
 impl Step {
@@ -55,16 +91,18 @@ impl Step {
             Step::Mine => "mine (colors from thumb)",
             Step::Colors => "  └ colors (old: full decode)",
             Step::Phash => "phash",
+            Step::Pipeline => "pipeline (stage_source)",
         }
     }
 }
 
-const STEPS: [Step; 5] = [
+const STEPS: [Step; 6] = [
     Step::CopyHash,
     Step::Thumb,
     Step::Mine,
     Step::Colors,
     Step::Phash,
+    Step::Pipeline,
 ];
 
 /// Run one step over one file, into `root`. Setup (hashing, thumbnail
@@ -111,6 +149,11 @@ fn run_step(step: Step, path: &Path, root: &Path) -> Duration {
         }
         Step::Phash => {
             let _ = search::VisualSignature::from_image(path);
+        }
+        Step::Pipeline => {
+            // Everything the import job does to one file, as it does it:
+            // hash → probe → one decode → thumbnail → metadata → signature.
+            let _ = import::stage_source(root, &root.join("cache"), path, ImportStorage::Link);
         }
     }
     t.elapsed()
@@ -232,9 +275,9 @@ fn main() {
     let mut step_sum = 0.0_f64;
     for (step, samples) in &per_step {
         let med = median(samples.clone());
-        // The "└ colors" line is a sub-step of "mine", so it must not be
-        // added twice — it is reported for attribution only.
-        let is_substep = matches!(step, Step::Colors);
+        // "colors" is a sub-step of "mine", and "pipeline" is every step at
+        // once: neither belongs in the sum.
+        let is_substep = matches!(step, Step::Colors | Step::Pipeline);
         if !is_substep {
             step_sum += med;
         }
@@ -249,7 +292,7 @@ fn main() {
     println!("{}", "-".repeat(60));
     println!(
         "{:<22} {:>10.1} {:>12.2}",
-        "sum of steps",
+        "sum of components",
         step_sum * 1000.0,
         step_sum * 1000.0 / n as f64
     );
@@ -287,9 +330,12 @@ fn main() {
     );
 
     // --- duplicate-import cost ----------------------------------------------
-    // Import the same batch twice: `thumb::ensure` short-circuits on the
-    // second pass, but `metadata::mine` and the pHash have no such check.
-    // The gap is the work that `commit_staged`'s dedupe branch throws away.
+    // Import the same batch twice. On the second pass the decode stage finds
+    // the cached thumbnails and decodes *those* instead of the originals, so
+    // what is left is the hash (unavoidable — it is the dedupe key), the
+    // palette, the signature and a stat per file. This is the number to watch
+    // when touching the decode stage: it used to pay a full decode per file
+    // even when nothing else had to change.
     println!();
     println!("--- duplicate import (same files, second pass) ---");
     let dup_root = base.join(format!("import-profile-dup-{me}"));
