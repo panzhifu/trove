@@ -8686,6 +8686,7 @@ dependencies = [
  "serde_json",
  "smallvec",
  "sys-locale",
+ "toml 0.8.23",
  "tracing",
  "tracing-subscriber",
  "tray-icon",

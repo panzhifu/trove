@@ -15,6 +15,9 @@ smallvec = { workspace = true }
 serde_json = { workspace = true }
 uuid = { workspace = true }
 rust-i18n = { workspace = true }
+# Parses plugins' own language files at startup. toml 0.8 already rides in
+# the graph via rust-i18n's loader, so this adds no compiled crates.
+toml = "0.8"
 sys-locale = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
