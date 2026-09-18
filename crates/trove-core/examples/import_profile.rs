@@ -234,7 +234,10 @@ fn main() {
         "import_profile: {n} files, {:.1} MiB, {rounds} rounds",
         bytes as f64 / 1048576.0
     );
-    println!("stage pool = {} threads", import::stage_thread_count());
+    println!(
+        "stage pool = {} threads",
+        import::stage_thread_count_for(&paths)
+    );
     println!();
 
     // --- per-step attribution ------------------------------------------------

@@ -136,60 +136,151 @@ impl ImportStorage {
     }
 }
 
-/// Cap on staging threads, regardless of how many cores the machine has.
+/// Staging has two regimes and they want opposite pool widths.
 ///
-/// Staging is I/O-bound, not CPU-bound: each file costs two fresh on-disk
-/// writes (blob + thumbnail, both temp-file + rename), so widening the pool
-/// past a few threads only deepens contention on the filesystem's metadata
-/// locks. The parallel speedup also depends strongly on file size — small
-/// files are metadata-lock bound and barely scale at all, large ones scale
-/// close to linearly — so this is a fixed ceiling rather than a tuned
-/// optimum.
+/// Per-file medians from the arm sweep (`stage_sweep`, 5 sittings x 3 passes,
+/// btrfs on NVMe, 20 hardware threads):
 ///
-/// The value assumes a btrfs library. On a filesystem with cheaper
-/// concurrent writes (XFS/ext4 on NVMe) a larger pool may win; if that ever
-/// matters, make this adaptive on the target's fstype rather than raising it
-/// blindly.
-const STAGE_THREADS_MAX: usize = 4;
+/// | batch | w1 | w4 | w12 |
+/// |---|---|---|---|
+/// | 30 x 3000x2000 JPEG | 30.63 ms | 9.19 ms | **4.98 ms** |
+/// | 300 x 1x1 PNG | 0.0445 ms | **0.0190 ms** | 0.0210 ms |
+///
+/// A photo-sized file spends ~30 ms of CPU at width 1 while all of its I/O —
+/// one fresh thumbnail plus a few hundred KB of reads — costs under 0.2 ms, so
+/// it is decode-bound and keeps scaling to 12. A 1x1 PNG has no decode to
+/// speak of: at 0.019 ms/file it is already sitting on the ~0.0135 ms cost of
+/// creating one file, so extra threads only deepen contention on the
+/// filesystem's metadata locks and the curve flattens at four.
+///
+/// Hence two pools, chosen per batch by average source size — the cheapest
+/// proxy for "how much decoding is in there" available before the pipeline
+/// runs. The narrow arm is the old fixed width, which is right for the
+/// thumbnail-sized end; the wide arm is for batches of real photographs, where
+/// the narrow arm was leaving ~1.85x on the table.
+///
+/// Both are ceilings rather than tuned optima: [`STAGE_THREADS_WIDE_MAX`] is
+/// where the sweep was still descending when it stopped, so a machine with
+/// fewer cores gets a proportionally smaller pool, and nobody gets more than
+/// 12. The width also assumes a local filesystem — on a network or fuse mount
+/// [`STAGE_THREADS_ENV`] can pin it without a rebuild.
+const STAGE_THREADS_NARROW: usize = 4;
+const STAGE_THREADS_WIDE_MAX: usize = 12;
 
-/// The pool staging runs on. Built once, outside the global rayon pool: the
-/// global pool is sized to the core count, which is exactly the overshoot
-/// [`STAGE_THREADS_MAX`] exists to avoid — and the global pool is also shared
-/// with the PLY parser's own `par_iter`, which should keep its full width.
-fn stage_pool() -> &'static rayon::ThreadPool {
+/// Average source size at which a batch switches to the wide pool: ~1 Mpx of
+/// JPEG, a file whose decode costs a few milliseconds.
+///
+/// This threshold is interpolated, not measured: the sweep's two sets sit at
+/// ~90 B and ~290 KB, so the crossover is bracketed but not pinned. The `mid`
+/// set in `target/tmp/bench-real.sh` exists to close that gap.
+const STAGE_WIDE_MIN_AVG_BYTES: u64 = 64 * 1024;
+
+/// Sources sampled to estimate a batch's average size. The estimate only picks
+/// an arm, so a sample is enough — and it bounds the `stat` cost on a slow
+/// mount to a few dozen calls rather than one per file.
+const STAGE_SIZE_SAMPLE: usize = 64;
+
+fn cores() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+}
+
+/// [`STAGE_THREADS_ENV`] as a positive integer, when set.
+fn env_thread_count() -> Option<usize> {
+    std::env::var(STAGE_THREADS_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|n| *n > 0)
+}
+
+/// The narrow arm's width: the fixed floor, the core count when that is
+/// smaller, or [`STAGE_THREADS_ENV`] when it is set to a positive integer.
+///
+/// Exposed for benchmarks and logs. Note this is the *floor* width — a batch
+/// of large sources may run on [`stage_thread_ceiling`] threads; use
+/// [`stage_thread_count_for`] to report what a given batch actually chose.
+pub fn stage_thread_count() -> usize {
+    env_thread_count().unwrap_or_else(|| STAGE_THREADS_NARROW.min(cores()))
+}
+
+/// The wide arm's width, honouring the same override. The ceiling for what any
+/// batch can use.
+pub fn stage_thread_ceiling() -> usize {
+    env_thread_count().unwrap_or_else(|| STAGE_THREADS_WIDE_MAX.min(cores()))
+}
+
+/// Whether an average source size puts a batch on the wide arm.
+fn wide_enough(avg_bytes: Option<u64>) -> bool {
+    avg_bytes.is_some_and(|avg| avg >= STAGE_WIDE_MIN_AVG_BYTES)
+}
+
+/// Average size of up to [`STAGE_SIZE_SAMPLE`] sources, sampled with a stride
+/// so a huge batch costs the same to size up as a small one.
+fn sample_avg_bytes(sources: &[PathBuf]) -> Option<u64> {
+    let n = sources.len();
+    if n == 0 {
+        return None;
+    }
+    let take = n.min(STAGE_SIZE_SAMPLE);
+    let stride = n.div_ceil(take);
+    let mut total: u64 = 0;
+    let mut seen: u64 = 0;
+    for src in sources.iter().step_by(stride).take(take) {
+        if let Ok(meta) = std::fs::metadata(src) {
+            total += meta.len();
+            seen += 1;
+        }
+    }
+    (seen > 0).then(|| total / seen)
+}
+
+/// Which arm this batch stages on. One decision for the whole batch: a mixed
+/// drop of photos and icons still gets one pool, and its average is what
+/// decides.
+fn wide_arm(sources: &[PathBuf]) -> bool {
+    env_thread_count().is_none() && wide_enough(sample_avg_bytes(sources))
+}
+
+/// How many threads `stage_all` will use for `sources`: the pinned override
+/// when [`STAGE_THREADS_ENV`] is set, otherwise the arm the batch's average
+/// source size selects. Exposed for benchmarks and logs.
+pub fn stage_thread_count_for(sources: &[PathBuf]) -> usize {
+    if wide_arm(sources) {
+        stage_thread_ceiling()
+    } else {
+        stage_thread_count()
+    }
+}
+
+/// The pool staging runs on, one per arm. Both are built once, outside the
+/// global rayon pool: the global pool is sized to the core count, which is
+/// exactly the overshoot the narrow arm exists to avoid — and the global pool
+/// is also shared with the PLY parser's own `par_iter`, which should keep its
+/// full width. At most one arm is ever doing work at a time, so the two
+/// together still add up to less than the global pool.
+fn stage_pool(wide: bool) -> &'static rayon::ThreadPool {
     use std::sync::OnceLock;
-    static POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
-    POOL.get_or_init(|| {
+    static NARROW: OnceLock<rayon::ThreadPool> = OnceLock::new();
+    static WIDE: OnceLock<rayon::ThreadPool> = OnceLock::new();
+    let (slot, width) = if wide {
+        (&WIDE, stage_thread_ceiling())
+    } else {
+        (&NARROW, stage_thread_count())
+    };
+    slot.get_or_init(|| {
         rayon::ThreadPoolBuilder::new()
-            .num_threads(stage_thread_count())
+            .num_threads(width)
             .thread_name(|i| format!("trove-stage-{i}"))
             .build()
             .expect("build staging thread pool")
     })
 }
 
-/// Environment override for the staging pool width. Benchmarks sweep it to
-/// find where the filesystem stops scaling; users on an exotic mount
-/// (network, fuse) can pin a width without a rebuild.
+/// Environment override for the staging pool width, both arms. Benchmarks
+/// sweep it to find where the filesystem stops scaling; users on an exotic
+/// mount (network, fuse) can pin a width without a rebuild.
 pub const STAGE_THREADS_ENV: &str = "TROVE_STAGE_THREADS";
-
-/// How wide the staging pool is on this machine: [`STAGE_THREADS_MAX`], the
-/// core count when that is smaller, or [`STAGE_THREADS_ENV`] when it is set to
-/// a positive integer. Exposed for benchmarks and logs.
-pub fn stage_thread_count() -> usize {
-    if let Some(n) = std::env::var(STAGE_THREADS_ENV)
-        .ok()
-        .and_then(|v| v.trim().parse::<usize>().ok())
-        && n > 0
-    {
-        return n;
-    }
-    STAGE_THREADS_MAX.min(
-        std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(1),
-    )
-}
 
 /// Phase one for a batch: stage every source file (hash + probe + thumbnail).
 /// Pure filesystem work, safe to run on a background thread. Individual
@@ -205,12 +296,11 @@ pub fn stage_all(
     use rayon::prelude::*;
 
     // Bounded parallel: every stage is independent file I/O (hash + blob copy
-    // + thumbnail) and the two on-disk writes per file make the filesystem the
-    // bottleneck, so the pool is deliberately narrower than the core count —
-    // see [`STAGE_THREADS_MAX`]. `par_iter` preserves input order, and
-    // blob/thumb writes are temp-file + rename, so concurrent staging of
-    // identical content cannot corrupt anything.
-    stage_pool().install(|| {
+    // + thumbnail), and how wide it should run depends entirely on how much
+    // decoding that I/O carries — see [`STAGE_THREADS_NARROW`]. `par_iter`
+    // preserves input order, and blob/thumb writes are temp-file + rename, so
+    // concurrent staging of identical content cannot corrupt anything.
+    stage_pool(wide_arm(sources)).install(|| {
         sources
             .par_iter()
             .map(|src| {
@@ -542,5 +632,60 @@ mod tests {
             }
         }
         out
+    }
+
+    #[test]
+    fn average_size_picks_the_arm_at_the_threshold() {
+        assert!(
+            !wide_enough(None),
+            "no readable source falls back to narrow"
+        );
+        assert!(!wide_enough(Some(0)));
+        assert!(!wide_enough(Some(STAGE_WIDE_MIN_AVG_BYTES - 1)));
+        assert!(wide_enough(Some(STAGE_WIDE_MIN_AVG_BYTES)));
+        assert!(wide_enough(Some(STAGE_WIDE_MIN_AVG_BYTES * 8)));
+    }
+
+    #[test]
+    fn average_size_samples_the_batch_by_size_not_by_name() {
+        let root = temp_root("avg");
+        let big = root.join("big.jpg");
+        let small = root.join("small.png");
+        std::fs::write(&big, vec![0u8; 200 * 1024]).unwrap();
+        std::fs::write(&small, PNG_1X1).unwrap();
+
+        // Four large sources average over the threshold; the same count of
+        // small ones stays under it.
+        let wide: Vec<PathBuf> = (0..3)
+            .map(|i| {
+                let p = root.join(format!("w{i}.jpg"));
+                std::fs::write(&p, vec![0u8; 200 * 1024]).unwrap();
+                p
+            })
+            .chain([big.clone()])
+            .collect();
+        let narrow: Vec<PathBuf> = (0..3)
+            .map(|i| {
+                let p = root.join(format!("n{i}.png"));
+                std::fs::write(&p, PNG_1X1).unwrap();
+                p
+            })
+            .chain([small])
+            .collect();
+
+        let wide_avg = sample_avg_bytes(&wide).unwrap();
+        let narrow_avg = sample_avg_bytes(&narrow).unwrap();
+        assert!(wide_avg >= 200 * 1024, "got {wide_avg}");
+        assert!(narrow_avg < 1024, "got {narrow_avg}");
+        assert!(wide_enough(Some(wide_avg)));
+        assert!(!wide_enough(Some(narrow_avg)));
+
+        // A batch where nothing can be stat'ed (deleted sources) reads as
+        // unknowable, not as large.
+        let gone: Vec<PathBuf> = (0..3).map(|i| root.join(format!("gone{i}"))).collect();
+        assert_eq!(sample_avg_bytes(&gone), None);
+        assert_eq!(sample_avg_bytes(&[]), None);
+
+        std::fs::remove_dir_all(&root).ok();
     }
 }

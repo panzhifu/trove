@@ -15,6 +15,10 @@
 //! slow filesystem.
 //!
 //! Output, one line per pass: `width=<n> pass=<i> <ms/file> <ms> failed=<n>`
+//!
+//! `width` is the width the process actually used, so a run with the sweep
+//! variable **unset** doubles as a check that the arm a batch's average source
+//! size implies is the arm staging chose.
 
 use std::path::PathBuf;
 use std::time::Instant;
@@ -50,7 +54,10 @@ fn main() {
         .join("target/tmp")
         .join("stage-sweep");
     let _ = std::fs::remove_dir_all(&root);
-    let width = import::stage_thread_count();
+    // The width this process will really use: the pinned `TROVE_STAGE_THREADS`
+    // when set (the sweep's arms), otherwise whatever the adaptive choice makes
+    // of this batch's average source size.
+    let width = import::stage_thread_count_for(&paths);
 
     for pass in 0..passes {
         // Cold cache: a warm thumbnail cache measures the cached path, which is
