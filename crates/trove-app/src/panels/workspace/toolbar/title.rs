@@ -13,10 +13,12 @@ use gpui_kit::component::slider::Slider;
 use gpui_kit::component::{IconName, Sizable as _};
 use gpui_kit::*;
 
-use crate::components::preview::ModelViewport;
+use crate::components::preview::{AssetPreviewPanel, ModelViewport};
+use crate::library::LibraryController;
 use crate::panels::WorkspacePanel;
 use crate::panels::workspace::MainPreview;
 use crate::panels::workspace::title_controls;
+use trove_core::media::edit::ImageEdit;
 
 impl DockPanel for WorkspacePanel {
     /// Title text: follows the browsed view (collection name, smart
@@ -57,8 +59,10 @@ impl DockPanel for WorkspacePanel {
         // of the grid's, so the content area is nothing but the picture. Which
         // set it is follows the preview, so opening one switches the bar.
         match &self.preview {
-            Some(MainPreview::Asset(_)) => {
-                return Some(preview_toolbar(cx).into_any_element());
+            Some(MainPreview::Asset(preview)) => {
+                return Some(
+                    preview_toolbar(preview, &self.controller, cx).into_any_element(),
+                );
             }
             Some(MainPreview::Model(viewport)) => {
                 return Some(model_toolbar(viewport, cx));
@@ -144,10 +148,90 @@ fn model_toolbar(viewport: &Entity<ModelViewport>, cx: &mut Context<WorkspacePan
     })
 }
 
-/// The still / video preview's title-bar controls: just the close button,
-/// because the tab beside it already names the asset. Zoom is wheel-only.
-fn preview_toolbar(cx: &mut Context<WorkspacePanel>) -> Div {
-    h_flex().items_center().child(
+/// The still / video preview's title-bar controls: the picture's edit tools
+/// (rotate, flip, the full edit dialog) when the backend can re-encode it,
+/// then the close button. The tab beside the bar already names the asset.
+/// Zoom is a gesture on the stage itself, not a toolbar control.
+fn preview_toolbar(
+    preview: &Entity<AssetPreviewPanel>,
+    controller: &Entity<LibraryController>,
+    cx: &mut Context<WorkspacePanel>,
+) -> Div {
+    use gpui_kit::assets::IconName as ToolIcon;
+
+    let (asset_id, editable) = {
+        let panel = preview.read(cx);
+        (panel.asset_id(), panel.editable())
+    };
+    let mut bar = h_flex().items_center().gap_1();
+
+    // The pixel edits act on the picture on screen — not on the grid
+    // selection, which the preview replaced. Each quick edit re-encodes at
+    // the dialog's default quality and re-opens the preview, so the edited
+    // result replaces the picture the moment the backend wrote it.
+    if let (Some(id), true) = (asset_id, editable) {
+        for (btn_id, icon, key, edits) in [
+            (
+                "preview-rotate-cw",
+                ToolIcon::RotateCw,
+                "viewport.rotate_cw",
+                vec![ImageEdit::Rotate90],
+            ),
+            (
+                "preview-rotate-ccw",
+                ToolIcon::RotateCcw,
+                "viewport.rotate_ccw",
+                vec![ImageEdit::Rotate270],
+            ),
+            (
+                "preview-flip-h",
+                ToolIcon::FlipHorizontal2,
+                "viewport.flip_horizontal",
+                vec![ImageEdit::FlipHorizontal],
+            ),
+            (
+                "preview-flip-v",
+                ToolIcon::FlipVertical2,
+                "viewport.flip_vertical",
+                vec![ImageEdit::FlipVertical],
+            ),
+        ] {
+            let ctl = controller.clone();
+            bar = bar.child(
+                Button::new(btn_id)
+                    .ghost()
+                    .xsmall()
+                    .icon(icon)
+                    .tooltip(rust_i18n::t!(key).to_string())
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        if crate::dialogs::edit::apply_single_edit(&ctl, id, edits.clone(), window, cx) {
+                            this.open_asset_preview(id, window, cx);
+                        }
+                    })),
+            );
+        }
+        // Everything the quick buttons cannot express — a crop, a rotation
+        // composed with it, a different quality — stays in the dialog, now
+        // aimed at this one asset.
+        let ctl = controller.clone();
+        bar = bar.child(
+            Button::new("preview-edit")
+                .ghost()
+                .xsmall()
+                .icon(ToolIcon::Pencil)
+                .tooltip(rust_i18n::t!("viewport.edit_image").to_string())
+                .on_click(move |_, window, cx| {
+                    crate::dialogs::edit::EditDialog::open_for_asset(
+                        window,
+                        cx,
+                        ctl.clone(),
+                        id,
+                    );
+                }),
+        );
+    }
+
+    bar.child(
         Button::new("preview-close")
             .ghost()
             .xsmall()
