@@ -1,6 +1,6 @@
 # Trove 导入管线 · 现状、实测与剩余优化
 
-> 写于 2026-09-18 ｜ 适用版本：0.4.4（工作树含 2026-09-18 的导入管线改动）
+> 写于 2026-09-18 ｜ 适用版本：0.4.5（含 2026-09-18/19 的导入管线改动）
 > 目标读者：重启机器之后继续这项工作的自己（或下一个接手的会话）。
 > 回答三个问题：**现在长什么样**、**已经量到哪些数**、**还剩什么值得做**。
 >
@@ -62,7 +62,7 @@
 ### 1.5 采集与目录监视（同在导入路径上）
 
 - **collect**（`services/collect.rs`）：落盘 `.part` → `sync_all` → 写 sidecar → `rename`；`inbox_items_in` 跳过 `.part`；固定 4 worker + 有界队列 + 60 s 空闲超时；body 流式落盘（512 MB 上传不再等于 512 MB 内存）。
-- **watch**（`tasks/watch.rs`）：notify 事件（`TICK = 400 ms`）+ 5 s 全扫兜底（watcher 覆盖全部 root 时退避 12× → 60 s）+ `SETTLE = 1500 ms`（内核在 `open` 时就报事件）+ **ack 回执**（未 ack 的文件继续重试，ack 过的停止上报）。
+- **watch**（`tasks/watch.rs`）：notify 事件（`TICK = 400 ms`）+ 5 s 全扫兜底（watcher 覆盖全部 root 时退避 12× → 60 s）+ `SETTLE = 1500 ms`（内核在 `open` 时就报事件）+ **ack 回执**（未 ack 的文件继续重试，ack 过的停止上报）。inbox 信号是**边沿触发**的（与上次信号时的列表比较），导入 job 再按（文件名, 大小）把已在库中的历史文件挡掉——两层合起来，长期存在的 inbox 才不会变成常驻的重哈希循环。
 
 ---
 
@@ -105,8 +105,10 @@
 | 批 3 | `ad1f60f` | collect：`.part`+rename+先写 sidecar、worker 池、流式落盘 | 正确性（半写文件曾被导入） |
 | 批 3 | `193b3a3` `d966ab0` `292b836` | watch：notify 事件 + 兜底 sweep + **ack 回执**（修掉「每次 sweep 重导入」的无限循环） | 新文件 ≤400 ms 可见；不再无限重哈希 |
 | 批 4 | `2c3495c` `e72e5e2` | 视频类型表唯一化、非 mp4 容器走 ffprobe、`Cost::Proc` 真正落地 | 正确性 + 防止 12 个并发解码器 |
+| 批 5 | 2026-09-19 | **inbox 正确性三连修**：信号改「边沿触发」（比较上次列表，不再每 5 s 对非空 inbox 发信号）；job 内按（文件名, 大小）去重，历史文件计入 `already_imported` 不再重哈希；列举统一走 `inbox_items_in`（此前 `collect_inbox_app` 手写列举漏掉 `.part`，半写文件会被永久导入；`.trove.json` 旁注也被当素材导入） | 正确性；运行时验证见 git |
+| 批 5 | 同上 | commit 批级错误不再丢报告：批失败整体回滚并逐文件记入 skipped，`ImportOutcome.error` 带首错上抛 UI；`stamp_collect_source` O(n²) → HashMap；符号链接/非 UTF-8 名记入 skipped；未来 mtime 视为已 settle | 正确性（有测试） |
 
-**基准工具**（都随代码一起维护）：`examples/stage_sweep.rs`（池宽臂跑器）、`examples/import_profile.rs`（组件归因）、`examples/event_path_profile.rs`（锁/事件路径）。
+**基准工具**（都随代码一起维护）：`examples/stage_sweep.rs`（池宽臂跑器）、`examples/import_profile.rs`（组件归因）、`examples/event_path_profile.rs`（锁/事件路径）、`examples/commit_batch_sample.rs`（COMMIT_BATCH 采样，走真实任务路径）。
 
 ---
 
@@ -122,12 +124,19 @@
 
 这是当前 ROI 最高的一步 —— 上面其它结论都建立在「池宽/闸宽选对了」之上。
 
-### P0 · SQLite 每次 commit 都在 fsync
+### P0 · SQLite 每次 commit 都在 fsync —— ✅ 已做（2026-09-19）
 
-- 现状：`store/mod.rs:44` 只设了 `journal_mode = WAL`，**`synchronous` 保持默认 FULL** → 每个事务 fsync；`COMMIT_BATCH = 16`。
-- 30 个大图那次的 4% 是**只有 2 个事务**的样本；**小文件批会反转**：1000 个文件 = 63 次 fsync，而 staging 总共才 ~19 ms（0.019 ms/文件）。
-- 先量：`import_profile` 跑一个 tiny 档（1000 × 1×1 PNG 或 500 张真实截图），看 `commit` 行占比。>20% 就上 `synchronous=NORMAL`（WAL 下的常规选择，只在 checkpoint 落盘；代价是断电可能丢最后一个事务，而导入本来可重跑）+ 把 `COMMIT_BATCH` 提到 64/128。
-- 顺带：`cache_size`（仍 8 MB page cache）、`mmap_size` 也没设，大库值得给。
+- `synchronous = NORMAL`（store 与导入 job 两条连接都设）+ `cache_size = -16000`。WAL 的常规配对：应用崩溃仍安全（WAL 重放），只有断电可能丢最后一个事务，而导入本来可重跑。
+- **标定数据**（1000 × 1×1 PNG，真实终端，5 轮丢首轮取中位）：
+
+  | TROVE_COMMIT_BATCH | ms/文件（中位） |
+  |---|---|
+  | 16 | 0.033 |
+  | **64** | **0.0285** |
+  | 128 | 0.0285 |
+  | 256 | 0.0285 |
+
+  结论：NORMAL 落地后 fsync 不再按事务付，批大小过 64 即平台；64 比 16 快 ~16%，再大只是持锁更久、进度更粗。**默认 64**（`tasks/import.rs::commit_batch`），`TROVE_COMMIT_BATCH` 可覆盖。采样工具：`examples/commit_batch_sample.rs`（走真实 `tasks::import::run`，process-per-sample，同 stage_sweep 惯例）。
 
 ### P1 · 索引 drain 落在「用户第一次搜索」上
 
@@ -202,7 +211,7 @@ TROVE_PROFILE_QUERY=1 <运行应用或测试>
 | `STAGE_THREADS_WIDE_MAX` | `media/import.rs` | 12 | **上限未定**（12 处仍降） |
 | `STAGE_WIDE_MIN_AVG_BYTES` | `media/import.rs` | 64 KiB | **插值**，未实测 |
 | `MAX_SLOTS` | `media/proc.rs` | 4 | **未实测** |
-| `COMMIT_BATCH` | `tasks/import.rs` | 16 | 未按小文件批验证 |
+| `COMMIT_BATCH` | `tasks/import.rs` | 64 | ✅ 已标定（见 §4；16→64 快 ~16%，64/128/256 持平） |
 | `TICK` / `SETTLE` / `SWEEP_COVERED_FACTOR` | `tasks/watch.rs` | 400 ms / 1500 ms / 12× | 体验驱动，未做 A/B |
 
 ---

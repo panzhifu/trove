@@ -96,6 +96,9 @@ pub fn run(
     // something land?": the embedder enumerates the directory itself, because
     // it needs the sidecars to record a source URL.
     let mut inbox_activity: Option<Activity> = None;
+    // The listing as of the last inbox signal: the fallback signals on
+    // *change* against this, not on "not empty" — see the collect block below.
+    let mut inbox_listing: Option<Vec<(std::path::PathBuf, Option<std::path::PathBuf>)>> = None;
     // Paths already offered, with the tick they were offered on. A path is
     // re-offered at most once per full sweep, so the fast path does not
     // multiply the embedder's retries (and the re-hashing behind them) by the
@@ -143,17 +146,28 @@ pub fn run(
             // The kernel says when something lands, and the collect service
             // renames its files into place, so that report is reliable. The
             // periodic scan stays as the fallback — it is also what notices a
-            // file that was already waiting when the watcher started.
+            // file that was already waiting when the watcher started — but it
+            // compares listings instead of just checking "not empty": the
+            // inbox keeps its files forever (they are linked, not copied), so
+            // an always-nonempty check would signal — and the embedder would
+            // re-enumerate, re-stat and re-dedup — the entire inbox history
+            // every interval, for the life of the process. Signalling on the
+            // first look (so pre-existing files still import) and on change
+            // (so an import that consumed sidecars re-arms the check) keeps
+            // the steady state silent.
             let touched = inbox_activity.as_ref().is_some_and(|watch| watch.take());
-            if (touched || settings_due)
-                && !crate::services::collect::inbox_items_in(&inbox_dir).is_empty()
-                && signals.send(WatchSignal::Inbox).is_err()
-            {
-                return Ok(()); // embedder hung up; stop watching
+            let listing = crate::services::collect::inbox_items_in(&inbox_dir);
+            let changed = inbox_listing.as_ref() != Some(&listing);
+            if !listing.is_empty() && (touched || changed) {
+                if signals.send(WatchSignal::Inbox).is_err() {
+                    return Ok(()); // embedder hung up; stop watching
+                }
+                inbox_listing = Some(listing);
             }
         } else {
             // Release the watch while collection is switched off.
             inbox_activity = None;
+            inbox_listing = None;
         }
 
         if library.watch_folders_enabled() {
@@ -393,7 +407,12 @@ fn sweep(
     if roots.is_empty() {
         return Vec::new();
     }
-    let files = super::import::all_files(roots);
+    // Symlinks and non-UTF-8 names land in `unrepresentable` and are dropped:
+    // the sweep's contract is "paths worth offering", and re-offering them
+    // forever would only spin. A *dropped folder* import reports them (see
+    // `expand_dirs`); the watch path never had a channel for skips.
+    let mut unrepresentable = Vec::new();
+    let files = super::import::all_files(roots, &mut unrepresentable);
     for root in roots {
         if baselined.insert(root.clone()) {
             for file in &files {
@@ -436,10 +455,13 @@ fn settled(path: &Path, now: SystemTime, settle: Duration) -> bool {
     if !meta.is_file() {
         return false;
     }
-    meta.modified()
-        .ok()
-        .and_then(|modified| now.duration_since(modified).ok())
-        .is_some_and(|age| age >= settle)
+    meta.modified().ok().is_some_and(|modified| match now.duration_since(modified) {
+        // A timestamp in the future — an archive that kept its mtimes, a
+        // skewed clock — can never age into `settle` by waiting, so waiting
+        // would hide the file forever. Take it as settled.
+        Ok(age) => age >= settle,
+        Err(_) => true,
+    })
 }
 
 #[cfg(test)]
@@ -529,6 +551,25 @@ mod tests {
             "a directory is not a file"
         );
         assert!(!settled(&dir.join("gone.png"), now, Duration::ZERO));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// An mtime in the future — an archive that kept its timestamps, a skewed
+    /// clock — can never age into the settle window, so it must count as
+    /// settled right away rather than hide from the importer forever.
+    #[test]
+    fn a_file_dated_in_the_future_is_settled() {
+        let dir = temp_dir("settle-future");
+        let file = dir.join("future.png");
+        std::fs::write(&file, b"x").unwrap();
+        let two_days_ahead = SystemTime::now() + Duration::from_secs(2 * 24 * 60 * 60);
+        let handle = std::fs::OpenOptions::new().write(true).open(&file).unwrap();
+        handle
+            .set_times(std::fs::FileTimes::new().set_modified(two_days_ahead))
+            .unwrap();
+
+        let now = SystemTime::now();
+        assert!(settled(&file, now, Duration::from_secs(60)));
         std::fs::remove_dir_all(&dir).ok();
     }
 

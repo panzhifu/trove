@@ -27,7 +27,7 @@ fn one_round(paths: &[PathBuf], root: &PathBuf, stage_only: bool) -> (Duration, 
     std::fs::create_dir_all(root).unwrap();
 
     let t0 = Instant::now();
-    let staged = import::stage_all(root, &root.join("cache"), paths, ImportStorage::Link);
+    let staged = import::stage_all(root, &root.join("cache"), paths, ImportStorage::Link, &std::sync::atomic::AtomicBool::new(false));
     let stage_time = t0.elapsed();
 
     if stage_only {

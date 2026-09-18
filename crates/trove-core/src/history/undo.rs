@@ -359,22 +359,31 @@ impl UndoStack {
     }
 
     /// Undo the most recent op. Returns `false` when the history is empty.
+    ///
+    /// The inverse applies inside its own transaction: if any step of it
+    /// fails, the database rolls back and the entry stays on the undo stack
+    /// where it can be retried — popping first (the old order) would have
+    /// dropped a half-applied op into neither stack, breaking the chain.
     pub fn undo(&mut self, conn: &Connection) -> Result<bool> {
-        let Some(entry) = self.undo.pop() else {
+        let Some(entry) = self.undo.last() else {
             return Ok(false);
         };
         let inverse = entry.op.inverse();
-        inverse.apply(conn)?;
+        apply_atomic(conn, |tx| inverse.apply(tx))?;
+        let entry = self.undo.pop().expect("peeked above");
         self.redo.push(entry);
         Ok(true)
     }
 
-    /// Redo the most recently undone op. Returns `false` when empty.
+    /// Redo the most recently undone op. Returns `false` when empty. Atomic
+    /// for the same reason as [`UndoStack::undo`].
     pub fn redo(&mut self, conn: &Connection) -> Result<bool> {
-        let Some(entry) = self.redo.pop() else {
+        let Some(entry) = self.redo.last() else {
             return Ok(false);
         };
-        entry.op.apply(conn)?;
+        let forward = entry.op.clone();
+        apply_atomic(conn, |tx| forward.apply(tx))?;
+        let entry = self.redo.pop().expect("peeked above");
         self.undo.push(entry);
         Ok(true)
     }
@@ -480,6 +489,26 @@ pub(crate) fn restore_patch(asset: &crate::model::Asset) -> AssetPatch {
     }
 }
 
+/// Apply one database step atomically: the closure runs inside a
+/// transaction that commits on success and rolls back on error, so a
+/// half-applied op can never leak into the store.
+fn apply_atomic(
+    conn: &Connection,
+    step: impl FnOnce(&Connection) -> Result<()>,
+) -> Result<()> {
+    // `unchecked_transaction`: the store hands out shared connections behind
+    // a RefCell, so the checked `&mut`-based API is not reachable here. There
+    // is no outer transaction on these paths to conflict with.
+    let tx = conn.unchecked_transaction()?;
+    match step(&tx) {
+        Ok(()) => tx.commit().map_err(crate::error::Error::from),
+        Err(error) => {
+            let _ = tx.rollback();
+            Err(error)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -515,6 +544,51 @@ mod tests {
             updated_at: now(),
             trashed_at: None,
         }
+    }
+
+    /// Undo runs its inverse inside a transaction, so an inverse that cannot
+    /// apply (here: the old tag name has been taken again) rolls back whole
+    /// and stays on the stack — the entry is neither lost nor half-applied,
+    /// and the chain behind it is intact.
+    #[test]
+    fn a_failing_undo_stays_on_the_stack_unchanged() {
+        let store = Store::in_memory().unwrap();
+        let conn = store.conn();
+        let mut stack = UndoStack::default();
+
+        let tag = NewTag {
+            name: "a".into(),
+            color: None,
+            parent_id: None,
+        };
+        let created = tags::create(conn, &tag).unwrap().id;
+        // Forward, recorded the way the library records it: a → x.
+        tags::rename(conn, created, "x").unwrap();
+        stack.record(
+            Op::TagRename {
+                id: created,
+                before: "a".into(),
+                after: "x".into(),
+            },
+            OpDesc::new(OpAction::TagRenamed, Some("a".into()), 1),
+        );
+        // Then someone else takes the name "a" again.
+        tags::create(
+            conn,
+            &NewTag {
+                name: "a".into(),
+                color: None,
+                parent_id: None,
+            },
+        )
+        .unwrap();
+
+        assert!(stack.undo(conn).is_err(), "the rename back must conflict");
+        assert_eq!(stack.undo_len(), 1, "the entry is retriable, not lost");
+        assert_eq!(stack.redo_len(), 0);
+        // And the store shows no half of it: the tag is still "x".
+        let tags = tags::list(conn).unwrap();
+        assert_eq!(tags.iter().filter(|t| t.name == "x").count(), 1);
     }
 
     #[test]

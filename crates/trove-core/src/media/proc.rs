@@ -14,7 +14,10 @@
 //!
 //! [`Cost::Proc`]: super::pipeline::Cost::Proc
 
+use std::io::Read;
+use std::process::{Command, Output, Stdio};
 use std::sync::{Condvar, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 /// Concurrent subprocesses an import may run.
 ///
@@ -135,4 +138,59 @@ mod tests {
     fn this_machine_offers_at_least_one_slot() {
         assert!(slots() >= 1);
     }
+}
+
+/// How long one import subprocess (`ffprobe` / `ffmpeg` / `heif-dec`) may run
+/// before it is killed. Generous by design: this bounds a *hung* decoder, not
+/// a slow one.
+pub const PROC_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// [`Command::output`] with a kill switch. `output()` waits forever, and one
+/// wedged decoder would pin a staging thread plus a process slot for the rest
+/// of the job — and leave a library swap's cancel-and-wait waiting behind it.
+/// Both pipes are drained on helper threads, so a chatty child cannot
+/// deadlock on a full pipe buffer while this loop polls for exit.
+pub fn output_with_timeout(mut command: Command) -> std::io::Result<Output> {
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command.spawn()?;
+    let mut stdout_pipe = child.stdout.take();
+    let mut stderr_pipe = child.stderr.take();
+    let stdout_reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(pipe) = stdout_pipe.as_mut() {
+            let _ = pipe.read_to_end(&mut buf);
+        }
+        buf
+    });
+    let stderr_reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(pipe) = stderr_pipe.as_mut() {
+            let _ = pipe.read_to_end(&mut buf);
+        }
+        buf
+    });
+
+    let deadline = Instant::now() + PROC_TIMEOUT;
+    let status = loop {
+        match child.try_wait()? {
+            Some(status) => break status,
+            None if Instant::now() >= deadline => {
+                // A killed child exits with a failure status, which is exactly
+                // how the callers already treat a broken decoder.
+                let _ = child.kill();
+                break child.wait()?;
+            }
+            None => std::thread::sleep(Duration::from_millis(10)),
+        }
+    };
+    let stdout = stdout_reader.join().unwrap_or_default();
+    let stderr = stderr_reader.join().unwrap_or_default();
+    Ok(Output {
+        status,
+        stdout,
+        stderr,
+    })
 }

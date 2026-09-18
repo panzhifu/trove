@@ -117,7 +117,8 @@ fn probe_with_ffprobe(path: &Path) -> Option<VideoStreamFacts> {
     // The import pipeline reaches this from the staging pool, so it takes a
     // subprocess slot — see [`super::proc`].
     let _slot = super::proc::slot();
-    let output = Command::new("ffprobe")
+    let mut command = Command::new("ffprobe");
+    command
         .args([
             "-v",
             "error",
@@ -129,9 +130,8 @@ fn probe_with_ffprobe(path: &Path) -> Option<VideoStreamFacts> {
             "json",
         ])
         .arg(path)
-        .stdin(Stdio::null())
-        .output()
-        .ok()?;
+        .stdin(Stdio::null());
+    let output = super::proc::output_with_timeout(command).ok()?;
     if !output.status.success() {
         return None;
     }
@@ -261,7 +261,8 @@ impl Drop for FramePipe {
 /// `ffprobe`; `false` when it is unavailable or the file has no audio —
 /// the player then hides its volume controls instead of faking silence.
 pub fn has_audio_track(path: &Path) -> bool {
-    let Ok(output) = Command::new("ffprobe")
+    let mut command = Command::new("ffprobe");
+    command
         .args([
             "-v",
             "error",
@@ -274,9 +275,8 @@ pub fn has_audio_track(path: &Path) -> bool {
         ])
         .arg(path)
         .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output()
-    else {
+        .stderr(Stdio::null());
+    let Ok(output) = super::proc::output_with_timeout(command) else {
         return false;
     };
     output.status.success() && !output.stdout.is_empty()

@@ -425,7 +425,10 @@ impl AppView {
             .unwrap_or(0);
         let path = std::env::temp_dir().join(format!("trove-paste-{nanos}.{ext}"));
         if std::fs::write(&path, &image.bytes).is_ok() {
-            jobs::import_paths_app(&self.controller, vec![path], window, cx);
+            // Copy, not link: the temp file is ours and disposable, and a
+            // link would leave the asset pointing at a path the system may
+            // empty at any moment.
+            jobs::import_copied_app(&self.controller, vec![path], window, cx);
         }
     }
 

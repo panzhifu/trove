@@ -820,7 +820,15 @@ impl InspectorPanel {
                                 kind: Some(kind),
                                 ..Default::default()
                             };
-                            let _ = ctl.library.patch_asset(id, &patch);
+                            if let Err(error) = ctl.library.patch_asset(id, &patch) {
+                                ctl.report_error(
+                                    rust_i18n::t!(
+                                        "inspector.edit_failed",
+                                        error = error.to_string()
+                                    )
+                                    .to_string(),
+                                );
+                            }
                             ctl.generation += 1;
                             cx.notify();
                         });
@@ -1006,7 +1014,15 @@ impl InspectorPanel {
                             rating: Some(value),
                             ..Default::default()
                         };
-                        let _ = ctl.library.patch_asset(id, &patch);
+                        if let Err(error) = ctl.library.patch_asset(id, &patch) {
+                            ctl.report_error(
+                                rust_i18n::t!(
+                                    "inspector.edit_failed",
+                                    error = error.to_string()
+                                )
+                                .to_string(),
+                            );
+                        }
                         ctl.generation += 1;
                         cx.notify();
                     });

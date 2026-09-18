@@ -321,11 +321,9 @@ pub(crate) fn heif_to_image(path: &std::path::Path) -> Option<image::DynamicImag
     // HEICs on a wide staging pool would otherwise start one `heif-dec` per
     // thread (see [`super::proc`]).
     let _slot = super::proc::slot();
-    let output = std::process::Command::new("heif-dec")
-        .arg(path)
-        .arg(&tmp)
-        .output()
-        .ok()?;
+    let mut command = std::process::Command::new("heif-dec");
+    command.arg(path).arg(&tmp);
+    let output = super::proc::output_with_timeout(command).ok()?;
     let result = if output.status.success() {
         image::open(&tmp).ok()
     } else {

@@ -37,7 +37,7 @@ pub fn compute_and_store_signature(
     }
 
     if let Some(ref rel) = asset.rel_path {
-        let path = library_root.join("media").join(rel);
+        let path = library_root.join(rel);
         let sig = VisualSignature::from_image(&path);
         if sig.phash != PHash(0) {
             let mut facts = asset.facts.clone();
@@ -236,7 +236,7 @@ pub fn backfill_signatures(
     let mut updated = 0_u64;
     for asset in rows_vec {
         if let Some(ref rel) = asset.rel_path {
-            let path = library_root.join("media").join(rel);
+            let path = library_root.join(rel);
             let sig = VisualSignature::from_image(&path);
             if sig.phash != PHash(0) {
                 let mut facts = asset.facts.clone();
