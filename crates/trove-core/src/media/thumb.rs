@@ -502,21 +502,32 @@ fn render_psd(path: &Path) -> Option<image::DynamicImage> {
     image::RgbaImage::from_raw(psd.width(), psd.height(), rgba).map(image::DynamicImage::ImageRgba8)
 }
 
-/// Decode `blob_path` and atomically write its downscaled JPEG to `out`
-/// (via a temporary file + rename). Missing/corrupt thumbs never fail the
-/// caller — they mean "no thumbnail yet".
-fn write_thumb(blob_path: &Path, out: &Path) -> Option<PathBuf> {
-    let image = decode_image(blob_path)?;
+/// The existing cache entry for `sha`, when there is one. The import pipeline
+/// asks this *before* decoding: a re-import can then decode the small cached
+/// thumbnail instead of the original.
+pub fn cached(root: &Path, sha: &str) -> Option<PathBuf> {
+    let out = abs_path(root, sha);
+    out.is_file().then_some(out)
+}
+
+/// Downscale `image` to fit [`THUMB_MAX`] on its longest edge, never
+/// enlarging. The one place the import pipeline's shared decode is resized.
+pub fn downscale(image: &image::DynamicImage) -> image::DynamicImage {
     let (w, h) = image.dimensions();
     if w == 0 || h == 0 {
-        return None;
+        return image.clone();
     }
     let scale = (THUMB_MAX as f32 / w.max(h) as f32).min(1.0);
-    let thumb = image.thumbnail(
+    image.thumbnail(
         (w as f32 * scale).max(1.0) as u32,
         (h as f32 * scale).max(1.0) as u32,
-    );
+    )
+}
 
+/// Write an already-downscaled image as the cache entry at `out` (temporary
+/// file + rename). This is the half of [`write_thumb`] that does not decode,
+/// so a caller holding a shared decode writes it without decoding again.
+pub fn write_downscaled(thumb: &image::DynamicImage, out: &Path) -> Option<PathBuf> {
     if let Some(parent) = out.parent() {
         std::fs::create_dir_all(parent).ok()?;
     }
@@ -533,6 +544,18 @@ fn write_thumb(blob_path: &Path, out: &Path) -> Option<PathBuf> {
             None
         }
     }
+}
+
+/// Decode `blob_path` and atomically write its downscaled JPEG to `out`
+/// (via a temporary file + rename). Missing/corrupt thumbs never fail the
+/// caller — they mean "no thumbnail yet".
+fn write_thumb(blob_path: &Path, out: &Path) -> Option<PathBuf> {
+    let image = decode_image(blob_path)?;
+    let (w, h) = image.dimensions();
+    if w == 0 || h == 0 {
+        return None;
+    }
+    write_downscaled(&downscale(&image), out)
 }
 
 /// Decode and develop a camera-RAW file with rawler: demosaic, white

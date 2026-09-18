@@ -7,18 +7,22 @@
 //! narrow case of a source Trove owns and is about to delete or overwrite.
 //!
 //! The pipeline is split into two phases so a UI can do the slow part (hash +
-//! probe + thumbnail, pure filesystem work) on a background thread and the fast
-//! part (database commit, which must not race the UI thread's reads) back on
-//! the main thread:
+//! probe + decode + thumbnail, pure filesystem work) on a background thread and
+//! the fast part (database commit, which must not race the UI thread's reads)
+//! back on the main thread:
 //!
-//! - [`stage_source`] — background: hash, probe, thumbnail under the cache root
+//! - [`stage_source`] — background: the stage pipeline in
+//!   [`crate::media::pipeline`], which decodes each image once and hands that
+//!   one buffer to the thumbnail writer, the palette miner and the visual
+//!   signature
 //! - [`commit_staged`] — foreground: dedupe against the store, insert rows
 
 use std::path::{Path, PathBuf};
 
 use uuid::Uuid;
 
-use super::{blob, metadata, probe, search, thumb};
+use super::metadata;
+use super::pipeline::{self, StageIo};
 use crate::error::{Error, Result};
 use crate::model::{Asset, AssetKind, Origin, UsageStatus, now};
 use crate::store::{Store, assets, collections};
@@ -231,85 +235,39 @@ pub fn commit_staged_all(
     report
 }
 
-/// Phase one (slow, pure I/O): hash + probe one source file.
-/// [`ImportStorage::Link`] leaves the file where it is and the record points
-/// at it; `Copy` writes a content-addressed blob into `data_root` first. The
-/// thumbnail is always written under `cache_root`.
+/// Phase one (slow, pure I/O): run the staged pipeline over one source file.
+///
+/// The stages themselves live in [`super::pipeline`]; this is the single-file
+/// entry point onto them. [`ImportStorage::Link`] leaves the file where it is
+/// and the record points at it; `Copy` writes a content-addressed blob into
+/// `data_root` first. The thumbnail is always written under `cache_root`.
 pub fn stage_source(
     data_root: &Path,
     cache_root: &Path,
     src: &Path,
     storage: ImportStorage,
 ) -> Result<StagedFile> {
-    let file_name = file_name_of(src)?;
-    let ext = probe::normalize_ext(
-        &src.extension()
-            .map(|e| e.to_string_lossy().to_string())
-            .unwrap_or_default(),
-    );
+    let mut io = StageIo::new(src, data_root, cache_root, storage)?;
+    pipeline::default_pipeline().run(&mut io)?;
+    Ok(staged_from(io))
+}
 
-    // Linked mode: hash the source in place; no blob is written. The probe
-    // and thumbnail generation read the original file directly.
-    let (sha256, size, rel_path, blob_path) = if storage.copies() {
-        let staged = blob::stage(src, data_root, &ext)?;
-        let blob_path = data_root.join(&staged.rel_path);
-        (staged.sha256, staged.size, staged.rel_path, blob_path)
-    } else {
-        let (sha256, size) = blob::hash_file(src)?;
-        (sha256, size, String::new(), src.to_path_buf())
-    };
-    let p = probe::probe(&ext);
-    let (width, height, video_duration_ms) = match p.kind {
-        AssetKind::Image => match probe::image_dimensions(&blob_path) {
-            Some(d) => (Some(d.width), Some(d.height), None),
-            None => (None, None, None),
-        },
-        // MP4-family containers carry track dimensions + duration in the moov
-        // box (pure-Rust read); other containers stay empty until probed.
-        AssetKind::Video => match probe::video_facts(&blob_path) {
-            Some(f) => (Some(f.width), Some(f.height), f.duration_ms),
-            None => (None, None, None),
-        },
-        _ => (None, None, None),
-    };
-    // Generate (or confirm) the thumbnail cache entry on the background thread.
-    let thumb_path = thumb::ensure(cache_root, &sha256, p.kind, &blob_path);
-    // Mine rich metadata (EXIF camera fields, audio tags/duration, font
-    // tables, video container). Best-effort. The palette is read from the
-    // thumbnail: the original has already been decoded once for the thumbnail,
-    // and a second full decode of a 6000x4000 image costs ~120 ms per file.
-    // (EXIF still comes from the original; thumbnails don't carry it.)
-    let color_source = thumb_path.clone().unwrap_or_else(|| blob_path.clone());
-    let mut mined = metadata::mine(&blob_path, p.kind, &color_source);
-    // Visual fingerprint (pHash + colour histogram) for search-by-image and
-    // search-by-colour, computed from the small thumbnail so a huge photo
-    // costs no more than a tiny one. Stored in the visual facts and persisted
-    // by `commit_staged` together with the rest of the mined metadata.
-    if p.kind == AssetKind::Image {
-        let sig_source = thumb_path.unwrap_or_else(|| blob_path.clone());
-        let sig = search::VisualSignature::from_image(&sig_source);
-        if sig.phash != search::PHash(0) {
-            sig.apply_to_facts(&mut mined.facts);
-        }
+/// A finished [`StageIo`] as the commit phase wants it.
+fn staged_from(io: StageIo) -> StagedFile {
+    StagedFile {
+        path: io.src,
+        file_name: io.file_name,
+        ext: io.ext,
+        sha256: io.sha256,
+        size: io.size,
+        rel_path: io.rel_path,
+        kind: io.kind,
+        mime: io.mime,
+        width: io.width,
+        height: io.height,
+        mined: io.mined,
+        linked: io.linked,
     }
-    if mined.duration_ms.is_none() {
-        mined.duration_ms = video_duration_ms;
-    }
-
-    Ok(StagedFile {
-        path: src.to_path_buf(),
-        file_name,
-        ext,
-        sha256,
-        size,
-        rel_path,
-        kind: p.kind,
-        mime: p.mime,
-        width,
-        height,
-        mined,
-        linked: !storage.copies(),
-    })
 }
 
 /// Phase two (fast, database-only): dedupe or insert, attach to a collection.
@@ -353,8 +311,10 @@ pub fn commit_staged(
     // Remember where the file came from: the folders panel browses by it.
     facts.source_path = Some(staged.path.display().to_string());
 
-    // Note: visual signature is computed in background after import to keep
-    // the import pipeline fast. See `compute_visual_signature_background()`.
+    // The visual signature (pHash + histogram) is part of `mined.facts`
+    // already: the pipeline's `visual-sig` stage computes it from the same
+    // decode the thumbnail and the palette were read from, so nothing is
+    // decoded twice and nothing is deferred.
 
     let asset = Asset {
         id: Uuid::new_v4(),
@@ -402,20 +362,6 @@ pub fn commit_staged(
         sha256: staged.sha256.clone(),
         reused: false,
     })
-}
-
-fn file_name_of(src: &Path) -> Result<String> {
-    let name = src
-        .file_name()
-        .ok_or_else(|| Error::Validation("path has no file name".into()))?
-        .to_string_lossy()
-        .to_string();
-    if name.trim().is_empty() {
-        return Err(Error::Validation("path has no file name".into()));
-    }
-    let mut name = name;
-    name.truncate(crate::model::MAX_NAME_LEN);
-    Ok(name)
 }
 
 #[cfg(test)]
