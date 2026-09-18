@@ -8696,6 +8696,7 @@ dependencies = [
  "memchr",
  "memmap2",
  "mp4",
+ "notify",
  "pinyin",
  "psd",
  "rawler",

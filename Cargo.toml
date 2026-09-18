@@ -84,6 +84,11 @@ rodio = { version = "0.19", default-features = false }
 # Local collect service: URL fetching for the inbox (extension / curl)
 ureq = "3"
 
+# Folder watching: kernel events (inotify/FSEvents/ReadDirectoryChangesW) for
+# the watch roots. The periodic sweep stays as the fallback — network mounts
+# and fuse have no events to give, and an overflowed kernel queue drops them.
+notify = "7"
+
 # Design-format thumbnails (SVG render, PSD composite, RAW decode).
 # Pinned to the 0.46 line so the graph keeps a single resvg/usvg: gpui-pre
 # (through gpui-kit) requires `resvg ^0.46`, and 0.45/0.46 are semver-

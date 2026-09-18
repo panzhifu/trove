@@ -1,32 +1,58 @@
-//! The folder-watch resident job: a periodic sweep over the collect-service
-//! inbox and the configured watch roots, reporting discoveries over a
-//! channel so the UI layer can start imports.
+//! The folder-watch resident job: watches the collect-service inbox and the
+//! configured watch roots, reporting discoveries over a channel so the UI
+//! layer can start imports.
 //!
 //! The job never starts imports itself — that is the embedder's call, so
 //! progress toasts and controller state stay in one place. The channel
 //! closes when the job exits (cancelled or panicked); the embedder treats a
 //! closed channel as "watch stopped".
 //!
+//! Two sources feed the same report:
+//!
+//! - kernel events through [`notify`], which is what makes a dropped folder
+//!   show up within a tick instead of within [`WATCH_INTERVAL`];
+//! - a periodic full sweep, kept because events are not always available: a
+//!   network or fuse mount has none to offer, the kernel queue can overflow
+//!   and drop them silently, and a root that only came into existence after
+//!   the watcher was attached would otherwise never be seen.
+//!
 //! Scan semantics: the inbox is signalled whenever files are waiting; watch
-//! roots are baselined on first sight (attaching a watch never
-//! retro-imports what is already there) and only *new* files are signalled.
-//! The embedder marks acceptance — a refused import (another import still
-//! running) must retry on a later sweep, so the job keeps re-signalling
-//! files it has not been told to forget. In practice the embedder accepts
-//! everything and the one-import-at-a-time rule in [`super::TaskManager`]
-//! makes the next sweep a no-op retry.
+//! roots are baselined on first sight (attaching a watch never retro-imports
+//! what is already there) and only *new* files are signalled. A file is only
+//! offered once it has stopped changing — see [`SETTLE`]. The embedder marks
+//! acceptance — a refused import (another import still running) must retry on
+//! a later sweep, so the job keeps re-signalling files it has not been told to
+//! forget. In practice the embedder accepts everything and the
+//! one-import-at-a-time rule in [`super::TaskManager`] makes the next sweep a
+//! no-op retry.
 
-use std::collections::HashSet;
-use std::path::PathBuf;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::Sender;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, SystemTime};
+
+use notify::{RecursiveMode, Watcher};
 
 use super::JobContext;
 use crate::config::{AppConfig, LibraryConfig};
 
-/// Sweep cadence. Both configs are re-read every sweep, so changes in
-/// Settings apply without a restart.
+/// Full-sweep cadence for the watch roots, and the interval the two configs
+/// are re-read at, so settings changes apply without a restart. It is now the
+/// *fallback* cadence: a file the kernel reports is picked up in [`TICK`].
 pub const WATCH_INTERVAL: Duration = Duration::from_secs(5);
+
+/// How often the event buffer is drained. Short enough that a drop feels
+/// immediate, long enough that a burst (a folder copy) arrives as one batch.
+const TICK: Duration = Duration::from_millis(400);
+
+/// How long a file must have gone untouched before it is offered.
+///
+/// The kernel reports a create the moment the writer opens the file, so
+/// without this an editor saving a large document — or a browser still
+/// downloading — would be imported half-written. The library *links* its files
+/// and records the hash it read, so that mistake cannot be repaired later.
+const SETTLE: Duration = Duration::from_millis(1500);
 
 /// Something discovered on a sweep that the embedder should act on.
 #[derive(Debug, Clone, PartialEq)]
@@ -38,7 +64,7 @@ pub enum WatchSignal {
 }
 
 /// Run the resident watch loop until cancelled. Sends every discovery to
-/// `signals`; sleeps in small cancellable slices between sweeps.
+/// `signals`; sleeps in small cancellable slices between ticks.
 ///
 /// `library_dir` is the open library's data directory: its `library.json`
 /// holds the watched-root list, which belongs to that library rather than to
@@ -52,6 +78,14 @@ pub fn run(
 ) -> Result<(), String> {
     let mut seen: HashSet<PathBuf> = HashSet::new();
     let mut baselined: HashSet<PathBuf> = HashSet::new();
+    let mut events: Option<Events> = None;
+    // Paths already offered, with the tick they were offered on. A path is
+    // re-offered at most once per full sweep, so the fast path does not
+    // multiply the embedder's retries (and the re-hashing behind them) by the
+    // tick rate.
+    let mut recent: HashMap<PathBuf, Instant> = HashMap::new();
+    let mut next_sweep = Instant::now();
+
     loop {
         if ctx.cancelled() {
             return Ok(());
@@ -68,34 +102,172 @@ pub fn run(
 
         if library.watch_folders_enabled() {
             let roots = library.watched_folders.clone();
-            for signal in sweep(&roots, inbox_dir.as_path(), &mut seen, &mut baselined) {
-                if signals.send(signal).is_err() {
-                    return Ok(());
-                }
+            let sweep_due = Instant::now() >= next_sweep;
+
+            // A watcher that could not be started is retried at the sweep
+            // cadence rather than every tick: a mount can appear later, but a
+            // platform with no backend must not cost a syscall storm.
+            if events.is_none() && sweep_due {
+                events = Events::start(&roots);
             }
+
+            let mut fresh = Vec::new();
+            if let Some(watch) = events.as_mut() {
+                watch.sync(&roots);
+                fresh = watch.drain(&roots, &mut recent, interval, SETTLE);
+            }
+            if sweep_due {
+                next_sweep = Instant::now() + interval;
+                fresh.extend(sweep(&roots, &mut seen, &mut baselined, SETTLE));
+                // Keep the cooldown map from growing with the library.
+                recent.retain(|_, at| at.elapsed() < interval * 4);
+            }
+            fresh.sort();
+            fresh.dedup();
+            if !fresh.is_empty() && signals.send(WatchSignal::Files(fresh)).is_err() {
+                return Ok(());
+            }
+        } else if events.is_some() {
+            // Release the kernel watches while watching is switched off.
+            events = None;
         }
 
-        // Sleep in slices so cancellation is responsive.
+        // Sleep in slices so cancellation stays responsive.
         let mut waited = Duration::ZERO;
-        while waited < interval {
+        while waited < TICK {
             if ctx.cancelled() {
                 return Ok(());
             }
-            let slice = Duration::from_millis(200).min(interval - waited);
+            let slice = Duration::from_millis(100).min(TICK - waited);
             std::thread::sleep(slice);
             waited += slice;
         }
     }
 }
 
-/// One sweep over the watch roots: baseline new roots, diff against `seen`,
-/// return the fresh files as a signal (empty when nothing new).
+/// The event side of the watch: a kernel watcher whose callback deposits
+/// changed paths into a buffer this job drains.
+struct Events {
+    watcher: notify::RecommendedWatcher,
+    /// Paths the kernel has reported since the last drain.
+    reported: Arc<Mutex<Vec<PathBuf>>>,
+    /// Reported paths held back until they stop changing.
+    held: Vec<PathBuf>,
+    /// Roots currently watched, so a settings change can be followed.
+    roots: Vec<PathBuf>,
+}
+
+impl Events {
+    /// Start a watcher over `roots`. `None` when the platform has no backend,
+    /// or the process is out of watches — the sweep then does all the work,
+    /// which is exactly the behaviour before events existed.
+    fn start(roots: &[PathBuf]) -> Option<Self> {
+        let reported: Arc<Mutex<Vec<PathBuf>>> = Arc::default();
+        let sink = Arc::clone(&reported);
+        let mut watcher =
+            notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
+                let Ok(event) = event else {
+                    return;
+                };
+                let mut paths = sink.lock().unwrap_or_else(|e| e.into_inner());
+                paths.extend(event.paths);
+            })
+            .ok()?;
+        let mut watched = Vec::new();
+        for root in roots {
+            if watcher.watch(root, RecursiveMode::Recursive).is_ok() {
+                watched.push(root.clone());
+            }
+        }
+        Some(Self {
+            watcher,
+            reported,
+            held: Vec::new(),
+            roots: watched,
+        })
+    }
+
+    /// Follow a change in the configured root list: attach what is new, drop
+    /// what is gone. A root that cannot be watched (deleted, unreadable, on a
+    /// filesystem without events) is left to the sweep.
+    fn sync(&mut self, roots: &[PathBuf]) {
+        let gone: Vec<PathBuf> = self
+            .roots
+            .iter()
+            .filter(|root| !roots.contains(root))
+            .cloned()
+            .collect();
+        for root in gone {
+            let _ = self.watcher.unwatch(&root);
+            self.roots.retain(|r| r != &root);
+        }
+        for root in roots {
+            if !self.roots.contains(root)
+                && self.watcher.watch(root, RecursiveMode::Recursive).is_ok()
+            {
+                self.roots.push(root.clone());
+            }
+        }
+    }
+
+    /// Paths the kernel reported that are new, real and settled. A candidate
+    /// that is still changing goes back into [`Self::held`] for the next tick;
+    /// one that vanished (a temporary file an app deleted) is dropped.
+    fn drain(
+        &mut self,
+        roots: &[PathBuf],
+        recent: &mut HashMap<PathBuf, Instant>,
+        cooldown: Duration,
+        settle: Duration,
+    ) -> Vec<PathBuf> {
+        let mut candidates = std::mem::take(&mut self.held);
+        candidates.extend(std::mem::take(
+            &mut *self.reported.lock().unwrap_or_else(|e| e.into_inner()),
+        ));
+        candidates.sort();
+        candidates.dedup();
+
+        let now = SystemTime::now();
+        let mut fresh = Vec::new();
+        for path in candidates {
+            let Some(root) = roots.iter().find(|root| path.starts_with(root)) else {
+                continue; // an unwatched root: its events are stale
+            };
+            if hidden_under(root, &path) {
+                continue;
+            }
+            if !settled(&path, now, settle) {
+                if path.is_file() {
+                    self.held.push(path);
+                }
+                continue;
+            }
+            if recent
+                .get(&path)
+                .is_some_and(|offered| offered.elapsed() < cooldown)
+            {
+                continue;
+            }
+            recent.insert(path.clone(), Instant::now());
+            fresh.push(path);
+        }
+        fresh
+    }
+}
+
+/// One full pass over the watch roots: baseline new roots, then report
+/// everything under them that is not in `seen` and has stopped changing.
+///
+/// The caller must not add the result to `seen`: a file the embedder could not
+/// import yet has to come back on a later sweep — that re-offer is the retry.
+/// Files too young to import are skipped rather than held; not being in `seen`,
+/// they come back on their own.
 fn sweep(
     roots: &[PathBuf],
-    _inbox: &std::path::Path,
     seen: &mut HashSet<PathBuf>,
     baselined: &mut HashSet<PathBuf>,
-) -> Vec<WatchSignal> {
+    settle: Duration,
+) -> Vec<PathBuf> {
     if roots.is_empty() {
         return Vec::new();
     }
@@ -109,12 +281,37 @@ fn sweep(
             }
         }
     }
-    let fresh: Vec<PathBuf> = files.into_iter().filter(|f| !seen.contains(f)).collect();
-    if fresh.is_empty() {
-        Vec::new()
-    } else {
-        vec![WatchSignal::Files(fresh)]
+    let now = SystemTime::now();
+    files
+        .into_iter()
+        .filter(|file| !seen.contains(file) && settled(file, now, settle))
+        .collect()
+}
+
+/// Whether `path` sits under a hidden component of `root` — the rule the import
+/// walk applies, so the fast path and the sweep agree on what is a candidate.
+fn hidden_under(root: &Path, path: &Path) -> bool {
+    path.strip_prefix(root)
+        .map(|rel| {
+            rel.components()
+                .any(|c| c.as_os_str().to_string_lossy().starts_with('.'))
+        })
+        .unwrap_or(true)
+}
+
+/// Whether a file exists, is a file, and was last modified at least `settle`
+/// ago — see [`SETTLE`].
+fn settled(path: &Path, now: SystemTime, settle: Duration) -> bool {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return false;
+    };
+    if !meta.is_file() {
+        return false;
     }
+    meta.modified()
+        .ok()
+        .and_then(|modified| now.duration_since(modified).ok())
+        .is_some_and(|age| age >= settle)
 }
 
 #[cfg(test)]
@@ -138,47 +335,117 @@ mod tests {
         std::fs::write(root.join(".hidden.png"), b"x").unwrap();
         let mut seen = HashSet::new();
         let mut baselined = HashSet::new();
-        let inbox = temp_dir("inbox");
 
         // First sweep baselines: existing files are not reported.
-        let signals = sweep(
+        let fresh = sweep(
             std::slice::from_ref(&root),
-            &inbox,
             &mut seen,
             &mut baselined,
+            Duration::ZERO,
         );
-        assert!(signals.is_empty());
+        assert!(fresh.is_empty(), "{fresh:?}");
 
-        // A new file is reported once; marking seen is the caller's job.
+        // A new file is reported, and keeps being reported until the caller
+        // records it — that repeat is how a refused import gets retried.
         std::fs::write(root.join("b.jpg"), b"x").unwrap();
-        let signals = sweep(
+        let fresh = sweep(
             std::slice::from_ref(&root),
-            &inbox,
             &mut seen,
             &mut baselined,
+            Duration::ZERO,
         );
-        match &signals[..] {
-            [WatchSignal::Files(files)] => assert_eq!(files, &[root.join("b.jpg")]),
-            other => panic!("expected one Files signal, got {other:?}"),
-        }
-        for signal in &signals {
-            if let WatchSignal::Files(files) = signal {
-                for f in files {
-                    seen.insert(f.clone());
-                }
-            }
-        }
+        assert_eq!(fresh, vec![root.join("b.jpg")]);
+        let fresh = sweep(
+            std::slice::from_ref(&root),
+            &mut seen,
+            &mut baselined,
+            Duration::ZERO,
+        );
+        assert_eq!(fresh, vec![root.join("b.jpg")]);
+
+        // Once the embedder has it, it stops being offered.
+        seen.insert(root.join("b.jpg"));
         assert!(
             sweep(
                 std::slice::from_ref(&root),
-                &inbox,
                 &mut seen,
-                &mut baselined
+                &mut baselined,
+                Duration::ZERO
             )
             .is_empty()
         );
 
         std::fs::remove_dir_all(&root).ok();
-        std::fs::remove_dir_all(&inbox).ok();
+    }
+
+    #[test]
+    fn hidden_components_are_never_candidates() {
+        let root = PathBuf::from("/lib/photos");
+        assert!(!hidden_under(&root, &root.join("trip/a.jpg")));
+        assert!(hidden_under(&root, &root.join(".thumbs/a.jpg")));
+        assert!(hidden_under(&root, &root.join("trip/.hidden.jpg")));
+        // Outside the root: not ours to watch.
+        assert!(hidden_under(&root, &PathBuf::from("/elsewhere/a.jpg")));
+    }
+
+    #[test]
+    fn a_file_is_only_settled_once_it_stops_changing() {
+        let dir = temp_dir("settle");
+        let file = dir.join("a.png");
+        std::fs::write(&file, b"x").unwrap();
+        let now = SystemTime::now();
+        assert!(settled(&file, now, Duration::ZERO));
+        assert!(!settled(&file, now, Duration::from_secs(60)));
+        assert!(
+            !settled(&dir, now, Duration::ZERO),
+            "a directory is not a file"
+        );
+        assert!(!settled(&dir.join("gone.png"), now, Duration::ZERO));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The kernel path is what makes a drop show up in under a second. If the
+    /// platform hands us no watcher this test has nothing to say — the sweep
+    /// covers that case — so it passes without asserting.
+    #[test]
+    fn kernel_events_reach_the_buffer() {
+        let root = temp_dir("events");
+        let Some(mut events) = Events::start(std::slice::from_ref(&root)) else {
+            return;
+        };
+        std::fs::write(root.join("new.png"), b"x").unwrap();
+
+        let mut recent = HashMap::new();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let fresh = events.drain(
+                std::slice::from_ref(&root),
+                &mut recent,
+                Duration::ZERO,
+                Duration::ZERO,
+            );
+            if fresh.iter().any(|p| p.ends_with("new.png")) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "no event for a new file within 5s"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+
+        // Reports of the same path do not repeat within the cooldown.
+        assert!(
+            events
+                .drain(
+                    std::slice::from_ref(&root),
+                    &mut recent,
+                    Duration::from_secs(60),
+                    Duration::ZERO
+                )
+                .is_empty()
+        );
+
+        std::fs::remove_dir_all(&root).ok();
     }
 }

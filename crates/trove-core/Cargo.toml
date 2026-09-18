@@ -30,6 +30,7 @@ rayon = { workspace = true }
 memchr = "2"
 memmap2 = "0.9"  # memory-mapped file access for large PLY files
 ureq = { workspace = true }
+notify = { workspace = true }
 resvg = { workspace = true }
 psd = { workspace = true }
 rawler = { workspace = true }
