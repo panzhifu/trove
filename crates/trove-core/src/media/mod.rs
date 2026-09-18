@@ -11,6 +11,7 @@ pub mod gpu;
 pub mod import;
 pub mod index;
 pub mod metadata;
+pub mod pipeline;
 pub mod probe;
 pub mod render3d;
 pub mod search;

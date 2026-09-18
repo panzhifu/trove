@@ -7,8 +7,6 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use image::GenericImageView;
-
 /// Downsample to at most `GRID`x`GRID` pixels before quantizing, so reading a
 /// 60 MP photo costs ~600 px, not millions.
 const GRID: u32 = 24;
@@ -20,17 +18,30 @@ pub const MAX_COLORS: usize = 12;
 /// as `#rrggbb` hex strings (quantized to 3 bits per channel). Empty when the
 /// file is not a decodable image.
 pub fn dominant_colors(path: &Path) -> Vec<String> {
-    let image = match image::open(path) {
-        Ok(i) => i,
-        Err(_) => return Vec::new(),
-    };
-    let (w, h) = image.dimensions();
+    match image::open(path) {
+        Ok(image) => dominant_from_rgb(&image.to_rgb8()),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// The same palette, computed from pixels the caller has already decoded.
+///
+/// This is the import pipeline's path: the image is decoded once (for the
+/// thumbnail, the palette and the visual signature all at the same time), so
+/// the palette must not open the file a second time. `rgb` may be any size —
+/// it is downsampled to [`GRID`] here, exactly as [`dominant_colors`] does.
+pub fn dominant_from_rgb(rgb: &image::RgbImage) -> Vec<String> {
+    let (w, h) = rgb.dimensions();
     if w == 0 || h == 0 {
         return Vec::new();
     }
 
     // Bucket every pixel by its top 3 bits per channel (4096 buckets).
-    let small = image.thumbnail(GRID, GRID).to_rgb8();
+    let small = if w.max(h) > GRID {
+        image::imageops::thumbnail(rgb, GRID, GRID)
+    } else {
+        rgb.clone()
+    };
     let mut counts: HashMap<u32, u64> = HashMap::new();
     for px in small.pixels() {
         let key = ((px[0] >> 5) as u32) << 6 | ((px[1] >> 5) as u32) << 3 | (px[2] >> 5) as u32;

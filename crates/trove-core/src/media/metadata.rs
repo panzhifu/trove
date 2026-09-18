@@ -36,9 +36,32 @@ pub struct MinedMetadata {
 /// file. EXIF still reads `path` itself: thumbnails do not carry it. Passing
 /// `path` for both restores the old behaviour (used by tests and callers
 /// without a thumbnail).
+///
+/// Callers that already hold the decode prefer [`mine_from_palette`], which
+/// skips the palette read entirely.
 pub fn mine(path: &Path, kind: AssetKind, color_source: &Path) -> MinedMetadata {
+    mine_impl(path, kind, None, color_source)
+}
+
+/// [`mine`] with the palette already computed from a decode the caller holds —
+/// the import pipeline's path, where one decode feeds the thumbnail, the
+/// palette and the visual signature. Only the palette is taken from the
+/// caller; EXIF still reads `path`.
+pub fn mine_from_palette(path: &Path, kind: AssetKind, palette: Vec<String>) -> MinedMetadata {
+    mine_impl(path, kind, Some(palette), path)
+}
+
+fn mine_impl(
+    path: &Path,
+    kind: AssetKind,
+    palette: Option<Vec<String>>,
+    color_source: &Path,
+) -> MinedMetadata {
     match kind {
-        AssetKind::Image => mine_image(path, color_source),
+        AssetKind::Image => mine_image(
+            path,
+            palette.unwrap_or_else(|| color::dominant_colors(color_source)),
+        ),
         AssetKind::Audio => mine_audio(path).unwrap_or_default(),
         AssetKind::Font => mine_font(path).unwrap_or_default(),
         // Video duration rides the mp4 container when it is one (mkv/webm/avi
@@ -128,13 +151,13 @@ fn mine_video(path: &Path) -> Option<MinedMetadata> {
 /// other extractors this therefore never short-circuits — a photo without EXIF
 /// still yields its dominant palette.
 ///
-/// Colours are read from `color_source` (normally the thumbnail — see [`mine`]);
-/// EXIF always reads `path`, which carries the metadata.
-fn mine_image(path: &Path, color_source: &Path) -> MinedMetadata {
+/// `palette` is handed in already computed (the pipeline's shared decode, or
+/// the thumbnail an older caller pointed at — see [`mine`]); EXIF always reads
+/// `path`, which carries the metadata.
+fn mine_image(path: &Path, palette: Vec<String>) -> MinedMetadata {
     let mut m = MinedMetadata::default();
 
     // Universal color facts: present for every decodable image, unlike EXIF.
-    let palette = color::dominant_colors(color_source);
     if let Some(first) = palette.first() {
         let visual = &mut m.facts.visual;
         visual.dominant_color = Some(first.clone());

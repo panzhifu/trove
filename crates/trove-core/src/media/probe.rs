@@ -177,6 +177,17 @@ pub fn video_facts(path: &std::path::Path) -> Option<VideoFacts> {
     })
 }
 
+/// Whether [`image_dimensions`] costs a full pixel decode for this extension
+/// rather than a header read.
+///
+/// Camera RAW goes through `rawler` (demosaic + develop), and HEIF/AVIF shell
+/// out to `heif-dec` and read the PNG it writes — both are the whole picture,
+/// not a header. The import pipeline asks this so it can skip the read: its
+/// decode stage is about to produce exactly those pixels.
+pub fn dimensions_need_full_decode(ext: &str) -> bool {
+    is_raw_ext(ext) || matches!(ext, "heif" | "heic" | "avif")
+}
+
 /// Read the pixel dimensions of a raster image by decoding only its header.
 ///
 /// Unsupported or corrupt images return `None` — never fail the import.
