@@ -681,7 +681,14 @@ impl AppView {
         let import = match &ctl.import_phase {
             ImportPhase::Idle => rust_i18n::t!("statusbar.import_idle").to_string(),
             ImportPhase::Running { total, done } => {
-                rust_i18n::t!("statusbar.import_running", done = done, total = total).to_string()
+                // Zero is the job's "counting the folder" state: there is no
+                // fraction to show until the walk on the backend thread ends.
+                if *total == 0 {
+                    rust_i18n::t!("statusbar.import_scanning").to_string()
+                } else {
+                    rust_i18n::t!("statusbar.import_running", done = done, total = total)
+                        .to_string()
+                }
             }
             ImportPhase::Done { imported, skipped } => rust_i18n::t!(
                 "statusbar.import_done",
