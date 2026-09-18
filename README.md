@@ -82,7 +82,9 @@ cargo run -p trove-app
 |---|---|
 | **无声预览** | ffmpeg 管线逐帧解码，播放 / 暂停 / 跳转 / 时间线，无音频管线 |
 | **截图采集** | 全屏或交互式框选，直接入库 PNG；全屏走进程内捕获（xcap：Wayland wlr-screencopy / X11 / macOS / Windows），免 portal 弹窗；框选回落外部工具（grim+slurp / scrot / macOS screencapture），命令可自定义 |
+| **批量像素编辑** | 旋转 / 翻转 / 裁剪（百分比坐标，按每张图自身尺寸解析），JPEG 质量参数，原地替换媒体文件并保留资产身份与组织关系 |
 | **批量格式转换** | 图片重新编码为 JPEG / PNG / WebP / BMP / TFT，可选长边限制，可重新导入转换后文件 |
+| **XMP 元数据导出** | 在媒体文件旁写入标准 XMP sidecar（标题 / 描述 / 标签 / 评分），原子写入、全转义、不破坏原文件 |
 
 ### 维护与安全
 
@@ -120,6 +122,7 @@ cargo run -p trove-app
 - 工作区网格采用对齐布局（Google 相册风格），任意宽度下撑满面板
 - 工作区标题栏内嵌弹出式搜索框，旁显示当前视图资产数
 - 整窗都是拖放面；`Ctrl/Cmd+点击` 或 `Shift` 范围选择
+- **系统托盘**：关闭窗口仅最小化到托盘（KDE/freedesktop StatusNotifierItem / Windows 通知图标 / macOS NSStatusItem），托盘菜单可恢复窗口或彻底退出
 
 ---
 
@@ -190,7 +193,7 @@ cargo test -p trove-core
 cargo run -p trove-app
 ```
 
-**当前测试基线：`trove-core` 382 + `trove-app` 27 全部通过；`cargo fmt --check` 干净；clippy 全工作区 0 告警。** `trove-app` 含 2 个真机 GPU 冒烟测试（EDL、meshlet 剔除），无显卡的机器自动跳过。
+**当前测试基线：`trove-core` 401 + `trove-app` 34 全部通过；`cargo fmt --check` 干净；clippy 全工作区 0 告警。** `trove-app` 含 2 个真机 GPU 冒烟测试（EDL、meshlet 剔除），无显卡的机器自动跳过。
 
 对标同类软件的功能差距与路线图见 [docs/FEATURE-GAPS.md](docs/FEATURE-GAPS.md)。
 

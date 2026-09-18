@@ -74,7 +74,9 @@ This README summarizes what ships. The **[Chinese README](./README.md)** is the 
 
 - **Silent preview** — frame-by-frame ffmpeg decode with play / pause / seek / timeline; no audio pipeline.
 - **Screenshot capture** — full screen or interactive region, imported as PNG. Full-screen shots are captured in-process via xcap (wlr-screencopy on Wayland, XCB on X11, ScreenCaptureKit on macOS, Windows) with no portal dialogs; region picking falls back to external tools (grim+slurp / scrot / macOS screencapture); custom command override.
+- **Batch pixel editor** — rotate / flip / crop (percent coordinates, resolved per asset from its own dimensions), JPEG quality; replaces the media file in place while preserving asset identity and organization membership.
 - **Batch conversion** — re-encode images to JPEG / PNG / WebP / BMP / TIFF, optional longest-edge cap, optional re-import.
+- **XMP metadata export** — write a standard XMP sidecar beside each asset's file (title / description / tags / rating), atomic write, fully escaped, never touches the original file.
 
 ### Maintenance & safety
 
@@ -105,6 +107,8 @@ This README summarizes what ships. The **[Chinese README](./README.md)** is the 
 
 **Settings** opens a window with six pages — About (version, release check, language) · Appearance (light/dark, themes, custom themes) · Files (storage, libraries, watched folders, thumbnails, backups, cleanup) · Model (point-cloud look, axes, preview zoom) · Search (full-text index, visual fingerprints) · Shortcuts. With no library yet, launch opens the **welcome window** instead of the main one.
 
+- **System tray** — closing the window minimizes to the tray (KDE/freedesktop StatusNotifierItem / Windows notification icon / macOS NSStatusItem); the tray menu restores the window or quits for good.
+
 ---
 
 ## Build & test
@@ -115,7 +119,7 @@ cargo test -p trove-core
 cargo run -p trove-app
 ```
 
-**Baseline: `trove-core` 382 + `trove-app` 27 all pass; `cargo fmt --check` clean; clippy 0 warnings workspace-wide.** Two real-GPU smoke tests live in `trove-app` (EDL, meshlet culling) and skip automatically on headless machines.
+**Baseline: `trove-core` 401 + `trove-app` 34 all pass; `cargo fmt --check` clean; clippy 0 warnings workspace-wide.** Two real-GPU smoke tests live in `trove-app` (EDL, meshlet culling) and skip automatically on headless machines.
 
 What is still missing vs. Eagle / Billfish / digiKam / Adobe Bridge is mapped in [docs/FEATURE-GAPS.md](docs/FEATURE-GAPS.md).
 
