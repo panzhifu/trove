@@ -33,10 +33,11 @@ pub struct WatchTask {
 /// so this keeps the bar smooth without busy-looping.
 const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(80);
 
-/// Start the resident watch task: a backend thread sweeps the collect
-/// inbox and the configured watch roots every [`watch::WATCH_INTERVAL`] and
-/// reports discoveries; this module's pump turns them into imports. Call
-/// once at startup and again after a library swap.
+/// Start the resident watch task: a backend thread watches the collect inbox
+/// and the configured watch roots — kernel events, falling back to a full
+/// sweep at least every [`watch::WATCH_INTERVAL`] — and reports discoveries;
+/// this module's pump turns them into imports. Call once at startup and again
+/// after a library swap.
 pub fn start_watch_service(
     controller: &Entity<LibraryController>,
     handle: gpui::AnyWindowHandle,
