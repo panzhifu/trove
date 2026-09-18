@@ -1,7 +1,9 @@
 //! Operational services that live above the store/media layers: database
-//! backups, maintenance jobs, the local collect service, handing files to
-//! external applications, and the release-update check.
+//! backups, the full-backup archive, maintenance jobs, the local collect
+//! service, handing files to external applications, and the release-update
+//! check.
 
+pub mod archive;
 pub mod backup;
 pub mod collect;
 pub mod font_manager;

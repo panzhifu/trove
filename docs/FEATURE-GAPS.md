@@ -128,6 +128,7 @@
 | # | 功能 | 现状 | 竞品参照 | 优先级 |
 |---|---|---|---|---|
 | 1 | **媒体文件+元数据整库导出/再导入** | **已实现**（导出 v2 含成员关系表；还原按 SHA 去重回链、缺失媒体成占位并在重导入时自愈） | 全部竞品 | ✅（媒体文件本体打包导出仍缺 → P2） |
+| 1b | **整包备份压缩包**（软件配置 + 全部素材库数据 + incoming → 单个 zip） | **已实现**（`services::archive::create_full_backup`：config.json / history.json / 用户主题 + 各库 VACUUM 快照、library.json、media blob + incoming；manifest.json 记录库注册表与恢复布局；跳过 backups/ 与 WAL sidecar，失败不留半包；库管理器卡片与 File 菜单双入口） | Eagle 备份 / TagStudio | ✅（应用内一键还原待补 → P2） |
 | 2 | Contact Sheet / PDF 图库输出 | 无 | Bridge Output/XnView | P2 |
 | 3 | 导出预设（尺寸/格式/命名模板） | 无 | Eagle/Billfish | P2 |
 | 4 | 复制到剪贴板（图片数据） | **已实现**（右键「复制图片」/快捷键：解码图像写入系统剪贴板） | Eagle | ✅ |

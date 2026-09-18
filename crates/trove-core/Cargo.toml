@@ -27,6 +27,10 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true }
 rayon = { workspace = true }
+# Writes the full-backup archive (deflate, streaming, zip64). Deflate and
+# CRC-32 already ride in the graph via lofty, so the added crates are the
+# container logic and little else.
+zip = { version = "2", default-features = false, features = ["deflate"] }
 memchr = "2"
 memmap2 = "0.9"  # memory-mapped file access for large PLY files
 ureq = { workspace = true }
