@@ -46,6 +46,11 @@ pub const WATCH_INTERVAL: Duration = Duration::from_secs(5);
 /// immediate, long enough that a burst (a folder copy) arrives as one batch.
 const TICK: Duration = Duration::from_millis(400);
 
+/// How much longer the full sweep may wait once every root is actually watched
+/// (12 × [`WATCH_INTERVAL`] = a minute): the kernel covers the fast path, so the
+/// sweep is only there for what it drops.
+const SWEEP_COVERED_FACTOR: u32 = 12;
+
 /// How long a file must have gone untouched before it is offered.
 ///
 /// The kernel reports a create the moment the writer opens the file, so
@@ -84,15 +89,33 @@ pub fn run(
     // multiply the embedder's retries (and the re-hashing behind them) by the
     // tick rate.
     let mut recent: HashMap<PathBuf, Instant> = HashMap::new();
+    let mut next_settings = Instant::now();
     let mut next_sweep = Instant::now();
+    let mut config = AppConfig::load();
+    let mut library = LibraryConfig::load(&library_dir);
+    let mut roots: Vec<PathBuf> = library.watched_folders.clone();
 
     loop {
         if ctx.cancelled() {
             return Ok(());
         }
-        let config = AppConfig::load();
-        let library = LibraryConfig::load(&library_dir);
+        let now = Instant::now();
 
+        // Settings are re-read on the sweep cadence, not on every tick: a tick
+        // is [`TICK`] long and each load is two file reads plus a parse, so
+        // re-reading them per tick would put that cost on the idle path where
+        // nothing has happened. This stays at `interval`, so a folder added in
+        // Settings starts being watched as promptly as before.
+        let settings_due = now >= next_settings;
+        if settings_due {
+            next_settings = now + interval;
+            config = AppConfig::load();
+            library = LibraryConfig::load(&library_dir);
+            roots = library.watched_folders.clone();
+        }
+
+        // The inbox is cheap to list and is what the browser extension feeds, so
+        // it keeps the tick cadence.
         if config.collect_enabled()
             && !crate::services::collect::inbox_items_in(&inbox_dir).is_empty()
             && signals.send(WatchSignal::Inbox).is_err()
@@ -101,13 +124,10 @@ pub fn run(
         }
 
         if library.watch_folders_enabled() {
-            let roots = library.watched_folders.clone();
-            let sweep_due = Instant::now() >= next_sweep;
-
-            // A watcher that could not be started is retried at the sweep
+            // A watcher that could not be started is retried on the settings
             // cadence rather than every tick: a mount can appear later, but a
             // platform with no backend must not cost a syscall storm.
-            if events.is_none() && sweep_due {
+            if events.is_none() && settings_due {
                 events = Events::start(&roots);
             }
 
@@ -116,8 +136,19 @@ pub fn run(
                 watch.sync(&roots);
                 fresh = watch.drain(&roots, &mut recent, interval, SETTLE);
             }
-            if sweep_due {
-                next_sweep = Instant::now() + interval;
+            if now >= next_sweep {
+                // The sweep exists to catch what the kernel cannot report. When
+                // every root is actually watched there is little left for it to
+                // find, so it backs off — walking the whole tree every five
+                // seconds to prove nothing changed was most of what the old
+                // watcher did, and it is not free on a large library.
+                let covered = events.as_ref().is_some_and(|watch| watch.covers(&roots));
+                next_sweep = now
+                    + if covered {
+                        interval * SWEEP_COVERED_FACTOR
+                    } else {
+                        interval
+                    };
                 fresh.extend(sweep(&roots, &mut seen, &mut baselined, SETTLE));
                 // Keep the cooldown map from growing with the library.
                 recent.retain(|_, at| at.elapsed() < interval * 4);
@@ -208,6 +239,12 @@ impl Events {
                 self.roots.push(root.clone());
             }
         }
+    }
+
+    /// Whether every one of `roots` is actually being watched — what the sweep
+    /// backs off on.
+    fn covers(&self, roots: &[PathBuf]) -> bool {
+        !roots.is_empty() && roots.iter().all(|root| self.roots.contains(root))
     }
 
     /// Paths the kernel reported that are new, real and settled. A candidate
