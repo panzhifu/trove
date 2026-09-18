@@ -32,13 +32,29 @@ pub struct ProcessSlot {
 }
 
 /// How many subprocess slots this machine offers.
+///
+/// [`PROC_SLOTS_ENV`] pins it when set to a positive integer, so the cap can be
+/// swept from a real terminal (the same way `TROVE_STAGE_THREADS` sweeps the
+/// staging pool) instead of being argued about. The value is read once per
+/// process, when the first slot is taken.
 pub fn slots() -> usize {
+    if let Some(n) = std::env::var(PROC_SLOTS_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|n| *n > 0)
+    {
+        return n;
+    }
     MAX_SLOTS.min(
         std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(1),
     )
 }
+
+/// Environment override for the process cap, for benchmarks and for a machine
+/// where the default is wrong.
+pub const PROC_SLOTS_ENV: &str = "TROVE_PROC_SLOTS";
 
 /// The counting behind [`slot`], separate from the global so a test can
 /// exercise it without racing every other test in the process.
