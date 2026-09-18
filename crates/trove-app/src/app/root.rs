@@ -30,6 +30,7 @@ use crate::library::{ImportPhase, LibraryController, SelectionSource};
 use crate::panels::{ExplorerPanel, FoldersPanel, InspectorPanel, TagsPanel, WorkspacePanel};
 use trove_core::config::AppConfig;
 use trove_core::library::Library;
+use trove_core::paths;
 use trove_core::services::update;
 use uuid::Uuid;
 
@@ -675,6 +676,42 @@ impl AppView {
         .detach();
     }
 
+    /// File ▸ Export backup archive… : save-dialog, then write the full
+    /// backup — the software configuration plus every library's data — as one
+    /// zip. The archive build runs on the background executor: a media store
+    /// can be gigabytes, and none of it needs the main thread.
+    fn prompt_export_backup(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let suggested = trove_core::services::archive::backup_file_name();
+        let rx = cx.prompt_for_new_path(&paths::data_dir(), Some(suggested.as_str()));
+        let handle = window.window_handle();
+        cx.spawn(async move |_, cx| {
+            if let Ok(Ok(Some(path))) = rx.await {
+                let outcome = cx
+                    .background_executor()
+                    .spawn(async move {
+                        trove_core::services::archive::create_full_backup(&path)
+                    })
+                    .await;
+                let _ = handle.update(cx, |_, window, cx| {
+                    let note = match outcome {
+                        Ok(report) => Notification::success(
+                            rust_i18n::t!(
+                                "app.backup_done",
+                                path = report.path.display().to_string()
+                            )
+                            .to_string(),
+                        ),
+                        Err(e) => Notification::warning(
+                            rust_i18n::t!("app.export_failed", error = e.to_string()).to_string(),
+                        ),
+                    };
+                    window.push_notification(note, cx);
+                });
+            }
+        })
+        .detach();
+    }
+
     /// Bottom status bar: selection count, library path, import state and the
     /// latest notice (errors surface here even outside Settings).
     fn status_bar(&self, cx: &Context<Self>) -> Div {
@@ -1147,6 +1184,9 @@ impl Render for AppView {
             }))
             .on_action(cx.listener(|this, _: &ExportLibrary, window, cx| {
                 this.prompt_export(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ExportBackup, window, cx| {
+                this.prompt_export_backup(window, cx);
             }))
             .on_action(cx.listener(|this, _: &ImportLibrary, window, cx| {
                 this.prompt_import_library(window, cx);

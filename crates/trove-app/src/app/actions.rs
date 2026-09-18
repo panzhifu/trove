@@ -16,6 +16,7 @@ gpui_kit::actions!(
         ScreenshotFull,
         ScreenshotRegion,
         ExportLibrary,
+        ExportBackup,
         ImportLibrary,
         ExportMediaPackage,
         ExportXmp,

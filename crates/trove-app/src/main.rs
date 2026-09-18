@@ -45,6 +45,11 @@ const WORKSPACE_CONTEXT: &str = "Workspace";
 /// so the panel can dismiss the editor.
 const EXPLORER_CONTEXT: &str = "Explorer";
 
+/// Key context of the library-manager window. Its only binding is Escape,
+/// dismissing the sidebar's inline rename editor the same way the explorer
+/// panel's is dismissed.
+const LIBRARY_MANAGER_CONTEXT: &str = "LibraryManager";
+
 /// Key context of the video preview (a video is open in the main area). It
 /// exists only while a video is previewed, so a bare letter bound here — the
 /// fullscreen key — never shadows typing in the search box, which sits in the
@@ -134,6 +139,13 @@ pub(crate) fn register_keys(cx: &mut App) {
         "escape",
         CancelEditor,
         Some(EXPLORER_CONTEXT),
+    ));
+    // Esc dismisses the library manager's inline rename editor, on the same
+    // terms as the explorer panel's.
+    bindings.push(KeyBinding::new(
+        "escape",
+        CancelEditor,
+        Some(LIBRARY_MANAGER_CONTEXT),
     ));
     // Esc leaves the fullscreen video window. Only that window's root
     // carries the VideoFullscreen context.

@@ -7,9 +7,11 @@
 //! File menu's 「素材库」 while a session is running.
 //!
 //! Launcher layout: the libraries stack in a sidebar on the left (click
-//! selects, double click enters); the right side is a centered hero — logo,
-//! name, version — over one card whose divider-separated rows carry the
-//! commands: create, open, rename, delete, and the interface language.
+//! selects, double click enters, and rename turns the row itself into an
+//! editor the way the collections panel does); the right side is a centered
+//! hero — logo, name, version — over one card whose divider-separated rows
+//! carry the commands: create, full-backup export, and the interface
+//! language.
 
 use std::sync::{Arc, OnceLock};
 
@@ -21,7 +23,7 @@ use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::notification::Notification;
 use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::WindowExt as _;
-use gpui_kit::component::{ActiveTheme, Disableable as _, IconName, Root, Sizable as _, TitleBar};
+use gpui_kit::component::{ActiveTheme, IconName, Root, Sizable as _, TitleBar};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
@@ -56,6 +58,11 @@ pub struct LibraryManagerView {
     name: Entity<InputState>,
     /// The library picked in the sidebar, by slug: the open row's subject.
     selected: Option<String>,
+    /// The reused inline rename editor (the collections panel's pattern) and
+    /// the slug whose row it currently replaces. `None` when no rename is
+    /// under way.
+    editor: Entity<InputState>,
+    renaming: Option<String>,
 }
 
 /// Handle of the open library manager, so `open` can focus instead of
@@ -105,12 +112,25 @@ impl LibraryManagerView {
         })
         .detach();
 
+        let editor = cx.new(|cx| InputState::new(window, cx));
+        cx.subscribe_in(&editor, window, |this, _, event, window, cx| {
+            // Enter in the inline editor commits the rename, exactly like the
+            // collections panel's editor.
+            if matches!(event, InputEvent::PressEnter { .. }) {
+                this.submit_rename(window, cx);
+            }
+            cx.notify();
+        })
+        .detach();
+
         let focus_handle = cx.focus_handle();
         focus_handle.focus(window, cx);
         Self {
             focus_handle,
             name,
             selected: None,
+            editor,
+            renaming: None,
         }
     }
 
@@ -194,6 +214,90 @@ impl LibraryManagerView {
         cx.notify();
     }
 
+    /// Right-click → Rename: the row itself becomes a prefilled, focused
+    /// editor — the same act as the collections panel's rename.
+    fn begin_rename(
+        &mut self,
+        entry: LibraryEntry,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.editor.update(cx, |state, cx| {
+            state.set_value(entry.name.clone(), window, cx);
+        });
+        self.renaming = Some(entry.slug);
+        self.editor.update(cx, |state, cx| state.focus(window, cx));
+        cx.notify();
+    }
+
+    /// Enter in the inline editor: commit the rename. An empty field is not a
+    /// rename — the editor just closes on the old name.
+    fn submit_rename(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(slug) = self.renaming.clone() else {
+            return;
+        };
+        let name = self.editor.read(cx).value().trim().to_string();
+        self.renaming = None;
+        self.editor
+            .update(cx, |state, cx| state.set_value("", window, cx));
+        if !name.is_empty() {
+            let mut config = AppConfig::load();
+            if let Err(error) = config.rename_library(&slug, &name) {
+                tracing::error!(%error, "could not rename the library");
+            }
+        }
+        // Other windows may carry the name too (the main window's title, the
+        // tray), so refresh beyond this one.
+        cx.refresh_windows();
+    }
+
+    /// Esc in the inline editor: drop it without committing. Fires only while
+    /// the editor holds focus — the input's own Escape handler propagates the
+    /// key, same as the collections panel.
+    fn cancel_rename(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.renaming.is_none() {
+            return;
+        }
+        self.renaming = None;
+        self.editor
+            .update(cx, |state, cx| state.set_value("", window, cx));
+        cx.notify();
+    }
+
+    /// The full-backup archive: the software configuration and every
+    /// library's data in one zip. The heavy work runs on the background
+    /// executor; the toast reports the outcome either way.
+    fn export_backup(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let suggested = trove_core::services::archive::backup_file_name();
+        let rx = cx.prompt_for_new_path(&paths::data_dir(), Some(suggested.as_str()));
+        let handle = window.window_handle();
+        cx.spawn(async move |_, cx| {
+            if let Ok(Ok(Some(path))) = rx.await {
+                let outcome = cx
+                    .background_executor()
+                    .spawn(async move {
+                        trove_core::services::archive::create_full_backup(&path)
+                    })
+                    .await;
+                let _ = handle.update(cx, |_, window, cx| {
+                    let note = match outcome {
+                        Ok(report) => Notification::success(
+                            rust_i18n::t!(
+                                "app.backup_done",
+                                path = report.path.display().to_string()
+                            )
+                            .to_string(),
+                        ),
+                        Err(e) => Notification::warning(
+                            rust_i18n::t!("app.export_failed", error = e.to_string()).to_string(),
+                        ),
+                    };
+                    window.push_notification(note, cx);
+                });
+            }
+        })
+        .detach();
+    }
 }
 
 impl Render for LibraryManagerView {
@@ -202,8 +306,8 @@ impl Render for LibraryManagerView {
         let libraries = config.libraries.clone();
         let active_slug = config.active_slug().to_string();
         let view = cx.entity();
-        // Toasts (export results) and the rename/delete dialogs are layers
-        // the window's root view has to draw, same as the app root does.
+        // Toasts (backup results) and the delete dialog are layers the
+        // window's root view has to draw, same as the app root does.
         let dialog_layer = gpui_kit::component::Root::render_dialog_layer(window, cx);
         let notification_layer = gpui_kit::component::Root::render_notification_layer(window, cx);
 
@@ -212,6 +316,16 @@ impl Render for LibraryManagerView {
             .bg(cx.theme().background)
             .text_color(cx.theme().foreground)
             .track_focus(&self.focus_handle)
+            // The inline rename editor's Escape. The input's own Escape
+            // handler propagates the key, so this fires only while the
+            // editor input holds focus — same arrangement as the collections
+            // panel.
+            .key_context("LibraryManager")
+            .on_action(cx.listener(
+                |this, _: &crate::app::actions::CancelEditor, window, cx| {
+                    this.cancel_rename(window, cx);
+                },
+            ))
             // Plugin commands are global chords: this window answers them
             // too, even though it never opens the asset grid's context.
             .on_action(|action: &RunPluginCommand, window, cx| {
@@ -232,9 +346,8 @@ impl Render for LibraryManagerView {
 }
 
 impl LibraryManagerView {
-    /// The sidebar: where the libraries live (the path is the header — the
-    /// section carries no name of its own), then the library rows, each with
-    /// its own kebab menu.
+    /// The sidebar: the library rows, each with its own kebab menu; a row
+    /// being renamed is replaced by its inline editor.
     fn sidebar(
         &self,
         libraries: &[LibraryEntry],
@@ -247,6 +360,7 @@ impl LibraryManagerView {
             .min_h_0()
             .overflow_y_scrollbar()
             .px_2()
+            .pt_3()
             .pb_3()
             .gap_0p5();
         if libraries.is_empty() {
@@ -260,6 +374,11 @@ impl LibraryManagerView {
             );
         }
         for entry in libraries {
+            if self.renaming.as_deref() == Some(entry.slug.as_str()) {
+                // The renamed row itself is replaced by the inline editor.
+                list = list.child(inline_editor(&self.editor));
+                continue;
+            }
             let selected = self.selected.as_deref() == Some(entry.slug.as_str());
             list = list.child(library_row(
                 &view,
@@ -277,34 +396,11 @@ impl LibraryManagerView {
             .bg(cx.theme().sidebar)
             .border_r_1()
             .border_color(cx.theme().sidebar_border)
-            .child(
-                div()
-                    .px_4()
-                    .pt_3()
-                    .pb_2()
-                    .child(
-                        div()
-                            .text_xs()
-                            .truncate()
-                            .text_color(cx.theme().muted_foreground)
-                            .child(paths::libraries_dir().display().to_string()),
-                    ),
-            )
             .child(list)
     }
 
     /// The right pane: the hero (logo, name, version) above the action card.
     fn main_pane(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
-        let config = AppConfig::load();
-        let selected = self
-            .selected
-            .as_ref()
-            .and_then(|slug| config.libraries.iter().find(|l| &l.slug == slug))
-            .cloned();
-        let in_use = selected
-            .as_ref()
-            .is_some_and(|entry| entry.slug == config.active_slug());
-
         v_flex()
             .flex_1()
             .h_full()
@@ -340,18 +436,14 @@ impl LibraryManagerView {
                                 .to_string(),
                             ),
                     )
-                    .child(self.action_card(selected, in_use, cx).mt_8()),
+                    .child(self.action_card(cx).mt_8()),
             )
     }
 
     /// The card: one row per command, hairline-separated, with the language
-    /// picker as the footer row.
-    fn action_card(
-        &mut self,
-        selected: Option<LibraryEntry>,
-        in_use: bool,
-        cx: &mut Context<Self>,
-    ) -> Div {
+    /// picker as the footer row. There is no "open" row: entering a library
+    /// is the sidebar's double click.
+    fn action_card(&mut self, cx: &mut Context<Self>) -> Div {
         let border = cx.theme().border;
         let divider = move || div().mx_4().border_t_1().border_color(border);
 
@@ -363,7 +455,7 @@ impl LibraryManagerView {
             .rounded(cx.theme().radius_lg)
             .child(self.create_row(cx))
             .child(divider())
-            .child(self.open_row(selected.as_ref(), in_use, cx))
+            .child(self.backup_row(cx))
             .child(self.language_footer(cx))
     }
 
@@ -417,42 +509,19 @@ impl LibraryManagerView {
         )
     }
 
-    /// Open: the picked library (or the pick-one hint) and the button that
-    /// enters it. The library already in use cannot be opened again.
-    fn open_row(
-        &mut self,
-        selected: Option<&LibraryEntry>,
-        in_use: bool,
-        cx: &mut Context<Self>,
-    ) -> Div {
-        let text = match selected {
-            Some(entry) => {
-                let mut text = format!("{} · {}", entry.name, entry.dir().display());
-                if in_use {
-                    text.push_str(" · ");
-                    text.push_str(rust_i18n::t!("library_manager.in_use").as_ref());
-                }
-                text
-            }
-            None => rust_i18n::t!("library_manager.manage_none").to_string(),
-        };
-        let entry = selected.cloned();
+    /// Backup: one archive carrying the software configuration and every
+    /// library's data, for moving or backing the whole install up.
+    fn backup_row(&mut self, cx: &mut Context<Self>) -> Div {
         self.card_row(
-            text,
-            false,
+            rust_i18n::t!("library_manager.backup").to_string(),
+            true,
             h_flex().flex_shrink_0().child(
-                Button::new("manager-open")
+                Button::new("manager-backup")
                     .outline()
-                    .disabled(entry.is_none() || in_use)
-                    .label(rust_i18n::t!("library_manager.open").to_string())
-                    .on_click({
-                        let entry = entry.clone();
-                        cx.listener(move |this, _, window, cx| {
-                            if let Some(entry) = entry.clone() {
-                                this.enter(entry, window, cx);
-                            }
-                        })
-                    }),
+                    .label(rust_i18n::t!("library_manager.backup_button").to_string())
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.export_backup(window, cx);
+                    })),
             )
             .into_any_element(),
             cx,
@@ -520,8 +589,8 @@ impl LibraryManagerView {
 
 /// One library in the sidebar: its name, where it lives underneath, a
 /// "in use" badge when it is the open one, and a kebab with the row's
-/// commands (rename, delete, export). Click selects it for the card; a
-/// double click enters straight away.
+/// commands (rename, delete). Click selects it for the card; a double click
+/// enters straight away.
 fn library_row(
     view: &Entity<LibraryManagerView>,
     entry: LibraryEntry,
@@ -606,16 +675,21 @@ fn library_row(
                 .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| {
                     cx.stop_propagation();
                 })
-                .child(row_menu(entry.clone(), in_use)),
+                .child(row_menu(view, entry.clone(), in_use)),
         )
         .into_any_element()
 }
 
-/// One row's kebab: the commands that act on this library. Delete follows the
-/// card's two-step confirmation (selecting the row and arming its button), so
-/// an irreversible act never happens from a menu slip.
-fn row_menu(entry: LibraryEntry, in_use: bool) -> impl IntoElement {
+/// One row's kebab: the commands that act on this library. Delete confirms
+/// through a dialog naming what goes, so an irreversible act never happens
+/// from a menu slip.
+fn row_menu(
+    view: &Entity<LibraryManagerView>,
+    entry: LibraryEntry,
+    in_use: bool,
+) -> impl IntoElement {
     let menu_entry = entry.clone();
+    let menu_view = view.clone();
     Button::new(SharedString::from(format!(
         "manager-row-menu-{}",
         entry.slug
@@ -625,76 +699,38 @@ fn row_menu(entry: LibraryEntry, in_use: bool) -> impl IntoElement {
     .icon(IconName::EllipsisVertical)
     .tooltip(rust_i18n::t!("library_manager.library_actions").to_string())
     .dropdown_menu_with_anchor(gpui::Anchor::TopRight, move |menu, _, _| {
-        let entry = menu_entry.clone();
+        let rename_entry = menu_entry.clone();
+        let rename_view = menu_view.clone();
+        let delete_entry = menu_entry.clone();
         menu.min_w(px(140.))
             .item(
-                PopupMenuItem::new(rust_i18n::t!("library_manager.rename").to_string()).on_click({
-                    let entry = entry.clone();
-                    move |_, window, cx| open_rename_dialog(entry.clone(), window, cx)
-                }),
+                PopupMenuItem::new(rust_i18n::t!("library_manager.rename").to_string()).on_click(
+                    move |_, window, cx| {
+                        rename_view.update(cx, |this, cx| {
+                            this.begin_rename(rename_entry.clone(), window, cx)
+                        });
+                    },
+                ),
             )
             .item(
                 PopupMenuItem::new(rust_i18n::t!("library_manager.delete").to_string())
                     .disabled(in_use)
-                    .on_click({
-                        let entry = entry.clone();
-                        move |_, window, cx| open_delete_confirm(entry.clone(), window, cx)
+                    .on_click(move |_, window, cx| {
+                        open_delete_confirm(delete_entry.clone(), window, cx)
                     }),
-            )
-            .item(
-                PopupMenuItem::new(rust_i18n::t!("library_manager.export").to_string()).on_click(
-                    move |_, window, cx| export_library(entry.clone(), window, cx),
-                ),
             )
     })
 }
 
-/// Rename `entry`: a small dialog with the current name staged for editing —
-/// Enter or the button commits, an empty field keeps the dialog up.
-fn open_rename_dialog(entry: LibraryEntry, window: &mut Window, cx: &mut App) {
-    window.open_dialog(cx, move |dialog, window, cx| {
-        let input = cx.new(|cx| InputState::new(window, cx));
-        input.update(cx, |input, cx| input.set_value(entry.name.clone(), window, cx));
-        let commit_input = input.clone();
-        let commit_slug = entry.slug.clone();
-        dialog
-            .title(rust_i18n::t!("library_manager.rename").to_string())
-            .width(px(360.))
-            .close_button(false)
-            .child(
-                v_flex()
-                    .gap_2()
-                    .p_1()
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(cx.theme().muted_foreground)
-                            .child(
-                                rust_i18n::t!("library_manager.rename_dialog_new_name")
-                                    .to_string(),
-                            ),
-                    )
-                    .child(Input::new(&input).small().appearance(true)),
-            )
-            .button_props(
-                DialogButtonProps::default()
-                    .ok_text(rust_i18n::t!("library_manager.rename").to_string())
-                    .show_cancel(true),
-            )
-            .on_ok(move |_, _, cx| {
-                let new_name = commit_input.read(cx).value().trim().to_string();
-                if new_name.is_empty() {
-                    // Nothing to rename to: keep the dialog up.
-                    return false;
-                }
-                let mut config = AppConfig::load();
-                if let Err(error) = config.rename_library(&commit_slug, &new_name) {
-                    tracing::error!(%error, "could not rename the library");
-                }
-                cx.refresh_windows();
-                true
-            })
-    });
+/// The inline editor that replaces a row while it is renamed — the
+/// collections panel's editor row, transplanted.
+fn inline_editor(editor: &Entity<InputState>) -> AnyElement {
+    h_flex()
+        .w_full()
+        .px_1()
+        .py_0p5()
+        .child(Input::new(editor).small().appearance(true))
+        .into_any_element()
 }
 
 /// Delete `entry`: a confirmation dialog that names the library and what goes
@@ -735,39 +771,4 @@ fn open_delete_confirm(entry: LibraryEntry, window: &mut Window, cx: &mut App) {
                 true
             })
     });
-}
-
-/// Export one library's metadata (assets, tags, collections — the same JSON
-/// the main window's File ▸ Export writes) to a file the user picks.
-///
-/// The manager window has no library session, but the export never needed
-/// one: it reads the library's database through a store opened on the spot.
-/// The file dialog decides the destination; the export and the write run
-/// once a path exists, and the toast reports the outcome either way.
-fn export_library(entry: LibraryEntry, window: &mut Window, cx: &mut App) {
-    let suggested = format!("trove-export-{}.json", entry.slug);
-    let rx = cx.prompt_for_new_path(&entry.dir(), Some(suggested.as_str()));
-    let handle = window.window_handle();
-    cx.spawn(async move |cx| {
-        if let Ok(Ok(Some(path))) = rx.await {
-            let _ = handle.update(cx, |_, window, cx| {
-                let outcome = trove_core::store::Store::open(&entry.dir().join("library.db"))
-                    .and_then(|store| {
-                        trove_core::library::export_metadata_from_store(&store)
-                    })
-                    .and_then(|json| std::fs::write(&path, json).map_err(Into::into));
-                let note = match outcome {
-                    Ok(()) => Notification::success(
-                        rust_i18n::t!("app.export_done", path = path.display().to_string())
-                            .to_string(),
-                    ),
-                    Err(e) => Notification::warning(
-                        rust_i18n::t!("app.export_failed", error = e.to_string()).to_string(),
-                    ),
-                };
-                window.push_notification(note, cx);
-            });
-        }
-    })
-    .detach();
 }
