@@ -96,8 +96,8 @@ pub fn libraries_dir() -> PathBuf {
     data_dir().join("libraries")
 }
 
-/// One library's data root: its database, `library.json`, backups, and (for
-/// assets stored before linking was the only mode) its `media/` blobs.
+/// One library's data root: its database, `library.json`, backups, and — when
+/// the library holds copies Trove made for itself — a `media/` blob store.
 pub fn library_dir(slug: &str) -> PathBuf {
     libraries_dir().join(slug)
 }

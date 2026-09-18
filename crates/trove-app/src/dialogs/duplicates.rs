@@ -41,7 +41,7 @@ impl DuplicateDialog {
                     let groups = cx
                         .background_executor()
                         .spawn(async move {
-                            // Store::open also runs the (no-op) migrations.
+                            // Store::open creates or checks the schema.
                             let store =
                                 trove_core::store::Store::open(&root.join("library.db")).ok()?;
                             trove_core::store::assets::duplicate_groups(store.conn()).ok()
