@@ -117,6 +117,32 @@ pub(crate) fn selection_toolbar(
                     }),
             )
             .child(
+                Button::new("sel-edit")
+                    .xsmall()
+                    .ghost()
+                    .icon(IconName::RotateCw)
+                    .tooltip(rust_i18n::t!("edit.menu").to_string())
+                    .on_click({
+                        let controller = controller.clone();
+                        move |_, window, cx| {
+                            crate::dialogs::edit::EditDialog::open(window, cx, controller.clone());
+                        }
+                    }),
+            )
+            .child(
+                Button::new("sel-xmp")
+                    .xsmall()
+                    .ghost()
+                    .icon(IconName::FileText)
+                    .tooltip(rust_i18n::t!("xmp.menu").to_string())
+                    .on_click({
+                        let controller = controller.clone();
+                        move |_, window, cx| {
+                            crate::library::jobs::export_xmp_app(&controller, window, cx);
+                        }
+                    }),
+            )
+            .child(
                 Button::new("sel-fav")
                     .xsmall()
                     .ghost()

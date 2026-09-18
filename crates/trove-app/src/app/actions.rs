@@ -18,6 +18,7 @@ gpui_kit::actions!(
         ExportLibrary,
         ImportLibrary,
         ExportMediaPackage,
+        ExportXmp,
         FindDuplicates,
         OpenSettings,
         // -- Edit menu / grid shortcuts ------------------------------------
@@ -25,6 +26,7 @@ gpui_kit::actions!(
         CopyImage,
         BatchRename,
         BatchConvert,
+        BatchEdit,
         SelectAll,
         ClearSelection,
         TrashSelected,
