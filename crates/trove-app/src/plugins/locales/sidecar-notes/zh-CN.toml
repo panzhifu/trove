@@ -1,0 +1,19 @@
+# sidecar-notes 的自有语言文件——文案随插件代码走，不占用主目录的 locale 名额。
+# 结构与主目录的 locale 文件完全一致（同样的分节、同样的键）：本文件就是
+# `crates/trove-app/locales/zh-CN.toml` 中属于该插件的那一片，原样搬来。
+# 启动时经 `AppPlugin::translations` 注册；取词按当前界面语言，缺词回落英文。
+
+[plugins]
+sidecar_notes_name = "旁注标题"
+sidecar_notes_description = "读取文件旁可选的「<文件名>.trove.json」，用其中的 title 作为素材标题。写入方式与快捷键在本页设置。"
+sidecar_notes_group = "行为"
+sidecar_notes_mode = "标题写入方式"
+sidecar_notes_mode_desc = "「总是覆盖」让旁注标题优先于文件自带标题；「仅在缺少时填写」保留文件自己的标题。改动立即生效。"
+sidecar_notes_mode_override = "总是覆盖"
+sidecar_notes_mode_fill = "仅在缺少时填写"
+sidecar_notes_mode_now = "旁注标题模式：%{mode}"
+sidecar_notes_toggle = "用键盘切换覆盖 / 补缺"
+sidecar_notes_shortcut_hint = "当前为「%{mode}」，改动立即生效；按键可到 设置 ▸ 快捷键 修改。"
+
+[commands]
+sidecar_notes_toggle_mode = "旁注标题：切换覆盖 / 补缺"

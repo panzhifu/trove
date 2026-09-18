@@ -1,0 +1,21 @@
+# sidecar-notes' own translations — the plugin carries its language files
+# beside its code instead of borrowing slots in the app catalogs. The shape
+# mirrors those catalogs exactly (same sections, same keys): this file is the
+# slice of `crates/trove-app/locales/en.toml` this plugin owns, moved here.
+# Registered at startup via `AppPlugin::translations`; lookup reads the live
+# interface language and falls back to English.
+
+[plugins]
+sidecar_notes_name = "Sidecar titles"
+sidecar_notes_description = "Reads an optional “<file>.trove.json” sibling and uses its “title” as the asset's title. Behaviour and shortcut are set on this page."
+sidecar_notes_group = "Behaviour"
+sidecar_notes_mode = "Title handling"
+sidecar_notes_mode_desc = "“Always override” lets the sidecar win over the title the file carries; “Only when the title is missing” keeps the file's own. Changes apply immediately."
+sidecar_notes_mode_override = "Always override"
+sidecar_notes_mode_fill = "Only when the title is missing"
+sidecar_notes_mode_now = "Sidecar titles mode: %{mode}"
+sidecar_notes_toggle = "Toggle override / fill from the keyboard"
+sidecar_notes_shortcut_hint = "Currently “%{mode}”, changes apply immediately. Rebind the key in Settings ▸ Shortcuts."
+
+[commands]
+sidecar_notes_toggle_mode = "Sidecar titles: toggle override / fill"

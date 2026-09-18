@@ -70,11 +70,15 @@ pub(super) fn plugins_page() -> SettingPage {
 }
 
 /// `plugins.<name>.<suffix>` in the active locale; `None` when the plugin
-/// ships no entry for it, so the caller can fall back to the raw name.
+/// ships no entry for it, so the caller can fall back to the raw name. The
+/// plugin's own language files are consulted first (they travel with the
+/// plugin), the app catalog second.
 fn localized(name: &str, suffix: &str) -> Option<String> {
     let key = format!("plugins.{}.{suffix}", name.replace('-', "_"));
-    let text = rust_i18n::t!(key.as_str()).to_string();
-    (text != key).then_some(text)
+    crate::plugins::i18n::translate(&key, &[], &[]).or_else(|| {
+        let text = rust_i18n::t!(key.as_str()).to_string();
+        (text != key).then_some(text)
+    })
 }
 
 /// A read-only text field, used for the empty-registry explainer row.

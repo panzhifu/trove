@@ -31,6 +31,8 @@ use gpui_kit::{div, App, IntoElement as _, ParentElement as _, SharedString, Sty
 use trove_core::config::AppConfig;
 use gpui_kit::Keystroke;
 
+use crate::plugins::i18n::pt;
+
 use trove_core::media::pipeline::{Cost, Stage, StageIo};
 use trove_core::plugins::{Plugin, PluginCommand};
 
@@ -59,11 +61,12 @@ impl Mode {
         }
     }
 
-    /// Localized display name (settings page, toast).
+    /// Localized display name (settings page, toast) — the plugin's own
+    /// catalogs, not the app's.
     fn label(self) -> String {
         match self {
-            Mode::Override => rust_i18n::t!("plugins.sidecar_notes.mode_override").to_string(),
-            Mode::FillMissing => rust_i18n::t!("plugins.sidecar_notes.mode_fill").to_string(),
+            Mode::Override => pt!("plugins.sidecar_notes.mode_override"),
+            Mode::FillMissing => pt!("plugins.sidecar_notes.mode_fill"),
         }
     }
 }
@@ -146,6 +149,16 @@ impl super::AppPlugin for SidecarNotes {
         Self::PLUGIN_NAME
     }
 
+    /// The plugin's own language files, living beside this source file and
+    /// shaped like the app catalogs. They carry every string the settings
+    /// page and the shortcuts page render, in every supported language.
+    fn translations(&self) -> Vec<(&'static str, &'static str)> {
+        vec![
+            ("en", include_str!("locales/sidecar-notes/en.toml")),
+            ("zh-CN", include_str!("locales/sidecar-notes/zh-CN.toml")),
+        ]
+    }
+
     /// The plugin's own settings page: its behaviour, and where its command's
     /// shortcut stands (rebinding happens in Settings ▸ Shortcuts, where the
     /// command sits beside the built-in actions).
@@ -160,17 +173,17 @@ impl super::AppPlugin for SidecarNotes {
 
         let getter_state = self.state.clone();
         let setter_state = self.state.clone();
-        let page = SettingPage::new(
-            rust_i18n::t!("plugins.sidecar_notes_name").to_string(),
-        )
-        .description(rust_i18n::t!("plugins.sidecar_notes_description").to_string())
-        .group(
-            gpui_kit::component::setting::SettingGroup::new()
-                .title(rust_i18n::t!("plugins.sidecar_notes.group").to_string())
-                .item(
-                    gpui_kit::component::setting::SettingItem::new(
-                        rust_i18n::t!("plugins.sidecar_notes.mode").to_string(),
-                        gpui_kit::component::setting::SettingField::dropdown(
+        let page =
+            SettingPage::new(pt!("plugins.sidecar_notes_name")).description(pt!(
+                "plugins.sidecar_notes_description"
+            ))
+            .group(
+                gpui_kit::component::setting::SettingGroup::new()
+                    .title(pt!("plugins.sidecar_notes.group"))
+                    .item(
+                        gpui_kit::component::setting::SettingItem::new(
+                            pt!("plugins.sidecar_notes.mode"),
+                            gpui_kit::component::setting::SettingField::dropdown(
                             vec![
                                 (
                                     SharedString::from(Mode::Override.as_str()),
@@ -192,9 +205,7 @@ impl super::AppPlugin for SidecarNotes {
                             },
                         ),
                     )
-                    .description(
-                        rust_i18n::t!("plugins.sidecar_notes.mode_desc").to_string(),
-                    ),
+                    .description(pt!("plugins.sidecar_notes.mode_desc")),
                 )
                 .item(
                     gpui_kit::component::setting::SettingItem::render(
@@ -219,13 +230,7 @@ impl super::AppPlugin for SidecarNotes {
         // The chord works anywhere, so say what it did: the only surface
         // showing the mode is this plugin's settings page.
         window.push_notification(
-            Notification::info(
-                rust_i18n::t!(
-                    "plugins.sidecar_notes.mode_now",
-                    mode = next.label()
-                )
-                .to_string(),
-            ),
+            Notification::info(pt!("plugins.sidecar_notes.mode_now", mode = next.label())),
             cx,
         );
         cx.refresh_windows();
@@ -280,21 +285,16 @@ fn shortcut_row(cx: &App, key: &str, mode_label: String) -> gpui_kit::Div {
                 .flex_1()
                 .min_w_0()
                 .child(
-                    div()
-                        .text_sm()
-                        .child(rust_i18n::t!("plugins.sidecar_notes.toggle").to_string()),
+                    div().text_sm().child(pt!("plugins.sidecar_notes.toggle")),
                 )
                 .child(
                     div()
                         .text_xs()
                         .text_color(cx.theme().muted_foreground)
-                        .child(
-                            rust_i18n::t!(
-                                "plugins.sidecar_notes.shortcut_hint",
-                                mode = mode_label
-                            )
-                            .to_string(),
-                        ),
+                        .child(pt!(
+                            "plugins.sidecar_notes.shortcut_hint",
+                            mode = mode_label
+                        )),
                 ),
         )
         .child(chord)

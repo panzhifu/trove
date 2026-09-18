@@ -454,9 +454,14 @@ fn action_label(action: &str) -> String {
         "ExitVideoFullscreen" => rust_i18n::t!("shortcuts.actions.ExitVideoFullscreen").to_string(),
         other => {
             // Plugin commands use a per-plugin catalog key:
-            // `commands.<id with "/" and "-" folded to "_">`; a plugin that
-            // ships no entry falls back to the raw id.
+            // `commands.<id with "/" and "-" folded to "_">`. The owning
+            // plugin's own language files win (they travel with the plugin);
+            // the app catalog is the fallback, and a plugin that ships no
+            // entry at all falls back to the raw id.
             let key = format!("commands.{}", other.replace(['/', '-'], "_"));
+            if let Some(text) = crate::plugins::i18n::translate(&key, &[], &[]) {
+                return text;
+            }
             let text = rust_i18n::t!(key.as_str()).to_string();
             if text == key {
                 other.to_string()

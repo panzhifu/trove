@@ -104,8 +104,16 @@ impl AppPlugin for MyPlugin {
 
 - 开关不用插件写：设置 ▸ 插件 遍历注册表，每插件一行 Switch，写
   `AppConfig.disabled_plugins`。
-- 文案按名查找：`plugins.<name下划线化>.name` / `.description`；命令标签
-  `commands.<…>`；不提供就显示原始名。
+- **文案随插件走**：插件在自己的代码旁携带语言文件（`locales/en.toml`、
+  `locales/zh-CN.toml`……结构与其主目录的 locale 文件完全一致——同样的
+  分节、同样的键），用 `include_str!` 嵌入后经
+  `AppPlugin::translations()` 上报；`plugins::init` 启动时注册进插件文案库。
+  取词按当前界面语言进行，缺词回落英文。sidecar-notes 的两个文件在
+  `crates/trove-app/src/plugins/locales/sidecar-notes/`。
+- 插件代码里取词用 `crate::plugins::i18n::pt!`（与 `t!` 同形：同键、
+  支持 `%{var}` 插值），先查插件自己的文案库、再回落主目录。设置页的
+  名称/描述（`plugins.<name下划线化>.name` / `.description`）与快捷键页的
+  命令标签（`commands.<…>`）自动先查插件文案库，键名不变。
 
 ## 3. 边界与守则
 

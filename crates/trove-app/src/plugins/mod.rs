@@ -19,6 +19,7 @@ use gpui_kit::component::setting::SettingPage;
 use gpui_kit::{App, Global, Window};
 
 pub mod builtin;
+pub mod i18n;
 
 /// A plugin's UI-facing hooks, implemented on the same type as
 /// [`trove_core::plugins::Plugin`].
@@ -27,6 +28,16 @@ pub trait AppPlugin: Send + Sync {
     /// repeated here so the UI can match a hook back to its configuration
     /// entry without a downcast.
     fn name(&self) -> &'static str;
+
+    /// The plugin's own language files, as `(language code, TOML text)`
+    /// pairs — the files live beside the plugin's code (embedded with
+    /// `include_str!`) and mirror the app catalogs' shape, so the plugin's
+    /// `zh-CN.toml` reads exactly like the slice of the app catalog it
+    /// replaces. Registered once at startup; lookups follow the live
+    /// interface language and fall back to English. See [`i18n`].
+    fn translations(&self) -> Vec<(&'static str, &'static str)> {
+        Vec::new()
+    }
 
     /// Setting pages appended after the built-in pages. Rebuilt on every
     /// render of the settings window, so re-reading the locale or config is
@@ -60,6 +71,9 @@ pub fn init(cx: &mut App) {
     // One plugin, two registries: the pipeline hook goes to the core (which
     // knows nothing of gpui), the settings hook stays here.
     trove_core::plugins::register(sidecar_notes.clone());
+    // The plugin's own language files join the translation store before any
+    // window can render its copy.
+    i18n::register(sidecar_notes.name(), &sidecar_notes.translations());
     cx.set_global(AppPlugins {
         plugins: vec![sidecar_notes],
     });
