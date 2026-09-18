@@ -86,6 +86,27 @@ fn shortcut_rows() -> Vec<ShortcutRow> {
             }
         })
         .collect();
+    // Plugin commands ride the same list, store and capture flow as the
+    // built-in actions — a plugin that declares a command has declared a
+    // rebindable shortcut, wherever the label comes from.
+    for plugin in trove_core::plugins::all() {
+        for command in plugin.commands() {
+            let customized = config.keybindings.contains_key(command.action);
+            let key = config
+                .keybindings
+                .get(command.action)
+                .cloned()
+                .unwrap_or_else(|| command.key.to_string());
+            rows.push(ShortcutRow {
+                action: command.action,
+                label: action_label(command.action),
+                context: (!command.global).then_some("Workspace"),
+                key,
+                customized,
+                conflict: false,
+            });
+        }
+    }
     rows.sort_by(|a, b| a.action.cmp(b.action));
 
     // A conflict is two live bindings answering to one key inside one
@@ -431,7 +452,18 @@ fn action_label(action: &str) -> String {
             rust_i18n::t!("shortcuts.actions.EnterVideoFullscreen").to_string()
         }
         "ExitVideoFullscreen" => rust_i18n::t!("shortcuts.actions.ExitVideoFullscreen").to_string(),
-        other => other.to_string(),
+        other => {
+            // Plugin commands use a per-plugin catalog key:
+            // `commands.<id with "/" and "-" folded to "_">`; a plugin that
+            // ships no entry falls back to the raw id.
+            let key = format!("commands.{}", other.replace(['/', '-'], "_"));
+            let text = rust_i18n::t!(key.as_str()).to_string();
+            if text == key {
+                other.to_string()
+            } else {
+                text
+            }
+        }
     }
 }
 

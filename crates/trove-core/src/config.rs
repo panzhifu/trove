@@ -12,6 +12,7 @@
 //!
 //! Where those files live is [`crate::paths`]' business, not this module's.
 
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -107,6 +108,16 @@ pub struct AppConfig {
     /// next release after it is announced as usual.
     #[serde(default)]
     pub skipped_version: Option<String>,
+    /// Plugin names switched off by the user (see [`crate::plugins`]). Read
+    /// once per process — the import pipeline snapshots its stages on first
+    /// import — so a toggle takes effect on the next launch.
+    #[serde(default)]
+    pub disabled_plugins: Vec<String>,
+    /// Per-plugin settings (`plugin name → key → value`). Plugins own their
+    /// keys and their meanings; Trove only persists the map. A missing entry
+    /// means "this plugin's default".
+    #[serde(default)]
+    pub plugin_settings: HashMap<String, HashMap<String, serde_json::Value>>,
 }
 
 /// One library in the registry. Its directory is [`paths::library_dir`] of

@@ -27,6 +27,7 @@ mod about;
 mod appearance;
 mod files;
 mod model;
+mod plugins;
 mod search;
 mod shortcuts;
 
@@ -358,6 +359,10 @@ impl Render for SettingsView {
             });
         }
         let view = cx.entity();
+        // The built-in pages, then the plugins page, then whatever pages the
+        // app plugins contribute — appended at the end, so the hand-written
+        // `SettingsPage` index above (which deep-links only to built-in
+        // pages) is unaffected by plugin pages.
         let settings = settings
             .page(about::about_page(&self.controller))
             .page(appearance::appearance_page(&self.controller, cx))
@@ -368,7 +373,11 @@ impl Render for SettingsView {
             ))
             .page(model::model_page())
             .page(search::search_page(&self.controller, stats.sig_coverage))
-            .page(shortcuts::shortcuts_page(self, &view));
+            .page(shortcuts::shortcuts_page(self, &view))
+            .page(plugins::plugins_page());
+        let settings = crate::plugins::settings_pages(cx)
+            .into_iter()
+            .fold(settings, |settings, page| settings.page(page));
 
         // Client-side decorations are forced app-wide, so this window draws
         // its own (title + gpui-kit's min/max/close controls).

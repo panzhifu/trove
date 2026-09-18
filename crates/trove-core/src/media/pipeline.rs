@@ -401,18 +401,40 @@ fn default_producer(need: Need) -> Option<Arc<dyn Stage>> {
 }
 
 /// The pipeline every import runs, built once.
+///
+/// The built-in six run first; stages contributed by registered plugins
+/// ([`crate::plugins`]) are appended after them — so a plugin that enriches
+/// what the miner found reads finished metadata — and the enabled set is
+/// snapshotted from the configuration at this first build. A plugin whose
+/// stages the pipeline rejects (a duplicated slot, say) is logged and left
+/// out rather than taking the built-in pipeline down with it.
 pub fn default_pipeline() -> &'static Pipeline {
     static PIPELINE: OnceLock<Pipeline> = OnceLock::new();
     PIPELINE.get_or_init(|| {
-        Pipeline::build(vec![
-            Arc::new(HashStage),
-            Arc::new(ProbeStage),
-            Arc::new(DecodeStage),
-            Arc::new(ThumbStage),
-            Arc::new(MineStage),
-            Arc::new(VisualSigStage),
-        ])
-        .expect("the built-in pipeline is well-formed")
+        let builtin = || -> Vec<Arc<dyn Stage>> {
+            vec![
+                Arc::new(HashStage),
+                Arc::new(ProbeStage),
+                Arc::new(DecodeStage),
+                Arc::new(ThumbStage),
+                Arc::new(MineStage),
+                Arc::new(VisualSigStage),
+            ]
+        };
+        let mut stages = builtin();
+        stages.extend(crate::plugins::pipeline_stages(
+            &crate::config::AppConfig::load().disabled_plugins,
+        ));
+        match Pipeline::build(stages) {
+            Ok(pipeline) => pipeline,
+            Err(error) => {
+                tracing::error!(
+                    %error,
+                    "plugin stages rejected by the pipeline; the built-in stages run alone"
+                );
+                Pipeline::build(builtin()).expect("the built-in pipeline is well-formed")
+            }
+        }
     })
 }
 

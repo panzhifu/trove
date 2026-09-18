@@ -54,3 +54,16 @@ gpui_kit::actions!(
         CancelScreenshotRegion,
     ]
 );
+
+/// Run a plugin command by id (`"plugin-id/command-id"`), dispatched from a
+/// keybinding the user bound in Settings ▸ Shortcuts.
+///
+/// One static action carries every plugin's commands — gpui actions are
+/// static types, so a plugin's commands cannot each be their own type. The
+/// payload routes to the plugin that declared the command; the handler on
+/// each window's root forwards to `plugins::run_command`.
+#[derive(Clone, PartialEq, gpui_kit::Action)]
+#[action(no_json, namespace = trove)]
+pub struct RunPluginCommand {
+    pub command: std::sync::Arc<str>,
+}

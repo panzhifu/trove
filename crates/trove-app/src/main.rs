@@ -30,6 +30,7 @@ mod fonts;
 mod library;
 mod logging;
 mod panels;
+mod plugins;
 
 use app::AppView;
 use app::actions::*;
@@ -162,6 +163,27 @@ pub(crate) fn register_keys(cx: &mut App) {
         Some(REGION_SELECT_CONTEXT),
     ));
 
+    // Plugin commands: declared by registered plugins, bound with each
+    // command's default key or the user's override (an empty effective key
+    // means "not on the keyboard yet" — the command still dispatches from
+    // wherever a menu shows it). Rebinding goes through Settings ▸ Shortcuts,
+    // where these rows sit beside the built-in ones.
+    for plugin in trove_core::plugins::all() {
+        for command in plugin.commands() {
+            let key = key_for(command.action, command.key);
+            if key.is_empty() {
+                continue;
+            }
+            bindings.push(KeyBinding::new(
+                &key,
+                RunPluginCommand {
+                    command: command.action.into(),
+                },
+                (!command.global).then_some(WORKSPACE_CONTEXT),
+            ));
+        }
+    }
+
     // `f` puts the video preview into the fullscreen stage. Its context is
     // the preview's, not `Workspace`, so the letter is only live while a
     // video is on screen — the search box shares the `Workspace` context and
@@ -234,6 +256,10 @@ fn main() {
             // Menus are owned by the title bar module — it renders them, so it
             // also defines and registers them.
             crate::app::title_bar::apply_menus(cx);
+
+            // Plugins last but before any window: the pipeline registry must
+            // be complete before the first import builds it.
+            crate::plugins::init(cx);
 
             register_keys(cx);
 
