@@ -16,18 +16,21 @@
 //!   and drop them silently, and a root that only came into existence after
 //!   the watcher was attached would otherwise never be seen.
 //!
-//! Scan semantics: the inbox is signalled whenever files are waiting; watch
-//! roots are baselined on first sight (attaching a watch never retro-imports
-//! what is already there) and only *new* files are signalled. A file is only
-//! offered once it has stopped changing — see [`SETTLE`]. The embedder marks
-//! acceptance — a refused import (another import still running) must retry on
-//! a later sweep, so the job keeps re-signalling files it has not been told to
-//! forget. In practice the embedder accepts everything and the
-//! one-import-at-a-time rule in [`super::TaskManager`] makes the next sweep a
-//! no-op retry.
+//! Scan semantics: watch roots are baselined on first sight (attaching a watch
+//! never retro-imports what is already there) and only *new* files are
+//! signalled. A file is only offered once it has stopped changing — see
+//! [`SETTLE`].
+//!
+//! The job keeps offering a file until the embedder says it has it: a refusal
+//! (another import still running) has to retry, so a refused batch is simply
+//! not acknowledged. `accepted` is the other half of that contract — the paths
+//! the embedder imported. Without it the job re-offered every uncovered file on
+//! every sweep, and since "offering" means "hash this file again" the embedder
+//! paid for the same import over and over for the life of the process.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
@@ -74,16 +77,25 @@ pub enum WatchSignal {
 /// `library_dir` is the open library's data directory: its `library.json`
 /// holds the watched-root list, which belongs to that library rather than to
 /// the application.
+///
+/// `accepted` carries the paths the embedder has taken responsibility for. It
+/// is half of the retry contract: what is never acknowledged comes back on the
+/// next sweep, and what is acknowledged stops being offered.
 pub fn run(
     interval: Duration,
     library_dir: std::path::PathBuf,
     inbox_dir: std::path::PathBuf,
     signals: Sender<WatchSignal>,
+    accepted: std::sync::mpsc::Receiver<Vec<PathBuf>>,
     ctx: &JobContext,
 ) -> Result<(), String> {
     let mut seen: HashSet<PathBuf> = HashSet::new();
     let mut baselined: HashSet<PathBuf> = HashSet::new();
     let mut events: Option<Events> = None;
+    // The inbox has its own watcher, and it only ever has to answer "did
+    // something land?": the embedder enumerates the directory itself, because
+    // it needs the sidecars to record a source URL.
+    let mut inbox_activity: Option<Activity> = None;
     // Paths already offered, with the tick they were offered on. A path is
     // re-offered at most once per full sweep, so the fast path does not
     // multiply the embedder's retries (and the re-hashing behind them) by the
@@ -101,6 +113,16 @@ pub fn run(
         }
         let now = Instant::now();
 
+        // Acknowledgements first: they make the rest of the tick cheaper.
+        // `seen` holds both halves of "do not offer this again" — the files a
+        // root had when it was first watched, and the files the embedder has
+        // since imported. Without the second half the sweep re-offered every
+        // file that appeared after the baseline, and offering a file means
+        // hashing it again, for the life of the process.
+        while let Ok(paths) = accepted.try_recv() {
+            seen.extend(paths);
+        }
+
         // Settings are re-read on the sweep cadence, not on every tick: a tick
         // is [`TICK`] long and each load is two file reads plus a parse, so
         // re-reading them per tick would put that cost on the idle path where
@@ -114,13 +136,24 @@ pub fn run(
             roots = library.watched_folders.clone();
         }
 
-        // The inbox is cheap to list and is what the browser extension feeds, so
-        // it keeps the tick cadence.
-        if config.collect_enabled()
-            && !crate::services::collect::inbox_items_in(&inbox_dir).is_empty()
-            && signals.send(WatchSignal::Inbox).is_err()
-        {
-            return Ok(()); // embedder hung up; stop watching
+        if config.collect_enabled() {
+            if inbox_activity.is_none() && settings_due {
+                inbox_activity = Activity::watch(&inbox_dir);
+            }
+            // The kernel says when something lands, and the collect service
+            // renames its files into place, so that report is reliable. The
+            // periodic scan stays as the fallback — it is also what notices a
+            // file that was already waiting when the watcher started.
+            let touched = inbox_activity.as_ref().is_some_and(|watch| watch.take());
+            if (touched || settings_due)
+                && !crate::services::collect::inbox_items_in(&inbox_dir).is_empty()
+                && signals.send(WatchSignal::Inbox).is_err()
+            {
+                return Ok(()); // embedder hung up; stop watching
+            }
+        } else {
+            // Release the watch while collection is switched off.
+            inbox_activity = None;
         }
 
         if library.watch_folders_enabled() {
@@ -134,14 +167,16 @@ pub fn run(
             let mut fresh = Vec::new();
             if let Some(watch) = events.as_mut() {
                 watch.sync(&roots);
-                fresh = watch.drain(&roots, &mut recent, interval, SETTLE);
+                fresh = watch.drain(&roots, &seen, &mut recent, interval, SETTLE);
             }
             if now >= next_sweep {
                 // The sweep exists to catch what the kernel cannot report. When
                 // every root is actually watched there is little left for it to
                 // find, so it backs off — walking the whole tree every five
                 // seconds to prove nothing changed was most of what the old
-                // watcher did, and it is not free on a large library.
+                // watcher did, and it is not free on a large library. What the
+                // kernel does report is unaffected: those files were already
+                // offered above.
                 let covered = events.as_ref().is_some_and(|watch| watch.covers(&roots));
                 next_sweep = now
                     + if covered {
@@ -250,9 +285,14 @@ impl Events {
     /// Paths the kernel reported that are new, real and settled. A candidate
     /// that is still changing goes back into [`Self::held`] for the next tick;
     /// one that vanished (a temporary file an app deleted) is dropped.
+    ///
+    /// `seen` is the same filter the sweep applies — baselined files and files
+    /// the embedder has already acknowledged — so the two sources agree on what
+    /// still needs offering.
     fn drain(
         &mut self,
         roots: &[PathBuf],
+        seen: &HashSet<PathBuf>,
         recent: &mut HashMap<PathBuf, Instant>,
         cooldown: Duration,
         settle: Duration,
@@ -270,7 +310,7 @@ impl Events {
             let Some(root) = roots.iter().find(|root| path.starts_with(root)) else {
                 continue; // an unwatched root: its events are stale
             };
-            if hidden_under(root, &path) {
+            if hidden_under(root, &path) || !still_wanted(&path, seen) {
                 continue;
             }
             if !settled(&path, now, settle) {
@@ -292,13 +332,58 @@ impl Events {
     }
 }
 
+/// A watcher that only reports *that* something happened under one directory.
+///
+/// The inbox needs no paths: the embedder lists the directory itself, because
+/// the sidecar next to a captured file is what carries its source URL. So this
+/// keeps one flag rather than a path buffer, and the per-tick cost is an atomic
+/// swap instead of a directory scan — which matters, because the inbox is where
+/// collected files *stay* (the library links them), so it only ever grows.
+struct Activity {
+    _watcher: notify::RecommendedWatcher,
+    touched: Arc<AtomicBool>,
+}
+
+impl Activity {
+    /// Watch `dir`, or `None` when the platform cannot (no backend) or the
+    /// directory is not there yet — the periodic scan then does the work, and
+    /// the caller retries on its next pass.
+    fn watch(dir: &Path) -> Option<Self> {
+        // Starts set, so the first pass scans once and picks up whatever was
+        // already waiting before the watcher existed.
+        let touched = Arc::new(AtomicBool::new(true));
+        let sink = Arc::clone(&touched);
+        let mut watcher =
+            notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
+                if event.is_ok() {
+                    sink.store(true, Ordering::Relaxed);
+                }
+            })
+            .ok()?;
+        // Non-recursive: captures land directly in the inbox.
+        if watcher.watch(dir, RecursiveMode::NonRecursive).is_err() {
+            return None;
+        }
+        Some(Self {
+            _watcher: watcher,
+            touched,
+        })
+    }
+
+    /// Whether anything happened since the last call.
+    fn take(&self) -> bool {
+        self.touched.swap(false, Ordering::Relaxed)
+    }
+}
+
 /// One full pass over the watch roots: baseline new roots, then report
 /// everything under them that is not in `seen` and has stopped changing.
 ///
 /// The caller must not add the result to `seen`: a file the embedder could not
-/// import yet has to come back on a later sweep — that re-offer is the retry.
-/// Files too young to import are skipped rather than held; not being in `seen`,
-/// they come back on their own.
+/// import yet has to come back on a later sweep — that re-offer is the retry,
+/// and it is the acknowledgement channel that ends it. Files too young to
+/// import are skipped rather than held; not being in `seen`, they come back on
+/// their own.
 fn sweep(
     roots: &[PathBuf],
     seen: &mut HashSet<PathBuf>,
@@ -321,8 +406,14 @@ fn sweep(
     let now = SystemTime::now();
     files
         .into_iter()
-        .filter(|file| !seen.contains(file) && settled(file, now, settle))
+        .filter(|file| still_wanted(file, seen) && settled(file, now, settle))
         .collect()
+}
+
+/// Whether a candidate still deserves offering: not baselined away when its
+/// root was first watched, and not already in the embedder's hands.
+fn still_wanted(path: &Path, seen: &HashSet<PathBuf>) -> bool {
+    !seen.contains(path)
 }
 
 /// Whether `path` sits under a hidden component of `root` — the rule the import
@@ -445,22 +536,19 @@ mod tests {
     /// platform hands us no watcher this test has nothing to say — the sweep
     /// covers that case — so it passes without asserting.
     #[test]
-    fn kernel_events_reach_the_buffer() {
+    fn kernel_events_reach_the_buffer_until_they_are_acknowledged() {
         let root = temp_dir("events");
         let Some(mut events) = Events::start(std::slice::from_ref(&root)) else {
             return;
         };
         std::fs::write(root.join("new.png"), b"x").unwrap();
 
+        let roots = std::slice::from_ref(&root);
+        let mut seen = HashSet::new();
         let mut recent = HashMap::new();
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
-            let fresh = events.drain(
-                std::slice::from_ref(&root),
-                &mut recent,
-                Duration::ZERO,
-                Duration::ZERO,
-            );
+            let fresh = events.drain(roots, &seen, &mut recent, Duration::ZERO, Duration::ZERO);
             if fresh.iter().any(|p| p.ends_with("new.png")) {
                 break;
             }
@@ -471,11 +559,23 @@ mod tests {
             std::thread::sleep(Duration::from_millis(50));
         }
 
-        // Reports of the same path do not repeat within the cooldown.
+        // An acknowledgement is what takes a path out of the offering set —
+        // without it the embedder would re-import (and re-hash) the same file
+        // on every sweep for as long as the process lives.
+        seen.insert(root.join("new.png"));
+        assert!(
+            events
+                .drain(roots, &seen, &mut recent, Duration::ZERO, Duration::ZERO)
+                .is_empty()
+        );
+
+        // An unacknowledged path is held back by the cooldown instead, so the
+        // tick rate does not multiply the retries.
         assert!(
             events
                 .drain(
-                    std::slice::from_ref(&root),
+                    roots,
+                    &HashSet::new(),
                     &mut recent,
                     Duration::from_secs(60),
                     Duration::ZERO

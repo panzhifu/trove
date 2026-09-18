@@ -46,12 +46,18 @@ pub fn start_watch_service(
     let manager = controller.read(cx).library.tasks().clone();
     let library_dir = controller.read(cx).library.root().to_path_buf();
     let (tx, rx) = std::sync::mpsc::channel();
+    // The other half of the watcher's retry contract: whatever the pump accepts
+    // is reported back, so the job stops offering it. Without this the sweep
+    // re-offered every file that arrived after the baseline, and offering one
+    // costs a hash — for as long as the process lived.
+    let (accepted_tx, accepted_rx) = std::sync::mpsc::channel();
     let started = manager.start(TaskKind::WatchScan, "watch", move |ctx| {
         watch::run(
             watch::WATCH_INTERVAL,
             library_dir,
             trove_core::services::collect::inbox_dir(),
             tx,
+            accepted_rx,
             ctx,
         )
     });
@@ -65,7 +71,7 @@ pub fn start_watch_service(
         });
         ctl.watch_handle = Some(handle);
     });
-    watch_signals(controller.clone(), rx, handle, cx);
+    watch_signals(controller.clone(), rx, accepted_tx, handle, cx);
     true
 }
 
@@ -76,6 +82,7 @@ pub fn start_watch_service(
 fn watch_signals(
     controller: Entity<LibraryController>,
     rx: std::sync::mpsc::Receiver<WatchSignal>,
+    accepted: std::sync::mpsc::Sender<Vec<PathBuf>>,
     handle: gpui::AnyWindowHandle,
     cx: &mut App,
 ) {
@@ -101,7 +108,7 @@ fn watch_signals(
             }
 
             if !pending.is_empty() {
-                let accepted = handle
+                let accepted_flag = handle
                     .update(cx, |_view, window, cx| {
                         if controller.read(cx).is_importing() {
                             return false;
@@ -110,8 +117,10 @@ fn watch_signals(
                     })
                     .unwrap_or(false);
                 // Mark seen only after the batch was accepted; a refusal
-                // retries on the next pump tick.
-                if accepted {
+                // retries on the next pump tick. The watcher is told the same
+                // thing, so it stops offering files it has already handed over.
+                if accepted_flag {
+                    let _ = accepted.send(pending.clone());
                     pending.clear();
                 }
             }
