@@ -50,13 +50,28 @@ pub fn is_raw_ext(ext: &str) -> bool {
     )
 }
 
+/// Whether this extension is a video container Trove can show: a poster frame
+/// from `ffmpeg`, playback through its pipe, and facts from the mp4 reader or
+/// `ffprobe`.
+///
+/// One list, because two of them drifted: the app's "open with" gate carried
+/// `flv` and `ts` while this classifier did not, so those files imported as
+/// `Other` — no poster frame, no duration — even though the same `ffmpeg` that
+/// plays them could have made one.
+pub fn is_video_ext(ext: &str) -> bool {
+    matches!(
+        ext,
+        "mp4" | "mov" | "mkv" | "webm" | "avi" | "m4v" | "mpg" | "mpeg" | "wmv" | "flv" | "ts"
+    )
+}
+
 /// Classify a file from its normalized extension.
 pub fn probe(ext: &str) -> Probe {
     let kind = match ext {
         "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "ico" | "tiff" | "tif" | "avif"
         | "jxl" | "heic" | "heif" | "svg" | "psd" => AssetKind::Image,
         ext if is_raw_ext(ext) => AssetKind::Image,
-        "mp4" | "mov" | "mkv" | "webm" | "avi" | "m4v" | "mpg" | "mpeg" | "wmv" => AssetKind::Video,
+        ext if is_video_ext(ext) => AssetKind::Video,
         "mp3" | "wav" | "flac" | "m4a" | "aac" | "ogg" | "opus" | "wma" => AssetKind::Audio,
         "pdf" | "doc" | "docx" | "xls" | "xlsx" | "ppt" | "pptx" | "txt" | "md" | "rtf" | "odt"
         | "ods" | "odp" | "csv" => AssetKind::Document,
@@ -95,6 +110,10 @@ pub fn probe(ext: &str) -> Probe {
         "webm" => "video/webm",
         "avi" => "video/x-msvideo",
         "m4v" => "video/x-m4v",
+        "wmv" => "video/x-ms-wmv",
+        "mpg" | "mpeg" => "video/mpeg",
+        "flv" => "video/x-flv",
+        "ts" => "video/mp2t",
         "mp3" => "audio/mpeg",
         "wav" => "audio/wav",
         "flac" => "audio/flac",
@@ -298,6 +317,10 @@ pub(crate) fn heif_to_image(path: &std::path::Path) -> Option<image::DynamicImag
             .ok()?
             .as_nanos()
     ));
+    // A decode worth of work in a subprocess, so it takes a slot: a batch of
+    // HEICs on a wide staging pool would otherwise start one `heif-dec` per
+    // thread (see [`super::proc`]).
+    let _slot = super::proc::slot();
     let output = std::process::Command::new("heif-dec")
         .arg(path)
         .arg(&tmp)
@@ -358,5 +381,26 @@ mod tests {
         let path = dir.join("bad.mp4");
         std::fs::write(&path, b"not an mp4").unwrap();
         assert!(video_facts(&path).is_none());
+    }
+
+    /// One video list, and every member has a kind and a media type — the
+    /// `flv`/`ts` pair used to sit in the app's "open with" gate only, so those
+    /// files imported as `Other` with an octet-stream mime.
+    #[test]
+    fn the_video_list_is_what_the_library_classifies() {
+        for ext in [
+            "mp4", "mov", "mkv", "webm", "avi", "m4v", "mpg", "mpeg", "wmv", "flv", "ts",
+        ] {
+            assert!(is_video_ext(ext), "{ext} is missing from the video list");
+            assert_eq!(probe(ext).kind, AssetKind::Video, "{ext}");
+            assert_ne!(
+                probe(ext).mime,
+                "application/octet-stream",
+                "{ext} has no media type"
+            );
+        }
+        for ext in ["png", "jpg", "mp3", "pdf", "zip", "ttf", "obj", "mystery"] {
+            assert!(!is_video_ext(ext), "{ext} is not a video");
+        }
     }
 }

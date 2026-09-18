@@ -114,6 +114,9 @@ pub fn probe(path: &Path) -> Option<VideoStreamFacts> {
 
 /// Probe via the system `ffprobe`.
 fn probe_with_ffprobe(path: &Path) -> Option<VideoStreamFacts> {
+    // The import pipeline reaches this from the staging pool, so it takes a
+    // subprocess slot — see [`super::proc`].
+    let _slot = super::proc::slot();
     let output = Command::new("ffprobe")
         .args([
             "-v",
