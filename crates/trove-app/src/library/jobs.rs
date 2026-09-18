@@ -173,22 +173,24 @@ pub fn import_paths_app_into(
                 return false;
             }
         }
-        // Expand before the count so progress totals cover the folder
-        // contents, not just the dropped entries. The walk shares the
-        // watcher's rules (dotfiles skipped, depth capped) and stays on the
-        // main thread like the watcher's own scan.
-        let expanded = import::expand_dirs(paths.clone());
-        if expanded.is_empty() {
-            return false;
-        }
-        let total = expanded.len();
+        // Count without walking. Progress totals must cover the folder
+        // contents, not just the dropped entries, but the walk that counts them
+        // belongs to the job (`tasks::import`): on a big folder it takes
+        // seconds, and this thread used to pay for it — once here to learn the
+        // total, and then again inside the job, for the same list. Zero means
+        // "not known yet", which the UI renders as scanning.
+        let total = if paths.iter().any(|p| p.is_dir()) {
+            0
+        } else {
+            paths.len()
+        };
         let options = ImportOptions {
             data_root: ctl.library.root().to_path_buf(),
             cache_root: ctl.library.cache().to_path_buf(),
             // A user import links: the file stays where the user keeps it.
             storage: trove_core::media::import::ImportStorage::Link,
             source: ImportSource::Paths {
-                paths: expanded,
+                paths,
                 into_collection,
             },
         };
@@ -295,9 +297,16 @@ fn start_import_job(
     };
 
     controller.update(cx, |ctl, _| ctl.begin_import(total));
+    // `total == 0` is the job's "still counting the folder" state: the scan
+    // runs on the backend thread and the real total arrives as a progress
+    // event, so the first toast must not claim "0 files".
+    let started = if total == 0 {
+        rust_i18n::t!("notice.import_scanning").to_string()
+    } else {
+        rust_i18n::t!("notice.import_started", count = total).to_string()
+    };
     window.push_notification(
-        Notification::info(rust_i18n::t!("notice.import_started", count = total).to_string())
-            .id1::<ImportNotice>("import-progress"),
+        Notification::info(started).id1::<ImportNotice>("import-progress"),
         cx,
     );
 
@@ -356,12 +365,16 @@ fn watch_import(
                     cx.notify();
                 });
                 let _ = handle.update(cx, |_view, window, cx| {
+                    // No total yet: the job is still walking the folders it was
+                    // handed, so the bar has nothing to be a fraction of.
+                    let text = if *total == 0 {
+                        rust_i18n::t!("notice.import_scanning").to_string()
+                    } else {
+                        rust_i18n::t!("notice.import_running", done = done, total = total)
+                            .to_string()
+                    };
                     window.push_notification(
-                        Notification::info(
-                            rust_i18n::t!("notice.import_running", done = done, total = total)
-                                .to_string(),
-                        )
-                        .id1::<ImportNotice>("import-progress"),
+                        Notification::info(text).id1::<ImportNotice>("import-progress"),
                         cx,
                     );
                 });
