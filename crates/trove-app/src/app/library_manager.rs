@@ -6,33 +6,56 @@
 //! every per-library preference lives — and reachable at any time from the
 //! File menu's 「素材库」 while a session is running.
 //!
-//! Two panes, in the order the decision reads: the library names on the
-//! left, and creating plus managing on the right. A click selects; a double
-//! click (or the Open button) enters.
+//! Launcher layout: the libraries stack in a sidebar on the left (click
+//! selects, double click enters); the right side is a centered hero — logo,
+//! name, version — over one card whose divider-separated rows carry the
+//! commands: create, open, rename, delete, and the interface language.
+
+use std::sync::{Arc, OnceLock};
 
 use gpui_kit::base::{h_flex, v_flex};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
+use gpui_kit::component::dialog::DialogButtonProps;
+use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
+use gpui_kit::component::notification::Notification;
 use gpui_kit::component::scroll::ScrollableElement as _;
-use gpui_kit::component::{ActiveTheme, Disableable as _, IconName, Root, TitleBar};
+use gpui_kit::component::WindowExt as _;
+use gpui_kit::component::{ActiveTheme, Disableable as _, IconName, Root, Sizable as _, TitleBar};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use super::AppView;
+use crate::app::actions::RunPluginCommand;
 use trove_core::config::{AppConfig, LibraryEntry};
+use trove_core::paths;
+
+/// The app logo, decoded once per process. gpui's `RenderImage` wants BGRA
+/// bytes, so the PNG's channels are swapped the same way the screenshot
+/// picker swaps its frames.
+fn app_logo() -> &'static Arc<RenderImage> {
+    static LOGO: OnceLock<Arc<RenderImage>> = OnceLock::new();
+    LOGO.get_or_init(|| {
+        let rgba = image::load_from_memory(include_bytes!("../../../../design/icon/trove-256.png"))
+            .expect("embedded app icon is a valid PNG")
+            .into_rgba8();
+        let mut buffer = rgba.as_raw().clone();
+        for pixel in buffer.as_chunks_mut::<4>().0 {
+            pixel.swap(0, 2);
+        }
+        let bgra = image::RgbaImage::from_raw(rgba.width(), rgba.height(), buffer)
+            .expect("the buffer came from an image of the same size");
+        Arc::new(RenderImage::new(vec![image::Frame::new(bgra)]))
+    })
+}
 
 /// The asset manager's root view.
 pub struct LibraryManagerView {
     focus_handle: FocusHandle,
     /// The name being typed for the new library.
     name: Entity<InputState>,
-    /// The library picked in the left pane, by slug.
+    /// The library picked in the sidebar, by slug: the open row's subject.
     selected: Option<String>,
-    /// The new name being typed for the selected library.
-    rename: Entity<InputState>,
-    /// The delete button's two-step confirmation: the first click arms it,
-    /// the second one deletes.
-    confirm_delete: bool,
 }
 
 /// Handle of the open library manager, so `open` can focus instead of
@@ -73,7 +96,6 @@ impl LibraryManagerView {
             InputState::new(window, cx)
                 .placeholder(rust_i18n::t!("library_manager.name_placeholder").to_string())
         });
-        let rename = cx.new(|cx| InputState::new(window, cx));
         cx.subscribe_in(&name, window, |this, _, event, window, cx| {
             // Enter in the name field is the same act as the button.
             if matches!(event, InputEvent::PressEnter { .. }) {
@@ -89,8 +111,6 @@ impl LibraryManagerView {
             focus_handle,
             name,
             selected: None,
-            rename,
-            confirm_delete: false,
         }
     }
 
@@ -165,95 +185,81 @@ impl LibraryManagerView {
         }
     }
 
-    /// Pick a library in the left pane: it becomes the manage pane's
-    /// subject, and its name is staged for renaming.
-    fn select(&mut self, slug: String, name: String, window: &mut Window, cx: &mut Context<Self>) {
+    /// Pick a library in the sidebar: it becomes the open row's subject.
+    fn select(&mut self, slug: String, cx: &mut Context<Self>) {
         if self.selected.as_deref() == Some(slug.as_str()) {
             return;
         }
         self.selected = Some(slug);
-        self.confirm_delete = false;
-        self.rename
-            .update(cx, |input, cx| input.set_value(name, window, cx));
         cx.notify();
     }
 
-    /// Rename the selected library to whatever the rename field holds. An
-    /// empty field is a no-op — there is nothing to rename it to.
-    fn rename_selected(&mut self, cx: &mut Context<Self>) {
-        let Some(slug) = self.selected.clone() else {
-            return;
-        };
-        let new_name = self.rename.read(cx).value().trim().to_string();
-        if new_name.is_empty() {
-            return;
-        }
-        let mut config = AppConfig::load();
-        if let Err(error) = config.rename_library(&slug, &new_name) {
-            tracing::error!(%error, "could not rename the library");
-        }
-        cx.notify();
-    }
-
-    /// Delete the selected library — the second click of a two-step
-    /// confirmation. The registry entry goes, and with it the library's
-    /// database and cache; the media files themselves were never inside.
-    fn delete_selected(&mut self, cx: &mut Context<Self>) {
-        if !self.confirm_delete {
-            // First click: arm it. The button turns to "confirm" and the
-            // next selection change disarms.
-            self.confirm_delete = true;
-            cx.notify();
-            return;
-        }
-        let Some(slug) = self.selected.clone() else {
-            return;
-        };
-        let config = AppConfig::load();
-        let Some(entry) = config.libraries.iter().find(|l| l.slug == slug) else {
-            return;
-        };
-        let entry = entry.clone();
-        let mut config = AppConfig::load();
-        let _ = config.forget_library(&slug);
-        let _ = std::fs::remove_dir_all(entry.dir());
-        let _ = std::fs::remove_dir_all(entry.cache_dir());
-        self.selected = None;
-        self.confirm_delete = false;
-        cx.notify();
-    }
 }
 
 impl Render for LibraryManagerView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let config = AppConfig::load();
         let libraries = config.libraries.clone();
         let active_slug = config.active_slug().to_string();
         let view = cx.entity();
+        // Toasts (export results) and the rename/delete dialogs are layers
+        // the window's root view has to draw, same as the app root does.
+        let dialog_layer = gpui_kit::component::Root::render_dialog_layer(window, cx);
+        let notification_layer = gpui_kit::component::Root::render_notification_layer(window, cx);
 
-        let mut list = v_flex()
-            .w(px(320.))
-            .h_full()
-            .flex_shrink_0()
-            .border_r_1()
-            .border_color(cx.theme().border)
-            .p_4()
-            .gap_2()
+        v_flex()
+            .size_full()
+            .bg(cx.theme().background)
+            .text_color(cx.theme().foreground)
+            .track_focus(&self.focus_handle)
+            // Plugin commands are global chords: this window answers them
+            // too, even though it never opens the asset grid's context.
+            .on_action(|action: &RunPluginCommand, window, cx| {
+                crate::plugins::run_command(&action.command, window, cx);
+            })
+            .child(TitleBar::new())
             .child(
-                div()
-                    .text_xs()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(rust_i18n::t!("library_manager.libraries").to_string()),
-            );
+                h_flex()
+                    .flex_1()
+                    .min_h_0()
+                    .items_stretch()
+                    .child(self.sidebar(&libraries, &active_slug, view, cx))
+                    .child(self.main_pane(cx)),
+            )
+            .children(dialog_layer)
+            .children(notification_layer)
+    }
+}
+
+impl LibraryManagerView {
+    /// The sidebar: where the libraries live (the path is the header — the
+    /// section carries no name of its own), then the library rows, each with
+    /// its own kebab menu.
+    fn sidebar(
+        &self,
+        libraries: &[LibraryEntry],
+        active_slug: &str,
+        view: Entity<Self>,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let mut list = v_flex()
+            .flex_1()
+            .min_h_0()
+            .overflow_y_scrollbar()
+            .px_2()
+            .pb_3()
+            .gap_0p5();
         if libraries.is_empty() {
             list = list.child(
                 div()
+                    .px_2()
+                    .py_1()
                     .text_sm()
                     .text_color(cx.theme().muted_foreground)
                     .child(rust_i18n::t!("library_manager.no_libraries").to_string()),
             );
         }
-        for entry in &libraries {
+        for entry in libraries {
             let selected = self.selected.as_deref() == Some(entry.slug.as_str());
             list = list.child(library_row(
                 &view,
@@ -265,217 +271,257 @@ impl Render for LibraryManagerView {
         }
 
         v_flex()
-            .size_full()
-            .bg(cx.theme().background)
-            .text_color(cx.theme().foreground)
-            .track_focus(&self.focus_handle)
-            .child(
-                TitleBar::new().child(
-                    div()
-                        .text_sm()
-                        .font_weight(FontWeight::BOLD)
-                        .child(rust_i18n::t!("library_manager.title").to_string()),
-                ),
-            )
-            .child(
-                h_flex()
-                    .flex_1()
-                    .w_full()
-                    .min_h_0()
-                    .items_stretch()
-                    .child(list)
-                    .child(
-                        v_flex()
-                            .flex_1()
-                            .h_full()
-                            .min_w_0()
-                            .overflow_y_scrollbar()
-                            .gap_5()
-                            .px_8()
-                            .py_8()
-                            .child(self.create_section(cx))
-                            .child(div().w_full().border_t_1().border_color(cx.theme().border))
-                            .child(self.manage_section(cx)),
-                    ),
-            )
-    }
-}
-
-impl LibraryManagerView {
-    /// The create pane: what a library is, the name field, and the button.
-    fn create_section(&mut self, cx: &mut Context<Self>) -> Div {
-        v_flex()
-            .gap_3()
-            .child(
-                h_flex().gap_2().items_center().child(IconName::Plus).child(
-                    div()
-                        .text_base()
-                        .font_weight(FontWeight::MEDIUM)
-                        .child(rust_i18n::t!("library_manager.create").to_string()),
-                ),
-            )
+            .w(px(264.))
+            .h_full()
+            .flex_shrink_0()
+            .bg(cx.theme().sidebar)
+            .border_r_1()
+            .border_color(cx.theme().sidebar_border)
             .child(
                 div()
-                    .text_sm()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(rust_i18n::t!("library_manager.create_desc").to_string()),
-            )
-            .child(
-                v_flex()
-                    .gap_1()
-                    .w_full()
+                    .px_4()
+                    .pt_3()
+                    .pb_2()
                     .child(
                         div()
                             .text_xs()
+                            .truncate()
                             .text_color(cx.theme().muted_foreground)
-                            .child(rust_i18n::t!("library_manager.name").to_string()),
-                    )
-                    .child(Input::new(&self.name)),
+                            .child(paths::libraries_dir().display().to_string()),
+                    ),
             )
+            .child(list)
+    }
+
+    /// The right pane: the hero (logo, name, version) above the action card.
+    fn main_pane(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let config = AppConfig::load();
+        let selected = self
+            .selected
+            .as_ref()
+            .and_then(|slug| config.libraries.iter().find(|l| &l.slug == slug))
+            .cloned();
+        let in_use = selected
+            .as_ref()
+            .is_some_and(|entry| entry.slug == config.active_slug());
+
+        v_flex()
+            .flex_1()
+            .h_full()
+            .min_w_0()
+            .overflow_y_scrollbar()
+            .items_center()
+            .px_8()
+            .pt_12()
+            .pb_8()
             .child(
-                h_flex().w_full().justify_end().child(
+                v_flex()
+                    .w_full()
+                    .max_w(px(560.))
+                    .items_center()
+                    .child(img(ImageSource::Render(app_logo().clone())).size_24())
+                    .child(
+                        div()
+                            .text_2xl()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .mt_4()
+                            .child("Trove"),
+                    )
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(cx.theme().muted_foreground)
+                            .mt_1()
+                            .child(
+                                rust_i18n::t!(
+                                    "app.version",
+                                    version = env!("CARGO_PKG_VERSION")
+                                )
+                                .to_string(),
+                            ),
+                    )
+                    .child(self.action_card(selected, in_use, cx).mt_8()),
+            )
+    }
+
+    /// The card: one row per command, hairline-separated, with the language
+    /// picker as the footer row.
+    fn action_card(
+        &mut self,
+        selected: Option<LibraryEntry>,
+        in_use: bool,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let border = cx.theme().border;
+        let divider = move || div().mx_4().border_t_1().border_color(border);
+
+        v_flex()
+            .w_full()
+            .bg(cx.theme().group_box)
+            .border_1()
+            .border_color(cx.theme().border)
+            .rounded(cx.theme().radius_lg)
+            .child(self.create_row(cx))
+            .child(divider())
+            .child(self.open_row(selected.as_ref(), in_use, cx))
+            .child(self.language_footer(cx))
+    }
+
+    /// One card row: one line of text on the left — the command name for the
+    /// create row, the current subject or hint for the others — and the
+    /// controls on the right.
+    fn card_row(
+        &self,
+        text: String,
+        as_title: bool,
+        control: AnyElement,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let mut text_el = div().text_sm().flex_1().min_w_0();
+        text_el = if as_title {
+            text_el.font_weight(FontWeight::MEDIUM)
+        } else {
+            text_el.text_color(cx.theme().muted_foreground)
+        };
+        h_flex()
+            .w_full()
+            .items_center()
+            .gap_4()
+            .px_4()
+            .py_4()
+            .child(text_el.child(text))
+            .child(control)
+    }
+
+    /// Create: the name field (optional — an empty name is auto-numbered)
+    /// and the primary commit.
+    fn create_row(&mut self, cx: &mut Context<Self>) -> Div {
+        self.card_row(
+            rust_i18n::t!("library_manager.new_library").to_string(),
+            true,
+            h_flex()
+                .items_center()
+                .flex_shrink_0()
+                .gap_2()
+                .child(Input::new(&self.name).w_40())
+                .child(
                     Button::new("manager-create")
                         .primary()
                         .label(rust_i18n::t!("library_manager.create_button").to_string())
                         .on_click(cx.listener(|this, _, window, cx| {
                             this.create(window, cx);
                         })),
-                ),
-            )
+                )
+                .into_any_element(),
+            cx,
+        )
     }
 
-    /// The manage pane: the picked library, rename, open, delete.
-    fn manage_section(&mut self, cx: &mut Context<Self>) -> Div {
-        let heading = h_flex()
-            .gap_2()
-            .items_center()
-            .child(IconName::Settings)
-            .child(
-                div()
-                    .text_base()
-                    .font_weight(FontWeight::MEDIUM)
-                    .child(rust_i18n::t!("library_manager.manage").to_string()),
-            );
-
-        let config = AppConfig::load();
-        let active_slug = config.active_slug().to_string();
-        let Some(entry) = self
-            .selected
-            .as_ref()
-            .and_then(|slug| config.libraries.iter().find(|l| &l.slug == slug))
-            .cloned()
-        else {
-            return v_flex().gap_3().child(heading).child(
-                div()
-                    .text_sm()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(rust_i18n::t!("library_manager.manage_none").to_string()),
-            );
+    /// Open: the picked library (or the pick-one hint) and the button that
+    /// enters it. The library already in use cannot be opened again.
+    fn open_row(
+        &mut self,
+        selected: Option<&LibraryEntry>,
+        in_use: bool,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let text = match selected {
+            Some(entry) => {
+                let mut text = format!("{} · {}", entry.name, entry.dir().display());
+                if in_use {
+                    text.push_str(" · ");
+                    text.push_str(rust_i18n::t!("library_manager.in_use").as_ref());
+                }
+                text
+            }
+            None => rust_i18n::t!("library_manager.manage_none").to_string(),
         };
-        let in_use = entry.slug == active_slug;
-
-        let mut heading = heading;
-        if in_use {
-            heading = heading.child(
-                div()
-                    .rounded_full()
-                    .px_2()
-                    .py_0p5()
-                    .text_xs()
-                    .bg(cx.theme().info.opacity(0.15))
-                    .text_color(cx.theme().info)
-                    .child(rust_i18n::t!("library_manager.in_use").to_string()),
-            );
-        }
-
-        v_flex()
-            .gap_3()
-            .child(heading)
-            .child(
-                div()
-                    .text_lg()
-                    .font_weight(FontWeight::MEDIUM)
-                    .child(entry.name.clone()),
-            )
-            // Rename: the field arrives pre-filled with the current name, so
-            // the edit is a change-and-confirm, not a retyping exercise.
-            .child(
-                v_flex()
-                    .gap_1()
-                    .w_full()
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(cx.theme().muted_foreground)
-                            .child(rust_i18n::t!("library_manager.rename_to").to_string()),
-                    )
-                    .child(
-                        h_flex()
-                            .w_full()
-                            .gap_2()
-                            .child(div().flex_1().min_w_0().child(Input::new(&self.rename))),
-                    ),
-            )
-            .child(
-                h_flex().w_full().justify_end().child(
-                    Button::new("manager-rename")
-                        .outline()
-                        .label(rust_i18n::t!("library_manager.rename").to_string())
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.rename_selected(cx);
-                        })),
-                ),
-            )
-            .child(
-                h_flex()
-                    .w_full()
-                    .items_center()
-                    .justify_end()
-                    .gap_2()
-                    .child(
-                        Button::new("manager-open")
-                            .primary()
-                            .disabled(in_use)
-                            .label(rust_i18n::t!("library_manager.open").to_string())
-                            .on_click({
-                                let entry = entry.clone();
-                                cx.listener(move |this, _, window, cx| {
-                                    this.enter(entry.clone(), window, cx);
-                                })
-                            }),
-                    )
-                    .child({
-                        let armed = self.confirm_delete;
-                        let mut button = Button::new("manager-delete");
-                        if armed {
-                            button = button
-                                .danger()
-                                .label(rust_i18n::t!("library_manager.delete_confirm").to_string());
-                        } else {
-                            button = button
-                                .danger()
-                                .outline()
-                                .label(rust_i18n::t!("library_manager.delete").to_string());
-                        }
-                        button
-                            .disabled(in_use)
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.delete_selected(cx);
-                            }))
+        let entry = selected.cloned();
+        self.card_row(
+            text,
+            false,
+            h_flex().flex_shrink_0().child(
+                Button::new("manager-open")
+                    .outline()
+                    .disabled(entry.is_none() || in_use)
+                    .label(rust_i18n::t!("library_manager.open").to_string())
+                    .on_click({
+                        let entry = entry.clone();
+                        cx.listener(move |this, _, window, cx| {
+                            if let Some(entry) = entry.clone() {
+                                this.enter(entry, window, cx);
+                            }
+                        })
                     }),
             )
+            .into_any_element(),
+            cx,
+        )
+    }
+
+    /// The card's footer: the interface language, switchable live — the same
+    /// picker the settings dialog carries, because a first launch has no
+    /// library yet and therefore no way into those settings.
+    fn language_footer(&mut self, cx: &mut Context<Self>) -> Div {
+        let language = AppConfig::load().language;
+        let current = match language.as_deref() {
+            Some(code) => crate::app::i18n::SUPPORTED
+                .iter()
+                .find(|(c, _)| *c == code)
+                .map(|(_, name)| SharedString::from(*name))
+                .unwrap_or_else(|| SharedString::from(code)),
+            None => rust_i18n::t!("settings.follow_system").to_owned().into(),
+        };
+
+        h_flex()
+            .w_full()
+            .items_center()
+            .justify_center()
+            .px_4()
+            .py_3()
+            .border_t_1()
+            .border_color(cx.theme().border)
             .child(
-                div()
-                    .text_xs()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(rust_i18n::t!("library_manager.delete_hint").to_string()),
+                Button::new("manager-language")
+                    .outline()
+                    .dropdown_caret(true)
+                    .w_64()
+                    .label(current.to_string())
+                    .dropdown_menu_with_anchor(gpui::Anchor::TopRight, move |menu, _, _| {
+                        let mut picker = menu.min_w(px(180.)).item(
+                            PopupMenuItem::new(
+                                rust_i18n::t!("settings.follow_system").to_string(),
+                            )
+                            .checked(language.is_none())
+                            .on_click(|_, _, cx| {
+                                let _ = crate::app::i18n::set_language(None);
+                                cx.refresh_windows();
+                                crate::app::title_bar::apply_menus(cx);
+                            }),
+                        );
+                        for (code, name) in crate::app::i18n::SUPPORTED {
+                            let code = code.to_string();
+                            picker = picker.item(
+                                PopupMenuItem::new(*name)
+                                    .checked(language.as_deref() == Some(code.as_str()))
+                                    .on_click(move |_, _, cx| {
+                                        let _ =
+                                            crate::app::i18n::set_language(Some(code.clone()));
+                                        cx.refresh_windows();
+                                        crate::app::title_bar::apply_menus(cx);
+                                    }),
+                            );
+                        }
+                        picker
+                    }),
             )
     }
 }
 
-/// One library in the left pane: its name, where it lives underneath, a
-/// "in use" badge when it is the open one. Click selects it for the manage
-/// pane; a double click enters straight away.
+/// One library in the sidebar: its name, where it lives underneath, a
+/// "in use" badge when it is the open one, and a kebab with the row's
+/// commands (rename, delete, export). Click selects it for the card; a
+/// double click enters straight away.
 fn library_row(
     view: &Entity<LibraryManagerView>,
     entry: LibraryEntry,
@@ -490,12 +536,13 @@ fn library_row(
         .items_center()
         .justify_between()
         .gap_2()
-        .p_2()
+        .px_2()
+        .py_1()
         .rounded_md()
         .cursor_pointer()
-        .when(selected, |row| row.bg(cx.theme().selection))
+        .when(selected, |row| row.bg(cx.theme().sidebar_accent))
         .when(!selected, |row| {
-            row.hover(|hovered| hovered.bg(cx.theme().muted))
+            row.hover(|hovered| hovered.bg(cx.theme().sidebar_accent.opacity(0.5)))
         })
         .on_click({
             let view = view.clone();
@@ -511,7 +558,7 @@ fn library_row(
                     if double_click {
                         this.enter(entry.clone(), window, cx);
                     } else {
-                        this.select(entry.slug.clone(), entry.name.clone(), window, cx);
+                        this.select(entry.slug.clone(), cx);
                     }
                 });
             }
@@ -519,12 +566,19 @@ fn library_row(
         .child(
             v_flex()
                 .min_w_0()
+                .flex_1()
                 .child(
                     h_flex()
                         .min_w_0()
                         .items_baseline()
                         .gap_2()
-                        .child(div().text_sm().truncate().child(entry.name.clone()))
+                        .child(
+                            div()
+                                .text_sm()
+                                .text_color(cx.theme().sidebar_foreground)
+                                .truncate()
+                                .child(entry.name.clone()),
+                        )
                         .when(in_use, |line| {
                             line.child(
                                 div()
@@ -543,5 +597,177 @@ fn library_row(
                         .child(dir),
                 ),
         )
+        .child(
+            // The kebab owns its clicks: without stopping the propagation the
+            // row would also take them — selecting at best, entering on a
+            // double click at worst.
+            div()
+                .flex_shrink_0()
+                .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| {
+                    cx.stop_propagation();
+                })
+                .child(row_menu(entry.clone(), in_use)),
+        )
         .into_any_element()
+}
+
+/// One row's kebab: the commands that act on this library. Delete follows the
+/// card's two-step confirmation (selecting the row and arming its button), so
+/// an irreversible act never happens from a menu slip.
+fn row_menu(entry: LibraryEntry, in_use: bool) -> impl IntoElement {
+    let menu_entry = entry.clone();
+    Button::new(SharedString::from(format!(
+        "manager-row-menu-{}",
+        entry.slug
+    )))
+    .ghost()
+    .xsmall()
+    .icon(IconName::EllipsisVertical)
+    .tooltip(rust_i18n::t!("library_manager.library_actions").to_string())
+    .dropdown_menu_with_anchor(gpui::Anchor::TopRight, move |menu, _, _| {
+        let entry = menu_entry.clone();
+        menu.min_w(px(140.))
+            .item(
+                PopupMenuItem::new(rust_i18n::t!("library_manager.rename").to_string()).on_click({
+                    let entry = entry.clone();
+                    move |_, window, cx| open_rename_dialog(entry.clone(), window, cx)
+                }),
+            )
+            .item(
+                PopupMenuItem::new(rust_i18n::t!("library_manager.delete").to_string())
+                    .disabled(in_use)
+                    .on_click({
+                        let entry = entry.clone();
+                        move |_, window, cx| open_delete_confirm(entry.clone(), window, cx)
+                    }),
+            )
+            .item(
+                PopupMenuItem::new(rust_i18n::t!("library_manager.export").to_string()).on_click(
+                    move |_, window, cx| export_library(entry.clone(), window, cx),
+                ),
+            )
+    })
+}
+
+/// Rename `entry`: a small dialog with the current name staged for editing —
+/// Enter or the button commits, an empty field keeps the dialog up.
+fn open_rename_dialog(entry: LibraryEntry, window: &mut Window, cx: &mut App) {
+    window.open_dialog(cx, move |dialog, window, cx| {
+        let input = cx.new(|cx| InputState::new(window, cx));
+        input.update(cx, |input, cx| input.set_value(entry.name.clone(), window, cx));
+        let commit_input = input.clone();
+        let commit_slug = entry.slug.clone();
+        dialog
+            .title(rust_i18n::t!("library_manager.rename").to_string())
+            .width(px(360.))
+            .close_button(false)
+            .child(
+                v_flex()
+                    .gap_2()
+                    .p_1()
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(
+                                rust_i18n::t!("library_manager.rename_dialog_new_name")
+                                    .to_string(),
+                            ),
+                    )
+                    .child(Input::new(&input).small().appearance(true)),
+            )
+            .button_props(
+                DialogButtonProps::default()
+                    .ok_text(rust_i18n::t!("library_manager.rename").to_string())
+                    .show_cancel(true),
+            )
+            .on_ok(move |_, _, cx| {
+                let new_name = commit_input.read(cx).value().trim().to_string();
+                if new_name.is_empty() {
+                    // Nothing to rename to: keep the dialog up.
+                    return false;
+                }
+                let mut config = AppConfig::load();
+                if let Err(error) = config.rename_library(&commit_slug, &new_name) {
+                    tracing::error!(%error, "could not rename the library");
+                }
+                cx.refresh_windows();
+                true
+            })
+    });
+}
+
+/// Delete `entry`: a confirmation dialog that names the library and what goes
+/// with it, with the destructive red as the commit button. The library's
+/// database and cache go; the media files were never inside.
+fn open_delete_confirm(entry: LibraryEntry, window: &mut Window, cx: &mut App) {
+    window.open_dialog(cx, move |dialog, _, _| {
+        let commit_entry = entry.clone();
+        dialog
+            .title(
+                rust_i18n::t!(
+                    "library_manager.delete_dialog_title",
+                    name = entry.name.clone()
+                )
+                .to_string(),
+            )
+            .width(px(360.))
+            .close_button(false)
+            .child(
+                div()
+                    .text_sm()
+                    .p_1()
+                    .child(rust_i18n::t!("library_manager.delete_hint").to_string()),
+            )
+            .button_props(
+                DialogButtonProps::default()
+                    .ok_text(rust_i18n::t!("library_manager.delete_confirm").to_string())
+                    .ok_variant(gpui_kit::component::button::ButtonVariant::Danger)
+                    .cancel_text(rust_i18n::t!("library_manager.cancel").to_string())
+                    .show_cancel(true),
+            )
+            .on_ok(move |_, _, cx| {
+                let mut config = AppConfig::load();
+                let _ = config.forget_library(&commit_entry.slug);
+                let _ = std::fs::remove_dir_all(commit_entry.dir());
+                let _ = std::fs::remove_dir_all(commit_entry.cache_dir());
+                cx.refresh_windows();
+                true
+            })
+    });
+}
+
+/// Export one library's metadata (assets, tags, collections — the same JSON
+/// the main window's File ▸ Export writes) to a file the user picks.
+///
+/// The manager window has no library session, but the export never needed
+/// one: it reads the library's database through a store opened on the spot.
+/// The file dialog decides the destination; the export and the write run
+/// once a path exists, and the toast reports the outcome either way.
+fn export_library(entry: LibraryEntry, window: &mut Window, cx: &mut App) {
+    let suggested = format!("trove-export-{}.json", entry.slug);
+    let rx = cx.prompt_for_new_path(&entry.dir(), Some(suggested.as_str()));
+    let handle = window.window_handle();
+    cx.spawn(async move |cx| {
+        if let Ok(Ok(Some(path))) = rx.await {
+            let _ = handle.update(cx, |_, window, cx| {
+                let outcome = trove_core::store::Store::open(&entry.dir().join("library.db"))
+                    .and_then(|store| {
+                        trove_core::library::export_metadata_from_store(&store)
+                    })
+                    .and_then(|json| std::fs::write(&path, json).map_err(Into::into));
+                let note = match outcome {
+                    Ok(()) => Notification::success(
+                        rust_i18n::t!("app.export_done", path = path.display().to_string())
+                            .to_string(),
+                    ),
+                    Err(e) => Notification::warning(
+                        rust_i18n::t!("app.export_failed", error = e.to_string()).to_string(),
+                    ),
+                };
+                window.push_notification(note, cx);
+            });
+        }
+    })
+    .detach();
 }
