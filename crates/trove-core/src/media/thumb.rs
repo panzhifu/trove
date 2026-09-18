@@ -401,6 +401,9 @@ fn write_video_thumb(blob_path: &Path, out: &Path) -> Option<PathBuf> {
     // Must keep a known extension (ffmpeg picks the muxer from it): the
     // temp file is `<stem>.tmp.jpg`, renamed onto `<stem>.jpg` on success.
     let tmp = out.with_extension(format!("tmp-{}.jpg", crate::model::new_id().simple()));
+    // Import-time subprocess: one slot per running decoder, so a batch of
+    // videos on a wide staging pool does not start one ffmpeg per thread.
+    let _slot = super::proc::slot();
     let output = std::process::Command::new("ffmpeg")
         .args(["-y", "-loglevel", "error", "-ss", "1", "-i"])
         .arg(blob_path)

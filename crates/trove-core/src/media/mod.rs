@@ -13,6 +13,7 @@ pub mod index;
 pub mod metadata;
 pub mod pipeline;
 pub mod probe;
+pub mod proc;
 pub mod render3d;
 pub mod search;
 pub mod thumb;

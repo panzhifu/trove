@@ -64,9 +64,11 @@ fn mine_impl(
         ),
         AssetKind::Audio => mine_audio(path).unwrap_or_default(),
         AssetKind::Font => mine_font(path).unwrap_or_default(),
-        // Video duration rides the mp4 container when it is one (mkv/webm/avi
-        // fall back to defaults); documents keep only the probe facts.
-        AssetKind::Video => mine_video(path).unwrap_or_default(),
+        // Videos, documents and archives carry only what the probe stage found.
+        // A video's duration is already on the shared stage state — the mp4
+        // moov box, or `ffprobe` for containers the mp4 reader cannot open — and
+        // the mine stage copies it across, so reading the container again here
+        // would only parse it twice.
         _ => MinedMetadata::default(),
     }
 }
@@ -129,18 +131,6 @@ fn face_name(face: &ttf_parser::Face, name_id: u16) -> Option<String> {
                 .filter(|n| n.name_id == name_id)
                 .find_map(|n| n.to_string())
         })
-}
-
-// -- video --------------------------------------------------------------------
-
-/// Container duration of an MP4-family file (dimensions are probed separately
-/// in `probe::video_facts` because they belong on the asset row).
-fn mine_video(path: &Path) -> Option<MinedMetadata> {
-    let facts = super::probe::video_facts(path)?;
-    Some(MinedMetadata {
-        duration_ms: facts.duration_ms,
-        ..Default::default()
-    })
 }
 
 // -- image -------------------------------------------------------------------

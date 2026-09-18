@@ -35,9 +35,10 @@ pub fn discover_apps(path: &Path) -> Vec<OpenWithApp> {
         "psd" | "psb" | "ai" | "sketch" | "fig" | "xd" => design_apps(&ext),
 
         // --- Video -------------------------------------------------------
-        "mp4" | "mov" | "mkv" | "avi" | "webm" | "flv" | "wmv" | "m4v" | "mpg" | "mpeg" | "ts" => {
-            video_apps()
-        }
+        // Not a literal list: the classifier in `media::probe` decides what *is*
+        // a video for the library, and this gate has to agree with it — the two
+        // lists had already drifted once (`flv`/`ts` here, absent there).
+        other if trove_core::media::probe::is_video_ext(other) => video_apps(),
 
         // --- Audio -------------------------------------------------------
         "mp3" | "wav" | "flac" | "aac" | "ogg" | "m4a" | "wma" | "aiff" | "opus" => audio_apps(),

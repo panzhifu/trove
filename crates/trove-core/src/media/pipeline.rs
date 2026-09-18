@@ -43,7 +43,7 @@ use crate::error::{Error, Result};
 use crate::model::AssetKind;
 
 use super::import::ImportStorage;
-use super::{blob, color, metadata, probe, search, thumb};
+use super::{blob, color, metadata, probe, search, thumb, video};
 
 /// What running a stage costs, so a scheduler can tell a metadata read from an
 /// ffmpeg spawn. Recorded on every stage; the import pool reads it (a `Proc`
@@ -491,13 +491,18 @@ impl Stage for ProbeStage {
                 }
             }
             // MP4-family containers carry track dimensions + duration in the
-            // moov box (pure-Rust read); other containers stay empty until
-            // ffprobe is asked (see `media::video::probe`).
+            // moov box: a pure-Rust read, no subprocess. Every other container
+            // (mkv, webm, avi, flv, mpeg-ts) needs `ffprobe`, which is why that
+            // path takes a process slot.
             AssetKind::Video => {
                 if let Some(f) = probe::video_facts(&io.blob_path()) {
                     io.width = Some(f.width);
                     io.height = Some(f.height);
                     io.duration_ms = f.duration_ms;
+                } else if let Some(f) = video::probe(&io.blob_path()) {
+                    io.width = Some(f.width);
+                    io.height = Some(f.height);
+                    io.duration_ms = (f.duration_ms > 0).then_some(f.duration_ms);
                 }
             }
             _ => {}
