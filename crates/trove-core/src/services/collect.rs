@@ -20,10 +20,25 @@
 //! `POST /add` (octet-stream) preflight would never pass. The listener is
 //! 127.0.0.1-only and the worst case is a file landing in the inbox, so the
 //! wildcard origin is acceptable here.
+//!
+//! Three things the server is careful about, because the inbox is watched and
+//! the library *links* what lands there:
+//!
+//! - Requests run on a fixed worker pool with a bounded queue, and each socket
+//!   has an idle timeout, so a client that opens connections and stalls cannot
+//!   grow the process without limit.
+//! - A body is streamed to disk as it arrives ([`Landing`]), never collected
+//!   into a `Vec` — a 512 MB upload costs a 512 MB file and no more.
+//! - The file appears in the inbox only via `rename`, so the drain can never
+//!   import a half-written file. A truncated import would record a sha256 that
+//!   its own bytes no longer match, and the library links rather than copies,
+//!   so that asset would stay wrong forever.
 
-use std::io::{Read, Write};
+use std::io::{BufWriter, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::Duration;
 
 use crate::config::AppConfig;
 
@@ -32,6 +47,30 @@ pub const DEFAULT_PORT: u16 = 23916;
 
 /// Largest accepted upload/download (512 MB).
 const MAX_BODY: u64 = 512 * 1024 * 1024;
+
+/// Largest JSON request body ([`/fetch`] carries only a URL and a name).
+const MAX_JSON_BODY: u64 = 64 * 1024;
+
+/// Size of the chunk bodies are streamed in.
+const PUMP_CHUNK: usize = 64 * 1024;
+
+/// Concurrent request handlers. The service is local and low-traffic, and a
+/// download occupies its worker for its whole duration.
+const WORKERS: usize = 4;
+
+/// Connections accepted but not yet picked up by a worker. When the queue is
+/// full the accept loop blocks, which is the backpressure: the kernel's accept
+/// backlog absorbs the rest.
+const QUEUE_DEPTH: usize = WORKERS * 2;
+
+/// How long a socket may sit idle mid-request. The timeout is per read, so a
+/// slow upload is fine — this only stops a half-open connection from pinning a
+/// worker forever.
+const IO_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Suffix of a file still being written. The inbox drain skips these, and the
+/// visible name only appears once the bytes are all there.
+const PART_SUFFIX: &str = ".part";
 
 /// Where collected files land.
 ///
@@ -46,7 +85,8 @@ pub fn inbox_dir() -> PathBuf {
 
 /// Files waiting in the inbox, each with its optional `*.meta.json` sidecar
 /// path (present only when the sidecar file exists). Sidecars themselves are
-/// never listed as imports.
+/// never listed as imports, and neither are files still being written —
+/// [`Landing`] renames them into place only once they are complete.
 pub fn inbox_items() -> Vec<(PathBuf, Option<PathBuf>)> {
     inbox_items_in(&inbox_dir())
 }
@@ -63,7 +103,7 @@ pub fn inbox_items_in(inbox: &std::path::Path) -> Vec<(PathBuf, Option<PathBuf>)
             || path
                 .file_name()
                 .and_then(|n| n.to_str())
-                .map(|n| n.ends_with(".meta.json"))
+                .map(|n| n.ends_with(".meta.json") || n.ends_with(PART_SUFFIX))
                 .unwrap_or(true)
         {
             continue;
@@ -86,61 +126,146 @@ pub fn spawn_server(port: u16) -> Option<u16> {
     let listener = TcpListener::bind(("127.0.0.1", port)).ok()?;
     let port = listener.local_addr().ok()?.port();
     let inbox = inbox_dir();
+    let queue = Arc::new(Queue::new(QUEUE_DEPTH));
+    for i in 0..WORKERS {
+        let queue = Arc::clone(&queue);
+        let inbox = inbox.clone();
+        let _ = std::thread::Builder::new()
+            .name(format!("trove-collect-{i}"))
+            .spawn(move || {
+                loop {
+                    let stream = queue.pop();
+                    let _ = handle(stream, &inbox);
+                }
+            });
+    }
     std::thread::Builder::new()
         .name("trove-collect".into())
         .spawn(move || {
             for stream in listener.incoming().flatten() {
-                // One thread per request keeps a slow download from blocking
-                // the accept loop; requests are strictly local.
-                let inbox = inbox.clone();
-                std::thread::spawn(move || {
-                    let _ = handle(stream, &inbox);
-                });
+                // A stalled client must not hold a worker for its whole
+                // lifetime without ever sending a request.
+                let _ = stream.set_read_timeout(Some(IO_TIMEOUT));
+                let _ = stream.set_write_timeout(Some(IO_TIMEOUT));
+                queue.push(stream);
             }
         })
         .ok()?;
     Some(port)
 }
 
-struct Request {
+/// Hand-off from the accept loop to the workers, with a bounded depth.
+///
+/// A dozen lines instead of a dependency, and bounded is the whole point: a
+/// queue that grows without limit is the same unbounded growth the old
+/// thread-per-connection did, only quieter. Blocks on push while full (the
+/// accept loop stops accepting) and on pop while empty.
+struct Queue {
+    slots: Mutex<std::collections::VecDeque<TcpStream>>,
+    ready: Condvar,
+    depth: usize,
+}
+
+impl Queue {
+    fn new(depth: usize) -> Self {
+        Self {
+            slots: Mutex::new(std::collections::VecDeque::with_capacity(depth)),
+            ready: Condvar::new(),
+            depth,
+        }
+    }
+
+    fn push(&self, stream: TcpStream) {
+        let mut slots = self.lock();
+        while slots.len() >= self.depth {
+            slots = self.ready.wait(slots).unwrap_or_else(|e| e.into_inner());
+        }
+        slots.push_back(stream);
+        self.ready.notify_one();
+    }
+
+    /// Never returns early: workers are daemons that live as long as the
+    /// process, and the queue is only ever abandoned when the process ends.
+    fn pop(&self) -> TcpStream {
+        let mut slots = self.lock();
+        loop {
+            if let Some(stream) = slots.pop_front() {
+                self.ready.notify_one();
+                return stream;
+            }
+            slots = self.ready.wait(slots).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, std::collections::VecDeque<TcpStream>> {
+        self.slots.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+/// The request line and headers, plus whatever body bytes arrived with them.
+struct Head {
     method: String,
     /// Path plus raw query string.
     target: String,
-    body: Vec<u8>,
+    content_length: u64,
+    /// Body bytes read past the head — clients are free to send both in one
+    /// packet, and dropping them would truncate the upload.
+    rest: Vec<u8>,
 }
 
 fn handle(mut stream: TcpStream, inbox: &Path) -> std::io::Result<()> {
-    let request = match read_request(&mut stream) {
-        Ok(Some(request)) => request,
+    let head = match read_head(&mut stream) {
+        Ok(Some(head)) => head,
         _ => {
             return respond(stream, 400, "{\"ok\":false,\"error\":\"bad request\"}");
         }
     };
 
-    match (request.method.as_str(), request.target.split('?').next()) {
+    match (head.method.as_str(), head.target.split('?').next()) {
         // CORS preflight: browsers send OPTIONS before the octet-stream
         // POST /add; without a 2xx the actual upload never fires.
         ("OPTIONS", _) => respond(stream, 204, ""),
         ("GET", Some("/") | Some("")) => respond_html(stream, 200, &index_page()),
         ("GET", Some("/ping")) => respond(stream, 200, "trove ok"),
         ("POST", Some("/add")) => {
-            let query = parse_query(&request.target);
+            if head.content_length > MAX_BODY {
+                return respond(stream, 413, "{\"ok\":false,\"error\":\"body too large\"}");
+            }
+            let query = parse_query(&head.target);
             let name = query
                 .get("filename")
                 .cloned()
                 .unwrap_or_else(|| "collected.bin".to_string());
             let source = query.get("source").cloned();
-            match save(inbox, &name, source, &request.body) {
+            let mut landing = match Landing::new(inbox, &name) {
+                Ok(landing) => landing,
+                Err(e) => {
+                    return respond(stream, 500, &format!("{{\"ok\":false,\"error\":\"{e}\"}}"));
+                }
+            };
+            if let Err(e) = pump_body(&mut stream, &head.rest, head.content_length, |chunk| {
+                landing.write(chunk)
+            }) {
+                landing.abort();
+                return respond(stream, 400, &format!("{{\"ok\":false,\"error\":\"{e}\"}}"));
+            }
+            match landing.finish(source.as_deref()) {
                 Ok(saved) => respond(
                     stream,
                     200,
                     &format!("{{\"ok\":true,\"file\":\"{saved}\"}}"),
                 ),
-                Err(e) => respond(stream, 400, &format!("{{\"ok\":false,\"error\":\"{e}\"}}")),
+                Err(e) => respond(stream, 500, &format!("{{\"ok\":false,\"error\":\"{e}\"}}")),
             }
         }
         ("POST", Some("/fetch")) => {
-            let body: serde_json::Value = match serde_json::from_slice(&request.body) {
+            let raw = match read_small_body(&mut stream, &head.rest, head.content_length) {
+                Ok(raw) => raw,
+                Err(e) => {
+                    return respond(stream, 400, &format!("{{\"ok\":false,\"error\":\"{e}\"}}"));
+                }
+            };
+            let body: serde_json::Value = match serde_json::from_slice(&raw) {
                 Ok(v) => v,
                 Err(e) => {
                     return respond(
@@ -157,39 +282,44 @@ fn handle(mut stream: TcpStream, inbox: &Path) -> std::io::Result<()> {
                 .get("name")
                 .and_then(|v| v.as_str())
                 .map(String::from)
-                .or_else(|| suggested_name(&url));
+                .or_else(|| suggested_name(&url))
+                .unwrap_or_else(|| "collected.bin".to_string());
             let source = body
                 .get("source")
                 .and_then(|v| v.as_str())
                 .map(String::from)
                 .or_else(|| Some(url.clone()));
-            match fetch(&url) {
-                Ok(bytes) => match save(
-                    inbox,
-                    &name.unwrap_or_else(|| "collected.bin".to_string()),
-                    source,
-                    &bytes,
-                ) {
-                    Ok(saved) => respond(
-                        stream,
-                        200,
-                        &format!("{{\"ok\":true,\"file\":\"{saved}\"}}"),
-                    ),
-                    Err(e) => respond(stream, 500, &format!("{{\"ok\":false,\"error\":\"{e}\"}}")),
-                },
-                Err(e) => respond(
+            let mut landing = match Landing::new(inbox, &name) {
+                Ok(landing) => landing,
+                Err(e) => {
+                    return respond(stream, 500, &format!("{{\"ok\":false,\"error\":\"{e}\"}}"));
+                }
+            };
+            if let Err(e) = download(&url, |chunk| landing.write(chunk)) {
+                landing.abort();
+                return respond(
                     stream,
                     502,
                     &format!("{{\"ok\":false,\"error\":\"download failed: {e}\"}}"),
+                );
+            }
+            match landing.finish(source.as_deref()) {
+                Ok(saved) => respond(
+                    stream,
+                    200,
+                    &format!("{{\"ok\":true,\"file\":\"{saved}\"}}"),
                 ),
+                Err(e) => respond(stream, 500, &format!("{{\"ok\":false,\"error\":\"{e}\"}}")),
             }
         }
         _ => respond(stream, 404, "{\"ok\":false,\"error\":\"not found\"}"),
     }
 }
 
-/// Read one HTTP request: head up to `\r\n\r\n`, then Content-Length bytes.
-fn read_request(stream: &mut TcpStream) -> std::io::Result<Option<Request>> {
+/// Read one HTTP request head: up to `\r\n\r\n`, capped at 64 KiB. Body bytes
+/// that arrived in the same packet come back in [`Head::rest`] rather than
+/// being dropped — a client is free to send head and body together.
+fn read_head(stream: &mut TcpStream) -> std::io::Result<Option<Head>> {
     let mut buf: Vec<u8> = Vec::with_capacity(1024);
     let mut chunk = [0_u8; 4096];
     let head_end;
@@ -214,7 +344,7 @@ fn read_request(stream: &mut TcpStream) -> std::io::Result<Option<Request>> {
     let method = parts.next().unwrap_or_default().to_string();
     let target = parts.next().unwrap_or_default().to_string();
 
-    let mut content_length: usize = 0;
+    let mut content_length: u64 = 0;
     for line in lines {
         let Some((name, value)) = line.split_once(':') else {
             continue;
@@ -223,24 +353,63 @@ fn read_request(stream: &mut TcpStream) -> std::io::Result<Option<Request>> {
             content_length = value.trim().parse().unwrap_or(0);
         }
     }
-    if content_length as u64 > MAX_BODY {
-        return Ok(None);
-    }
-
-    let mut body: Vec<u8> = buf[head_end + 4..].to_vec();
-    while body.len() < content_length {
-        let n = stream.read(&mut chunk)?;
-        if n == 0 {
-            break;
-        }
-        body.extend_from_slice(&chunk[..n]);
-    }
-    body.truncate(content_length);
-    Ok(Some(Request {
+    Ok(Some(Head {
         method,
         target,
-        body,
+        content_length,
+        rest: buf[head_end + 4..].to_vec(),
     }))
+}
+
+/// Copy exactly `len` body bytes into `sink`, starting with the bytes
+/// [`read_head`] already pulled off the socket.
+///
+/// The body is never collected into a `Vec`: a 512 MB upload costs the file it
+/// is written to and one chunk of buffer, instead of an equal-sized allocation
+/// per concurrent request.
+fn pump_body(
+    stream: &mut TcpStream,
+    rest: &[u8],
+    len: u64,
+    mut sink: impl FnMut(&[u8]) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    let mut remaining = len;
+    let carry = rest.len().min(remaining as usize);
+    if carry > 0 {
+        sink(&rest[..carry])?;
+        remaining -= carry as u64;
+    }
+    let mut chunk = vec![0_u8; PUMP_CHUNK];
+    while remaining > 0 {
+        let want = remaining.min(PUMP_CHUNK as u64) as usize;
+        let n = stream.read(&mut chunk[..want])?;
+        if n == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "request body truncated",
+            ));
+        }
+        sink(&chunk[..n])?;
+        remaining -= n as u64;
+    }
+    Ok(())
+}
+
+/// Read a small body (the `/fetch` JSON) into memory, refusing anything past
+/// [`MAX_JSON_BODY`]. A 512 MB cap exists for media, not for a URL and a name.
+fn read_small_body(stream: &mut TcpStream, rest: &[u8], len: u64) -> std::io::Result<Vec<u8>> {
+    if len > MAX_JSON_BODY {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "json body too large",
+        ));
+    }
+    let mut body = Vec::with_capacity(len as usize);
+    pump_body(stream, rest, len, |chunk| {
+        body.extend_from_slice(chunk);
+        Ok(())
+    })?;
+    Ok(body)
 }
 
 fn find_head_end(buf: &[u8]) -> Option<usize> {
@@ -297,14 +466,113 @@ fn suggested_name(url: &str) -> Option<String> {
     (!name.is_empty()).then(|| name.to_string())
 }
 
-/// Write the bytes plus sidecar under a collision-free name.
-fn save(
-    inbox: &Path,
-    raw_name: &str,
-    source: Option<String>,
-    bytes: &[u8],
-) -> Result<String, String> {
-    std::fs::create_dir_all(inbox).map_err(|e| e.to_string())?;
+/// A file being landed in the inbox.
+///
+/// Bytes go to `<stem>.part`; the visible name appears only via `rename`, once
+/// the file is complete and its sidecar is in place. Both halves of that order
+/// matter to the drain:
+///
+/// - a half-written file that got imported would record a sha256 its own bytes
+///   no longer match, and the library *links* its files, so that asset would
+///   stay wrong for good;
+/// - a file whose sidecar has not been written yet imports *without* its source
+///   URL — the drain pairs the two by name at scan time, so the sidecar has to
+///   exist before the file is visible.
+struct Landing {
+    part: PathBuf,
+    path: PathBuf,
+    file: Option<BufWriter<std::fs::File>>,
+}
+
+impl Landing {
+    fn new(inbox: &Path, raw_name: &str) -> std::io::Result<Self> {
+        std::fs::create_dir_all(inbox)?;
+        let name = sanitize_name(raw_name);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        // `create_new` on the part file is what makes the name unique: two
+        // captures in the same nanosecond race here, and the loser takes a
+        // numbered name instead of writing over the winner.
+        for n in 0..64 {
+            let stem = if n == 0 {
+                format!("{nanos}-{name}")
+            } else {
+                format!("{nanos}-{n}-{name}")
+            };
+            let part = inbox.join(format!("{stem}{PART_SUFFIX}"));
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&part)
+            {
+                Ok(file) => {
+                    return Ok(Self {
+                        part,
+                        path: inbox.join(stem),
+                        file: Some(BufWriter::new(file)),
+                    });
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "inbox name collision",
+        ))
+    }
+
+    fn write(&mut self, chunk: &[u8]) -> std::io::Result<()> {
+        match self.file.as_mut() {
+            Some(file) => file.write_all(chunk),
+            None => Err(std::io::Error::other("landing already finished")),
+        }
+    }
+
+    /// Flush, write the sidecar, rename into the visible name, and hand the
+    /// file name back for the response body.
+    fn finish(mut self, source: Option<&str>) -> std::io::Result<String> {
+        let mut file = self.file.take().expect("open until finished");
+        file.flush()?;
+        // The rename is atomic against a concurrent reader; only fsync makes
+        // the *contents* durable. Without it a crash can leave a visible file
+        // with nothing in it.
+        file.get_ref().sync_all()?;
+        drop(file);
+        if let Some(source) = source {
+            let meta = serde_json::json!({ "source_url": source });
+            std::fs::write(sidecar_path(&self.path), meta.to_string())?;
+        }
+        std::fs::rename(&self.part, &self.path)?;
+        Ok(self
+            .path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default())
+    }
+
+    /// Give up: drop the partial file so a failed request leaves nothing behind.
+    fn abort(mut self) {
+        self.file = None;
+        let _ = std::fs::remove_file(&self.part);
+    }
+}
+
+/// `<name>.meta.json` next to `<name>` — the sidecar name the drain looks for.
+fn sidecar_path(path: &Path) -> PathBuf {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    path.with_file_name(format!("{name}.meta.json"))
+}
+
+/// Keep the client's name recognisable but harmless as a path component, and
+/// never let it end in a suffix the drain treats as internal — a captured file
+/// named `shot.part` would otherwise sit in the inbox forever, invisible.
+fn sanitize_name(raw_name: &str) -> String {
     let safe: String = raw_name
         .chars()
         .map(|c| {
@@ -315,57 +583,62 @@ fn save(
             }
         })
         .collect();
-    let name = if safe.trim().is_empty() {
-        "collected.bin".to_string()
+    let safe = safe.trim().to_string();
+    if safe.is_empty() {
+        return "collected.bin".to_string();
+    }
+    if safe.ends_with(PART_SUFFIX) || safe.ends_with(".meta.json") {
+        format!("{safe}.bin")
     } else {
         safe
-    };
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let path = inbox.join(format!("{nanos}-{name}"));
-    std::fs::write(&path, bytes).map_err(|e| e.to_string())?;
-    if let Some(source) = source {
-        let sidecar = inbox.join(format!("{}-{name}.meta.json", nanos));
-        let sidecar = sidecar
-            .file_name()
-            .map(|n| inbox.join(n))
-            .unwrap_or(sidecar);
-        let meta = serde_json::json!({ "source_url": source });
-        std::fs::write(sidecar, meta.to_string()).map_err(|e| e.to_string())?;
     }
-    Ok(path
-        .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_default())
 }
 
-/// In-app URL import: download `url` (http/https only) into the inbox with
-/// a source-URL sidecar, so the next inbox drain imports it and records the
-/// source on the asset. Returns the saved file name.
+/// In-app URL import: download `url` into the inbox with a source-URL sidecar,
+/// so the next inbox drain imports it and records the source on the asset.
+/// Returns the saved file name.
 pub fn fetch_to_inbox(url: &str) -> Result<String, String> {
-    let bytes = fetch(url)?;
+    // Checked before the landing exists, so a rejected URL leaves no trace.
+    ensure_http(url)?;
     let name = suggested_name(url).unwrap_or_else(|| "collected.bin".to_string());
-    save(&inbox_dir(), &name, Some(url.to_string()), &bytes)
+    let mut landing = Landing::new(&inbox_dir(), &name).map_err(|e| e.to_string())?;
+    if let Err(e) = download(url, |chunk| landing.write(chunk)) {
+        landing.abort();
+        return Err(e);
+    }
+    landing.finish(Some(url)).map_err(|e| e.to_string())
 }
 
-fn fetch(url: &str) -> Result<Vec<u8>, String> {
-    if !url.starts_with("http://") && !url.starts_with("https://") {
-        return Err("only http(s) URLs are supported".into());
+/// The two schemes this service will fetch.
+fn ensure_http(url: &str) -> Result<(), String> {
+    if url.starts_with("http://") || url.starts_with("https://") {
+        Ok(())
+    } else {
+        Err("only http(s) URLs are supported".into())
     }
+}
+
+/// Download `url` and stream the body into `sink`, in chunks.
+///
+/// `limit` caps the download the way `read_to_vec` used to, but the bytes go
+/// straight to disk instead of through an allocation the size of the file.
+fn download(url: &str, mut sink: impl FnMut(&[u8]) -> std::io::Result<()>) -> Result<(), String> {
+    ensure_http(url)?;
     let mut response = ureq::get(url)
         .config()
-        .timeout_global(Some(std::time::Duration::from_secs(60)))
+        .timeout_global(Some(Duration::from_secs(60)))
         .build()
         .call()
         .map_err(|e| e.to_string())?;
-    response
-        .body_mut()
-        .with_config()
-        .limit(MAX_BODY)
-        .read_to_vec()
-        .map_err(|e| e.to_string())
+    let mut reader = response.body_mut().with_config().limit(MAX_BODY).reader();
+    let mut chunk = vec![0_u8; PUMP_CHUNK];
+    loop {
+        let n = reader.read(&mut chunk).map_err(|e| e.to_string())?;
+        if n == 0 {
+            return Ok(());
+        }
+        sink(&chunk[..n]).map_err(|e| e.to_string())?;
+    }
 }
 
 /// Browser-friendly landing page: someone opening the endpoint in a tab
@@ -433,6 +706,7 @@ fn respond(mut stream: TcpStream, status: u16, body: &str) -> std::io::Result<()
         204 => "No Content",
         400 => "Bad Request",
         404 => "Not Found",
+        413 => "Payload Too Large",
         502 => "Bad Gateway",
         _ => "Internal Server Error",
     };
@@ -562,5 +836,118 @@ mod tests {
         stream.read_to_string(&mut response).unwrap();
         assert!(response.contains("text/html"));
         assert!(response.contains("collect service is running"));
+    }
+
+    /// The drain must never see a file that is still being written, nor a
+    /// captured name that would hide behind the internal suffixes.
+    #[test]
+    fn partial_uploads_and_internal_suffixes_stay_invisible() {
+        let inbox = std::env::temp_dir().join(format!("trove-inbox-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&inbox).unwrap();
+        std::fs::write(inbox.join("a.png"), b"done").unwrap();
+        std::fs::write(inbox.join("b.png.part"), b"half").unwrap();
+        std::fs::write(inbox.join("c.png.meta.json"), b"{}").unwrap();
+
+        let items = inbox_items_in(&inbox);
+        assert_eq!(items.len(), 1, "{items:?}");
+        assert!(items[0].0.ends_with("a.png"));
+
+        assert_eq!(sanitize_name("shot.part"), "shot.part.bin");
+        assert_eq!(sanitize_name("x.meta.json"), "x.meta.json.bin");
+        assert_eq!(sanitize_name("   "), "collected.bin");
+        assert_eq!(sanitize_name("../../etc/passwd"), ".._.._etc_passwd");
+        assert_eq!(sanitize_name("  shot.png  "), "shot.png");
+
+        std::fs::remove_dir_all(&inbox).ok();
+    }
+
+    /// A body bigger than one pump chunk lands byte-for-byte, with no partial
+    /// file left behind. The body deliberately contains a header terminator and
+    /// non-UTF8 bytes: it must be copied by length, never parsed.
+    #[test]
+    fn a_multi_chunk_upload_lands_exactly() {
+        let inbox = std::env::temp_dir().join(format!("trove-inbox-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&inbox).unwrap();
+        let inbox_for_assert = inbox.clone();
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let _ = handle(stream, &inbox);
+            }
+        });
+
+        let mut body: Vec<u8> = Vec::new();
+        body.extend_from_slice(b"\r\n\r\n");
+        body.extend_from_slice(&vec![0xFF_u8; 200 * 1024]);
+        body.extend_from_slice(b"\r\n\r\ntail");
+
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        let head = format!(
+            "POST /add?filename=big.bin HTTP/1.1\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        );
+        stream.write_all(head.as_bytes()).unwrap();
+        // Split the body across two writes: the head and the first packet must
+        // not be mistaken for the whole request.
+        stream.write_all(&body[..1000]).unwrap();
+        stream.write_all(&body[1000..]).unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).unwrap();
+        assert!(response.contains("\"ok\":true"), "{response}");
+
+        let entries: Vec<PathBuf> = std::fs::read_dir(&inbox_for_assert)
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .collect();
+        assert!(
+            !entries
+                .iter()
+                .any(|p| p.to_string_lossy().ends_with(PART_SUFFIX)),
+            "partial file left behind: {entries:?}"
+        );
+        let landed = entries
+            .iter()
+            .find(|p| p.to_string_lossy().ends_with("-big.bin"))
+            .unwrap_or_else(|| panic!("no landed file in {entries:?}"));
+        assert_eq!(std::fs::read(landed).unwrap(), body);
+
+        std::fs::remove_dir_all(&inbox_for_assert).ok();
+    }
+
+    /// A client that gives up mid-body must not leave a truncated file in the
+    /// inbox: importing one would record a hash its bytes no longer match.
+    #[test]
+    fn a_truncated_upload_leaves_nothing_behind() {
+        let inbox = std::env::temp_dir().join(format!("trove-inbox-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&inbox).unwrap();
+        let inbox_for_assert = inbox.clone();
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let _ = handle(stream, &inbox);
+            }
+        });
+
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        stream
+            .write_all(b"POST /add?filename=cut.png HTTP/1.1\r\nContent-Length: 100000\r\n\r\n")
+            .unwrap();
+        stream.write_all(&[0_u8; 10]).unwrap();
+        stream.shutdown(std::net::Shutdown::Write).unwrap();
+        let mut response = String::new();
+        let _ = stream.read_to_string(&mut response);
+        assert!(response.contains("400"), "{response}");
+
+        let entries: Vec<String> = std::fs::read_dir(&inbox_for_assert)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        assert!(entries.is_empty(), "left behind: {entries:?}");
+
+        std::fs::remove_dir_all(&inbox_for_assert).ok();
     }
 }
