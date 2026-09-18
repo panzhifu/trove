@@ -221,7 +221,7 @@
 
 | 功能 | 说明 |
 |---|---|
-| 移除语义搜索栈 | 删除 CLIP / ONNX Runtime / 分词器（`media/clip.rs`、`media/tokenizer.rs`）及其导入任务、设置页、配置项；二进制不再依赖 onnxruntime 动态库与模型文件，导入提速明显；语义文本搜索一并移除（FTS 关键词搜索不受影响）。schema v4 `embedding` 列保留（历史迁移不可动），已标注 legacy 不再读写 |
+| 移除语义搜索栈 | 删除 CLIP / ONNX Runtime / 分词器（`media/clip.rs`、`media/tokenizer.rs`）及其导入任务、设置页、配置项；二进制不再依赖 onnxruntime 动态库与模型文件，导入提速明显；语义文本搜索一并移除（FTS 关键词搜索不受影响）。schema v4 的 `embedding` 列已随迁移链折叠一并移除 |
 | 视觉指纹自动计算 | 导入时从缩略图计算 pHash + 颜色直方图签名（大图小图同成本、毫秒级），存 `extra` 随导入持久化；设置 ▸ 搜索改为「指纹覆盖率 + 补算缺失指纹」（每帧一张，UI 不卡）；此前视觉搜索需要手工补签名的缺口随之闭合 |
 | 系统字体浏览器 | 文件 ▸ 系统字体…：后台扫描全平台字体目录（Windows 每用户 + 系统目录 / macOS 三目录 / Linux 用户目录 + 系统树递归），ttf-parser 名表提取字族与样式；实时预览（复用库内字体的注册管线）、一键导入媒体库、用户字体卸载（仅每用户目录可删，系统目录一律拒绝、永不提权） |
 | Windows 字体安装 | 库内字体「安装到系统」支持 Windows：复制到每用户目录 `%LOCALAPPDATA%\Microsoft\Windows\Fonts` + `HKCU\…\Fonts` 注册表值（reg.exe，CREATE_NO_WINDOW 不弹控制台），卸载同步删注册表；三平台齐备。注：Windows 路径未在真机验证（本机无 MSVC 工具链），待 CI 覆盖 |
