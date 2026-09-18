@@ -11,6 +11,17 @@
 //! the main thread. Here every [`COMMIT_BATCH`] files share one transaction
 //! (one fsync per batch instead of per file), with a savepoint per file so a
 //! bad file still skips without poisoning its batch.
+//!
+//! Staging runs in [`stage_window`]-sized windows rather than over the whole
+//! batch: the job used to build every [`import::StagedFile`] before opening its
+//! first transaction, which held the metadata of the entire drop in memory and
+//! made a cancellation wait for the last file. Windowed, both are bounded by
+//! the window.
+//!
+//! Directory expansion also belongs here rather than to the caller: the walk is
+//! I/O-bound and a dropped folder can take seconds to enumerate, so the job
+//! does it on its own thread and reports the total when it knows it
+//! (`total == 0` until then).
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -26,6 +37,20 @@ use crate::store::assets;
 /// Files per transaction. Bigger batches amortize fsyncs further but widen
 /// the window between progress updates and hold write locks longer.
 const COMMIT_BATCH: usize = 16;
+
+/// How many files are staged before a round of commits.
+///
+/// Staging used to run over the whole batch at once: every [`StagedFile`] was
+/// built in memory before the first transaction opened, so a 100k-file drop
+/// held 100k metadata records and could not be cancelled until the last file
+/// had been staged. Windowed staging bounds both — the window is a few
+/// pool-widths worth of work, so the commit side never waits long, and a
+/// cancellation takes effect within one window instead of one drop. Peak
+/// staging memory is bounded by the pool's own decodes, which is where it
+/// already was.
+fn stage_window() -> usize {
+    crate::media::import::stage_thread_count() * COMMIT_BATCH * 2
+}
 
 /// SQLite busy timeout for the job connection: the UI thread keeps reading
 /// the same database while this job writes.
@@ -153,11 +178,24 @@ pub fn run(options: &ImportOptions, ctx: &JobContext) -> Result<ImportOutcome, S
         ImportSource::Paths {
             paths,
             into_collection,
-        } => (expand_dirs(paths.clone()), *into_collection),
+        } => {
+            // The directory walk belongs here, on the job's thread. The UI
+            // thread used to run it only to learn the total, then this job ran
+            // it again — twice the I/O for one number, and a folder of 200k
+            // files froze the window for the whole walk. Progress is
+            // indeterminate (`total == 0`) until the list exists.
+            (expand_dirs(paths.clone()), *into_collection)
+        }
         ImportSource::CollectInbox { items } => {
             (items.iter().map(|(p, _)| p.clone()).collect(), None)
         }
     };
+    if ctx.cancelled() {
+        return Ok(ImportOutcome {
+            report: ImportReport::default(),
+            cancelled: true,
+        });
+    }
     let total = paths.len() as u64;
     ctx.set_total(total);
 
@@ -172,51 +210,58 @@ pub fn run(options: &ImportOptions, ctx: &JobContext) -> Result<ImportOutcome, S
     conn.execute_batch("PRAGMA foreign_keys = ON;")
         .map_err(|e| format!("enable foreign keys: {e}"))?;
 
-    let staged = import::stage_all(
-        &options.data_root,
-        &options.cache_root,
-        &paths,
-        options.storage,
-    );
     let mut report = ImportReport::default();
     let mut done: u64 = 0;
     let mut cancelled = false;
+    let window = stage_window();
 
-    for chunk in staged.chunks(COMMIT_BATCH) {
+    'windows: for slice in paths.chunks(window) {
         if ctx.cancelled() {
             cancelled = true;
             break;
         }
-        let mut tx = conn
-            .transaction()
-            .map_err(|e| format!("begin batch: {e}"))?;
-        for item in chunk {
-            match item {
-                Ok(file) => {
-                    // Savepoint per file: a mid-file failure rolls back only
-                    // that file, keeping the rest of the batch intact.
-                    let sp = tx.savepoint().map_err(|e| format!("savepoint: {e}"))?;
-                    match import::commit_staged(&sp, into_collection, file) {
-                        Ok(imported) => {
-                            stamp_collect_source(&sp, &options.source, file, &imported);
-                            sp.commit().map_err(|e| format!("commit file: {e}"))?;
-                            report.imported.push(imported);
-                        }
-                        Err(e) => {
-                            // Dropped savepoint = rolled back file.
-                            report.skipped.push(import::ImportSkip {
-                                path: file.path.clone(),
-                                reason: e.to_string(),
-                            });
+        let staged = import::stage_all(
+            &options.data_root,
+            &options.cache_root,
+            slice,
+            options.storage,
+        );
+        for chunk in staged.chunks(COMMIT_BATCH) {
+            if ctx.cancelled() {
+                cancelled = true;
+                break 'windows;
+            }
+            let mut tx = conn
+                .transaction()
+                .map_err(|e| format!("begin batch: {e}"))?;
+            for item in chunk {
+                match item {
+                    Ok(file) => {
+                        // Savepoint per file: a mid-file failure rolls back only
+                        // that file, keeping the rest of the batch intact.
+                        let sp = tx.savepoint().map_err(|e| format!("savepoint: {e}"))?;
+                        match import::commit_staged(&sp, into_collection, file) {
+                            Ok(imported) => {
+                                stamp_collect_source(&sp, &options.source, file, &imported);
+                                sp.commit().map_err(|e| format!("commit file: {e}"))?;
+                                report.imported.push(imported);
+                            }
+                            Err(e) => {
+                                // Dropped savepoint = rolled back file.
+                                report.skipped.push(import::ImportSkip {
+                                    path: file.path.clone(),
+                                    reason: e.to_string(),
+                                });
+                            }
                         }
                     }
+                    Err(skip) => report.skipped.push(skip.clone()),
                 }
-                Err(skip) => report.skipped.push(skip.clone()),
+                done += 1;
+                ctx.progress(done, total);
             }
-            done += 1;
-            ctx.progress(done, total);
+            tx.commit().map_err(|e| format!("commit batch: {e}"))?;
         }
-        tx.commit().map_err(|e| format!("commit batch: {e}"))?;
     }
 
     if !cancelled && let ImportSource::CollectInbox { items } = &options.source {
@@ -343,6 +388,40 @@ mod tests {
             !expanded
                 .iter()
                 .any(|p| p.file_name().unwrap().to_string_lossy().starts_with('.'))
+        );
+    }
+
+    /// A dropped folder reaches the job unexpanded: the walk is the job's own
+    /// work now. The UI thread used to run it purely to learn the total, and
+    /// the job then ran it again for the same list.
+    #[test]
+    fn a_directory_source_is_expanded_inside_the_job() {
+        let root = Temp::new("task-dir-source");
+        let src = root.path().join("src");
+        fs::create_dir_all(&src).unwrap();
+        for i in 0..5 {
+            fs::write(
+                src.join(format!("img{i}.png")),
+                [PNG_1X1, &[i as u8][..]].concat(),
+            )
+            .unwrap();
+        }
+
+        let options = ImportOptions {
+            data_root: root.path().to_path_buf(),
+            cache_root: root.path().join("cache"),
+            storage: ImportStorage::Link,
+            source: ImportSource::Paths {
+                paths: vec![src.clone()],
+                into_collection: None,
+            },
+        };
+        let outcome = run(&options, &JobContext::for_tests(false)).unwrap();
+        assert_eq!(
+            outcome.report.imported_count(),
+            5,
+            "{:?}",
+            outcome.report.skipped
         );
     }
 
