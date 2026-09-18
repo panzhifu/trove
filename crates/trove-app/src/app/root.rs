@@ -1204,6 +1204,12 @@ impl Render for AppView {
             .on_action(cx.listener(|this, _: &BatchConvert, window, cx| {
                 crate::dialogs::convert::ConvertDialog::open(window, cx, this.controller.clone());
             }))
+            .on_action(cx.listener(|this, _: &BatchEdit, window, cx| {
+                crate::dialogs::edit::EditDialog::open(window, cx, this.controller.clone());
+            }))
+            .on_action(cx.listener(|this, _: &ExportXmp, window, cx| {
+                crate::library::jobs::export_xmp_app(&this.controller, window, cx);
+            }))
             .on_action(cx.listener(|this, _: &SelectAll, _, cx| {
                 this.controller
                     .update(cx, |ctl, _cx| ctl.select_all_visible());
