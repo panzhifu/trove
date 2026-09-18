@@ -404,7 +404,8 @@ fn write_video_thumb(blob_path: &Path, out: &Path) -> Option<PathBuf> {
     // Import-time subprocess: one slot per running decoder, so a batch of
     // videos on a wide staging pool does not start one ffmpeg per thread.
     let _slot = super::proc::slot();
-    let output = std::process::Command::new("ffmpeg")
+    let mut command = std::process::Command::new("ffmpeg");
+    command
         .args(["-y", "-loglevel", "error", "-ss", "1", "-i"])
         .arg(blob_path)
         .args([
@@ -413,9 +414,8 @@ fn write_video_thumb(blob_path: &Path, out: &Path) -> Option<PathBuf> {
             "-vf",
             &format!("scale='min({THUMB_MAX},iw)':-2"),
         ])
-        .arg(&tmp)
-        .output()
-        .ok()?;
+        .arg(&tmp);
+    let output = super::proc::output_with_timeout(command).ok()?;
     if !output.status.success() {
         let _ = std::fs::remove_file(&tmp);
         return None;

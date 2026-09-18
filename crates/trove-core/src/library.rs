@@ -1546,6 +1546,7 @@ mod tests {
             &root.join("cache"),
             std::slice::from_ref(&src),
             ImportStorage::Link,
+            &std::sync::atomic::AtomicBool::new(false),
         );
         let report = commit_staged_all(lib.store().conn(), None, staged);
         assert_eq!(report.imported_count(), 1);
@@ -2697,6 +2698,7 @@ mod tests {
             &root.join("cache"),
             std::slice::from_ref(&linked_src),
             ImportStorage::Link,
+            &std::sync::atomic::AtomicBool::new(false),
         );
         commit_staged_all(lib.store().conn(), None, staged);
         let conn = lib.store().conn();

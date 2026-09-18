@@ -174,6 +174,15 @@ impl TaskManager {
         {
             return Err(StartError::AlreadyRunning);
         }
+        // Finished jobs leave the registry here rather than never: every
+        // state lives on only until the next job starts, which bounds the map
+        // to the live job plus the last one of each kind instead of every job
+        // the process ever ran. Their terminal events are already queued in
+        // `events`, which is a separate collection — nothing a consumer reads
+        // through the registry is lost with the entries.
+        inner
+            .jobs
+            .retain(|_, j| j.status == TaskStatus::Running);
         let id: TaskId = new_id();
         let cancel = Arc::new(AtomicBool::new(false));
         inner.jobs.insert(
@@ -279,9 +288,9 @@ impl TaskManager {
         inner.events.drain(..).collect()
     }
 
-    /// Snapshot of every known job. Finished jobs are dropped from the
-    /// registry as they are observed here, so the map only holds what the
-    /// embedder has not yet seen settle.
+    /// Snapshot of every known job. Finished jobs leave the registry when the
+    /// next one starts (see [`TaskManager::start`]), so the map only ever
+    /// holds running jobs plus the last finished ones.
     pub fn snapshot(&self) -> Vec<TaskInfo> {
         let inner = self.inner.lock().unwrap();
         inner
@@ -334,6 +343,12 @@ impl JobContext {
     /// work and unwind their loop early.
     pub fn cancelled(&self) -> bool {
         self.cancel.load(Ordering::Relaxed)
+    }
+
+    /// The raw cancellation flag, for workers that check it deep inside a
+    /// parallel loop (the staging pool) rather than at job-level checkpoints.
+    pub fn cancel_flag(&self) -> &AtomicBool {
+        &self.cancel
     }
 
     /// Update the total unit count once it is known (e.g. after expanding

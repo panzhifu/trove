@@ -92,6 +92,11 @@ pub fn inbox_items() -> Vec<(PathBuf, Option<PathBuf>)> {
 }
 
 /// [`inbox_items`] over an explicit directory (tests, alternate inboxes).
+///
+/// This is the one definition of "what is waiting to be imported" — the
+/// importer's own drain must list through here, never re-enumerate by hand:
+/// the skip rules below (files still being written, sidecars of both kinds)
+/// are exactly what a hand-rolled listing drifts away from.
 pub fn inbox_items_in(inbox: &std::path::Path) -> Vec<(PathBuf, Option<PathBuf>)> {
     let Ok(entries) = std::fs::read_dir(inbox) else {
         return Vec::new();
@@ -99,13 +104,7 @@ pub fn inbox_items_in(inbox: &std::path::Path) -> Vec<(PathBuf, Option<PathBuf>)
     let mut items = Vec::new();
     for entry in entries.flatten() {
         let path = entry.path();
-        if !path.is_file()
-            || path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .map(|n| n.ends_with(".meta.json") || n.ends_with(PART_SUFFIX))
-                .unwrap_or(true)
-        {
+        if !path.is_file() || is_inbox_sidecar(path.file_name()) {
             continue;
         }
         let sidecar = {
@@ -118,6 +117,17 @@ pub fn inbox_items_in(inbox: &std::path::Path) -> Vec<(PathBuf, Option<PathBuf>)
         items.push((path, sidecar.is_file().then_some(sidecar)));
     }
     items
+}
+
+/// Whether this directory entry is metadata about an import rather than an
+/// import: the collect sidecar (`<file>.meta.json`), the sidecar the
+/// sidecar-notes plugin reads (`<file>.trove.json`), or a file still being
+/// written ([`PART_SUFFIX`]). A sidecar that slipped through would be
+/// imported as an asset in its own right.
+fn is_inbox_sidecar(name: Option<&std::ffi::OsStr>) -> bool {
+    name.and_then(|n| n.to_str())
+        .map(|n| n.ends_with(".meta.json") || n.ends_with(".trove.json") || n.ends_with(PART_SUFFIX))
+        .unwrap_or(true)
 }
 
 /// Start the server on a daemon thread. Returns the bound port, or `None`
@@ -721,6 +731,25 @@ fn respond(mut stream: TcpStream, status: u16, body: &str) -> std::io::Result<()
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sidecars_and_half_written_files_are_never_listed_as_imports() {
+        let inbox = std::env::temp_dir().join(format!("trove-inbox-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&inbox).unwrap();
+        std::fs::write(inbox.join("shot.png"), b"png").unwrap();
+        std::fs::write(inbox.join("shot.png.meta.json"), b"{}").unwrap();
+        std::fs::write(inbox.join("shot.png.trove.json"), b"{}").unwrap();
+        std::fs::write(inbox.join("upload.png.part"), b"half").unwrap();
+
+        let items = inbox_items_in(&inbox);
+        assert_eq!(
+            items.iter().map(|(p, _)| p.clone()).collect::<Vec<_>>(),
+            vec![inbox.join("shot.png")],
+            "only the complete file is waiting"
+        );
+
+        std::fs::remove_dir_all(&inbox).unwrap();
+    }
 
     #[test]
     fn fetch_to_inbox_rejects_non_http_urls() {

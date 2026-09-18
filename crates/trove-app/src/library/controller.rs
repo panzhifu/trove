@@ -82,8 +82,17 @@ pub enum SelectionSource {
 /// Owns the open [`Library`] plus transient view state (which collection is
 /// browsed, which asset is selected). The Dock panels read it each frame and
 /// are re-rendered when a mutation bumps [`generation`](Self::generation).
+/// How long a library swap waits for a cancelled import to actually stop.
+/// The staging pool checks the flag per file and subprocesses are killed on
+/// timeout, so a healthy job settles in well under a second; the cap is a
+/// guard against a job that cannot stop, not the expected wait.
+const IMPORT_CANCEL_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
 pub struct LibraryController {
     pub library: Library,
+    /// The running import job, if any: what the cancel button presses and
+    /// what a library swap must stop before it can swap the store.
+    pub(crate) import_task: Option<crate::library::jobs::ImportTaskHandle>,
     /// Monotonic revision of the library *contents* (imports, edits, trash,
     /// renames, collection/tag mutations, browse switches). Keys every data
     /// cache: the explorer snapshot, the folder/tag/extension scans, the
@@ -237,6 +246,7 @@ impl LibraryController {
             duplicates_computing: false,
             watch_task: None,
             watch_handle: None,
+            import_task: None,
             last_import_refresh: None,
         }
     }
@@ -275,8 +285,18 @@ impl LibraryController {
     /// bumps the generation: the final full refresh must not be throttled.
     pub fn finish_import(&mut self, imported: usize, skipped: usize) {
         self.import_phase = ImportPhase::Done { imported, skipped };
+        self.import_task = None;
         self.last_import_refresh = None;
         self.generation += 1;
+    }
+
+    /// Ask the running import to stop at its next checkpoint. The job
+    /// settles asynchronously — the progress toast turns into the outcome
+    /// toast on its own.
+    pub fn cancel_import(&mut self) {
+        if let Some(task) = &self.import_task {
+            task.manager.cancel(task.task_id);
+        }
     }
 
     pub fn is_importing(&self) -> bool {
@@ -511,8 +531,22 @@ impl LibraryController {
         data_root: PathBuf,
         cache_root: PathBuf,
     ) -> Result<(), trove_core::Error> {
-        if self.is_importing() {
-            return Err(trove_core::Error::Validation("import in progress".into()));
+        // A running import no longer refuses the swap: it is cancelled and
+        // the swap waits for the job thread to stop touching the store. The
+        // staging pool's per-file checkpoints bound the wait to the in-flight
+        // decodes; the cap only guards against a job that cannot stop at all,
+        // and timing out simply refuses this swap — nothing is half-done.
+        if let Some(task) = self.import_task.take() {
+            task.manager.cancel(task.task_id);
+            let deadline = std::time::Instant::now() + IMPORT_CANCEL_WAIT;
+            while task.manager.is_task_running(task.task_id) {
+                if std::time::Instant::now() >= deadline {
+                    return Err(trove_core::Error::Validation(
+                        "import did not stop in time".into(),
+                    ));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
         }
         let library = Library::open(data_root, cache_root)?;
         self.library = library;
@@ -532,6 +566,13 @@ impl LibraryController {
         self.filter_ext = None;
         self.import_phase = ImportPhase::Idle;
         self.integrity_report = None;
+        // Duplicate clusters belong to the library they were computed in; the
+        // field doc says "invalidated on cleanup and library swap" and this
+        // is the swap half of that. A stale cache here would show the
+        // previous library's clusters, and acting on them (trash by id) is a
+        // silent no-op against the new store.
+        self.duplicates = None;
+        self.duplicates_computing = false;
         // The old watch task scans for the previous library; cancel it. The
         // caller restarts the service against the new library.
         if let Some(watch) = self.watch_task.take() {
@@ -745,5 +786,88 @@ impl LibraryController {
         }
         self.generation += 1;
         ids.len()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A swap no longer refuses while an import runs: the import is
+    /// cancelled, the swap waits for the job thread to stop, and the
+    /// controller lands on the new library with no job left running.
+    #[test]
+    fn a_swap_cancels_a_running_import_and_waits() {
+        const PNG_1X1: &[u8] = &[
+            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48,
+            0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00,
+            0x00, 0x1F, 0x15, 0xC4, 0x89, 0x00, 0x00, 0x00, 0x0A, 0x49, 0x44, 0x41, 0x54, 0x78,
+            0x9C, 0x63, 0x00, 0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0D, 0x0A, 0x2D, 0xB4, 0x00,
+            0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+        ];
+
+        let root = std::env::temp_dir().join(format!("trove-ctl-swap-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(root.join("cache")).unwrap();
+        let mut controller = LibraryController::new(
+            Library::open(&root, root.join("cache")).expect("the first library opens"),
+        );
+
+        let src = root.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        for i in 0..300 {
+            std::fs::write(src.join(format!("img{i}.png")), PNG_1X1).unwrap();
+        }
+
+        // Start a real import job the way the job bridge does, and register
+        // it on the controller the same way.
+        let options = trove_core::tasks::import::ImportOptions {
+            data_root: root.clone(),
+            cache_root: root.join("cache"),
+            storage: trove_core::media::import::ImportStorage::Link,
+            source: trove_core::tasks::import::ImportSource::Paths {
+                paths: (0..300).map(|i| src.join(format!("img{i}.png"))).collect(),
+                into_collection: None,
+            },
+        };
+        let manager = controller.library.tasks().clone();
+        let watcher = manager.clone();
+        let (task_id, _rx) = manager
+            .start(
+                trove_core::tasks::TaskKind::Import,
+                "test",
+                move |ctx| trove_core::tasks::import::run(&options, ctx),
+            )
+            .expect("the import job starts");
+        controller.import_task = Some(crate::library::jobs::ImportTaskHandle {
+            manager,
+            task_id,
+        });
+        controller.begin_import(300);
+        assert!(controller.is_importing());
+
+        let other = root.join("other");
+        std::fs::create_dir_all(other.join("cache")).unwrap();
+
+        let swapped = controller.swap_library(other.clone(), other.join("cache"));
+        assert!(swapped.is_ok(), "the swap must not be refused: {swapped:?}");
+        assert_eq!(controller.library.root(), other);
+        assert!(
+            !controller.is_importing(),
+            "the swap resets the import phase"
+        );
+        assert!(controller.import_task.is_none());
+        // Give the cancelled job a beat to exit, then confirm it stopped.
+        for _ in 0..100 {
+            if !watcher.is_task_running(task_id) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            !watcher.is_task_running(task_id),
+            "the cancelled import must have stopped"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
     }
 }

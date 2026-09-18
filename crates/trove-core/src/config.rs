@@ -13,7 +13,7 @@
 //! Where those files live is [`crate::paths`]' business, not this module's.
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -153,10 +153,19 @@ impl LibraryConfig {
     }
 
     /// Load from `library_dir`, or defaults when the file is absent or
-    /// unreadable. A missing file is the normal state of a fresh library.
+    /// unreadable. A missing file is the normal state of a fresh library; an
+    /// unreadable one is not — the broken file is moved aside (kept, not
+    /// deleted) so nothing silently rewrites over the only evidence of what
+    /// the library's settings were.
     pub fn load(library_dir: &std::path::Path) -> Self {
         match fs::read_to_string(Self::file(library_dir)) {
-            Ok(text) => serde_json::from_str(&text).unwrap_or_default(),
+            Ok(text) => match serde_json::from_str(&text) {
+                Ok(config) => config,
+                Err(error) => {
+                    quarantine_corrupt(&Self::file(library_dir), &error);
+                    Self::default()
+                }
+            },
             Err(_) => Self::default(),
         }
     }
@@ -168,8 +177,7 @@ impl LibraryConfig {
             fs::create_dir_all(parent)?;
         }
         let text = serde_json::to_string_pretty(self).unwrap_or_default();
-        fs::write(&path, text)?;
-        Ok(())
+        write_atomic(&path, &text)
     }
 
     /// Whether the folder watcher should run (on by default).
@@ -254,11 +262,65 @@ pub const FILTER_TOOLS: &[&str] = &["kind", "tag", "shape", "rating", "format"];
 /// The filter tools shown when the user has not customized the set.
 pub const DEFAULT_FILTER_TOOLS: &[&str] = &["kind"];
 
+/// Replace `path` with `text` without ever leaving a half-written file
+/// behind: the data goes to a sibling temp file first and a rename — atomic
+/// on every supported platform — moves it into place. A crash mid-save then
+/// costs at most the previous state, never a truncated config.
+fn write_atomic(path: &Path, text: &str) -> Result<()> {
+    let temp = path.with_extension(format!(
+        "{}tmp-{}",
+        path.extension()
+            .and_then(|e| e.to_str())
+            .map(|e| format!("{e}."))
+            .unwrap_or_default(),
+        std::process::id()
+    ));
+    fs::write(&temp, text)?;
+    // A failure here leaves the temp file behind (harmless litter next to
+    // the config) and the previous config intact.
+    fs::rename(&temp, path)?;
+    Ok(())
+}
+
+/// Move a config file that no longer parses out of the way instead of
+/// letting the next save overwrite the only copy of what it said. The
+/// suffix carries the unix time so repeated corruption keeps every copy.
+fn quarantine_corrupt(path: &Path, error: &serde_json::Error) {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let quarantined = path.with_extension(format!("corrupt-{stamp}.json"));
+    match fs::rename(path, &quarantined) {
+        Ok(()) => tracing::error!(
+            %error,
+            quarantined = %quarantined.display(),
+            "config file did not parse; it was moved aside and defaults apply"
+        ),
+        Err(error) => {
+            tracing::error!(%error, "config file did not parse and could not be moved aside")
+        }
+    }
+}
+
 impl AppConfig {
     /// Load the config from disk, or return a default config if none exists.
+    ///
+    /// A file that exists but does not parse is the dangerous case: this
+    /// config holds the library registry, so silently replacing it with the
+    /// default would present "no libraries" as a fresh install. The broken
+    /// file is moved aside (`*.corrupt-*`, kept for inspection) and the
+    /// default is returned — the data directories are still on disk either
+    /// way.
     pub fn load() -> Self {
         match fs::read_to_string(paths::config_file()) {
-            Ok(text) => serde_json::from_str(&text).unwrap_or_default(),
+            Ok(text) => match serde_json::from_str(&text) {
+                Ok(config) => config,
+                Err(error) => {
+                    quarantine_corrupt(&paths::config_file(), &error);
+                    Self::default()
+                }
+            },
             Err(_) => Self::default(),
         }
     }
@@ -270,8 +332,7 @@ impl AppConfig {
             fs::create_dir_all(parent)?;
         }
         let text = serde_json::to_string_pretty(self).unwrap_or_default();
-        fs::write(&path, text)?;
-        Ok(())
+        write_atomic(&path, &text)
     }
 
     // -----------------------------------------------------------------------
@@ -615,6 +676,55 @@ mod tests {
         assert_eq!(entry.dir(), paths::data_dir().join("libraries/work"));
         assert_eq!(entry.cache_dir(), paths::cache_dir().join("libraries/work"));
         assert_ne!(entry.dir(), entry.cache_dir());
+    }
+
+    /// A crash mid-save must never leave a truncated config: the write lands
+    /// on a temp file first and the rename into place is atomic, so the
+    /// destination only ever holds a complete file.
+    #[test]
+    fn a_saved_config_never_replaces_itself_half_written() {
+        let dir = std::env::temp_dir().join(format!("trove-cfg-atomic-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.json");
+
+        write_atomic(&path, "{ \"first\": true }").unwrap();
+        write_atomic(&path, "{ \"second\": true }").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "{ \"second\": true }"
+        );
+        // No temp litter survives a successful save.
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A config that does not parse is moved aside, not overwritten: the file
+    /// is the only record of the library registry, and the next save would
+    /// otherwise destroy it.
+    #[test]
+    fn a_corrupt_config_is_quarantined_not_deleted() {
+        let dir = std::env::temp_dir().join(format!("trove-cfg-quar-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.json");
+        std::fs::write(&path, "{ not json").unwrap();
+
+        let parsed: std::result::Result<AppConfig, serde_json::Error> =
+            serde_json::from_str("{ not json");
+        quarantine_corrupt(&path, &parsed.unwrap_err());
+
+        assert!(!path.exists(), "the broken file no longer blocks loading");
+        let kept: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(kept.len(), 1, "exactly the quarantined copy remains");
+        assert_eq!(
+            std::fs::read_to_string(kept[0].path()).unwrap(),
+            "{ not json"
+        );
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// The library's own preferences round-trip through `library.json`, and a

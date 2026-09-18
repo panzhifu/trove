@@ -7,10 +7,13 @@
 
 use std::path::PathBuf;
 
+use gpui_kit::component::button::Button;
+use gpui_kit::component::Sizable as _;
 use gpui_kit::component::WindowExt as _;
 use gpui_kit::component::notification::Notification;
 use gpui_kit::*;
 
+use trove_core::media::import::ImportStorage;
 use trove_core::tasks::import::{self, ImportOptions, ImportOutcome, ImportSource};
 use trove_core::tasks::watch::{self, WatchSignal};
 use trove_core::tasks::{TaskEvent, TaskId, TaskKind, TaskManager};
@@ -20,6 +23,14 @@ use crate::library::LibraryController;
 /// Marker type for the import progress toast: pushing with the same id
 /// replaces the previous toast instead of stacking a new one.
 pub struct ImportNotice;
+
+/// Handle of the running import job, kept on the controller: the cancel
+/// button presses it, and a library swap cancels-and-waits on it before
+/// swapping the store.
+pub struct ImportTaskHandle {
+    pub manager: TaskManager,
+    pub task_id: TaskId,
+}
 
 /// Handle for the resident watch task, kept on the controller: the manager
 /// clone belongs to the library the task was started against, so a library
@@ -85,6 +96,13 @@ pub fn export_xmp_app(controller: &Entity<LibraryController>, window: &mut Windo
                     cx,
                 );
             });
+            // Yield: a spawned foreground future runs to completion once
+            // polled, so without this the whole selection would be processed
+            // inside one frame — the grid would freeze and this toast would
+            // never repaint until the end.
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(1))
+                .await;
         }
 
         let note = if skipped == 0 {
@@ -113,6 +131,9 @@ pub fn start_watch_service(
 ) -> bool {
     let manager = controller.read(cx).library.tasks().clone();
     let library_dir = controller.read(cx).library.root().to_path_buf();
+    // The pump guards every tick against this same root: the watch thread
+    // gets its own copy, the pump another.
+    let pump_root = library_dir.clone();
     let (tx, rx) = std::sync::mpsc::channel();
     // The other half of the watcher's retry contract: whatever the pump accepts
     // is reported back, so the job stops offering it. Without this the sweep
@@ -122,7 +143,7 @@ pub fn start_watch_service(
     let started = manager.start(TaskKind::WatchScan, "watch", move |ctx| {
         watch::run(
             watch::WATCH_INTERVAL,
-            library_dir,
+            library_dir.clone(),
             trove_core::services::collect::inbox_dir(),
             tx,
             accepted_rx,
@@ -139,7 +160,7 @@ pub fn start_watch_service(
         });
         ctl.watch_handle = Some(handle);
     });
-    watch_signals(controller.clone(), rx, accepted_tx, handle, cx);
+    watch_signals(controller.clone(), rx, accepted_tx, pump_root, handle, cx);
     true
 }
 
@@ -147,10 +168,19 @@ pub fn start_watch_service(
 /// files under watch roots queue for import, retried until accepted (a
 /// manual import still running refuses the batch, and the queue keeps the
 /// files pending — the same contract the old watcher loop had).
+///
+/// `library_root` is the library this watch service was started against. A
+/// swap cancels the old watcher cooperatively — its thread checks the flag
+/// between ticks — so for a window the old pump is still alive while the
+/// controller already points at the new library. Signals from that window
+/// must not act: a pending file from the old library's watch roots would be
+/// imported into the new one. The pump drops everything until the channel
+/// closes.
 fn watch_signals(
     controller: Entity<LibraryController>,
     rx: std::sync::mpsc::Receiver<WatchSignal>,
     accepted: std::sync::mpsc::Sender<Vec<PathBuf>>,
+    library_root: PathBuf,
     handle: gpui::AnyWindowHandle,
     cx: &mut App,
 ) {
@@ -158,6 +188,34 @@ fn watch_signals(
         let mut pending: Vec<PathBuf> = Vec::new();
         loop {
             cx.background_executor().timer(POLL_INTERVAL).await;
+
+            // Checked every tick, not only when a signal arrives: a swap
+            // between signals must still stop this pump's queued batch.
+            let same_library =
+                controller.update(cx, |ctl, _| ctl.library.root() == library_root);
+            if !same_library {
+                // The library moved under this pump: its watcher is being (or
+                // has been) cancelled, its signals describe the old library's
+                // roots, and its pending files must not land in the new one.
+                // Drain and ignore until the channel closes, then stop.
+                pending.clear();
+                let mut channel_open = true;
+                loop {
+                    match rx.try_recv() {
+                        Ok(_) => {}
+                        Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                        Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                            channel_open = false;
+                            break;
+                        }
+                    }
+                }
+                if !channel_open {
+                    break;
+                }
+                continue;
+            }
+
             let mut channel_open = true;
             loop {
                 match rx.try_recv() {
@@ -186,9 +244,13 @@ fn watch_signals(
                     .unwrap_or(false);
                 // Mark seen only after the batch was accepted; a refusal
                 // retries on the next pump tick. The watcher is told the same
-                // thing, so it stops offering files it has already handed over.
-                if accepted_flag {
-                    let _ = accepted.send(pending.clone());
+                // thing, so it stops offering files it has already handed
+                // over. A dying channel has no watcher left to retry — the
+                // queue would just leak, so it goes.
+                if accepted_flag || !channel_open {
+                    if accepted_flag {
+                        let _ = accepted.send(pending.clone());
+                    }
                     pending.clear();
                 }
             }
@@ -217,6 +279,20 @@ pub fn import_paths_app(
     import_paths_app_into(controller, paths, into_collection, window, cx);
 }
 
+/// Import files the library itself just produced and left in a temporary
+/// spot — clipboard pastes. They are *copied* into the store rather than
+/// linked: a link would point at `/tmp`, which the system is free to empty
+/// at any moment, leaving an asset with no reachable original.
+pub fn import_copied_app(
+    controller: &Entity<LibraryController>,
+    paths: Vec<PathBuf>,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let into_collection = controller.read(cx).current_collection;
+    start_paths_import(controller, paths, into_collection, ImportStorage::Copy, window, cx);
+}
+
 /// Start an import into an explicit collection (`None` = unfiled).
 /// Directories in `paths` are expanded into their contained files, so a
 /// dropped folder imports everything inside it. Returns `false` when the
@@ -227,6 +303,27 @@ pub fn import_paths_app_into(
     controller: &Entity<LibraryController>,
     paths: Vec<PathBuf>,
     into_collection: Option<uuid::Uuid>,
+    window: &mut Window,
+    cx: &mut App,
+) -> bool {
+    // A user import links: the file stays where the user keeps it.
+    start_paths_import(
+        controller,
+        paths,
+        into_collection,
+        ImportStorage::Link,
+        window,
+        cx,
+    )
+}
+
+/// The shared importer entry: snapshot everything the job needs from the
+/// controller, then hand off.
+fn start_paths_import(
+    controller: &Entity<LibraryController>,
+    paths: Vec<PathBuf>,
+    into_collection: Option<uuid::Uuid>,
+    storage: ImportStorage,
     window: &mut Window,
     cx: &mut App,
 ) -> bool {
@@ -265,8 +362,7 @@ pub fn import_paths_app_into(
         let options = ImportOptions {
             data_root: ctl.library.root().to_path_buf(),
             cache_root: ctl.library.cache().to_path_buf(),
-            // A user import links: the file stays where the user keeps it.
-            storage: trove_core::media::import::ImportStorage::Link,
+            storage,
             source: ImportSource::Paths {
                 paths,
                 into_collection,
@@ -287,40 +383,20 @@ pub fn import_paths_app_into(
 }
 
 /// Drain the collect-service inbox: import every waiting file (unfiled,
-/// `source_url` stamped from the sidecar, files deleted afterwards).
-/// Returns `false` when the inbox was empty or an import is already running
-/// (retry on the next watcher cycle).
+/// `source_url` stamped from the sidecar, files kept and linked). Returns
+/// `false` when nothing importable was waiting or an import is already
+/// running (retry on the next watcher cycle).
+///
+/// The waiting-list comes from `collect::inbox_items` — the one definition
+/// of what is waiting — rather than a hand-rolled enumeration: a private
+/// copy of the skip rules is exactly how `.part` files (still being written)
+/// and sidecars ended up being imported as assets in their own right.
 pub fn collect_inbox_app(
     controller: &Entity<LibraryController>,
     window: &mut Window,
     cx: &mut App,
 ) -> bool {
-    let inbox = trove_core::services::collect::inbox_dir();
-    let Ok(entries) = std::fs::read_dir(&inbox) else {
-        return false;
-    };
-    // Files with an optional sidecar; sidecars themselves are not imports.
-    let mut items: Vec<(PathBuf, Option<PathBuf>)> = Vec::new();
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if !path.is_file()
-            || path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .map(|n| n.ends_with(".meta.json"))
-                .unwrap_or(true)
-        {
-            continue;
-        }
-        let sidecar = {
-            let name = path
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_default();
-            inbox.join(format!("{name}.meta.json"))
-        };
-        items.push((path, sidecar.is_file().then_some(sidecar)));
-    }
+    let items = trove_core::services::collect::inbox_items();
     if items.is_empty() {
         return false;
     }
@@ -374,7 +450,13 @@ fn start_import_job(
         return false;
     };
 
-    controller.update(cx, |ctl, _| ctl.begin_import(total));
+    controller.update(cx, |ctl, _| {
+        ctl.begin_import(total);
+        ctl.import_task = Some(ImportTaskHandle {
+            manager: manager.clone(),
+            task_id,
+        });
+    });
     // `total == 0` is the job's "still counting the folder" state: the scan
     // runs on the backend thread and the real total arrives as a progress
     // event, so the first toast must not claim "0 files".
@@ -384,7 +466,9 @@ fn start_import_job(
         rust_i18n::t!("notice.import_started", count = total).to_string()
     };
     window.push_notification(
-        Notification::info(started).id1::<ImportNotice>("import-progress"),
+        Notification::info(started)
+            .id1::<ImportNotice>("import-progress")
+            .action(cancel_button(controller.clone())),
         cx,
     );
 
@@ -416,7 +500,8 @@ fn watch_import(
                         TaskEvent::Failed { error, .. } => {
                             settled = Some(Notification::warning(
                                 rust_i18n::t!("workspace.trash_failed", error = error).to_string(),
-                            ));
+                            )
+                            .id1::<ImportNotice>("import-progress"));
                             controller.update(cx, |ctl, cx| {
                                 ctl.finish_import(0, 0);
                                 cx.notify();
@@ -425,7 +510,8 @@ fn watch_import(
                         TaskEvent::Cancelled { .. } => {
                             settled = Some(Notification::info(
                                 rust_i18n::t!("notice.import_cancelled").to_string(),
-                            ));
+                            )
+                            .id1::<ImportNotice>("import-progress"));
                             controller.update(cx, |ctl, cx| {
                                 ctl.finish_import(0, 0);
                                 cx.notify();
@@ -452,7 +538,9 @@ fn watch_import(
                             .to_string()
                     };
                     window.push_notification(
-                        Notification::info(text).id1::<ImportNotice>("import-progress"),
+                        Notification::info(text)
+                            .id1::<ImportNotice>("import-progress")
+                            .action(cancel_button(controller.clone())),
                         cx,
                     );
                 });
@@ -467,7 +555,7 @@ fn watch_import(
                         );
                         cx.notify();
                     });
-                    settled = Some(outcome_toast(&outcome));
+                    settled = outcome_toast(&outcome);
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => {}
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
@@ -506,26 +594,68 @@ fn event_task_id(event: &TaskEvent) -> Option<TaskId> {
 }
 
 /// The completion toast: success when everything landed, a warning listing
-/// skips otherwise, a plain info when the run was cancelled.
-fn outcome_toast(outcome: &ImportOutcome) -> Notification {
+/// skips otherwise, a plain info when the run was cancelled, an error naming
+/// the database problem when batches failed. `None` for the run that did
+/// nothing at all — the resident inbox sweep re-runs over its whole history
+/// and ends "everything already imported"; toasting that every time would
+/// train the user to dismiss import notices unread.
+fn outcome_toast(outcome: &ImportOutcome) -> Option<Notification> {
+    // Every variant carries the progress toast's id: with the cancel button
+    // attached the progress toast never auto-hides, so the outcome must
+    // *replace* it, not stack beside it.
+    let keyed = |note: Notification| note.id1::<ImportNotice>("import-progress");
     if outcome.cancelled {
-        Notification::info(rust_i18n::t!("notice.import_cancelled").to_string())
+        Some(keyed(Notification::info(
+            rust_i18n::t!("notice.import_cancelled").to_string(),
+        )))
+    } else if let Some(error) = &outcome.error {
+        Some(keyed(Notification::warning(
+            rust_i18n::t!(
+                "notice.import_error",
+                error = error,
+                imported = outcome.report.imported_count(),
+                skipped = outcome.report.skipped_count()
+            )
+            .to_string(),
+        )))
+    } else if outcome.report.imported.is_empty()
+        && outcome.report.skipped.is_empty()
+        && outcome.report.already_imported > 0
+    {
+        None
     } else if outcome.report.skipped.is_empty() {
-        Notification::success(
+        Some(keyed(Notification::success(
             rust_i18n::t!(
                 "notice.import_done",
                 imported = outcome.report.imported_count()
             )
             .to_string(),
-        )
+        )))
     } else {
-        Notification::warning(
+        Some(keyed(Notification::warning(
             rust_i18n::t!(
                 "notice.import_done_skipped",
                 imported = outcome.report.imported_count(),
                 skipped = outcome.report.skipped_count()
             )
             .to_string(),
-        )
+        )))
+    }
+}
+
+/// The progress toast's cancel button: asks the job to stop at its next
+/// checkpoint; the outcome toast replaces this one when the job settles.
+fn cancel_button(
+    controller: Entity<LibraryController>,
+) -> impl Fn(&mut Notification, &mut Window, &mut gpui_kit::Context<Notification>) -> Button {
+    move |_notification, _window, _cx| {
+        let controller = controller.clone();
+        Button::new("import-cancel")
+            .outline()
+            .small()
+            .label(rust_i18n::t!("notice.import_cancel").to_string())
+            .on_click(move |_, _, cx| {
+                controller.update(cx, |ctl, _| ctl.cancel_import());
+            })
     }
 }

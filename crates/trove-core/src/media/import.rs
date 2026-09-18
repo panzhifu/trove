@@ -18,6 +18,7 @@
 //! - [`commit_staged`] — foreground: dedupe against the store, insert rows
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use uuid::Uuid;
 
@@ -53,6 +54,11 @@ pub struct ImportSkip {
 pub struct ImportReport {
     pub imported: Vec<ImportItem>,
     pub skipped: Vec<ImportSkip>,
+    /// Files handed to the job that the library already held (same name and
+    /// size) and so were never staged — the resident inbox sweep re-runs over
+    /// a directory that keeps its files, and this is the "nothing new"
+    /// counter that keeps those sweeps quiet. Not a skip: nothing went wrong.
+    pub already_imported: u64,
 }
 
 impl ImportReport {
@@ -105,10 +111,13 @@ pub fn import_files(
     {
         return Err(Error::NotFound("collection"));
     }
+    // The synchronous path has no cancellation story (it is the library
+    // import/export round-trip), so staging here runs to completion.
+    let never_cancelled = AtomicBool::new(false);
     Ok(commit_staged_all(
         store.conn(),
         into_collection,
-        stage_all(data_root, cache_root, sources, storage),
+        stage_all(data_root, cache_root, sources, storage, &never_cancelled),
     ))
 }
 
@@ -292,6 +301,7 @@ pub fn stage_all(
     cache_root: &Path,
     sources: &[PathBuf],
     storage: ImportStorage,
+    cancelled: &AtomicBool,
 ) -> Vec<std::result::Result<StagedFile, ImportSkip>> {
     use rayon::prelude::*;
 
@@ -304,6 +314,16 @@ pub fn stage_all(
         sources
             .par_iter()
             .map(|src| {
+                // Per-file cancellation checkpoint: with this, a cancelled
+                // job stops staging the moment each file starts, so a
+                // cancel-and-wait (the library swap) is bounded by the few
+                // in-flight decodes instead of the whole window.
+                if cancelled.load(Ordering::Relaxed) {
+                    return Err(ImportSkip {
+                        path: src.clone(),
+                        reason: "cancelled".to_string(),
+                    });
+                }
                 stage_source(data_root, cache_root, src, storage).map_err(|e| ImportSkip {
                     path: src.clone(),
                     reason: e.to_string(),
@@ -499,11 +519,13 @@ mod tests {
         let missing = root.join("nope.png");
 
         // Phase one: staging collects failures instead of aborting the batch.
+        let no_cancel = AtomicBool::new(false);
         let staged = stage_all(
             &root,
             &cache,
             &[good.clone(), missing.clone()],
             ImportStorage::Link,
+        &no_cancel,
         );
         assert_eq!(staged.len(), 2);
         assert!(staged[0].is_ok());
@@ -522,7 +544,8 @@ mod tests {
         assert_eq!(roots.len(), 0, "no auto-collection should be created");
 
         // Re-importing identical content dedupes (reused = true).
-        let staged2 = stage_all(&root, &cache, &[good], ImportStorage::Link);
+        let no_cancel = AtomicBool::new(false);
+        let staged2 = stage_all(&root, &cache, &[good], ImportStorage::Link, &no_cancel);
         let report2 = commit_staged_all(store.conn(), None, staged2);
         assert_eq!(report2.imported_count(), 1);
         assert!(report2.imported[0].reused);
@@ -542,11 +565,13 @@ mod tests {
         let src = outside.join("linked.png");
         std::fs::write(&src, PNG_1X1).unwrap();
 
+        let no_cancel = AtomicBool::new(false);
         let staged = stage_all(
             &root,
             &cache,
             std::slice::from_ref(&src),
             ImportStorage::Link,
+        &no_cancel,
         );
         assert!(staged[0].is_ok(), "{:?}", staged[0].as_ref().err());
         let report = commit_staged_all(store.conn(), None, staged);
@@ -595,11 +620,13 @@ mod tests {
         let src = root.join("packaged.png");
         std::fs::write(&src, PNG_1X1).unwrap();
 
+        let no_cancel = AtomicBool::new(false);
         let staged = stage_all(
             &root,
             &cache,
             std::slice::from_ref(&src),
             ImportStorage::Copy,
+            &no_cancel,
         );
         assert!(staged[0].is_ok(), "{:?}", staged[0].as_ref().err());
         let report = commit_staged_all(store.conn(), None, staged);

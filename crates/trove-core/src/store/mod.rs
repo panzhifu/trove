@@ -42,6 +42,16 @@ impl Store {
         // the UI thread reads. The mode is persistent per database file; an
         // in-memory database ignores it, so the result is not checked.
         let _ = conn.execute_batch("PRAGMA journal_mode = WAL;");
+        // WAL's usual pairing: fsync at checkpoint instead of per commit.
+        // An app crash is still safe (WAL replays); only a power cut can
+        // lose the last transactions — and every bulk write on this database
+        // (an import) is re-runnable by design. Without this every commit
+        // transaction pays one fsync, which on a small-file import costs
+        // more than the staging does.
+        let _ = conn.execute_batch("PRAGMA synchronous = NORMAL;");
+        // A larger page cache: the working set of a browse/scan easily
+        // exceeds the ~2 MB default on a six-figure library.
+        let _ = conn.execute_batch("PRAGMA cache_size = -16000;");
         // A backend writer holding the write lock must not error the UI's
         // reads; wait briefly instead.
         let _ = conn.busy_timeout(std::time::Duration::from_secs(5));

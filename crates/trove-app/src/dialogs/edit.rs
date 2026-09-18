@@ -524,6 +524,13 @@ fn start_edit(draft: Entity<EditDraft>, spec: EditSpec, window: &mut Window, cx:
                     cx,
                 );
             });
+            // Yield so the grid keeps painting between files: a polled future
+            // runs to completion, and without this a large batch would decode
+            // and re-encode inside one frame — the freeze the loop comment
+            // promises does not exist unless the loop actually suspends.
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(1))
+                .await;
         }
 
         let note = if failed == 0 && skipped == 0 {

@@ -103,7 +103,15 @@ pub(crate) fn asset_context_menu(
                 .on_click(move |_, _, cx| {
                     c_fav.update(cx, move |ctl, cx| {
                         let ids = ctl.action_targets(asset_id);
-                        let _ = ctl.library.set_assets_favorite(&ids, !favorite);
+                        if let Err(error) = ctl.library.set_assets_favorite(&ids, !favorite) {
+                            ctl.report_error(
+                                rust_i18n::t!(
+                                    "workspace.favorite_failed",
+                                    error = error.to_string()
+                                )
+                                .to_string(),
+                            );
+                        }
                         ctl.generation += 1;
                         cx.notify();
                     });
@@ -225,8 +233,19 @@ pub(crate) fn asset_context_menu(
             move |_, _, cx| {
                 c_trash.update(cx, move |ctl, cx| {
                     let ids = ctl.action_targets(asset_id);
-                    let _ = ctl.library.trash_assets(&ids);
-                    ctl.deselect(&ids);
+                    match ctl.library.trash_assets(&ids) {
+                        // The selection only moves when the trash did: a
+                        // silent failure used to leave the user reading a
+                        // "gone" grid while the rows were still in the
+                        // database.
+                        Ok(_) => ctl.deselect(&ids),
+                        Err(error) => {
+                            ctl.report_error(
+                                rust_i18n::t!("workspace.trash_failed", error = error.to_string())
+                                    .to_string(),
+                            );
+                        }
+                    }
                     cx.notify();
                 });
             },
@@ -248,7 +267,15 @@ fn trash_menu(
                 move |_, _, cx| {
                     ctl_restore.update(cx, move |ctl, cx| {
                         let ids = ctl.action_targets(asset_id);
-                        let _ = ctl.library.restore_assets(&ids);
+                        if let Err(error) = ctl.library.restore_assets(&ids) {
+                            ctl.report_error(
+                                rust_i18n::t!(
+                                    "workspace.restore_failed",
+                                    error = error.to_string()
+                                )
+                                .to_string(),
+                            );
+                        }
                         ctl.deselect(&ids);
                         cx.notify();
                     });
