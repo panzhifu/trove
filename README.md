@@ -80,7 +80,7 @@ cargo run -p trove-app
 
 | | |
 |---|---|
-| **无声预览** | ffmpeg 管线逐帧解码，播放 / 暂停 / 跳转 / 时间线，无音频管线 |
+| **有声预览** | ffmpeg 逐帧解码 + 音频管线（rodio 播放 44.1 kHz 立体声 PCM），播放 / 暂停 / 跳转 / 时间线 / 音量 / 静音 / 倍速（0.5×–2×，音调保持），音画同步走音频时钟 |
 | **截图采集** | 全屏或交互式框选，直接入库 PNG；全屏走进程内捕获（xcap：Wayland wlr-screencopy / X11 / macOS / Windows），免 portal 弹窗；框选回落外部工具（grim+slurp / scrot / macOS screencapture），命令可自定义 |
 | **批量像素编辑** | 旋转 / 翻转 / 裁剪（百分比坐标，按每张图自身尺寸解析），JPEG 质量参数，原地替换媒体文件并保留资产身份与组织关系 |
 | **批量格式转换** | 图片重新编码为 JPEG / PNG / WebP / BMP / TFT，可选长边限制，可重新导入转换后文件 |

@@ -62,7 +62,7 @@
 |---|---|---|---|---|
 | 1 | RAW（CR2/NEF/ARW/DNG）、HEIC/HEIF、AVIF、JPEG-XL 缩略图 | **全部已实现**（RAW 走 rawler 完整解码管线含去马赛克/白平衡/sRGB，HEIC 用系统 heif-dec，AVIF/JPEG-XL 探测 + 缩略图（libheif / 样本构建路径），缺工具时优雅降级） | XnView 500+、digiKam 全流程 | ✅ |
 | 2 | SVG/PSD/AI/EPS/CDR 等设计格式预览 | **SVG/PSD 已实现**（resvg 渲染 + psd 合成，导入即生成缩略图与尺寸） | Eagle/Billfish 核心格式 | ✅（AI/EPS/CDR 仍缺 → P2） |
-| 3 | 视频播放/逐帧/音频波形预览 | **已实现（无声预览）**（详细查看弹窗：ffmpeg 管线逐帧解码，单帧解码循环，播放/暂停、跳转、时间线控制；无音频管线，预览用于观看而非收听） | Eagle/Billfish | ✅ |
+| 3 | 视频播放/逐帧/音频播放 | **已实现（有声预览）**（详细查看弹窗：ffmpeg 逐帧解码 + 音频管线（rodio 播放 44.1 kHz 立体声 PCM），播放/暂停/跳转/时间线/音量/静音/倍速（0.5×–2× 音调保持），音画同步走音频时钟） | Eagle/Billfish | ✅ |
 | 4 | GIF/WebP/APNG 动图播放 | **已实现**（详细查看弹窗与 Inspector 预览：GIF/动态 WebP 由 gpui 从原文件直接解码全部帧并原生播放；APNG 用 image 拆帧转 BGRA 构建多帧 RenderImage（带 256MB 帧预算护栏），结果全局缓存避免重复解码；网格/列表仍用静态缩略图保证性能） | TagStudio/XnView | ✅ |
 | 5 | 3D 模型查看（OBJ/FBX/GLB） | **已实现（OBJ/STL/PLY）**（一等资产类型；wgpu GPU 视口 + CPU 软件光栅回退；双面 Lambert + Blinn-Phong 着色；纯 Rust 宽容解析） | Eagle 4 内置查看器 | ✅ |
 | 6 | 字体网格实况预览（用样张文本渲染单元格） | **已实现**（导入时用 fontdue 光栅化生成「样张卡片」缩略图——样张文本以该字体实况渲染，字体缺字自动跳过；样张文本可在设置自定义，配合维护页「重建缩略图（强制）」刷新；Inspector 实况预览原有保留） | Eagle/Billfish | ✅ |
