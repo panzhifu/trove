@@ -48,6 +48,13 @@ const COMMIT_BATCH: usize = 16;
 /// cancellation takes effect within one window instead of one drop. Peak
 /// staging memory is bounded by the pool's own decodes, which is where it
 /// already was.
+///
+/// Sized from the *floor* pool width ([`stage_thread_count`]) while staging
+/// itself may run wider on a batch of large sources; that only makes the window
+/// a finer slice of the pool's work, which is the safe direction for both the
+/// commit lag and cancellation latency this exists to bound.
+///
+/// [`stage_thread_count`]: crate::media::import::stage_thread_count
 fn stage_window() -> usize {
     crate::media::import::stage_thread_count() * COMMIT_BATCH * 2
 }

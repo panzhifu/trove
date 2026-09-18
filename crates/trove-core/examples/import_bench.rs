@@ -108,7 +108,7 @@ fn main() {
         "{} files, {} rounds (+1 warm-up), stage pool = {} threads",
         paths.len(),
         rounds,
-        trove_core::media::import::stage_thread_count()
+        trove_core::media::import::stage_thread_count_for(&paths)
     );
     println!(
         "  stage  median {:>7.3} s   min {:>7.3}  max {:>7.3}   ({:>6.1} files/s)",

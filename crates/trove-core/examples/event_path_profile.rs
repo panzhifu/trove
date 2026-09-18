@@ -176,7 +176,7 @@ fn main() {
     println!(
         "D tiny files ({n} x {} B)     : stage_all {per_file:>7.3} ms/file  ({failed} failed, pool {} threads)",
         PNG_1X1.len() + 4,
-        import::stage_thread_count()
+        import::stage_thread_count_for(&paths)
     );
     println!(
         "  → event path as a share     : {:.5} %  of that budget",
