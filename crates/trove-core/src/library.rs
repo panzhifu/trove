@@ -36,6 +36,8 @@ pub fn export_metadata_from_store(store: &Store) -> Result<String> {
         |row| Ok((rows::req_uuid(row, 0)?, rows::req_uuid(row, 1)?)),
     )?;
 
+    // `format`, `version`, `exported_at` and `asset_count` describe the file to
+    // whoever opens it; the importer reads the sections below and nothing else.
     let export = serde_json::json!({
         "format": "trove-export",
         "version": 2,
@@ -67,8 +69,8 @@ pub struct MetadataImportReport {
     pub collections: u64,
     pub tags: u64,
     pub smart_collections: u64,
-    /// Entries that could not be restored (invalid smart queries, version 1
-    /// exports have no membership tables, …).
+    /// Entries that could not be restored (invalid smart queries, memberships
+    /// whose asset or collection is missing, …).
     pub skipped: u64,
 }
 
@@ -103,16 +105,11 @@ struct ExportFile {
     tags: Vec<crate::model::Tag>,
     #[serde(default)]
     smart_collections: Vec<crate::model::SmartCollection>,
-    /// v2 membership tables (absent in version 1 exports).
-    #[serde(default)]
+    /// Membership tables. Required rather than defaulted: a file without them
+    /// is not something this build's exporter writes, so it is not silently
+    /// restored as a library with no memberships.
     asset_collections: Vec<(Uuid, Uuid)>,
-    #[serde(default)]
     asset_tags: Vec<(Uuid, Uuid)>,
-    /// Export schema version (accepted: 2; version 1 restores without
-    /// membership tables — every pair then counts as skipped).
-    #[serde(default)]
-    #[allow(dead_code)]
-    version: u32,
 }
 
 /// Insert one exported collection (its parent chain first) and record the
@@ -1429,8 +1426,8 @@ impl Library {
             report.assets_placeholder += 1;
         }
 
-        // v2 membership tables. A version 1 export has neither; every entry
-        // then counts as skipped, which the report surfaces honestly.
+        // Memberships whose asset or collection is missing from the file (a
+        // partial export) count as skipped, which the report surfaces honestly.
         for (old_asset, old_coll) in file.asset_collections {
             match (asset_map.get(&old_asset), coll_map.get(&old_coll)) {
                 (Some(a), Some(c)) => {

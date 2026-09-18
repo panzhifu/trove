@@ -11,9 +11,12 @@ use super::{MAX_DESCRIPTION_LEN, MAX_NAME_LEN, MAX_RATING};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Origin {
-    /// The file was copied into the library (content-addressed storage).
+    /// The file was copied into the library (content-addressed storage). Only
+    /// ever a copy Trove made for itself: an extracted media package, the
+    /// re-encoded output of an in-place edit.
     Stored,
-    /// The file is referenced at its external path. Reserved for future use.
+    /// The file is referenced at its external path, which rides in the asset's
+    /// mined facts (`extra["source_path"]`). What a user import produces.
     Linked,
 }
 
