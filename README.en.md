@@ -72,7 +72,7 @@ This README summarizes what ships. The **[Chinese README](./README.md)** is the 
 
 ### Video & screenshots
 
-- **Silent preview** — frame-by-frame ffmpeg decode with play / pause / seek / timeline; no audio pipeline.
+- **Audio-capable preview** — frame-by-frame ffmpeg decode plus an audio pipeline (rodio plays 44.1 kHz stereo PCM); play / pause / seek / timeline / volume / mute / speed (0.5×–2× with pitch holding); audio-clock-driven A/V sync.
 - **Screenshot capture** — full screen or interactive region, imported as PNG. Full-screen shots are captured in-process via xcap (wlr-screencopy on Wayland, XCB on X11, ScreenCaptureKit on macOS, Windows) with no portal dialogs; region picking falls back to external tools (grim+slurp / scrot / macOS screencapture); custom command override.
 - **Batch pixel editor** — rotate / flip / crop (percent coordinates, resolved per asset from its own dimensions), JPEG quality; replaces the media file in place while preserving asset identity and organization membership.
 - **Batch conversion** — re-encode images to JPEG / PNG / WebP / BMP / TIFF, optional longest-edge cap, optional re-import.
