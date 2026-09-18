@@ -70,20 +70,30 @@ impl Store {
         Ok(())
     }
 
-    /// Bring the schema up to date.
+    /// Create the schema in a new file, or insist that an existing one matches.
+    ///
+    /// There is no upgrading — see [`schema`]. Before 0.5 the only libraries in
+    /// existence are this project's own, so a library written by an earlier
+    /// build is refused with both versions in the message rather than walked
+    /// forward through a chain of migrations that no longer exists.
     pub fn migrate(&self) -> Result<()> {
         let current = self.user_version()?;
-        for (ix, sql) in schema::MIGRATIONS.iter().enumerate() {
-            let target = (ix + 1) as i64;
-            if current < target {
-                self.migrate_one(sql)?;
-                self.set_user_version(target)?;
-            }
+        if current == schema::SCHEMA_VERSION {
+            return Ok(());
         }
-        Ok(())
+        if current != 0 {
+            return Err(crate::error::Error::Validation(format!(
+                "library schema v{current}, this build creates v{}: \
+                 libraries written before 0.5 are not upgraded",
+                schema::SCHEMA_VERSION
+            )));
+        }
+        self.apply(schema::SCHEMA)?;
+        self.set_user_version(schema::SCHEMA_VERSION)
     }
 
-    fn migrate_one(&self, sql: &str) -> Result<()> {
+    /// Apply one DDL script atomically.
+    fn apply(&self, sql: &str) -> Result<()> {
         let mut mut_borrow = self.conn.borrow_mut();
         let tx = mut_borrow.transaction()?;
         tx.execute_batch(sql).map_err(crate::error::Error::from)?;
@@ -333,11 +343,38 @@ mod tests {
     }
 
     #[test]
-    fn migrations_run_and_store_reopens() {
+    fn a_new_file_gets_the_schema_and_reopening_is_a_no_op() {
         let store = Store::in_memory().unwrap();
         assert_eq!(store.user_version().unwrap(), schema::SCHEMA_VERSION);
-        // Migrating again is a no-op.
         store.migrate().unwrap();
+    }
+
+    /// A library from another build is refused rather than guessed at. Before
+    /// 0.5 the only such libraries are development ones, and a half-upgraded
+    /// database would be worse than this error.
+    #[test]
+    fn a_library_from_another_version_is_refused() {
+        let dir = std::env::temp_dir().join(format!("trove-schema-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("library.db");
+        Store::open(&path).unwrap();
+
+        // Rewrite the version as an older build would have left it.
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .execute_batch("PRAGMA user_version = 7")
+            .unwrap();
+
+        let err = match Store::open(&path) {
+            Ok(_) => panic!("a v7 library must not open"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("v7"), "{err}");
+        assert!(
+            err.contains(&format!("v{}", schema::SCHEMA_VERSION)),
+            "{err}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -1154,27 +1191,9 @@ mod tests {
     }
 
     #[test]
-    fn legacy_tree_without_op_tag_roundtrips() {
-        // Trees saved by early builds lack the internally-tagged `op` key on
-        // match nodes ("missing field `op`"); node_from_json restores it.
-        let store = Store::in_memory().unwrap();
-        let mut a = sample_asset("old.png", AssetKind::Image);
-        a.is_favorite = true;
-        assets::insert(store.conn(), &a).unwrap();
-
-        let legacy = serde_json::json!({
-            "op": "and",
-            "children": [
-                { "field": "is_favorite", "value": true },
-                { "field": "kind", "value": "image" },
-            ]
-        });
-        let node = super::smart::node_from_json(&legacy).unwrap();
-        let ids = super::smart::evaluate(store.conn(), None, &node, None, 0).unwrap();
-        assert_eq!(ids.total, 1);
-        assert_eq!(ids.items, vec![a.id]);
-
-        // A truly malformed tree (no field either) is still an error.
+    fn a_tree_without_a_node_type_is_still_an_error() {
+        // The `op` tag is required; a node that carries neither it nor a field
+        // is not something to guess at.
         assert!(
             super::smart::node_from_json(&serde_json::json!({
                 "op": "and", "children": [{ "value": 1 }]
