@@ -10,6 +10,7 @@ pub mod library;
 pub mod media;
 pub mod model;
 pub mod paths;
+pub mod plugins;
 pub mod search;
 pub mod services;
 pub mod store;

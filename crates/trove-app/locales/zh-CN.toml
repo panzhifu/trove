@@ -645,3 +645,26 @@ rename = "重命名"
 delete = "删除"
 delete_confirm = "确认删除"
 delete_hint = "删除会移除该素材库的数据库、备份与缩略图缓存；素材文件本身留在原位置，不受影响。"
+
+[plugins]
+page_title = "插件"
+page_desc = "随本构建一同编译的扩展。开关在导入管线首次构建时读取，因此改动要下次启动才生效。"
+page_group = "已安装的插件"
+none = "暂无插件"
+none_desc = "本构建除内置导入阶段外没有携带任何插件。"
+none_hint = "如何编写插件见 docs/PLUGINS.md。"
+
+# 每个插件的文案，按插件名为键（plugins.<name>.name / .description）。
+sidecar_notes_name = "旁注标题"
+sidecar_notes_description = "读取文件旁可选的「<文件名>.trove.json」，用其中的 title 作为素材标题。写入方式与快捷键在本页设置。"
+sidecar_notes_group = "行为"
+sidecar_notes_mode = "标题写入方式"
+sidecar_notes_mode_desc = "「总是覆盖」让旁注标题优先于文件自带标题；「仅在缺少时填写」保留文件自己的标题。改动立即生效。"
+sidecar_notes_mode_override = "总是覆盖"
+sidecar_notes_mode_fill = "仅在缺少时填写"
+sidecar_notes_mode_now = "旁注标题模式：%{mode}"
+sidecar_notes_toggle = "用键盘切换覆盖 / 补缺"
+sidecar_notes_shortcut_hint = "当前为「%{mode}」，改动立即生效；按键可到 设置 ▸ 快捷键 修改。"
+
+[commands]
+sidecar_notes_toggle_mode = "旁注标题：切换覆盖 / 补缺"

@@ -1137,6 +1137,11 @@ impl Render for AppView {
             .on_action(cx.listener(|this, _: &ImportFiles, window, cx| {
                 this.prompt_import(window, cx);
             }))
+            // Plugin commands: one generic action carries every plugin's
+            // commands; the payload routes to the plugin that declared it.
+            .on_action(cx.listener(|_, action: &RunPluginCommand, window, cx| {
+                crate::plugins::run_command(&action.command, window, cx);
+            }))
             .on_action(cx.listener(|_: &mut Self, _: &ManageLibraries, _, cx| {
                 crate::app::library_manager::open(cx);
             }))
