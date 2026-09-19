@@ -65,8 +65,8 @@ impl Mode {
     /// catalogs, not the app's.
     fn label(self) -> String {
         match self {
-            Mode::Override => pt!("plugins.sidecar_notes.mode_override"),
-            Mode::FillMissing => pt!("plugins.sidecar_notes.mode_fill"),
+            Mode::Override => pt!("plugins.sidecar_notes_mode_override"),
+            Mode::FillMissing => pt!("plugins.sidecar_notes_mode_fill"),
         }
     }
 }
@@ -179,10 +179,10 @@ impl super::AppPlugin for SidecarNotes {
             ))
             .group(
                 gpui_kit::component::setting::SettingGroup::new()
-                    .title(pt!("plugins.sidecar_notes.group"))
+                    .title(pt!("plugins.sidecar_notes_group"))
                     .item(
                         gpui_kit::component::setting::SettingItem::new(
-                            pt!("plugins.sidecar_notes.mode"),
+                            pt!("plugins.sidecar_notes_mode"),
                             gpui_kit::component::setting::SettingField::dropdown(
                             vec![
                                 (
@@ -205,7 +205,7 @@ impl super::AppPlugin for SidecarNotes {
                             },
                         ),
                     )
-                    .description(pt!("plugins.sidecar_notes.mode_desc")),
+                    .description(pt!("plugins.sidecar_notes_mode_desc")),
                 )
                 .item(
                     gpui_kit::component::setting::SettingItem::render(
@@ -230,7 +230,7 @@ impl super::AppPlugin for SidecarNotes {
         // The chord works anywhere, so say what it did: the only surface
         // showing the mode is this plugin's settings page.
         window.push_notification(
-            Notification::info(pt!("plugins.sidecar_notes.mode_now", mode = next.label())),
+            Notification::info(pt!("plugins.sidecar_notes_mode_now", mode = next.label())),
             cx,
         );
         cx.refresh_windows();
@@ -285,14 +285,14 @@ fn shortcut_row(cx: &App, key: &str, mode_label: String) -> gpui_kit::Div {
                 .flex_1()
                 .min_w_0()
                 .child(
-                    div().text_sm().child(pt!("plugins.sidecar_notes.toggle")),
+                    div().text_sm().child(pt!("plugins.sidecar_notes_toggle")),
                 )
                 .child(
                     div()
                         .text_xs()
                         .text_color(cx.theme().muted_foreground)
                         .child(pt!(
-                            "plugins.sidecar_notes.shortcut_hint",
+                            "plugins.sidecar_notes_shortcut_hint",
                             mode = mode_label
                         )),
                 ),

@@ -3,11 +3,20 @@
 //! imports them.
 //!
 //! Endpoints (the future browser extension speaks the first two):
-//! - `GET  /ping` → `trove ok` (health check)
+//! - `GET  /ping` → `trove ok` (liveness check)
+//! - `GET  /health` → the process metrics snapshot as JSON: version, uptime,
+//!   whether a library is open and its asset count, import throughput, the
+//!   search outbox's backlog, thumbnail-cache hit rate, slow-query counts
+//!   ([`crate::metrics::snapshot`])
 //! - `POST /add?filename=NAME&source=URL` — body is the raw file bytes
 //!   (`curl --data-binary @img.png 'http://127.0.0.1:P/add?filename=a.png'`)
-//! - `POST /fetch` — JSON body `{"url": "…", "name": "…", "source": "…"}`
-//!   downloads the URL server-side (ureq + rustls).
+//! - `POST /fetch` — JSON body `{"url": "…", "name": "…", "source": "…",
+//!   "referer": "…", "reject_html": true}` downloads the URL server-side
+//!   (ureq + rustls). The request carries a browser-like User-Agent and, when
+//!   the caller knows it, the capturing page as Referer — that is the point
+//!   of the fallback: the extension lands here when its own request was
+//!   refused by hotlink protection. `reject_html` refuses a text/html answer
+//!   (a webpage, not a file) instead of landing one in the library.
 //!
 //! Every saved file gets a `<name>.meta.json` sidecar recording the source
 //! URL; the importer writes it into `assets.source_url` and deletes both.
@@ -50,6 +59,11 @@ const MAX_BODY: u64 = 512 * 1024 * 1024;
 
 /// Largest JSON request body ([`/fetch`] carries only a URL and a name).
 const MAX_JSON_BODY: u64 = 64 * 1024;
+
+/// User-Agent for server-side downloads. Hotlink protection routinely
+/// refuses bare client UAs outright; presenting a common browser string is
+/// the difference between a fallback that works and one that always 403s.
+const BROWSER_UA: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
 
 /// Size of the chunk bodies are streamed in.
 const PUMP_CHUNK: usize = 64 * 1024;
@@ -237,6 +251,14 @@ fn handle(mut stream: TcpStream, inbox: &Path) -> std::io::Result<()> {
         ("OPTIONS", _) => respond(stream, 204, ""),
         ("GET", Some("/") | Some("")) => respond_html(stream, 200, &index_page()),
         ("GET", Some("/ping")) => respond(stream, 200, "trove ok"),
+        ("GET", Some("/health")) => {
+            // The metrics registry is process-global statics, so the server
+            // thread reads it without going anywhere near the store or the
+            // UI thread.
+            let body = serde_json::to_string(&crate::metrics::snapshot())
+                .unwrap_or_else(|_| "{\"ok\":false,\"error\":\"snapshot\"}".to_string());
+            respond(stream, 200, &body)
+        }
         ("POST", Some("/add")) => {
             if head.content_length > MAX_BODY {
                 return respond(stream, 413, "{\"ok\":false,\"error\":\"body too large\"}");
@@ -299,13 +321,23 @@ fn handle(mut stream: TcpStream, inbox: &Path) -> std::io::Result<()> {
                 .and_then(|v| v.as_str())
                 .map(String::from)
                 .or_else(|| Some(url.clone()));
+            let referer = body
+                .get("referer")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            let reject_html = body
+                .get("reject_html")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
             let mut landing = match Landing::new(inbox, &name) {
                 Ok(landing) => landing,
                 Err(e) => {
                     return respond(stream, 500, &format!("{{\"ok\":false,\"error\":\"{e}\"}}"));
                 }
             };
-            if let Err(e) = download(&url, |chunk| landing.write(chunk)) {
+            if let Err(e) = download(&url, referer.as_deref(), reject_html, |chunk| {
+                landing.write(chunk)
+            }) {
                 landing.abort();
                 return respond(
                     stream,
@@ -612,7 +644,7 @@ pub fn fetch_to_inbox(url: &str) -> Result<String, String> {
     ensure_http(url)?;
     let name = suggested_name(url).unwrap_or_else(|| "collected.bin".to_string());
     let mut landing = Landing::new(&inbox_dir(), &name).map_err(|e| e.to_string())?;
-    if let Err(e) = download(url, |chunk| landing.write(chunk)) {
+    if let Err(e) = download(url, None, false, |chunk| landing.write(chunk)) {
         landing.abort();
         return Err(e);
     }
@@ -630,16 +662,48 @@ fn ensure_http(url: &str) -> Result<(), String> {
 
 /// Download `url` and stream the body into `sink`, in chunks.
 ///
-/// `limit` caps the download the way `read_to_vec` used to, but the bytes go
-/// straight to disk instead of through an allocation the size of the file.
-fn download(url: &str, mut sink: impl FnMut(&[u8]) -> std::io::Result<()>) -> Result<(), String> {
+/// `referer` — the capturing page, when the caller knows it — and the
+/// browser-like [`BROWSER_UA`] are what let this path through hotlink
+/// protection, which is the whole reason the browser extension falls back to
+/// it. With `reject_html`, a text/html answer is refused instead of landed in
+/// the library: this path exists for *files*, and a webpage slipping in
+/// silently is worse than a failed save.
+fn download(
+    url: &str,
+    referer: Option<&str>,
+    reject_html: bool,
+    mut sink: impl FnMut(&[u8]) -> std::io::Result<()>,
+) -> Result<(), String> {
     ensure_http(url)?;
-    let mut response = ureq::get(url)
+    let request = ureq::get(url).header("User-Agent", BROWSER_UA);
+    let request = match referer {
+        Some(page) => request.header("Referer", page),
+        None => request,
+    };
+    let mut response = request
         .config()
         .timeout_global(Some(Duration::from_secs(60)))
         .build()
         .call()
         .map_err(|e| e.to_string())?;
+    if reject_html {
+        let is_html = response
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok())
+            .map(|value| {
+                value
+                    .split(';')
+                    .next()
+                    .unwrap_or_default()
+                    .trim()
+                    .to_ascii_lowercase()
+            })
+            .is_some_and(|value| value.starts_with("text/html"));
+        if is_html {
+            return Err("the URL answered with a webpage (text/html), not a file".into());
+        }
+    }
     let mut reader = response.body_mut().with_config().limit(MAX_BODY).reader();
     let mut chunk = vec![0_u8; PUMP_CHUNK];
     loop {
@@ -678,7 +742,8 @@ fn index_page() -> String {
 <h3>Endpoints</h3>
 <table>
 <tr><th>Method</th><th>Path</th><th>Purpose</th></tr>
-<tr><td>GET</td><td><code>/ping</code></td><td>health check</td></tr>
+<tr><td>GET</td><td><code>/ping</code></td><td>liveness check</td></tr>
+<tr><td>GET</td><td><code>/health</code></td><td>metrics &amp; health snapshot (JSON)</td></tr>
 <tr><td>POST</td><td><code>/add?filename=NAME&amp;source=URL</code></td><td>upload raw file bytes</td></tr>
 <tr><td>POST</td><td><code>/fetch</code></td><td>server downloads <code>{{"url": "…"}}</code></td></tr>
 </table>
@@ -756,6 +821,44 @@ mod tests {
         assert!(fetch_to_inbox("ftp://example.com/a.png").is_err());
         assert!(fetch_to_inbox("file:///etc/passwd").is_err());
         assert!(fetch_to_inbox("data:text/plain,hi").is_err());
+    }
+
+    /// `/fetch` validates its JSON — a missing url is a 400 — and the fields
+    /// the browser extension sends alongside the old ones (`referer`,
+    /// `reject_html`) parse. Both paths reject before any network is touched.
+    #[test]
+    fn fetch_json_is_validated_and_new_fields_parse() {
+        let inbox = std::env::temp_dir().join(format!("trove-inbox-{}", uuid::Uuid::new_v4()));
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let _ = handle(stream, &inbox);
+            }
+        });
+
+        let send = |body: &str| {
+            let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+            let head = format!(
+                "POST /fetch HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+                body.len()
+            );
+            stream.write_all(head.as_bytes()).unwrap();
+            stream.write_all(body.as_bytes()).unwrap();
+            let mut response = String::new();
+            stream.read_to_string(&mut response).unwrap();
+            response
+        };
+
+        let response = send("{}");
+        assert!(response.contains("400"), "{response}");
+        assert!(response.contains("url required"), "{response}");
+
+        let response = send(
+            r#"{"url":"ftp://example.com/a.png","name":"a.png","source":"https://page.example/","referer":"https://page.example/","reject_html":true}"#,
+        );
+        assert!(response.contains("502"), "{response}");
+        assert!(response.contains("only http(s)"), "{response}");
     }
 
     #[test]
@@ -865,6 +968,39 @@ mod tests {
         stream.read_to_string(&mut response).unwrap();
         assert!(response.contains("text/html"));
         assert!(response.contains("collect service is running"));
+    }
+
+    /// `/health` serves the metrics snapshot as JSON: parseable, versioned,
+    /// with the headline library gauges present.
+    #[test]
+    fn health_serves_the_metrics_snapshot() {
+        let inbox = std::env::temp_dir().join(format!("trove-inbox-{}", uuid::Uuid::new_v4()));
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let _ = handle(stream, &inbox);
+            }
+        });
+
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        stream.write_all(b"GET /health HTTP/1.1\r\n\r\n").unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).unwrap();
+        assert!(response.contains("200"), "{response}");
+        assert!(response.contains("application/json"), "{response}");
+
+        let body = response.split("\r\n\r\n").nth(1).unwrap_or("");
+        let value: serde_json::Value = serde_json::from_str(body).expect("valid JSON body");
+        assert_eq!(value["version"], env!("CARGO_PKG_VERSION"));
+        assert!(value["uptime_secs"].is_u64());
+        assert!(value["library"]["open"].is_boolean());
+        assert!(value["outbox"]["drained_rows_total"].is_u64());
+        assert!(
+            value["thumb_cache"]["hit_rate"].is_number()
+                || value["thumb_cache"]["hit_rate"].is_null()
+        );
+        assert!(value["queries"]["slow_threshold_ms"].is_u64());
     }
 
     /// The drain must never see a file that is still being written, nor a

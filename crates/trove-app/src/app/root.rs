@@ -240,6 +240,7 @@ impl AppView {
         .detach();
 
         crate::library::jobs::start_watch_service(&controller, window.window_handle(), cx);
+        crate::library::jobs::start_index_drain_service(&controller, window.window_handle(), cx);
         start_collect_server(cx);
 
         let tray = tray::Tray::install();

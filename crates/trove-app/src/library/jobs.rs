@@ -263,6 +263,57 @@ fn watch_signals(
     .detach();
 }
 
+/// Cadence for the resident index-drain loop. The read paths drain too —
+/// every search and browse flushes the outbox first — so this loop is not
+/// what makes the index converge during normal use; it is the safety net:
+/// it retries a drain that failed on a busy write lock, and keeps the index
+/// current even when nothing reads.
+const DRAIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Start the resident index-drain loop: every [`DRAIN_INTERVAL`], flush the
+/// `search_queue` outbox into the text index. The store connection is
+/// confined to the UI thread, so — like the watch pump — this runs as a
+/// foreground task, and a tick costs one small SELECT while the queue is
+/// empty.
+///
+/// Started once per session, next to the watch service. A library swap needs
+/// no restart — the loop follows whatever library the controller holds — and
+/// the loop ends when its window does.
+pub fn start_index_drain_service(
+    controller: &Entity<LibraryController>,
+    handle: gpui::AnyWindowHandle,
+    cx: &mut App,
+) {
+    let controller = controller.clone();
+    cx.spawn(async move |cx| {
+        loop {
+            cx.background_executor().timer(DRAIN_INTERVAL).await;
+            // A dead window ends the loop. A running import is skipped, not
+            // forced: the import's own connection takes the write lock in
+            // bursts, and the drain's batch delete would otherwise wait out
+            // the store's 5 s busy timeout on this thread — the outbox rows
+            // are still there for the next tick.
+            let ran = handle.update(cx, |_, _, cx| {
+                if controller.read(cx).is_importing() {
+                    return;
+                }
+                if let Err(error) =
+                    controller.update(cx, |ctl, _| ctl.library.drain_search_queue())
+                {
+                    tracing::warn!(
+                        %error,
+                        "periodic search outbox drain failed; the next tick retries"
+                    );
+                }
+            });
+            if ran.is_err() {
+                break;
+            }
+        }
+    })
+    .detach();
+}
+
 /// Start an import from a set of file paths into the currently browsed
 /// collection. See [`import_paths_app_into`].
 ///
@@ -659,3 +710,4 @@ fn cancel_button(
             })
     }
 }
+

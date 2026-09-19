@@ -14,7 +14,7 @@
 ## 安装（Firefox）
 
 manifest 是 Chrome/Firefox 双兼容 MV3：`background` 同时带 `scripts`（Firefox 走
-event page）和 `service_worker`（Chromium 走 SW）。Firefox 121+ 可用。
+event page）和 `service_worker`（Chromium 走 SW）。Firefox 128+ 可用。
 
 1. 启动 Trove 桌面应用（采集服务默认开启）。
 2. 临时加载（重启浏览器后失效，日常调试用）：
@@ -32,14 +32,20 @@ event page）和 `service_worker`（Chromium 走 SW）。Firefox 121+ 可用。
    - **Developer Edition / Nightly**：`about:config` 把
      `xpinstall.signatures.required` 设为 `false`，即可直接从文件安装未签名 .xpi。
 
-> 注：Firefox 桌面支持系统通知（走 libnotify/桌面通知守护进程）；保存结果也会写进
-> 背景脚本 console（`about:debugging` → 该扩展 →「检查」可看日志）。
+> 注：Firefox 桌面支持系统通知（走 libnotify/桌面通知守护进程）；保存成功与否
+> 一律以通知为准。
 
 ## 使用
 
 - 右键网页上的图片 → **保存图片到 Trove**。
 - 右键链接 → **保存链接文件到 Trove**（保存链接指向的文件）。
 - 点击扩展图标可修改端口并测试与 Trove 的连接。
+- 保存前会先探测采集服务：Trove 未运行时立即提示，不会白下载。
+- 抓图走「浏览器下载 → Trove 服务端下载」的回退链：浏览器请求带页面的登录
+  会话，服务端请求带浏览器 UA 和来源页 Referer，防盗链图片大概率也能拿下；
+  超过 64MB 的大文件直接走服务端（落盘流式，不占浏览器内存）。
+- `data:` 图片直接解码保存；`blob:` 图片（≤32MB）从页面内读取。
+- 「保存链接」指向网页（HTML）时会明确提示，不会把网页源码存进库。
 
 文件先落到 Trove 的 inbox 目录，几秒内自动导入（见状态栏/通知）。
 

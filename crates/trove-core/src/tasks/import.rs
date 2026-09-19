@@ -223,6 +223,7 @@ fn walk(dir: &Path, depth: usize, out: &mut Vec<PathBuf>, skipped: &mut Vec<impo
 /// Run one import to completion. Synchronous and self-contained: tests call
 /// it directly, [`super::TaskManager`] runs it on a thread.
 pub fn run(options: &ImportOptions, ctx: &JobContext) -> Result<ImportOutcome, String> {
+    let started = std::time::Instant::now();
     let (mut paths, into_collection, walk_skips) = match &options.source {
         ImportSource::Paths {
             paths,
@@ -351,6 +352,12 @@ pub fn run(options: &ImportOptions, ctx: &JobContext) -> Result<ImportOutcome, S
         report.imported_count(),
         report.skipped_count()
     ));
+    crate::metrics::note_import_run(
+        report.imported_count(),
+        report.skipped_count(),
+        error.is_some(),
+        started.elapsed(),
+    );
     Ok(ImportOutcome {
         report,
         cancelled,
