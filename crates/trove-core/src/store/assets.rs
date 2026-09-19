@@ -50,6 +50,33 @@ pub fn count_by_sha256(conn: &Connection, sha256: &str) -> Result<u64> {
     )? as u64)
 }
 
+/// Content columns of a *linked* asset after an in-place edit that wrote the
+/// re-encoded result back to the file it links to: hash, size and geometry
+/// move; the link columns do not (`rel_path` stays NULL, the origin stays
+/// linked, the source path is untouched).
+pub fn set_linked_media_columns(
+    conn: &Connection,
+    id: Uuid,
+    sha256: &str,
+    size_bytes: u64,
+    width: Option<u32>,
+    height: Option<u32>,
+) -> Result<()> {
+    rows::execute(
+        conn,
+        "UPDATE assets SET sha256 = ?1, size_bytes = ?2, width = ?3, height = ?4 \
+         WHERE id = ?5",
+        vec![
+            Value::Text(sha256.to_string()),
+            Value::Integer(size_bytes as i64),
+            rows::bind_opt_int(width.map(i64::from)),
+            rows::bind_opt_int(height.map(i64::from)),
+            rows::uuid(id).into(),
+        ],
+    )?;
+    Ok(())
+}
+
 /// Distinct content hashes referenced by any record (live or trashed).
 pub fn referenced_shas(conn: &Connection) -> Result<Vec<String>> {
     rows::query_map(

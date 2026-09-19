@@ -4,9 +4,11 @@
 //! size, dimensions, thumbnail and visual fingerprint are recomputed by the
 //! backend ([`trove_core::library::Library::batch_edit_images`]).
 //!
-//! Only assets the library owns can be edited: a *linked* file belongs to its
-//! owner and the backend refuses it, so the dialog says so before the user
-//! picks options rather than failing one file at a time afterwards.
+//! Where the result lands depends on how the asset is stored: a *stored*
+//! asset's new content becomes a library blob, while a *linked* asset's
+//! result is **written back over the original file** it links to — the
+//! user's own file, changed in place. The dialog says so up front and the
+//! count of linked assets in the batch rides on the note below the form.
 //!
 //! Crop is expressed in percent of the frame, measured *after* rotation, and
 //! resolved to pixels per asset — a batch holds files of different sizes, so
@@ -202,20 +204,14 @@ impl EditDialog {
     }
 
     /// The dialog proper over a pre-filtered set of candidate images. Empty
-    /// candidates say so up front: either nothing here is an image (or all
-    /// of it is trashed), or every image is linked and the backend would
-    /// refuse it.
+    /// candidates say so up front: nothing here is an image (or all of it is
+    /// trashed).
     fn open_batch(
         window: &mut Window,
         cx: &mut App,
         controller: Entity<LibraryController>,
         images: Vec<Asset>,
     ) {
-        let editable: Vec<Asset> = images
-            .iter()
-            .filter(|a| a.origin != Origin::Linked)
-            .cloned()
-            .collect();
         if images.is_empty() {
             window.push_notification(
                 Notification::warning(rust_i18n::t!("edit.empty_selection").to_string()),
@@ -223,17 +219,14 @@ impl EditDialog {
             );
             return;
         }
-        if editable.is_empty() {
-            // Worth saying out loud rather than failing per file: in a
-            // link-only library this is every asset there is.
-            window.push_notification(
-                Notification::warning(rust_i18n::t!("edit.all_linked").to_string()),
-                cx,
-            );
-            return;
-        }
 
-        let linked_skipped = images.len() - editable.len();
+        // Linked assets are editable — the result is written back over the
+        // original file — but the user should see that coming before they
+        // pick options.
+        let linked = images
+            .iter()
+            .filter(|a| a.origin == Origin::Linked)
+            .count();
         window.open_dialog(cx, move |dialog, window, cx| {
             let crop_left = cx.new(|cx| InputState::new(window, cx).placeholder("0"));
             let crop_top = cx.new(|cx| InputState::new(window, cx).placeholder("0"));
@@ -242,8 +235,8 @@ impl EditDialog {
             let quality = cx.new(|cx| InputState::new(window, cx).placeholder("90"));
             let draft = cx.new(|_| EditDraft {
                 controller: controller.clone(),
-                images: editable.clone(),
-                linked_skipped,
+                images: images.clone(),
+                linked,
                 rotation: Rotation::None,
                 flip_h: false,
                 flip_v: false,
@@ -255,7 +248,7 @@ impl EditDialog {
             });
             let draft_ok = draft.clone();
             dialog
-                .title(rust_i18n::t!("edit.title", count = editable.len()).to_string())
+                .title(rust_i18n::t!("edit.title", count = images.len()).to_string())
                 .width(px(520.))
                 .close_button(false)
                 .child(super::with_close_x(
@@ -340,8 +333,9 @@ pub(crate) fn apply_single_edit(
 struct EditDraft {
     controller: Entity<LibraryController>,
     images: Vec<Asset>,
-    /// Linked assets in the selection, reported in the dialog's note.
-    linked_skipped: usize,
+    /// Linked assets in the batch: their edit results are written back over
+    /// the original files, which the note below the form spells out.
+    linked: usize,
     rotation: Rotation,
     flip_h: bool,
     flip_v: bool,
@@ -393,9 +387,9 @@ impl EditDraft {
 
 /// The dialog body: rotation, flips, the crop row, quality and the notes.
 fn content(draft: &Entity<EditDraft>, cx: &mut App) -> Div {
-    let (rotation, flip_h, flip_v, linked_skipped) = {
+    let (rotation, flip_h, flip_v, linked) = {
         let d = draft.read(cx);
-        (d.rotation, d.flip_h, d.flip_v, d.linked_skipped)
+        (d.rotation, d.flip_h, d.flip_v, d.linked)
     };
     let label = |cx: &App, key: &'static str| {
         div()
@@ -520,12 +514,12 @@ fn content(draft: &Entity<EditDraft>, cx: &mut App) -> Div {
                 .text_color(cx.theme().muted_foreground)
                 .child(rust_i18n::t!("edit.note").to_string()),
         );
-    if linked_skipped > 0 {
+    if linked > 0 {
         body = body.child(
             div()
                 .text_xs()
                 .text_color(cx.theme().muted_foreground)
-                .child(rust_i18n::t!("edit.linked_note", count = linked_skipped).to_string()),
+                .child(rust_i18n::t!("edit.linked_note", count = linked).to_string()),
         );
     }
     body

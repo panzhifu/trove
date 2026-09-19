@@ -868,8 +868,10 @@ impl Library {
     /// re-encoded results in as the assets' new media content. Identity and
     /// organization (id, title, tags, collections, captured-at) survive the
     /// edit; hash, size, dimensions, thumbnail and visual fingerprint are
-    /// recomputed. Linked assets are rejected — their files belong to the
-    /// user, the library only references them.
+    /// recomputed. A *stored* asset's new content becomes a library blob; a
+    /// *linked* asset's result is written back over the original file it
+    /// links to — the caller (and the UI above it) owns that decision, the
+    /// backend just keeps the record honest about what the file now is.
     pub fn batch_edit_images(
         &self,
         ids: &[Uuid],
@@ -905,13 +907,11 @@ impl Library {
         if asset.trashed_at.is_some() || asset.kind != crate::model::AssetKind::Image {
             return Ok(false);
         }
-        if asset.origin != crate::model::Origin::Linked && asset.rel_path.is_none() {
-            return Ok(false);
-        }
         if asset.origin == crate::model::Origin::Linked {
-            return Err(crate::Error::Validation(
-                "linked assets cannot be edited in place (the file stays with its owner)".into(),
-            ));
+            return self.edit_linked_in_place(&asset, edits, jpeg_quality);
+        }
+        if asset.rel_path.is_none() {
+            return Ok(false);
         }
 
         let source = self
@@ -931,6 +931,84 @@ impl Library {
         })();
         let _ = std::fs::remove_file(&tmp);
         result?;
+        Ok(true)
+    }
+
+    /// Edit a *linked* asset in place: the re-encoded result overwrites the
+    /// original file the record links to, and the record's content columns
+    /// (hash, size, geometry) follow so the library stays honest about what
+    /// that file now is. The link itself is untouched — same path, same
+    /// origin. A sibling record linking the same file keeps its old hash
+    /// until the integrity check meets the changed file; the rewrite is the
+    /// user's explicit act, and this is its one honest consequence.
+    fn edit_linked_in_place(
+        &self,
+        asset: &crate::model::Asset,
+        edits: &[media::edit::ImageEdit],
+        jpeg_quality: u8,
+    ) -> Result<bool> {
+        let Some(source) = asset.facts.source_path.as_ref().map(PathBuf::from) else {
+            // No reachable original (moved, or never recorded): skip the
+            // asset — relinking is the fix, not an error toast.
+            return Ok(false);
+        };
+        let out = media::edit::apply(&source, edits, jpeg_quality)?;
+        let sha = {
+            use sha2::{Digest, Sha256};
+            let mut hasher = Sha256::new();
+            hasher.update(&out.bytes);
+            crate::media::blob::hex(hasher.finalize().as_slice())
+        };
+        if asset
+            .sha256
+            .as_deref()
+            .is_some_and(|old| old.eq_ignore_ascii_case(&sha))
+        {
+            // The edits produced byte-identical content: the file on disk is
+            // already what the record says.
+            return Ok(true);
+        }
+
+        // Atomic replace: the bytes land on a hidden sibling first and a
+        // rename moves them over the original, so a crash mid-write costs at
+        // most the previous content, never a truncated file.
+        let tmp = source.with_file_name(format!(
+            ".{}.trove-edit-{}",
+            source
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("file"),
+            uuid::Uuid::new_v4().simple()
+        ));
+        let write = (|| -> Result<()> {
+            std::fs::write(&tmp, &out.bytes)?;
+            std::fs::rename(&tmp, &source)?;
+            Ok(())
+        })();
+        if let Err(error) = write {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(error);
+        }
+
+        let old_sha = asset.sha256.clone().unwrap_or_default();
+        assets::set_linked_media_columns(
+            self.store.conn(),
+            asset.id,
+            &sha,
+            out.bytes.len() as u64,
+            Some(out.width),
+            Some(out.height),
+        )?;
+
+        // The old thumbnail described content no record references anymore
+        // once the last asset on that hash is gone; the new one is rebuilt
+        // from the file where it lives.
+        if !old_sha.is_empty()
+            && assets::count_by_sha256(self.store.conn(), &old_sha)? == 0
+        {
+            let _ = std::fs::remove_file(media::thumb::abs_path(self.cache(), &old_sha));
+        }
+        media::thumb::regenerate(self.cache(), &sha, asset.kind, &source);
         Ok(true)
     }
 
@@ -2634,6 +2712,83 @@ mod tests {
         path
     }
 
+    /// A linked asset's edit rewrites the file where it lives and the
+    /// record follows the new content — same path, same origin, no blob.
+    #[test]
+    fn batch_edit_writes_a_linked_file_back_in_place() {
+        let (lib, _root) = temp_library("edit-linked");
+        // The user's own directory, outside the library root: linking is
+        // what makes this the file the user keeps.
+        let home = std::env::temp_dir().join(format!("trove-edit-src-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&home).unwrap();
+        let src = write_wide_png(&home, "kept.png");
+        let original_bytes = std::fs::read(&src).unwrap();
+
+        let report = lib.link_files(std::slice::from_ref(&src), None).unwrap();
+        let id = report.imported[0].asset_id;
+        let conn = lib.store().conn();
+        let before = assets::get(conn, id).unwrap().unwrap();
+        assert_eq!(before.origin, crate::model::Origin::Linked);
+        assert!(before.rel_path.is_none());
+        let old_sha = before.sha256.clone().unwrap();
+        assert!(thumb::abs_path(lib.cache(), &old_sha).is_file());
+
+        let out = lib
+            .batch_edit_images(&[id], &[crate::media::edit::ImageEdit::Rotate90], 90)
+            .unwrap();
+        assert_eq!(out.edited, 1, "failures: {:?}", out.failures);
+
+        // The original file now holds the rotated picture — same path, PNG
+        // still, and no longer the bytes it started with.
+        let rewritten = image::image_dimensions(&src).unwrap();
+        assert_eq!(rewritten, (3, 4), "the file itself rotated");
+        assert_ne!(std::fs::read(&src).unwrap(), original_bytes);
+
+        // The record moved with the content; the link columns did not.
+        let after = assets::get(conn, id).unwrap().unwrap();
+        assert_eq!(after.origin, crate::model::Origin::Linked);
+        assert!(after.rel_path.is_none());
+        assert_eq!(after.facts.source_path.as_deref(), Some(src.to_str().unwrap()));
+        assert_ne!(after.sha256.as_deref(), Some(old_sha.as_str()));
+        assert_eq!((after.width, after.height), (Some(3), Some(4)));
+        assert!(thumb::abs_path(lib.cache(), after.sha256.as_deref().unwrap()).is_file());
+        assert!(
+            !thumb::abs_path(lib.cache(), &old_sha).is_file(),
+            "the old thumbnail describes content nothing references"
+        );
+
+        // No temp siblings survive the write.
+        let litter: Vec<_> = std::fs::read_dir(&home)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains("trove-edit"))
+            .collect();
+        assert!(litter.is_empty(), "temp write-back files left behind: {litter:?}");
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// A linked asset whose recorded source path is *gone* is a per-asset
+    /// failure, not a silent skip: the user asked for this edit, so the
+    /// report must say it did not happen. (Relinking is the fix.)
+    #[test]
+    fn batch_edit_reports_a_linked_asset_whose_file_vanished() {
+        let (lib, root) = temp_library("edit-linked-missing");
+        let src = write_wide_png(&root, "gone.png");
+        let report = lib.link_files(std::slice::from_ref(&src), None).unwrap();
+        let id = report.imported[0].asset_id;
+        std::fs::remove_file(&src).unwrap();
+
+        let out = lib
+            .batch_edit_images(&[id], &[crate::media::edit::ImageEdit::Rotate90], 90)
+            .unwrap();
+        assert_eq!(out.edited, 0);
+        assert_eq!(out.skipped, 0, "failures: {:?}", out.failures);
+        assert_eq!(out.failures.len(), 1);
+        assert_eq!(out.failures[0].0, id);
+    }
+
     #[test]
     fn batch_edit_rotates_and_swaps_content_in_place() {
         let (lib, root) = temp_library("batch-edit");
@@ -2688,8 +2843,9 @@ mod tests {
             .unwrap();
         let stored_id = report.imported[0].asset_id;
 
-        // A linked asset: its file belongs to the user, editing is refused
-        // (as a per-asset failure, not a batch abort).
+        // A linked asset: its edit writes back to the file it links to (the
+        // rewrite is what makes the file's owner the decision-maker, and the
+        // UI confirms before handing a batch to this path).
         let linked_src = write_source(&root, "linked.png", PNG_1X1);
         use crate::media::import::{ImportStorage, commit_staged_all, stage_all};
         use crate::model::Origin;
@@ -2711,6 +2867,7 @@ mod tests {
                 .id
         };
 
+        let linked_before = std::fs::read(&linked_src).unwrap();
         let out = lib
             .batch_edit_images(
                 &[stored_id, linked_id, Uuid::new_v4()],
@@ -2718,12 +2875,16 @@ mod tests {
                 90,
             )
             .unwrap();
-        assert_eq!(out.edited, 1);
-        // The missing id is skipped (no record), the linked one is a failure.
+        // The stored asset swaps blobs, the linked one rewrites its file in
+        // place; only the missing id is skipped (no record at all).
+        assert_eq!(out.edited, 2, "failures: {:?}", out.failures);
         assert_eq!(out.skipped, 1);
-        assert_eq!(out.failures.len(), 1);
-        assert_eq!(out.failures[0].0, linked_id);
-        assert!(out.failures[0].1.contains("linked"));
+        assert!(out.failures.is_empty());
+        assert_ne!(
+            std::fs::read(&linked_src).unwrap(),
+            linked_before,
+            "the linked file was rewritten"
+        );
     }
 
     #[test]
