@@ -7,10 +7,11 @@
 
 use gpui_kit::base::h_flex;
 use gpui_kit::component::ActiveTheme as _;
-use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::button::{Button, ButtonVariants as _, ButtonVariant};
+use gpui_kit::component::dialog::DialogButtonProps;
 use gpui_kit::component::dock::{Panel as DockPanel, PanelControl};
 use gpui_kit::component::slider::Slider;
-use gpui_kit::component::{IconName, Sizable as _};
+use gpui_kit::component::{IconName, Sizable as _, WindowExt as _};
 use gpui_kit::*;
 
 use crate::components::preview::{AssetPreviewPanel, ModelViewport};
@@ -164,16 +165,29 @@ fn preview_toolbar(
     use gpui_kit::assets::IconName as ToolIcon;
     use gpui_kit::component::Disableable as _;
 
-    let (asset_id, is_image, blocker) = {
+    let (asset_id, is_image, blocker, write_back, original) = {
         let panel = preview.read(cx);
-        (panel.asset_id(), panel.is_image(), panel.edit_blocker())
+        (
+            panel.asset_id(),
+            panel.is_image(),
+            panel.edit_blocker(),
+            panel.write_back(),
+            panel
+                .original_path()
+                .map(std::path::Path::to_path_buf),
+        )
     };
+    // The panel entity, so a write-back confirmation can reopen the preview
+    // once the backend has written — the dialog callback runs outside any
+    // listener on this panel.
+    let panel_entity = cx.entity();
     let mut bar = h_flex().items_center().gap_1();
 
     // The pixel edits act on the picture on screen — not on the grid
     // selection, which the preview replaced. Each quick edit re-encodes at
     // the dialog's default quality and re-opens the preview, so the edited
-    // result replaces the picture the moment the backend wrote it.
+    // result replaces the picture the moment the backend wrote it. A linked
+    // asset's edit overwrites the user's own file, so it asks first.
     if let Some(id) = asset_id
         && is_image
     {
@@ -211,6 +225,8 @@ fn preview_toolbar(
             ),
         ] {
             let ctl = controller.clone();
+            let panel = panel_entity.clone();
+            let original = original.clone();
             bar = bar.child(
                 Button::new(btn_id)
                     .ghost()
@@ -218,9 +234,32 @@ fn preview_toolbar(
                     .icon(icon)
                     .disabled(blocked)
                     .tooltip(tooltip(key))
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        if crate::dialogs::edit::apply_single_edit(&ctl, id, edits.clone(), window, cx) {
-                            this.open_asset_preview(id, window, cx);
+                    .on_click(cx.listener(move |_, _, window, cx| {
+                        let apply = {
+                            let ctl = ctl.clone();
+                            let edits = edits.clone();
+                            let panel = panel.clone();
+                            // `Fn`, not `FnOnce`: the write-back confirmation
+                            // hands it to a dialog callback that may be built
+                            // more than once.
+                            move |window: &mut Window, cx: &mut App| {
+                                if crate::dialogs::edit::apply_single_edit(
+                                    &ctl,
+                                    id,
+                                    edits.clone(),
+                                    window,
+                                    cx,
+                                ) {
+                                    panel.update(cx, |this, cx| {
+                                        this.open_asset_preview(id, window, cx);
+                                    });
+                                }
+                            }
+                        };
+                        if write_back {
+                            confirm_write_back(window, cx, original.clone(), apply);
+                        } else {
+                            apply(window, cx);
                         }
                     })),
             );
@@ -257,4 +296,45 @@ fn preview_toolbar(
                 this.dismiss_preview(window, cx);
             })),
     )
+}
+
+/// The write-back confirmation for a linked asset: editing overwrites the
+/// file the user keeps, so the edit runs only after an OK that names the
+/// path and says the act cannot be undone.
+fn confirm_write_back(
+    window: &mut Window,
+    cx: &mut App,
+    path: Option<std::path::PathBuf>,
+    run: impl Fn(&mut Window, &mut App) + 'static,
+) {
+    let Some(path) = path else {
+        // No recorded path to name: run as-is — the backend reports what
+        // happens (a link without a reachable original fails loudly there).
+        run(window, cx);
+        return;
+    };
+    // `Rc` rather than a move: the dialog builder closure is `Fn` (the
+    // framework may build it again), and each build hands a clone to `on_ok`.
+    let run = std::rc::Rc::new(run);
+    window.open_dialog(cx, move |dialog, _, _| {
+        let run = run.clone();
+        let shown = path.display().to_string();
+        dialog
+            .title(rust_i18n::t!("edit.writeback_title").to_string())
+            .width(px(440.))
+            .close_button(false)
+            .child(div().text_sm().p_1().child(
+                rust_i18n::t!("edit.writeback_body", path = shown).to_string(),
+            ))
+            .button_props(
+                DialogButtonProps::default()
+                    .ok_text(rust_i18n::t!("edit.writeback_ok").to_string())
+                    .ok_variant(ButtonVariant::Danger)
+                    .show_cancel(true),
+            )
+            .on_ok(move |_, window, cx| {
+                run(window, cx);
+                true
+            })
+    });
 }

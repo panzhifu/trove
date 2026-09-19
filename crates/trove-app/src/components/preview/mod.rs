@@ -160,12 +160,15 @@ pub(crate) struct AssetPreviewData {
     /// Whether the previewed asset is an image — the only kind whose
     /// toolbar carries the pixel-edit tools.
     pub(crate) is_image: bool,
+    /// Whether an edit on this asset writes its result back over the
+    /// original file (a *linked* asset: the library holds no copy). The
+    /// toolbar asks for confirmation before the first byte moves; a stored
+    /// asset's edit only touches the library's own blob.
+    pub(crate) write_back: bool,
     /// Why the backend would refuse a pixel edit on this asset, `None` when
-    /// it may take one: a *linked* file belongs to its source and the
-    /// backend re-encodes only what the library stores; a trashed asset is
-    /// not editable until restored. The toolbar renders its buttons
-    /// disabled with this as the reason, rather than hiding them — a
-    /// silently missing toolbar reads as a bug.
+    /// it may take one. A trashed asset is not editable until restored —
+    /// the toolbar renders its buttons disabled with this as the reason,
+    /// rather than hiding them; a silently missing toolbar reads as a bug.
     pub(crate) edit_blocker: Option<&'static str>,
     pub(crate) thumb: Option<PathBuf>,
     /// Full-size original: the library blob, or the linked source.
@@ -221,9 +224,8 @@ impl AssetPreviewData {
             name: crate::panels::common::display_name(asset),
             kind: asset.kind,
             is_image: asset.kind == trove_core::model::AssetKind::Image,
-            edit_blocker: if asset.origin == trove_core::model::Origin::Linked {
-                Some("edit.blocked_linked")
-            } else if asset.trashed_at.is_some() {
+            write_back: asset.origin == trove_core::model::Origin::Linked,
+            edit_blocker: if asset.trashed_at.is_some() {
                 Some("edit.blocked_trashed")
             } else {
                 None
@@ -389,6 +391,18 @@ impl AssetPreviewPanel {
     /// why.
     pub(crate) fn edit_blocker(&self) -> Option<&'static str> {
         self.data.edit_blocker
+    }
+
+    /// Whether an edit writes its result back over the original file (the
+    /// asset links to it) instead of re-encoding the library's own copy —
+    /// the toolbar confirms before the first byte moves.
+    pub(crate) fn write_back(&self) -> bool {
+        self.data.write_back
+    }
+
+    /// The file an edit reads from and, for a linked asset, writes back to.
+    pub(crate) fn original_path(&self) -> Option<&Path> {
+        self.data.original.as_deref()
     }
 
     /// The live player, for the app view to render as a fullscreen stage in
