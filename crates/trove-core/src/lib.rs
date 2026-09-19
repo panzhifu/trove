@@ -8,6 +8,7 @@ pub mod keybindings;
 pub mod layout;
 pub mod library;
 pub mod media;
+pub mod metrics;
 pub mod model;
 pub mod paths;
 pub mod plugins;

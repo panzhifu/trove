@@ -75,7 +75,15 @@ pub fn translate(key: &str, patterns: &[&str], values: &[String]) -> Option<Stri
     let text = store
         .get(&current)
         .and_then(|catalog| catalog.get(key))
-        .or_else(|| store.get("en").and_then(|catalog| catalog.get(key)))?;
+        .or_else(|| store.get("en").and_then(|catalog| catalog.get(key)));
+    let Some(text) = text else {
+        // A miss here is how a key-shape mismatch between the code and a
+        // plugin's catalogs surfaces — silent at compile time, invisible at
+        // the default log level, and exactly what a `plugins.*` literal in
+        // the UI means. One debug line makes it findable.
+        tracing::debug!(key, "no plugin translation carries this key");
+        return None;
+    };
     Some(rust_i18n::replace_patterns(text, patterns, values))
 }
 

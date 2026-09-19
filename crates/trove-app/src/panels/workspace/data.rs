@@ -272,8 +272,12 @@ impl WorkspacePanel {
         let ctl = self.controller.read(cx);
         let conn = ctl.library.store().conn();
         // Flush pending outbox rows first so a just-finished write (import,
-        // edit) is reflected in the same refresh.
-        let _ = ctl.library.drain_search_queue();
+        // edit) is reflected in the same refresh. A failed drain (a writer
+        // holding the store's write lock past the busy timeout) still renders
+        // the page — a stale browse beats no browse — but the staleness must
+        // not be silent: the log records it and the notice below names it;
+        // the resident drain loop and the next refresh both retry.
+        let drained = ctl.library.drain_search_queue();
         let text_index = ctl.library.text_index();
         let page = match if count_total {
             ctx.run(conn, text_index, limit)
@@ -286,6 +290,12 @@ impl WorkspacePanel {
                 trove_core::model::Page::new(0, Vec::new())
             }
         };
+        if let Err(error) = drained {
+            tracing::warn!(%error, "search outbox drain failed before a browse refresh");
+            let msg =
+                rust_i18n::t!("workspace.index_sync_failed", error = error.to_string()).to_string();
+            self.report_notice(cx, msg);
+        }
         let (total, list) = (page.total as usize, page.items);
 
         let cells: Vec<Cell> = list
@@ -318,11 +328,16 @@ impl WorkspacePanel {
         (cells.len(), cells)
     }
 
-    /// Surface a view/query failure in the status bar. `report_error`
-    /// dedupes identical messages so a re-render cannot re-notify in a
-    /// loop when the same query keeps failing.
+    /// Surface a view/query failure in the status bar.
     fn report_view_error(&mut self, cx: &mut Context<Self>, error: impl std::fmt::Display) {
         let msg = rust_i18n::t!("workspace.query_failed", error = error.to_string()).to_string();
+        self.report_notice(cx, msg);
+    }
+
+    /// Push a message into the controller's status-bar notice; `report_error`
+    /// dedupes identical messages so a render-path caller can notify safely
+    /// without re-render loops when the same message keeps failing.
+    fn report_notice(&mut self, cx: &mut Context<Self>, msg: String) {
         self.controller.update(cx, |ctl, cx| {
             if ctl.report_error(msg) {
                 cx.notify();

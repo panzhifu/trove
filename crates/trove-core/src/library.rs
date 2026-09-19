@@ -245,6 +245,12 @@ impl Library {
         // outdated index re-derives itself from the store here, so `search`
         // never silently returns nothing for assets that predate it.
         lib.reconcile_search_index()?;
+        // Health headline: a library is open and here is its size — the two
+        // gauges a /health scrape leads with. A failed count is not worth
+        // failing the open over; the gauge just stays at zero.
+        let assets = rows::query_count(lib.store.conn(), "SELECT COUNT(*) FROM assets", vec![])
+            .unwrap_or(0);
+        crate::metrics::set_library_open(assets.max(0) as u64);
         // Daily safety snapshot (24h throttle, rolling 10 files). Best-effort:
         // a failed backup never blocks opening the library.
         crate::services::backup::maybe_auto_backup(&lib.root, lib.store.conn());
@@ -454,6 +460,9 @@ impl Library {
         let t_rank = t0.elapsed();
         let page = assets::page_assets(&ids, q, conn)?;
         let t_page = t0.elapsed();
+        // The whole query against the slow-query threshold; the drain inside
+        // it warns separately through the outbox's own slow-drain log.
+        crate::metrics::note_query(t_page);
         if prof {
             let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
             eprintln!(
@@ -2930,5 +2939,4 @@ mod tests {
         let out = lib.export_xmp_sidecars(&[id]).unwrap();
         assert_eq!(out.written, 0);
         assert_eq!(out.skipped, 1);
-    }
-}
+    }}

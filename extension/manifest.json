@@ -1,18 +1,19 @@
 {
   "manifest_version": 3,
   "name": "Trove 采集器",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "把网页图片一键存进本地 Trove 素材库。",
   "browser_specific_settings": {
     "gecko": {
       "id": "trove-collector@trove.local",
-      "strict_min_version": "121.0"
+      "strict_min_version": "128.0"
     }
   },
   "permissions": [
     "contextMenus",
     "storage",
-    "notifications"
+    "notifications",
+    "scripting"
   ],
   "host_permissions": [
     "<all_urls>"

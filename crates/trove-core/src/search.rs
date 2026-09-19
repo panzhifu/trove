@@ -591,10 +591,19 @@ impl TextIndex {
 /// still there.
 const DRAIN_BATCH: i64 = 8_000;
 
+/// A drain pass that runs longer than this escalates its log line from
+/// debug to warn — the index's closest thing to a slow-query log. One batch
+/// of [`DRAIN_BATCH`] lands well under it; a warn means a backlog big enough
+/// that the UI thread paid real time on the read path that triggered it.
+const SLOW_DRAIN: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// Flush the `search_queue` outbox into the index: upsert rows whose assets
 /// still exist, drop documents for purged ones. Cheap when the queue is empty
 /// (one small SELECT), so every search can afford to call it. Lives on the
 /// store connection, so both [`crate::library::Library`] and tests drive it.
+///
+/// A pass that moved rows logs its size and duration — debug normally, warn
+/// past [`SLOW_DRAIN`]. These lines are the outbox's only queue-depth signal.
 ///
 /// This is the only place the search index learns about asset or tag writes —
 /// the `search_queue` triggers fill the outbox and nothing else touches the
@@ -606,6 +615,8 @@ const DRAIN_BATCH: i64 = 8_000;
 /// [`TextIndex::index_asset`] also drops a doc whose row has vanished). The
 /// converse order would lose index updates silently.
 pub fn drain(conn: &Connection, index: &TextIndex) -> Result<()> {
+    let started = std::time::Instant::now();
+    let mut rows: u64 = 0;
     loop {
         let pending: Vec<(i64, Uuid, bool)> = crate::store::rows::query_map(
             conn,
@@ -622,6 +633,7 @@ pub fn drain(conn: &Connection, index: &TextIndex) -> Result<()> {
         if pending.is_empty() {
             break;
         }
+        rows += pending.len() as u64;
         let full_batch = pending.len() as i64 == DRAIN_BATCH;
 
         // `search_queue` has no UNIQUE constraint (duplicate rows are
@@ -670,6 +682,17 @@ pub fn drain(conn: &Connection, index: &TextIndex) -> Result<()> {
 
         if !full_batch {
             break;
+        }
+    }
+    if rows > 0 {
+        let elapsed = started.elapsed();
+        let elapsed_ms = elapsed.as_millis() as u64;
+        let slow = elapsed >= SLOW_DRAIN;
+        crate::metrics::note_drain(rows, elapsed, slow);
+        if slow {
+            tracing::warn!(rows, elapsed_ms, "slow search outbox drain");
+        } else {
+            tracing::debug!(rows, elapsed_ms, "search outbox drained");
         }
     }
     Ok(())

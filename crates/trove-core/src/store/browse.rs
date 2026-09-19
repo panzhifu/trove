@@ -82,6 +82,21 @@ impl BrowseContext {
         limit: Option<u32>,
         count: bool,
     ) -> Result<Page<Asset>> {
+        // Every paged browse feeds the query metrics; past the slow threshold
+        // the note itself logs the warn.
+        let started = std::time::Instant::now();
+        let result = self.run_counted_inner(conn, text, limit, count);
+        crate::metrics::note_query(started.elapsed());
+        result
+    }
+
+    fn run_counted_inner(
+        &self,
+        conn: &Connection,
+        text: &crate::search::TextIndex,
+        limit: Option<u32>,
+        count: bool,
+    ) -> Result<Page<Asset>> {
         let search_active = !self.in_trash && !self.in_recent && !self.search.trim().is_empty();
 
         if self.in_recent {

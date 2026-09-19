@@ -507,10 +507,17 @@ fn render_psd(path: &Path) -> Option<image::DynamicImage> {
 
 /// The existing cache entry for `sha`, when there is one. The import pipeline
 /// asks this *before* decoding: a re-import can then decode the small cached
-/// thumbnail instead of the original.
+/// thumbnail instead of the original. Every probe feeds the cache-hit
+/// metrics.
 pub fn cached(root: &Path, sha: &str) -> Option<PathBuf> {
     let out = abs_path(root, sha);
-    out.is_file().then_some(out)
+    if out.is_file() {
+        crate::metrics::note_thumb_hit();
+        Some(out)
+    } else {
+        crate::metrics::note_thumb_miss();
+        None
+    }
 }
 
 /// Downscale `image` to fit [`THUMB_MAX`] on its longest edge, never

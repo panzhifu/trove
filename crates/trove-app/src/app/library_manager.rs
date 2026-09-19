@@ -8,10 +8,10 @@
 //!
 //! Launcher layout: the libraries stack in a sidebar on the left (click
 //! selects, double click enters, and rename turns the row itself into an
-//! editor the way the collections panel does); the right side is a centered
-//! hero — logo, name, version — over one card whose divider-separated rows
-//! carry the commands: create, full-backup export, and the interface
-//! language.
+//! editor the way the collections panel does), each row's kebab carrying
+//! the row's commands — full-backup export, rename, delete; the right side
+//! is a centered hero — logo, name, version — over one card with the
+//! commands: create, and the interface language.
 
 use std::sync::{Arc, OnceLock};
 
@@ -440,13 +440,10 @@ impl LibraryManagerView {
             )
     }
 
-    /// The card: one row per command, hairline-separated, with the language
-    /// picker as the footer row. There is no "open" row: entering a library
-    /// is the sidebar's double click.
+    /// The card: the create row, with the language picker as the footer row.
+    /// There is no "open" row: entering a library is the sidebar's double
+    /// click, and the backup export lives in the sidebar rows' kebab menus.
     fn action_card(&mut self, cx: &mut Context<Self>) -> Div {
-        let border = cx.theme().border;
-        let divider = move || div().mx_4().border_t_1().border_color(border);
-
         v_flex()
             .w_full()
             .bg(cx.theme().group_box)
@@ -454,14 +451,11 @@ impl LibraryManagerView {
             .border_color(cx.theme().border)
             .rounded(cx.theme().radius_lg)
             .child(self.create_row(cx))
-            .child(divider())
-            .child(self.backup_row(cx))
             .child(self.language_footer(cx))
     }
 
-    /// One card row: one line of text on the left — the command name for the
-    /// create row, the current subject or hint for the others — and the
-    /// controls on the right.
+    /// One card row: the command name on the left, the controls on the
+    /// right.
     fn card_row(
         &self,
         text: String,
@@ -505,25 +499,6 @@ impl LibraryManagerView {
                         })),
                 )
                 .into_any_element(),
-            cx,
-        )
-    }
-
-    /// Backup: one archive carrying the software configuration and every
-    /// library's data, for moving or backing the whole install up.
-    fn backup_row(&mut self, cx: &mut Context<Self>) -> Div {
-        self.card_row(
-            rust_i18n::t!("library_manager.backup").to_string(),
-            true,
-            h_flex().flex_shrink_0().child(
-                Button::new("manager-backup")
-                    .outline()
-                    .label(rust_i18n::t!("library_manager.backup_button").to_string())
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.export_backup(window, cx);
-                    })),
-            )
-            .into_any_element(),
             cx,
         )
     }
@@ -589,8 +564,8 @@ impl LibraryManagerView {
 
 /// One library in the sidebar: its name, where it lives underneath, a
 /// "in use" badge when it is the open one, and a kebab with the row's
-/// commands (rename, delete). Click selects it for the card; a double click
-/// enters straight away.
+/// commands (export, rename, delete). Click selects it for the card; a
+/// double click enters straight away.
 fn library_row(
     view: &Entity<LibraryManagerView>,
     entry: LibraryEntry,
@@ -680,9 +655,10 @@ fn library_row(
         .into_any_element()
 }
 
-/// One row's kebab: the commands that act on this library. Delete confirms
-/// through a dialog naming what goes, so an irreversible act never happens
-/// from a menu slip.
+/// One row's kebab: the commands that act on this library. The export item
+/// writes the full-backup archive — the whole install, not just this row's
+/// library. Delete confirms through a dialog naming what goes, so an
+/// irreversible act never happens from a menu slip.
 fn row_menu(
     view: &Entity<LibraryManagerView>,
     entry: LibraryEntry,
@@ -690,6 +666,7 @@ fn row_menu(
 ) -> impl IntoElement {
     let menu_entry = entry.clone();
     let menu_view = view.clone();
+    let export_view = view.clone();
     Button::new(SharedString::from(format!(
         "manager-row-menu-{}",
         entry.slug
@@ -702,7 +679,15 @@ fn row_menu(
         let rename_entry = menu_entry.clone();
         let rename_view = menu_view.clone();
         let delete_entry = menu_entry.clone();
+        let export_view = export_view.clone();
         menu.min_w(px(140.))
+            .item(
+                PopupMenuItem::new(rust_i18n::t!("library_manager.backup").to_string()).on_click(
+                    move |_, window, cx| {
+                        export_view.update(cx, |this, cx| this.export_backup(window, cx));
+                    },
+                ),
+            )
             .item(
                 PopupMenuItem::new(rust_i18n::t!("library_manager.rename").to_string()).on_click(
                     move |_, window, cx| {
