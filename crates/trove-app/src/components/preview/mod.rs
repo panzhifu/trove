@@ -157,9 +157,16 @@ pub(crate) struct AssetPreviewData {
     pub(crate) asset_id: Option<Uuid>,
     pub(crate) name: String,
     pub(crate) kind: trove_core::model::AssetKind,
-    /// Whether the backend may re-encode this asset's pixels: an image the
-    /// library owns (a linked file belongs to its owner) and not in trash.
-    pub(crate) editable: bool,
+    /// Whether the previewed asset is an image — the only kind whose
+    /// toolbar carries the pixel-edit tools.
+    pub(crate) is_image: bool,
+    /// Why the backend would refuse a pixel edit on this asset, `None` when
+    /// it may take one: a *linked* file belongs to its source and the
+    /// backend re-encodes only what the library stores; a trashed asset is
+    /// not editable until restored. The toolbar renders its buttons
+    /// disabled with this as the reason, rather than hiding them — a
+    /// silently missing toolbar reads as a bug.
+    pub(crate) edit_blocker: Option<&'static str>,
     pub(crate) thumb: Option<PathBuf>,
     /// Full-size original: the library blob, or the linked source.
     pub(crate) original: Option<PathBuf>,
@@ -213,12 +220,14 @@ impl AssetPreviewData {
             asset_id: Some(asset.id),
             name: crate::panels::common::display_name(asset),
             kind: asset.kind,
-            // The same terms the edit dialog admits on: pixel edits re-encode
-            // the file, so only an image the library owns (never a linked
-            // file, never a trashed one) may take them.
-            editable: asset.kind == trove_core::model::AssetKind::Image
-                && asset.origin != trove_core::model::Origin::Linked
-                && asset.trashed_at.is_none(),
+            is_image: asset.kind == trove_core::model::AssetKind::Image,
+            edit_blocker: if asset.origin == trove_core::model::Origin::Linked {
+                Some("edit.blocked_linked")
+            } else if asset.trashed_at.is_some() {
+                Some("edit.blocked_trashed")
+            } else {
+                None
+            },
             thumb,
             original,
             animated,
@@ -369,10 +378,17 @@ impl AssetPreviewPanel {
         self.data.asset_id
     }
 
-    /// Whether the backend may re-encode this asset's pixels (an owned, live
-    /// image) — the preview toolbar shows its edit buttons on this.
-    pub(crate) fn editable(&self) -> bool {
-        self.data.editable
+    /// Whether the previewed asset is an image — the toolbar only carries
+    /// pixel-edit tools for images.
+    pub(crate) fn is_image(&self) -> bool {
+        self.data.is_image
+    }
+
+    /// Why the backend would refuse a pixel edit on this asset; `None` when
+    /// it may take one. The toolbar disables its buttons on `Some` and says
+    /// why.
+    pub(crate) fn edit_blocker(&self) -> Option<&'static str> {
+        self.data.edit_blocker
     }
 
     /// The live player, for the app view to render as a fullscreen stage in
