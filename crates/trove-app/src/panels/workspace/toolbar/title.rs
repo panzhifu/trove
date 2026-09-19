@@ -149,19 +149,24 @@ fn model_toolbar(viewport: &Entity<ModelViewport>, cx: &mut Context<WorkspacePan
 }
 
 /// The still / video preview's title-bar controls: the picture's edit tools
-/// (rotate, flip, the full edit dialog) when the backend can re-encode it,
-/// then the close button. The tab beside the bar already names the asset.
-/// Zoom is a gesture on the stage itself, not a toolbar control.
+/// (rotate, flip, the full edit dialog) for images, then the close button.
+/// The tools always show for an image — disabled, with the reason on their
+/// tooltips, when the backend would refuse the edit (a linked file belongs
+/// to its source; a trashed asset is not editable until restored) — a
+/// silently missing toolbar reads as a bug, not as a constraint. The tab
+/// beside the bar already names the asset; zoom is a gesture on the stage
+/// itself, not a toolbar control.
 fn preview_toolbar(
     preview: &Entity<AssetPreviewPanel>,
     controller: &Entity<LibraryController>,
     cx: &mut Context<WorkspacePanel>,
 ) -> Div {
     use gpui_kit::assets::IconName as ToolIcon;
+    use gpui_kit::component::Disableable as _;
 
-    let (asset_id, editable) = {
+    let (asset_id, is_image, blocker) = {
         let panel = preview.read(cx);
-        (panel.asset_id(), panel.editable())
+        (panel.asset_id(), panel.is_image(), panel.edit_blocker())
     };
     let mut bar = h_flex().items_center().gap_1();
 
@@ -169,7 +174,16 @@ fn preview_toolbar(
     // selection, which the preview replaced. Each quick edit re-encodes at
     // the dialog's default quality and re-opens the preview, so the edited
     // result replaces the picture the moment the backend wrote it.
-    if let (Some(id), true) = (asset_id, editable) {
+    if let Some(id) = asset_id
+        && is_image
+    {
+        let blocked = blocker.is_some();
+        // A refusal reason overrides the button's own label: the user should
+        // learn why the tools are grey, not what they do.
+        let tooltip = |key: &'static str| match blocker {
+            Some(why) => rust_i18n::t!(why).to_string(),
+            None => rust_i18n::t!(key).to_string(),
+        };
         for (btn_id, icon, key, edits) in [
             (
                 "preview-rotate-cw",
@@ -202,7 +216,8 @@ fn preview_toolbar(
                     .ghost()
                     .xsmall()
                     .icon(icon)
-                    .tooltip(rust_i18n::t!(key).to_string())
+                    .disabled(blocked)
+                    .tooltip(tooltip(key))
                     .on_click(cx.listener(move |this, _, window, cx| {
                         if crate::dialogs::edit::apply_single_edit(&ctl, id, edits.clone(), window, cx) {
                             this.open_asset_preview(id, window, cx);
@@ -219,7 +234,8 @@ fn preview_toolbar(
                 .ghost()
                 .xsmall()
                 .icon(ToolIcon::Pencil)
-                .tooltip(rust_i18n::t!("viewport.edit_image").to_string())
+                .disabled(blocked)
+                .tooltip(tooltip("viewport.edit_image"))
                 .on_click(move |_, window, cx| {
                     crate::dialogs::edit::EditDialog::open_for_asset(
                         window,
