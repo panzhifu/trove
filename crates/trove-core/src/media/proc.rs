@@ -120,26 +120,6 @@ impl Drop for ProcessSlot {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn the_cap_bounds_and_dropping_a_guard_frees_a_slot() {
-        let sem = Semaphore::new(2);
-        assert!(sem.take(false));
-        assert!(sem.take(false));
-        assert!(!sem.take(false), "a full semaphore refuses a third taker");
-        sem.release();
-        assert!(sem.take(false));
-    }
-
-    #[test]
-    fn this_machine_offers_at_least_one_slot() {
-        assert!(slots() >= 1);
-    }
-}
-
 /// How long one import subprocess (`ffprobe` / `ffmpeg` / `heif-dec`) may run
 /// before it is killed. Generous by design: this bounds a *hung* decoder, not
 /// a slow one.
@@ -193,4 +173,24 @@ pub fn output_with_timeout(mut command: Command) -> std::io::Result<Output> {
         stdout,
         stderr,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_cap_bounds_and_dropping_a_guard_frees_a_slot() {
+        let sem = Semaphore::new(2);
+        assert!(sem.take(false));
+        assert!(sem.take(false));
+        assert!(!sem.take(false), "a full semaphore refuses a third taker");
+        sem.release();
+        assert!(sem.take(false));
+    }
+
+    #[test]
+    fn this_machine_offers_at_least_one_slot() {
+        assert!(slots() >= 1);
+    }
 }
