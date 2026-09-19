@@ -1016,11 +1016,8 @@ impl InspectorPanel {
                         };
                         if let Err(error) = ctl.library.patch_asset(id, &patch) {
                             ctl.report_error(
-                                rust_i18n::t!(
-                                    "inspector.edit_failed",
-                                    error = error.to_string()
-                                )
-                                .to_string(),
+                                rust_i18n::t!("inspector.edit_failed", error = error.to_string())
+                                    .to_string(),
                             );
                         }
                         ctl.generation += 1;

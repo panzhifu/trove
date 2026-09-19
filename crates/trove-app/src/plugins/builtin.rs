@@ -21,15 +21,15 @@
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 
+use gpui_kit::base::{h_flex, v_flex};
+use gpui_kit::component::WindowExt as _;
 use gpui_kit::component::kbd::Kbd;
 use gpui_kit::component::notification::Notification;
 use gpui_kit::component::setting::SettingPage;
-use gpui_kit::component::WindowExt as _;
-use gpui_kit::base::{h_flex, v_flex};
-use gpui_kit::{div, App, IntoElement as _, ParentElement as _, SharedString, Styled as _, Window};
+use gpui_kit::{App, IntoElement as _, ParentElement as _, SharedString, Styled as _, Window, div};
 
-use trove_core::config::AppConfig;
 use gpui_kit::Keystroke;
+use trove_core::config::AppConfig;
 
 use crate::plugins::i18n::pt;
 
@@ -173,10 +173,8 @@ impl super::AppPlugin for SidecarNotes {
 
         let getter_state = self.state.clone();
         let setter_state = self.state.clone();
-        let page =
-            SettingPage::new(pt!("plugins.sidecar_notes_name")).description(pt!(
-                "plugins.sidecar_notes_description"
-            ))
+        let page = SettingPage::new(pt!("plugins.sidecar_notes_name"))
+            .description(pt!("plugins.sidecar_notes_description"))
             .group(
                 gpui_kit::component::setting::SettingGroup::new()
                     .title(pt!("plugins.sidecar_notes_group"))
@@ -184,37 +182,33 @@ impl super::AppPlugin for SidecarNotes {
                         gpui_kit::component::setting::SettingItem::new(
                             pt!("plugins.sidecar_notes_mode"),
                             gpui_kit::component::setting::SettingField::dropdown(
-                            vec![
-                                (
-                                    SharedString::from(Mode::Override.as_str()),
-                                    Mode::Override.label().into(),
-                                ),
-                                (
-                                    SharedString::from(Mode::FillMissing.as_str()),
-                                    Mode::FillMissing.label().into(),
-                                ),
-                            ],
-                            move |_cx| {
-                                SharedString::from(
-                                    Self::mode_of(&getter_state).as_str().to_string(),
-                                )
-                            },
-                            move |value: SharedString, cx| {
-                                self_set_mode(&setter_state, Mode::parse(&value));
-                                cx.refresh_windows();
-                            },
-                        ),
+                                vec![
+                                    (
+                                        SharedString::from(Mode::Override.as_str()),
+                                        Mode::Override.label().into(),
+                                    ),
+                                    (
+                                        SharedString::from(Mode::FillMissing.as_str()),
+                                        Mode::FillMissing.label().into(),
+                                    ),
+                                ],
+                                move |_cx| {
+                                    SharedString::from(
+                                        Self::mode_of(&getter_state).as_str().to_string(),
+                                    )
+                                },
+                                move |value: SharedString, cx| {
+                                    self_set_mode(&setter_state, Mode::parse(&value));
+                                    cx.refresh_windows();
+                                },
+                            ),
+                        )
+                        .description(pt!("plugins.sidecar_notes_mode_desc")),
                     )
-                    .description(pt!("plugins.sidecar_notes_mode_desc")),
-                )
-                .item(
-                    gpui_kit::component::setting::SettingItem::render(
-                        move |_, _, cx| {
-                            shortcut_row(cx, &effective_key, Mode::label(mode))
-                        },
-                    ),
-                ),
-        );
+                    .item(gpui_kit::component::setting::SettingItem::render(
+                        move |_, _, cx| shortcut_row(cx, &effective_key, Mode::label(mode)),
+                    )),
+            );
         vec![page]
     }
 
@@ -240,7 +234,8 @@ impl super::AppPlugin for SidecarNotes {
 impl SidecarNotes {
     /// (action id, default key) of the toggle command — read by the settings
     /// page and the command handler so the id is written once.
-    const TOGGLE_COMMAND: (&'static str, &'static str) = ("sidecar-notes/toggle-mode", "ctrl-alt-s");
+    const TOGGLE_COMMAND: (&'static str, &'static str) =
+        ("sidecar-notes/toggle-mode", "ctrl-alt-s");
 
     fn mode_of(state: &Arc<RwLock<Mode>>) -> Mode {
         *state.read().expect("sidecar-notes mode lock")
@@ -284,9 +279,7 @@ fn shortcut_row(cx: &App, key: &str, mode_label: String) -> gpui_kit::Div {
             v_flex()
                 .flex_1()
                 .min_w_0()
-                .child(
-                    div().text_sm().child(pt!("plugins.sidecar_notes_toggle")),
-                )
+                .child(div().text_sm().child(pt!("plugins.sidecar_notes_toggle")))
                 .child(
                     div()
                         .text_xs()
@@ -409,7 +402,11 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let titled = dir.join("titled.jpg");
         std::fs::write(&titled, b"jpg").unwrap();
-        std::fs::write(dir.join("titled.jpg.trove.json"), br#"{"title": "sidecar"}"#).unwrap();
+        std::fs::write(
+            dir.join("titled.jpg.trove.json"),
+            br#"{"title": "sidecar"}"#,
+        )
+        .unwrap();
         let untitled = dir.join("untitled.jpg");
         std::fs::write(&untitled, b"jpg").unwrap();
         std::fs::write(

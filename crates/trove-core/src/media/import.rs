@@ -525,7 +525,7 @@ mod tests {
             &cache,
             &[good.clone(), missing.clone()],
             ImportStorage::Link,
-        &no_cancel,
+            &no_cancel,
         );
         assert_eq!(staged.len(), 2);
         assert!(staged[0].is_ok());
@@ -571,7 +571,7 @@ mod tests {
             &cache,
             std::slice::from_ref(&src),
             ImportStorage::Link,
-        &no_cancel,
+            &no_cancel,
         );
         assert!(staged[0].is_ok(), "{:?}", staged[0].as_ref().err());
         let report = commit_staged_all(store.conn(), None, staged);

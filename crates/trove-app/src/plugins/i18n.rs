@@ -110,13 +110,19 @@ mod tests {
 
     #[test]
     fn plugin_catalogs_resolve_interpolate_and_fall_back() {
-        register("test-plugin", &[
-            (
-                "en",
-                "[plugins]\ntest_plugin_greeting = \"Hello %{name}\"\ntest_plugin_plain = \"Plain\"\n",
-            ),
-            ("zh-CN", "[plugins]\ntest_plugin_greeting = \"你好 %{name}\"\n"),
-        ]);
+        register(
+            "test-plugin",
+            &[
+                (
+                    "en",
+                    "[plugins]\ntest_plugin_greeting = \"Hello %{name}\"\ntest_plugin_plain = \"Plain\"\n",
+                ),
+                (
+                    "zh-CN",
+                    "[plugins]\ntest_plugin_greeting = \"你好 %{name}\"\n",
+                ),
+            ],
+        );
 
         // The live locale in the test process is `en`: the interpolated
         // English string wins.
@@ -139,7 +145,10 @@ mod tests {
 
         // The `pt!` shape: plugin hit interpolates, plugin miss falls through
         // to the app catalog (which returns the key itself for a miss).
-        assert_eq!(pt!("plugins.test_plugin_greeting", name = "Trove"), "Hello Trove");
+        assert_eq!(
+            pt!("plugins.test_plugin_greeting", name = "Trove"),
+            "Hello Trove"
+        );
         assert_eq!(pt!("plugins.test_plugin_plain"), "Plain");
     }
 }

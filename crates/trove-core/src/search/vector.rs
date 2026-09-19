@@ -90,12 +90,7 @@ impl VectorIndex {
     /// from the same model that named this index — a query vector is never
     /// comparable across models or spaces. Returns matches sorted by
     /// descending score; the caller narrows them with the SQL filters.
-    pub fn search(
-        &self,
-        conn: &Connection,
-        query: &[f32],
-        cap: usize,
-    ) -> Result<Vec<VectorMatch>> {
+    pub fn search(&self, conn: &Connection, query: &[f32], cap: usize) -> Result<Vec<VectorMatch>> {
         if query.is_empty() {
             return Ok(Vec::new());
         }
@@ -174,11 +169,11 @@ pub fn check_dim(query: &[f32], stored: usize) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::test_asset;
     use crate::model::{EmbeddingSpace, NewEmbedding};
     use crate::store::Store;
     use crate::store::assets;
     use crate::store::embeddings;
-    use crate::model::test_asset;
     use uuid::Uuid;
 
     fn emb(asset_id: Uuid, vector: Vec<f32>) -> NewEmbedding {
@@ -211,7 +206,11 @@ mod tests {
     fn ranks_by_cosine_and_truncates() {
         let (store, a, b, c) = seed();
         let index = VectorIndex::new("test-model", EmbeddingSpace::Text);
-        assert_eq!(index.len(store.conn()).unwrap(), 3, "lazy-loaded on first use");
+        assert_eq!(
+            index.len(store.conn()).unwrap(),
+            3,
+            "lazy-loaded on first use"
+        );
 
         // A query pointing at +x: exact match first, opposite vector last.
         let hits = index.search(store.conn(), &[1.0, 0.0], 10).unwrap();
@@ -260,7 +259,10 @@ mod tests {
         let (store, a, _b, _c) = seed();
         let image_index = VectorIndex::new("test-model", EmbeddingSpace::Image);
         assert!(
-            image_index.search(store.conn(), &[1.0, 0.0], 10).unwrap().is_empty(),
+            image_index
+                .search(store.conn(), &[1.0, 0.0], 10)
+                .unwrap()
+                .is_empty(),
             "only text rows were written"
         );
         // …and an image row is invisible to the text index until written
@@ -292,6 +294,11 @@ mod tests {
         assert!(check_dim(&[1.0, 0.0], 2).is_ok());
         assert!(check_dim(&[1.0, 0.0, 0.0], 2).is_err());
         // A 3-dim query scores nothing (every row is skipped by length).
-        assert!(index.search(store.conn(), &[1.0, 0.0, 0.0], 5).unwrap().is_empty());
+        assert!(
+            index
+                .search(store.conn(), &[1.0, 0.0, 0.0], 5)
+                .unwrap()
+                .is_empty()
+        );
     }
 }

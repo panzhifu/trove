@@ -832,16 +832,11 @@ mod tests {
         let manager = controller.library.tasks().clone();
         let watcher = manager.clone();
         let (task_id, _rx) = manager
-            .start(
-                trove_core::tasks::TaskKind::Import,
-                "test",
-                move |ctx| trove_core::tasks::import::run(&options, ctx),
-            )
+            .start(trove_core::tasks::TaskKind::Import, "test", move |ctx| {
+                trove_core::tasks::import::run(&options, ctx)
+            })
             .expect("the import job starts");
-        controller.import_task = Some(crate::library::jobs::ImportTaskHandle {
-            manager,
-            task_id,
-        });
+        controller.import_task = Some(crate::library::jobs::ImportTaskHandle { manager, task_id });
         controller.begin_import(300);
         assert!(controller.is_importing());
 

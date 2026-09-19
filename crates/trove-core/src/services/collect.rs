@@ -140,7 +140,9 @@ pub fn inbox_items_in(inbox: &std::path::Path) -> Vec<(PathBuf, Option<PathBuf>)
 /// imported as an asset in its own right.
 fn is_inbox_sidecar(name: Option<&std::ffi::OsStr>) -> bool {
     name.and_then(|n| n.to_str())
-        .map(|n| n.ends_with(".meta.json") || n.ends_with(".trove.json") || n.ends_with(PART_SUFFIX))
+        .map(|n| {
+            n.ends_with(".meta.json") || n.ends_with(".trove.json") || n.ends_with(PART_SUFFIX)
+        })
         .unwrap_or(true)
 }
 

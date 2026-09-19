@@ -7,7 +7,7 @@
 
 use gpui_kit::base::h_flex;
 use gpui_kit::component::ActiveTheme as _;
-use gpui_kit::component::button::{Button, ButtonVariants as _, ButtonVariant};
+use gpui_kit::component::button::{Button, ButtonVariant, ButtonVariants as _};
 use gpui_kit::component::dialog::DialogButtonProps;
 use gpui_kit::component::dock::{Panel as DockPanel, PanelControl};
 use gpui_kit::component::slider::Slider;
@@ -61,9 +61,7 @@ impl DockPanel for WorkspacePanel {
         // set it is follows the preview, so opening one switches the bar.
         match &self.preview {
             Some(MainPreview::Asset(preview)) => {
-                return Some(
-                    preview_toolbar(preview, &self.controller, cx).into_any_element(),
-                );
+                return Some(preview_toolbar(preview, &self.controller, cx).into_any_element());
             }
             Some(MainPreview::Model(viewport)) => {
                 return Some(model_toolbar(viewport, cx));
@@ -172,9 +170,7 @@ fn preview_toolbar(
             panel.is_image(),
             panel.edit_blocker(),
             panel.write_back(),
-            panel
-                .original_path()
-                .map(std::path::Path::to_path_buf),
+            panel.original_path().map(std::path::Path::to_path_buf),
         )
     };
     // The panel entity, so a write-back confirmation can reopen the preview
@@ -276,12 +272,7 @@ fn preview_toolbar(
                 .disabled(blocked)
                 .tooltip(tooltip("viewport.edit_image"))
                 .on_click(move |_, window, cx| {
-                    crate::dialogs::edit::EditDialog::open_for_asset(
-                        window,
-                        cx,
-                        ctl.clone(),
-                        id,
-                    );
+                    crate::dialogs::edit::EditDialog::open_for_asset(window, cx, ctl.clone(), id);
                 }),
         );
     }
@@ -323,9 +314,12 @@ fn confirm_write_back(
             .title(rust_i18n::t!("edit.writeback_title").to_string())
             .width(px(440.))
             .close_button(false)
-            .child(div().text_sm().p_1().child(
-                rust_i18n::t!("edit.writeback_body", path = shown).to_string(),
-            ))
+            .child(
+                div()
+                    .text_sm()
+                    .p_1()
+                    .child(rust_i18n::t!("edit.writeback_body", path = shown).to_string()),
+            )
             .button_props(
                 DialogButtonProps::default()
                     .ok_text(rust_i18n::t!("edit.writeback_ok").to_string())

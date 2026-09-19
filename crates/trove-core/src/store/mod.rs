@@ -99,7 +99,9 @@ impl Store {
             return self.set_user_version(schema::SCHEMA_VERSION);
         }
         while current != schema::SCHEMA_VERSION {
-            let Some(&(_, to, sql)) = schema::UPGRADES.iter().find(|(from, _, _)| *from == current)
+            let Some(&(_, to, sql)) = schema::UPGRADES
+                .iter()
+                .find(|(from, _, _)| *from == current)
             else {
                 return Err(crate::error::Error::Validation(format!(
                     "library schema v{current}, this build creates v{}: \

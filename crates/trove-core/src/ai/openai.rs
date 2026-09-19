@@ -78,8 +78,7 @@ impl OpenAICompatible {
 
     /// One HTTP round trip for `inputs`, parsed and validated.
     fn request(&self, inputs: &[String]) -> Result<Vec<Vec<f32>>> {
-        let body = serde_json::json!({ "model": self.model, "input": inputs })
-            .to_string();
+        let body = serde_json::json!({ "model": self.model, "input": inputs }).to_string();
         let url = format!("{}/embeddings", self.base_url);
 
         let mut last_error: Option<String> = None;
@@ -112,8 +111,7 @@ impl OpenAICompatible {
                         }
                         return Ok(vectors);
                     }
-                    let detail = parse_error(&text)
-                        .unwrap_or_else(|| format!("HTTP {status}"));
+                    let detail = parse_error(&text).unwrap_or_else(|| format!("HTTP {status}"));
                     // A 4xx other than 429 is the server rejecting the
                     // request itself — retrying cannot help.
                     if status == 429 || status >= 500 {
@@ -272,7 +270,11 @@ mod tests {
         let provider =
             OpenAICompatible::new(&config("https://api.example.com/v1///", " m3-small ")).unwrap();
         assert_eq!(provider.id(), "m3-small");
-        assert_eq!(provider.dim(), None, "the dimension is learned, not configured");
+        assert_eq!(
+            provider.dim(),
+            None,
+            "the dimension is learned, not configured"
+        );
         assert_eq!(provider.asset_space(), EmbeddingSpace::Text);
         assert!(provider.known_dim.set(1536).is_ok());
         assert_eq!(provider.dim(), Some(1536));
@@ -290,7 +292,11 @@ mod tests {
             "usage": {"prompt_tokens": 4, "total_tokens": 4}
         }"#;
         let vectors = parse_response(text, 2).unwrap();
-        assert_eq!(vectors[0], vec![0.1, 0.2, 0.3], "input order, not wire order");
+        assert_eq!(
+            vectors[0],
+            vec![0.1, 0.2, 0.3],
+            "input order, not wire order"
+        );
         assert_eq!(vectors[1], vec![0.4, 0.5, 0.6]);
 
         // Wrong count, missing entry, bad index, empty vector, mixed dims.
@@ -311,7 +317,8 @@ mod tests {
 
     #[test]
     fn parse_error_reads_the_official_shape_then_gives_up() {
-        let official = r#"{"error": {"message": "Model `nope` not found", "type": "invalid_request_error"}}"#;
+        let official =
+            r#"{"error": {"message": "Model `nope` not found", "type": "invalid_request_error"}}"#;
         assert_eq!(
             parse_error(official).as_deref(),
             Some("Model `nope` not found")

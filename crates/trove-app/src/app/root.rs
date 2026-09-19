@@ -689,9 +689,7 @@ impl AppView {
             if let Ok(Ok(Some(path))) = rx.await {
                 let outcome = cx
                     .background_executor()
-                    .spawn(async move {
-                        trove_core::services::archive::create_full_backup(&path)
-                    })
+                    .spawn(async move { trove_core::services::archive::create_full_backup(&path) })
                     .await;
                 let _ = handle.update(cx, |_, window, cx| {
                     let note = match outcome {

@@ -458,9 +458,7 @@ impl AssetPreviewPanel {
     /// content.
     fn fitted_base(&self, vw: f32, vh: f32) -> Option<(f32, f32)> {
         let pad = 32.0; // the content container's p_4
-        let fit = |w: f32, h: f32| {
-            ((vw - pad).max(60.0) / w).min((vh - pad).max(60.0) / h)
-        };
+        let fit = |w: f32, h: f32| ((vw - pad).max(60.0) / w).min((vh - pad).max(60.0) / h);
         if self.font_live {
             let (tw, th, _) = font::specimen_metrics();
             let scale = fit(tw, th);
@@ -652,11 +650,13 @@ impl Render for AssetPreviewPanel {
                             cx.notify();
                         }),
                     )
-                    .on_click(cx.listener(|this, event: &ClickEvent, _, cx| {
-                        if event.click_count() == 2 {
-                            this.reset_zoom(cx);
-                        }
-                    }))
+                    .on_click(cx.listener(
+                        |this, event: &ClickEvent, _, cx| {
+                            if event.click_count() == 2 {
+                                this.reset_zoom(cx);
+                            }
+                        },
+                    ))
                 })
                 .child(content),
         )

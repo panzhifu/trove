@@ -455,13 +455,15 @@ fn settled(path: &Path, now: SystemTime, settle: Duration) -> bool {
     if !meta.is_file() {
         return false;
     }
-    meta.modified().ok().is_some_and(|modified| match now.duration_since(modified) {
-        // A timestamp in the future — an archive that kept its mtimes, a
-        // skewed clock — can never age into `settle` by waiting, so waiting
-        // would hide the file forever. Take it as settled.
-        Ok(age) => age >= settle,
-        Err(_) => true,
-    })
+    meta.modified()
+        .ok()
+        .is_some_and(|modified| match now.duration_since(modified) {
+            // A timestamp in the future — an archive that kept its mtimes, a
+            // skewed clock — can never age into `settle` by waiting, so waiting
+            // would hide the file forever. Take it as settled.
+            Ok(age) => age >= settle,
+            Err(_) => true,
+        })
 }
 
 #[cfg(test)]

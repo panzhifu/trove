@@ -227,7 +227,11 @@ pub struct Library {
     /// the index itself re-checks the table fingerprint per search, so a
     /// finished backfill is visible to the next query.
     vector_index: std::cell::RefCell<
-        Option<(String, crate::model::EmbeddingSpace, crate::search::vector::VectorIndex)>,
+        Option<(
+            String,
+            crate::model::EmbeddingSpace,
+            crate::search::vector::VectorIndex,
+        )>,
     >,
 }
 
@@ -257,8 +261,8 @@ impl Library {
         // Health headline: a library is open and here is its size — the two
         // gauges a /health scrape leads with. A failed count is not worth
         // failing the open over; the gauge just stays at zero.
-        let assets = rows::query_count(lib.store.conn(), "SELECT COUNT(*) FROM assets", vec![])
-            .unwrap_or(0);
+        let assets =
+            rows::query_count(lib.store.conn(), "SELECT COUNT(*) FROM assets", vec![]).unwrap_or(0);
         crate::metrics::set_library_open(assets.max(0) as u64);
         // Daily safety snapshot (24h throttle, rolling 10 files). Best-effort:
         // a failed backup never blocks opening the library.
@@ -581,9 +585,7 @@ impl Library {
     ) -> crate::search::vector::VectorIndex {
         let mut cached = self.vector_index.borrow_mut();
         let stale = match cached.as_ref() {
-            Some((model, space, _)) => {
-                model != provider.id() || *space != provider.asset_space()
-            }
+            Some((model, space, _)) => model != provider.id() || *space != provider.asset_space(),
             None => true,
         };
         if stale {
@@ -1133,9 +1135,7 @@ impl Library {
         // The old thumbnail described content no record references anymore
         // once the last asset on that hash is gone; the new one is rebuilt
         // from the file where it lives.
-        if !old_sha.is_empty()
-            && assets::count_by_sha256(self.store.conn(), &old_sha)? == 0
-        {
+        if !old_sha.is_empty() && assets::count_by_sha256(self.store.conn(), &old_sha)? == 0 {
             let _ = std::fs::remove_file(media::thumb::abs_path(self.cache(), &old_sha));
         }
         media::thumb::regenerate(self.cache(), &sha, asset.kind, &source);
@@ -2878,7 +2878,10 @@ mod tests {
         let after = assets::get(conn, id).unwrap().unwrap();
         assert_eq!(after.origin, crate::model::Origin::Linked);
         assert!(after.rel_path.is_none());
-        assert_eq!(after.facts.source_path.as_deref(), Some(src.to_str().unwrap()));
+        assert_eq!(
+            after.facts.source_path.as_deref(),
+            Some(src.to_str().unwrap())
+        );
         assert_ne!(after.sha256.as_deref(), Some(old_sha.as_str()));
         assert_eq!((after.width, after.height), (Some(3), Some(4)));
         assert!(thumb::abs_path(lib.cache(), after.sha256.as_deref().unwrap()).is_file());
@@ -2894,7 +2897,10 @@ mod tests {
             .map(|e| e.file_name().to_string_lossy().into_owned())
             .filter(|name| name.contains("trove-edit"))
             .collect();
-        assert!(litter.is_empty(), "temp write-back files left behind: {litter:?}");
+        assert!(
+            litter.is_empty(),
+            "temp write-back files left behind: {litter:?}"
+        );
 
         std::fs::remove_dir_all(&home).ok();
     }
@@ -3076,11 +3082,8 @@ mod tests {
         // stable pseudo-random vector.
         let titles = ["red car in snow", "blue boat at sea", "green tree on hill"];
         for title in titles {
-            let asset = crate::model::test_asset(
-                &format!("{title}.png"),
-                AssetKind::Image,
-                Uuid::new_v4(),
-            );
+            let asset =
+                crate::model::test_asset(&format!("{title}.png"), AssetKind::Image, Uuid::new_v4());
             assets::insert(conn, &asset).unwrap();
             lib.patch_asset(
                 asset.id,
@@ -3129,7 +3132,9 @@ mod tests {
         }
 
         // An empty query is an empty page, not a scan.
-        let page = lib.semantic_search(provider.as_ref(), "   ", &AssetQuery::default()).unwrap();
+        let page = lib
+            .semantic_search(provider.as_ref(), "   ", &AssetQuery::default())
+            .unwrap();
         assert!(page.items.is_empty() && page.total == 0);
 
         // A structural filter still applies to the semantic candidates.

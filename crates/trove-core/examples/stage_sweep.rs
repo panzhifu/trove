@@ -68,7 +68,13 @@ fn main() {
         std::fs::create_dir_all(&cache).unwrap();
 
         let t = Instant::now();
-        let staged = import::stage_all(&root.join("data"), &cache, &paths, ImportStorage::Link, &std::sync::atomic::AtomicBool::new(false));
+        let staged = import::stage_all(
+            &root.join("data"),
+            &cache,
+            &paths,
+            ImportStorage::Link,
+            &std::sync::atomic::AtomicBool::new(false),
+        );
         let ms = t.elapsed().as_secs_f64() * 1e3;
         let failed = staged.iter().filter(|r| r.is_err()).count();
         println!(

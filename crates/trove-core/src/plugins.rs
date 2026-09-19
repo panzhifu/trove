@@ -96,7 +96,10 @@ impl Registry {
             .iter()
             .any(|known| known.name() == plugin.name())
         {
-            tracing::debug!(plugin = plugin.name(), "plugin already registered; ignoring");
+            tracing::debug!(
+                plugin = plugin.name(),
+                "plugin already registered; ignoring"
+            );
             return;
         }
         self.plugins.push(plugin);
@@ -200,8 +203,6 @@ mod tests {
         let mut registry = Registry::new();
         registry.register(Arc::new(Stages("stages")));
         assert_eq!(registry.pipeline_stages(&[]).len(), 1);
-        assert!(registry
-            .pipeline_stages(&["stages".to_string()])
-            .is_empty());
+        assert!(registry.pipeline_stages(&["stages".to_string()]).is_empty());
     }
 }

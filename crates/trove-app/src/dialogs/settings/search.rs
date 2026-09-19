@@ -129,7 +129,11 @@ fn ai_embedding_group(controller: &Entity<LibraryController>) -> SettingGroup {
 fn ai_coverage_row(controller: &Entity<LibraryController>, cx: &mut App) -> Div {
     let config = embedding_config();
     let text = if config.is_configured() {
-        match controller.read(cx).library.embedding_coverage(&config.model) {
+        match controller
+            .read(cx)
+            .library
+            .embedding_coverage(&config.model)
+        {
             Ok((embedded, total)) => rust_i18n::t!(
                 "settings.ai_coverage_value",
                 embedded = embedded,

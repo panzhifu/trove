@@ -137,7 +137,9 @@ pub fn run(
             return Ok(outcome);
         }
 
-        let tx = conn.transaction().map_err(|e| format!("begin batch: {e}"))?;
+        let tx = conn
+            .transaction()
+            .map_err(|e| format!("begin batch: {e}"))?;
         for ((asset, _, hash), vector) in batch.iter().zip(vectors) {
             let embedding = NewEmbedding {
                 asset_id: asset.id,
@@ -317,7 +319,10 @@ mod tests {
         // The same model name, a different width: refused up front.
         let outcome = run(&options, &MockProvider::new("mock", 16), &ctx).unwrap();
         let error = outcome.error.expect("dim conflict must surface");
-        assert!(error.contains("dimensions") && error.contains("delete"), "{error}");
+        assert!(
+            error.contains("dimensions") && error.contains("delete"),
+            "{error}"
+        );
         assert_eq!(outcome.embedded, 0);
 
         // A different model name is a different identity and just works.

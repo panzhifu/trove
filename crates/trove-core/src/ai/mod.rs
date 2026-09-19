@@ -114,14 +114,25 @@ mod tests {
 
     #[test]
     fn asset_embed_text_prefers_title_and_keeps_all_parts() {
-        let mut asset = test_asset("IMG_2049.png", crate::model::AssetKind::Image, Uuid::new_v4());
+        let mut asset = test_asset(
+            "IMG_2049.png",
+            crate::model::AssetKind::Image,
+            Uuid::new_v4(),
+        );
         asset.title = Some("Sunset over the bay".into());
         asset.description = Some("Long exposure, tripod".into());
         let text = asset_embed_text(&asset, &["beach".into(), "trip 2026".into()]);
-        assert_eq!(text, "Sunset over the bay\nLong exposure, tripod\nbeach, trip 2026");
+        assert_eq!(
+            text,
+            "Sunset over the bay\nLong exposure, tripod\nbeach, trip 2026"
+        );
 
         // No title → the file name stands in; no description → it is skipped.
-        let bare = test_asset("IMG_2049.png", crate::model::AssetKind::Image, Uuid::new_v4());
+        let bare = test_asset(
+            "IMG_2049.png",
+            crate::model::AssetKind::Image,
+            Uuid::new_v4(),
+        );
         assert_eq!(asset_embed_text(&bare, &[]), "IMG_2049.png");
     }
 

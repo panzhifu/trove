@@ -168,7 +168,13 @@ fn main() {
     }
 
     let t = Instant::now();
-    let staged = import::stage_all(&root, &root.join("cache"), &paths, ImportStorage::Link, &std::sync::atomic::AtomicBool::new(false));
+    let staged = import::stage_all(
+        &root,
+        &root.join("cache"),
+        &paths,
+        ImportStorage::Link,
+        &std::sync::atomic::AtomicBool::new(false),
+    );
     let d = t.elapsed();
     let failed = staged.iter().filter(|r| r.is_err()).count();
     let per_file = d.as_secs_f64() * 1e3 / n as f64;

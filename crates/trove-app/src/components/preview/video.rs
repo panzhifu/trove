@@ -778,10 +778,7 @@ impl VideoPlayer {
         if vw <= 0.0 || vh <= 0.0 || fw <= 0.0 || fh <= 0.0 {
             return None;
         }
-        Some((
-            fw * (vw / fw).min(vh / fh),
-            fh * (vw / fw).min(vh / fh),
-        ))
+        Some((fw * (vw / fw).min(vh / fh), fh * (vw / fw).min(vh / fh)))
     }
 
     /// Wheel over the picture: zoom toward the cursor, like every preview.
@@ -794,10 +791,13 @@ impl VideoPlayer {
             return;
         };
         let cfg = trove_core::config::AppConfig::load();
-        if self
-            .pan
-            .handle_wheel(event, (vw, vh), base, cfg.min_preview_zoom(), cfg.max_preview_zoom())
-        {
+        if self.pan.handle_wheel(
+            event,
+            (vw, vh),
+            base,
+            cfg.min_preview_zoom(),
+            cfg.max_preview_zoom(),
+        ) {
             cx.notify();
         }
     }

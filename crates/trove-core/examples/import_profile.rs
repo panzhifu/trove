@@ -178,7 +178,13 @@ fn full_pipeline(paths: &[PathBuf], root: &Path) -> (Duration, Duration) {
     std::fs::create_dir_all(root).unwrap();
 
     let t0 = Instant::now();
-    let staged = import::stage_all(root, &root.join("cache"), paths, ImportStorage::Link, &std::sync::atomic::AtomicBool::new(false));
+    let staged = import::stage_all(
+        root,
+        &root.join("cache"),
+        paths,
+        ImportStorage::Link,
+        &std::sync::atomic::AtomicBool::new(false),
+    );
     let stage = t0.elapsed();
 
     let store = Store::open(&root.join("library.db")).unwrap();

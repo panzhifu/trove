@@ -28,8 +28,15 @@ use trove_core::tasks::{TaskKind, TaskManager};
 
 fn main() {
     let mut args = std::env::args().skip(1);
-    let src: PathBuf = args.next().expect("usage: commit_batch_sample <src> <files>").into();
-    let files: usize = args.next().expect("usage: commit_batch_sample <src> <files>").parse().expect("files is a number");
+    let src: PathBuf = args
+        .next()
+        .expect("usage: commit_batch_sample <src> <files>")
+        .into();
+    let files: usize = args
+        .next()
+        .expect("usage: commit_batch_sample <src> <files>")
+        .parse()
+        .expect("files is a number");
 
     let batch = std::env::var("TROVE_COMMIT_BATCH")
         .ok()

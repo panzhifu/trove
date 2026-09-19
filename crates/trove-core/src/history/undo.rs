@@ -492,10 +492,7 @@ pub(crate) fn restore_patch(asset: &crate::model::Asset) -> AssetPatch {
 /// Apply one database step atomically: the closure runs inside a
 /// transaction that commits on success and rolls back on error, so a
 /// half-applied op can never leak into the store.
-fn apply_atomic(
-    conn: &Connection,
-    step: impl FnOnce(&Connection) -> Result<()>,
-) -> Result<()> {
+fn apply_atomic(conn: &Connection, step: impl FnOnce(&Connection) -> Result<()>) -> Result<()> {
     // `unchecked_transaction`: the store hands out shared connections behind
     // a RefCell, so the checked `&mut`-based API is not reachable here. There
     // is no outer transaction on these paths to conflict with.

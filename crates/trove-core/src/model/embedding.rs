@@ -68,7 +68,9 @@ pub struct NewEmbedding {
 impl NewEmbedding {
     pub fn validate(&self) -> Result<()> {
         if self.model.trim().is_empty() {
-            return Err(Error::Validation("embedding model must not be empty".into()));
+            return Err(Error::Validation(
+                "embedding model must not be empty".into(),
+            ));
         }
         if self.model.len() > 255 {
             return Err(Error::Validation(
@@ -77,7 +79,9 @@ impl NewEmbedding {
         }
         let dim = self.vector.len();
         if dim == 0 {
-            return Err(Error::Validation("embedding vector must not be empty".into()));
+            return Err(Error::Validation(
+                "embedding vector must not be empty".into(),
+            ));
         }
         if dim > MAX_DIM {
             return Err(Error::Validation(format!(
@@ -103,7 +107,9 @@ pub struct VectorMatch {
 /// Refuses NaN/∞ and the all-zero vector, which have no direction.
 pub fn normalized(vector: &[f32]) -> Result<Vec<f32>> {
     if vector.is_empty() {
-        return Err(Error::Validation("embedding vector must not be empty".into()));
+        return Err(Error::Validation(
+            "embedding vector must not be empty".into(),
+        ));
     }
     if vector.iter().any(|v| !v.is_finite()) {
         return Err(Error::Validation(

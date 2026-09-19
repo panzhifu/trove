@@ -113,9 +113,11 @@ pub fn coverage(
          WHERE e.model = ?1 AND e.space = ?2 AND a.trashed_at IS NULL",
         vec![text(model), text(space.as_str())],
     )? as u64;
-    let total =
-        rows::query_count(conn, "SELECT COUNT(*) FROM assets WHERE trashed_at IS NULL", vec![])?
-            as u64;
+    let total = rows::query_count(
+        conn,
+        "SELECT COUNT(*) FROM assets WHERE trashed_at IS NULL",
+        vec![],
+    )? as u64;
     Ok((embedded, total))
 }
 
@@ -244,7 +246,10 @@ mod tests {
             .unwrap()
             .expect("row exists");
         // [3, 4] normalized is [0.6, 0.8]; float storage rounds a hair.
-        assert!((got[0] - 0.6).abs() < 1e-6 && (got[1] - 0.8).abs() < 1e-6, "{got:?}");
+        assert!(
+            (got[0] - 0.6).abs() < 1e-6 && (got[1] - 0.8).abs() < 1e-6,
+            "{got:?}"
+        );
 
         // The provider's raw vector was not mutated by the write path.
         let e = emb(asset.id, vec![3.0, 4.0]);
@@ -269,7 +274,9 @@ mod tests {
             },
         )
         .unwrap();
-        let got = get(conn, asset.id, "test-model", EmbeddingSpace::Text).unwrap().unwrap();
+        let got = get(conn, asset.id, "test-model", EmbeddingSpace::Text)
+            .unwrap()
+            .unwrap();
         assert!(got[1] > 0.99, "second write won: {got:?}");
         let (count, _) = fingerprint(conn, "test-model", EmbeddingSpace::Text).unwrap();
         assert_eq!(count, 1, "one row, not two");
@@ -301,15 +308,21 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            fingerprint(conn, "test-model", EmbeddingSpace::Text).unwrap().0,
+            fingerprint(conn, "test-model", EmbeddingSpace::Text)
+                .unwrap()
+                .0,
             1
         );
         assert_eq!(
-            fingerprint(conn, "test-model", EmbeddingSpace::Image).unwrap().0,
+            fingerprint(conn, "test-model", EmbeddingSpace::Image)
+                .unwrap()
+                .0,
             1
         );
         assert_eq!(
-            fingerprint(conn, "other-model", EmbeddingSpace::Text).unwrap().0,
+            fingerprint(conn, "other-model", EmbeddingSpace::Text)
+                .unwrap()
+                .0,
             1
         );
         assert_eq!(
@@ -319,12 +332,16 @@ mod tests {
 
         // Deleting one model leaves the others.
         assert_eq!(delete_model(conn, "test-model").unwrap(), 2);
-        assert!(get(conn, asset.id, "test-model", EmbeddingSpace::Text)
-            .unwrap()
-            .is_none());
-        assert!(get(conn, asset.id, "other-model", EmbeddingSpace::Text)
-            .unwrap()
-            .is_some());
+        assert!(
+            get(conn, asset.id, "test-model", EmbeddingSpace::Text)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            get(conn, asset.id, "other-model", EmbeddingSpace::Text)
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[test]
@@ -356,13 +373,22 @@ mod tests {
         }
         upsert(conn, &emb(a.id, vec![1.0])).unwrap();
 
-        assert_eq!(coverage(conn, "test-model", EmbeddingSpace::Text).unwrap(), (1, 3));
+        assert_eq!(
+            coverage(conn, "test-model", EmbeddingSpace::Text).unwrap(),
+            (1, 3)
+        );
 
         // Trashing hides the asset from both sides of the fraction.
         assets::set_trashed(conn, a.id, true).unwrap();
-        assert_eq!(coverage(conn, "test-model", EmbeddingSpace::Text).unwrap(), (0, 2));
+        assert_eq!(
+            coverage(conn, "test-model", EmbeddingSpace::Text).unwrap(),
+            (0, 2)
+        );
         assets::set_trashed(conn, b.id, true).unwrap();
-        assert_eq!(coverage(conn, "test-model", EmbeddingSpace::Text).unwrap(), (0, 1));
+        assert_eq!(
+            coverage(conn, "test-model", EmbeddingSpace::Text).unwrap(),
+            (0, 1)
+        );
     }
 
     #[test]
@@ -378,7 +404,11 @@ mod tests {
         let rows = embeddable_assets(conn, "test-model", EmbeddingSpace::Text).unwrap();
         assert_eq!(rows.len(), 2, "every live asset is a backfill candidate");
         let a_row = rows.iter().find(|(asset, _)| asset.id == a.id).unwrap();
-        assert_eq!(a_row.1.as_deref(), Some("hash-1"), "stored hash comes along");
+        assert_eq!(
+            a_row.1.as_deref(),
+            Some("hash-1"),
+            "stored hash comes along"
+        );
         let b_row = rows.iter().find(|(asset, _)| asset.id == b.id).unwrap();
         assert_eq!(b_row.1, None, "not yet embedded");
 

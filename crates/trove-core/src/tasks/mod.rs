@@ -183,9 +183,7 @@ impl TaskManager {
         // the process ever ran. Their terminal events are already queued in
         // `events`, which is a separate collection — nothing a consumer reads
         // through the registry is lost with the entries.
-        inner
-            .jobs
-            .retain(|_, j| j.status == TaskStatus::Running);
+        inner.jobs.retain(|_, j| j.status == TaskStatus::Running);
         let id: TaskId = new_id();
         let cancel = Arc::new(AtomicBool::new(false));
         inner.jobs.insert(
