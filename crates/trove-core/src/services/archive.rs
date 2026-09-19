@@ -71,11 +71,7 @@ pub fn create_full_backup(dest: &Path) -> Result<FullBackupReport> {
 /// point it at a sandbox instead of the machine's real configuration. An
 /// archive that cannot be finished is removed rather than left half written
 /// where the user chose to put it.
-fn write_full_backup(
-    dest: &Path,
-    config_dir: &Path,
-    data_dir: &Path,
-) -> Result<FullBackupReport> {
+fn write_full_backup(dest: &Path, config_dir: &Path, data_dir: &Path) -> Result<FullBackupReport> {
     match build_archive(dest, config_dir, data_dir) {
         Ok(report) => Ok(report),
         Err(error) => {
@@ -94,12 +90,8 @@ fn build_archive(dest: &Path, config_dir: &Path, data_dir: &Path) -> Result<Full
     let mut files = 0u64;
     let mut bytes = 0u64;
 
-    let add = |zip: &mut zip::ZipWriter<std::fs::File>,
-                   name: String,
-                   src: &Path|
-     -> Result<u64> {
-        zip.start_file(name.as_str(), options)
-            .map_err(zip_error)?;
+    let add = |zip: &mut zip::ZipWriter<std::fs::File>, name: String, src: &Path| -> Result<u64> {
+        zip.start_file(name.as_str(), options).map_err(zip_error)?;
         let size = std::io::copy(&mut std::fs::File::open(src)?, zip)?;
         Ok(size)
     };
@@ -255,8 +247,7 @@ fn start_and_copy(
     src: &Path,
     options: &SimpleFileOptions,
 ) -> Result<u64> {
-    zip.start_file(name, *options)
-        .map_err(zip_error)?;
+    zip.start_file(name, *options).map_err(zip_error)?;
     Ok(std::io::copy(&mut std::fs::File::open(src)?, zip)?)
 }
 
@@ -411,18 +402,22 @@ mod tests {
         // The database ships as a snapshot: no WAL sidecar beside it, and its
         // content is the seeded one, readable from the extracted entry.
         assert!(
-            !names.iter().any(|n| n.ends_with("-wal") || n.ends_with("-shm")),
+            !names
+                .iter()
+                .any(|n| n.ends_with("-wal") || n.ends_with("-shm")),
             "no live-database sidecars in the archive: {names:?}"
         );
         assert!(
             !names.iter().any(|n| n.contains("backups/")),
             "snapshot-of-snapshot must not ride along: {names:?}"
         );
-        let mut db_entry = archive
-            .by_name("data/libraries/work/library.db")
-            .unwrap();
+        let mut db_entry = archive.by_name("data/libraries/work/library.db").unwrap();
         let snapshot = sandbox.root.join("extracted.db");
-        std::io::copy(&mut db_entry, &mut std::fs::File::create(&snapshot).unwrap()).unwrap();
+        std::io::copy(
+            &mut db_entry,
+            &mut std::fs::File::create(&snapshot).unwrap(),
+        )
+        .unwrap();
         drop(db_entry);
         let conn = rusqlite::Connection::open(&snapshot).unwrap();
         let value: String = conn

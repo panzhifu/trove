@@ -53,7 +53,6 @@ fn commit_batch() -> usize {
 /// The calibrated default for [`commit_batch`].
 const COMMIT_BATCH_DEFAULT: usize = 64;
 
-
 /// How many files are staged before a round of commits.
 ///
 /// Staging used to run over the whole batch at once: every [`StagedFile`] was
@@ -423,7 +422,9 @@ fn already_imported(conn: &Connection) -> HashSet<(String, u64)> {
     let Ok(mut stmt) = conn.prepare("SELECT file_name, size_bytes FROM assets") else {
         return HashSet::new();
     };
-    let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, u64>(1)?)));
+    let rows = stmt.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, u64>(1)?))
+    });
     let mut known = HashSet::new();
     if let Ok(rows) = rows {
         for row in rows.flatten() {
@@ -534,7 +535,8 @@ mod tests {
         let top = root.path().join("top.gif");
         fs::write(&top, b"x").unwrap();
 
-        let (expanded, skipped) = expand_dirs(vec![folder.clone(), top.clone(), folder.join("a.png")]);
+        let (expanded, skipped) =
+            expand_dirs(vec![folder.clone(), top.clone(), folder.join("a.png")]);
         assert!(expanded.contains(&top));
         assert!(expanded.contains(&folder.join("a.png")));
         assert_eq!(

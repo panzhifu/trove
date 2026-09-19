@@ -463,11 +463,7 @@ fn action_label(action: &str) -> String {
                 return text;
             }
             let text = rust_i18n::t!(key.as_str()).to_string();
-            if text == key {
-                other.to_string()
-            } else {
-                text
-            }
+            if text == key { other.to_string() } else { text }
         }
     }
 }

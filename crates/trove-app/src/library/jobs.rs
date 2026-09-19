@@ -7,9 +7,9 @@
 
 use std::path::PathBuf;
 
-use gpui_kit::component::button::Button;
 use gpui_kit::component::Sizable as _;
 use gpui_kit::component::WindowExt as _;
+use gpui_kit::component::button::Button;
 use gpui_kit::component::notification::Notification;
 use gpui_kit::*;
 
@@ -192,8 +192,7 @@ fn watch_signals(
 
             // Checked every tick, not only when a signal arrives: a swap
             // between signals must still stop this pump's queued batch.
-            let same_library =
-                controller.update(cx, |ctl, _| ctl.library.root() == library_root);
+            let same_library = controller.update(cx, |ctl, _| ctl.library.root() == library_root);
             if !same_library {
                 // The library moved under this pump: its watcher is being (or
                 // has been) cancelled, its signals describe the old library's
@@ -298,8 +297,7 @@ pub fn start_index_drain_service(
                 if controller.read(cx).is_importing() {
                     return;
                 }
-                if let Err(error) =
-                    controller.update(cx, |ctl, _| ctl.library.drain_search_queue())
+                if let Err(error) = controller.update(cx, |ctl, _| ctl.library.drain_search_queue())
                 {
                     tracing::warn!(
                         %error,
@@ -342,7 +340,14 @@ pub fn import_copied_app(
     cx: &mut App,
 ) {
     let into_collection = controller.read(cx).current_collection;
-    start_paths_import(controller, paths, into_collection, ImportStorage::Copy, window, cx);
+    start_paths_import(
+        controller,
+        paths,
+        into_collection,
+        ImportStorage::Copy,
+        window,
+        cx,
+    );
 }
 
 /// Start an import into an explicit collection (`None` = unfiled).
@@ -550,20 +555,25 @@ fn watch_import(
                     }
                     match event {
                         TaskEvent::Failed { error, .. } => {
-                            settled = Some(Notification::warning(
-                                rust_i18n::t!("workspace.trash_failed", error = error).to_string(),
-                            )
-                            .id1::<ImportNotice>("import-progress"));
+                            settled = Some(
+                                Notification::warning(
+                                    rust_i18n::t!("workspace.trash_failed", error = error)
+                                        .to_string(),
+                                )
+                                .id1::<ImportNotice>("import-progress"),
+                            );
                             controller.update(cx, |ctl, cx| {
                                 ctl.finish_import(0, 0);
                                 cx.notify();
                             });
                         }
                         TaskEvent::Cancelled { .. } => {
-                            settled = Some(Notification::info(
-                                rust_i18n::t!("notice.import_cancelled").to_string(),
-                            )
-                            .id1::<ImportNotice>("import-progress"));
+                            settled = Some(
+                                Notification::info(
+                                    rust_i18n::t!("notice.import_cancelled").to_string(),
+                                )
+                                .id1::<ImportNotice>("import-progress"),
+                            );
                             controller.update(cx, |ctl, cx| {
                                 ctl.finish_import(0, 0);
                                 cx.notify();

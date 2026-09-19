@@ -88,7 +88,9 @@ mod tests {
         assert_eq!(once.len(), 1);
         assert_eq!(once[0].len(), 16);
 
-        let other = provider.embed_texts(&["a blue boat at sea".into()]).unwrap();
+        let other = provider
+            .embed_texts(&["a blue boat at sea".into()])
+            .unwrap();
         assert_ne!(once[0], other[0]);
 
         // Order is preserved, and an empty batch is an empty result.
@@ -110,8 +112,10 @@ mod tests {
         assert_eq!(provider.dim(), Some(8));
         assert_eq!(provider.asset_space(), EmbeddingSpace::Text);
         // The image path stays unsupported — the default implementation.
-        assert!(provider
-            .embed_images(&[std::path::PathBuf::from("media/ab/abc.png")])
-            .is_err());
+        assert!(
+            provider
+                .embed_images(&[std::path::PathBuf::from("media/ab/abc.png")])
+                .is_err()
+        );
     }
 }

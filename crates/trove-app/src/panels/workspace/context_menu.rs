@@ -91,53 +91,51 @@ pub(crate) fn asset_context_menu(
             .map(|rel| ctl.library.root().join(rel))
     };
 
-    let mut menu =
-        menu.min_w(px(200.))
-            .item(
-                PopupMenuItem::new(if favorite {
-                    rust_i18n::t!("workspace.remove_from_favorites").to_string()
-                } else {
-                    rust_i18n::t!("workspace.add_to_favorites").to_string()
-                })
-                .checked(favorite)
-                .on_click(move |_, _, cx| {
-                    c_fav.update(cx, move |ctl, cx| {
-                        let ids = ctl.action_targets(asset_id);
-                        if let Err(error) = ctl.library.set_assets_favorite(&ids, !favorite) {
-                            ctl.report_error(
-                                rust_i18n::t!(
-                                    "workspace.favorite_failed",
-                                    error = error.to_string()
-                                )
+    let mut menu = menu
+        .min_w(px(200.))
+        .item(
+            PopupMenuItem::new(if favorite {
+                rust_i18n::t!("workspace.remove_from_favorites").to_string()
+            } else {
+                rust_i18n::t!("workspace.add_to_favorites").to_string()
+            })
+            .checked(favorite)
+            .on_click(move |_, _, cx| {
+                c_fav.update(cx, move |ctl, cx| {
+                    let ids = ctl.action_targets(asset_id);
+                    if let Err(error) = ctl.library.set_assets_favorite(&ids, !favorite) {
+                        ctl.report_error(
+                            rust_i18n::t!("workspace.favorite_failed", error = error.to_string())
                                 .to_string(),
-                            );
-                        }
-                        ctl.generation += 1;
-                        cx.notify();
-                    });
-                }),
-            )
-            .separator()
-            .item(PopupMenuItem::submenu(
-                rust_i18n::t!("workspace.usage_status").to_string(),
-                status_submenu,
-            ))
-            .item(PopupMenuItem::submenu(
-                rust_i18n::t!("workspace.commercial_use").to_string(),
-                commercial_submenu,
-            ))
-            .separator()
-            .item(
-                PopupMenuItem::new(rust_i18n::t!("workspace.search_by_image").to_string())
-                    .on_click(move |_, window, cx| {
-                        let ctl = c_search.clone();
-                        let ids = ctl.read(cx).action_targets(asset_id);
-                        if let Some(id) = ids.first() {
-                            open_image_search(*id, &ctl, window, cx);
-                        }
-                    }),
-            )
-            .separator();
+                        );
+                    }
+                    ctl.generation += 1;
+                    cx.notify();
+                });
+            }),
+        )
+        .separator()
+        .item(PopupMenuItem::submenu(
+            rust_i18n::t!("workspace.usage_status").to_string(),
+            status_submenu,
+        ))
+        .item(PopupMenuItem::submenu(
+            rust_i18n::t!("workspace.commercial_use").to_string(),
+            commercial_submenu,
+        ))
+        .separator()
+        .item(
+            PopupMenuItem::new(rust_i18n::t!("workspace.search_by_image").to_string()).on_click(
+                move |_, window, cx| {
+                    let ctl = c_search.clone();
+                    let ids = ctl.read(cx).action_targets(asset_id);
+                    if let Some(id) = ids.first() {
+                        open_image_search(*id, &ctl, window, cx);
+                    }
+                },
+            ),
+        )
+        .separator();
     // Images are the only kind we can hand over as pixels, so the entry is
     // hidden for everything else rather than failing after the click.
     if is_image {

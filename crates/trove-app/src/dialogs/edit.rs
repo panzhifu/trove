@@ -223,10 +223,7 @@ impl EditDialog {
         // Linked assets are editable — the result is written back over the
         // original file — but the user should see that coming before they
         // pick options.
-        let linked = images
-            .iter()
-            .filter(|a| a.origin == Origin::Linked)
-            .count();
+        let linked = images.iter().filter(|a| a.origin == Origin::Linked).count();
         window.open_dialog(cx, move |dialog, window, cx| {
             let crop_left = cx.new(|cx| InputState::new(window, cx).placeholder("0"));
             let crop_top = cx.new(|cx| InputState::new(window, cx).placeholder("0"));

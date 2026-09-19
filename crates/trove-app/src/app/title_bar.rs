@@ -99,10 +99,7 @@ fn build_menus() -> Vec<Menu> {
                     FindDuplicates,
                 ),
                 MenuItem::separator(),
-                MenuItem::action(
-                    rust_i18n::t!("app.export_backup").to_string(),
-                    ExportBackup,
-                ),
+                MenuItem::action(rust_i18n::t!("app.export_backup").to_string(), ExportBackup),
                 MenuItem::action(
                     rust_i18n::t!("app.export_media_package").to_string(),
                     ExportMediaPackage,

@@ -16,13 +16,13 @@
 use std::sync::{Arc, OnceLock};
 
 use gpui_kit::base::{h_flex, v_flex};
+use gpui_kit::component::WindowExt as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::dialog::DialogButtonProps;
+use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::notification::Notification;
 use gpui_kit::component::scroll::ScrollableElement as _;
-use gpui_kit::component::WindowExt as _;
 use gpui_kit::component::{ActiveTheme, IconName, Root, Sizable as _, TitleBar};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -216,12 +216,7 @@ impl LibraryManagerView {
 
     /// Right-click → Rename: the row itself becomes a prefilled, focused
     /// editor — the same act as the collections panel's rename.
-    fn begin_rename(
-        &mut self,
-        entry: LibraryEntry,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    fn begin_rename(&mut self, entry: LibraryEntry, window: &mut Window, cx: &mut Context<Self>) {
         self.editor.update(cx, |state, cx| {
             state.set_value(entry.name.clone(), window, cx);
         });
@@ -275,9 +270,7 @@ impl LibraryManagerView {
             if let Ok(Ok(Some(path))) = rx.await {
                 let outcome = cx
                     .background_executor()
-                    .spawn(async move {
-                        trove_core::services::archive::create_full_backup(&path)
-                    })
+                    .spawn(async move { trove_core::services::archive::create_full_backup(&path) })
                     .await;
                 let _ = handle.update(cx, |_, window, cx| {
                     let note = match outcome {
@@ -321,11 +314,11 @@ impl Render for LibraryManagerView {
             // editor input holds focus — same arrangement as the collections
             // panel.
             .key_context("LibraryManager")
-            .on_action(cx.listener(
-                |this, _: &crate::app::actions::CancelEditor, window, cx| {
+            .on_action(
+                cx.listener(|this, _: &crate::app::actions::CancelEditor, window, cx| {
                     this.cancel_rename(window, cx);
-                },
-            ))
+                }),
+            )
             // Plugin commands are global chords: this window answers them
             // too, even though it never opens the asset grid's context.
             .on_action(|action: &RunPluginCommand, window, cx| {
@@ -429,11 +422,8 @@ impl LibraryManagerView {
                             .text_color(cx.theme().muted_foreground)
                             .mt_1()
                             .child(
-                                rust_i18n::t!(
-                                    "app.version",
-                                    version = env!("CARGO_PKG_VERSION")
-                                )
-                                .to_string(),
+                                rust_i18n::t!("app.version", version = env!("CARGO_PKG_VERSION"))
+                                    .to_string(),
                             ),
                     )
                     .child(self.action_card(cx).mt_8()),
@@ -533,15 +523,13 @@ impl LibraryManagerView {
                     .label(current.to_string())
                     .dropdown_menu_with_anchor(gpui::Anchor::TopRight, move |menu, _, _| {
                         let mut picker = menu.min_w(px(180.)).item(
-                            PopupMenuItem::new(
-                                rust_i18n::t!("settings.follow_system").to_string(),
-                            )
-                            .checked(language.is_none())
-                            .on_click(|_, _, cx| {
-                                let _ = crate::app::i18n::set_language(None);
-                                cx.refresh_windows();
-                                crate::app::title_bar::apply_menus(cx);
-                            }),
+                            PopupMenuItem::new(rust_i18n::t!("settings.follow_system").to_string())
+                                .checked(language.is_none())
+                                .on_click(|_, _, cx| {
+                                    let _ = crate::app::i18n::set_language(None);
+                                    cx.refresh_windows();
+                                    crate::app::title_bar::apply_menus(cx);
+                                }),
                         );
                         for (code, name) in crate::app::i18n::SUPPORTED {
                             let code = code.to_string();
@@ -549,8 +537,7 @@ impl LibraryManagerView {
                                 PopupMenuItem::new(*name)
                                     .checked(language.as_deref() == Some(code.as_str()))
                                     .on_click(move |_, _, cx| {
-                                        let _ =
-                                            crate::app::i18n::set_language(Some(code.clone()));
+                                        let _ = crate::app::i18n::set_language(Some(code.clone()));
                                         cx.refresh_windows();
                                         crate::app::title_bar::apply_menus(cx);
                                     }),
