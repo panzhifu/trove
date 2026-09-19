@@ -12,6 +12,11 @@
 //! fuzzy), **2–3 grams** (substring matching), and **pinyin** (full
 //! syllables + initials, so `mao` finds 猫). Search composes all of them
 //! as ranked `should` clauses under a per-term `must`.
+//!
+//! Text is one leg of retrieval; the other is semantic — [`vector`] holds
+//! the in-memory embedding index over the `asset_embeddings` table.
+
+pub mod vector;
 
 use std::cell::RefCell;
 use std::collections::HashMap;

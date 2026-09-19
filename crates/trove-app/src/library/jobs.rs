@@ -14,9 +14,10 @@ use gpui_kit::component::notification::Notification;
 use gpui_kit::*;
 
 use trove_core::media::import::ImportStorage;
+use trove_core::tasks::embed::EmbedOutcome;
 use trove_core::tasks::import::{self, ImportOptions, ImportOutcome, ImportSource};
 use trove_core::tasks::watch::{self, WatchSignal};
-use trove_core::tasks::{TaskEvent, TaskId, TaskKind, TaskManager};
+use trove_core::tasks::{TaskEvent, TaskId, TaskKind, TaskManager, TaskStatus};
 
 use crate::library::LibraryController;
 
@@ -711,3 +712,176 @@ fn cancel_button(
     }
 }
 
+// ============================ embedding backfill =============================
+
+/// Marker for the keyed embedding-progress toast: pushing with the same id
+/// replaces the previous toast instead of stacking one per progress event.
+pub struct EmbeddingNotice;
+
+/// Start an embedding backfill from the settings page: build the provider
+/// from the saved config (an OpenAI-compatible endpoint), start the
+/// library's `EmbeddingBackfill` job, and watch it — a keyed toast carries
+/// progress, and the outcome replaces it. The job runs on the backend task
+/// thread; this only starts it and watches. Returns `false` when the config
+/// is missing or incomplete (a toast says so) or a run is already going.
+pub fn start_embedding_backfill_app(
+    controller: &Entity<LibraryController>,
+    window: &mut Window,
+    cx: &mut App,
+) -> bool {
+    let config = trove_core::config::AppConfig::load().ai_embedding;
+    let Some(config) = config.filter(trove_core::config::EmbeddingConfig::is_configured) else {
+        window.push_notification(
+            Notification::warning(rust_i18n::t!("settings.ai_not_configured").to_string()),
+            cx,
+        );
+        return false;
+    };
+    let provider: std::sync::Arc<dyn trove_core::ai::EmbeddingProvider> =
+        match trove_core::ai::OpenAICompatible::new(&config) {
+            Ok(provider) => std::sync::Arc::new(provider),
+            Err(error) => {
+                window.push_notification(Notification::warning(error.to_string()), cx);
+                return false;
+            }
+        };
+
+    let manager = controller.read(cx).library.tasks().clone();
+    let started = controller.update(cx, |ctl, _| ctl.library.start_embedding_backfill(provider));
+    let Ok((task_id, rx)) = started else {
+        return false; // one backfill at a time; the running toast is up
+    };
+    window.push_notification(
+        Notification::info(rust_i18n::t!("settings.ai_running").to_string())
+            .id1::<EmbeddingNotice>("embedding-progress"),
+        cx,
+    );
+    watch_embedding(
+        controller.clone(),
+        manager,
+        task_id,
+        rx,
+        window.window_handle(),
+        cx,
+    );
+    true
+}
+
+/// Ask the running backfill to stop at its next cancellation checkpoint (a
+/// batch boundary); the outcome toast replaces the progress toast.
+pub fn cancel_embedding_backfill_app(controller: &Entity<LibraryController>, cx: &mut App) {
+    let manager = controller.read(cx).library.tasks().clone();
+    if let Some(task) = manager
+        .snapshot()
+        .into_iter()
+        .find(|t| t.kind == TaskKind::EmbeddingBackfill && t.status == TaskStatus::Running)
+    {
+        manager.cancel(task.id);
+    }
+}
+
+/// Poll the backfill until it settles, translating events into toasts — the
+/// same shape as [`watch_import`]. A settle also refreshes the windows so
+/// the settings page's coverage line and generate/cancel button reflect the
+/// new state.
+fn watch_embedding(
+    controller: Entity<LibraryController>,
+    manager: TaskManager,
+    task_id: TaskId,
+    rx: std::sync::mpsc::Receiver<EmbedOutcome>,
+    handle: gpui::AnyWindowHandle,
+    cx: &mut App,
+) {
+    cx.spawn(async move |cx| {
+        loop {
+            cx.background_executor().timer(POLL_INTERVAL).await;
+            let mut settled: Option<Notification> = None;
+            for event in manager.poll_events() {
+                if event_task_id(&event) != Some(task_id) {
+                    continue;
+                }
+                match event {
+                    TaskEvent::Progress { done, total, .. } => {
+                        let _ = handle.update(cx, |_view, window, cx| {
+                            window.push_notification(
+                                Notification::info(
+                                    rust_i18n::t!(
+                                        "settings.ai_running_progress",
+                                        done = done,
+                                        total = total
+                                    )
+                                    .to_string(),
+                                )
+                                .id1::<EmbeddingNotice>("embedding-progress"),
+                                cx,
+                            );
+                        });
+                    }
+                    TaskEvent::Failed { error, .. } => {
+                        settled = Some(keyed_embedding(Notification::warning(
+                            rust_i18n::t!("settings.ai_failed", error = error).to_string(),
+                        )));
+                    }
+                    TaskEvent::Cancelled { .. } => {
+                        settled = Some(keyed_embedding(Notification::info(
+                            rust_i18n::t!("settings.ai_cancelled").to_string(),
+                        )));
+                    }
+                    _ => {}
+                }
+            }
+
+            match rx.try_recv() {
+                Ok(outcome) => {
+                    settled = Some(embedding_outcome_toast(&outcome));
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    // No value: the terminal event above already set the
+                    // toast. Nothing to add — just stop watching.
+                }
+            }
+
+            if let Some(note) = settled {
+                let _ = handle.update(cx, |_view, window, cx| {
+                    window.push_notification(note, cx);
+                });
+                controller.update(cx, |_, cx| cx.refresh_windows());
+                break;
+            }
+        }
+    })
+    .detach();
+}
+
+/// Attach the progress toast's key so a settle replaces it, never stacks.
+fn keyed_embedding(note: Notification) -> Notification {
+    note.id1::<EmbeddingNotice>("embedding-progress")
+}
+
+/// The completion toast for a backfill that returned a value: success when
+/// nothing failed, a warning naming the failures otherwise. The `error`
+/// case (a fatal stop) is handled from the terminal event, not here.
+fn embedding_outcome_toast(outcome: &EmbedOutcome) -> Notification {
+    if outcome.failed > 0 {
+        keyed_embedding(Notification::warning(
+            rust_i18n::t!(
+                "settings.ai_done",
+                embedded = outcome.embedded,
+                skipped = outcome.skipped,
+                failed = outcome.failed
+            )
+            .to_string(),
+        ))
+    } else {
+        keyed_embedding(Notification::success(
+            rust_i18n::t!(
+                "settings.ai_done",
+                embedded = outcome.embedded,
+                skipped = outcome.skipped,
+                failed = outcome.failed
+            )
+            .to_string(),
+        ))
+    }
+}

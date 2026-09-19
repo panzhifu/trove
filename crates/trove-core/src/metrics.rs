@@ -53,6 +53,16 @@ static THUMB_MISSES: AtomicU64 = AtomicU64::new(0);
 static QUERIES_TOTAL: AtomicU64 = AtomicU64::new(0);
 static QUERIES_SLOW: AtomicU64 = AtomicU64::new(0);
 
+// -- embeddings -------------------------------------------------------------
+
+static EMBED_RUNS: AtomicU64 = AtomicU64::new(0);
+static EMBED_VECTORS: AtomicU64 = AtomicU64::new(0);
+static EMBED_FAILURES: AtomicU64 = AtomicU64::new(0);
+/// Duration of the last settled run, in whole milliseconds.
+static EMBED_LAST_MS: AtomicU64 = AtomicU64::new(0);
+/// Semantic (vector) searches issued against the in-memory index.
+static VECTOR_SEARCHES: AtomicU64 = AtomicU64::new(0);
+
 // -- library ----------------------------------------------------------------
 
 static LIBRARY_OPEN: AtomicU64 = AtomicU64::new(0);
@@ -119,6 +129,20 @@ pub fn set_library_open(assets: u64) {
     LIBRARY_ASSETS.store(assets, Ordering::Relaxed);
 }
 
+/// Record a settled embedding run: `vectors` rows written, `failed` rows
+/// rejected, and how long the whole run took.
+pub fn note_embedding_run(vectors: usize, failed: usize, duration: Duration) {
+    EMBED_RUNS.fetch_add(1, Ordering::Relaxed);
+    EMBED_VECTORS.fetch_add(vectors as u64, Ordering::Relaxed);
+    EMBED_FAILURES.fetch_add(failed as u64, Ordering::Relaxed);
+    EMBED_LAST_MS.store(duration.as_millis() as u64, Ordering::Relaxed);
+}
+
+/// Record one semantic (vector) search.
+pub fn note_vector_search() {
+    VECTOR_SEARCHES.fetch_add(1, Ordering::Relaxed);
+}
+
 /// The registry as plain JSON-ready data — the `/health` body.
 #[derive(Debug, Serialize)]
 pub struct Snapshot {
@@ -129,6 +153,7 @@ pub struct Snapshot {
     outbox: OutboxHealth,
     thumb_cache: ThumbCacheHealth,
     queries: QueryHealth,
+    embeddings: EmbedHealth,
 }
 
 #[derive(Debug, Serialize)]
@@ -170,6 +195,16 @@ pub struct QueryHealth {
     total: u64,
     slow_total: u64,
     slow_threshold_ms: u64,
+    /// Semantic searches issued since process start.
+    vector_searches_total: u64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct EmbedHealth {
+    runs_total: u64,
+    vectors_total: u64,
+    failures_total: u64,
+    last_duration_ms: u64,
 }
 
 /// Hits over probes, when any probe has happened.
@@ -222,6 +257,13 @@ pub fn snapshot() -> Snapshot {
             total: load(&QUERIES_TOTAL),
             slow_total: load(&QUERIES_SLOW),
             slow_threshold_ms: SLOW_QUERY.as_millis() as u64,
+            vector_searches_total: load(&VECTOR_SEARCHES),
+        },
+        embeddings: EmbedHealth {
+            runs_total: load(&EMBED_RUNS),
+            vectors_total: load(&EMBED_VECTORS),
+            failures_total: load(&EMBED_FAILURES),
+            last_duration_ms: load(&EMBED_LAST_MS),
         },
     }
 }

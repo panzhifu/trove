@@ -118,6 +118,51 @@ pub struct AppConfig {
     /// means "this plugin's default".
     #[serde(default)]
     pub plugin_settings: HashMap<String, HashMap<String, serde_json::Value>>,
+    /// AI embedding settings (semantic search groundwork). `None` = the
+    /// feature is not configured and every AI-facing surface stays inert.
+    #[serde(default)]
+    pub ai_embedding: Option<EmbeddingConfig>,
+}
+
+/// Settings for an OpenAI-compatible embeddings endpoint — the shape every
+/// mainstream server speaks: OpenAI itself, Ollama (`http://127.0.0.1:11434/v1`),
+/// LM Studio, vLLM, and the hosted proxies.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EmbeddingConfig {
+    /// Base URL of the server, without the `/embeddings` tail.
+    #[serde(default = "default_embedding_base_url")]
+    pub base_url: String,
+    /// Bearer token. Empty is legitimate: local servers usually want none.
+    #[serde(default)]
+    pub api_key: String,
+    /// Model name exactly as the server knows it
+    /// (`text-embedding-3-small`, `nomic-embed-text`, …). This string is the
+    /// `model` identity stored beside every vector, so renaming it orphans
+    /// the old rows (delete them from the settings page and re-embed).
+    #[serde(default)]
+    pub model: String,
+}
+
+/// `https://api.openai.com/v1` — the default [`EmbeddingConfig::base_url`].
+fn default_embedding_base_url() -> String {
+    "https://api.openai.com/v1".into()
+}
+
+impl Default for EmbeddingConfig {
+    fn default() -> Self {
+        Self {
+            base_url: default_embedding_base_url(),
+            api_key: String::new(),
+            model: String::new(),
+        }
+    }
+}
+
+impl EmbeddingConfig {
+    /// Whether enough is configured to talk to the server at all.
+    pub fn is_configured(&self) -> bool {
+        !self.model.trim().is_empty() && !self.base_url.trim().is_empty()
+    }
 }
 
 /// One library in the registry. Its directory is [`paths::library_dir`] of
