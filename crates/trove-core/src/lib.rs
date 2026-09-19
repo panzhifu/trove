@@ -1,6 +1,7 @@
 //! Trove core library — domain models, persistence and services for a local
 //! asset library. Contains no UI code.
 
+pub mod ai;
 pub mod config;
 pub mod error;
 pub mod history;

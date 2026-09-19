@@ -12,6 +12,7 @@
 
 mod asset;
 mod collection;
+mod embedding;
 mod facts;
 mod query;
 mod smart_query;
@@ -22,6 +23,7 @@ pub use asset::{
     UsageStatus,
 };
 pub use collection::{Collection, NewCollection, NewSmartCollection, SmartCollection};
+pub use embedding::{EmbeddingSpace, MAX_DIM, NewEmbedding, VectorMatch, normalized};
 pub use facts::{AssetFacts, FontFacts, MediaTagsFacts, PhotoFacts, VisualFacts};
 pub use query::{AssetQuery, AssetSort, Page};
 pub use smart_query::{SmartCompare, SmartField, SmartNode};

@@ -221,6 +221,14 @@ pub struct Library {
     /// disposable derivative of the asset rows, fed by the search_queue
     /// outbox (schema triggers) and drained here.
     text_index: crate::search::TextIndex,
+    /// The in-memory embedding index for the model the app last searched
+    /// semantically, cached so consecutive queries do not reload the vector
+    /// table. Keyed by (model, space) and rebuilt when the provider changes;
+    /// the index itself re-checks the table fingerprint per search, so a
+    /// finished backfill is visible to the next query.
+    vector_index: std::cell::RefCell<
+        Option<(String, crate::model::EmbeddingSpace, crate::search::vector::VectorIndex)>,
+    >,
 }
 
 impl Library {
@@ -240,6 +248,7 @@ impl Library {
             undo: SharedUndoStack::with_cap(crate::config::AppConfig::load().undo_cap()),
             tasks: std::sync::Arc::new(crate::tasks::TaskManager::new()),
             text_index,
+            vector_index: std::cell::RefCell::new(None),
         };
         // Reconcile the search index with the asset rows: a fresh, wiped or
         // outdated index re-derives itself from the store here, so `search`
@@ -329,6 +338,7 @@ impl Library {
             cache,
             undo: SharedUndoStack::with_cap(crate::history::undo::DEFAULT_UNDO_CAP),
             tasks: std::sync::Arc::new(crate::tasks::TaskManager::new()),
+            vector_index: std::cell::RefCell::new(None),
         })
     }
 
@@ -476,6 +486,117 @@ impl Library {
             );
         }
         Ok(crate::model::Page::new(total, page))
+    }
+
+    // -- AI embeddings ---------------------------------------------------------
+
+    /// `(embedded, total)` — how many live assets carry a vector under
+    /// `model`, out of all live assets. The settings page's coverage line.
+    pub fn embedding_coverage(&self, model: &str) -> Result<(u64, u64)> {
+        crate::store::embeddings::coverage(
+            self.store.conn(),
+            model,
+            crate::model::EmbeddingSpace::Text,
+        )
+    }
+
+    /// Delete every vector stored under `model`, across spaces — the
+    /// "switched provider, start over" button. Returns rows removed.
+    pub fn delete_embeddings(&self, model: &str) -> Result<u64> {
+        self.vector_index.borrow_mut().take();
+        crate::store::embeddings::delete_model(self.store.conn(), model)
+    }
+
+    /// Start an embedding backfill on a background thread: every live asset
+    /// whose source fingerprint moved (or that has no vector yet) is
+    /// embedded through `provider` and stored. One backfill at a time
+    /// (mutual exclusion is per [`crate::tasks::TaskKind`]); progress and
+    /// lifecycle events come off [`Self::tasks`].
+    pub fn start_embedding_backfill(
+        &self,
+        provider: std::sync::Arc<dyn crate::ai::EmbeddingProvider>,
+    ) -> std::result::Result<
+        (
+            crate::tasks::TaskId,
+            std::sync::mpsc::Receiver<crate::tasks::embed::EmbedOutcome>,
+        ),
+        crate::tasks::StartError,
+    > {
+        let options = crate::tasks::embed::EmbedOptions {
+            db_path: self.root.join("library.db"),
+        };
+        let label = format!("embedding backfill ({})", provider.id());
+        self.tasks.start(
+            crate::tasks::TaskKind::EmbeddingBackfill,
+            label,
+            move |ctx| crate::tasks::embed::run(&options, provider.as_ref(), ctx),
+        )
+    }
+
+    /// Semantic search: embed `query` with `provider`, score the model's
+    /// stored vectors by cosine, and narrow the top candidates with `q`'s
+    /// structural filters — the same rank-intersect-then-page pipeline the
+    /// full-text search uses. An empty query is an empty page, not a scan.
+    pub fn semantic_search(
+        &self,
+        provider: &dyn crate::ai::EmbeddingProvider,
+        query: &str,
+        q: &crate::model::AssetQuery,
+    ) -> Result<crate::model::Page<crate::model::Asset>> {
+        let started = std::time::Instant::now();
+        let query = query.trim();
+        if query.is_empty() {
+            return Ok(crate::model::Page::new(0, Vec::new()));
+        }
+        // One query vector, from the same provider that produced the rows —
+        // the model identity is the whole comparability contract.
+        let vector = provider
+            .embed_texts(std::slice::from_ref(&query.to_string()))?
+            .into_iter()
+            .next()
+            .ok_or_else(|| {
+                crate::error::Error::Validation(
+                    "embedding provider returned no vector for the query".into(),
+                )
+            })?;
+
+        let conn = self.store.conn();
+        let index = self.vector_index_for(provider);
+        let candidates =
+            index.search(conn, &vector, crate::search::vector::VECTOR_CANDIDATE_CAP)?;
+        let ranked: Vec<Uuid> = candidates.into_iter().map(|m| m.asset_id).collect();
+        let (total, ids) = assets::rank_intersect(conn, &ranked, q)?;
+        let page = assets::page_assets(&ids, q, conn)?;
+        crate::metrics::note_vector_search();
+        crate::metrics::note_query(started.elapsed());
+        Ok(crate::model::Page::new(total, page))
+    }
+
+    /// The cached index for `provider`'s model+space, rebuilt when the
+    /// provider changes. Drift inside one model (a backfill finishing, an
+    /// asset deleted) is the index's own fingerprint check, not this cache's.
+    fn vector_index_for(
+        &self,
+        provider: &dyn crate::ai::EmbeddingProvider,
+    ) -> crate::search::vector::VectorIndex {
+        let mut cached = self.vector_index.borrow_mut();
+        let stale = match cached.as_ref() {
+            Some((model, space, _)) => {
+                model != provider.id() || *space != provider.asset_space()
+            }
+            None => true,
+        };
+        if stale {
+            *cached = Some((
+                provider.id().to_string(),
+                provider.asset_space(),
+                crate::search::vector::VectorIndex::new(provider.id(), provider.asset_space()),
+            ));
+        }
+        match cached.as_ref() {
+            Some((_, _, index)) => index.clone(),
+            None => unreachable!("populated immediately above"),
+        }
     }
 
     // -- smart collections ----------------------------------------------------
@@ -2939,4 +3060,100 @@ mod tests {
         let out = lib.export_xmp_sidecars(&[id]).unwrap();
         assert_eq!(out.written, 0);
         assert_eq!(out.skipped, 1);
-    }}
+    }
+
+    // -- AI embeddings ---------------------------------------------------------
+
+    /// The full AI-vector round trip through the facade: backfill on the
+    /// task manager, coverage on the settings page, semantic search through
+    /// the same rank-and-page pipeline as text search, and the reset button.
+    #[test]
+    fn embedding_backfill_semantic_search_and_reset() {
+        let (lib, root) = temp_library("embeddings");
+        let conn = lib.store().conn();
+
+        // Three assets with distinct titles; the mock maps each title to a
+        // stable pseudo-random vector.
+        let titles = ["red car in snow", "blue boat at sea", "green tree on hill"];
+        for title in titles {
+            let asset = crate::model::test_asset(
+                &format!("{title}.png"),
+                AssetKind::Image,
+                Uuid::new_v4(),
+            );
+            assets::insert(conn, &asset).unwrap();
+            lib.patch_asset(
+                asset.id,
+                &crate::model::AssetPatch {
+                    title: Some(Some(title.into())),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        }
+
+        let provider: std::sync::Arc<dyn crate::ai::EmbeddingProvider> =
+            std::sync::Arc::new(crate::ai::MockProvider::new("mock-embed", 16));
+
+        // Coverage is zero before any backfill.
+        assert_eq!(lib.embedding_coverage("mock-embed").unwrap(), (0, 3));
+
+        // Backfill on the task manager; wait for the outcome channel.
+        let (task_id, rx) = lib.start_embedding_backfill(provider.clone()).unwrap();
+        let outcome = rx.recv().expect("the job returns an outcome");
+        assert_eq!(outcome.embedded, 3, "{outcome:?}");
+        assert_eq!(outcome.error, None);
+        assert!(lib.tasks().snapshot().iter().any(|t| t.id == task_id));
+
+        assert_eq!(lib.embedding_coverage("mock-embed").unwrap(), (3, 3));
+
+        // Semantic search ranks the exact-title asset first: the query text
+        // embeds to the same vector the asset's title did.
+        for title in titles {
+            let page = lib
+                .semantic_search(
+                    provider.as_ref(),
+                    title,
+                    &AssetQuery {
+                        kind: Some(AssetKind::Image),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            assert_eq!(page.total, 3, "the cap feeds every vector to the filters");
+            assert_eq!(
+                page.items[0].title.as_deref(),
+                Some(title),
+                "query {title:?} must rank its own asset first"
+            );
+        }
+
+        // An empty query is an empty page, not a scan.
+        let page = lib.semantic_search(provider.as_ref(), "   ", &AssetQuery::default()).unwrap();
+        assert!(page.items.is_empty() && page.total == 0);
+
+        // A structural filter still applies to the semantic candidates.
+        let page = lib
+            .semantic_search(
+                provider.as_ref(),
+                "red car in snow",
+                &AssetQuery {
+                    kind: Some(AssetKind::Document),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(page.total, 0, "no documents in an image library");
+
+        // The reset button clears one model and leaves no vectors behind;
+        // coverage reports zero again.
+        assert_eq!(lib.delete_embeddings("mock-embed").unwrap(), 3);
+        assert_eq!(lib.embedding_coverage("mock-embed").unwrap(), (0, 3));
+        let page = lib
+            .semantic_search(provider.as_ref(), "red car in snow", &AssetQuery::default())
+            .unwrap();
+        assert_eq!(page.total, 0);
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+}

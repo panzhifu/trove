@@ -1,28 +1,57 @@
-//! The library schema: one script, one version.
+//! The library schema: one script, one version, plus a short additive
+//! upgrade list.
 //!
 //! `PRAGMA user_version` records the shape a library on disk has. This build
-//! *creates* the schema and *refuses* anything else; it does not upgrade
-//! libraries written by an earlier build.
+//! *creates* the whole shape from nothing and *refuses* shapes it cannot walk
+//! forward to. Historically it refused everything else outright: the
+//! migration chain that used to live here was twelve steps of history that
+//! only ever served this project's own development (an abandoned FTS5 table,
+//! columns altered in and dropped again), so before 0.5 the chain was deleted
+//! and [`SCHEMA`] was the whole shape.
 //!
-//! The migration chain that used to live here was twelve steps of history that
-//! only ever served this project's own development: three of them created and
-//! dropped an FTS5 table that text search abandoned, two altered in columns for
-//! features that no longer exist, and one added a column nothing has read since
-//! the workflow state replaced it. Before 0.5 there is nobody to upgrade, so
-//! the chain is gone and [`SCHEMA`] is the whole shape. A library from a build
-//! before the collapse gets an error naming both versions instead of a
-//! half-upgraded database.
+//! From 13 on there is a second door: [`UPGRADES`], a short list of purely
+//! additive steps (`CREATE TABLE`/`CREATE INDEX`, never `ALTER` or `DROP`)
+//! that walk an existing library forward one version at a time. A library
+//! from a shape with no path to here still gets an error naming both
+//! versions instead of a half-upgraded database.
 
 /// The schema this build creates. An existing library has to already be at
-/// this version to open.
+/// this version — or be walkable to it via [`UPGRADES`] — to open.
 ///
-/// The number stays at 12 rather than restarting: every library in existence
-/// was written by a build whose chain ended here, and the shape below is that
-/// same shape (the two columns dropped from it were read by nothing, and SQLite
-/// never looks at a column nobody selects). A fresh file and an existing one
-/// are therefore the same schema as far as the code is concerned — which is the
-/// only sense in which a version number means anything.
-pub const SCHEMA_VERSION: i64 = 12;
+/// The number continued from 12 rather than restarting: every library in
+/// existence was written by a build whose chain ended there, and that shape
+/// is the pre-`asset_embeddings` subset of the one below. A fresh file and an
+/// upgraded one are therefore the same schema as far as the code is
+/// concerned — which is the only sense in which a version number means
+/// anything.
+pub const SCHEMA_VERSION: i64 = 13;
+
+/// Forward upgrades: `(from_version, to_version, script)` steps, each purely
+/// additive DDL and each idempotent (`IF NOT EXISTS`) so a crash between a
+/// step's `apply` and its version write re-runs it safely on the next open.
+///
+/// The scripts deliberately duplicate the matching tail of [`SCHEMA`] rather
+/// than being derived from it: deriving DDL from a string is a parser nobody
+/// wants to own, and the diff between the two is one review glance.
+pub const UPGRADES: &[(i64, i64, &str)] = &[(12, 13, UPGRADE_V12_V13)];
+
+/// v12 → v13: the AI embedding table. Additive only — no existing table is
+/// touched, so a pre-vector library opens unchanged and the new one starts
+/// empty (the backfill task fills it).
+pub const UPGRADE_V12_V13: &str = r#"
+    CREATE TABLE IF NOT EXISTS asset_embeddings (
+        asset_id    TEXT NOT NULL REFERENCES assets(id) ON DELETE CASCADE,
+        model       TEXT NOT NULL,
+        space       TEXT NOT NULL CHECK (space IN ('text', 'image')),
+        dim         INTEGER NOT NULL,
+        source_hash TEXT NOT NULL DEFAULT '',
+        vector      BLOB NOT NULL,
+        updated_at  TEXT NOT NULL,
+        PRIMARY KEY (asset_id, model, space)
+    );
+    CREATE INDEX IF NOT EXISTS idx_asset_embeddings_model
+        ON asset_embeddings(model, space);
+"#;
 
 /// Create the current shape from nothing.
 ///
@@ -181,4 +210,31 @@ pub const SCHEMA: &str = r#"
         INSERT OR IGNORE INTO search_queue(asset_id, deleted)
         SELECT asset_id, 0 FROM asset_tag WHERE tag_id = new.id;
     END;
+
+    -- AI embeddings, one unit-normalized vector per (asset, model, space).
+    -- `space` separates the text view of an asset from its image view — a
+    -- CLIP-style model can legitimately hold both, in the same vector space,
+    -- while a plain text model only ever fills 'text'. Vectors are stored
+    -- little-endian f32, L2-normalized on write, so similarity search is a
+    -- plain dot product over the BLOBs. `dim` guards against a model-config
+    -- change quietly mixing vector shapes under one model name; `source_hash`
+    -- is the fingerprint of the exact input text (or file) that produced the
+    -- vector, so a backfill can skip rows whose inputs have not changed.
+    -- Deleting an asset deletes its embeddings with it (CASCADE).
+    CREATE TABLE asset_embeddings (
+        asset_id    TEXT NOT NULL REFERENCES assets(id) ON DELETE CASCADE,
+        -- Model identity as the provider names it, e.g.
+        -- 'text-embedding-3-small'. Everything about comparability hangs off
+        -- this string: a query vector is only scored against rows of the
+        -- same model and space.
+        model       TEXT NOT NULL,
+        space       TEXT NOT NULL CHECK (space IN ('text', 'image')),
+        dim         INTEGER NOT NULL,
+        source_hash TEXT NOT NULL DEFAULT '',
+        vector      BLOB NOT NULL,
+        updated_at  TEXT NOT NULL,
+        PRIMARY KEY (asset_id, model, space)
+    );
+
+    CREATE INDEX idx_asset_embeddings_model ON asset_embeddings(model, space);
 "#;

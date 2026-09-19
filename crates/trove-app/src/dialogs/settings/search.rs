@@ -1,5 +1,6 @@
-//! Search page: the full-text index, and the visual fingerprints (pHash +
-//! colour histogram) that power "search by image" and "search by colour".
+//! Search page: the full-text index, the visual fingerprints (pHash +
+//! colour histogram) that power "search by image" and "search by colour",
+//! and the AI-embedding endpoint that will power semantic search.
 
 use super::files::{finish_job, start_job};
 use super::*;
@@ -51,6 +52,130 @@ pub(super) fn search_page(
                     .description(rust_i18n::t!("settings.backfill_sigs_desc").to_string()),
                 ),
         )
+        .group(ai_embedding_group(controller))
+}
+
+// ============================ AI embeddings ==================================
+
+/// The saved embedding config, or defaults when the feature has never been
+/// configured.
+fn embedding_config() -> trove_core::config::EmbeddingConfig {
+    AppConfig::load().ai_embedding.unwrap_or_default()
+}
+
+/// Persist one field change to the embedding config (`config.json`, like
+/// every other setting).
+fn save_embedding_config(
+    edit: impl FnOnce(&mut trove_core::config::EmbeddingConfig),
+    cx: &mut App,
+) {
+    let mut config = AppConfig::load();
+    edit(config.ai_embedding.get_or_insert_with(Default::default));
+    let _ = config.save();
+    cx.refresh_windows();
+}
+
+/// The AI-embeddings group: the OpenAI-compatible endpoint (base URL / API
+/// key / model — Ollama, LM Studio and cloud providers all speak this), the
+/// live coverage line, and the generate/cancel button.
+fn ai_embedding_group(controller: &Entity<LibraryController>) -> SettingGroup {
+    SettingGroup::new()
+        .title(rust_i18n::t!("settings.ai_embedding").to_string())
+        .item(SettingItem::new(
+            rust_i18n::t!("settings.ai_base_url").to_string(),
+            SettingField::input(
+                |_cx| SharedString::from(embedding_config().base_url.clone()),
+                |value, cx| save_embedding_config(|c| c.base_url = value.to_string(), cx),
+            ),
+        ))
+        .item(SettingItem::new(
+            rust_i18n::t!("settings.ai_api_key").to_string(),
+            SettingField::input(
+                |_cx| SharedString::from(embedding_config().api_key.clone()),
+                |value, cx| save_embedding_config(|c| c.api_key = value.to_string(), cx),
+            ),
+        ))
+        .item(SettingItem::new(
+            rust_i18n::t!("settings.ai_model").to_string(),
+            SettingField::input(
+                |_cx| SharedString::from(embedding_config().model.clone()),
+                |value, cx| save_embedding_config(|c| c.model = value.to_string(), cx),
+            ),
+        ))
+        .item(
+            SettingItem::new(
+                rust_i18n::t!("settings.ai_coverage").to_string(),
+                SettingField::render({
+                    let controller = controller.clone();
+                    move |_, _, cx| ai_coverage_row(&controller, cx)
+                }),
+            )
+            .description(rust_i18n::t!("settings.ai_coverage_desc").to_string()),
+        )
+        .item(
+            SettingItem::new(
+                rust_i18n::t!("settings.ai_generate").to_string(),
+                SettingField::render({
+                    let controller = controller.clone();
+                    move |_, _, cx| ai_action_row(controller.clone(), cx)
+                }),
+            )
+            .description(rust_i18n::t!("settings.ai_generate_desc").to_string()),
+        )
+}
+
+/// Live coverage for the configured model: live assets carrying a vector
+/// under it, out of all live assets. Not configured → a dash.
+fn ai_coverage_row(controller: &Entity<LibraryController>, cx: &mut App) -> Div {
+    let config = embedding_config();
+    let text = if config.is_configured() {
+        match controller.read(cx).library.embedding_coverage(&config.model) {
+            Ok((embedded, total)) => rust_i18n::t!(
+                "settings.ai_coverage_value",
+                embedded = embedded,
+                total = total
+            )
+            .to_string(),
+            Err(_) => "—".into(),
+        }
+    } else {
+        "—".into()
+    };
+    div()
+        .text_sm()
+        .text_color(cx.theme().muted_foreground)
+        .child(text)
+}
+
+/// Generate or cancel, depending on whether a backfill is running. The job
+/// runs on the backend task thread ([`crate::library::jobs`] starts and
+/// watches it), so the button never blocks the window.
+fn ai_action_row(controller: Entity<LibraryController>, cx: &mut App) -> Div {
+    let running = controller
+        .read(cx)
+        .library
+        .tasks()
+        .is_running(trove_core::tasks::TaskKind::EmbeddingBackfill);
+    let button = if running {
+        let controller = controller.clone();
+        Button::new("embedding-cancel")
+            .outline()
+            .small()
+            .label(rust_i18n::t!("settings.ai_cancel").to_string())
+            .on_click(move |_, _, cx| {
+                crate::library::jobs::cancel_embedding_backfill_app(&controller, cx);
+            })
+    } else {
+        let controller = controller.clone();
+        Button::new("embedding-generate")
+            .outline()
+            .small()
+            .label(rust_i18n::t!("settings.ai_generate").to_string())
+            .on_click(move |_, window, cx| {
+                crate::library::jobs::start_embedding_backfill_app(&controller, window, cx);
+            })
+    };
+    h_flex().w_full().justify_end().child(button)
 }
 
 /// Fingerprint coverage row: the snapshot values (see [`StatsSnapshot`]).

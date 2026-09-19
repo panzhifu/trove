@@ -5,6 +5,7 @@ pub mod batch;
 pub mod browse;
 pub use browse::BrowseContext;
 pub mod collections;
+pub mod embeddings;
 pub(crate) mod rows;
 pub mod schema;
 pub mod smart;
@@ -80,26 +81,37 @@ impl Store {
         Ok(())
     }
 
-    /// Create the schema in a new file, or insist that an existing one matches.
+    /// Create the schema in a new file, or walk an existing one forward.
     ///
-    /// There is no upgrading — see [`schema`]. Before 0.5 the only libraries in
-    /// existence are this project's own, so a library written by an earlier
-    /// build is refused with both versions in the message rather than walked
-    /// forward through a chain of migrations that no longer exists.
+    /// A fresh file gets [`schema::SCHEMA`] whole. An existing one must
+    /// already be at [`schema::SCHEMA_VERSION`] or be reachable from its own
+    /// version through the additive steps in [`schema::UPGRADES`] — applied
+    /// one at a time, each committing its version write before the next step
+    /// is attempted. Anything else is refused with both versions in the
+    /// message rather than half-upgraded.
     pub fn migrate(&self) -> Result<()> {
-        let current = self.user_version()?;
+        let mut current = self.user_version()?;
         if current == schema::SCHEMA_VERSION {
             return Ok(());
         }
-        if current != 0 {
-            return Err(crate::error::Error::Validation(format!(
-                "library schema v{current}, this build creates v{}: \
-                 libraries written before 0.5 are not upgraded",
-                schema::SCHEMA_VERSION
-            )));
+        if current == 0 {
+            self.apply(schema::SCHEMA)?;
+            return self.set_user_version(schema::SCHEMA_VERSION);
         }
-        self.apply(schema::SCHEMA)?;
-        self.set_user_version(schema::SCHEMA_VERSION)
+        while current != schema::SCHEMA_VERSION {
+            let Some(&(_, to, sql)) = schema::UPGRADES.iter().find(|(from, _, _)| *from == current)
+            else {
+                return Err(crate::error::Error::Validation(format!(
+                    "library schema v{current}, this build creates v{}: \
+                     no upgrade path from v{current}",
+                    schema::SCHEMA_VERSION
+                )));
+            };
+            self.apply(sql)?;
+            self.set_user_version(to)?;
+            current = to;
+        }
+        Ok(())
     }
 
     /// Apply one DDL script atomically.
@@ -384,6 +396,43 @@ mod tests {
             err.contains(&format!("v{}", schema::SCHEMA_VERSION)),
             "{err}"
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A v12 library — every library written before the embedding table
+    /// existed — walks forward through [`schema::UPGRADES`]: the additive
+    /// step recreates the new table, the version lands on the current one,
+    /// and the data already in the library is untouched.
+    #[test]
+    fn a_v12_library_upgrades_to_the_current_schema() {
+        let dir = std::env::temp_dir().join(format!("trove-upgrade-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("library.db");
+        let asset = sample_asset("kept.png", AssetKind::Image);
+        {
+            let store = Store::open(&path).unwrap();
+            assets::insert(store.conn(), &asset).unwrap();
+            // Rewind to a pre-vector build: version 12, no embeddings table.
+            rusqlite::Connection::open(&path)
+                .unwrap()
+                .execute_batch("PRAGMA user_version = 12; DROP TABLE asset_embeddings;")
+                .unwrap();
+        }
+        let store = Store::open(&path).unwrap();
+        assert_eq!(store.user_version().unwrap(), schema::SCHEMA_VERSION);
+        assert!(assets::get(store.conn(), asset.id).unwrap().is_some());
+        // The upgraded shape accepts embedding rows, same as a fresh file.
+        crate::store::embeddings::upsert(
+            store.conn(),
+            &crate::model::NewEmbedding {
+                asset_id: asset.id,
+                model: "test-model".into(),
+                space: crate::model::EmbeddingSpace::Text,
+                vector: vec![1.0, 0.0],
+                source_hash: "h".into(),
+            },
+        )
+        .unwrap();
         std::fs::remove_dir_all(&dir).ok();
     }
 

@@ -23,6 +23,7 @@ use std::time::{Duration, Instant};
 use crate::model::new_id;
 use uuid::Uuid;
 
+pub mod embed;
 pub mod import;
 pub mod watch;
 
@@ -44,6 +45,7 @@ pub enum TaskKind {
     Maintenance,
     VisualBackfill,
     WatchScan,
+    EmbeddingBackfill,
 }
 
 impl TaskKind {
@@ -58,6 +60,7 @@ impl TaskKind {
             TaskKind::Maintenance => "maintenance",
             TaskKind::VisualBackfill => "visual-backfill",
             TaskKind::WatchScan => "watch-scan",
+            TaskKind::EmbeddingBackfill => "embedding-backfill",
         }
     }
 }
