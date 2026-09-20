@@ -386,6 +386,17 @@ impl Library {
         path.is_file().then_some(path)
     }
 
+    /// The subset of `paths` the library does not hold yet.
+    ///
+    /// Keyed on file name plus size — the same loose rule the collect import
+    /// skips on ([`assets::known_key`]) — so it can answer "is a drain worth
+    /// starting?" without staging a single file. The collect inbox keeps its
+    /// files (they are linked, not copied), so most wake-ups over it are
+    /// directories whose whole contents are already assets.
+    pub fn unimported_paths(&self, paths: &[PathBuf]) -> Vec<PathBuf> {
+        assets::unimported_paths(self.store.conn(), paths)
+    }
+
     /// Open the file behind `id` with an external application.
     ///
     /// `None` hands the file to the system default program for its type;

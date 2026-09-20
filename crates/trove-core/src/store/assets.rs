@@ -894,3 +894,138 @@ fn parse_usage_status(s: &str) -> Result<UsageStatus> {
         other => return Err(Error::Db(format!("bad usage status {other}"))),
     })
 }
+
+/// The collect-import dedup key of a candidate file: its file name and size.
+///
+/// Loose on purpose. A different file that happens to share both is skipped
+/// once, and the user can re-import it by hand — keying on the content hash
+/// instead would be the re-read this exists to avoid. `None` when the file
+/// cannot be stat'ed at all, which leaves the decision to the importer (it
+/// reports such a file as a skip in due course).
+pub fn known_key(path: &std::path::Path) -> Option<(String, u64)> {
+    let name = path.file_name()?.to_str()?;
+    let size = std::fs::metadata(path).ok()?.len();
+    Some((name.to_string(), size))
+}
+
+/// Every key the library already holds, in one scan of `assets`.
+///
+/// A database that cannot answer yields an empty set, which reads as "nothing
+/// is known yet" — the caller's next move is to offer the files to the
+/// importer, which checks again. That is the safe direction to fail in.
+pub fn known_keys(conn: &Connection) -> HashSet<(String, u64)> {
+    let Ok(mut stmt) = conn.prepare("SELECT file_name, size_bytes FROM assets") else {
+        return HashSet::new();
+    };
+    let rows = stmt.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, u64>(1)?))
+    });
+    let mut known = HashSet::new();
+    if let Ok(rows) = rows {
+        for row in rows.flatten() {
+            known.insert(row);
+        }
+    }
+    known
+}
+
+/// The subset of `paths` the library does not hold yet, in the order given.
+///
+/// The same rule the collect import skips on ([`known_key`]), asked *ahead* of
+/// the job. Worth asking because the collect inbox keeps its files — they are
+/// linked, not copied — so a wake-up over that directory is usually a
+/// directory whose entire contents are already assets, and a job would report
+/// nothing after paying for a scan and a progress notice.
+pub fn unimported_paths(
+    conn: &Connection,
+    paths: &[std::path::PathBuf],
+) -> Vec<std::path::PathBuf> {
+    if paths.is_empty() {
+        return Vec::new();
+    }
+    let known = known_keys(conn);
+    paths
+        .iter()
+        .filter(|path| match known_key(path) {
+            Some(key) => !known.contains(&key),
+            None => true,
+        })
+        .cloned()
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{AssetKind, test_asset};
+    use crate::store::Store;
+    use uuid::Uuid;
+
+    fn temp_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "trove-known-{name}-{}-{}",
+            std::process::id(),
+            Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn a_file_the_library_already_holds_is_not_offered_again() {
+        let store = Store::in_memory().unwrap();
+        let dir = temp_dir("known");
+        let held = dir.join("shot.png");
+        std::fs::write(&held, b"0123456789").unwrap();
+        let fresh = dir.join("new.png");
+        std::fs::write(&fresh, b"xy").unwrap();
+
+        let mut asset = test_asset("shot.png", AssetKind::Image, Uuid::new_v4());
+        asset.size_bytes = 10;
+        insert(store.conn(), &asset).unwrap();
+
+        let unimported = unimported_paths(store.conn(), &[held.clone(), fresh.clone()]);
+        assert_eq!(unimported, vec![fresh]);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The key is name *and* size: a different file with the same name is a
+    /// different asset, and dropping it would lose an import.
+    #[test]
+    fn the_same_name_with_a_different_size_is_still_new() {
+        let store = Store::in_memory().unwrap();
+        let dir = temp_dir("size");
+        let other = dir.join("shot.png");
+        std::fs::write(&other, b"a longer file than the one on record").unwrap();
+
+        let mut asset = test_asset("shot.png", AssetKind::Image, Uuid::new_v4());
+        asset.size_bytes = 10;
+        insert(store.conn(), &asset).unwrap();
+
+        assert_eq!(
+            unimported_paths(store.conn(), std::slice::from_ref(&other)),
+            vec![other]
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn an_empty_waiting_list_asks_the_database_nothing() {
+        let store = Store::in_memory().unwrap();
+        assert!(unimported_paths(store.conn(), &[]).is_empty());
+    }
+
+    /// A file that cannot be stat'ed stays a candidate: the importer is the
+    /// one that reports it, and dropping it here would hide the reason.
+    #[test]
+    fn a_missing_file_stays_a_candidate() {
+        let store = Store::in_memory().unwrap();
+        let gone = std::path::PathBuf::from("/nonexistent/trove/shot.png");
+        assert_eq!(
+            unimported_paths(store.conn(), std::slice::from_ref(&gone)),
+            vec![gone]
+        );
+    }
+}

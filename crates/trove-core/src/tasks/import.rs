@@ -274,9 +274,9 @@ pub fn run(options: &ImportOptions, ctx: &JobContext) -> Result<ImportOutcome, S
     // (same name and size) are dropped before staging and counted separately
     // from real skips: nothing was wrong with them, they are just in already.
     if matches!(options.source, ImportSource::CollectInbox { .. }) {
-        let known = already_imported(&conn);
+        let known = assets::known_keys(&conn);
         let before = paths.len();
-        paths.retain(|path| match known_entry(path) {
+        paths.retain(|path| match assets::known_key(path) {
             Some(key) => !known.contains(&key),
             None => true,
         });
@@ -411,35 +411,6 @@ fn commit_chunk(
     report.imported.extend(imported);
     report.skipped.extend(skipped);
     Ok(())
-}
-
-/// Every (file name, size) pair the library already holds, in one scan. Keyed
-/// loosely on purpose: name + size can only false-positive on a different
-/// file that happens to share both, and the cost of that is one file a user
-/// can re-import by hand — while keying on the hash would be the re-read this
-/// exists to avoid.
-fn already_imported(conn: &Connection) -> HashSet<(String, u64)> {
-    let Ok(mut stmt) = conn.prepare("SELECT file_name, size_bytes FROM assets") else {
-        return HashSet::new();
-    };
-    let rows = stmt.query_map([], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, u64>(1)?))
-    });
-    let mut known = HashSet::new();
-    if let Ok(rows) = rows {
-        for row in rows.flatten() {
-            known.insert(row);
-        }
-    }
-    known
-}
-
-/// The dedup key of a candidate file: its name and size. `None` when the file
-/// cannot be stat'ed (staging reports it as a skip in due course).
-fn known_entry(path: &Path) -> Option<(String, u64)> {
-    let name = path.file_name()?.to_str()?;
-    let size = std::fs::metadata(path).ok()?.len();
-    Some((name.to_string(), size))
 }
 
 /// Collect-inbox imports stamp the sidecar's `source_url` onto the fresh
