@@ -8,6 +8,7 @@ use uuid::Uuid;
 use crate::error::Result;
 use crate::history::undo::{self, Op, OpAction, OpDesc, SharedUndoStack};
 use crate::media;
+use crate::services::collect;
 use crate::store::{Store, assets, batch, collections, rows, smart, smart_collections, tags};
 
 /// Serialize the whole metadata catalog of `store` (assets, collections,
@@ -167,6 +168,8 @@ pub struct PurgeReport {
     pub purged: u64,
     pub blobs_removed: u64,
     pub thumbs_removed: u64,
+    /// Files Trove removed from its own inbox along with their records.
+    pub sources_removed: u64,
 }
 
 /// Outcome of a batch image edit. `skipped` counts assets the batch had no
@@ -679,47 +682,37 @@ impl Library {
 
     /// Permanently delete one asset. The database row (and its collection /
     /// tag memberships) is removed; the blob file and thumbnail are deleted
-    /// once no other asset references the same content hash.
+    /// once no other asset references the same content hash, and a file Trove
+    /// itself put in the inbox goes with it (see [`Self::purge_assets`]).
+    /// A target that is already gone is an error, not a silent no-op.
     pub fn purge_asset(&self, asset_id: Uuid) -> Result<()> {
-        let conn = self.store.conn();
-        let Some(asset) = assets::get(conn, asset_id)? else {
+        if assets::get(self.store.conn(), asset_id)?.is_none() {
             return Err(crate::Error::NotFound("asset"));
-        };
-        let sha = asset.sha256.clone();
-        let rel = asset.rel_path.clone();
-        assets::delete(conn, asset_id)?;
-        if let (Some(sha), Some(rel)) = (sha, rel)
-            && assets::count_by_sha256(conn, &sha)? == 0
-        {
-            self.remove_blob_files(&rel, &sha);
         }
+        self.purge_assets(std::slice::from_ref(&asset_id))?;
         Ok(())
     }
 
     /// Permanently delete every trashed asset. Returns the number removed.
     pub fn empty_trash(&self) -> Result<u64> {
-        let conn = self.store.conn();
+        self.empty_trash_against(&collect::inbox_dir())
+    }
+
+    /// [`empty_trash`] with the inbox spelled out (tests).
+    ///
+    /// One batch through [`Self::purge_assets_against`], so an asset emptied
+    /// from the trash is treated exactly like one deleted outright — this used
+    /// to be a second copy of the purge rules that could drift from the first.
+    pub(crate) fn empty_trash_against(&self, inbox: &Path) -> Result<u64> {
         let page = assets::query(
-            conn,
+            self.store.conn(),
             &crate::model::AssetQuery {
                 is_trashed: true,
                 ..Default::default()
             },
         )?;
-        let mut removed = 0u64;
-        for asset in page.items {
-            let id = asset.id;
-            let sha = asset.sha256.clone();
-            let rel = asset.rel_path.clone();
-            assets::delete(conn, id)?;
-            if let (Some(sha), Some(rel)) = (sha, rel)
-                && assets::count_by_sha256(conn, &sha)? == 0
-            {
-                self.remove_blob_files(&rel, &sha);
-            }
-            removed += 1;
-        }
-        Ok(removed)
+        let ids: Vec<Uuid> = page.items.iter().map(|asset| asset.id).collect();
+        Ok(self.purge_assets_against(&ids, inbox)?.purged)
     }
 
     // -- batch asset mutations ------------------------------------------------
@@ -1669,17 +1662,38 @@ impl Library {
 
     /// Permanently delete many assets atomically, freeing any content-addressed
     /// blob (and its thumbnail) once no asset references it left.
+    ///
+    /// A linked file generally outlives its record — it is the user's, wherever
+    /// they keep it — with one exception: a file Trove put in its own inbox (a
+    /// screenshot, a collected page, an extension upload) is deleted with the
+    /// record. The inbox is a permanent import source and the dedupe key lives
+    /// in the very row being deleted, so a file left behind there is imported
+    /// again on the next scan: "delete" would undo itself on every restart.
     pub fn purge_assets(&self, ids: &[Uuid]) -> Result<PurgeReport> {
+        self.purge_assets_against(ids, &collect::inbox_dir())
+    }
+
+    /// [`purge_assets`] with the inbox spelled out, so the rule can be
+    /// exercised without relocating the data root.
+    pub(crate) fn purge_assets_against(&self, ids: &[Uuid], inbox: &Path) -> Result<PurgeReport> {
         // Track (rel, sha) for every content hash left unreferenced by this
         // purge, so the file is deleted exactly once even when several deleted
-        // assets shared it.
+        // assets shared it. Linked sources are collected the same way, then
+        // tried against the inbox once the records are gone.
         let mut freed: Vec<(String, String)> = Vec::new();
+        let mut sources: Vec<PathBuf> = Vec::new();
         let purged = self.store.transaction(|tx| {
             let mut freed_tx: Vec<(String, String)> = Vec::new();
+            let mut sources_tx: Vec<PathBuf> = Vec::new();
             for id in ids {
                 let Some(asset) = assets::get(tx, *id)? else {
                     continue;
                 };
+                if asset.origin == crate::model::Origin::Linked
+                    && let Some(source) = asset.facts.source_path.as_deref()
+                {
+                    sources_tx.push(PathBuf::from(source));
+                }
                 let sha = asset.sha256.clone();
                 let rel = asset.rel_path.clone();
                 assets::delete(tx, *id)?;
@@ -1690,6 +1704,7 @@ impl Library {
                 }
             }
             freed = freed_tx;
+            sources = sources_tx;
             Ok(ids.len() as u64)
         })?;
 
@@ -1703,6 +1718,15 @@ impl Library {
             }
             report.thumbs_removed += 1;
             self.remove_blob_files(&rel, &sha);
+        }
+        for source in collect::inbox_files(inbox, sources) {
+            if collect::remove_inbox_file(&source) {
+                report.sources_removed += 1;
+                tracing::info!(
+                    path = %source.display(),
+                    "purge: removed the inbox file along with its asset"
+                );
+            }
         }
         Ok(report)
     }
@@ -1971,6 +1995,82 @@ mod tests {
         );
         let sha = stored.sha256.unwrap();
         assert!(!thumb::abs_path(lib.cache(), &sha).exists());
+    }
+
+    /// Import one file as a *linked* asset — the shape screenshots and
+    /// collected pages have, where the file stays where it is.
+    fn import_linked(lib: &Library, root: &Path, source: &Path) -> Uuid {
+        use crate::media::import::{ImportStorage, commit_staged_all, stage_all};
+
+        let staged = stage_all(
+            root,
+            &root.join("cache"),
+            std::slice::from_ref(&source.to_path_buf()),
+            ImportStorage::Link,
+            &std::sync::atomic::AtomicBool::new(false),
+        );
+        let report = commit_staged_all(lib.store().conn(), None, staged);
+        assert_eq!(report.imported_count(), 1);
+        report.imported[0].asset_id
+    }
+
+    /// A screenshot's record and its file go together: the inbox keeps its
+    /// files forever and is a permanent import source, so a file left behind
+    /// would be imported again on the next scan and the delete would undo
+    /// itself at every restart.
+    #[test]
+    fn purging_an_asset_removes_its_file_from_the_inbox() {
+        let (lib, root) = temp_library("purge-inbox");
+        let inbox = root.join("incoming");
+        std::fs::create_dir_all(&inbox).unwrap();
+        let shot = write_source(&inbox, "screenshot-1.png", PNG_1X1);
+        let sidecar = inbox.join("screenshot-1.png.meta.json");
+        std::fs::write(&sidecar, b"{}").unwrap();
+
+        let id = import_linked(&lib, &root, &shot);
+        let report = lib.purge_assets_against(&[id], &inbox).unwrap();
+
+        assert_eq!(report.purged, 1);
+        assert_eq!(report.sources_removed, 1);
+        assert!(!shot.exists(), "the file goes with the record");
+        assert!(!sidecar.exists(), "and so does its sidecar");
+        assert!(assets::get(lib.store().conn(), id).unwrap().is_none());
+    }
+
+    /// Everywhere else the file is the user's: purging the record leaves it
+    /// exactly where it was.
+    #[test]
+    fn purging_a_linked_file_outside_the_inbox_leaves_it_alone() {
+        let (lib, root) = temp_library("purge-outside");
+        let inbox = root.join("incoming");
+        let pictures = root.join("pictures");
+        std::fs::create_dir_all(&inbox).unwrap();
+        std::fs::create_dir_all(&pictures).unwrap();
+        let photo = write_source(&pictures, "holiday.png", PNG_1X1);
+
+        let id = import_linked(&lib, &root, &photo);
+        let report = lib.purge_assets_against(&[id], &inbox).unwrap();
+
+        assert_eq!(report.purged, 1);
+        assert_eq!(report.sources_removed, 0);
+        assert!(photo.is_file(), "a user's own file is never deleted");
+    }
+
+    /// Soft delete stays reversible, so it must not touch the file at all —
+    /// only a purge does, and emptying the trash counts as one.
+    #[test]
+    fn trashing_an_inbox_file_leaves_it_for_the_restore() {
+        let (lib, root) = temp_library("trash-inbox");
+        let inbox = root.join("incoming");
+        std::fs::create_dir_all(&inbox).unwrap();
+        let shot = write_source(&inbox, "screenshot-2.png", PNG_1X1);
+
+        let id = import_linked(&lib, &root, &shot);
+        lib.trash_assets(&[id]).unwrap();
+        assert!(shot.is_file(), "the trash is undoable, so the file stays");
+
+        assert_eq!(lib.empty_trash_against(&inbox).unwrap(), 1);
+        assert!(!shot.exists(), "emptying the trash is what removes it");
     }
 
     #[test]

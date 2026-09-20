@@ -86,6 +86,11 @@ const IO_TIMEOUT: Duration = Duration::from_secs(60);
 /// visible name only appears once the bytes are all there.
 const PART_SUFFIX: &str = ".part";
 
+/// Suffix of the notes sidecar (`<file>.trove.json`), written and read by the
+/// sidecar-notes plugin in `trove-app`. The drain skips it too, and an inbox
+/// file is deleted together with it.
+const NOTES_SUFFIX: &str = ".trove.json";
+
 /// Where collected files land.
 ///
 /// This is not a staging area to be swept clean: the library *links* whatever
@@ -140,10 +145,60 @@ pub fn inbox_items_in(inbox: &std::path::Path) -> Vec<(PathBuf, Option<PathBuf>)
 /// imported as an asset in its own right.
 fn is_inbox_sidecar(name: Option<&std::ffi::OsStr>) -> bool {
     name.and_then(|n| n.to_str())
-        .map(|n| {
-            n.ends_with(".meta.json") || n.ends_with(".trove.json") || n.ends_with(PART_SUFFIX)
-        })
+        .map(|n| n.ends_with(".meta.json") || n.ends_with(NOTES_SUFFIX) || n.ends_with(PART_SUFFIX))
         .unwrap_or(true)
+}
+
+/// The paths in `sources` that live in `inbox` — the files Trove put there
+/// itself.
+///
+/// The inbox is the one directory whose files are Trove's to remove: a
+/// screenshot or a collected page lands here and the library links it where it
+/// stands, so deleting the record can only mean deleting the file. Everywhere
+/// else a linked file belongs to the user and outlives its record, which is
+/// why a purge has to ask this question first.
+///
+/// Both sides are canonicalized, so a relocated data root or a symlinked
+/// `/tmp` still compares equal; a path that no longer resolves is compared as
+/// written. `starts_with` is component-wise, so a sibling `incoming-old/`
+/// never matches.
+pub fn inbox_files(inbox: &Path, sources: Vec<PathBuf>) -> Vec<PathBuf> {
+    let inbox = resolved(inbox);
+    sources
+        .into_iter()
+        .filter(|source| resolved(source).starts_with(&inbox))
+        .collect()
+}
+
+/// Canonical form of `path`, or the path itself when it cannot be resolved.
+fn resolved(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// Delete one inbox file together with the sidecars that describe it. True
+/// when the file went away in this call.
+///
+/// The sidecars go too: once their file is gone they describe nothing, the
+/// drain skips them, and no other code path would ever clean them up — an
+/// older note would sit in the inbox forever.
+pub fn remove_inbox_file(path: &Path) -> bool {
+    let notes = path.with_file_name(format!(
+        "{}{NOTES_SUFFIX}",
+        path.file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    ));
+    let _ = std::fs::remove_file(sidecar_path(path));
+    let _ = std::fs::remove_file(notes);
+    match std::fs::remove_file(path) {
+        Ok(()) => true,
+        Err(error) => {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(path = %path.display(), %error, "could not remove an inbox file");
+            }
+            false
+        }
+    }
 }
 
 /// Start the server on a daemon thread. Returns the bound port, or `None`
@@ -799,6 +854,13 @@ fn respond(mut stream: TcpStream, status: u16, body: &str) -> std::io::Result<()
 mod tests {
     use super::*;
 
+    /// A file with any content, at its final path.
+    fn write(dir: &Path, name: &str) -> PathBuf {
+        let path = dir.join(name);
+        std::fs::write(&path, b"x").unwrap();
+        path
+    }
+
     #[test]
     fn sidecars_and_half_written_files_are_never_listed_as_imports() {
         let inbox = std::env::temp_dir().join(format!("trove-inbox-{}", uuid::Uuid::new_v4()));
@@ -814,6 +876,70 @@ mod tests {
             vec![inbox.join("shot.png")],
             "only the complete file is waiting"
         );
+
+        std::fs::remove_dir_all(&inbox).unwrap();
+    }
+
+    /// The purge rule leans on this: only files in the inbox are Trove's to
+    /// delete, and "in the inbox" has to mean the directory itself rather than
+    /// anything whose path happens to start with the same letters.
+    #[test]
+    fn only_files_inside_the_inbox_are_troves_own() {
+        let root = std::env::temp_dir().join(format!("trove-inbox-{}", uuid::Uuid::new_v4()));
+        let inbox = root.join("incoming");
+        let nested = inbox.join("nested");
+        let sibling = root.join("incoming-old");
+        let pictures = root.join("pictures");
+        for dir in [&nested, &sibling, &pictures] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let inside = write(&inbox, "shot.png");
+        let deep = write(&nested, "deep.png");
+        let near_miss = write(&sibling, "shot.png");
+        let users = write(&pictures, "holiday.jpg");
+
+        let owned = inbox_files(
+            &inbox,
+            vec![
+                inside.clone(),
+                deep.clone(),
+                near_miss.clone(),
+                users.clone(),
+            ],
+        );
+        assert_eq!(owned, vec![inside.clone(), deep]);
+
+        // A spelling with a `.` in it still resolves to the same file.
+        assert_eq!(
+            inbox_files(&inbox, vec![inbox.join(".").join("shot.png")]).len(),
+            1
+        );
+
+        // An inbox that does not exist yet owns nothing.
+        assert!(inbox_files(&root.join("missing"), vec![users.clone()]).is_empty());
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn removing_an_inbox_file_takes_its_sidecars() {
+        let inbox = std::env::temp_dir().join(format!("trove-inbox-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&inbox).unwrap();
+        let shot = write(&inbox, "shot.png");
+        let meta = inbox.join("shot.png.meta.json");
+        let notes = inbox.join("shot.png.trove.json");
+        std::fs::write(&meta, b"{}").unwrap();
+        std::fs::write(&notes, b"{}").unwrap();
+        let neighbour = write(&inbox, "other.png");
+
+        assert!(remove_inbox_file(&shot));
+        assert!(!shot.exists());
+        assert!(!meta.exists(), "the collect sidecar goes with the file");
+        assert!(!notes.exists(), "so does the notes sidecar");
+        assert!(neighbour.exists(), "nothing else in the inbox is touched");
+
+        // Asking twice reports no second removal.
+        assert!(!remove_inbox_file(&shot));
 
         std::fs::remove_dir_all(&inbox).unwrap();
     }
