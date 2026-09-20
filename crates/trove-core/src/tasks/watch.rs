@@ -602,6 +602,14 @@ mod tests {
     /// one an inbox import with nothing to do, for as long as a single file
     /// sits in the inbox — which, since a screenshot or a collected file stays
     /// there for good, is the whole life of the process.
+    ///
+    /// inotify-shaped, so not run on macOS: notify's FSEvents backend works
+    /// in imprecise mode by default, where every event arrives as
+    /// `EventKind::Any` — reads and writes are indistinguishable there, and
+    /// this filter cannot be expressed. The consequence on macOS is the one
+    /// this test guards against on Linux: the listing scan may re-signal
+    /// itself (a no-op import per tick), which is a wart, not a wrong import.
+    #[cfg(not(target_os = "macos"))]
     #[test]
     fn reading_the_inbox_is_not_activity() {
         let dir = temp_dir("inbox-read");
@@ -655,6 +663,14 @@ mod tests {
     /// The kernel path is what makes a drop show up in under a second. If the
     /// platform hands us no watcher this test has nothing to say — the sweep
     /// covers that case — so it passes without asserting.
+    ///
+    /// Not run on macOS: FSEvents registers its stream asynchronously on a
+    /// runloop thread with `SinceNow`, so a file written immediately after
+    /// `Events::start` can land before the stream is live and never be
+    /// reported. The sweep covers that case there (a root that `watch`ed
+    /// successfully still backs off to the slower cadence, so files arrive
+    /// late rather than never).
+    #[cfg(not(target_os = "macos"))]
     #[test]
     fn kernel_events_reach_the_buffer_until_they_are_acknowledged() {
         let root = temp_dir("events");
