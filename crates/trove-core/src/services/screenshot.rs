@@ -61,6 +61,24 @@ impl CaptureTarget {
     pub fn is_interactive(&self) -> bool {
         matches!(self, CaptureTarget::PickWindow | CaptureTarget::PickArea)
     }
+
+    /// Whether only the platform's compositor interface can render this target.
+    ///
+    /// A window or a single output is not something the desktop's capture tools
+    /// can be *told* about — `grim`, `scrot` and `screencapture` take a screen
+    /// or a rectangle — so these are the targets that go in-process or nowhere.
+    /// Worth telling apart from the rest: on a session with no such interface
+    /// (KWin is the one that has an enumerable window stack) the reason a
+    /// window capture failed is a missing capability, not a broken tool.
+    pub fn needs_compositor(&self) -> bool {
+        matches!(
+            self,
+            CaptureTarget::Screen { .. }
+                | CaptureTarget::ActiveWindow
+                | CaptureTarget::Window { .. }
+                | CaptureTarget::PickWindow
+        )
+    }
 }
 
 /// Where a frame came from — the reason to log it, and (later) the start of
@@ -268,12 +286,14 @@ pub fn capture(target: &CaptureTarget, dest: &Path) -> Result<CaptureSource, Err
 
     // KWin first on Linux: Plasma implements neither wlr-screencopy nor
     // ext-image-copy-capture, so KWin's own D-Bus interface is the only
-    // in-process capture there. On other sessions the call simply finds no
-    // such service and we fall through. The call reaches into the display
-    // server, and a bug there should not take the caller's task down, hence
-    // the unwind guard on both in-process backends.
+    // in-process capture there. On other sessions that name is not even owned,
+    // so ask before calling: a session without KWin should reach the toolchain
+    // without a failed D-Bus round trip in the log, and "no compositor here"
+    // says more than echoing `ServiceUnknown`. The call reaches into the
+    // display server, and a bug there should not take the caller's task down,
+    // hence the unwind guard on both in-process backends.
     #[cfg(target_os = "linux")]
-    let mut in_process_error: Option<String> = {
+    let mut in_process_error: Option<String> = if kwin::available() {
         let attempt =
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| capture_in_process(target)));
         match attempt.unwrap_or_else(|payload| Err(kwin::Failure::Failed(panic_message(payload)))) {
@@ -290,6 +310,9 @@ pub fn capture(target: &CaptureTarget, dest: &Path) -> Result<CaptureSource, Err
                 Some(failure.labelled())
             }
         }
+    } else {
+        tracing::debug!(target = ?target, "no KDE Plasma session; skipping the compositor path");
+        None
     };
     #[cfg(not(target_os = "linux"))]
     let mut in_process_error: Option<String> = None;
@@ -318,15 +341,8 @@ pub fn capture(target: &CaptureTarget, dest: &Path) -> Result<CaptureSource, Err
     }
 
     let Some(plan) = plan_for(target, dest, Platform::detect()) else {
-        tracing::error!(
-            target = ?target,
-            in_process_error = ?in_process_error,
-            "no capture backend for this target"
-        );
-        let reason = match in_process_error {
-            Some(reason) => format!("{reason}; no external capture tool for this target"),
-            None => "no capture backend for this target on this platform".into(),
-        };
+        let reason = no_backend_reason(in_process_error, target);
+        tracing::error!(target = ?target, reason, "no capture backend for this target");
         return Err(Error::Unsupported(reason));
     };
     tracing::debug!(program = %plan.program, args = ?plan.args, "external capture plan");
@@ -336,6 +352,25 @@ pub fn capture(target: &CaptureTarget, dest: &Path) -> Result<CaptureSource, Err
             Some(reason) => Error::Failed(format!("{reason}; {e}")),
             None => Error::Failed(e),
         })
+}
+
+/// Why nothing could take `target`, in the words the user gets.
+///
+/// Three situations end here and they want different sentences: a backend that
+/// was there and refused (its reason is carried along, and it is the one worth
+/// reading), a target only a compositor interface can render on a session that
+/// has none — the honest answer for a window or a screen, and the one a user on
+/// a wlroots compositor should see instead of `ServiceUnknown` — and a target
+/// this platform has no tool for at all.
+fn no_backend_reason(in_process_error: Option<String>, target: &CaptureTarget) -> String {
+    match (in_process_error, target.needs_compositor()) {
+        (Some(reason), _) => format!("{reason}; no external capture tool for this target"),
+        (None, true) => {
+            "window and screen capture need a compositor interface this session does not offer"
+                .into()
+        }
+        (None, false) => "no capture backend for this target on this platform".into(),
+    }
 }
 
 /// The in-process path for one target: KWin on Linux, nothing elsewhere
@@ -707,5 +742,44 @@ mod tests {
         assert!(CaptureTarget::PickArea.is_interactive());
         assert!(!CaptureTarget::Workspace.is_interactive());
         assert!(!area().is_interactive());
+    }
+
+    #[test]
+    fn a_window_or_a_screen_is_the_compositors_to_render() {
+        for target in [
+            CaptureTarget::ActiveWindow,
+            CaptureTarget::Window {
+                handle: "uuid".into(),
+            },
+            CaptureTarget::PickWindow,
+            CaptureTarget::Screen { name: None },
+        ] {
+            assert!(target.needs_compositor(), "{target:?}");
+        }
+        for target in [CaptureTarget::Workspace, CaptureTarget::PickArea, area()] {
+            assert!(!target.needs_compositor(), "{target:?}");
+        }
+    }
+
+    #[test]
+    fn the_reason_names_what_was_missing() {
+        // A backend that refused keeps its own words: they are the diagnosis.
+        assert_eq!(
+            no_backend_reason(Some("kwin: boom".into()), &CaptureTarget::Workspace),
+            "kwin: boom; no external capture tool for this target"
+        );
+
+        // A window on a session with no compositor interface: nothing failed,
+        // a capability is missing, and that deserves its own sentence rather
+        // than a D-Bus error name.
+        let window = no_backend_reason(None, &CaptureTarget::ActiveWindow);
+        assert!(window.contains("compositor interface"), "{window}");
+        assert!(!window.contains("kwin"), "{window}");
+
+        // Nothing in process to blame and no tool for this target.
+        assert_eq!(
+            no_backend_reason(None, &CaptureTarget::Workspace),
+            "no capture backend for this target on this platform"
+        );
     }
 }
