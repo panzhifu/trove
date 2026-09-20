@@ -29,13 +29,12 @@ jobs:
             os: macos-14
             asset_name: trove-x86_64-apple-darwin
             archive_ext: zip
-          # Linux (x86_64). Built on the oldest LTS runner image so the
-          # artifact's glibc floor stays low (22.04 -> glibc 2.35). Note:
-          # GitHub began deprecating the ubuntu-22.04 image in September 2026
-          # and drops it entirely by April 2027 — when that happens, either
-          # build inside an ubuntu:22.04 container or accept the newer floor.
+          # Linux (x86_64). Built on 24.04, not 22.04: xcap -> libspa needs
+          # pipewire headers >= 0.3.65 (see the Ubuntu step below), and jammy's
+          # 0.3.48 cannot compile the crate. Consequence: this artifact needs
+          # glibc >= 2.39, i.e. Ubuntu 24.04+ / Debian 13+ at runtime.
           - target: x86_64-unknown-linux-gnu
-            os: ubuntu-22.04
+            os: ubuntu-24.04
             asset_name: trove-x86_64-unknown-linux-gnu
             archive_ext: tar.gz
           # Windows (x86_64)
@@ -70,29 +69,30 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
+          # Ubuntu 24.04 is required, not 22.04: xcap -> libspa binds the pipewire
+          # headers at build time and needs >= 0.3.65 (spa_video_info_raw.flags,
+          # spa_meta_first, spa_meta_region_is_valid); jammy's 0.3.48 fails.
+          #
           # Every system library this graph needs, mapped to the crate that
           # needs it — the list must not depend on what the image happens to
-          # preinstall, because images differ (24.04 dropped fontconfig and
-          # libgbm, and each of those killed a run on its own):
+          # preinstall, because ubuntu-24.04 dropped fontconfig and libgbm, and
+          # each of those killed a run on its own:
           #   libxcb1-dev         xcb (gpui clipboard/capture)
           #   libxkbcommon*-dev   xkbcommon (gpui keyboard)
           #   libegl1-mesa-dev    khronos-egl (gpui/wgpu GL context)
-          #   libfontconfig1-dev  yeslogic-fontconfig-sys <- zed-font-kit
+          #   libfontconfig-dev   yeslogic-fontconfig-sys <- zed-font-kit
           #   libasound2-dev      alsa-sys <- cpal (rodio, video preview audio)
           #   libwayland-dev      wayland-sys (client/cursor/egl/server)
           #   libdrm-dev          drm-sys <- gbm
           #   libzstd-dev         zstd-sys <- tantivy
+          #   libpipewire-0.3-dev libspa-sys <- pipewire <- xcap
           # and the link-only one, which consults no .pc file:
           #   libgbm-dev          gbm (rustc-link-lib=gbm, gpui's GBM surface)
-          # No pipewire: xcap is not a Linux dependency any more (see
-          # trove-core's Cargo.toml), so nothing in the graph binds it.
-          # libfontconfig1-dev is the name that exists on both jammy and
-          # noble (on noble it forwards to libfontconfig-dev).
           sudo apt-get install -y \
             libxcb1-dev libxkbcommon-dev libxkbcommon-x11-dev \
-            libegl1-mesa-dev libgl1-mesa-dev libfontconfig1-dev \
+            libegl1-mesa-dev libgl1-mesa-dev libfontconfig-dev \
             libasound2-dev libwayland-dev libdrm-dev libzstd-dev \
-            libgbm-dev
+            libgbm-dev libpipewire-0.3-dev
 
       - name: Build release binary
         run: cargo build --release --target ${{ matrix.target }} -p trove-app
