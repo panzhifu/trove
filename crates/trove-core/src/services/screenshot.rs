@@ -642,6 +642,9 @@ fn windows_capture_script(dest: &str) -> String {
 mod tests {
     use super::*;
 
+    // Only the plans that shell out through `sh` ask for a destination; the
+    // macOS `screencapture` and Windows PowerShell tests build their own.
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     fn dest() -> PathBuf {
         PathBuf::from("/tmp/shot.png")
     }

@@ -1434,6 +1434,7 @@ fn prepare_pick() -> Result<
 /// itself (decoration included, native resolution, nothing else in frame),
 /// and the rectangle the user clicked is the fallback if the window is gone
 /// by the time we ask for it.
+#[cfg(target_os = "linux")]
 pub(crate) fn capture_picked_window(
     picked: crate::components::capture_pick::Candidate,
     dest: PathBuf,
