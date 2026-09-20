@@ -548,6 +548,9 @@ fn watch_import(
     cx.spawn(async move |cx| {
         loop {
             let mut settled: Option<Notification> = None;
+            // Whether the job is over, independently of whether there is a
+            // toast to show for it: the watcher must stop either way.
+            let mut finished = false;
             for event in manager.poll_events() {
                 let TaskEvent::Progress { done, total, id } = &event else {
                     if event_task_id(&event) != Some(task_id) {
@@ -618,6 +621,7 @@ fn watch_import(
                         cx.notify();
                     });
                     settled = outcome_toast(&outcome);
+                    finished = true;
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => {}
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
@@ -630,12 +634,19 @@ fn watch_import(
                             cx.notify();
                         });
                     }
+                    finished = true;
                 }
             }
 
-            if let Some(note) = settled {
-                let _ = handle.update(cx, |_view, window, cx| {
-                    window.push_notification(note, cx);
+            if finished {
+                let _ = handle.update(cx, |_view, window, cx| match settled {
+                    Some(note) => window.push_notification(note, cx),
+                    // Nothing worth saying — the whole batch was already
+                    // imported. The progress toast carries the cancel button,
+                    // so it never ages out on its own; leaving it behind is
+                    // what turned a no-op inbox drain into a permanent
+                    // "importing…" in the corner.
+                    None => window.remove_notification1::<ImportNotice>("import-progress", cx),
                 });
                 break;
             }
