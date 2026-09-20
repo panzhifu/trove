@@ -369,7 +369,10 @@ impl Activity {
         let sink = Arc::clone(&touched);
         let mut watcher =
             notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
-                if event.is_ok() {
+                let Ok(event) = event else {
+                    return;
+                };
+                if counts_as_activity(&event) {
                     sink.store(true, Ordering::Relaxed);
                 }
             })
@@ -388,6 +391,22 @@ impl Activity {
     fn take(&self) -> bool {
         self.touched.swap(false, Ordering::Relaxed)
     }
+}
+
+/// Whether an event means the inbox changed, as opposed to being read.
+///
+/// Only the write side counts: what lands, changes or goes away. Reads have to
+/// be excluded by name because this job lists the inbox on *every* tick, and
+/// reading a directory is reported as `Access(Open)` — counting "any event"
+/// made the listing scan its own trigger, which signalled the embedder every
+/// tick and left it starting an inbox import that had nothing to do (for as
+/// long as a single file sits in the inbox, which is forever: the inbox keeps
+/// its files, they are linked rather than copied).
+///
+/// `Any` and `Other` are backend catch-alls — on a platform whose events
+/// cannot be classified, they are all there is — so they stay counted.
+fn counts_as_activity(event: &notify::Event) -> bool {
+    !matches!(event.kind, notify::EventKind::Access(_))
 }
 
 /// One full pass over the watch roots: baseline new roots, then report
@@ -573,6 +592,64 @@ mod tests {
         let now = SystemTime::now();
         assert!(settled(&file, now, Duration::from_secs(60)));
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Reading the inbox is not activity.
+    ///
+    /// The listing scan runs every tick, and `read_dir` opens the directory —
+    /// which inotify reports as `Access(Open)` (measured). Counting it made
+    /// the scan its own trigger: an inbox signal every tick, and behind each
+    /// one an inbox import with nothing to do, for as long as a single file
+    /// sits in the inbox — which, since a screenshot or a collected file stays
+    /// there for good, is the whole life of the process.
+    #[test]
+    fn reading_the_inbox_is_not_activity() {
+        let dir = temp_dir("inbox-read");
+        std::fs::write(dir.join("shot.png"), b"x").unwrap();
+        let Some(activity) = Activity::watch(&dir) else {
+            return; // no backend here: the periodic scan carries the inbox
+        };
+        // The watcher starts set, so the first pass sees files that predate it.
+        assert!(activity.take());
+        // A listing scan, exactly as the loop runs it every tick.
+        assert_eq!(crate::services::collect::inbox_items_in(&dir).len(), 1);
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(!activity.take(), "a read of the inbox is not activity");
+
+        // A file landing still is: the filter must not have deafened it.
+        std::fs::write(dir.join("shot2.png"), b"x").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !activity.take() {
+            assert!(
+                Instant::now() < deadline,
+                "a file landing in the inbox went unnoticed"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn only_write_side_events_count_as_inbox_activity() {
+        use notify::EventKind;
+        use notify::event::{AccessKind, AccessMode, CreateKind, DataChange, ModifyKind};
+
+        let read = notify::Event::new(EventKind::Access(AccessKind::Open(AccessMode::Any)));
+        assert!(!counts_as_activity(&read));
+        let read_close = notify::Event::new(EventKind::Access(AccessKind::Close(AccessMode::Read)));
+        assert!(!counts_as_activity(&read_close));
+
+        for kind in [
+            EventKind::Create(CreateKind::File),
+            EventKind::Modify(ModifyKind::Data(DataChange::Any)),
+            EventKind::Remove(notify::event::RemoveKind::File),
+            EventKind::Any,
+        ] {
+            assert!(
+                counts_as_activity(&notify::Event::new(kind)),
+                "{kind:?} must count as activity"
+            );
+        }
     }
 
     /// The kernel path is what makes a drop show up in under a second. If the
