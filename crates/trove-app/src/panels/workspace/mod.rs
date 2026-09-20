@@ -397,19 +397,17 @@ impl WorkspacePanel {
         // Which filter tools the user enabled; recomputed per render so a
         // toggle in the "+" menu applies immediately.
         let enabled_tools = trove_core::config::AppConfig::load().filter_tools();
-        let tool_enabled =
-            |tool: &str| !in_trash && !in_recent && enabled_tools.iter().any(|t| t == tool);
+        let tool_enabled = |tool: &str| enabled_tools.iter().any(|t| t == tool);
         h_flex()
             .w_full()
             .items_center()
             .gap_1()
-            // Colour filter sits at the far left, then the kind filter.
-            .when(!in_trash && !in_recent, |row| {
-                // Trigger and popover both live in `toolbar::color_filter`;
-                // recent colours ride along as the featured row, so the colours
-                // the user actually reaches for stay one click away.
-                row.child(color_filter(&color_picker, recent_picker_colors(cx), cx))
-            })
+            // Colour filter sits at the far left, then the kind filter. This
+            // row is shown in every view the grid can be in — the trash and
+            // the recent list included — because the query behind it honours
+            // the filters there too. A filter bar that silently narrows
+            // nothing is worse than no bar at all.
+            .child(color_filter(&color_picker, recent_picker_colors(cx), cx))
             .when(tool_enabled("kind"), |row| {
                 row.child(kind_filter(&controller, cx))
             })
@@ -425,9 +423,7 @@ impl WorkspacePanel {
             .when(tool_enabled("format"), |row| {
                 row.child(format_filter(exts, &controller, cx))
             })
-            .when(!in_trash && !in_recent, |row| {
-                row.child(add_filter_button(&controller))
-            })
+            .child(add_filter_button(&controller))
             .when(search_active, |row| {
                 row.child(
                     Button::new("save-smart")
