@@ -14,6 +14,7 @@ use uuid::Uuid;
 use super::{assets, smart, smart_collections, view_history};
 use crate::error::{Error, Result};
 use crate::model::{AspectPreset, Asset, AssetKind, AssetQuery, AssetSort, Orientation, Page};
+use crate::search::vector::{self, QueryVector, VECTOR_CANDIDATE_CAP, VectorIndex};
 
 /// How the workspace grid is currently browsing the library.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -32,6 +33,15 @@ pub struct BrowseContext {
     pub folder: Option<String>,
     /// Active full-text search term. Overrides the other views when set.
     pub search: String,
+    /// The search term's embedding when the caller has one — the vector leg
+    /// of the hybrid ranking, scored against the index passed to
+    /// [`Self::run`].
+    ///
+    /// Hybrid ranking is opt-in *by data*, never by a flag: with no vector
+    /// here, no index, a vector left over from a different term, or a
+    /// model/space that disagrees with the index, the text ranking stands
+    /// alone — exactly the pre-hybrid behaviour.
+    pub vector: Option<QueryVector>,
     /// Grid filters (compose with every view except the trash, which hides
     /// the filter controls and ignores them entirely).
     pub kind: Option<AssetKind>,
@@ -52,13 +62,19 @@ pub struct BrowseContext {
 impl BrowseContext {
     /// Run the paged query for this view. `limit` caps the page (the grid's
     /// pagination cursor); the recent view treats it as an id cap too.
+    ///
+    /// `vector` is the in-memory index holding the stored embeddings — the
+    /// second leg of a hybrid search. It is only consulted when
+    /// [`Self::vector`] carries a vector for the *current* term; see that
+    /// field for what "no hybrid" means.
     pub fn run(
         &self,
         conn: &Connection,
         text: &crate::search::TextIndex,
         limit: Option<u32>,
+        vector: Option<&VectorIndex>,
     ) -> Result<Page<Asset>> {
-        self.run_counted(conn, text, limit, true)
+        self.run_counted(conn, text, limit, vector, true)
     }
 
     /// Like [`run`](Self::run), but skips the exact COUNT where the view
@@ -71,8 +87,9 @@ impl BrowseContext {
         conn: &Connection,
         text: &crate::search::TextIndex,
         limit: Option<u32>,
+        vector: Option<&VectorIndex>,
     ) -> Result<Page<Asset>> {
-        self.run_counted(conn, text, limit, false)
+        self.run_counted(conn, text, limit, vector, false)
     }
 
     fn run_counted(
@@ -80,14 +97,55 @@ impl BrowseContext {
         conn: &Connection,
         text: &crate::search::TextIndex,
         limit: Option<u32>,
+        vector: Option<&VectorIndex>,
         count: bool,
     ) -> Result<Page<Asset>> {
         // Every paged browse feeds the query metrics; past the slow threshold
         // the note itself logs the warn.
         let started = std::time::Instant::now();
-        let result = self.run_counted_inner(conn, text, limit, count);
+        let result = self.run_counted_inner(conn, text, limit, vector, count);
         crate::metrics::note_query(started.elapsed());
         result
+    }
+
+    /// The vector leg of a hybrid search, fused with the text ranking.
+    ///
+    /// `None` means "there is nothing to fuse", and the caller then uses the
+    /// text ranking as it stands. Every reason to decline is a data mismatch
+    /// rather than an error: no query vector, no index, a vector computed for
+    /// a term the user has already typed past, or a model/space that
+    /// disagrees with the index — the same comparability contract the store
+    /// enforces on the write side.
+    fn fused_candidates(
+        &self,
+        conn: &Connection,
+        index: Option<&VectorIndex>,
+        text_ranked: &[Uuid],
+    ) -> Result<Option<Vec<Uuid>>> {
+        let (Some(query), Some(index)) = (self.vector.as_ref(), index) else {
+            return Ok(None);
+        };
+        if query.text != self.search.trim() || query.vector.is_empty() {
+            return Ok(None);
+        }
+        if index.model() != query.model || index.space() != query.space {
+            return Ok(None);
+        }
+        // A failure here must not sink the search: the text ranking is
+        // already a complete answer, so a broken vector leg degrades to it.
+        let hits = match index.search(conn, &query.vector, VECTOR_CANDIDATE_CAP) {
+            Ok(hits) => hits,
+            Err(error) => {
+                tracing::warn!(%error, "vector leg of a hybrid search failed; text ranking stands");
+                return Ok(None);
+            }
+        };
+        if hits.is_empty() {
+            return Ok(None);
+        }
+        crate::metrics::note_vector_search();
+        let ranked: Vec<Uuid> = hits.into_iter().map(|m| m.asset_id).collect();
+        Ok(Some(vector::reciprocal_rank_fusion(text_ranked, &ranked)))
     }
 
     fn run_counted_inner(
@@ -95,6 +153,7 @@ impl BrowseContext {
         conn: &Connection,
         text: &crate::search::TextIndex,
         limit: Option<u32>,
+        vector: Option<&VectorIndex>,
         count: bool,
     ) -> Result<Page<Asset>> {
         let search_active = !self.in_trash && !self.in_recent && !self.search.trim().is_empty();
@@ -111,7 +170,15 @@ impl BrowseContext {
             // Ranked candidates come from the Tantivy index (words, typo
             // tolerance, gram substrings, pinyin); the compound grid filters
             // stay in SQL and narrow the ranked set, preserving rank order.
-            let candidates = text.search(&self.search, crate::search::CANDIDATE_CAP)?;
+            let text_ranked = text.search(&self.search, crate::search::CANDIDATE_CAP)?;
+            // A configured embedding endpoint turns the same term into a
+            // second ranking, and the two are fused rather than one replacing
+            // the other: an asset both legs like outranks either leg's
+            // favourite. Nothing to fuse with ⇒ the text ranking stands.
+            let candidates = match self.fused_candidates(conn, vector, &text_ranked)? {
+                Some(fused) => fused,
+                None => text_ranked,
+            };
             let q = AssetQuery {
                 collection_id: self.collection,
                 tag_ids: self.tag.map(|t| vec![t]).unwrap_or_default(),
@@ -243,6 +310,86 @@ mod tests {
     use crate::store::Store;
 
     #[test]
+    fn hybrid_search_fuses_a_vector_leg_into_the_text_ranking() {
+        use crate::model::{EmbeddingSpace, NewEmbedding};
+        use crate::store::embeddings;
+
+        let store = Store::in_memory().unwrap();
+        let conn = store.conn();
+        let mut shot = test_asset("a.png", AssetKind::Image, Uuid::new_v4());
+        shot.title = Some("sunset shot".into());
+        assets::insert(conn, &shot).unwrap();
+        let mut beach = test_asset("b.png", AssetKind::Image, Uuid::new_v4());
+        beach.title = Some("beach walk".into());
+        assets::insert(conn, &beach).unwrap();
+
+        let idx = crate::search::TextIndex::in_ram().unwrap();
+        idx.index_asset(conn, shot.id).unwrap();
+        idx.index_asset(conn, beach.id).unwrap();
+        idx.commit().unwrap();
+
+        // Only `beach` carries a vector, and it points straight at the query
+        // — a hit the text leg cannot see on its own.
+        embeddings::upsert(
+            conn,
+            &NewEmbedding {
+                asset_id: beach.id,
+                model: "test-model".into(),
+                space: EmbeddingSpace::Text,
+                vector: vec![1.0, 0.0],
+                source_hash: "h".into(),
+            },
+        )
+        .unwrap();
+        let index = VectorIndex::new("test-model", EmbeddingSpace::Text);
+        let query = |text: &str, model: &str| QueryVector {
+            text: text.into(),
+            model: model.into(),
+            space: EmbeddingSpace::Text,
+            vector: vec![1.0, 0.0],
+        };
+        let ctx = |mutate: &dyn Fn(&mut BrowseContext)| {
+            let mut c = BrowseContext {
+                search: "sunset".into(),
+                ..Default::default()
+            };
+            mutate(&mut c);
+            c
+        };
+
+        // Text alone: only the asset whose title matches.
+        let page = ctx(&|_| {}).run(conn, &idx, None, Some(&index)).unwrap();
+        assert_eq!(page.total, 1, "no query vector ⇒ the text ranking stands");
+        assert_eq!(page.items[0].id, shot.id);
+
+        // With the term's vector, the second leg pulls its own hit in.
+        let page = ctx(&|c: &mut BrowseContext| {
+            c.vector = Some(query("sunset", "test-model"));
+        })
+        .run(conn, &idx, None, Some(&index))
+        .unwrap();
+        assert_eq!(page.total, 2, "the vector leg contributes its own hit");
+        let ids: Vec<Uuid> = page.items.iter().map(|a| a.id).collect();
+        assert!(ids.contains(&shot.id) && ids.contains(&beach.id), "{ids:?}");
+
+        // A vector for a term the user has typed past is ignored …
+        let page = ctx(&|c: &mut BrowseContext| {
+            c.vector = Some(query("bicycle", "test-model"));
+        })
+        .run(conn, &idx, None, Some(&index))
+        .unwrap();
+        assert_eq!(page.total, 1, "a stale query vector must not fuse");
+
+        // … and so is one from another model (the comparability contract).
+        let page = ctx(&|c: &mut BrowseContext| {
+            c.vector = Some(query("sunset", "other-model"));
+        })
+        .run(conn, &idx, None, Some(&index))
+        .unwrap();
+        assert_eq!(page.total, 1, "a model mismatch must not fuse");
+    }
+
+    #[test]
     fn dispatches_plain_search_smart_trash_and_recent() {
         let store = Store::in_memory().unwrap();
         let conn = store.conn();
@@ -262,12 +409,12 @@ mod tests {
         };
 
         // Plain: everything, newest first.
-        let page = ctx(&|_| {}).run(conn, &idx, None).unwrap();
+        let page = ctx(&|_| {}).run(conn, &idx, None, None).unwrap();
         assert_eq!(page.total, 2);
 
         // Search overrides the plain view.
         let page = ctx(&|c: &mut BrowseContext| c.search = "sunset".into())
-            .run(conn, &idx, None)
+            .run(conn, &idx, None, None)
             .unwrap();
         assert_eq!(page.total, 1);
         assert_eq!(page.items[0].id, img.id);
@@ -293,14 +440,14 @@ mod tests {
             c.search = "sunset".into();
             c.smart = Some(sc.id);
         })
-        .run(conn, &idx, None)
+        .run(conn, &idx, None, None)
         .unwrap();
         assert_eq!(page.total, 1);
         assert_eq!(page.items[0].id, img.id);
 
         // With no search text, the smart collection drives the view.
         let page = ctx(&|c: &mut BrowseContext| c.smart = Some(sc.id))
-            .run(conn, &idx, None)
+            .run(conn, &idx, None, None)
             .unwrap();
         assert_eq!(page.total, 1);
         assert_eq!(page.items[0].id, doc.id);
@@ -312,7 +459,7 @@ mod tests {
             c.is_favorite = true;
             c.kind = Some(AssetKind::Font);
         })
-        .run(conn, &idx, None)
+        .run(conn, &idx, None, None)
         .unwrap();
         eprintln!(
             "trash page: total={} items={:?}",
@@ -335,7 +482,7 @@ mod tests {
         assets::insert(conn, &rated).unwrap();
 
         let page = ctx(&|c: &mut BrowseContext| c.orientation = Some(Orientation::Square))
-            .run(conn, &idx, None)
+            .run(conn, &idx, None, None)
             .unwrap();
         assert_eq!(
             page.items.iter().map(|a| a.id).collect::<Vec<_>>(),
@@ -343,7 +490,7 @@ mod tests {
         );
 
         let page = ctx(&|c: &mut BrowseContext| c.min_rating = Some(4))
-            .run(conn, &idx, None)
+            .run(conn, &idx, None, None)
             .unwrap();
         assert_eq!(
             page.items.iter().map(|a| a.id).collect::<Vec<_>>(),
@@ -351,7 +498,7 @@ mod tests {
         );
 
         let page = ctx(&|c: &mut BrowseContext| c.ext = Some("JPG".into()))
-            .run(conn, &idx, None)
+            .run(conn, &idx, None, None)
             .unwrap();
         assert_eq!(
             page.items.iter().map(|a| a.id).collect::<Vec<_>>(),
@@ -364,7 +511,7 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(5));
         view_history::record(conn, img.id).unwrap();
         let page = ctx(&|c: &mut BrowseContext| c.in_recent = true)
-            .run(conn, &idx, None)
+            .run(conn, &idx, None, None)
             .unwrap();
         // img was trashed above: readers hide trashed rows, so only doc shows.
         assert_eq!(
@@ -419,7 +566,7 @@ mod tests {
             let want = expected(&names);
             // Plain view: the SQL ratio-band CASE.
             let page = ctx(&|c: &mut BrowseContext| c.aspect = Some(preset))
-                .run(conn, &idx, None)
+                .run(conn, &idx, None, None)
                 .unwrap();
             assert_eq!(
                 page.items.iter().map(|a| a.id).collect::<Vec<_>>(),
@@ -444,7 +591,7 @@ mod tests {
                 c.smart = Some(sc.id);
                 c.aspect = Some(preset);
             })
-            .run(conn, &idx, None)
+            .run(conn, &idx, None, None)
             .unwrap();
             assert_eq!(
                 page.items.iter().map(|a| a.id).collect::<Vec<_>>(),
@@ -458,7 +605,7 @@ mod tests {
             c.aspect = Some(AspectPreset::WechatCover);
             c.orientation = Some(Orientation::Landscape);
         })
-        .run(conn, &idx, None)
+        .run(conn, &idx, None, None)
         .unwrap();
         assert_eq!(
             page.items.iter().map(|a| a.id).collect::<Vec<_>>(),

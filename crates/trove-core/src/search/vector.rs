@@ -154,6 +154,66 @@ impl VectorIndex {
     }
 }
 
+// -- hybrid ranking ---------------------------------------------------------
+
+/// A search term's embedding, held by the caller for as long as that term is
+/// the current one.
+///
+/// It carries the term it was computed for, because embedding a query is an
+/// HTTP round trip: the workspace renders the text ranking immediately and
+/// re-runs the query when the vector lands, and a response that arrives
+/// after the user moved on must be dropped rather than fused into an answer
+/// to a different question. That comparison is why this is a struct and not
+/// a bare `Vec<f32>`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct QueryVector {
+    /// The search term this vector embeds (trimmed, matching the search box's
+    /// own normalization).
+    pub text: String,
+    /// Model identity the vector came from; must equal the index's.
+    pub model: String,
+    /// The space the *stored* rows live in — for a text embedder, `Text`.
+    pub space: EmbeddingSpace,
+    /// The query vector, un-normalized ([`VectorIndex::search`] normalizes).
+    pub vector: Vec<f32>,
+}
+
+/// Reciprocal-rank-fusion constant from the original paper (Cormack et al.,
+/// 2009). 60 is what most implementations ship: large enough that the top
+/// rank does not run away with the result, small enough that rank 1 still
+/// clearly outweighs rank 10.
+pub const RRF_K: f64 = 60.0;
+
+/// Fuse two rank-ordered id lists into one, by reciprocal rank.
+///
+/// Each list contributes `1 / (RRF_K + rank)` per id (rank counted from 1),
+/// an id present in both lists collects both terms, and the result is ordered
+/// by that sum. Scores are deliberately not used: BM25 and cosine similarity
+/// live on different scales, and calibrating them against each other is
+/// precisely the tuning problem RRF removes.
+///
+/// Ties break on the id, so the order is deterministic — a hash map's
+/// iteration order is not, and the grid pages through this list across
+/// frames.
+pub fn reciprocal_rank_fusion(text: &[uuid::Uuid], vector: &[uuid::Uuid]) -> Vec<uuid::Uuid> {
+    use std::collections::HashMap;
+
+    let mut scores: HashMap<uuid::Uuid, f64> = HashMap::with_capacity(text.len() + vector.len());
+    for list in [text, vector] {
+        for (rank, id) in list.iter().enumerate() {
+            *scores.entry(*id).or_default() += 1.0 / (RRF_K + rank as f64 + 1.0);
+        }
+    }
+
+    let mut ranked: Vec<(uuid::Uuid, f64)> = scores.into_iter().collect();
+    ranked.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.cmp(&b.0))
+    });
+    ranked.into_iter().map(|(id, _)| id).collect()
+}
+
 /// Reject a query whose dimension disagrees with what a model's rows carry —
 /// the caller-facing guard the backfill enforces on the write side.
 pub fn check_dim(query: &[f32], stored: usize) -> Result<()> {
@@ -200,6 +260,42 @@ mod tests {
         embeddings::upsert(conn, &emb(b, vec![0.6, 0.8])).unwrap();
         embeddings::upsert(conn, &emb(c, vec![-1.0, 0.0])).unwrap();
         (store, a, b, c)
+    }
+
+    #[test]
+    fn rrf_lets_agreement_beat_a_single_first_place() {
+        let (a, b, c) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        // `a` is second in both legs while `b` and `c` each lead one. Two
+        // modest votes outweigh one strong one — the property that makes RRF
+        // worth using instead of blending normalized scores.
+        let fused = reciprocal_rank_fusion(&[b, a], &[c, a]);
+        assert_eq!(fused[0], a, "{fused:?}");
+        assert_eq!(fused.len(), 3);
+        assert!(fused.contains(&b) && fused.contains(&c));
+    }
+
+    #[test]
+    fn rrf_orders_deterministically_and_keeps_the_union() {
+        let ids: Vec<Uuid> = (0..8).map(|_| Uuid::new_v4()).collect();
+        let text = &ids[..5];
+        let vector = &ids[3..8];
+        let fused = reciprocal_rank_fusion(text, vector);
+
+        assert_eq!(fused.len(), 8, "the union, with no duplicates");
+        assert_eq!(fused, reciprocal_rank_fusion(text, vector), "stable order");
+        // Ids in both legs outrank the tails that appear in only one.
+        for id in &ids[3..5] {
+            let pos = fused.iter().position(|x| x == id).unwrap();
+            assert!(pos < 5, "shared id ranked too low at {pos}");
+        }
+    }
+
+    #[test]
+    fn rrf_of_a_single_leg_is_that_leg() {
+        let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+        assert_eq!(reciprocal_rank_fusion(&[a, b], &[]), vec![a, b]);
+        assert_eq!(reciprocal_rank_fusion(&[], &[b, a]), vec![b, a]);
+        assert!(reciprocal_rank_fusion(&[], &[]).is_empty());
     }
 
     #[test]

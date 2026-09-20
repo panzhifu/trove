@@ -551,10 +551,19 @@ impl Library {
         )
     }
 
-    /// Semantic search: embed `query` with `provider`, score the model's
+    /// Pure semantic search: embed `query` with `provider`, score the model's
     /// stored vectors by cosine, and narrow the top candidates with `q`'s
     /// structural filters — the same rank-intersect-then-page pipeline the
     /// full-text search uses. An empty query is an empty page, not a scan.
+    ///
+    /// The workspace does **not** go through here: its search is hybrid,
+    /// fusing the text and vector rankings with
+    /// [`crate::search::vector::reciprocal_rank_fusion`] (see
+    /// `store::browse`), which needs no provider at query time because the
+    /// app fetches the query vector ahead of the call. This entry point is
+    /// the "vectors only, no text leg" answer — the natural backing for a
+    /// mode switch or a CLI query, and the reference for what the fused
+    /// ranking started from.
     pub fn semantic_search(
         &self,
         provider: &dyn crate::ai::EmbeddingProvider,
@@ -579,7 +588,7 @@ impl Library {
             })?;
 
         let conn = self.store.conn();
-        let index = self.vector_index_for(provider);
+        let index = self.cached_vector_index(provider.id(), provider.asset_space());
         let candidates =
             index.search(conn, &vector, crate::search::vector::VECTOR_CANDIDATE_CAP)?;
         let ranked: Vec<Uuid> = candidates.into_iter().map(|m| m.asset_id).collect();
@@ -590,23 +599,30 @@ impl Library {
         Ok(crate::model::Page::new(total, page))
     }
 
-    /// The cached index for `provider`'s model+space, rebuilt when the
-    /// provider changes. Drift inside one model (a backfill finishing, an
+    /// The cached in-memory index for one model+space, rebuilt when the
+    /// identity changes. Drift *inside* one model (a backfill finishing, an
     /// asset deleted) is the index's own fingerprint check, not this cache's.
-    fn vector_index_for(
+    ///
+    /// Public because the workspace's hybrid ranking needs exactly the index
+    /// [`Self::semantic_search`] uses, while holding a query vector fetched
+    /// earlier rather than a provider.
+    pub fn cached_vector_index(
         &self,
-        provider: &dyn crate::ai::EmbeddingProvider,
+        model: &str,
+        space: crate::model::EmbeddingSpace,
     ) -> crate::search::vector::VectorIndex {
         let mut cached = self.vector_index.borrow_mut();
         let stale = match cached.as_ref() {
-            Some((model, space, _)) => model != provider.id() || *space != provider.asset_space(),
+            Some((cached_model, cached_space, _)) => {
+                cached_model != model || *cached_space != space
+            }
             None => true,
         };
         if stale {
             *cached = Some((
-                provider.id().to_string(),
-                provider.asset_space(),
-                crate::search::vector::VectorIndex::new(provider.id(), provider.asset_space()),
+                model.to_string(),
+                space,
+                crate::search::vector::VectorIndex::new(model, space),
             ));
         }
         match cached.as_ref() {

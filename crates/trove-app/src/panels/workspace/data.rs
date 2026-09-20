@@ -252,6 +252,7 @@ impl WorkspacePanel {
         }
 
         let limit = Some(key.grid_loaded as u32);
+        let ctl = self.controller.read(cx);
         let ctx = BrowseContext {
             collection: key.collection,
             in_trash: key.in_trash,
@@ -268,8 +269,12 @@ impl WorkspacePanel {
             ext: key.filter_ext.clone(),
             sort: key.sort,
             sort_desc: key.sort_desc,
+            // The vector leg of a hybrid search, when the app holds one for
+            // the current term. `None` — no endpoint configured, not fetched
+            // yet, or a vector for a term the user has typed past — is the
+            // ordinary text-only search; the query checks the term itself.
+            vector: ctl.query_vector.clone(),
         };
-        let ctl = self.controller.read(cx);
         let conn = ctl.library.store().conn();
         // Flush pending outbox rows first so a just-finished write (import,
         // edit) is reflected in the same refresh. A failed drain (a writer
@@ -279,10 +284,16 @@ impl WorkspacePanel {
         // the resident drain loop and the next refresh both retry.
         let drained = ctl.library.drain_search_queue();
         let text_index = ctl.library.text_index();
+        // The index the vector leg scores against — the same cached one the
+        // semantic search uses, fetched only when this pass has a vector.
+        let vector_index = ctx
+            .vector
+            .as_ref()
+            .map(|query| ctl.library.cached_vector_index(&query.model, query.space));
         let page = match if count_total {
-            ctx.run(conn, text_index, limit)
+            ctx.run(conn, text_index, limit, vector_index.as_ref())
         } else {
-            ctx.run_without_count(conn, text_index, limit)
+            ctx.run_without_count(conn, text_index, limit, vector_index.as_ref())
         } {
             Ok(page) => page,
             Err(e) => {

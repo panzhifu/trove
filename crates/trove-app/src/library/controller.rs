@@ -211,6 +211,12 @@ pub struct LibraryController {
     /// task-manager job: it is one call against a server the user typed in,
     /// so it reports inline on the page and never blocks a job slot.
     pub ai_probe: AiProbe,
+    /// The embedding of the committed search term, when one has been fetched
+    /// (`jobs::request_query_embedding_app` runs after Enter). The workspace
+    /// hands it to the query, which fuses it into the text ranking for as
+    /// long as its `text` still matches the search box; `None` = the search
+    /// is text-only, which is also what an unconfigured endpoint gives.
+    pub query_vector: Option<trove_core::search::vector::QueryVector>,
     /// Cached duplicate clusters for the duplicates dialog: computed once on
     /// a backend thread (the O(n²) pHash pass must not run per render frame),
     /// invalidated on cleanup and library swap.
@@ -275,6 +281,7 @@ impl LibraryController {
             integrity_report: None,
             busy: false,
             ai_probe: AiProbe::Idle,
+            query_vector: None,
             duplicates: None,
             duplicates_computing: false,
             watch_task: None,
@@ -603,6 +610,9 @@ impl LibraryController {
         // endpoint; a result from before the swap would be about a store that
         // is no longer open.
         self.ai_probe = AiProbe::Idle;
+        // Same for the query embedding: it was computed against the previous
+        // library's model rows.
+        self.query_vector = None;
         // Duplicate clusters belong to the library they were computed in; the
         // field doc says "invalidated on cleanup and library swap" and this
         // is the swap half of that. A stale cache here would show the
@@ -623,7 +633,13 @@ impl LibraryController {
 
     pub fn set_search(&mut self, text: String) {
         self.search_text = text;
-        if !self.search_text.trim().is_empty() {
+        if self.search_text.trim().is_empty() {
+            // A cleared search has nothing to fuse with. A *changed* term
+            // deliberately keeps the old vector: the query compares the
+            // term itself and ignores a stale one, so re-typing the same
+            // words costs no second request.
+            self.query_vector = None;
+        } else {
             self.active_smart = None;
             // A typed search replaces the visual-search results view.
             self.close_visual_search();
