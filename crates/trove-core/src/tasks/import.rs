@@ -530,21 +530,23 @@ mod tests {
 
     /// A symlink inside a dropped folder is reported, not silently dropped:
     /// a folder whose contents quietly half-arrive reads as a bug.
+    ///
+    /// Unix-only: creating a symlink on Windows needs a privilege the test
+    /// environment does not have, and without one the assertions below have
+    /// nothing to say.
+    #[cfg(unix)]
     #[test]
     fn a_symlink_in_a_dropped_folder_is_reported_as_skipped() {
         let root = Temp::new("task-symlink");
         let folder = root.path().join("folder");
         fs::create_dir_all(&folder).unwrap();
         fs::write(folder.join("a.png"), b"x").unwrap();
-        #[cfg(unix)]
         std::os::unix::fs::symlink(folder.join("a.png"), folder.join("link.png")).unwrap();
 
         let (expanded, skipped) = expand_dirs(vec![folder.clone()]);
         assert!(expanded.contains(&folder.join("a.png")));
         assert!(!expanded.iter().any(|p| p.ends_with("link.png")));
-        #[cfg(unix)]
         assert_eq!(skipped.len(), 1, "{skipped:?}");
-        #[cfg(unix)]
         assert!(skipped[0].path.ends_with("link.png"));
     }
 
