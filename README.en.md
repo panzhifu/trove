@@ -92,7 +92,7 @@ This README summarizes what ships. The **[Chinese README](./README.md)** is the 
 
 - **Local collect server** — `http://127.0.0.1:23916`, `POST /add` (raw bytes) and `POST /fetch` (server-side fetch); browser extension connects directly.
 - **Browser extension** — MV3 addon under `extension/`; right-click any image to send it to your running Trove.
-- **Bilingual** — English / 简体中文, switch live in Settings; follows the system language by default.
+- **Multilingual UI** — 9 languages, switch live in Settings: English, 简体中文, 日本語, 한국어, Español, Français, Deutsch, Português, Русский; follows the system language by default.
 
 ---
 
