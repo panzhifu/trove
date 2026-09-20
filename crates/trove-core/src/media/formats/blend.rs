@@ -281,7 +281,17 @@ fn is_executable(path: &Path) -> bool {
     }
     #[cfg(not(unix))]
     {
-        true
+        // Windows has no exec bit; what makes a file runnable is its
+        // extension (the PATHEXT entries `CreateProcess` resolves, minus
+        // the interpreter scripts Trove never spawns). Everything else —
+        // a `.blend` saved over the override, a stray data file on `PATH` —
+        // is data, not a Blender, and must not be run.
+        path.extension().and_then(|e| e.to_str()).is_some_and(|e| {
+            matches!(
+                e.to_ascii_lowercase().as_str(),
+                "exe" | "com" | "bat" | "cmd"
+            )
+        })
     }
 }
 
@@ -347,6 +357,14 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&plain, std::fs::Permissions::from_mode(0o755)).unwrap();
             assert!(is_executable(&plain), "a 0755 file is executable");
+        }
+        #[cfg(windows)]
+        {
+            // The extension is the whole test on Windows: a runnable suffix
+            // makes the file a program, everything else stays data.
+            let program = directory.join("blender.exe");
+            std::fs::write(&program, b"MZ").unwrap();
+            assert!(is_executable(&program), "an .exe is executable");
         }
         std::fs::remove_dir_all(&directory).ok();
     }
