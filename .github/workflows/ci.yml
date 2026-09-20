@@ -19,7 +19,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-14, ubuntu-22.04, windows-2022]
+        os: [macos-14, ubuntu-24.04, windows-2022]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -38,18 +38,20 @@ jobs:
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
             target/
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ matrix.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-
+            ${{ matrix.os }}-cargo-
 
       - name: Install system dependencies (Ubuntu)
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          # libpipewire-0.3-dev: xcap (in-process screenshot import) depends on
-          # pipewire on Linux, whose -sys crates probe libpipewire-0.3 via
-          # pkg-config; the runner image ships neither the library nor its .pc
-          # file, which is what killed libspa-sys' build script.
+          # libpipewire-0.3-dev: xcap (the in-process screenshot import) pulls
+          # pipewire/libspa on Linux, and libspa binds the system headers at
+          # build time. That needs pipewire >= 0.3.65 for spa_video_info_raw.flags,
+          # spa_meta_first and spa_meta_region_is_valid — jammy's 0.3.48 has none
+          # of them, so this job is on ubuntu-24.04 (pipewire 1.0.5) and cannot
+          # move back to 22.04.
           sudo apt-get install -y \
             libxcb1-dev libxkbcommon-dev libxkbcommon-x11-dev \
             libegl1-mesa-dev libgl1-mesa-dev libpipewire-0.3-dev
