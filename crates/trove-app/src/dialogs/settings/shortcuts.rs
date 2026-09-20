@@ -442,13 +442,7 @@ fn action_label(action: &str) -> String {
         "Redo" => rust_i18n::t!("shortcuts.actions.Redo").to_string(),
         "ImportFiles" => rust_i18n::t!("shortcuts.actions.ImportFiles").to_string(),
         "OpenSettings" => rust_i18n::t!("shortcuts.actions.OpenSettings").to_string(),
-        "ScreenshotFull" => rust_i18n::t!("shortcuts.actions.ScreenshotFull").to_string(),
-        "ScreenshotRegion" => rust_i18n::t!("shortcuts.actions.ScreenshotRegion").to_string(),
-        "ScreenshotWindow" => rust_i18n::t!("shortcuts.actions.ScreenshotWindow").to_string(),
-        "ScreenshotActiveWindow" => {
-            rust_i18n::t!("shortcuts.actions.ScreenshotActiveWindow").to_string()
-        }
-        "ScreenshotScreen" => rust_i18n::t!("shortcuts.actions.ScreenshotScreen").to_string(),
+        "Screenshot" => rust_i18n::t!("shortcuts.actions.Screenshot").to_string(),
         "RefreshLibrary" => rust_i18n::t!("shortcuts.actions.RefreshLibrary").to_string(),
         "BatchRename" => rust_i18n::t!("shortcuts.actions.BatchRename").to_string(),
         "BatchConvert" => rust_i18n::t!("shortcuts.actions.BatchConvert").to_string(),

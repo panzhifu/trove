@@ -474,20 +474,15 @@ impl AppView {
         .detach();
     }
 
-    /// File ▸ Take Screenshot: capture `target` and import the PNG.
+    /// File ▸ Screenshot: pick a region and import the PNG.
     ///
-    /// A dragged region is the one target the platform cannot do for us on
-    /// Linux — no compositor-side region picker is reachable (KWin offers
-    /// none over D-Bus, and the KDE Screenshot portal has no region option)
-    /// — so that one opens our own picker over a frozen frame, with the
-    /// compositor's window list so a click can also mean "this window".
-    /// Everything else goes straight to the capture chain.
-    fn take_screenshot(
-        &mut self,
-        target: trove_core::services::screenshot::CaptureTarget,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    /// One entry point covers every target the capture chain knows how to
+    /// reach: what the user chooses in the picker is what gets imported, so
+    /// there is no menu full of granularities to pick between first. On Linux
+    /// the picker is ours — a frozen frame with the compositor's window list,
+    /// where a click can also mean "this window"; elsewhere the platform's own
+    /// region picker is the whole interaction.
+    fn take_screenshot(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         use trove_core::services::screenshot;
 
         // The capture lands in the incoming directory and stays there: the
@@ -496,7 +491,7 @@ impl AppView {
         let controller = self.controller.clone();
         let handle = window.window_handle();
 
-        tracing::info!(target = ?target, dest = %dest.display(), "take screenshot");
+        tracing::info!(dest = %dest.display(), "take screenshot");
 
         window.push_notification(
             Notification::info(rust_i18n::t!("notice.screenshot_started").to_string()),
@@ -504,12 +499,19 @@ impl AppView {
         );
 
         #[cfg(target_os = "linux")]
-        if target == screenshot::CaptureTarget::PickArea {
-            open_capture_picker(controller, dest, handle, cx);
-            return;
-        }
+        open_capture_picker(controller, dest, handle, cx);
 
-        run_capture_chain(target, None, dest, controller, handle, cx);
+        // No in-process overlay to draw on these platforms: `screencapture -i`
+        // is the region picker, and the chain reports back what it wrote.
+        #[cfg(not(target_os = "linux"))]
+        run_capture_chain(
+            screenshot::CaptureTarget::PickArea,
+            None,
+            dest,
+            controller,
+            handle,
+            cx,
+        );
     }
 
     /// Put the OS window into (or out of) fullscreen, idempotently: the only
@@ -1173,40 +1175,8 @@ impl Render for AppView {
             .on_action(cx.listener(|this, _: &ExitVideoFullscreen, window, cx| {
                 this.leave_video_fullscreen(window, cx);
             }))
-            .on_action(cx.listener(|this, _: &ScreenshotFull, window, cx| {
-                this.take_screenshot(
-                    trove_core::services::screenshot::CaptureTarget::Workspace,
-                    window,
-                    cx,
-                );
-            }))
-            .on_action(cx.listener(|this, _: &ScreenshotRegion, window, cx| {
-                this.take_screenshot(
-                    trove_core::services::screenshot::CaptureTarget::PickArea,
-                    window,
-                    cx,
-                );
-            }))
-            .on_action(cx.listener(|this, _: &ScreenshotWindow, window, cx| {
-                this.take_screenshot(
-                    trove_core::services::screenshot::CaptureTarget::PickWindow,
-                    window,
-                    cx,
-                );
-            }))
-            .on_action(cx.listener(|this, _: &ScreenshotActiveWindow, window, cx| {
-                this.take_screenshot(
-                    trove_core::services::screenshot::CaptureTarget::ActiveWindow,
-                    window,
-                    cx,
-                );
-            }))
-            .on_action(cx.listener(|this, _: &ScreenshotScreen, window, cx| {
-                this.take_screenshot(
-                    trove_core::services::screenshot::CaptureTarget::Screen { name: None },
-                    window,
-                    cx,
-                );
+            .on_action(cx.listener(|this, _: &Screenshot, window, cx| {
+                this.take_screenshot(window, cx);
             }))
             .on_action(cx.listener(|this, _: &BatchRename, window, cx| {
                 crate::dialogs::rename::RenameDialog::open(window, cx, this.controller.clone());
