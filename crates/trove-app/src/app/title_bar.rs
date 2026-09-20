@@ -80,23 +80,7 @@ fn build_menus() -> Vec<Menu> {
                 MenuItem::separator(),
                 MenuItem::action(rust_i18n::t!("app.import_files").to_string(), ImportFiles),
                 MenuItem::action(rust_i18n::t!("app.import_url").to_string(), ImportUrl),
-                MenuItem::action(rust_i18n::t!("app.screenshot").to_string(), ScreenshotFull),
-                MenuItem::action(
-                    rust_i18n::t!("app.screenshot_region").to_string(),
-                    ScreenshotRegion,
-                ),
-                MenuItem::action(
-                    rust_i18n::t!("app.screenshot_active_window").to_string(),
-                    ScreenshotActiveWindow,
-                ),
-                MenuItem::action(
-                    rust_i18n::t!("app.screenshot_window").to_string(),
-                    ScreenshotWindow,
-                ),
-                MenuItem::action(
-                    rust_i18n::t!("app.screenshot_screen").to_string(),
-                    ScreenshotScreen,
-                ),
+                MenuItem::action(rust_i18n::t!("app.screenshot").to_string(), Screenshot),
                 MenuItem::separator(),
                 MenuItem::action(
                     rust_i18n::t!("app.export_library").to_string(),

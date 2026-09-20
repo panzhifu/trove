@@ -223,11 +223,7 @@ pub(crate) fn register_keys(cx: &mut App) {
             }
         };
     }
-    bind_global!(ScreenshotFull, "ScreenshotFull");
-    bind_global!(ScreenshotRegion, "ScreenshotRegion");
-    bind_global!(ScreenshotWindow, "ScreenshotWindow");
-    bind_global!(ScreenshotActiveWindow, "ScreenshotActiveWindow");
-    bind_global!(ScreenshotScreen, "ScreenshotScreen");
+    bind_global!(Screenshot, "Screenshot");
 
     cx.bind_keys(bindings);
 }
