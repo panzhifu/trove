@@ -38,6 +38,34 @@ pub enum ViewMode {
     Timeline,
 }
 
+/// Outcome of the last AI-endpoint connection test (Settings ▸ AI).
+///
+/// Lives on the controller rather than inside the settings view because the
+/// test is an HTTP round trip: it finishes on a background thread and has to
+/// survive the page being rebuilt (pages are rebuilt every render).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum AiProbe {
+    /// Never run, or cleared by a library swap.
+    #[default]
+    Idle,
+    /// A test is in flight — the button is disabled meanwhile.
+    Running,
+    /// The endpoint answered; `dim` is the vector width it reported.
+    Ok { dim: usize },
+    /// Unreachable, refused, or misconfigured. The message is the reason the
+    /// user has to read: this surfaces without a log window.
+    Failed { message: String },
+}
+
+impl AiProbe {
+    /// Whether a test is in flight (the settings button guards on this
+    /// instead of [`LibraryController::busy`], which the maintenance jobs
+    /// own).
+    pub fn is_running(&self) -> bool {
+        matches!(self, Self::Running)
+    }
+}
+
 /// Page size of the workspace asset grid: how many assets one page of the
 /// paged queries loads. Scrolling near the end loads the next page.
 pub const GRID_PAGE_SIZE: usize = 200;
@@ -179,6 +207,10 @@ pub struct LibraryController {
     /// A maintenance / library job is running; Settings buttons refuse to
     /// start a second one until it finishes.
     pub busy: bool,
+    /// Result of the last AI-endpoint connection test (Settings ▸ AI). Not a
+    /// task-manager job: it is one call against a server the user typed in,
+    /// so it reports inline on the page and never blocks a job slot.
+    pub ai_probe: AiProbe,
     /// Cached duplicate clusters for the duplicates dialog: computed once on
     /// a backend thread (the O(n²) pHash pass must not run per render frame),
     /// invalidated on cleanup and library swap.
@@ -242,6 +274,7 @@ impl LibraryController {
             notice: None,
             integrity_report: None,
             busy: false,
+            ai_probe: AiProbe::Idle,
             duplicates: None,
             duplicates_computing: false,
             watch_task: None,
@@ -566,6 +599,10 @@ impl LibraryController {
         self.filter_ext = None;
         self.import_phase = ImportPhase::Idle;
         self.integrity_report = None;
+        // The probe described the other library's vectors as much as its
+        // endpoint; a result from before the swap would be about a store that
+        // is no longer open.
+        self.ai_probe = AiProbe::Idle;
         // Duplicate clusters belong to the library they were computed in; the
         // field doc says "invalidated on cleanup and library swap" and this
         // is the swap half of that. A stale cache here would show the

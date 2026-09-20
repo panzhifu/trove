@@ -5,4 +5,6 @@ pub mod clipboard;
 mod controller;
 pub mod jobs;
 
-pub use controller::{GRID_PAGE_SIZE, ImportPhase, LibraryController, SelectionSource, ViewMode};
+pub use controller::{
+    AiProbe, GRID_PAGE_SIZE, ImportPhase, LibraryController, SelectionSource, ViewMode,
+};

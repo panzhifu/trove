@@ -19,7 +19,7 @@ use trove_core::tasks::import::{self, ImportOptions, ImportOutcome, ImportSource
 use trove_core::tasks::watch::{self, WatchSignal};
 use trove_core::tasks::{TaskEvent, TaskId, TaskKind, TaskManager, TaskStatus};
 
-use crate::library::LibraryController;
+use crate::library::{AiProbe, LibraryController};
 
 /// Marker type for the import progress toast: pushing with the same id
 /// replaces the previous toast instead of stacking a new one.
@@ -869,6 +869,125 @@ pub fn cancel_embedding_backfill_app(controller: &Entity<LibraryController>, cx:
     }
 }
 
+/// The line a connection test embeds. The content is irrelevant — only that
+/// the endpoint answers with a vector at all, and how wide it is.
+const PROBE_TEXT: &str = "trove connection test";
+
+/// Prove the configured endpoint works (Settings ▸ AI): build the provider
+/// exactly as the backfill does, embed one throwaway line on the background
+/// executor, and record the width the server answered with — or the reason it
+/// refused — on [`LibraryController::ai_probe`].
+///
+/// Deliberately not a task-manager job: it writes no rows, must not occupy
+/// the embedding slot a real backfill needs, and its answer is one line of
+/// text on the page rather than a progress bar.
+pub fn test_embedding_endpoint_app(controller: &Entity<LibraryController>, cx: &mut App) {
+    if controller.read(cx).ai_probe.is_running() {
+        return;
+    }
+    let Some(config) = trove_core::config::AppConfig::load()
+        .ai_embedding
+        .filter(trove_core::config::EmbeddingConfig::is_configured)
+    else {
+        set_ai_probe(
+            controller,
+            ai_probe_failure(rust_i18n::t!("settings.ai_not_configured").to_string()),
+            cx,
+        );
+        return;
+    };
+    let provider: std::sync::Arc<dyn trove_core::ai::EmbeddingProvider> =
+        match trove_core::ai::OpenAICompatible::new(&config) {
+            Ok(provider) => std::sync::Arc::new(provider),
+            Err(error) => {
+                set_ai_probe(controller, ai_probe_failure(error.to_string()), cx);
+                return;
+            }
+        };
+
+    set_ai_probe(controller, AiProbe::Running, cx);
+    let controller = controller.clone();
+    cx.spawn(async move |cx| {
+        // Flattened to a string on the worker: the page only needs the
+        // message, and that keeps the awaited payload trivially `Send`.
+        let result: Result<usize, String> = cx
+            .background_executor()
+            .spawn(async move {
+                provider
+                    .embed_texts(&[PROBE_TEXT.to_string()])
+                    .map(|vectors| vectors.first().map_or(0, Vec::len))
+                    .map_err(|error| error.to_string())
+            })
+            .await;
+        let probe = match result {
+            Ok(dim) if dim > 0 => AiProbe::Ok { dim },
+            // A success with no vector means the server is answering
+            // nonsense; report it as a failure rather than a green line.
+            Ok(_) => ai_probe_failure(rust_i18n::t!("settings.ai_probe_empty").to_string()),
+            Err(message) => ai_probe_failure(message),
+        };
+        // `notify` is enough to repaint the page (the settings view observes
+        // the controller); `refresh_windows` is an `App` method and this runs
+        // on a background executor, where only `AsyncApp` is in hand.
+        controller.update(cx, |ctl, cx| {
+            ctl.ai_probe = probe;
+            cx.notify();
+        });
+    })
+    .detach();
+}
+
+/// Delete every vector stored under the configured model (Settings ▸ AI).
+///
+/// A vector is a derivative of title / description / tags, so this costs a
+/// re-embed and never user data — the same class of operation as clearing the
+/// thumbnail cache, which is why it runs on the click and reports the row
+/// count through a toast instead of asking first.
+pub fn delete_embeddings_app(
+    controller: &Entity<LibraryController>,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let Some(config) = trove_core::config::AppConfig::load()
+        .ai_embedding
+        .filter(trove_core::config::EmbeddingConfig::is_configured)
+    else {
+        window.push_notification(
+            Notification::warning(rust_i18n::t!("settings.ai_not_configured").to_string()),
+            cx,
+        );
+        return;
+    };
+    let note = match controller.update(cx, |ctl, _| ctl.library.delete_embeddings(&config.model)) {
+        Ok(count) => {
+            Notification::success(rust_i18n::t!("settings.ai_deleted", count = count).to_string())
+        }
+        Err(error) => {
+            Notification::warning(rust_i18n::t!("settings.job_failed", error = error).to_string())
+        }
+    };
+    window.push_notification(note, cx);
+    // The coverage line and the delete button's enabled state both read the
+    // table, and both are rendered per paint.
+    cx.refresh_windows();
+}
+
+/// A [`AiProbe::Failed`] carrying a localized reason.
+fn ai_probe_failure(reason: impl Into<String>) -> AiProbe {
+    AiProbe::Failed {
+        message: reason.into(),
+    }
+}
+
+/// Record a probe result and repaint, so the page shows it whether the test
+/// finished on the UI thread (bad configuration) or a worker (a real call).
+fn set_ai_probe(controller: &Entity<LibraryController>, probe: AiProbe, cx: &mut App) {
+    controller.update(cx, |ctl, cx| {
+        ctl.ai_probe = probe;
+        cx.notify();
+    });
+    cx.refresh_windows();
+}
 /// Poll the backfill until it settles, translating events into toasts — the
 /// same shape as [`watch_import`]. A settle also refreshes the windows so
 /// the settings page's coverage line and generate/cancel button reflect the

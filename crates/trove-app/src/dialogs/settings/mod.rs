@@ -24,6 +24,7 @@
 //! render.
 
 mod about;
+mod ai;
 mod appearance;
 mod files;
 mod model;
@@ -71,6 +72,9 @@ pub enum SettingsPage {
     /// The full-text index and the visual fingerprints.
     #[expect(dead_code, reason = "deep-link target; no entry point wired yet")]
     Search,
+    /// The embedding endpoint and the vector store it feeds.
+    #[expect(dead_code, reason = "deep-link target; no entry point wired yet")]
+    Ai,
     #[expect(dead_code, reason = "deep-link target; no entry point wired yet")]
     Shortcuts,
 }
@@ -84,7 +88,8 @@ impl SettingsPage {
             Self::Files => 2,
             Self::Model => 3,
             Self::Search => 4,
-            Self::Shortcuts => 5,
+            Self::Ai => 5,
+            Self::Shortcuts => 6,
         }
     }
 }
@@ -373,6 +378,7 @@ impl Render for SettingsView {
             ))
             .page(model::model_page())
             .page(search::search_page(&self.controller, stats.sig_coverage))
+            .page(ai::ai_page(&self.controller, cx))
             .page(shortcuts::shortcuts_page(self, &view))
             .page(plugins::plugins_page());
         let settings = crate::plugins::settings_pages(cx)
