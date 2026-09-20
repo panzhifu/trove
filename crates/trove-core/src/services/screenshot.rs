@@ -154,7 +154,11 @@ pub fn plan(target: &CaptureTarget, dest: &Path) -> Option<CapturePlan> {
 }
 
 /// [`plan`] with an explicit session type — the unit-testable core.
-#[allow(unused_variables)]
+///
+/// Every platform block returns early so the other targets' blocks can be
+/// `cfg`'d out entirely; on any one target that leaves the surviving
+/// `return` looking needless to clippy.
+#[allow(unused_variables, clippy::needless_return)]
 pub fn plan_for(target: &CaptureTarget, dest: &Path, platform: Platform) -> Option<CapturePlan> {
     #[cfg(target_os = "macos")]
     {
@@ -444,6 +448,11 @@ fn capture_in_process(
 use crate::services::kwin;
 
 /// Write a captured frame to `dest`, creating the directory first.
+///
+/// Linux only: that is where the compositor path hands back an image to
+/// write. macOS and Windows capture through `xcap`/the toolchain, which save
+/// the file themselves.
+#[cfg(target_os = "linux")]
 fn save_png(image: &image::RgbaImage, dest: &Path) -> Result<(), Error> {
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent).map_err(|e| {
@@ -582,6 +591,10 @@ fn run_plan(plan: &CapturePlan, dest: &Path) -> Result<(), String> {
 
 /// A `sh -c` step: `$1` is the destination, so commands can ignore
 /// `{file}` and still find it.
+///
+/// Only the Linux plans shell out through `sh`; macOS uses `screencapture`
+/// and Windows a PowerShell one-liner, both called directly.
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 fn shell(command: String, dest: &Path) -> CapturePlan {
     CapturePlan {
         program: "sh".into(),
