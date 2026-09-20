@@ -66,9 +66,13 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
+          # libpipewire-0.3-dev: xcap (in-process screenshot import) depends on
+          # pipewire on Linux, whose -sys crates probe libpipewire-0.3 via
+          # pkg-config; the runner image ships neither the library nor its .pc
+          # file, which is what killed libspa-sys' build script.
           sudo apt-get install -y \
             libxcb1-dev libxkbcommon-dev libxkbcommon-x11-dev \
-            libegl1-mesa-dev libgl1-mesa-dev
+            libegl1-mesa-dev libgl1-mesa-dev libpipewire-0.3-dev
 
       - name: Build release binary
         run: cargo build --release --target ${{ matrix.target }} -p trove-app
