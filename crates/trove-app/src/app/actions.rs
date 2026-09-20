@@ -15,6 +15,9 @@ gpui_kit::actions!(
         ImportUrl,
         ScreenshotFull,
         ScreenshotRegion,
+        ScreenshotWindow,
+        ScreenshotActiveWindow,
+        ScreenshotScreen,
         ExportLibrary,
         ExportBackup,
         ImportLibrary,
@@ -51,8 +54,8 @@ gpui_kit::actions!(
         // -- Fullscreen video stage -----------------------------------------
         EnterVideoFullscreen,
         ExitVideoFullscreen,
-        // -- Region screenshot overlay ---------------------------------------
-        CancelScreenshotRegion,
+        // -- Capture picker overlay ------------------------------------------
+        CancelCapturePick,
     ]
 );
 

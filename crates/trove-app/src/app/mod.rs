@@ -15,3 +15,6 @@ mod tray;
 pub use library_manager::LibraryManagerView;
 pub use root::AppView;
 pub(crate) use root::run_update_check;
+// The screenshot picker overlay hands a highlighted window back here, since
+// it is the main window that has to run the capture.
+pub(crate) use root::capture_picked_window;

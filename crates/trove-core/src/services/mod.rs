@@ -9,6 +9,8 @@ pub mod collect;
 pub mod font_manager;
 #[cfg(target_os = "linux")]
 pub mod kwin;
+#[cfg(target_os = "linux")]
+pub mod kwin_script;
 pub mod maintenance;
 pub mod open_external;
 pub mod screenshot;

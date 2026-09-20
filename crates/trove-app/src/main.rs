@@ -62,10 +62,10 @@ const VIDEO_PREVIEW_CONTEXT: &str = "VideoPreview";
 /// untouched.
 const VIDEO_FULLSCREEN_CONTEXT: &str = "VideoFullscreen";
 
-/// Key context of the region-screenshot overlay. Its only binding is
-/// Escape: it cancels the picker. The context lives only on the overlay's
+/// Key context of the screenshot picker overlay. Its only binding is
+/// Escape: it cancels the pick. The context lives only on the overlay's
 /// root, so nothing else sees it.
-const REGION_SELECT_CONTEXT: &str = "ScreenshotRegion";
+const CAPTURE_PICK_CONTEXT: &str = "CapturePick";
 
 pub(crate) fn register_keys(cx: &mut App) {
     use trove_core::config::AppConfig;
@@ -167,12 +167,12 @@ pub(crate) fn register_keys(cx: &mut App) {
             ));
         }
     }
-    // Esc cancels the region-screenshot overlay; only the overlay's root
+    // Esc cancels the screenshot picker overlay; only the overlay's root
     // carries that context.
     bindings.push(KeyBinding::new(
         "escape",
-        CancelScreenshotRegion,
-        Some(REGION_SELECT_CONTEXT),
+        CancelCapturePick,
+        Some(CAPTURE_PICK_CONTEXT),
     ));
 
     // Plugin commands: declared by registered plugins, bound with each
@@ -225,6 +225,9 @@ pub(crate) fn register_keys(cx: &mut App) {
     }
     bind_global!(ScreenshotFull, "ScreenshotFull");
     bind_global!(ScreenshotRegion, "ScreenshotRegion");
+    bind_global!(ScreenshotWindow, "ScreenshotWindow");
+    bind_global!(ScreenshotActiveWindow, "ScreenshotActiveWindow");
+    bind_global!(ScreenshotScreen, "ScreenshotScreen");
 
     cx.bind_keys(bindings);
 }
