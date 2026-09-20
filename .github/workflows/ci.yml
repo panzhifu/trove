@@ -47,7 +47,8 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            libxcb1-dev libxkbcommon-dev libxkbcommon-x11-dev
+            libxcb1-dev libxkbcommon-dev libxkbcommon-x11-dev \
+            libegl1-mesa-dev libgl1-mesa-dev
 
       - name: cargo fmt --check
         run: cargo fmt --all -- --check
