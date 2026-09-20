@@ -42,8 +42,9 @@ pub struct BrowseContext {
     /// model/space that disagrees with the index, the text ranking stands
     /// alone — exactly the pre-hybrid behaviour.
     pub vector: Option<QueryVector>,
-    /// Grid filters (compose with every view except the trash, which hides
-    /// the filter controls and ignores them entirely).
+    /// Grid filters. Every view honours them — the trash and the recent
+    /// list included — so the filter bar means the same thing wherever it
+    /// is shown.
     pub kind: Option<AssetKind>,
     pub is_favorite: bool,
     pub orientation: Option<Orientation>,
@@ -159,12 +160,16 @@ impl BrowseContext {
         let search_active = !self.in_trash && !self.in_recent && !self.search.trim().is_empty();
 
         if self.in_recent {
-            // Recently viewed: ids ordered by last view time, materialized in
-            // that order (missing / trashed ids drop out of the query).
-            // History is capped, so one page covers it all.
-            let ids = view_history::recent_ids(conn, limit.map(|l| l as usize).unwrap_or(200))?;
-            let total = ids.len() as u64;
-            let items = assets::by_ids(conn, &ids)?;
+            // Recently viewed: ids ordered by last view time. That order
+            // lives in the history table, so the id list drives the query and
+            // the filters only reject rows — the same candidate-driven shape
+            // the text ranking uses. History is capped, so the pool is the
+            // whole list whenever the caller asks for a full page.
+            let pool = limit.map_or(view_history::HISTORY_CAP, |l| l as usize);
+            let ids = view_history::recent_ids(conn, pool)?;
+            let q = self.filter_query(limit);
+            let (total, ids) = assets::rank_intersect(conn, &ids, &q)?;
+            let items = assets::page_assets(&ids, &q, conn)?;
             Ok(Page::new(total, items))
         } else if search_active {
             // Ranked candidates come from the Tantivy index (words, typo
@@ -179,20 +184,7 @@ impl BrowseContext {
                 Some(fused) => fused,
                 None => text_ranked,
             };
-            let q = AssetQuery {
-                collection_id: self.collection,
-                tag_ids: self.tag.map(|t| vec![t]).unwrap_or_default(),
-                kind: self.kind,
-                is_favorite: self.is_favorite.then_some(true),
-                orientation: self.orientation,
-                aspect: self.aspect,
-                min_rating: self.min_rating,
-                ext: self.ext.clone(),
-                source_path_prefix: self.folder.clone(),
-                is_trashed: false,
-                limit,
-                ..Default::default()
-            };
+            let q = self.filter_query(limit);
             let (total, ids) = assets::rank_intersect(conn, &candidates, &q)?;
             let page = assets::page_assets(&ids, &q, conn)?;
             Ok(Page::new(total, page))
@@ -232,43 +224,45 @@ impl BrowseContext {
                 .collect();
             Ok(Page::new(ids.total, items))
         } else {
-            let q = AssetQuery {
-                collection_id: if self.in_trash { None } else { self.collection },
-                tag_ids: if self.in_trash {
-                    Vec::new()
-                } else {
-                    self.tag.map(|t| vec![t]).unwrap_or_default()
-                },
-                kind: if self.in_trash { None } else { self.kind },
-                is_favorite: (!self.in_trash && self.is_favorite).then_some(true),
-                orientation: if self.in_trash {
-                    None
-                } else {
-                    self.orientation
-                },
-                aspect: if self.in_trash { None } else { self.aspect },
-                min_rating: if self.in_trash { None } else { self.min_rating },
-                ext: if self.in_trash {
-                    None
-                } else {
-                    self.ext.clone()
-                },
-                source_path_prefix: if self.in_trash {
-                    None
-                } else {
-                    self.folder.clone()
-                },
-                is_trashed: self.in_trash,
-                sort: self.sort,
-                sort_desc: self.sort_desc,
-                limit,
-                ..Default::default()
-            };
+            let q = self.filter_query(limit);
             if count {
                 assets::query(conn, &q)
             } else {
                 assets::query_without_count(conn, &q)
             }
+        }
+    }
+
+    /// The structured filters of this browse, as an [`AssetQuery`].
+    ///
+    /// One definition shared by every dispatch that has to honour them — the
+    /// SQL browse, the text ranking and the recent list — so a filter cannot
+    /// mean one thing in one view and something else in the next. The
+    /// candidate-driven paths bring their own ids and use this for its
+    /// conditions only; `limit` therefore matters to the SQL path alone.
+    ///
+    /// Two filters stay off in the trash: the current collection and the
+    /// source folder. Neither has a control the user can see while the trash
+    /// is open, so a lingering one would silently narrow a list whose whole
+    /// point is to hold everything deleted — a wrong answer with no visible
+    /// cause.
+    fn filter_query(&self, limit: Option<u32>) -> AssetQuery {
+        let container = !self.in_trash;
+        AssetQuery {
+            collection_id: if container { self.collection } else { None },
+            source_path_prefix: if container { self.folder.clone() } else { None },
+            tag_ids: self.tag.map(|t| vec![t]).unwrap_or_default(),
+            kind: self.kind,
+            is_favorite: self.is_favorite.then_some(true),
+            orientation: self.orientation,
+            aspect: self.aspect,
+            min_rating: self.min_rating,
+            ext: self.ext.clone(),
+            is_trashed: self.in_trash,
+            sort: self.sort,
+            sort_desc: self.sort_desc,
+            limit,
+            ..Default::default()
         }
     }
 }
@@ -452,23 +446,56 @@ mod tests {
         assert_eq!(page.total, 1);
         assert_eq!(page.items[0].id, doc.id);
 
-        // Trash ignores the grid filters entirely.
+        // The trash honours the grid filters like every other view — that is
+        // what makes the filter bar safe to show there. Being ignored was the
+        // old contract, and the bar was hidden to match.
         assets::set_trashed(conn, img.id, true).unwrap();
+
+        let page = ctx(&|c: &mut BrowseContext| c.in_trash = true)
+            .run(conn, &idx, None, None)
+            .unwrap();
+        assert_eq!(page.total, 1, "only the deleted asset");
+        assert_eq!(page.items[0].id, img.id);
+        assert!(page.items[0].trashed_at.is_some());
+
+        // A kind filter that matches the deleted asset still finds it …
         let page = ctx(&|c: &mut BrowseContext| {
             c.in_trash = true;
-            c.is_favorite = true;
-            c.kind = Some(AssetKind::Font);
+            c.kind = Some(AssetKind::Image);
         })
         .run(conn, &idx, None, None)
         .unwrap();
-        eprintln!(
-            "trash page: total={} items={:?}",
-            page.total,
-            page.items
-                .iter()
-                .map(|a| (a.file_name.as_str(), a.trashed_at.is_some()))
-                .collect::<Vec<_>>()
-        );
+        assert_eq!(page.total, 1);
+        assert_eq!(page.items[0].id, img.id);
+
+        // … and one that does not rules it out instead of being dropped.
+        for excluded in [AssetKind::Font, AssetKind::Document, AssetKind::Video] {
+            let page = ctx(&|c: &mut BrowseContext| {
+                c.in_trash = true;
+                c.kind = Some(excluded);
+            })
+            .run(conn, &idx, None, None)
+            .unwrap();
+            assert_eq!(page.total, 0, "{excluded:?} must not match a deleted image");
+        }
+
+        let page = ctx(&|c: &mut BrowseContext| {
+            c.in_trash = true;
+            c.is_favorite = true;
+        })
+        .run(conn, &idx, None, None)
+        .unwrap();
+        assert_eq!(page.total, 0, "the deleted asset is not a favourite");
+
+        // Tags narrow the trash as well.
+        let keep = crate::store::tags::ensure_named(conn, "keep").unwrap();
+        crate::store::tags::add_to_asset(conn, img.id, keep.id).unwrap();
+        let page = ctx(&|c: &mut BrowseContext| {
+            c.in_trash = true;
+            c.tag = Some(keep.id);
+        })
+        .run(conn, &idx, None, None)
+        .unwrap();
         assert_eq!(page.total, 1);
         assert_eq!(page.items[0].id, img.id);
 
@@ -518,6 +545,42 @@ mod tests {
             page.items.iter().map(|a| a.id).collect::<Vec<_>>(),
             vec![doc.id]
         );
+
+        // The recent list narrows under the same filters as every other view,
+        // and keeps its own view-time order while doing so.
+        for id in [square.id, rated.id] {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            view_history::record(conn, id).unwrap();
+        }
+        let recent = |mutate: &dyn Fn(&mut BrowseContext)| {
+            ctx(&|c: &mut BrowseContext| {
+                c.in_recent = true;
+                mutate(c);
+            })
+            .run(conn, &idx, None, None)
+            .unwrap()
+        };
+        let ids = |page: &Page<Asset>| -> Vec<Uuid> { page.items.iter().map(|a| a.id).collect() };
+
+        let page = recent(&|_: &mut BrowseContext| {});
+        assert_eq!(
+            ids(&page),
+            vec![rated.id, square.id, doc.id],
+            "newest view first"
+        );
+
+        let page = recent(&|c: &mut BrowseContext| c.kind = Some(AssetKind::Document));
+        assert_eq!(ids(&page), vec![doc.id], "kind narrows the recent list");
+
+        let page = recent(&|c: &mut BrowseContext| c.min_rating = Some(4));
+        assert_eq!(ids(&page), vec![rated.id], "so does the rating floor");
+
+        let page = recent(&|c: &mut BrowseContext| c.ext = Some("JPG".into()));
+        assert_eq!(ids(&page), vec![rated.id]);
+
+        let page = recent(&|c: &mut BrowseContext| c.orientation = Some(Orientation::Square));
+        assert_eq!(ids(&page), vec![square.id]);
+        assert_eq!(page.total, 1, "the total follows the filters, not the pool");
     }
 
     #[test]
