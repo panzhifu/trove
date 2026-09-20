@@ -895,18 +895,24 @@ impl AppView {
                                     // Drain the inbox right away; when an
                                     // import is already running the file
                                     // stays queued for the watcher's next
-                                    // sweep.
-                                    if !jobs::collect_inbox_app(&ctl, window, cx) {
-                                        window.push_notification(
-                                            Notification::info(
-                                                rust_i18n::t!(
-                                                    "notice.import_url_queued",
-                                                    name = name
-                                                )
-                                                .to_string(),
-                                            ),
-                                            cx,
-                                        );
+                                    // sweep, and the user is told so. A file
+                                    // the library already holds (the same name
+                                    // and size — a re-download) says nothing:
+                                    // the outcome would have been a no-op too.
+                                    match jobs::collect_inbox_app(&ctl, window, cx) {
+                                        jobs::InboxDrain::Started | jobs::InboxDrain::Idle => {}
+                                        jobs::InboxDrain::Refused => {
+                                            window.push_notification(
+                                                Notification::info(
+                                                    rust_i18n::t!(
+                                                        "notice.import_url_queued",
+                                                        name = name
+                                                    )
+                                                    .to_string(),
+                                                ),
+                                                cx,
+                                            );
+                                        }
                                     }
                                 }
                                 Err(e) => {
