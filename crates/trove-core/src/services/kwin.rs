@@ -2,8 +2,7 @@
 //!
 //! KWin deliberately implements neither `wlr-screencopy` nor
 //! `ext-image-copy-capture-v1`, so on Plasma no third-party capture
-//! protocol exists — capture libraries that walk those protocols can never
-//! work there. What KWin
+//! protocol exists — `xcap` and friends can never work there. What KWin
 //! does expose is `org.kde.KWin.ScreenShot2`: the caller passes the write
 //! end of a pipe plus a small options map, KWin renders the frame, writes
 //! the raw pixels into the pipe and answers with a metadata map

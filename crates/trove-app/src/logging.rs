@@ -9,7 +9,7 @@
 //!   `trove.log.old` once it grows past [`MAX_LOG_BYTES`].
 //!
 //! The filter comes from `RUST_LOG` (standard `tracing` directives, e.g.
-//! `RUST_LOG=trove=debug,mp4=warn`); without it everything logs at `info`
+//! `RUST_LOG=trove=debug,xcap=warn`); without it everything logs at `info`
 //! and up. Every crate in the workspace logs through the same global
 //! subscriber, and so does any dependency using the `tracing` facade
 //! (gpui-pre's ashpd/zbus, for example).

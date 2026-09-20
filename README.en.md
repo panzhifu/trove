@@ -73,7 +73,7 @@ This README summarizes what ships. The **[Chinese README](./README.md)** is the 
 ### Video & screenshots
 
 - **Audio-capable preview** — frame-by-frame ffmpeg decode plus an audio pipeline (rodio plays 44.1 kHz stereo PCM); play / pause / seek / timeline / volume / mute / speed (0.5×–2× with pitch holding); audio-clock-driven A/V sync.
-- **Screenshot capture** — one menu entry: a picker opens, drag to select a region (or click a window where the session offers a window list) and the PNG lands in the library. In-process first (Linux: KWin D-Bus; macOS/Windows: xcap), external tools as the fallback (grim+slurp / scrot / macOS screencapture).
+- **Screenshot capture** — one menu entry: a picker opens, drag to select a region (or click a window where the session offers a window list) and the PNG lands in the library. In-process first (KWin D-Bus → xcap), external tools as the fallback (grim+slurp / scrot / macOS screencapture).
 - **Batch pixel editor** — rotate / flip / crop (percent coordinates, resolved per asset from its own dimensions), JPEG quality; replaces the media file in place while preserving asset identity and organization membership.
 - **Batch conversion** — re-encode images to JPEG / PNG / WebP / BMP / TIFF, optional longest-edge cap, optional re-import.
 - **XMP metadata export** — write a standard XMP sidecar beside each asset's file (title / description / tags / rating), atomic write, fully escaped, never touches the original file.
