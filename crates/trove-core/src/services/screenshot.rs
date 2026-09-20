@@ -3,17 +3,23 @@
 //!
 //! Capture runs in-process wherever a platform interface exists: KWin's
 //! `org.kde.KWin.ScreenShot2` on Plasma (see [`crate::services::kwin`]),
-//! `xcap` for a whole screen on X11, macOS and Windows. What is left over —
+//! `xcap` for a whole screen on macOS and Windows. What is left over —
 //! interactive pickers, and every session type without an in-process path —
 //! goes through the platform's own tool ([`plan_for`]): `screencapture` on
 //! macOS, a PowerShell one-liner on Windows, `grim`/`scrot` on Linux.
+//!
+//! Linux deliberately has no `xcap`: its Linux backends bind PipeWire at
+//! build time (`libspa` needs headers ≥ 0.3.65, which Ubuntu 22.04 does not
+//! ship), so keeping it pinned every Linux build to newer distros than the
+//! rest of the app supports. KWin's D-Bus interface plus `grim`/`scrot`
+//! cover the same ground with no system dependency.
 //!
 //! Planning that chain is a pure function precisely so the whole matrix
 //! stays unit-testable without a display:
 //!
 //! | target | in-process | external fallback |
 //! | --- | --- | --- |
-//! | [`CaptureTarget::Workspace`] | KWin, then `xcap` | `screencapture -x`, PowerShell, `grim`, `scrot` |
+//! | [`CaptureTarget::Workspace`] | KWin (Linux), `xcap` (macOS/Windows) | `screencapture -x`, PowerShell, `grim`, `scrot` |
 //! | [`CaptureTarget::Screen`] | KWin (`activeOutputName` when unnamed) | — |
 //! | [`CaptureTarget::ActiveWindow`] | KWin | — |
 //! | [`CaptureTarget::Window`] | KWin | — |
@@ -295,9 +301,9 @@ pub fn capture(target: &CaptureTarget, dest: &Path) -> Result<CaptureSource, Err
     // without a failed D-Bus round trip in the log, and "no compositor here"
     // says more than echoing `ServiceUnknown`. The call reaches into the
     // display server, and a bug there should not take the caller's task down,
-    // hence the unwind guard on both in-process backends.
+    // hence the unwind guard.
     #[cfg(target_os = "linux")]
-    let mut in_process_error: Option<String> = if kwin::available() {
+    let in_process_error: Option<String> = if kwin::available() {
         let attempt =
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| capture_in_process(target)));
         match attempt.unwrap_or_else(|payload| Err(kwin::Failure::Failed(panic_message(payload)))) {
@@ -318,28 +324,29 @@ pub fn capture(target: &CaptureTarget, dest: &Path) -> Result<CaptureSource, Err
         tracing::debug!(target = ?target, "no KDE Plasma session; skipping the compositor path");
         None
     };
+    // Outside Linux the workspace is `xcap`'s (ScreenCaptureKit on macOS,
+    // Windows Graphics Capture). On Linux there is no in-process path past
+    // KWin — the toolchain takes over directly.
     #[cfg(not(target_os = "linux"))]
     let mut in_process_error: Option<String> = None;
 
-    if *target == CaptureTarget::Workspace {
-        // xcap talks to the display server and can panic on hostile
-        // environments; the unwind guard keeps such a failure a fallback
-        // instead of taking the caller's task down. Its Wayland path is
-        // libwayshot (wlr-screencopy), so it covers the wlroots compositors
-        // and X11, not KWin.
-        let attempt =
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| capture_via_xcap(dest)));
-        match attempt.unwrap_or_else(|payload| Err(panic_message(payload))) {
-            Ok(()) => return Ok(CaptureSource::Workspace),
-            Err(reason) => {
-                tracing::warn!(
-                    reason,
-                    "xcap capture failed; falling back to external tools"
-                );
-                in_process_error = Some(match in_process_error {
-                    Some(previous) => format!("{previous}; xcap: {reason}"),
-                    None => format!("xcap: {reason}"),
-                });
+    #[cfg(not(target_os = "linux"))]
+    {
+        if *target == CaptureTarget::Workspace {
+            // xcap talks to the window server and can panic on hostile
+            // environments; the unwind guard keeps such a failure a fallback
+            // instead of taking the caller's task down.
+            let attempt =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| capture_via_xcap(dest)));
+            match attempt.unwrap_or_else(|payload| Err(panic_message(payload))) {
+                Ok(()) => return Ok(CaptureSource::Workspace),
+                Err(reason) => {
+                    tracing::warn!(
+                        reason,
+                        "xcap capture failed; falling back to external tools"
+                    );
+                    in_process_error = Some(format!("xcap: {reason}"));
+                }
             }
         }
     }
@@ -485,9 +492,9 @@ fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
 ///
 /// `Monitor::all()` sorts by position; the first monitor is the primary.
 /// The image comes back as an RGBA buffer, so saving is all that is left.
-/// On Wayland this only succeeds where wlr-screencopy exists (wlroots
-/// compositors); KWin does not implement it, so KDE falls through to the
-/// external toolchain.
+/// macOS and Windows only — see the module docs for why Linux stays on
+/// KWin and the toolchain.
+#[cfg(not(target_os = "linux"))]
 fn capture_via_xcap(dest: &Path) -> Result<(), String> {
     use xcap::Monitor;
 
