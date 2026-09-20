@@ -664,7 +664,7 @@ mod tests {
             kind,
             ..Default::default()
         }
-        .run(store.conn(), idx, None)
+        .run(store.conn(), idx, None, None)
         .unwrap()
     }
 

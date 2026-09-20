@@ -43,6 +43,11 @@ impl SearchBox {
                 InputEvent::PressEnter { .. } => {
                     let text = this.input.read(cx).value().trim().to_string();
                     this.controller.update(cx, |ctl, _| ctl.set_search(text));
+                    // Hybrid ranking: fetch this term's embedding in the
+                    // background. The grid paints the text ranking now and
+                    // re-runs the query when the vector lands (a no-op when
+                    // no embedding endpoint is configured).
+                    crate::library::jobs::request_query_embedding_app(&this.controller, cx);
                     // Committing must NOT close the popover: pin the flag
                     // open and re-render so the controlled popover stays.
                     // The ✕ is the only way to close it.

@@ -988,6 +988,90 @@ fn set_ai_probe(controller: &Entity<LibraryController>, probe: AiProbe, cx: &mut
     });
     cx.refresh_windows();
 }
+
+// ============================ query embedding ================================
+
+/// Fetch the embedding for the just-committed search term (the search box
+/// submits on Enter, so there is nothing to debounce), letting the grid's
+/// next data pass fuse a vector leg into the text ranking.
+///
+/// Silent by design: no endpoint configured, an unreachable server, or a bad
+/// model name all leave the search exactly as it was before hybrid ranking —
+/// which is not worth a toast on every keystroke-submitted search. The
+/// failure is logged instead.
+///
+/// The response is dropped unless the search term is still the committed one,
+/// so a slow call can never paint an answer to a question the user has moved
+/// past.
+pub fn request_query_embedding_app(controller: &Entity<LibraryController>, cx: &mut App) {
+    let text = controller.read(cx).search_text.trim().to_string();
+    if text.is_empty() {
+        return;
+    }
+    let already_have_it = controller
+        .read(cx)
+        .query_vector
+        .as_ref()
+        .is_some_and(|query| query.text == text);
+    if already_have_it {
+        return;
+    }
+    let Some(config) = trove_core::config::AppConfig::load()
+        .ai_embedding
+        .filter(trove_core::config::EmbeddingConfig::is_configured)
+    else {
+        return;
+    };
+    let provider: std::sync::Arc<dyn trove_core::ai::EmbeddingProvider> =
+        match trove_core::ai::OpenAICompatible::new(&config) {
+            Ok(provider) => std::sync::Arc::new(provider),
+            Err(error) => {
+                tracing::warn!(%error, "query embedding skipped: endpoint is misconfigured");
+                return;
+            }
+        };
+    let model = config.model.trim().to_string();
+    let space = provider.asset_space();
+    let controller = controller.clone();
+
+    cx.spawn(async move |cx| {
+        let asked = text.clone();
+        let result: Result<Vec<f32>, String> = cx
+            .background_executor()
+            .spawn(async move {
+                provider
+                    .embed_texts(std::slice::from_ref(&asked))
+                    .map(|mut vectors| vectors.pop().unwrap_or_default())
+                    .map_err(|error| error.to_string())
+            })
+            .await;
+        let vector = match result {
+            Ok(vector) if !vector.is_empty() => vector,
+            Ok(_) => return,
+            Err(error) => {
+                tracing::warn!(%error, "query embedding failed; searching with text only");
+                return;
+            }
+        };
+        controller.update(cx, |ctl, cx| {
+            if ctl.search_text.trim() != text {
+                return; // the user moved on while the request was in flight
+            }
+            ctl.query_vector = Some(trove_core::search::vector::QueryVector {
+                text,
+                model,
+                space,
+                vector,
+            });
+            // Re-run the query so the fused ranking replaces the text-only
+            // one that is on screen right now.
+            ctl.generation += 1;
+            cx.notify();
+        });
+    })
+    .detach();
+}
+
 /// Poll the backfill until it settles, translating events into toasts — the
 /// same shape as [`watch_import`]. A settle also refreshes the windows so
 /// the settings page's coverage line and generate/cancel button reflect the
