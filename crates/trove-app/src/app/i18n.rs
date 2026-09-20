@@ -11,7 +11,17 @@
 use trove_core::config::AppConfig;
 
 /// Supported UI languages: `(code, native display name)`, picker order.
-pub const SUPPORTED: &[(&str, &str)] = &[("en", "English"), ("zh-CN", "简体中文")];
+pub const SUPPORTED: &[(&str, &str)] = &[
+    ("en", "English"),
+    ("zh-CN", "简体中文"),
+    ("ja", "日本語"),
+    ("ko", "한국어"),
+    ("es", "Español"),
+    ("fr", "Français"),
+    ("de", "Deutsch"),
+    ("pt", "Português"),
+    ("ru", "Русский"),
+];
 
 /// Map a BCP-47-ish code onto a supported catalog: an exact match wins,
 /// otherwise the language prefix (`zh-*` → `zh-CN`), else English.
@@ -64,7 +74,15 @@ mod tests {
         assert_eq!(resolve("zh-CN"), "zh-CN");
         assert_eq!(resolve("zh-TW"), "zh-CN");
         assert_eq!(resolve("zh"), "zh-CN");
-        assert_eq!(resolve("fr"), "en");
+        assert_eq!(resolve("fr"), "fr");
+        assert_eq!(resolve("pt-BR"), "pt");
+        assert_eq!(resolve("pt"), "pt");
+        assert_eq!(resolve("ja-JP"), "ja");
+        assert_eq!(resolve("ko"), "ko");
+        assert_eq!(resolve("es"), "es");
+        assert_eq!(resolve("de"), "de");
+        assert_eq!(resolve("ru"), "ru");
+        assert_eq!(resolve("ar"), "en");  // Arabic not yet supported
         assert_eq!(effective(Some("zh-TW")), "zh-CN");
     }
 }
