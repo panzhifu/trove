@@ -82,7 +82,7 @@ mod tests {
         assert_eq!(resolve("es"), "es");
         assert_eq!(resolve("de"), "de");
         assert_eq!(resolve("ru"), "ru");
-        assert_eq!(resolve("ar"), "en");  // Arabic not yet supported
+        assert_eq!(resolve("ar"), "en"); // Arabic not yet supported
         assert_eq!(effective(Some("zh-TW")), "zh-CN");
     }
 }
