@@ -14,12 +14,6 @@ mp4 = { workspace = true }
 ttf-parser = { workspace = true }
 fontdue = { workspace = true }
 rusqlite = { workspace = true }
-# In-process screen capture for the screenshot import (Linux: wlr-screencopy
-# via libwayshot on Wayland and XCB on X11; macOS ScreenCaptureKit; Windows
-# Graphics Capture). Compositors without wlr-screencopy (KWin) have no
-# in-process path and fall through to the external toolchain in
-# services/screenshot.rs, so a failed capture degrades instead of failing.
-xcap = "0.9.8"
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
@@ -58,3 +52,13 @@ pinyin = "0.10"
 # the only in-process way to capture on Plasma. zbus already rides in the
 # graph via gpui-pre -> ashpd/oo7, so no new compiled crates.
 zbus = "5"
+
+[target.'cfg(not(target_os = "linux"))'.dependencies]
+# In-process screen capture for the screenshot import: ScreenCaptureKit on
+# macOS, Windows Graphics Capture on Windows. Deliberately not on Linux:
+# xcap's Linux backends bind PipeWire at build time (libspa needs headers
+# >= 0.3.65, which Ubuntu 22.04 does not ship), so it would pin every Linux
+# build to newer distros than the app supports. Linux keeps the KWin D-Bus
+# path above and the external toolchain (grim/scrot) in services/screenshot.rs
+# — a failed capture degrades instead of failing.
+xcap = "0.9.8"
