@@ -8673,7 +8673,7 @@ dependencies = [
 
 [[package]]
 name = "trove-app"
-version = "0.4.5"
+version = "0.4.6"
 dependencies = [
  "arboard",
  "bytemuck",
@@ -8697,7 +8697,7 @@ dependencies = [
 
 [[package]]
 name = "trove-core"
-version = "0.4.5"
+version = "0.4.6"
 dependencies = [
  "chrono",
  "dirs 5.0.1",
