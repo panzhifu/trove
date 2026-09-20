@@ -67,7 +67,8 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            libxcb1-dev libxkbcommon-dev libxkbcommon-x11-dev
+            libxcb1-dev libxkbcommon-dev libxkbcommon-x11-dev \
+            libegl1-mesa-dev libgl1-mesa-dev
 
       - name: Build release binary
         run: cargo build --release --target ${{ matrix.target }} -p trove-app
