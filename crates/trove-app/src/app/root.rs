@@ -1425,9 +1425,11 @@ fn open_capture_picker(
 
 /// The frame the picker freezes on, plus the windows it can snap to.
 ///
-/// The window list is a bonus, never a requirement: without it (no
-/// scripting interface, a compositor that did not answer in time) the
-/// picker still drags rectangles, it just never highlights a window.
+/// The window list is a bonus, never a requirement: without it (no scripting
+/// interface, a compositor that did not answer in time) the picker still drags
+/// rectangles, it just never highlights a window. On a session without KWin
+/// there is not even a frame to freeze — the compositor's own picker takes
+/// over, which is the same region capture with a plainer interface.
 #[cfg(target_os = "linux")]
 fn prepare_pick() -> Result<
     (
@@ -1439,6 +1441,9 @@ fn prepare_pick() -> Result<
     use crate::components::capture_pick::{Candidate, window_label};
     use trove_core::services::{kwin, kwin_script};
 
+    if !kwin::available() {
+        return Err("this session has no compositor interface for a frozen frame".into());
+    }
     let frame = kwin::capture_workspace_image().map_err(|failure| failure.labelled())?;
     let candidates = kwin_script::window_list()
         .unwrap_or_default()

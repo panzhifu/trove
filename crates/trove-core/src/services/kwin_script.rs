@@ -151,10 +151,15 @@ impl Callback {
 /// Ask KWin for its window stack, in stacking order (bottom first).
 ///
 /// `None` whenever the answer is not available in time or not available at
-/// all — no session bus, no scripting interface, a script that failed to
-/// load, a compositor that took too long. The caller treats that as "no
-/// window snapping" and carries on.
+/// all — no session bus, no KWin (the scripting interface is the compositor's
+/// too, so a session without Plasma has nothing to load a script into), a
+/// script that failed to load, a compositor that took too long. The caller
+/// treats that as "no window snapping" and carries on.
 pub fn window_list() -> Option<Vec<WindowInfo>> {
+    if !super::kwin::available() {
+        tracing::debug!("kwin script: no KDE Plasma session; skipping the window list");
+        return None;
+    }
     let service = format!("{CALLBACK_INTERFACE}.p{}", std::process::id());
     let script = write_script(&service, &script_source(&service))?;
     let outcome = run(&service, &script);

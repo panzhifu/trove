@@ -207,6 +207,27 @@ pub fn active_output_name() -> Result<String, Failure> {
         .map_err(|e| Failure::Failed(format!("activeOutputName reply: {e}")))
 }
 
+/// Whether a compositor is there to talk to at all.
+///
+/// KWin's interface answers `ServiceUnknown` when Plasma is not the session —
+/// a wlroots compositor (niri, sway, Hyprland), a stripped session, Plasma not
+/// started yet. Asking first keeps that from being reported as a capture
+/// failure (and keeps the proxy's property-cache warning out of the log), and
+/// it is the difference between "no backend here" and "the backend refused",
+/// which the fallback chain needs to tell apart.
+pub fn available() -> bool {
+    let Ok(connection) = Connection::session() else {
+        return false;
+    };
+    let Ok(dbus) = zbus::blocking::fdo::DBusProxy::new(&connection) else {
+        return false;
+    };
+    let Ok(name) = zbus::names::BusName::try_from(DESTINATION) else {
+        return false;
+    };
+    dbus.name_has_owner(name).unwrap_or(false)
+}
+
 /// The compositor's `ScreenShot2.Version`, cached for the session: it only
 /// changes when KWin restarts, and every capture would otherwise pay a
 /// round trip for it. `0` means "unknown", which switches off the keys
