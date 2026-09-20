@@ -187,6 +187,13 @@ fn watch_signals(
 ) {
     cx.spawn(async move |cx| {
         let mut pending: Vec<PathBuf> = Vec::new();
+        // An inbox signal the drain refused (an import of the other kind was
+        // already running) is not lost: it stays pending and is retried on
+        // later ticks. The retry is gated on that import having finished,
+        // because the gate is a flag while the drain lists the inbox and asks
+        // the database — checking every tick while busy would be the cost of
+        // the very loop this replaced.
+        let mut inbox_pending = false;
         loop {
             cx.background_executor().timer(POLL_INTERVAL).await;
 
@@ -220,9 +227,10 @@ fn watch_signals(
             loop {
                 match rx.try_recv() {
                     Ok(WatchSignal::Inbox) => {
-                        let _ = handle.update(cx, |_view, window, cx| {
-                            collect_inbox_app(&controller, window, cx);
+                        let outcome = handle.update(cx, |_view, window, cx| {
+                            collect_inbox_app(&controller, window, cx)
                         });
+                        inbox_pending = matches!(outcome, Ok(InboxDrain::Refused));
                     }
                     Ok(WatchSignal::Files(files)) => pending.extend(files),
                     Err(std::sync::mpsc::TryRecvError::Empty) => break,
@@ -230,6 +238,21 @@ fn watch_signals(
                         channel_open = false;
                         break;
                     }
+                }
+            }
+
+            // The retry half of the inbox contract: a refused drain leaves its
+            // signal pending until a tick finds the import slot free. The gate
+            // is a flag; only a free slot pays for the listing.
+            if inbox_pending {
+                let outcome = handle.update(cx, |_view, window, cx| {
+                    if controller.read(cx).is_importing() {
+                        return InboxDrain::Refused;
+                    }
+                    collect_inbox_app(&controller, window, cx)
+                });
+                if !matches!(outcome, Ok(InboxDrain::Refused)) {
+                    inbox_pending = false;
                 }
             }
 
@@ -439,31 +462,51 @@ fn start_paths_import(
     )
 }
 
+/// What [`collect_inbox_app`] did with the waiting files.
+///
+/// The caller needs the difference: a refusal is the embedder's "try again
+/// later" (an inbox signal that carried a file must not be dropped because an
+/// unrelated import happened to be running), while `Idle` is a settled answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InboxDrain {
+    /// A job is running over the waiting files.
+    Started,
+    /// Another import is running: nothing was touched, ask again later.
+    Refused,
+    /// Nothing was waiting, or the library already holds every waiting file.
+    Idle,
+}
+
 /// Drain the collect-service inbox: import every waiting file (unfiled,
-/// `source_url` stamped from the sidecar, files kept and linked). Returns
-/// `false` when nothing importable was waiting or an import is already
-/// running (retry on the next watcher cycle).
+/// `source_url` stamped from the sidecar, files kept and linked).
 ///
 /// The waiting-list comes from `collect::inbox_items` — the one definition
 /// of what is waiting — rather than a hand-rolled enumeration: a private
 /// copy of the skip rules is exactly how `.part` files (still being written)
-/// and sidecars ended up being imported as assets in their own right.
+/// and sidecars ended up being imported as assets in their own right. Files
+/// the library already holds are dropped before the job is even started; see
+/// [`waiting_files`].
 pub fn collect_inbox_app(
     controller: &Entity<LibraryController>,
     window: &mut Window,
     cx: &mut App,
-) -> bool {
+) -> InboxDrain {
     let items = trove_core::services::collect::inbox_items();
     if items.is_empty() {
-        return false;
+        return InboxDrain::Idle;
     }
 
-    let total = items.len();
-    let (manager, options) = {
+    let (manager, options, total) = {
         let ctl = controller.read(cx);
         if ctl.is_importing() {
-            return false;
+            return InboxDrain::Refused;
         }
+        let items = waiting_files(ctl, items);
+        if items.is_empty() {
+            tracing::debug!("collect inbox: nothing waiting that the library lacks");
+            return InboxDrain::Idle;
+        }
+        let total = items.len();
         let options = ImportOptions {
             data_root: ctl.library.root().to_path_buf(),
             cache_root: ctl.library.cache().to_path_buf(),
@@ -472,10 +515,10 @@ pub fn collect_inbox_app(
             storage: trove_core::media::import::ImportStorage::Link,
             source: ImportSource::CollectInbox { items },
         };
-        (ctl.library.tasks().clone(), options)
+        (ctl.library.tasks().clone(), options, total)
     };
 
-    start_import_job(
+    if start_import_job(
         controller,
         &manager,
         TaskKind::CollectInbox,
@@ -483,7 +526,32 @@ pub fn collect_inbox_app(
         total,
         window,
         cx,
-    )
+    ) {
+        InboxDrain::Started
+    } else {
+        // Both import kinds share one slot: the other one got there first.
+        InboxDrain::Refused
+    }
+}
+
+/// Drop the waiting files the library already holds.
+///
+/// The inbox is where imports *stay* — a collected page and a screenshot are
+/// linked, not copied — so a wake-up over that directory is normally a batch
+/// of files the library has had for days. Asking first (by the same loose
+/// file-name-plus-size key the import itself skips on) keeps that from costing
+/// a job, a scan and a progress notice that then has nothing to report.
+fn waiting_files(
+    ctl: &LibraryController,
+    items: Vec<(PathBuf, Option<PathBuf>)>,
+) -> Vec<(PathBuf, Option<PathBuf>)> {
+    let paths: Vec<PathBuf> = items.iter().map(|(path, _)| path.clone()).collect();
+    let unimported: std::collections::HashSet<PathBuf> =
+        ctl.library.unimported_paths(&paths).into_iter().collect();
+    items
+        .into_iter()
+        .filter(|(path, _)| unimported.contains(path))
+        .collect()
 }
 
 /// Start the backend import job and detach the event watcher. Returns
