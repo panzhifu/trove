@@ -46,15 +46,28 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          # libpipewire-0.3-dev: xcap (the in-process screenshot import) pulls
-          # pipewire/libspa on Linux, and libspa binds the system headers at
-          # build time. That needs pipewire >= 0.3.65 for spa_video_info_raw.flags,
-          # spa_meta_first and spa_meta_region_is_valid — jammy's 0.3.48 has none
-          # of them, so this job is on ubuntu-24.04 (pipewire 1.0.5) and cannot
-          # move back to 22.04.
+          # Ubuntu 24.04 is required, not 22.04: xcap -> libspa binds the pipewire
+          # headers at build time and needs >= 0.3.65 (spa_video_info_raw.flags,
+          # spa_meta_first, spa_meta_region_is_valid); jammy's 0.3.48 fails.
+          #
+          # Every pkg-config library this graph probes, mapped to the crate that
+          # probes it — the list must not depend on what the image happens to
+          # preinstall, because ubuntu-24.04 dropped fontconfig and that alone
+          # killed the build:
+          #   libxcb1-dev         xcb (gpui clipboard/capture)
+          #   libxkbcommon*-dev   xkbcommon (gpui keyboard)
+          #   libegl1-mesa-dev    khronos-egl (gpui/wgpu GL context)
+          #   libfontconfig-dev   yeslogic-fontconfig-sys <- zed-font-kit
+          #   libasound2-dev      alsa-sys <- cpal (rodio, video preview audio)
+          #   libwayland-dev      wayland-sys (client/cursor/egl/server)
+          #   libdrm-dev          drm-sys <- gbm
+          #   libzstd-dev         zstd-sys <- tantivy
+          #   libpipewire-0.3-dev libspa-sys <- pipewire <- xcap
           sudo apt-get install -y \
             libxcb1-dev libxkbcommon-dev libxkbcommon-x11-dev \
-            libegl1-mesa-dev libgl1-mesa-dev libpipewire-0.3-dev
+            libegl1-mesa-dev libgl1-mesa-dev libfontconfig-dev \
+            libasound2-dev libwayland-dev libdrm-dev libzstd-dev \
+            libpipewire-0.3-dev
 
       - name: cargo fmt --check
         run: cargo fmt --all -- --check
