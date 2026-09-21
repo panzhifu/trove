@@ -115,16 +115,21 @@ impl DockPanel for WorkspacePanel {
             // still does (grid layout), so keep everything; only these two
             // contextual actions differ.
             //
-            // Both are destructive, so both are icon-only: the glyph and the
-            // danger tint carry the meaning, the tooltip spells it out. The
-            // glyphs come from the complete Lucide catalog — the
+            // Icon-only, and styled like every other control in this bar: the
+            // glyph carries the meaning, the tooltip spells it out. The
+            // destructive variant is deliberately not used — `ghost()` and
+            // `danger()` set the same field, so the two chained together were
+            // never a ghost in danger colours but a plain danger button, and a
+            // lone red one among ghosts reads as a different kind of control
+            // rather than as a warning.
+            //
+            // The glyphs come from the complete Lucide catalog: the
             // component-level `IconName` is a compatibility subset and has
             // neither a trash nor an eraser.
             use gpui_kit::assets::IconName as CatalogIcon;
             let action = if in_trash {
                 Button::new("empty-trash")
                     .ghost()
-                    .danger()
                     .xsmall()
                     .icon(CatalogIcon::Trash)
                     .tooltip(rust_i18n::t!("workspace.empty_all_tooltip").to_string())
@@ -132,7 +137,6 @@ impl DockPanel for WorkspacePanel {
             } else {
                 Button::new("clear-history")
                     .ghost()
-                    .danger()
                     .xsmall()
                     .icon(CatalogIcon::Eraser)
                     .tooltip(rust_i18n::t!("workspace.clear_history_tooltip").to_string())
