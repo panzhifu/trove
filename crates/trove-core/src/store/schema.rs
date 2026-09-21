@@ -1,77 +1,32 @@
-//! The library schema: one script, one version, plus a short additive
-//! upgrade list.
+//! The library schema: one script, one version, one door.
 //!
 //! `PRAGMA user_version` records the shape a library on disk has. This build
-//! *creates* the whole shape from nothing and *refuses* shapes it cannot walk
-//! forward to. Historically it refused everything else outright: the
-//! migration chain that used to live here was twelve steps of history that
-//! only ever served this project's own development (an abandoned FTS5 table,
-//! columns altered in and dropped again), so before 0.5 the chain was deleted
-//! and [`SCHEMA`] was the whole shape.
+//! *creates* the whole shape from nothing and *refuses* anything else — an
+//! existing library has to be at [`SCHEMA_VERSION`] exactly, or it does not
+//! open. The refusal names both versions and costs nothing: it happens before
+//! a single statement runs, so a library this build cannot read is left
+//! exactly as it was found.
 //!
-//! From 13 on there is a second door: [`UPGRADES`], a short list of small
-//! steps that walk an existing library forward one version at a time. Each
-//! step is applied *atomically with its version write* (see
-//! `Store::migrate`), so a crash anywhere in one rolls the whole step back
-//! instead of leaving a half-applied shape — which is what lets a step be
-//! plain DDL, a `RENAME` included, rather than something that has to be
-//! re-runnable. Steps still never *drop* data: no `DROP TABLE`, no `DROP
-//! COLUMN`, nothing that could lose a row it did not have to. A library from
-//! a shape with no path to here still gets an error naming both versions
-//! instead of a half-upgraded database.
+//! That is deliberate, and it is the second time this file has landed here.
+//! The first migration chain was twelve steps of history that only ever
+//! served this project's own development (an abandoned FTS5 table, columns
+//! altered in and dropped again) and was deleted before 0.5. A short upgrade
+//! list then existed for two steps — the AI embedding table and the `sha256`
+//! → `content_hash` rename — and went the same way once the rename had run on
+//! every library worth carrying forward. A chain is a thing to own, test and
+//! keep correct forever; a version gate is four lines. When the next shape
+//! change arrives and there *are* libraries worth walking forward, a list can
+//! come back — with the rule that a step must be applicable from a shape that
+//! matches the version on record.
 
-/// The schema this build creates. An existing library has to already be at
-/// this version — or be walkable to it via [`UPGRADES`] — to open.
+/// The schema this build creates, and the only shape it opens. A library at
+/// any other version is refused by name rather than guessed at.
 ///
 /// The number continued from 12 rather than restarting: every library in
 /// existence was written by a build whose chain ended there, and that shape
-/// is the pre-`asset_embeddings` subset of the one below. A fresh file and an
-/// upgraded one are therefore the same schema as far as the code is
-/// concerned — which is the only sense in which a version number means
-/// anything.
+/// is the pre-`asset_embeddings` subset of the one below — which is the only
+/// sense in which a version number means anything.
 pub const SCHEMA_VERSION: i64 = 14;
-
-/// Forward upgrades: `(from_version, to_version, script)` steps, each a small
-/// DDL script applied atomically with its own version write, so a step can be
-/// plain SQL (a rename, say) without having to be re-runnable.
-///
-/// The scripts deliberately duplicate the matching tail of [`SCHEMA`] rather
-/// than being derived from it: deriving DDL from a string is a parser nobody
-/// wants to own, and the diff between the two is one review glance.
-pub const UPGRADES: &[(i64, i64, &str)] = &[(12, 13, UPGRADE_V12_V13), (13, 14, UPGRADE_V13_V14)];
-
-/// v12 → v13: the AI embedding table. Additive only — no existing table is
-/// touched, so a pre-vector library opens unchanged and the new one starts
-/// empty (the backfill task fills it).
-pub const UPGRADE_V12_V13: &str = r#"
-    CREATE TABLE IF NOT EXISTS asset_embeddings (
-        asset_id    TEXT NOT NULL REFERENCES assets(id) ON DELETE CASCADE,
-        model       TEXT NOT NULL,
-        space       TEXT NOT NULL CHECK (space IN ('text', 'image')),
-        dim         INTEGER NOT NULL,
-        source_hash TEXT NOT NULL DEFAULT '',
-        vector      BLOB NOT NULL,
-        updated_at  TEXT NOT NULL,
-        PRIMARY KEY (asset_id, model, space)
-    );
-    CREATE INDEX IF NOT EXISTS idx_asset_embeddings_model
-        ON asset_embeddings(model, space);
-"#;
-
-/// v13 → v14: `assets.sha256` becomes `assets.content_hash`.
-///
-/// The column holds content hashes and the algorithm behind them changed from
-/// SHA-256 to BLAKE3 (see `media/hash.rs`); the name follows the meaning so
-/// the next reader cannot mistake it for a promise about the algorithm. The
-/// rename is data-preserving and rewrites nothing — but a library written
-/// before this version holds *SHA-256* values in it, and those no longer match
-/// what hashing the same file produces today. See the note on
-/// [`crate::model::Asset::content_hash`] for what that means in practice.
-pub const UPGRADE_V13_V14: &str = r#"
-    ALTER TABLE assets RENAME COLUMN sha256 TO content_hash;
-    DROP INDEX IF EXISTS idx_assets_sha256;
-    CREATE INDEX idx_assets_content_hash ON assets(content_hash);
-"#;
 
 /// Create the current shape from nothing.
 ///

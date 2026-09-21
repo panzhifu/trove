@@ -317,12 +317,11 @@ pub fn verify_integrity(lib: &Library) -> Result<IntegrityReport> {
 
 /// Streaming content hash of a file; fails when the file cannot be read.
 ///
-/// One line on purpose: this used to carry its own SHA-256 loop with its own
-/// 256 KiB buffer, which meant the integrity check and the importer could
-/// disagree about a file without either of them being obviously wrong. They
-/// now share [`crate::media::hash`], so "the hash of this file" has exactly
-/// one definition (and the parallel path for large blobs comes along for
-/// free).
+/// One line on purpose: the integrity check and the importer have to agree
+/// about what "the hash of this file" is, and the only way to guarantee that
+/// is for both to ask [`crate::media::hash`]. Its own loop would be a second
+/// definition, free to drift, and it would also miss the parallel path the
+/// shared one takes for large blobs.
 fn hash_file(path: &Path) -> std::io::Result<String> {
     Ok(crate::media::hash::hash_file(path)?.0)
 }

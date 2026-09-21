@@ -1,12 +1,10 @@
 //! Content hashing: BLAKE3, with the three properties an importer wants.
 //!
 //! Every content hash in the pipeline is BLAKE3 (`blake3::Hasher`, 32-byte
-//! digest, 64 hex characters — the same width the SHA-256 hex had, so the
-//! storage column and every path derived from it keep their shape). Two
-//! things made the switch worth its migration:
+//! digest, 64 hex characters). Two things made the switch worth its
+//! migration:
 //!
-//! 1. **Speed.** BLAKE3 is several times faster than SHA-256 per byte on one
-//!    core, and the hash is on the critical path of every import: with
+//! 1. **Speed.** The hash is on the critical path of every import: with
 //!    [`ImportStorage::Link`] the read-for-hashing is the *whole* I/O an
 //!    import does.
 //! 2. **It is a tree, so it parallelises.** [`Hasher::update_rayon`] splits
@@ -49,10 +47,10 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
-/// Hex characters in a content hash. Kept at 64 (the SHA-256 width) rather
-/// than 32: the blob layout, the thumbnail file names and the storage column
-/// all read hashes as opaquely-64-hex, and a shorter digest would only make
-/// the two generations of value harder to tell apart on disk.
+/// Hex characters in a content hash. 64 rather than 32: the blob layout, the
+/// thumbnail file names and the storage column all read a hash as opaquely
+/// 64-hex, and a shorter digest would mean revisiting every one of them for
+/// nothing a longer digest does not already give.
 pub const HEX_LEN: usize = 64;
 
 // ---------------------------------------------------------------------------
