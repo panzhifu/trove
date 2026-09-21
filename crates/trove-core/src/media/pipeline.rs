@@ -969,6 +969,10 @@ mod tests {
         // Same length, different bytes, same (restored) modification time.
         std::fs::write(&src, b"other content").unwrap();
         let handle = std::fs::OpenOptions::new().write(true).open(&src).unwrap();
+        // Restoring the time exactly is the point: this is the one case where
+        // the cache is *meant* to answer for content that has changed. Setting
+        // it explicitly, rather than trusting the write's own timestamp, makes
+        // the round trip independent of the clock's resolution.
         handle
             .set_times(std::fs::FileTimes::new().set_modified(mtime))
             .unwrap();
@@ -985,8 +989,22 @@ mod tests {
             "the file was not read again"
         );
 
-        // And a file that really changed (mtime moved) is read again.
+        // And a file that really changed (mtime moved) is read again. The
+        // mtime is moved by hand rather than left to the clock: every payload
+        // here is the same length, so a clock that advances in coarse steps —
+        // Windows' file-time clock ticks in roughly 15 ms — can stamp this
+        // write with the very time already in the cache, leaving the key the
+        // cache matches on (path, size, mtime) indistinguishable from the
+        // file it already answered for. Moving it by two seconds is distinct
+        // on every file system, from nanosecond APFS to FAT's two-second
+        // granularity.
         std::fs::write(&src, b"third content").unwrap();
+        let moved = mtime + std::time::Duration::from_secs(2);
+        let handle = std::fs::OpenOptions::new().write(true).open(&src).unwrap();
+        handle
+            .set_times(std::fs::FileTimes::new().set_modified(moved))
+            .unwrap();
+
         let mut third = StageIo::new(&src, &root, &cache, ImportStorage::Link).unwrap();
         default_pipeline().run(&mut third).unwrap();
         assert_eq!(
