@@ -30,11 +30,18 @@
 //!
 //! ## Duplicate imports
 //!
-//! The last section stages the same batch twice. The second pass finds
-//! thumbnails in the cache, so the decode stage reads those instead of the
-//! originals — the gap to a batch where nothing is cached is what a re-import
-//! costs, and before the pipeline existed that pass still decoded every
-//! original once.
+//! The last section stages the same batch three times and times the last two:
+//!
+//! - **cached** — thumbnails in the cache, and the hash cache remembers every
+//!   file. The decode stage reads the cached thumbnails instead of the
+//!   originals, and the hash stage answers from a `stat`.
+//! - **uncached hash** — the same pass with the hash cache emptied first.
+//!   Everything else is identical (thumbnails still cached), so the gap
+//!   between the two rows is exactly what the hash cache is worth on a
+//!   re-import — and it is also what a re-import cost before the cache
+//!   existed, since an emptied cache makes the hash stage read every file.
+//!
+//! This is the number to watch when touching the hash or decode stage.
 //!
 //! ## What the single decode is actually worth (measured)
 //!
@@ -339,44 +346,76 @@ fn main() {
     );
 
     // --- duplicate-import cost ----------------------------------------------
-    // Import the same batch twice. On the second pass the decode stage finds
-    // the cached thumbnails and decodes *those* instead of the originals, so
-    // what is left is the hash (unavoidable — it is the dedupe key), the
-    // palette, the signature and a stat per file. This is the number to watch
-    // when touching the decode stage: it used to pay a full decode per file
-    // even when nothing else had to change.
+    // Import the same batch, then time it again. On that second pass the
+    // decode stage finds the cached thumbnails and decodes *those* instead of
+    // the originals, and the hash stage finds every file in the hash cache —
+    // so what is left is a stat per file, the palette, the signature and a
+    // decode of a ≤512px JPEG. The third pass empties the hash cache first,
+    // which puts the full read back and is what this pass cost before the
+    // cache existed.
     println!();
-    println!("--- duplicate import (same files, second pass) ---");
+    println!("--- duplicate import (same files, repeat passes) ---");
     let dup_root = base.join(format!("import-profile-dup-{me}"));
     let _ = std::fs::remove_dir_all(&dup_root);
     std::fs::create_dir_all(&dup_root).unwrap();
+    let dup_cache = dup_root.join("cache");
+
+    // First pass populates the store, the thumbnails and the hash cache. Not
+    // timed: it is the cold number the section above already reports.
+    let _ = import::stage_all(
+        &dup_root,
+        &dup_cache,
+        &paths,
+        ImportStorage::Link,
+        &std::sync::atomic::AtomicBool::new(false),
+    );
+
     let mut dup_samples = Vec::new();
+    let mut uncached_samples = Vec::new();
     for _ in 0..rounds {
-        // First pass populates the store; only the second is timed.
-        let _ = import::stage_all(
-            &dup_root,
-            &dup_root.join("cache"),
-            &paths,
-            ImportStorage::Link,
-            &std::sync::atomic::AtomicBool::new(false),
-        );
         let t = Instant::now();
         let staged = import::stage_all(
             &dup_root,
-            &dup_root.join("cache"),
+            &dup_cache,
             &paths,
             ImportStorage::Link,
             &std::sync::atomic::AtomicBool::new(false),
         );
         dup_samples.push(t.elapsed().as_secs_f64());
         drop(staged);
+
+        // Same pass, hash cache emptied. The clear itself is outside the
+        // clock: what is timed is the staging it forces to read the files.
+        trove_core::media::hash_cache::clear(&dup_cache);
+        let t = Instant::now();
+        let staged = import::stage_all(
+            &dup_root,
+            &dup_cache,
+            &paths,
+            ImportStorage::Link,
+            &std::sync::atomic::AtomicBool::new(false),
+        );
+        uncached_samples.push(t.elapsed().as_secs_f64());
+        drop(staged);
     }
     let dmed = median(dup_samples);
+    let umed = median(uncached_samples);
     println!(
         "{:<22} {:>10.1} {:>12.2}",
-        "stage_all (2nd pass)",
+        "stage_all (cached)",
         dmed * 1000.0,
         dmed * 1000.0 / n as f64
+    );
+    println!(
+        "{:<22} {:>10.1} {:>12.2}",
+        "stage_all (hash uncached)",
+        umed * 1000.0,
+        umed * 1000.0 / n as f64
+    );
+    println!(
+        "hash cache is worth: {:.2}x on a re-import ({:.2} ms/file)",
+        umed / dmed.max(1e-9),
+        (umed - dmed) * 1000.0 / n as f64
     );
     println!(
         "vs first pass: {:.2}x  ({} if fully cached)",
