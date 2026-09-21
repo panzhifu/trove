@@ -81,24 +81,17 @@ impl Store {
         Ok(())
     }
 
-    /// Create the schema in a new file, or walk an existing one forward.
+    /// Open a new library, or check that an existing one is the shape this
+    /// build reads.
     ///
-    /// A fresh file gets [`schema::SCHEMA`] whole. An existing one must
-    /// already be at [`schema::SCHEMA_VERSION`] or be reachable from its own
-    /// version through the steps in [`schema::UPGRADES`] — applied one at a
-    /// time, each committing before the next step is attempted. Anything else
-    /// is refused with both versions in the message rather than
-    /// half-upgraded.
-    ///
-    /// A step and its version write go in *one* transaction, and
-    /// `PRAGMA user_version` participates in transactions (it is a database
-    /// header field, not a per-connection setting — verified), so a crash
-    /// mid-step rolls the step back and the re-run starts from a shape that
-    /// still matches the version on record. That is what lets a step use
-    /// plain DDL — `ALTER TABLE … RENAME COLUMN`, which SQLite cannot write
-    /// as `IF EXISTS` — instead of having to be individually re-runnable.
+    /// A fresh file (version 0) gets [`schema::SCHEMA`] whole. A library at
+    /// [`schema::SCHEMA_VERSION`] is left alone. Anything else is refused with
+    /// both versions in the message — before a statement has run, so the file
+    /// is untouched and the user's next move (back it up, start a new one) is
+    /// theirs to make on intact data. There is no upgrade chain; see
+    /// [`crate::store::schema`] for why.
     pub fn migrate(&self) -> Result<()> {
-        let mut current = self.user_version()?;
+        let current = self.user_version()?;
         if current == schema::SCHEMA_VERSION {
             return Ok(());
         }
@@ -106,21 +99,11 @@ impl Store {
             self.apply(schema::SCHEMA)?;
             return self.set_user_version(schema::SCHEMA_VERSION);
         }
-        while current != schema::SCHEMA_VERSION {
-            let Some(&(_, to, sql)) = schema::UPGRADES
-                .iter()
-                .find(|(from, _, _)| *from == current)
-            else {
-                return Err(crate::error::Error::Validation(format!(
-                    "library schema v{current}, this build creates v{}: \
-                     no upgrade path from v{current}",
-                    schema::SCHEMA_VERSION
-                )));
-            };
-            self.apply_step(sql, to)?;
-            current = to;
-        }
-        Ok(())
+        Err(crate::error::Error::Validation(format!(
+            "library schema v{current}, this build reads v{} only: \
+             back the library up and start a new one",
+            schema::SCHEMA_VERSION
+        )))
     }
 
     /// Apply one DDL script atomically.
@@ -128,18 +111,6 @@ impl Store {
         let mut mut_borrow = self.conn.borrow_mut();
         let tx = mut_borrow.transaction()?;
         tx.execute_batch(sql).map_err(crate::error::Error::from)?;
-        tx.commit().map_err(crate::error::Error::from)?;
-        Ok(())
-    }
-
-    /// Apply one upgrade step and record the version it lands at, in the same
-    /// transaction — see [`Store::migrate`].
-    fn apply_step(&self, sql: &str, to: i64) -> Result<()> {
-        let mut mut_borrow = self.conn.borrow_mut();
-        let tx = mut_borrow.transaction()?;
-        tx.execute_batch(sql).map_err(crate::error::Error::from)?;
-        tx.execute_batch(&format!("PRAGMA user_version = {to}"))
-            .map_err(crate::error::Error::from)?;
         tx.commit().map_err(crate::error::Error::from)?;
         Ok(())
     }
@@ -392,145 +363,59 @@ mod tests {
         store.migrate().unwrap();
     }
 
-    /// A library from another build is refused rather than guessed at. Before
-    /// 0.5 the only such libraries are development ones, and a half-upgraded
-    /// database would be worse than this error.
+    /// A library from another build is refused rather than guessed at — and
+    /// refused *before anything runs*, so the file the user has is the file
+    /// they had. That is the whole argument for a version gate over an
+    /// upgrade chain: the failure mode is a message, not a half-applied
+    /// shape.
+    ///
+    /// v13 is the interesting case, because it is the version this build's
+    /// immediate predecessor wrote: those libraries differ from a current one
+    /// by one column name, and they are still refused (the rename used to be
+    /// an upgrade step; see [`crate::store::schema`]).
     #[test]
-    fn a_library_from_another_version_is_refused() {
+    fn a_library_from_another_version_is_refused_untouched() {
         let dir = std::env::temp_dir().join(format!("trove-schema-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("library.db");
-        Store::open(&path).unwrap();
-
-        // Rewrite the version as an older build would have left it.
-        rusqlite::Connection::open(&path)
-            .unwrap()
-            .execute_batch("PRAGMA user_version = 7")
-            .unwrap();
-
-        let err = match Store::open(&path) {
-            Ok(_) => panic!("a v7 library must not open"),
-            Err(e) => e.to_string(),
-        };
-        assert!(err.contains("v7"), "{err}");
-        assert!(
-            err.contains(&format!("v{}", schema::SCHEMA_VERSION)),
-            "{err}"
-        );
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    /// A v12 library — every library written before the embedding table
-    /// existed — walks forward through [`schema::UPGRADES`]: the additive
-    /// step recreates the new table, the version lands on the current one,
-    /// and the data already in the library is untouched.
-    #[test]
-    fn a_v12_library_upgrades_to_the_current_schema() {
-        let dir = std::env::temp_dir().join(format!("trove-upgrade-{}", Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("library.db");
         let asset = sample_asset("kept.png", AssetKind::Image);
         {
             let store = Store::open(&path).unwrap();
             assets::insert(store.conn(), &asset).unwrap();
-            // Rewind to a pre-vector *and* pre-rename build: version 12, no
-            // embeddings table, and the hash column under its old name. A real
-            // v12 library has all three, and the walk forward has to cope with
-            // that shape rather than with today's shape under an old number.
-            rusqlite::Connection::open(&path)
-                .unwrap()
-                .execute_batch(
-                    "PRAGMA user_version = 12;
-                     DROP TABLE asset_embeddings;
-                     DROP INDEX idx_assets_content_hash;
-                     ALTER TABLE assets RENAME COLUMN content_hash TO sha256;
-                     CREATE INDEX idx_assets_sha256 ON assets(sha256);",
-                )
-                .unwrap();
-        }
-        let store = Store::open(&path).unwrap();
-        assert_eq!(store.user_version().unwrap(), schema::SCHEMA_VERSION);
-        assert!(assets::get(store.conn(), asset.id).unwrap().is_some());
-        assert!(
-            asset_columns(store.conn()).contains(&"content_hash".to_string()),
-            "the frozen 12 -> 14 chain ends at the current column name"
-        );
-        // The upgraded shape accepts embedding rows, same as a fresh file.
-        crate::store::embeddings::upsert(
-            store.conn(),
-            &crate::model::NewEmbedding {
-                asset_id: asset.id,
-                model: "test-model".into(),
-                space: crate::model::EmbeddingSpace::Text,
-                vector: vec![1.0, 0.0],
-                source_hash: "h".into(),
-            },
-        )
-        .unwrap();
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    /// A v13 library — everything written before `assets.sha256` was renamed
-    /// — walks forward: the column is renamed, its *values* survive, and the
-    /// index follows the new name.
-    ///
-    /// The rename is the one step in [`schema::UPGRADES`] that plain
-    /// `IF EXISTS` DDL cannot express, which is why a step now commits
-    /// together with its version write; the second half of this test is the
-    /// property that buys — running the step again on an already-upgraded
-    /// library is a no-op rather than an error.
-    #[test]
-    fn a_v13_library_renames_its_content_hash_column() {
-        let dir = std::env::temp_dir().join(format!("trove-rename-{}", Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("library.db");
-        let asset = sample_asset("kept.png", AssetKind::Image);
-        {
-            let store = Store::open(&path).unwrap();
-            assets::insert(store.conn(), &asset).unwrap();
-            // Rewind to the pre-rename shape: the column carries the old name
-            // and the old-index name, and the version says so.
-            rusqlite::Connection::open(&path)
-                .unwrap()
-                .execute_batch(
-                    "PRAGMA user_version = 13;
-                     DROP INDEX idx_assets_content_hash;
-                     ALTER TABLE assets RENAME COLUMN content_hash TO sha256;
-                     CREATE INDEX idx_assets_sha256 ON assets(sha256);",
-                )
-                .unwrap();
         }
 
-        let store = Store::open(&path).unwrap();
-        assert_eq!(store.user_version().unwrap(), schema::SCHEMA_VERSION);
-        let columns = asset_columns(store.conn());
-        assert!(columns.contains(&"content_hash".to_string()), "{columns:?}");
-        assert!(!columns.contains(&"sha256".to_string()), "{columns:?}");
-        // The row and its hash are the same row and the same hash.
-        let read = assets::get(store.conn(), asset.id).unwrap().unwrap();
-        assert_eq!(read.content_hash, asset.content_hash);
-        assert_eq!(
-            assets::find_by_content_hash(store.conn(), asset.content_hash.as_deref().unwrap())
+        for version in [7, 13] {
+            // Rewrite the version as another build would have left it.
+            rusqlite::Connection::open(&path)
                 .unwrap()
-                .map(|found| found.id),
-            Some(asset.id),
-            "the index serves lookups under the new name"
-        );
+                .execute_batch(&format!("PRAGMA user_version = {version}"))
+                .unwrap();
 
-        // The upgrade is recorded, not repeated.
-        store.migrate().unwrap();
-        assert_eq!(store.user_version().unwrap(), schema::SCHEMA_VERSION);
+            let err = match Store::open(&path) {
+                Ok(_) => panic!("a v{version} library must not open"),
+                Err(e) => e.to_string(),
+            };
+            assert!(err.contains(&format!("v{version}")), "{err}");
+            assert!(
+                err.contains(&format!("v{}", schema::SCHEMA_VERSION)),
+                "{err}"
+            );
+
+            // Nothing ran: the version is still what it was, and the row is
+            // still there.
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            assert_eq!(
+                conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                    .unwrap(),
+                version
+            );
+            assert!(
+                assets::get(&conn, asset.id).unwrap().is_some(),
+                "the refusal left the data alone"
+            );
+        }
 
         std::fs::remove_dir_all(&dir).ok();
-    }
-
-    /// The column names of `assets`, in declaration order.
-    fn asset_columns(conn: &rusqlite::Connection) -> Vec<String> {
-        let mut stmt = conn.prepare("PRAGMA table_info(assets)").unwrap();
-        stmt.query_map([], |row| row.get::<_, String>(1))
-            .unwrap()
-            .flatten()
-            .collect()
     }
 
     #[test]

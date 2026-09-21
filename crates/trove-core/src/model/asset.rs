@@ -118,20 +118,6 @@ pub struct Asset {
     pub size_bytes: u64,
     /// BLAKE3 of the file content, hex (64 characters). Deduplication key,
     /// blob name and thumbnail cache key at once.
-    ///
-    /// **Two generations of value live in this column.** A record written
-    /// before schema v14 holds a *SHA-256* hex there (the column was called
-    /// `sha256`; v13→v14 renames it without rewriting anything), and a
-    /// SHA-256 digest is not what hashing that file gives today. What that
-    /// costs: an old record's hash still names its blob and its thumbnail
-    /// correctly, but it no longer matches a fresh hash of the same file, so
-    /// relinking an old linked asset reports a mismatch and a re-import of
-    /// content an old record holds inserts a second row instead of reusing
-    /// the first. Neither is repaired automatically — the hash of a file is
-    /// only ever measured from the file, and there is no "rehash everything"
-    /// pass here. Re-importing the file is the way to move a record onto the
-    /// current algorithm.
-    #[serde(alias = "sha256")]
     pub content_hash: Option<String>,
     pub kind: AssetKind,
     /// Media dimensions / duration, present only when the file carries them.
