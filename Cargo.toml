@@ -36,20 +36,18 @@ serde_json = "1"
 
 # Persistence
 rusqlite = { version = "0.37", features = ["bundled", "chrono", "uuid", "serde_json"] }
-# Only the AI embedding fingerprint still hashes with SHA-256 — every content
-# hash in the import pipeline is BLAKE3 now. Deliberately kept on 0.10 rather
-# than aligned with the sha2 0.11 that gpui-kit-assets pulls in: oo7
-# (-> zbus/ashpd, via gpui-pre) hard-requires `sha2 ^0.10`, so both stacks
-# exist either way and moving costs a crypto generation for zero dedup.
-# Revisit when oo7 moves to digest 0.11.
-sha2 = "0.10"
 
-# Content hashing for the whole import pipeline (dedup key, blob name,
-# thumbnail cache key, integrity check). BLAKE3 over SHA-256 for two reasons
-# that matter to an importer: it is several times faster per byte single
-# threaded, and its tree structure lets one file be hashed across cores —
-# see `media/hash.rs`. The `rayon` feature is what buys the parallel path; it
+# Hashing: one primitive for the whole crate — content hashes (dedup key, blob
+# name, thumbnail cache key, integrity check) and the AI embedding fingerprint
+# alike, see `trove-core/src/media/hash.rs`. BLAKE3 over SHA-256 for the two
+# reasons that matter to an importer: several times faster per byte single
+# threaded, and a tree, so one large file can be hashed across the rayon pool
+# the caller is already on. The `rayon` feature is what buys that path; it
 # rides in the graph via the workspace's own rayon, adding no new crate.
+#
+# `sha2` is no longer declared: nothing of ours uses it. Two versions still
+# ride in the graph (`oo7` via `gpui-pre` pins 0.10, `gpui-kit-assets` asks
+# for 0.11) — that is upstream's business, not a pin of ours to maintain.
 blake3 = { version = "1", features = ["rayon"] }
 
 # Utilities

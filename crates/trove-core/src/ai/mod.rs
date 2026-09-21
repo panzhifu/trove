@@ -97,18 +97,26 @@ pub fn asset_embed_text(asset: &Asset, tags: &[String]) -> String {
     text
 }
 
-/// SHA-256 of an embedding input, hex — the `source_hash` column's value.
+/// BLAKE3 of an embedding input, hex — the `source_hash` column's value.
 ///
-/// Deliberately the one hash in the crate that is *not* [`crate::media::hash`]:
-/// this is a fingerprint of a provider request, not of a file the library
-/// owns, and changing it would invalidate every stored embedding (the backfill
-/// skips a row only while its `source_hash` still matches its input).
+/// This is **not** a content hash of anything the library owns: it fingerprints
+/// the exact text that was sent to the provider, and it exists so the embed
+/// task can skip an asset whose input has not changed since the vector was
+/// paid for (`tasks/embed`). It goes through
+/// [`crate::media::hash`] like every other hash in the crate — one primitive,
+/// one implementation — rather than carrying a second algorithm of its own.
+///
+/// 🔴 **Changing this function invalidates every stored embedding.** The skip
+/// above is an equality test against the value written last time, so a new
+/// digest means the next embed run treats the whole library as changed and
+/// re-embeds it: one provider call per asset, at the user's expense. That is
+/// the intended behaviour when the *input* changes (an edited title, a new
+/// tag) and a one-off cost when the *algorithm* does — so it is worth doing
+/// deliberately and never as a tidy-up. Nothing else keys off this value: the
+/// `source_hash` column is plain `TEXT` with no width or format constraint,
+/// and no search path reads it.
 pub fn source_hash(input: &str) -> String {
-    use sha2::{Digest, Sha256};
-    let mut hasher = Sha256::new();
-    hasher.update(input.as_bytes());
-    let digest = hasher.finalize();
-    digest.iter().map(|b| format!("{b:02x}")).collect()
+    crate::media::hash::hash_bytes(input.as_bytes())
 }
 
 #[cfg(test)]
@@ -149,6 +157,11 @@ mod tests {
         assert_eq!(text.chars().count(), MAX_TEXT_CHARS);
     }
 
+    /// The fingerprint is a digest, stable for one input and different for
+    /// another — a cache key for work that costs money, so "stable" is the
+    /// property that matters. It is pinned to the shared implementation: the
+    /// day `media::hash` changes algorithm, this test is where the
+    /// invalidation of every stored embedding shows up.
     #[test]
     fn source_hash_is_stable_hex_and_input_sensitive() {
         let a = source_hash("one");
@@ -158,5 +171,12 @@ mod tests {
         assert_ne!(a, c);
         assert_eq!(a.len(), 64);
         assert!(a.chars().all(|ch| ch.is_ascii_hexdigit()));
+
+        assert_eq!(a, crate::media::hash::hash_bytes(b"one"));
+        assert_eq!(
+            a,
+            crate::media::hash::hex(blake3::hash(b"one").as_bytes()),
+            "the fingerprint is BLAKE3, the same primitive as every other hash"
+        );
     }
 }
