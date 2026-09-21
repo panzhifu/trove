@@ -98,6 +98,11 @@ pub fn asset_embed_text(asset: &Asset, tags: &[String]) -> String {
 }
 
 /// SHA-256 of an embedding input, hex — the `source_hash` column's value.
+///
+/// Deliberately the one hash in the crate that is *not* [`crate::media::hash`]:
+/// this is a fingerprint of a provider request, not of a file the library
+/// owns, and changing it would invalidate every stored embedding (the backfill
+/// skips a row only while its `source_hash` still matches its input).
 pub fn source_hash(input: &str) -> String {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();

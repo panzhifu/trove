@@ -35,9 +35,9 @@ pub(crate) fn open_image_search(
         }
         let name = asset.file_name.clone();
         let thumb = asset
-            .sha256
+            .content_hash
             .as_deref()
-            .map(|sha| trove_core::media::thumb::abs_path(&cache_root, sha));
+            .map(|hash| trove_core::media::thumb::abs_path(&cache_root, hash));
         let path = thumb.filter(|p| p.is_file()).or_else(|| {
             asset
                 .rel_path

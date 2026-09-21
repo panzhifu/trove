@@ -14,7 +14,7 @@ use crate::model::{
 };
 
 /// Column list shared by every read; index order matches `asset_from_row`.
-pub(crate) const COLS: &str = "id, origin, rel_path, file_name, ext, mime, size_bytes, sha256, \
+pub(crate) const COLS: &str = "id, origin, rel_path, file_name, ext, mime, size_bytes, content_hash, \
                     kind, width, height, duration_ms, captured_at, title, description, \
                     rating, is_favorite, source_url, extra, created_at, updated_at, trashed_at, \
                     usage_status, commercial_use";
@@ -42,11 +42,11 @@ pub fn get(conn: &Connection, id: Uuid) -> Result<Option<Asset>> {
 }
 
 /// Number of records (live or trashed) referencing a content hash.
-pub fn count_by_sha256(conn: &Connection, sha256: &str) -> Result<u64> {
+pub fn count_by_content_hash(conn: &Connection, content_hash: &str) -> Result<u64> {
     Ok(rows::query_count(
         conn,
-        "SELECT COUNT(*) FROM assets WHERE sha256 = ?1",
-        vec![sha256.to_string().into()],
+        "SELECT COUNT(*) FROM assets WHERE content_hash = ?1",
+        vec![content_hash.to_string().into()],
     )? as u64)
 }
 
@@ -57,17 +57,17 @@ pub fn count_by_sha256(conn: &Connection, sha256: &str) -> Result<u64> {
 pub fn set_linked_media_columns(
     conn: &Connection,
     id: Uuid,
-    sha256: &str,
+    content_hash: &str,
     size_bytes: u64,
     width: Option<u32>,
     height: Option<u32>,
 ) -> Result<()> {
     rows::execute(
         conn,
-        "UPDATE assets SET sha256 = ?1, size_bytes = ?2, width = ?3, height = ?4 \
+        "UPDATE assets SET content_hash = ?1, size_bytes = ?2, width = ?3, height = ?4 \
          WHERE id = ?5",
         vec![
-            Value::Text(sha256.to_string()),
+            Value::Text(content_hash.to_string()),
             Value::Integer(size_bytes as i64),
             rows::bind_opt_int(width.map(i64::from)),
             rows::bind_opt_int(height.map(i64::from)),
@@ -78,21 +78,27 @@ pub fn set_linked_media_columns(
 }
 
 /// Distinct content hashes referenced by any record (live or trashed).
-pub fn referenced_shas(conn: &Connection) -> Result<Vec<String>> {
+///
+/// Used to decide what a blob or thumbnail on disk is still needed for, and
+/// by the dedup pre-check ([`crate::media::precheck`]) to answer "does the
+/// library already hold this content?" from memory instead of a query per
+/// candidate file. Trashed rows count: their content still owns the files on
+/// disk, and whether to re-import it is the commit's decision.
+pub fn referenced_hashes(conn: &Connection) -> Result<Vec<String>> {
     rows::query_map(
         conn,
-        "SELECT DISTINCT sha256 FROM assets WHERE sha256 IS NOT NULL",
+        "SELECT DISTINCT content_hash FROM assets WHERE content_hash IS NOT NULL",
         vec![],
         |row| row.get::<_, String>(0).map_err(Error::from),
     )
 }
 
 /// Find a live (not trashed) asset with the same content hash, if any.
-pub fn find_by_sha256(conn: &Connection, sha256: &str) -> Result<Option<Asset>> {
+pub fn find_by_content_hash(conn: &Connection, content_hash: &str) -> Result<Option<Asset>> {
     rows::query_one(
         conn,
-        &format!("SELECT {COLS} FROM assets WHERE sha256 = ?1 AND trashed_at IS NULL"),
-        vec![sha256.to_string().into()],
+        &format!("SELECT {COLS} FROM assets WHERE content_hash = ?1 AND trashed_at IS NULL"),
+        vec![content_hash.to_string().into()],
         asset_from_row,
     )
 }
@@ -340,7 +346,7 @@ pub fn set_rel_path(conn: &Connection, id: Uuid, rel_path: &str) -> Result<()> {
 pub fn set_media_columns(
     conn: &Connection,
     id: Uuid,
-    sha256: &str,
+    content_hash: &str,
     rel_path: &str,
     size_bytes: u64,
     width: Option<u32>,
@@ -348,10 +354,10 @@ pub fn set_media_columns(
 ) -> Result<()> {
     rows::execute(
         conn,
-        "UPDATE assets SET sha256 = ?1, rel_path = ?2, size_bytes = ?3, width = ?4, height = ?5 \
+        "UPDATE assets SET content_hash = ?1, rel_path = ?2, size_bytes = ?3, width = ?4, height = ?5 \
          WHERE id = ?6",
         vec![
-            Value::Text(sha256.to_string()),
+            Value::Text(content_hash.to_string()),
             Value::Text(rel_path.to_string()),
             Value::Integer(size_bytes as i64),
             rows::bind_opt_int(width.map(i64::from)),
@@ -398,7 +404,7 @@ pub fn delete(conn: &Connection, id: Uuid) -> Result<()> {
 const DUPLICATE_PHASH_DISTANCE: u32 = 8;
 
 /// A cluster of live images that look the same. Exact content duplicates
-/// cannot occur among live assets — the importer deduplicates by SHA-256 at
+/// cannot occur among live assets — the importer deduplicates by content hash at
 /// the record level — so a "duplicate" here is a re-encoded/resized variant
 /// with a different hash but the same picture.
 #[derive(Debug, Clone, PartialEq)]
@@ -498,7 +504,7 @@ pub(crate) fn asset_from_row(row: &rusqlite::Row) -> Result<Asset> {
             let v = rows::int(row, 6)?;
             v.max(0) as u64
         },
-        sha256: rows::opt_str(row, 7)?,
+        content_hash: rows::opt_str(row, 7)?,
         kind: parse_kind(&rows::req_str(row, 8)?)?,
         width: rows::opt_int(row, 9)?.map(|v| v as u32),
         height: rows::opt_int(row, 10)?.map(|v| v as u32),
@@ -530,7 +536,7 @@ fn asset_values(a: &Asset) -> Vec<Value> {
         a.ext.clone().into(),
         a.mime.clone().into(),
         Value::Integer(a.size_bytes as i64),
-        bind_opt_str(a.sha256.as_deref()),
+        bind_opt_str(a.content_hash.as_deref()),
         kind_str(a.kind).into(),
         a.width
             .map(|v| Value::Integer(v as i64))
@@ -908,13 +914,20 @@ pub fn known_key(path: &std::path::Path) -> Option<(String, u64)> {
     Some((name.to_string(), size))
 }
 
-/// Every key the library already holds, in one scan of `assets`.
+/// Every key a *live* record holds, in one scan of `assets`.
+///
+/// Trashed rows are excluded, and that is the same rule the commit side
+/// dedupes by ([`find_by_content_hash`] ignores them too): a file whose only
+/// record is in the trash is a file the user can import again, and skipping
+/// it here would leave no way back short of restoring the record.
 ///
 /// A database that cannot answer yields an empty set, which reads as "nothing
 /// is known yet" — the caller's next move is to offer the files to the
 /// importer, which checks again. That is the safe direction to fail in.
 pub fn known_keys(conn: &Connection) -> HashSet<(String, u64)> {
-    let Ok(mut stmt) = conn.prepare("SELECT file_name, size_bytes FROM assets") else {
+    let Ok(mut stmt) =
+        conn.prepare("SELECT file_name, size_bytes FROM assets WHERE trashed_at IS NULL")
+    else {
         return HashSet::new();
     };
     let rows = stmt.query_map([], |row| {

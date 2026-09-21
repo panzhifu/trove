@@ -202,9 +202,9 @@ impl AssetPreviewData {
         cache_root: &Path,
     ) -> Self {
         let thumb = asset
-            .sha256
+            .content_hash
             .as_deref()
-            .map(|sha| trove_core::media::thumb::abs_path(cache_root, sha))
+            .map(|hash| trove_core::media::thumb::abs_path(cache_root, hash))
             .filter(|p| p.is_file());
         let original = if asset.origin == trove_core::model::Origin::Linked {
             asset

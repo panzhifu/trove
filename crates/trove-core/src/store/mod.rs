@@ -85,10 +85,18 @@ impl Store {
     ///
     /// A fresh file gets [`schema::SCHEMA`] whole. An existing one must
     /// already be at [`schema::SCHEMA_VERSION`] or be reachable from its own
-    /// version through the additive steps in [`schema::UPGRADES`] — applied
-    /// one at a time, each committing its version write before the next step
-    /// is attempted. Anything else is refused with both versions in the
-    /// message rather than half-upgraded.
+    /// version through the steps in [`schema::UPGRADES`] — applied one at a
+    /// time, each committing before the next step is attempted. Anything else
+    /// is refused with both versions in the message rather than
+    /// half-upgraded.
+    ///
+    /// A step and its version write go in *one* transaction, and
+    /// `PRAGMA user_version` participates in transactions (it is a database
+    /// header field, not a per-connection setting — verified), so a crash
+    /// mid-step rolls the step back and the re-run starts from a shape that
+    /// still matches the version on record. That is what lets a step use
+    /// plain DDL — `ALTER TABLE … RENAME COLUMN`, which SQLite cannot write
+    /// as `IF EXISTS` — instead of having to be individually re-runnable.
     pub fn migrate(&self) -> Result<()> {
         let mut current = self.user_version()?;
         if current == schema::SCHEMA_VERSION {
@@ -109,8 +117,7 @@ impl Store {
                     schema::SCHEMA_VERSION
                 )));
             };
-            self.apply(sql)?;
-            self.set_user_version(to)?;
+            self.apply_step(sql, to)?;
             current = to;
         }
         Ok(())
@@ -121,6 +128,18 @@ impl Store {
         let mut mut_borrow = self.conn.borrow_mut();
         let tx = mut_borrow.transaction()?;
         tx.execute_batch(sql).map_err(crate::error::Error::from)?;
+        tx.commit().map_err(crate::error::Error::from)?;
+        Ok(())
+    }
+
+    /// Apply one upgrade step and record the version it lands at, in the same
+    /// transaction — see [`Store::migrate`].
+    fn apply_step(&self, sql: &str, to: i64) -> Result<()> {
+        let mut mut_borrow = self.conn.borrow_mut();
+        let tx = mut_borrow.transaction()?;
+        tx.execute_batch(sql).map_err(crate::error::Error::from)?;
+        tx.execute_batch(&format!("PRAGMA user_version = {to}"))
+            .map_err(crate::error::Error::from)?;
         tx.commit().map_err(crate::error::Error::from)?;
         Ok(())
     }
@@ -188,7 +207,7 @@ mod tests {
             ext: "png".into(),
             mime: "image/png".into(),
             size_bytes: 128,
-            sha256: Some("a".repeat(64)),
+            content_hash: Some("a".repeat(64)),
             kind,
             width: Some(800),
             height: Some(600),
@@ -414,15 +433,28 @@ mod tests {
         {
             let store = Store::open(&path).unwrap();
             assets::insert(store.conn(), &asset).unwrap();
-            // Rewind to a pre-vector build: version 12, no embeddings table.
+            // Rewind to a pre-vector *and* pre-rename build: version 12, no
+            // embeddings table, and the hash column under its old name. A real
+            // v12 library has all three, and the walk forward has to cope with
+            // that shape rather than with today's shape under an old number.
             rusqlite::Connection::open(&path)
                 .unwrap()
-                .execute_batch("PRAGMA user_version = 12; DROP TABLE asset_embeddings;")
+                .execute_batch(
+                    "PRAGMA user_version = 12;
+                     DROP TABLE asset_embeddings;
+                     DROP INDEX idx_assets_content_hash;
+                     ALTER TABLE assets RENAME COLUMN content_hash TO sha256;
+                     CREATE INDEX idx_assets_sha256 ON assets(sha256);",
+                )
                 .unwrap();
         }
         let store = Store::open(&path).unwrap();
         assert_eq!(store.user_version().unwrap(), schema::SCHEMA_VERSION);
         assert!(assets::get(store.conn(), asset.id).unwrap().is_some());
+        assert!(
+            asset_columns(store.conn()).contains(&"content_hash".to_string()),
+            "the frozen 12 -> 14 chain ends at the current column name"
+        );
         // The upgraded shape accepts embedding rows, same as a fresh file.
         crate::store::embeddings::upsert(
             store.conn(),
@@ -436,6 +468,69 @@ mod tests {
         )
         .unwrap();
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A v13 library — everything written before `assets.sha256` was renamed
+    /// — walks forward: the column is renamed, its *values* survive, and the
+    /// index follows the new name.
+    ///
+    /// The rename is the one step in [`schema::UPGRADES`] that plain
+    /// `IF EXISTS` DDL cannot express, which is why a step now commits
+    /// together with its version write; the second half of this test is the
+    /// property that buys — running the step again on an already-upgraded
+    /// library is a no-op rather than an error.
+    #[test]
+    fn a_v13_library_renames_its_content_hash_column() {
+        let dir = std::env::temp_dir().join(format!("trove-rename-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("library.db");
+        let asset = sample_asset("kept.png", AssetKind::Image);
+        {
+            let store = Store::open(&path).unwrap();
+            assets::insert(store.conn(), &asset).unwrap();
+            // Rewind to the pre-rename shape: the column carries the old name
+            // and the old-index name, and the version says so.
+            rusqlite::Connection::open(&path)
+                .unwrap()
+                .execute_batch(
+                    "PRAGMA user_version = 13;
+                     DROP INDEX idx_assets_content_hash;
+                     ALTER TABLE assets RENAME COLUMN content_hash TO sha256;
+                     CREATE INDEX idx_assets_sha256 ON assets(sha256);",
+                )
+                .unwrap();
+        }
+
+        let store = Store::open(&path).unwrap();
+        assert_eq!(store.user_version().unwrap(), schema::SCHEMA_VERSION);
+        let columns = asset_columns(store.conn());
+        assert!(columns.contains(&"content_hash".to_string()), "{columns:?}");
+        assert!(!columns.contains(&"sha256".to_string()), "{columns:?}");
+        // The row and its hash are the same row and the same hash.
+        let read = assets::get(store.conn(), asset.id).unwrap().unwrap();
+        assert_eq!(read.content_hash, asset.content_hash);
+        assert_eq!(
+            assets::find_by_content_hash(store.conn(), asset.content_hash.as_deref().unwrap())
+                .unwrap()
+                .map(|found| found.id),
+            Some(asset.id),
+            "the index serves lookups under the new name"
+        );
+
+        // The upgrade is recorded, not repeated.
+        store.migrate().unwrap();
+        assert_eq!(store.user_version().unwrap(), schema::SCHEMA_VERSION);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The column names of `assets`, in declaration order.
+    fn asset_columns(conn: &rusqlite::Connection) -> Vec<String> {
+        let mut stmt = conn.prepare("PRAGMA table_info(assets)").unwrap();
+        stmt.query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .flatten()
+            .collect()
     }
 
     #[test]

@@ -9,11 +9,16 @@
 //! columns altered in and dropped again), so before 0.5 the chain was deleted
 //! and [`SCHEMA`] was the whole shape.
 //!
-//! From 13 on there is a second door: [`UPGRADES`], a short list of purely
-//! additive steps (`CREATE TABLE`/`CREATE INDEX`, never `ALTER` or `DROP`)
-//! that walk an existing library forward one version at a time. A library
-//! from a shape with no path to here still gets an error naming both
-//! versions instead of a half-upgraded database.
+//! From 13 on there is a second door: [`UPGRADES`], a short list of small
+//! steps that walk an existing library forward one version at a time. Each
+//! step is applied *atomically with its version write* (see
+//! `Store::migrate`), so a crash anywhere in one rolls the whole step back
+//! instead of leaving a half-applied shape — which is what lets a step be
+//! plain DDL, a `RENAME` included, rather than something that has to be
+//! re-runnable. Steps still never *drop* data: no `DROP TABLE`, no `DROP
+//! COLUMN`, nothing that could lose a row it did not have to. A library from
+//! a shape with no path to here still gets an error naming both versions
+//! instead of a half-upgraded database.
 
 /// The schema this build creates. An existing library has to already be at
 /// this version — or be walkable to it via [`UPGRADES`] — to open.
@@ -24,16 +29,16 @@
 /// upgraded one are therefore the same schema as far as the code is
 /// concerned — which is the only sense in which a version number means
 /// anything.
-pub const SCHEMA_VERSION: i64 = 13;
+pub const SCHEMA_VERSION: i64 = 14;
 
-/// Forward upgrades: `(from_version, to_version, script)` steps, each purely
-/// additive DDL and each idempotent (`IF NOT EXISTS`) so a crash between a
-/// step's `apply` and its version write re-runs it safely on the next open.
+/// Forward upgrades: `(from_version, to_version, script)` steps, each a small
+/// DDL script applied atomically with its own version write, so a step can be
+/// plain SQL (a rename, say) without having to be re-runnable.
 ///
 /// The scripts deliberately duplicate the matching tail of [`SCHEMA`] rather
 /// than being derived from it: deriving DDL from a string is a parser nobody
 /// wants to own, and the diff between the two is one review glance.
-pub const UPGRADES: &[(i64, i64, &str)] = &[(12, 13, UPGRADE_V12_V13)];
+pub const UPGRADES: &[(i64, i64, &str)] = &[(12, 13, UPGRADE_V12_V13), (13, 14, UPGRADE_V13_V14)];
 
 /// v12 → v13: the AI embedding table. Additive only — no existing table is
 /// touched, so a pre-vector library opens unchanged and the new one starts
@@ -51,6 +56,21 @@ pub const UPGRADE_V12_V13: &str = r#"
     );
     CREATE INDEX IF NOT EXISTS idx_asset_embeddings_model
         ON asset_embeddings(model, space);
+"#;
+
+/// v13 → v14: `assets.sha256` becomes `assets.content_hash`.
+///
+/// The column holds content hashes and the algorithm behind them changed from
+/// SHA-256 to BLAKE3 (see `media/hash.rs`); the name follows the meaning so
+/// the next reader cannot mistake it for a promise about the algorithm. The
+/// rename is data-preserving and rewrites nothing — but a library written
+/// before this version holds *SHA-256* values in it, and those no longer match
+/// what hashing the same file produces today. See the note on
+/// [`crate::model::Asset::content_hash`] for what that means in practice.
+pub const UPGRADE_V13_V14: &str = r#"
+    ALTER TABLE assets RENAME COLUMN sha256 TO content_hash;
+    DROP INDEX IF EXISTS idx_assets_sha256;
+    CREATE INDEX idx_assets_content_hash ON assets(content_hash);
 "#;
 
 /// Create the current shape from nothing.
@@ -72,7 +92,7 @@ pub const SCHEMA: &str = r#"
         ext            TEXT NOT NULL DEFAULT '',
         mime           TEXT NOT NULL DEFAULT '',
         size_bytes     INTEGER NOT NULL DEFAULT 0,
-        sha256         TEXT,
+        content_hash         TEXT,
         kind           TEXT NOT NULL DEFAULT '',
         width          INTEGER,
         height         INTEGER,
@@ -99,7 +119,7 @@ pub const SCHEMA: &str = r#"
     CREATE INDEX idx_assets_trashed  ON assets(trashed_at);
     CREATE INDEX idx_assets_ext      ON assets(ext);
     CREATE INDEX idx_assets_kind     ON assets(kind);
-    CREATE INDEX idx_assets_sha256   ON assets(sha256);
+    CREATE INDEX idx_assets_content_hash   ON assets(content_hash);
     CREATE INDEX idx_assets_created  ON assets(created_at);
     CREATE INDEX idx_assets_rating   ON assets(rating);
     CREATE INDEX idx_assets_favorite ON assets(is_favorite);

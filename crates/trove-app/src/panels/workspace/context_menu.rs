@@ -35,7 +35,7 @@ pub(crate) fn asset_context_menu(
             .flatten()
             .map(|a| {
                 let font_file = if a.kind == AssetKind::Font {
-                    a.sha256.clone().map(|sha| {
+                    a.content_hash.clone().map(|hash| {
                         // Same blob resolution the Inspector uses: the stored
                         // blob, or the linked original for linked fonts.
                         let blob = if a.origin == trove_core::model::Origin::Linked {
@@ -45,7 +45,7 @@ pub(crate) fn asset_context_menu(
                                 .as_ref()
                                 .map(|rel| controller.read(cx).library.root().join(rel))
                         };
-                        (sha, blob)
+                        (hash, blob)
                     })
                 } else {
                     None
@@ -168,10 +168,10 @@ pub(crate) fn asset_context_menu(
     }
     // Fonts: system-level install / uninstall right from the grid, same
     // user-level mechanism as the Inspector button.
-    if let Some((sha, blob)) = font_file {
-        let installed = crate::fonts::is_installed(&sha);
+    if let Some((hash, blob)) = font_file {
+        let installed = crate::fonts::is_installed(&hash);
         let ctl_font = controller.clone();
-        let sha_font = sha.clone();
+        let hash_font = hash.clone();
         let blob_font = blob.clone();
         menu = menu.item(
             PopupMenuItem::new(if installed {
@@ -181,10 +181,10 @@ pub(crate) fn asset_context_menu(
             })
             .on_click(move |_, _, cx| {
                 let outcome = if installed {
-                    crate::fonts::uninstall(&sha_font).map(|_| ())
+                    crate::fonts::uninstall(&hash_font).map(|_| ())
                 } else {
                     match &blob_font {
-                        Some(blob) => crate::fonts::install(blob, &sha_font).map(|_| ()),
+                        Some(blob) => crate::fonts::install(blob, &hash_font).map(|_| ()),
                         None => Err("font file not found".to_string()),
                     }
                 };

@@ -39,9 +39,9 @@
 //! - A body is streamed to disk as it arrives ([`Landing`]), never collected
 //!   into a `Vec` — a 512 MB upload costs a 512 MB file and no more.
 //! - The file appears in the inbox only via `rename`, so the drain can never
-//!   import a half-written file. A truncated import would record a sha256 that
-//!   its own bytes no longer match, and the library links rather than copies,
-//!   so that asset would stay wrong forever.
+//!   import a half-written file. A truncated import would record a content
+//!   hash its own bytes no longer match, and the library links rather than
+//!   copies, so that asset would stay wrong forever.
 
 use std::io::{BufWriter, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -571,9 +571,9 @@ fn suggested_name(url: &str) -> Option<String> {
 /// the file is complete and its sidecar is in place. Both halves of that order
 /// matter to the drain:
 ///
-/// - a half-written file that got imported would record a sha256 its own bytes
-///   no longer match, and the library *links* its files, so that asset would
-///   stay wrong for good;
+/// - a half-written file that got imported would record a content hash its
+///   own bytes no longer match, and the library *links* its files, so that
+///   asset would stay wrong for good;
 /// - a file whose sidecar has not been written yet imports *without* its source
 ///   URL — the drain pairs the two by name at scan time, so the sidecar has to
 ///   exist before the file is visible.

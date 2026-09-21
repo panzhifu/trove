@@ -43,7 +43,7 @@ use crate::error::{Error, Result};
 use crate::model::AssetKind;
 
 use super::import::ImportStorage;
-use super::{blob, color, metadata, probe, search, thumb, video};
+use super::{blob, color, hash, hash_cache, metadata, probe, search, thumb, video};
 
 /// What running a stage costs, so a scheduler can tell a metadata read from an
 /// ffmpeg spawn. Recorded on every stage; the import pool reads it (a `Proc`
@@ -64,7 +64,8 @@ pub enum Cost {
 /// A slot a stage can need or produce.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Need {
-    /// The content hash (and, for a copying import, the blob) exists.
+    /// The content hash (and, for a copying import, the blob) exists — see
+    /// [`HashStage`] for the three ways it can be answered.
     Hash,
     /// Kind, mime and container facts are known.
     Probe,
@@ -201,7 +202,9 @@ pub struct StageIo {
     pub ext: String,
     pub kind: AssetKind,
     pub mime: String,
-    pub sha256: String,
+    /// Hex BLAKE3 of the content. Also the thumbnail cache key, so a stage
+    /// may read it only once [`Need::Hash`] has run.
+    pub content_hash: String,
     pub size: u64,
     /// Library-relative blob path; empty for a linked import.
     pub rel_path: String,
@@ -240,7 +243,7 @@ impl StageIo {
             storage,
             kind: AssetKind::Other,
             mime: String::new(),
-            sha256: String::new(),
+            content_hash: String::new(),
             size: 0,
             rel_path: String::new(),
             linked: !storage.copies(),
@@ -442,7 +445,29 @@ pub fn default_pipeline() -> &'static Pipeline {
 // The stages
 // ---------------------------------------------------------------------------
 
-/// sha-256 (and, for a copying import, the blob). Reads the source once.
+/// The content hash (and, for a copying import, the blob). Reads the source
+/// once — or not at all, when something cheaper already knows the answer.
+///
+/// Three tiers, cheapest first, and each one is skipped only when the one
+/// above it can *prove* what the content is:
+///
+/// 1. **The hash cache remembers this file** — `(path, size, mtime)` matched
+///    an entry, so its digest is in hand without a single read. A copying
+///    import still copies the bytes, with [`blob::stage_with`] told the hash
+///    so it does not hash them again.
+/// 2. **The cheap sample matches a fingerprint that was hashed before** — one
+///    lookup against three blocks read out of the middle of the file, which
+///    is how a re-import of a duplicate under another name (or a second copy
+///    inside the same batch) is answered without reading the whole thing.
+///    See [`hash::SAMPLE_MIN_BYTES`] for why small sources go straight to
+///    tier 3 instead: sampling them would cost what reading them costs.
+/// 3. **A full read** — BLAKE3, across cores for anything large
+///    ([`hash::PARALLEL_MIN_BYTES`]).
+///
+/// What tiers 1 and 2 have in common is that they answer with a hash some
+/// *earlier* read established; neither invents one. A tier that cannot answer
+/// falls through rather than guessing, which is what keeps a cold or corrupt
+/// cache a performance problem instead of a correctness one.
 pub struct HashStage;
 
 impl Stage for HashStage {
@@ -459,19 +484,93 @@ impl Stage for HashStage {
     }
 
     fn run(&self, io: &mut StageIo) -> Result<()> {
-        if io.storage.copies() {
+        let copies = io.storage.copies();
+        let stamp = hash_cache::stamp(&io.src);
+
+        // Tier 1: this exact file, already read once.
+        if let Some((size, mtime)) = stamp
+            && let Some(hash) = hash_cache::lookup(&io.cache_root, &io.src, size, mtime)
+        {
+            return self.use_known(io, copies, hash, size);
+        }
+
+        // Tier 2, for sources where a sample is worth taking. The sampler
+        // answers `None` for anything small enough that the sample would cost
+        // what the read costs; those fall straight through to tier 3.
+        let sample = hash::fingerprint(&io.src)
+            .map_err(|error| Error::Validation(format!("hash {}: {error}", io.src.display())))?;
+        if let Some(sample) = &sample
+            && let Some(hash) =
+                hash_cache::hash_for_fingerprint(&io.cache_root, sample.size, &sample.digest)
+        {
+            self.remember(io, &hash, sample.size, stamp, Some(&sample.digest));
+            return self.use_known(io, copies, hash, sample.size);
+        }
+
+        // Tier 3: the real read. A copying import stages in the same pass, so
+        // the bytes are neither read nor moved twice.
+        let (content_hash, size) = if copies {
             let staged = blob::stage(&io.src, &io.data_root, &io.ext)?;
-            io.sha256 = staged.sha256;
-            io.size = staged.size;
+            io.rel_path = staged.rel_path;
+            (staged.content_hash, staged.size)
+        } else {
+            let (hash, size) = blob::hash_file(&io.src)?;
+            io.rel_path = String::new();
+            (hash, size)
+        };
+        self.remember(
+            io,
+            &content_hash,
+            size,
+            stamp,
+            sample.as_ref().map(|sample| sample.digest.as_str()),
+        );
+        io.content_hash = content_hash;
+        io.size = size;
+        io.linked = !copies;
+        Ok(())
+    }
+}
+
+impl HashStage {
+    /// Publish a hash that was already known. A copying import still has to
+    /// move the bytes — it just does not have to hash them again to name
+    /// where they go.
+    fn use_known(&self, io: &mut StageIo, copies: bool, hash: String, size: u64) -> Result<()> {
+        if copies {
+            let staged = blob::stage_with(&io.src, &io.data_root, &io.ext, Some(&hash))?;
             io.rel_path = staged.rel_path;
         } else {
-            let (sha256, size) = blob::hash_file(&io.src)?;
-            io.sha256 = sha256;
-            io.size = size;
             io.rel_path = String::new();
         }
-        io.linked = !io.storage.copies();
+        io.content_hash = hash;
+        io.size = size;
+        io.linked = !copies;
         Ok(())
+    }
+
+    /// Remember what this file hashed to, so the next encounter is a `stat`.
+    /// `fingerprint` is `None` when the sample is not worth indexing — the
+    /// file was small enough that the sample *was* the digest, in which case
+    /// the index entry would only duplicate the path entry.
+    fn remember(
+        &self,
+        io: &StageIo,
+        hash: &str,
+        size: u64,
+        stamp: Option<(u64, i64)>,
+        fingerprint: Option<&str>,
+    ) {
+        if let Some((_, mtime)) = stamp {
+            hash_cache::record(
+                &io.cache_root,
+                &io.src,
+                size,
+                mtime,
+                hash,
+                fingerprint.unwrap_or_default(),
+            );
+        }
     }
 }
 
@@ -564,7 +663,7 @@ impl Stage for DecodeStage {
             return Ok(());
         }
         let blob = io.blob_path();
-        let cached = thumb::cached(&io.cache_root, &io.sha256);
+        let cached = thumb::cached(&io.cache_root, &io.content_hash);
         let (pixels, from_cache) = match cached {
             Some(thumb_path) => match thumb::decode_image(&thumb_path) {
                 Some(small) => (small, true),
@@ -638,14 +737,14 @@ impl Stage for ThumbStage {
     }
 
     fn run(&self, io: &mut StageIo) -> Result<()> {
-        let out = thumb::abs_path(&io.cache_root, &io.sha256);
+        let out = thumb::abs_path(&io.cache_root, &io.content_hash);
         if out.is_file() {
             io.thumb = Some(out);
             return Ok(());
         }
         io.thumb = match io.artifacts.get::<Decoded>() {
             Some(decoded) => thumb::write_downscaled(&decoded.small, &out),
-            None => thumb::ensure(&io.cache_root, &io.sha256, io.kind, &io.blob_path()),
+            None => thumb::ensure(&io.cache_root, &io.content_hash, io.kind, &io.blob_path()),
         };
         Ok(())
     }
@@ -840,7 +939,150 @@ mod tests {
         assert_eq!(io.kind, AssetKind::Document);
         assert!(!io.artifacts.has::<Decoded>());
         assert!(io.thumb.is_none());
-        assert!(!io.sha256.is_empty(), "the hash still ran");
+        assert!(!io.content_hash.is_empty(), "the hash still ran");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Tier 1, and the whole reason the hash cache exists: a file the pipeline
+    /// has already read is answered from its `stat`.
+    ///
+    /// Proving it needs the file to still exist (nothing else could produce a
+    /// hash for it) while its *content* is no longer what was hashed — so the
+    /// test rewrites the bytes and puts the modification time back, which is
+    /// exactly the assumption the cache is built on, applied deliberately.
+    #[test]
+    fn a_second_run_answers_from_the_hash_cache_without_reading_the_file() {
+        let root = std::env::temp_dir().join(format!("trove-pipe-{}", uuid::Uuid::new_v4()));
+        let cache = root.join("cache");
+        std::fs::create_dir_all(&root).unwrap();
+        let src = root.join("pic.bin");
+        std::fs::write(&src, b"first content").unwrap();
+        let mtime = std::fs::metadata(&src).unwrap().modified().unwrap();
+
+        let mut first = StageIo::new(&src, &root, &cache, ImportStorage::Link).unwrap();
+        default_pipeline().run(&mut first).unwrap();
+        assert_eq!(
+            first.content_hash,
+            crate::media::hash::hash_bytes(b"first content")
+        );
+
+        // Same length, different bytes, same (restored) modification time.
+        std::fs::write(&src, b"other content").unwrap();
+        let handle = std::fs::OpenOptions::new().write(true).open(&src).unwrap();
+        handle
+            .set_times(std::fs::FileTimes::new().set_modified(mtime))
+            .unwrap();
+
+        let mut again = StageIo::new(&src, &root, &cache, ImportStorage::Link).unwrap();
+        default_pipeline().run(&mut again).unwrap();
+        assert_eq!(
+            again.content_hash, first.content_hash,
+            "the remembered hash answered"
+        );
+        assert_ne!(
+            again.content_hash,
+            crate::media::hash::hash_bytes(b"other content"),
+            "the file was not read again"
+        );
+
+        // And a file that really changed (mtime moved) is read again.
+        std::fs::write(&src, b"third content").unwrap();
+        let mut third = StageIo::new(&src, &root, &cache, ImportStorage::Link).unwrap();
+        default_pipeline().run(&mut third).unwrap();
+        assert_eq!(
+            third.content_hash,
+            crate::media::hash::hash_bytes(b"third content")
+        );
+
+        crate::media::hash_cache::clear(&cache);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Tier 2: a file too large to sample in full is hashed once, and its
+    /// sample then answers for the same content under another name.
+    ///
+    /// The test aims at the boundary on purpose — the duplicate differs in a
+    /// region the sample does not cover — because that is the exact trade
+    /// [`super::hash::fingerprint`] documents: the sample decides, and a full
+    /// read is what would decide otherwise. Asserting the *documented*
+    /// behaviour (rather than the true hash) is the point: if someone later
+    /// "fixes" the cheap tier into a full read, this test says so.
+    #[test]
+    fn a_large_sources_sample_answers_for_a_duplicate_under_another_name() {
+        use crate::media::hash;
+
+        let root = std::env::temp_dir().join(format!("trove-pipe-{}", uuid::Uuid::new_v4()));
+        let cache = root.join("cache");
+        std::fs::create_dir_all(&root).unwrap();
+        let len = 8 << 20;
+        let payload: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+
+        let original = root.join("original.bin");
+        std::fs::write(&original, &payload).unwrap();
+        let mut first = StageIo::new(&original, &root, &cache, ImportStorage::Link).unwrap();
+        default_pipeline().run(&mut first).unwrap();
+        let hash_a = first.content_hash.clone();
+        assert_eq!(hash_a, hash::hash_bytes(&payload), "a full read, once");
+
+        // The pipeline recorded this file's sample, which is what the next
+        // tier reads.
+        let sample = hash::fingerprint(&original)
+            .unwrap()
+            .expect("8 MiB is past the sampling threshold");
+        assert_eq!(
+            crate::media::hash_cache::hash_for_fingerprint(&cache, sample.size, &sample.digest)
+                .as_deref(),
+            Some(hash_a.as_str())
+        );
+
+        // A same-length copy with one byte changed *outside* the sampled
+        // head/middle/tail: never seen by path, so only the sample can answer.
+        let mut edited = payload.clone();
+        edited[100 * 1024] ^= 0xFF;
+        let duplicate = root.join("duplicate.bin");
+        std::fs::write(&duplicate, &edited).unwrap();
+        let mut second = StageIo::new(&duplicate, &root, &cache, ImportStorage::Link).unwrap();
+        default_pipeline().run(&mut second).unwrap();
+        assert_eq!(
+            second.content_hash, hash_a,
+            "the sample matched, so the remembered hash answered"
+        );
+        assert_ne!(
+            second.content_hash,
+            hash::hash_bytes(&edited),
+            "a full read would have found the edited byte"
+        );
+
+        crate::media::hash_cache::clear(&cache);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A copying import that is answered from the cache still moves the
+    /// bytes: the known hash names the destination, it does not replace the
+    /// copy.
+    #[test]
+    fn a_remembered_hash_still_moves_the_bytes_of_a_copying_import() {
+        let root = std::env::temp_dir().join(format!("trove-pipe-{}", uuid::Uuid::new_v4()));
+        let cache = root.join("cache");
+        std::fs::create_dir_all(&root).unwrap();
+        let src = root.join("pic.png");
+        std::fs::copy(gradient_png(&root), &src).unwrap();
+
+        let mut first = StageIo::new(&src, &root, &cache, ImportStorage::Copy).unwrap();
+        default_pipeline().run(&mut first).unwrap();
+        assert!(!first.rel_path.is_empty(), "the blob was placed");
+        let blob = root.join(&first.rel_path);
+        assert!(blob.is_file());
+
+        // Second time around the hash comes from the cache; the blob is still
+        // placed, at the same path, with the same content.
+        let mut again = StageIo::new(&src, &root, &cache, ImportStorage::Copy).unwrap();
+        default_pipeline().run(&mut again).unwrap();
+        assert_eq!(again.rel_path, first.rel_path);
+        assert_eq!(again.content_hash, first.content_hash);
+        assert_eq!(std::fs::read(&blob).unwrap(), std::fs::read(&src).unwrap());
+
+        crate::media::hash_cache::clear(&cache);
         std::fs::remove_dir_all(&root).ok();
     }
 
@@ -877,7 +1119,7 @@ mod tests {
 
         let thumb = io.thumb.clone().expect("thumbnail written");
         assert!(thumb.is_file());
-        assert_eq!(thumb, thumb::abs_path(&cache, &io.sha256));
+        assert_eq!(thumb, thumb::abs_path(&cache, &io.content_hash));
 
         // Palette and signature both landed, read from that one decode.
         let visual = &io.mined.facts.visual;
@@ -924,7 +1166,7 @@ mod tests {
 
         // Same content hash (the cache key), but only the thumbnail exists.
         let mut again = StageIo::new(&src, &root, &cache, ImportStorage::Link).unwrap();
-        again.sha256 = first.sha256.clone();
+        again.content_hash = first.content_hash.clone();
         again.kind = AssetKind::Image;
         pipeline.run(&mut again).unwrap();
 

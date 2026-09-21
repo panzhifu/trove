@@ -3,7 +3,7 @@
 //! Install = copy the font file into the user's fonts directory, register it
 //! with the OS and refresh the font cache; uninstall = unregister, delete
 //! the file and refresh again. The copy is named by content hash
-//! (`<sha256>.<ext>`), which doubles as the installed-state check.
+//! (`<hash>.<ext>`), which doubles as the installed-state check.
 //!
 //! Windows registers per-user fonts in `HKCU\…\Fonts` (the value name is
 //! `<family> (TrueType)`); running applications learn about the change on
@@ -27,13 +27,13 @@ fn fonts_dir() -> Option<PathBuf> {
     }
 }
 
-/// The installed file for `sha`, if any (match by hash-named file in the
+/// The installed file for `hash`, if any (match by hash-named file in the
 /// fonts directory).
-fn installed_path(sha: &str) -> Option<PathBuf> {
+fn installed_path(hash: &str) -> Option<PathBuf> {
     let dir = fonts_dir()?;
     for entry in std::fs::read_dir(dir).ok()?.flatten() {
         let name = entry.file_name().to_string_lossy().into_owned();
-        if name.split('.').next() == Some(sha) {
+        if name.split('.').next() == Some(hash) {
             return Some(entry.path());
         }
     }
@@ -41,14 +41,14 @@ fn installed_path(sha: &str) -> Option<PathBuf> {
 }
 
 /// Whether the font with this content hash is already installed.
-pub(crate) fn is_installed(sha: &str) -> bool {
-    installed_path(sha).is_some()
+pub(crate) fn is_installed(hash: &str) -> bool {
+    installed_path(hash).is_some()
 }
 
-/// Copy the font into the user fonts directory (named `<sha>.<ext>`),
+/// Copy the font into the user fonts directory (named `<hash>.<ext>`),
 /// register it with the OS and refresh the font cache. Returns the
 /// installed path.
-pub(crate) fn install(source: &Path, sha: &str) -> Result<PathBuf, String> {
+pub(crate) fn install(source: &Path, hash: &str) -> Result<PathBuf, String> {
     let dir =
         fonts_dir().ok_or_else(|| "font install is not supported on this platform".to_string())?;
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
@@ -57,7 +57,7 @@ pub(crate) fn install(source: &Path, sha: &str) -> Result<PathBuf, String> {
         .and_then(|e| e.to_str())
         .unwrap_or("ttf")
         .to_ascii_lowercase();
-    let dest = dir.join(format!("{sha}.{ext}"));
+    let dest = dir.join(format!("{hash}.{ext}"));
     if source != dest.as_path() {
         std::fs::copy(source, &dest).map_err(|e| e.to_string())?;
     }
@@ -66,7 +66,7 @@ pub(crate) fn install(source: &Path, sha: &str) -> Result<PathBuf, String> {
     {
         let family = trove_core::media::metadata::font_family(&dest)
             .map(|(family, _)| family)
-            .unwrap_or_else(|| format!("Trove Font {sha}"));
+            .unwrap_or_else(|| format!("Trove Font {hash}"));
         registry_set(&format!("{family} (TrueType)"), &dest);
     }
     refresh_cache();
@@ -75,8 +75,8 @@ pub(crate) fn install(source: &Path, sha: &str) -> Result<PathBuf, String> {
 
 /// Unregister the installed font, remove its file and refresh the font
 /// cache.
-pub(crate) fn uninstall(sha: &str) -> Result<(), String> {
-    let path = installed_path(sha).ok_or_else(|| "font is not installed".to_string())?;
+pub(crate) fn uninstall(hash: &str) -> Result<(), String> {
+    let path = installed_path(hash).ok_or_else(|| "font is not installed".to_string())?;
     #[cfg(target_os = "windows")]
     if let Some((family, _)) = trove_core::media::metadata::font_family(&path) {
         registry_remove(&format!("{family} (TrueType)"));

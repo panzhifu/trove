@@ -1,11 +1,17 @@
 //! The import job: stage files on this thread, commit in batched
 //! transactions over the job's own database connection.
 //!
-//! This is the whole import pipeline minus the UI: directory expansion,
-//! staging (hash / blob / thumbnail / metadata — see
+//! This is the whole import pipeline minus the UI: the dedup pre-check,
+//! directory expansion, staging (hash / blob / thumbnail / metadata — see
 //! [`crate::media::import`]) and the database commits. It runs on a plain
 //! thread managed by [`super::TaskManager`]; the UI thread only receives
 //! progress events and the final [`ImportOutcome`].
+//!
+//! The order is the point: the *cheap* gates run before the expensive ones.
+//! The pre-check ([`crate::media::precheck`]) drops what the library already
+//! holds for the price of a `stat` per path; what survives it is staged, and
+//! the staging pipeline's hash stage applies its own two layers of memory
+//! before reading a byte (see `media::pipeline::HashStage`).
 //!
 //! Commit batching: the app previously committed one file per transaction on
 //! the main thread. Here every [`commit_batch`] files share one transaction
@@ -268,19 +274,29 @@ pub fn run(options: &ImportOptions, ctx: &JobContext) -> Result<ImportOutcome, S
         ..Default::default()
     };
 
-    // The collect inbox keeps its files (they are linked, not copied), so a
-    // sweep over a long-lived inbox would re-stage — re-hash — its whole
-    // history every time anything new lands. Files the library already holds
-    // (same name and size) are dropped before staging and counted separately
-    // from real skips: nothing was wrong with them, they are just in already.
-    if matches!(options.source, ImportSource::CollectInbox { .. }) {
-        let known = assets::known_keys(&conn);
+    // The cheap dedup pre-check: drop what the library already holds before
+    // any file is read. It is worth running for *every* source, not just the
+    // inbox — a dropped folder is usually a folder that was dropped before,
+    // and a watch root re-offers whatever the embedder never acknowledged.
+    // What a kept file costs from here on is a stat and a hash-map lookup;
+    // what a dropped one would have cost is a full read.
+    //
+    // Nothing is committed on the strength of this gate: it only ever *drops*
+    // a path it can prove is already in the library (see
+    // [`crate::media::precheck`]), and everything it lets through is still
+    // deduplicated by content hash at commit time.
+    {
+        let held = crate::media::precheck::Held::load(&conn);
         let before = paths.len();
-        paths.retain(|path| match assets::known_key(path) {
-            Some(key) => !known.contains(&key),
-            None => true,
-        });
-        report.already_imported = (before - paths.len()) as u64;
+        let (rest, dropped) = held.partition(&paths, &options.cache_root);
+        paths = rest;
+        report.already_imported = dropped;
+        tracing::debug!(
+            offered = before,
+            held = dropped,
+            fresh = paths.len(),
+            "import pre-check"
+        );
     }
 
     let total = paths.len() as u64;
@@ -345,6 +361,10 @@ pub fn run(options: &ImportOptions, ctx: &JobContext) -> Result<ImportOutcome, S
     if !cancelled && matches!(options.source, ImportSource::CollectInbox { .. }) {
         cleanup_inbox(&sidecars);
     }
+
+    // One write per run, not one per file: the hash cache is a whole-file
+    // rewrite, and everything staged above has been adding to it.
+    crate::media::hash_cache::flush(&options.cache_root);
 
     ctx.set_summary(format!(
         "{} imported, {} skipped",
@@ -728,6 +748,95 @@ mod tests {
         let store = crate::store::Store::open(&options.db_path()).unwrap();
         let all = assets::query(store.conn(), &crate::model::AssetQuery::default()).unwrap();
         assert_eq!(all.items.len(), 1, "no duplicate row appeared");
+    }
+
+    /// The pre-check runs for *every* source, not only the inbox: a folder
+    /// dropped a second time is a `stat` per file and nothing else. The first
+    /// run's staging is what fills the hash cache, which is why the second
+    /// run can answer without reading anything.
+    #[test]
+    fn a_second_drop_of_the_same_folder_is_not_staged_again() {
+        let root = Temp::new("task-redrop");
+        let src = root.path().join("src");
+        fs::create_dir_all(&src).unwrap();
+        for i in 0..4 {
+            fs::write(
+                src.join(format!("img{i}.png")),
+                [PNG_1X1, &[i as u8][..]].concat(),
+            )
+            .unwrap();
+        }
+        let options = ImportOptions {
+            data_root: root.path().to_path_buf(),
+            cache_root: root.path().join("cache"),
+            storage: ImportStorage::Link,
+            source: ImportSource::Paths {
+                paths: vec![src.clone()],
+                into_collection: None,
+            },
+        };
+
+        let first = run(&options, &JobContext::for_tests(false)).unwrap();
+        assert_eq!(first.report.imported_count(), 4);
+        assert_eq!(first.report.already_imported, 0);
+
+        let second = run(&options, &JobContext::for_tests(false)).unwrap();
+        assert_eq!(second.report.imported_count(), 0);
+        assert_eq!(
+            second.report.already_imported, 4,
+            "recognised by name and size without being read: {:?}",
+            second.report
+        );
+        assert!(second.report.skipped.is_empty());
+    }
+
+    /// A file that changed since the last import is *not* waved through by the
+    /// name-and-size fallback: the hash cache holds an entry for the path and
+    /// that entry is authoritative, so a rewrite (which moves the mtime) drops
+    /// the path back into staging.
+    #[test]
+    fn a_file_rewritten_since_the_last_import_is_staged_again() {
+        let root = Temp::new("task-rewrite");
+        let src = root.path().join("src");
+        fs::create_dir_all(&src).unwrap();
+        let file = src.join("img.png");
+        // Same length, different content: only the mtime tells them apart.
+        fs::write(&file, [PNG_1X1, b"a"].concat()).unwrap();
+        let options = ImportOptions {
+            data_root: root.path().to_path_buf(),
+            cache_root: root.path().join("cache"),
+            storage: ImportStorage::Link,
+            source: ImportSource::Paths {
+                paths: vec![file.clone()],
+                into_collection: None,
+            },
+        };
+        let first = run(&options, &JobContext::for_tests(false)).unwrap();
+        assert_eq!(first.report.imported_count(), 1);
+        let first_hash = first.report.imported[0].content_hash.clone();
+
+        std::thread::sleep(Duration::from_millis(10));
+        fs::write(&file, [PNG_1X1, b"b"].concat()).unwrap();
+
+        let again = run(&options, &JobContext::for_tests(false)).unwrap();
+        assert_eq!(
+            again.report.imported_count(),
+            1,
+            "the rewrite was staged, not skipped: {:?}",
+            again.report
+        );
+        assert_eq!(again.report.already_imported, 0);
+        assert!(again.report.skipped.is_empty());
+        // Different content, so a different record — the pre-check's job is
+        // only to keep the *unchanged* case cheap, never to swallow an edit.
+        assert!(
+            !again.report.imported[0].reused,
+            "edited content is a new asset, not the old one re-imported"
+        );
+        assert_ne!(
+            again.report.imported[0].content_hash, first_hash,
+            "the new bytes got a new content hash"
+        );
     }
 
     // Small helpers so tests can build contexts without a manager thread.

@@ -4,14 +4,11 @@
 //! decides where to run.
 
 use std::collections::{HashMap, HashSet};
-use std::io::Read as _;
 use std::path::{Path, PathBuf};
-
-use sha2::{Digest, Sha256};
 
 use crate::error::Result;
 use crate::library::Library;
-use crate::media::{blob, thumb};
+use crate::media::thumb;
 use crate::model::{AssetKind, AssetQuery};
 use crate::store::assets;
 use uuid::Uuid;
@@ -31,7 +28,7 @@ pub struct ThumbRebuildReport {
 /// gathered where the non-`Send` [`Library`] lives.
 #[derive(Debug, Clone, Default)]
 pub struct ThumbPlan {
-    /// `(blob path, sha256, kind)` triples whose thumbnail should be
+    /// `(blob path, content_hash, kind)` triples whose thumbnail should be
     /// regenerated.
     pub items: Vec<(PathBuf, String, AssetKind)>,
     /// Image assets whose stored blob file is missing on disk.
@@ -59,7 +56,9 @@ pub fn plan_thumbnail_rebuild(lib: &Library, force: bool) -> Result<ThumbPlan> {
             },
         )?;
         for asset in assets.items {
-            let Some(sha) = asset.sha256 else { continue };
+            let Some(sha) = asset.content_hash else {
+                continue;
+            };
             let Some(rel) = asset.rel_path else { continue };
             let blob = root.join(&rel);
             if !blob.is_file() {
@@ -157,7 +156,7 @@ pub fn clean_orphans(lib: &Library) -> Result<OrphanReport> {
     }
 
     // 2. Collect hashes referenced by any record, and hashes present on disk.
-    let referenced: HashSet<String> = assets::referenced_shas(conn)?.into_iter().collect();
+    let referenced: HashSet<String> = assets::referenced_hashes(conn)?.into_iter().collect();
 
     let media_dir = root.join("media");
     let thumbs_dir = lib.cache().join("thumbs");
@@ -166,7 +165,7 @@ pub fn clean_orphans(lib: &Library) -> Result<OrphanReport> {
     for file in walk_files(&media_dir) {
         // A content-addressed blob is `media/<a>/<b>.<ext>` with the full hash
         // `a + b`. Files that don't match (e.g. leftover `.tmp-…`) are junk.
-        match reconstructed_sha(&file) {
+        match reconstructed_hash(&file) {
             Some(sha) => {
                 let orphan = !referenced.contains(&sha);
                 present.insert(sha);
@@ -185,7 +184,7 @@ pub fn clean_orphans(lib: &Library) -> Result<OrphanReport> {
     // 3. Thumbs are orphaned when no record references the hash OR the blob is
     //    no longer present on disk.
     for file in walk_files(&thumbs_dir) {
-        match reconstructed_sha(&file) {
+        match reconstructed_hash(&file) {
             Some(sha) => {
                 let orphan = !referenced.contains(&sha) || !present.contains(&sha);
                 if orphan && std::fs::remove_file(&file).is_ok() {
@@ -213,7 +212,7 @@ pub enum IntegrityIssue {
     /// The blob file the record points at does not exist on disk.
     MissingBlob,
     /// The blob exists, but its content hash differs from the recorded
-    /// SHA-256 — the file was modified or corrupted after import.
+    /// BLAKE3 content hash — the file was modified or corrupted after import.
     HashMismatch,
 }
 
@@ -240,7 +239,7 @@ pub struct IntegrityReport {
 /// [`Library`] lives.
 #[derive(Debug, Clone, Default)]
 pub struct IntegrityPlan {
-    /// `(asset id, file name, blob path, expected sha256)` tuples.
+    /// `(asset id, file name, blob path, expected content_hash)` tuples.
     pub items: Vec<(Uuid, String, PathBuf, String)>,
 }
 
@@ -259,7 +258,8 @@ pub fn plan_integrity(lib: &Library) -> Result<IntegrityPlan> {
             },
         )?;
         for asset in list.items {
-            let (Some(sha), Some(rel)) = (asset.sha256.clone(), asset.rel_path.clone()) else {
+            let (Some(sha), Some(rel)) = (asset.content_hash.clone(), asset.rel_path.clone())
+            else {
                 continue;
             };
             plan.items
@@ -307,26 +307,24 @@ pub fn run_integrity_plan(plan: IntegrityPlan) -> IntegrityReport {
     report
 }
 
-/// Verify every stored blob against its recorded SHA-256 (plan + run on the
+/// Verify every stored blob against its recorded content hash (plan + run on
+/// the
 /// current thread; prefer the split API for UI usage).
 pub fn verify_integrity(lib: &Library) -> Result<IntegrityReport> {
     let plan = plan_integrity(lib)?;
     Ok(run_integrity_plan(plan))
 }
 
-/// Streaming SHA-256 of a file; fails when the file cannot be read.
+/// Streaming content hash of a file; fails when the file cannot be read.
+///
+/// One line on purpose: this used to carry its own SHA-256 loop with its own
+/// 256 KiB buffer, which meant the integrity check and the importer could
+/// disagree about a file without either of them being obviously wrong. They
+/// now share [`crate::media::hash`], so "the hash of this file" has exactly
+/// one definition (and the parallel path for large blobs comes along for
+/// free).
 fn hash_file(path: &Path) -> std::io::Result<String> {
-    let mut file = std::fs::File::open(path)?;
-    let mut hasher = Sha256::new();
-    let mut buffer = [0u8; 256 * 1024];
-    loop {
-        let n = file.read(&mut buffer)?;
-        if n == 0 {
-            break;
-        }
-        hasher.update(&buffer[..n]);
-    }
-    Ok(blob::hex(&hasher.finalize()))
+    Ok(crate::media::hash::hash_file(path)?.0)
 }
 
 // -- filesystem helpers ------------------------------------------------------
@@ -338,7 +336,7 @@ fn hash_file(path: &Path) -> std::io::Result<String> {
 /// two hex chars and the file basename the rest, so the full hash is
 /// `a + file_stem`. Returns `None` for files that don't match this layout
 /// (leftover `.tmp-…` files, stray files), which the sweep treats as orphans.
-fn reconstructed_sha(path: &Path) -> Option<String> {
+fn reconstructed_hash(path: &Path) -> Option<String> {
     let bucket = path.parent()?.file_name()?.to_string_lossy();
     if bucket.len() != 2 || !bucket.bytes().all(|b| b.is_ascii_hexdigit()) {
         return None;
@@ -439,7 +437,7 @@ mod tests {
             .into_iter()
             .find(|a| a.id == item.asset_id)
             .unwrap()
-            .sha256
+            .content_hash
             .unwrap()
     }
 
@@ -545,7 +543,7 @@ mod tests {
         let all = crate::store::assets::query(lib.store().conn(), &AssetQuery::default()).unwrap();
         let asset = &all.items[0];
         let blob_path = root.join(asset.rel_path.as_deref().unwrap());
-        let expected = asset.sha256.clone().unwrap();
+        let expected = asset.content_hash.clone().unwrap();
 
         // Healthy library: the blob is read and matches the record.
         let report = verify_integrity(&lib).unwrap();
