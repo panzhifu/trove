@@ -114,12 +114,19 @@ impl DockPanel for WorkspacePanel {
             // Zoom has no effect in list view contexts of trash/recent? It
             // still does (grid layout), so keep everything; only these two
             // contextual actions differ.
+            //
+            // Both are destructive, so both are icon-only: the glyph and the
+            // danger tint carry the meaning, the tooltip spells it out. The
+            // glyphs come from the complete Lucide catalog — the
+            // component-level `IconName` is a compatibility subset and has
+            // neither a trash nor an eraser.
+            use gpui_kit::assets::IconName as CatalogIcon;
             let action = if in_trash {
                 Button::new("empty-trash")
                     .ghost()
                     .danger()
                     .xsmall()
-                    .label(rust_i18n::t!("workspace.empty_all").to_string())
+                    .icon(CatalogIcon::Trash)
                     .tooltip(rust_i18n::t!("workspace.empty_all_tooltip").to_string())
                     .on_click(cx.listener(|this, _, _, cx| this.empty_trash(cx)))
             } else {
@@ -127,7 +134,7 @@ impl DockPanel for WorkspacePanel {
                     .ghost()
                     .danger()
                     .xsmall()
-                    .label(rust_i18n::t!("workspace.clear_history").to_string())
+                    .icon(CatalogIcon::Eraser)
                     .tooltip(rust_i18n::t!("workspace.clear_history_tooltip").to_string())
                     .on_click(cx.listener(|this, _, _, cx| this.clear_view_history(cx)))
             };
