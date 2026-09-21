@@ -4,6 +4,15 @@
 //! controlled open flag. Commits the query on Enter through the
 //! [`LibraryController`]; the ✕ inside the popover clears the query and
 //! dismisses the popover.
+//!
+//! One instance per dock panel rather than one overall: the dock can be
+//! rearranged and the workspace is not always the visible panel, so the
+//! magnifier has to be within reach wherever the user is. The instances
+//! share the *query* (through the controller) and nothing else — the
+//! trigger's active tint reads `search_text`, and opening any of them loads
+//! the committed term into its own input, so none of them can disagree about
+//! what is being searched for. `panel` is what keeps their element ids
+//! apart, since several are rendered in the same frame.
 
 use std::cell::Cell;
 use std::rc::Rc;
@@ -19,13 +28,16 @@ use gpui_kit::*;
 
 use crate::library::LibraryController;
 
-/// Floating asset search, rendered in the workspace title bar.
+/// Floating asset search, rendered in a panel's title bar.
 pub struct SearchBox {
     controller: Entity<LibraryController>,
     input: Entity<InputState>,
     /// Controlled popover visibility. Shared via `Rc<Cell<bool>>` because
     /// the ✕ handler runs with a popover context, not `Context<Self>`.
     open: Rc<Cell<bool>>,
+    /// The owning panel: the only thing that differs between instances, and
+    /// the reason their element ids do not collide.
+    panel: &'static str,
 }
 
 impl SearchBox {
@@ -33,6 +45,7 @@ impl SearchBox {
         window: &mut Window,
         cx: &mut Context<Self>,
         controller: Entity<LibraryController>,
+        panel: &'static str,
     ) -> Self {
         let input = cx.new(|cx| {
             InputState::new(window, cx)
@@ -67,6 +80,7 @@ impl SearchBox {
             controller,
             input,
             open: Rc::new(Cell::new(false)),
+            panel,
         }
     }
 }
@@ -74,19 +88,29 @@ impl SearchBox {
 impl Render for SearchBox {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let search_active = !self.controller.read(cx).search_text.trim().is_empty();
+        let panel = self.panel;
         let this = cx.entity();
         let open = self.open.clone();
         let input = self.input.clone();
         let ctl = self.controller.clone();
 
-        Popover::new("search-popover")
+        Popover::new(SharedString::from(format!("search-popover-{panel}")))
             .anchor(Anchor::TopRight)
             .open(self.open.get())
             .on_open_change({
                 let open = open.clone();
                 let this = this.clone();
-                move |is_open: &bool, _, cx| {
+                let input = input.clone();
+                let ctl = ctl.clone();
+                move |is_open: &bool, window, cx| {
                     open.set(*is_open);
+                    if *is_open {
+                        // Several boxes share one query: opening any of them
+                        // has to show the term actually being searched for,
+                        // not whatever this instance was last typed into.
+                        let term = ctl.read(cx).search_text.clone();
+                        input.update(cx, |state, cx| state.set_value(term, window, cx));
+                    }
                     this.update(cx, |_, cx| cx.notify());
                 }
             })
@@ -97,7 +121,7 @@ impl Render for SearchBox {
             .shadow_none()
             .p_0()
             .trigger(
-                Button::new("search")
+                Button::new(SharedString::from(format!("search-{panel}")))
                     .ghost()
                     .xsmall()
                     .icon(IconName::Search)
@@ -125,7 +149,7 @@ impl Render for SearchBox {
                         .child(
                             // Always visible: with text it clears + closes,
                             // when empty it just dismisses the popover.
-                            Button::new("clear-search")
+                            Button::new(SharedString::from(format!("clear-search-{panel}")))
                                 .ghost()
                                 .xsmall()
                                 .icon(IconName::Close)

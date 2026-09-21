@@ -166,9 +166,9 @@ impl AppView {
         let title_bar = cx.new(|cx| TitleBarView::new(controller.clone(), cx));
 
         let explorer = cx.new(|cx| ExplorerPanel::new(window, cx, controller.clone()));
-        let folders = cx.new(|cx| FoldersPanel::new(cx, controller.clone()));
+        let folders = cx.new(|cx| FoldersPanel::new(window, cx, controller.clone()));
         let workspace = cx.new(|cx| WorkspacePanel::new(window, cx, controller.clone()));
-        let tags = cx.new(|cx| TagsPanel::new(cx, controller.clone()));
+        let tags = cx.new(|cx| TagsPanel::new(window, cx, controller.clone()));
         let inspector = cx.new(|cx| InspectorPanel::new(window, cx, controller.clone()));
 
         // Status bar ← model renderer: the workspace panel watches its model

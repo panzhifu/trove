@@ -11,6 +11,12 @@
 /// ```ignore
 /// panel!(FoldersPanel, title, rows: Option<(u64, Vec<(String, u64)>)>);
 /// ```
+///
+/// A panel declared this way must also write
+/// `fn title_controls(&self, cx: &mut Context<Self>) -> Option<Div>`: the
+/// macro forwards the dock's `title_suffix` to it, so what each title bar
+/// carries besides its name stays the panel's own business (see
+/// [`search_box`], which every panel puts there).
 macro_rules! panel {
     ($name:ident, $title:expr $(, $extra_field:ident: $extra_ty:ty)*) => {
         pub struct $name {
@@ -35,6 +41,18 @@ macro_rules! panel {
 
             fn zoom_control(&self, _: &App) -> Option<gpui_kit::component::dock::PanelControl> {
                 None
+            }
+
+            /// Delegated to the panel's own `title_controls`, which is where a
+            /// panel says what its title bar carries besides the name — a
+            /// search box, an add button, nothing. The macro has no opinion,
+            /// so it cannot impose one on a panel that wants something else.
+            fn title_suffix(
+                &mut self,
+                _: &mut Window,
+                cx: &mut Context<Self>,
+            ) -> Option<impl IntoElement> {
+                self.title_controls(cx)
             }
         }
 
