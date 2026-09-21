@@ -13,6 +13,13 @@
 //! Threads own their resources. A database job opens its own SQLite
 //! connection (the UI thread's [`crate::store::Store`] is thread-confined)
 //! and commits in batched transactions — see [`import`].
+//!
+//! The job registry (what `snapshot`/`is_running` read, and where `start`
+//! inserts) and the event queue (what `poll_events` drains) live behind two
+//! separate mutexes, so a job reporting progress never waits on the UI
+//! draining events and the UI never waits on a job's registry write. When
+//! both are needed the registry lock is taken first; no path takes them the
+//! other way round.
 
 use std::collections::{HashMap, VecDeque};
 use std::panic::{self, AssertUnwindSafe};
@@ -128,16 +135,16 @@ struct JobState {
     cancel: Arc<AtomicBool>,
 }
 
-#[derive(Default)]
-struct Inner {
-    jobs: HashMap<TaskId, JobState>,
-    events: VecDeque<TaskEvent>,
-}
-
 /// Shared registry of background jobs. Cheap to clone.
+///
+/// Two independent locks: `jobs` guards the registry, `events` guards the
+/// event queue. Splitting them keeps a job's per-file `progress` call from
+/// contending with the embedder's `poll_events` drain. Lock order, when both
+/// are held, is always `jobs` → `events`.
 #[derive(Clone, Default)]
 pub struct TaskManager {
-    inner: Arc<Mutex<Inner>>,
+    jobs: Arc<Mutex<HashMap<TaskId, JobState>>>,
+    events: Arc<Mutex<VecDeque<TaskEvent>>>,
 }
 
 /// Why a job could not be started.
@@ -169,9 +176,8 @@ impl TaskManager {
         T: Send + 'static,
         F: FnOnce(&JobContext) -> Result<T, String> + Send + 'static,
     {
-        let mut inner = self.inner.lock().unwrap();
-        if inner
-            .jobs
+        let mut jobs = self.jobs.lock().unwrap();
+        if jobs
             .values()
             .any(|j| j.kind == kind && j.status == TaskStatus::Running)
         {
@@ -183,10 +189,10 @@ impl TaskManager {
         // the process ever ran. Their terminal events are already queued in
         // `events`, which is a separate collection — nothing a consumer reads
         // through the registry is lost with the entries.
-        inner.jobs.retain(|_, j| j.status == TaskStatus::Running);
+        jobs.retain(|_, j| j.status == TaskStatus::Running);
         let id: TaskId = new_id();
         let cancel = Arc::new(AtomicBool::new(false));
-        inner.jobs.insert(
+        jobs.insert(
             id,
             JobState {
                 kind,
@@ -198,46 +204,52 @@ impl TaskManager {
                 cancel: cancel.clone(),
             },
         );
-        inner.events.push_back(TaskEvent::Started { id, kind });
-        let ctx_inner = self.inner.clone();
+        // Queued while the registry lock is held so no other job can slip an
+        // event in ahead of this job's `Started`.
+        self.events
+            .lock()
+            .unwrap()
+            .push_back(TaskEvent::Started { id, kind });
+        drop(jobs);
         let (tx, rx) = std::sync::mpsc::channel();
         let ctx = JobContext {
             id,
             kind,
             cancel,
-            inner: ctx_inner,
+            jobs: self.jobs.clone(),
+            events: self.events.clone(),
             last_progress: Mutex::new(Instant::now() - PROGRESS_EVENT_INTERVAL),
         };
         std::thread::Builder::new()
             .name(format!("trove-task-{}", kind.name()))
             .spawn(move || {
                 let outcome = panic::catch_unwind(AssertUnwindSafe(|| run(&ctx)));
-                let mut inner = ctx.inner.lock().unwrap();
-                let Some(state) = inner.jobs.get_mut(&ctx.id) else {
+                let mut jobs = ctx.jobs.lock().unwrap();
+                let Some(state) = jobs.get_mut(&ctx.id) else {
                     return;
                 };
                 match outcome {
                     Ok(Ok(value)) if !ctx.cancelled() => {
                         state.status = TaskStatus::Completed;
                         let summary = state.summary.clone().unwrap_or_default();
-                        inner.events.push_back(TaskEvent::Completed {
+                        ctx.events.lock().unwrap().push_back(TaskEvent::Completed {
                             id: ctx.id,
                             kind: ctx.kind,
                             summary,
                         });
-                        drop(inner);
+                        drop(jobs);
                         let _ = tx.send(value);
                     }
                     Ok(Ok(_)) => {
                         state.status = TaskStatus::Cancelled;
-                        inner.events.push_back(TaskEvent::Cancelled {
+                        ctx.events.lock().unwrap().push_back(TaskEvent::Cancelled {
                             id: ctx.id,
                             kind: ctx.kind,
                         });
                     }
                     Ok(Err(error)) => {
                         state.status = TaskStatus::Failed;
-                        inner.events.push_back(TaskEvent::Failed {
+                        ctx.events.lock().unwrap().push_back(TaskEvent::Failed {
                             id: ctx.id,
                             kind: ctx.kind,
                             error,
@@ -245,7 +257,7 @@ impl TaskManager {
                     }
                     Err(_) => {
                         state.status = TaskStatus::Failed;
-                        inner.events.push_back(TaskEvent::Failed {
+                        ctx.events.lock().unwrap().push_back(TaskEvent::Failed {
                             id: ctx.id,
                             kind: ctx.kind,
                             error: "task panicked".into(),
@@ -259,44 +271,39 @@ impl TaskManager {
 
     /// Ask the job to stop at its next cancellation checkpoint.
     pub fn cancel(&self, id: TaskId) {
-        let inner = self.inner.lock().unwrap();
-        if let Some(state) = inner.jobs.get(&id) {
+        let jobs = self.jobs.lock().unwrap();
+        if let Some(state) = jobs.get(&id) {
             state.cancel.store(true, Ordering::Relaxed);
         }
     }
 
     /// Whether a job of `kind` is currently running.
     pub fn is_running(&self, kind: TaskKind) -> bool {
-        let inner = self.inner.lock().unwrap();
-        inner
-            .jobs
-            .values()
+        let jobs = self.jobs.lock().unwrap();
+        jobs.values()
             .any(|j| j.kind == kind && j.status == TaskStatus::Running)
     }
 
     /// Whether this exact job is still running.
     pub fn is_task_running(&self, id: TaskId) -> bool {
-        let inner = self.inner.lock().unwrap();
-        inner
-            .jobs
-            .get(&id)
+        let jobs = self.jobs.lock().unwrap();
+        jobs.get(&id)
             .is_some_and(|j| j.status == TaskStatus::Running)
     }
 
-    /// Drain every accumulated event (all jobs, oldest first).
+    /// Drain every accumulated event (all jobs, oldest first). Takes only the
+    /// event lock, so it never queues behind a job's registry writes.
     pub fn poll_events(&self) -> Vec<TaskEvent> {
-        let mut inner = self.inner.lock().unwrap();
-        inner.events.drain(..).collect()
+        let mut events = self.events.lock().unwrap();
+        events.drain(..).collect()
     }
 
     /// Snapshot of every known job. Finished jobs leave the registry when the
     /// next one starts (see [`TaskManager::start`]), so the map only ever
     /// holds running jobs plus the last finished ones.
     pub fn snapshot(&self) -> Vec<TaskInfo> {
-        let inner = self.inner.lock().unwrap();
-        inner
-            .jobs
-            .iter()
+        let jobs = self.jobs.lock().unwrap();
+        jobs.iter()
             .map(|(id, j)| TaskInfo {
                 id: *id,
                 kind: j.kind,
@@ -315,7 +322,8 @@ pub struct JobContext {
     id: TaskId,
     kind: TaskKind,
     cancel: Arc<AtomicBool>,
-    inner: Arc<Mutex<Inner>>,
+    jobs: Arc<Mutex<HashMap<TaskId, JobState>>>,
+    events: Arc<Mutex<VecDeque<TaskEvent>>>,
     last_progress: Mutex<Instant>,
 }
 
@@ -335,7 +343,8 @@ impl JobContext {
             id: new_id(),
             kind: TaskKind::Import,
             cancel: Arc::new(AtomicBool::new(cancelled)),
-            inner: Arc::new(Mutex::new(Inner::default())),
+            jobs: Arc::new(Mutex::new(HashMap::new())),
+            events: Arc::new(Mutex::new(VecDeque::new())),
             last_progress: Mutex::new(Instant::now() - PROGRESS_EVENT_INTERVAL),
         }
     }
@@ -356,29 +365,32 @@ impl JobContext {
     /// directories). Pushes an immediate progress event.
     pub fn set_total(&self, total: u64) {
         let done = {
-            let mut inner = self.inner.lock().unwrap();
-            if let Some(state) = inner.jobs.get_mut(&self.id) {
-                state.total = total;
+            let mut jobs = self.jobs.lock().unwrap();
+            match jobs.get_mut(&self.id) {
+                Some(state) => {
+                    state.total = total;
+                    state.done
+                }
+                None => 0,
             }
-            let done = inner.jobs.get(&self.id).map(|s| s.done).unwrap_or(0);
-            inner.events.push_back(TaskEvent::Progress {
-                id: self.id,
-                done,
-                total,
-            });
-            done
         };
-        let _ = done;
+        self.events.lock().unwrap().push_back(TaskEvent::Progress {
+            id: self.id,
+            done,
+            total,
+        });
         *self.last_progress.lock().unwrap() = Instant::now();
     }
 
     /// Report progress. State updates always land; the event is throttled to
     /// [`PROGRESS_EVENT_INTERVAL`] except for the final unit.
     pub fn progress(&self, done: u64, total: u64) {
-        let mut inner = self.inner.lock().unwrap();
-        if let Some(state) = inner.jobs.get_mut(&self.id) {
-            state.done = done;
-            state.total = total;
+        {
+            let mut jobs = self.jobs.lock().unwrap();
+            if let Some(state) = jobs.get_mut(&self.id) {
+                state.done = done;
+                state.total = total;
+            }
         }
         let due = done == total || {
             let mut last = self.last_progress.lock().unwrap();
@@ -390,7 +402,7 @@ impl JobContext {
             }
         };
         if due {
-            inner.events.push_back(TaskEvent::Progress {
+            self.events.lock().unwrap().push_back(TaskEvent::Progress {
                 id: self.id,
                 done,
                 total,
@@ -400,8 +412,8 @@ impl JobContext {
 
     /// Set the human-readable line carried by the completion event.
     pub fn set_summary(&self, summary: String) {
-        let mut inner = self.inner.lock().unwrap();
-        if let Some(state) = inner.jobs.get_mut(&self.id) {
+        let mut jobs = self.jobs.lock().unwrap();
+        if let Some(state) = jobs.get_mut(&self.id) {
             state.summary = Some(summary);
         }
     }

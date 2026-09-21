@@ -1,28 +1,29 @@
-//! Task-event path profiler: what the `TaskManager`'s single global lock costs
-//! per import, and therefore the *ceiling* on what replacing it with per-job
-//! channels could win.
+//! Task-event path profiler: what the `TaskManager`'s locks cost per import,
+//! and therefore the *ceiling* on what replacing them with per-job channels
+//! could win.
 //!
 //! Run:
 //!   cargo run --release -p trove-core --example event_path_profile [calls] [polls] [per_file_ms]
 //!
 //! ## What is measured
 //!
-//! Every progress report a job makes takes the same `Arc<Mutex<Inner>>` the
-//! UI thread takes to drain events (`TaskManager::poll_events`) and to read the
-//! job registry. The import job reports once per file, so the question is
-//! whether that lock is a throughput limiter — if it is not, a per-job
-//! channel / events-channel rewrite cannot pay for itself on speed.
+//! Progress reports take the registry lock, then the event-queue lock — both
+//! of which the UI thread also takes when it drains events
+//! (`TaskManager::poll_events`) and reads the job registry. The import job
+//! reports once per file, so the question is whether those locks are a
+//! throughput limiter — if they are not, a per-job channel / events-channel
+//! rewrite cannot pay for itself on speed.
 //!
 //! A. `progress()`, one writer, uncontended — the per-file cost the import job
 //!    actually pays.
 //! B. `poll_events()` on an empty queue — the per-poll cost the UI pays.
-//! C. Four writers hammering the lock while this thread polls — the *worst
-//!    case* the refactor is meant to protect against (every staging thread
-//!    reporting independently), reported as poll latency percentiles plus the
-//!    writers' aggregate call rate.
+//! C. Four writers hammering the event lock while this thread polls — the
+//!    *worst case* the refactor is meant to protect against (every staging
+//!    thread reporting independently), reported as poll latency percentiles
+//!    plus the writers' aggregate call rate.
 //! D. The share: (A) against a real per-file import cost.
 //! E. Tiny files: the shape where the per-file work is smallest, so the event
-//!    path is proportionally largest — the only case where the lock could
+//!    path is proportionally largest — the only case where the locks could
 //!    plausibly show up.
 
 use std::sync::Arc;
