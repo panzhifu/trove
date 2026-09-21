@@ -18,6 +18,7 @@ use uuid::Uuid;
 use crate::library::LibraryController;
 
 use super::common::{AssetsDrag, hex_to_rgb, observe_controller};
+use super::search_box::SearchBox;
 
 // =========================== Tags panel ======================================
 
@@ -32,6 +33,9 @@ pub struct TagsPanel {
     /// `COUNT(DISTINCT …)` — which `render` must not run, because `render` runs
     /// every frame. Cached the same way `ExplorerPanel` caches its counts.
     tag_counts: Option<(u64, std::collections::HashMap<Uuid, u64>)>,
+    /// The magnifier in the title bar. Each panel owns one, so the search
+    /// entry point is always in reach.
+    search_box: Entity<SearchBox>,
 }
 
 impl BasePanel for TagsPanel {
@@ -52,21 +56,27 @@ impl DockPanel for TagsPanel {
         None
     }
 
-    /// "+" pinned to the trailing edge of the title bar (same form as the
-    /// explorer panel's add button).
+    /// The magnifier plus the "+", pinned to the trailing edge of the title
+    /// bar (same form as the explorer panel's add button).
     fn title_suffix(&mut self, _: &mut Window, cx: &mut Context<Self>) -> Option<impl IntoElement> {
         let entity = cx.entity();
         Some(
-            Button::new("add-tag-title")
-                .ghost()
-                .xsmall()
-                .label("+")
-                .tooltip(rust_i18n::t!("tags.add_tag").to_string())
-                .on_click(move |_, window, cx| {
-                    entity.update(cx, |this, cx| {
-                        open_create_dialog(window, cx, &this.controller, None);
-                    });
-                }),
+            h_flex()
+                .items_center()
+                .gap_1()
+                .child(self.search_box.clone())
+                .child(
+                    Button::new("add-tag-title")
+                        .ghost()
+                        .xsmall()
+                        .label("+")
+                        .tooltip(rust_i18n::t!("tags.add_tag").to_string())
+                        .on_click(move |_, window, cx| {
+                            entity.update(cx, |this, cx| {
+                                open_create_dialog(window, cx, &this.controller, None);
+                            });
+                        }),
+                ),
         )
     }
 }
@@ -80,12 +90,18 @@ impl Focusable for TagsPanel {
 }
 
 impl TagsPanel {
-    pub fn new(cx: &mut Context<Self>, controller: Entity<LibraryController>) -> Self {
+    pub fn new(
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        controller: Entity<LibraryController>,
+    ) -> Self {
+        let search_box = cx.new(|cx| SearchBox::new(window, cx, controller.clone(), "tags"));
         let this = Self {
             focus_handle: cx.focus_handle(),
             controller,
             collapsed: Default::default(),
             tag_counts: None,
+            search_box,
         };
         observe_controller(cx, &this.controller);
         this

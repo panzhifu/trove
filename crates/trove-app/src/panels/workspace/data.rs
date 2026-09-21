@@ -167,7 +167,7 @@ impl WorkspacePanel {
         cx: &mut Context<Self>,
         controller: Entity<LibraryController>,
     ) -> Self {
-        let search_box = cx.new(|cx| SearchBox::new(window, cx, controller.clone()));
+        let search_box = cx.new(|cx| SearchBox::new(window, cx, controller.clone(), "workspace"));
         let available_width = cx.new(|_| px(0.));
         let list_state = ListState::new(0, ListAlignment::Top, px(LIST_OVERDRAW_PX));
         // Grid-zoom slider: live label while dragging, the row layout
