@@ -24,7 +24,7 @@ use uuid::Uuid;
 /// also how the favorites view is entered.
 /// The icon cluster for the panel title bar: view toggle, sort, favorites.
 pub(crate) fn title_controls(controller: &Entity<LibraryController>, cx: &App) -> Div {
-    let (kind, favorite, view_mode, sort, sort_desc) = {
+    let (kind, favorite, view_mode, sort, sort_desc, offer_favorites) = {
         let ctl = controller.read(cx);
         (
             ctl.filter_kind,
@@ -32,6 +32,11 @@ pub(crate) fn title_controls(controller: &Entity<LibraryController>, cx: &App) -
             ctl.view_mode,
             ctl.sort,
             ctl.sort_desc,
+            // The favourites toggle belongs to the plain listings. The trash
+            // and the recent list are not places anyone curates from, so the
+            // control is left out there rather than offering a filter that is
+            // never reached for in either.
+            !ctl.showing_trash && !ctl.showing_recent,
         )
     };
     let t = |k: &str| rust_i18n::t!(k).to_string();
@@ -113,20 +118,23 @@ pub(crate) fn title_controls(controller: &Entity<LibraryController>, cx: &App) -
     );
 
     // Favorites toggle: the primary (filled) state marks the active filter.
-    bar = bar.child(
-        Button::new("filter-favorite")
-            .xsmall()
-            .when(favorite, |b| b.primary())
-            .when(!favorite, |b| b.ghost())
-            .icon(IconName::Heart)
-            .tooltip(t("workspace.filter_favorite"))
-            .on_click({
-                let controller = controller.clone();
-                move |_, _, cx| {
-                    controller.update(cx, |ctl, _| ctl.set_filter_favorite(!favorite));
-                }
-            }),
-    );
+    // Absent in the trash and the recent list — see `offer_favorites`.
+    if offer_favorites {
+        bar = bar.child(
+            Button::new("filter-favorite")
+                .xsmall()
+                .when(favorite, |b| b.primary())
+                .when(!favorite, |b| b.ghost())
+                .icon(IconName::Heart)
+                .tooltip(t("workspace.filter_favorite"))
+                .on_click({
+                    let controller = controller.clone();
+                    move |_, _, cx| {
+                        controller.update(cx, |ctl, _| ctl.set_filter_favorite(!favorite));
+                    }
+                }),
+        );
+    }
 
     // Reset when anything is active.
     if kind.is_some() || favorite {
