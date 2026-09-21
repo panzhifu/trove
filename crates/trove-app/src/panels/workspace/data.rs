@@ -370,9 +370,9 @@ pub(super) fn total_identity(key: &DataKey) -> DataKey {
 /// and the visual-search pass so both grids render identically.
 fn cell_from_asset(library_root: &Path, cache_root: &Path, a: &Asset) -> Cell {
     let thumb = a
-        .sha256
+        .content_hash
         .as_deref()
-        .map(|sha| trove_core::media::thumb::abs_path(cache_root, sha))
+        .map(|hash| trove_core::media::thumb::abs_path(cache_root, hash))
         .filter(|p| p.is_file());
     // Live font preview inputs: family (probed at import) plus the font
     // file to register (blob or linked source).

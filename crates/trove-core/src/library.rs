@@ -61,7 +61,7 @@ pub fn export_metadata_from_store(store: &Store) -> Result<String> {
 /// Outcome of [`Library::import_metadata`].
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct MetadataImportReport {
-    /// Records whose content (SHA-256) already lives in the library: the
+    /// Records whose content hash already lives in the library: the
     /// organization was merged onto the existing asset.
     pub assets_linked: u64,
     /// Records created without media (placeholders). Re-importing the file
@@ -847,7 +847,7 @@ impl Library {
         })
     }
 
-    /// Group live assets with identical content (SHA-256). The UI offers
+    /// Group live assets with identical content hash. The UI offers
     /// per-group cleanup; trashing one member is ordinary (undoable) trash.
     pub fn find_duplicates(&self) -> Result<Vec<crate::store::assets::DuplicateGroup>> {
         crate::store::assets::duplicate_groups(self.store.conn())
@@ -973,10 +973,10 @@ impl Library {
         Ok(())
     }
 
-    /// Re-point a linked asset at a moved file. The chosen file must hash
-    /// to the same SHA-256 as the one recorded at import — relinking
-    /// reconnects a *moved* file, it never swaps content (import the new
-    /// file instead when the original is truly gone).
+    /// Re-point a linked asset at a moved file. The chosen file must hash to
+    /// the same content hash as the one recorded at import — relinking
+    /// reconnects a *moved* file, it never swaps content (import the new file
+    /// instead when the original is truly gone).
     pub fn relink_asset(&self, asset_id: Uuid, new_path: &Path) -> Result<()> {
         let conn = self.store.conn();
         let asset = assets::get(conn, asset_id)?.ok_or(crate::Error::NotFound("asset"))?;
@@ -991,11 +991,14 @@ impl Library {
                 new_path.display()
             )));
         }
-        let (sha, _) = crate::media::blob::hash_file(new_path)?;
-        let recorded = asset.sha256.as_deref().unwrap_or_default();
-        if !sha.eq_ignore_ascii_case(recorded) {
+        // Through the hash cache: a file the importer has already read is
+        // recognised from its `stat`, and the read that relinking would do
+        // otherwise is exactly the read that was already paid for.
+        let (hash, _) = crate::media::hash::hash_file_cached(self.cache(), new_path)?;
+        let recorded = asset.content_hash.as_deref().unwrap_or_default();
+        if !hash.eq_ignore_ascii_case(recorded) {
             return Err(crate::Error::Validation(format!(
-                "content mismatch: recorded sha256 {recorded}, found {sha}"
+                "content mismatch: recorded content hash {recorded}, found {hash}"
             )));
         }
         let mut facts = asset.facts.clone();
@@ -1105,16 +1108,11 @@ impl Library {
             return Ok(false);
         };
         let out = media::edit::apply(&source, edits, jpeg_quality)?;
-        let sha = {
-            use sha2::{Digest, Sha256};
-            let mut hasher = Sha256::new();
-            hasher.update(&out.bytes);
-            crate::media::blob::hex(hasher.finalize().as_slice())
-        };
+        let hash = media::hash::hash_bytes(&out.bytes);
         if asset
-            .sha256
+            .content_hash
             .as_deref()
-            .is_some_and(|old| old.eq_ignore_ascii_case(&sha))
+            .is_some_and(|old| old.eq_ignore_ascii_case(&hash))
         {
             // The edits produced byte-identical content: the file on disk is
             // already what the record says.
@@ -1142,11 +1140,11 @@ impl Library {
             return Err(error);
         }
 
-        let old_sha = asset.sha256.clone().unwrap_or_default();
+        let old_hash = asset.content_hash.clone().unwrap_or_default();
         assets::set_linked_media_columns(
             self.store.conn(),
             asset.id,
-            &sha,
+            &hash,
             out.bytes.len() as u64,
             Some(out.width),
             Some(out.height),
@@ -1155,10 +1153,11 @@ impl Library {
         // The old thumbnail described content no record references anymore
         // once the last asset on that hash is gone; the new one is rebuilt
         // from the file where it lives.
-        if !old_sha.is_empty() && assets::count_by_sha256(self.store.conn(), &old_sha)? == 0 {
-            let _ = std::fs::remove_file(media::thumb::abs_path(self.cache(), &old_sha));
+        if !old_hash.is_empty() && assets::count_by_content_hash(self.store.conn(), &old_hash)? == 0
+        {
+            let _ = std::fs::remove_file(media::thumb::abs_path(self.cache(), &old_hash));
         }
-        media::thumb::regenerate(self.cache(), &sha, asset.kind, &source);
+        media::thumb::regenerate(self.cache(), &hash, asset.kind, &source);
         Ok(true)
     }
 
@@ -1174,9 +1173,9 @@ impl Library {
         height: u32,
     ) -> Result<()> {
         let staged = media::blob::stage(new_file, self.root(), &asset.ext)?;
-        let old_sha = asset.sha256.clone().unwrap_or_default();
+        let old_hash = asset.content_hash.clone().unwrap_or_default();
         let old_rel = asset.rel_path.clone();
-        if staged.sha256.eq_ignore_ascii_case(&old_sha) {
+        if staged.content_hash.eq_ignore_ascii_case(&old_hash) {
             // The edits produced byte-identical content: the blob in place
             // is already correct.
             return Ok(());
@@ -1186,7 +1185,7 @@ impl Library {
         assets::set_media_columns(
             self.store.conn(),
             id,
-            &staged.sha256,
+            &staged.content_hash,
             &staged.rel_path,
             staged.size,
             Some(width),
@@ -1194,15 +1193,15 @@ impl Library {
         )?;
 
         // Free the old content when this was the last reference to it.
-        if assets::count_by_sha256(self.store.conn(), &old_sha)? == 0
+        if assets::count_by_content_hash(self.store.conn(), &old_hash)? == 0
             && let Some(rel) = &old_rel
         {
-            self.remove_blob_files(rel, &old_sha);
+            self.remove_blob_files(rel, &old_hash);
         }
 
         // Thumbnail and visual fingerprint describe the old pixels; both
         // must follow the content to its new hash.
-        media::thumb::regenerate(self.cache(), &staged.sha256, asset.kind, &new_blob);
+        media::thumb::regenerate(self.cache(), &staged.content_hash, asset.kind, &new_blob);
         crate::store::visual_search::compute_and_store_signature(&self.store, &self.root, id)?;
         Ok(())
     }
@@ -1513,7 +1512,7 @@ impl Library {
 
     /// Restore a metadata catalog produced by [`Self::export_metadata`] into
     /// this library. Media files are not part of the export: assets whose
-    /// content (SHA-256) already exists are linked, everything else becomes
+    /// content hash already exists are linked, everything else becomes
     /// a placeholder record that self-heals when the file is re-imported
     /// (content-addressed storage keys both paths by hash).
     pub fn import_metadata(&self, json: &str) -> Result<MetadataImportReport> {
@@ -1615,8 +1614,8 @@ impl Library {
         // (rel_path = None, invisible to orphan cleanup until healed).
         let mut asset_map: std::collections::HashMap<Uuid, Uuid> = Default::default();
         for asset in file.assets {
-            if let Some(sha) = &asset.sha256
-                && let Some(existing) = assets::find_by_sha256(conn, sha)?
+            if let Some(hash) = &asset.content_hash
+                && let Some(existing) = assets::find_by_content_hash(conn, hash)?
             {
                 asset_map.insert(asset.id, existing.id);
                 report.assets_linked += 1;
@@ -1631,7 +1630,7 @@ impl Library {
                 ext: asset.ext.clone(),
                 mime: asset.mime.clone(),
                 size_bytes: asset.size_bytes,
-                sha256: asset.sha256.clone(),
+                content_hash: asset.content_hash.clone(),
                 kind: asset.kind,
                 width: asset.width,
                 height: asset.height,
@@ -1692,7 +1691,7 @@ impl Library {
     /// [`purge_assets`] with the inbox spelled out, so the rule can be
     /// exercised without relocating the data root.
     pub(crate) fn purge_assets_against(&self, ids: &[Uuid], inbox: &Path) -> Result<PurgeReport> {
-        // Track (rel, sha) for every content hash left unreferenced by this
+        // Track (rel, hash) for every content hash left unreferenced by this
         // purge, so the file is deleted exactly once even when several deleted
         // assets shared it. Linked sources are collected the same way, then
         // tried against the inbox once the records are gone.
@@ -1710,13 +1709,13 @@ impl Library {
                 {
                     sources_tx.push(PathBuf::from(source));
                 }
-                let sha = asset.sha256.clone();
+                let hash = asset.content_hash.clone();
                 let rel = asset.rel_path.clone();
                 assets::delete(tx, *id)?;
-                if let (Some(sha), Some(rel)) = (sha, rel)
-                    && assets::count_by_sha256(tx, &sha)? == 0
+                if let (Some(hash), Some(rel)) = (hash, rel)
+                    && assets::count_by_content_hash(tx, &hash)? == 0
                 {
-                    freed_tx.push((rel, sha));
+                    freed_tx.push((rel, hash));
                 }
             }
             freed = freed_tx;
@@ -1728,12 +1727,12 @@ impl Library {
             purged,
             ..Default::default()
         };
-        for (rel, sha) in freed {
+        for (rel, hash) in freed {
             if rel.starts_with("media/") {
                 report.blobs_removed += 1;
             }
             report.thumbs_removed += 1;
-            self.remove_blob_files(&rel, &sha);
+            self.remove_blob_files(&rel, &hash);
         }
         for source in collect::inbox_files(inbox, sources) {
             if collect::remove_inbox_file(&source) {
@@ -1749,11 +1748,11 @@ impl Library {
 
     /// Best-effort removal of a content-addressed blob and its thumbnail.
     /// Only called once the content is unreferenced.
-    fn remove_blob_files(&self, rel: &str, sha: &str) {
+    fn remove_blob_files(&self, rel: &str, hash: &str) {
         if rel.starts_with("media/") {
             let _ = std::fs::remove_file(self.root.join(rel));
         }
-        let thumb = media::thumb::abs_path(&self.cache, sha);
+        let thumb = media::thumb::abs_path(&self.cache, hash);
         let _ = std::fs::remove_file(thumb);
     }
 }
@@ -1823,7 +1822,10 @@ mod tests {
             asset.facts.source_path.as_deref(),
             Some(moved.display().to_string().as_str())
         );
-        assert_eq!(asset.sha256.as_deref(), all.items[0].sha256.as_deref());
+        assert_eq!(
+            asset.content_hash.as_deref(),
+            all.items[0].content_hash.as_deref()
+        );
 
         // Different content is rejected — relinking never swaps content.
         let other = outside.join("other.png");
@@ -1894,7 +1896,7 @@ mod tests {
         assert_eq!(asset.mime, "image/png");
         assert_eq!(asset.width, Some(1));
         assert_eq!(asset.height, Some(1));
-        assert!(asset.sha256.is_some());
+        assert!(asset.content_hash.is_some());
         assert_eq!(asset.file_name, "photo.png");
 
         // The blob exists on disk under a content-addressed name.
@@ -1902,7 +1904,7 @@ mod tests {
         assert!(lib.resolve(rel).is_file());
 
         // A JPEG thumbnail was generated next to it.
-        let thumb_path = thumb::abs_path(lib.cache(), asset.sha256.as_deref().unwrap());
+        let thumb_path = thumb::abs_path(lib.cache(), asset.content_hash.as_deref().unwrap());
         assert!(
             thumb_path.is_file(),
             "thumbnail missing at {}",
@@ -2009,8 +2011,8 @@ mod tests {
             !blob.exists(),
             "blob removed after last reference is purged"
         );
-        let sha = stored.sha256.unwrap();
-        assert!(!thumb::abs_path(lib.cache(), &sha).exists());
+        let hash = stored.content_hash.unwrap();
+        assert!(!thumb::abs_path(lib.cache(), &hash).exists());
     }
 
     /// Import one file as a *linked* asset — the shape screenshots and
@@ -2403,9 +2405,9 @@ mod tests {
     #[test]
     fn duplicate_content_import_needs_no_sha_scan() {
         // The importer deduplicates identical content at the record level,
-        // so two live assets never share a SHA-256 — the duplicate finder
+        // so two live assets never share a content hash — the duplicate finder
         // works on perceptual hashes instead.
-        let (lib, dir) = temp_library("duplicates-sha");
+        let (lib, dir) = temp_library("duplicates-hash");
         let src = write_source(&dir, "same.png", PNG_1X1);
         lib.import_into_store(std::slice::from_ref(&src), None)
             .unwrap();
@@ -2786,7 +2788,7 @@ mod tests {
         assert_eq!(asset.width, Some(640));
         assert_eq!(asset.height, Some(480));
         // The rendered thumbnail is on disk.
-        let thumb = thumb::abs_path(lib.cache(), asset.sha256.as_deref().unwrap());
+        let thumb = thumb::abs_path(lib.cache(), asset.content_hash.as_deref().unwrap());
         assert!(thumb.is_file(), "svg thumbnail missing");
     }
     #[test]
@@ -2928,7 +2930,7 @@ mod tests {
                 .unwrap()
         };
         assert_eq!(asset.kind, AssetKind::Image);
-        let thumb = thumb::abs_path(lib.cache(), asset.sha256.as_deref().unwrap());
+        let thumb = thumb::abs_path(lib.cache(), asset.content_hash.as_deref().unwrap());
         assert!(thumb.is_file(), "heic thumbnail missing");
     }
 
@@ -2950,7 +2952,7 @@ mod tests {
             .unwrap();
         assert_eq!(asset.kind, AssetKind::Image);
         assert!(asset.width.unwrap_or(0) > 0);
-        let thumb = thumb::abs_path(lib.cache(), asset.sha256.as_deref().unwrap());
+        let thumb = thumb::abs_path(lib.cache(), asset.content_hash.as_deref().unwrap());
         assert!(thumb.is_file(), "raw thumbnail missing");
     }
 
@@ -2987,8 +2989,8 @@ mod tests {
         let before = assets::get(conn, id).unwrap().unwrap();
         assert_eq!(before.origin, crate::model::Origin::Linked);
         assert!(before.rel_path.is_none());
-        let old_sha = before.sha256.clone().unwrap();
-        assert!(thumb::abs_path(lib.cache(), &old_sha).is_file());
+        let old_hash = before.content_hash.clone().unwrap();
+        assert!(thumb::abs_path(lib.cache(), &old_hash).is_file());
 
         let out = lib
             .batch_edit_images(&[id], &[crate::media::edit::ImageEdit::Rotate90], 90)
@@ -3009,11 +3011,11 @@ mod tests {
             after.facts.source_path.as_deref(),
             Some(src.to_str().unwrap())
         );
-        assert_ne!(after.sha256.as_deref(), Some(old_sha.as_str()));
+        assert_ne!(after.content_hash.as_deref(), Some(old_hash.as_str()));
         assert_eq!((after.width, after.height), (Some(3), Some(4)));
-        assert!(thumb::abs_path(lib.cache(), after.sha256.as_deref().unwrap()).is_file());
+        assert!(thumb::abs_path(lib.cache(), after.content_hash.as_deref().unwrap()).is_file());
         assert!(
-            !thumb::abs_path(lib.cache(), &old_sha).is_file(),
+            !thumb::abs_path(lib.cache(), &old_hash).is_file(),
             "the old thumbnail describes content nothing references"
         );
 
@@ -3062,9 +3064,9 @@ mod tests {
         let id = report.imported[0].asset_id;
         let conn = lib.store().conn();
         let before = assets::get(conn, id).unwrap().unwrap();
-        let old_sha = before.sha256.clone().unwrap();
+        let old_hash = before.content_hash.clone().unwrap();
         let old_rel = before.rel_path.clone().unwrap();
-        let old_thumb = thumb::abs_path(lib.cache(), &old_sha);
+        let old_thumb = thumb::abs_path(lib.cache(), &old_hash);
         assert!(old_thumb.is_file(), "precondition: thumbnail exists");
 
         let out = lib
@@ -3077,7 +3079,7 @@ mod tests {
         // Identity survives; content does not.
         assert_eq!(after.file_name, before.file_name);
         assert_eq!(after.title, before.title);
-        assert_ne!(after.sha256, before.sha256);
+        assert_ne!(after.content_hash, before.content_hash);
         assert_eq!((after.width, after.height), (Some(3), Some(4)));
         assert_eq!(after.ext, before.ext);
         assert_eq!(after.mime, "image/png");
@@ -3087,7 +3089,7 @@ mod tests {
         assert!(!old_thumb.is_file(), "old thumbnail removed");
         let new_rel = after.rel_path.as_ref().unwrap();
         assert!(lib.resolve(new_rel).is_file(), "new blob exists");
-        let new_thumb = thumb::abs_path(lib.cache(), after.sha256.as_deref().unwrap());
+        let new_thumb = thumb::abs_path(lib.cache(), after.content_hash.as_deref().unwrap());
         assert!(new_thumb.is_file(), "new thumbnail generated");
 
         // The pixel content is really rotated: decoding the new blob gives

@@ -86,7 +86,7 @@ mod tests {
             ext: "png".into(),
             mime: "image/png".into(),
             size_bytes: 128,
-            sha256: Some("a".repeat(64)),
+            content_hash: Some("a".repeat(64)),
             kind,
             width: Some(1),
             height: Some(1),

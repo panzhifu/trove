@@ -333,7 +333,7 @@ impl Render for InspectorPanel {
             .map(|(w, h)| format!("{w} × {h}"))
             .unwrap_or_else(|| "—".into());
         let hash: String = asset
-            .sha256
+            .content_hash
             .as_deref()
             .map(|s| s.chars().take(12).collect())
             .unwrap_or_else(|| "—".into());
@@ -525,7 +525,7 @@ impl Render for InspectorPanel {
             })
             .child(property_row(cx, "inspector.dimensions", dims))
             .child(property_row(cx, "inspector.added", added))
-            .child(property_row(cx, "inspector.sha256", hash))
+            .child(property_row(cx, "inspector.content_hash", hash))
             .when_some(disk_path, |row, path| {
                 // Linked files can go missing (moved / deleted on disk);
                 // surface that and offer a relink pick.
@@ -703,7 +703,7 @@ impl Render for InspectorPanel {
                 font_glyphs,
                 font_italic,
                 font_blob.as_deref(),
-                asset.sha256.clone(),
+                asset.content_hash.clone(),
             );
             content = content.child(self.collapsible_section(
                 "font",
@@ -850,7 +850,7 @@ impl InspectorPanel {
         glyphs: Option<u32>,
         italic: bool,
         blob: Option<&std::path::Path>,
-        sha: Option<String>,
+        hash: Option<String>,
     ) -> Div {
         let registered = family
             .as_ref()
@@ -899,11 +899,11 @@ impl InspectorPanel {
 
         // System install: user-level fonts directory, hash-named copy. The
         // button state re-evaluates on the next render after the action.
-        if let Some(sha) = sha {
-            let installed = crate::fonts::is_installed(&sha);
+        if let Some(hash) = hash {
+            let installed = crate::fonts::is_installed(&hash);
             let controller = self.controller.clone();
             let controller_err = controller.clone();
-            let sha_err = sha.clone();
+            let hash_err = hash.clone();
             section = section.child(
                 h_flex()
                     .gap_2()
@@ -922,7 +922,7 @@ impl InspectorPanel {
                             .xsmall()
                             .label(rust_i18n::t!("inspector.font_uninstall").to_string())
                             .on_click(move |_, _, cx| {
-                                if let Err(e) = crate::fonts::uninstall(&sha_err) {
+                                if let Err(e) = crate::fonts::uninstall(&hash_err) {
                                     controller_err.update(cx, |ctl, cx| {
                                         ctl.notice = Some(
                                             rust_i18n::t!("notice.font_install_failed", error = e)
@@ -935,7 +935,7 @@ impl InspectorPanel {
                             })
                             .into_any_element()
                     } else {
-                        let sha_install = sha.clone();
+                        let hash_install = hash.clone();
                         Button::new("font-install")
                             .ghost()
                             .xsmall()
@@ -944,7 +944,7 @@ impl InspectorPanel {
                                 let blob = blob.map(|p| p.to_path_buf());
                                 move |_, _, cx| {
                                     let Some(blob) = &blob else { return };
-                                    match crate::fonts::install(blob, &sha_install) {
+                                    match crate::fonts::install(blob, &hash_install) {
                                         Ok(_) => cx.refresh_windows(),
                                         Err(e) => controller_err.update(cx, |ctl, cx| {
                                             ctl.notice = Some(

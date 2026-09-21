@@ -1,7 +1,8 @@
 //! Duplicate finder: lists clusters of visually identical images (perceptual
 //! hash distance ≤ 8) and offers per-group cleanup — keep the newest, trash
 //! the rest. Content-exact duplicates cannot occur among live assets (the
-//! importer deduplicates by SHA-256), so this catches re-encoded variants.
+//! importer deduplicates by content hash), so this catches re-encoded
+//! variants.
 //!
 //! The scan runs once, on a backend thread (own database connection — the
 //! O(n²) pHash pass must never run per render frame); the dialog renders the

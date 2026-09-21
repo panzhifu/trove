@@ -35,7 +35,7 @@ pub struct ImportItem {
     pub asset_id: Uuid,
     pub file_name: String,
     pub kind: AssetKind,
-    pub sha256: String,
+    pub content_hash: String,
     /// `true` when the content already existed and the existing asset was
     /// reused instead of inserting a new record.
     pub reused: bool,
@@ -54,10 +54,14 @@ pub struct ImportSkip {
 pub struct ImportReport {
     pub imported: Vec<ImportItem>,
     pub skipped: Vec<ImportSkip>,
-    /// Files handed to the job that the library already held (same name and
-    /// size) and so were never staged — the resident inbox sweep re-runs over
-    /// a directory that keeps its files, and this is the "nothing new"
-    /// counter that keeps those sweeps quiet. Not a skip: nothing went wrong.
+    /// Files handed to the job that the library already held, and so were
+    /// never staged at all — see [`crate::media::precheck`]. The resident
+    /// inbox sweep re-runs over a directory that keeps its files, and a watch
+    /// root re-offers everything the embedder never acknowledged, so this is
+    /// the "nothing new" counter that keeps those repeats quiet *and* cheap:
+    /// each one is a `stat` plus a lookup, not a read.
+    ///
+    /// Not a skip: nothing went wrong.
     pub already_imported: u64,
 }
 
@@ -79,7 +83,7 @@ pub struct StagedFile {
     pub path: PathBuf,
     pub file_name: String,
     pub ext: String,
-    pub sha256: String,
+    pub content_hash: String,
     pub size: u64,
     /// Library-relative blob path; empty when [`StagedFile::linked`] is set
     /// (the file stays at its original location).
@@ -114,11 +118,12 @@ pub fn import_files(
     // The synchronous path has no cancellation story (it is the library
     // import/export round-trip), so staging here runs to completion.
     let never_cancelled = AtomicBool::new(false);
-    Ok(commit_staged_all(
-        store.conn(),
-        into_collection,
-        stage_all(data_root, cache_root, sources, storage, &never_cancelled),
-    ))
+    let staged = stage_all(data_root, cache_root, sources, storage, &never_cancelled);
+    let report = commit_staged_all(store.conn(), into_collection, staged);
+    // The hash cache is one file rewritten whole, so it is written once per
+    // run rather than once per staged source.
+    super::hash_cache::flush(cache_root);
+    Ok(report)
 }
 
 /// How an import treats its sources.
@@ -381,7 +386,7 @@ fn staged_from(io: StageIo) -> StagedFile {
         path: io.src,
         file_name: io.file_name,
         ext: io.ext,
-        sha256: io.sha256,
+        content_hash: io.content_hash,
         size: io.size,
         rel_path: io.rel_path,
         kind: io.kind,
@@ -410,7 +415,7 @@ pub fn commit_staged(
     }
 
     // Reuse an existing live asset with identical content.
-    if let Some(existing) = assets::find_by_sha256(conn, &staged.sha256)? {
+    if let Some(existing) = assets::find_by_content_hash(conn, &staged.content_hash)? {
         // A placeholder record (metadata restore without media) becomes a
         // full asset the moment its content lands in the library. Linked
         // records keep pointing at their original location.
@@ -424,7 +429,7 @@ pub fn commit_staged(
             asset_id: existing.id,
             file_name: existing.file_name.clone(),
             kind: existing.kind,
-            sha256: staged.sha256.clone(),
+            content_hash: staged.content_hash.clone(),
             reused: true,
         });
     }
@@ -455,7 +460,7 @@ pub fn commit_staged(
         ext: staged.ext.clone(),
         mime: staged.mime.clone(),
         size_bytes: staged.size,
-        sha256: Some(staged.sha256.clone()),
+        content_hash: Some(staged.content_hash.clone()),
         kind: staged.kind,
         width: staged.width,
         height: staged.height,
@@ -482,7 +487,7 @@ pub fn commit_staged(
         asset_id: asset.id,
         file_name: asset.file_name.clone(),
         kind: asset.kind,
-        sha256: staged.sha256.clone(),
+        content_hash: staged.content_hash.clone(),
         reused: false,
     })
 }
@@ -589,15 +594,15 @@ mod tests {
             asset.facts.source_path.as_deref(),
             Some(src.display().to_string().as_str())
         );
-        let (src_sha, _) = super::super::blob::hash_file(&src).unwrap();
-        assert_eq!(asset.sha256.as_deref(), Some(src_sha.as_str()));
+        let (src_hash, _) = super::super::blob::hash_file(&src).unwrap();
+        assert_eq!(asset.content_hash.as_deref(), Some(src_hash.as_str()));
 
         // The thumbnail was generated from the original file, into the cache
         // root — not next to the database.
-        let thumb = super::super::thumb::abs_path(&cache, asset.sha256.as_deref().unwrap());
+        let thumb = super::super::thumb::abs_path(&cache, asset.content_hash.as_deref().unwrap());
         assert!(thumb.is_file());
         assert!(
-            !super::super::thumb::abs_path(&root, asset.sha256.as_deref().unwrap()).exists(),
+            !super::super::thumb::abs_path(&root, asset.content_hash.as_deref().unwrap()).exists(),
             "thumbnails must not land in the data root"
         );
 

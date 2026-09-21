@@ -31,7 +31,7 @@ fn asset(name: &str, ext: &str, kind: AssetKind, title: Option<&str>, desc: Opti
         ext: ext.to_string(),
         mime: format!("application/{ext}"),
         size_bytes: 128,
-        sha256: Some(format!("{:0>64}", id.simple())),
+        content_hash: Some(format!("{:0>64}", id.simple())),
         kind,
         width: None,
         height: None,
