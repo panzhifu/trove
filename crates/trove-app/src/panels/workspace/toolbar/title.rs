@@ -108,8 +108,7 @@ impl DockPanel for WorkspacePanel {
                     .text_color(cx.theme().muted_foreground)
                     .child(zoom_label),
             )
-            .child(title_controls(&controller, cx))
-            .child(self.search_box.clone());
+            .child(title_controls(&controller, cx));
         if in_trash || in_recent {
             // Zoom has no effect in list view contexts of trash/recent? It
             // still does (grid layout), so keep everything; only these two
@@ -144,7 +143,11 @@ impl DockPanel for WorkspacePanel {
             };
             row = row.child(action);
         }
-        Some(row.into_any_element())
+        // The magnifier holds the last slot in every view, so it always sits
+        // beside the dock's collapse button instead of shifting left when a
+        // view brings an action of its own (the trash's empty button, the
+        // recent list's clear-history one).
+        Some(row.child(self.search_box.clone()).into_any_element())
     }
 }
 
