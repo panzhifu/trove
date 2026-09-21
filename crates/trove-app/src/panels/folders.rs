@@ -15,7 +15,6 @@ use gpui_kit::*;
 use trove_core::store::assets::source_folders;
 
 use crate::library::LibraryController;
-use crate::panels::search_box::SearchBox;
 
 // =========================== Folders panel ===================================
 
@@ -27,39 +26,18 @@ panel!(
     // pulls the folder out of each `source_path`, and materialises one
     // `String` per asset before grouping in Rust — 46.8 ms on a 100k library.
     // `render` runs every frame, so it may only read this on a miss.
-    folders: Option<(u64, Vec<(String, u64)>)>,
-    // The magnifier in the title bar. Each panel owns one, so the search
-    // entry point travels with whichever panel the user is looking at.
-    search_box: Entity<SearchBox>
+    folders: Option<(u64, Vec<(String, u64)>)>
 );
 
 impl FoldersPanel {
-    pub fn new(
-        window: &mut Window,
-        cx: &mut Context<Self>,
-        controller: Entity<LibraryController>,
-    ) -> Self {
-        let search_box = cx.new(|cx| SearchBox::new(window, cx, controller.clone(), "folders"));
+    pub fn new(cx: &mut Context<Self>, controller: Entity<LibraryController>) -> Self {
         let this = Self {
             focus_handle: cx.focus_handle(),
             controller,
             folders: None,
-            search_box,
         };
         super::common::observe_controller(cx, &this.controller);
         this
-    }
-
-    /// The magnifier, in the trailing slot the other panels put theirs in.
-    /// This panel has no add button of its own — folders are discovered, not
-    /// created — so the search box stands alone.
-    fn title_controls(&self, _: &mut Context<Self>) -> Option<Div> {
-        Some(
-            h_flex()
-                .items_center()
-                .gap_1()
-                .child(self.search_box.clone()),
-        )
     }
 
     fn folder_rows(

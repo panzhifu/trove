@@ -24,7 +24,6 @@ use crate::components::preview::{AssetPreviewData, PreviewContext};
 use crate::library::LibraryController;
 
 use super::common::{color_swatch, hex_to_rgb, human_bytes, observe_controller};
-use super::search_box::SearchBox;
 
 // ==================== Inspector: details + tags ==============================
 
@@ -49,9 +48,6 @@ pub struct InspectorPanel {
     /// Section ids the user collapsed (absent = expanded). Persisted on the
     /// panel so collapse state survives re-renders and asset switches.
     collapsed: std::collections::HashSet<&'static str>,
-    /// The magnifier in the title bar. Each panel owns one, so the search
-    /// entry point is always in reach.
-    search_box: Entity<SearchBox>,
 }
 
 impl InspectorPanel {
@@ -75,7 +71,6 @@ impl InspectorPanel {
             InputState::new(window, cx)
                 .placeholder(rust_i18n::t!("inspector.source_url").to_string())
         });
-        let search_box = cx.new(|cx| SearchBox::new(window, cx, controller.clone(), "inspector"));
         let this = Self {
             focus_handle: cx.focus_handle(),
             controller,
@@ -85,7 +80,6 @@ impl InspectorPanel {
             source_input,
             editing_id: None,
             collapsed: std::collections::HashSet::new(),
-            search_box,
         };
         observe_controller(cx, &this.controller);
 
@@ -290,15 +284,9 @@ impl DockPanel for InspectorPanel {
         None
     }
 
-    /// The magnifier, and nothing else: zoom lives on the workspace title
-    /// bar and this panel has no other title action.
+    /// No title suffix controls (zoom removed from inspector).
     fn title_suffix(&mut self, _: &mut Window, _: &mut Context<Self>) -> Option<impl IntoElement> {
-        Some(
-            h_flex()
-                .items_center()
-                .gap_1()
-                .child(self.search_box.clone()),
-        )
+        None::<Div>
     }
 }
 impl EventEmitter<PanelEvent> for InspectorPanel {}

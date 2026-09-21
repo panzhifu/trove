@@ -25,7 +25,6 @@ use trove_core::store::{assets, collections, smart_collections};
 use uuid::Uuid;
 
 use crate::library::LibraryController;
-use crate::panels::search_box::SearchBox;
 
 use super::common::{
     AssetsDrag, CollectionDrag, SmartDrag, hex_to_rgb, live_count, observe_controller,
@@ -278,10 +277,6 @@ pub struct ExplorerPanel {
     /// that do not touch the kind (favorite, shape, rating, format) leave
     /// the snapshot valid — the counts behind it never read them.
     snapshot_cache: Option<(u64, Option<AssetKind>, Snapshot)>,
-    /// The magnifier in the title bar. Each panel owns one, so the search
-    /// entry point is never more than a glance away — wherever the user has
-    /// dragged the dock to.
-    search_box: Entity<SearchBox>,
 }
 
 impl ExplorerPanel {
@@ -294,14 +289,12 @@ impl ExplorerPanel {
             InputState::new(window, cx)
                 .placeholder(rust_i18n::t!("explorer.name_placeholder").to_string())
         });
-        let search_box = cx.new(|cx| SearchBox::new(window, cx, controller.clone(), "explorer"));
         let this = Self {
             focus_handle: cx.focus_handle(),
             controller,
             editor_input,
             mode: EditorMode::None,
             snapshot_cache: None,
-            search_box,
         };
         observe_controller(cx, &this.controller);
         this.subscribe_enter(window, cx);
@@ -503,24 +496,18 @@ impl DockPanel for ExplorerPanel {
         None
     }
 
-    /// The magnifier plus the "+" pinned to the trailing edge of the title
-    /// bar (where the removed ellipsis menu used to sit).
+    /// "+" pinned to the trailing edge of the title bar (where the removed
+    /// ellipsis menu used to sit).
     fn title_suffix(&mut self, _: &mut Window, cx: &mut Context<Self>) -> Option<impl IntoElement> {
         let entity = cx.entity();
         Some(
-            h_flex()
-                .items_center()
-                .gap_1()
-                .child(self.search_box.clone())
-                .child(
-                    plus_button(
-                        "add-collection-title",
-                        rust_i18n::t!("explorer.add_collection").to_string(),
-                    )
-                    .on_click(move |_, window, cx| {
-                        entity.update(cx, |this, cx| this.begin_add(window, cx));
-                    }),
-                ),
+            plus_button(
+                "add-collection-title",
+                rust_i18n::t!("explorer.add_collection").to_string(),
+            )
+            .on_click(move |_, window, cx| {
+                entity.update(cx, |this, cx| this.begin_add(window, cx));
+            }),
         )
     }
 }
