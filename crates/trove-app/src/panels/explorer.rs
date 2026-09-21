@@ -20,8 +20,8 @@ use gpui_kit::component::{ActiveTheme, Icon, IconName, Sizable};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
-use trove_core::model::{AssetKind, NewCollection};
-use trove_core::store::{assets, collections, smart_collections};
+use trove_core::model::NewCollection;
+use trove_core::store::{collections, smart_collections};
 use uuid::Uuid;
 
 use crate::library::LibraryController;
@@ -56,19 +56,6 @@ const HEADER_ACTION_PAD: f32 = 8.;
 /// Live (non-trashed) entry count of the recently-viewed history.
 fn recent_count(ctl: &LibraryController) -> u64 {
     trove_core::store::view_history::live_count(ctl.library.store().conn()).unwrap_or(0)
-}
-
-/// Live (non-trashed) font-asset count for the fonts pseudo-row.
-fn fonts_count(ctl: &LibraryController) -> u64 {
-    assets::query(
-        ctl.library.store().conn(),
-        &trove_core::model::AssetQuery {
-            kind: Some(AssetKind::Font),
-            ..Default::default()
-        },
-    )
-    .map(|page| page.total)
-    .unwrap_or(0)
 }
 
 // ============================================================================
@@ -196,8 +183,6 @@ struct Snapshot {
     all_count: u64,
     trash_total: u64,
     recent_total: u64,
-    fonts_total: u64,
-    filter_kind: Option<AssetKind>,
     rows: Vec<CollectionRow>,
     smart_rows: Vec<SmartRow>,
 }
@@ -238,8 +223,6 @@ impl Snapshot {
             all_count: live_count(ctl),
             trash_total: trash_count(ctl),
             recent_total: recent_count(ctl),
-            fonts_total: fonts_count(ctl),
-            filter_kind: ctl.filter_kind,
             rows,
             smart_rows,
         }
@@ -247,18 +230,7 @@ impl Snapshot {
 
     /// "All assets" highlights when nothing specific is selected.
     fn all_selected(&self) -> bool {
-        self.current.is_none()
-            && !self.showing_trash
-            && !self.showing_recent
-            && self.filter_kind != Some(AssetKind::Font)
-    }
-
-    /// The fonts row highlights only when the fonts kind filter is active.
-    fn fonts_selected(&self) -> bool {
-        self.current.is_none()
-            && !self.showing_trash
-            && !self.showing_recent
-            && self.filter_kind == Some(AssetKind::Font)
+        self.current.is_none() && !self.showing_trash && !self.showing_recent
     }
 }
 
@@ -273,10 +245,9 @@ pub struct ExplorerPanel {
     editor_input: Entity<InputState>,
     mode: EditorMode,
     /// Row/count snapshot keyed by the controller generation it was taken
-    /// at, plus the kind filter the kind highlight reads. Filter changes
-    /// that do not touch the kind (favorite, shape, rating, format) leave
-    /// the snapshot valid — the counts behind it never read them.
-    snapshot_cache: Option<(u64, Option<AssetKind>, Snapshot)>,
+    /// at. That is the whole key: the counts move only when the library
+    /// does, and no row highlight reads a filter any more.
+    snapshot_cache: Option<(u64, Snapshot)>,
 }
 
 impl ExplorerPanel {
@@ -447,9 +418,6 @@ impl ExplorerPanel {
         if ctl.showing_recent {
             return rust_i18n::t!("app.recent_viewed").to_string();
         }
-        if ctl.filter_kind == Some(AssetKind::Font) {
-            return rust_i18n::t!("app.fonts_view").to_string();
-        }
         if let Some(sid) = ctl.active_smart
             && let Ok(Some(sc)) = smart_collections::get(conn, sid)
         {
@@ -524,27 +492,22 @@ impl Render for ExplorerPanel {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let mode = self.mode;
         let explorer = cx.entity();
-        // Reuse the cached snapshot while the generation and the kind filter
-        // are unchanged; the COUNT queries behind it only need to re-run
-        // after a mutation (or a kind change, which the highlight reads).
+        // Reuse the cached snapshot while the generation is unchanged: the
+        // COUNT queries behind it re-run only after a mutation.
         let ctl = self.controller.read(cx);
-        let (generation, filter_kind) = (ctl.generation, ctl.filter_kind);
+        let generation = ctl.generation;
         let snapshot = match &self.snapshot_cache {
-            Some((cached_gen, cached_kind, snap))
-                if *cached_gen == generation && *cached_kind == filter_kind =>
-            {
-                snap.clone()
-            }
+            Some((cached_gen, snap)) if *cached_gen == generation => snap.clone(),
             _ => {
                 let snap = Snapshot::take(ctl);
-                self.snapshot_cache = Some((generation, filter_kind, snap.clone()));
+                self.snapshot_cache = Some((generation, snap.clone()));
                 snap
             }
         };
         let snap = snapshot;
         let mut items: Vec<AnyElement> = Vec::new();
 
-        // --- Pseudo rows: All assets, Fonts, Recently viewed, Trash ---
+        // --- Pseudo rows: All assets, Recently viewed, Trash ---
 
         items.push(
             collection_row(
@@ -558,15 +521,6 @@ impl Render for ExplorerPanel {
             )
             .into_any_element(),
         );
-
-        // Fonts view: every live font asset (a kind-filtered all-assets
-        // browse). Grid cells render live specimen cards.
-        items.push(fonts_row(
-            cx,
-            self.controller.clone(),
-            snap.fonts_total,
-            snap.fonts_selected(),
-        ));
 
         // Recently viewed: history count, click browses the view. Dropping
         // assets here sends them to the trash like any other view.
@@ -804,26 +758,6 @@ fn attach_trash_drop(row: Stateful<Div>, controller: Entity<LibraryController>) 
                 cx.notify();
             });
         })
-}
-
-/// Fonts view row: click switches the library to the fonts kind filter.
-fn fonts_row(
-    cx: &mut Context<ExplorerPanel>,
-    controller: Entity<LibraryController>,
-    count: u64,
-    selected: bool,
-) -> AnyElement {
-    pseudo_row(
-        cx,
-        "collection-row-fonts",
-        rust_i18n::t!("app.fonts_view").to_string(),
-        count,
-        selected,
-    )
-    .on_click(move |_ev: &ClickEvent, _window, cx| {
-        controller.update(cx, |ctl, _| ctl.select_fonts());
-    })
-    .into_any_element()
 }
 
 /// Recently viewed row.
