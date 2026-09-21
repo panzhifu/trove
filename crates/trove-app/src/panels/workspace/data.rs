@@ -237,10 +237,9 @@ impl WorkspacePanel {
     /// this only maps the render-side [`DataKey`] onto it and surfaces query
     /// errors. Called only when the [`DataKey`] changes — never on the
     /// per-frame path. An active visual search replaces the browse query
-    /// with a rank-ordered id fetch; the fonts view appends virtual cells
-    /// for system fonts the library has not imported. `count_total = false`
-    /// skips the exact COUNT (a lower-bound total comes back) — the caller
-    /// overlays its cached exact number.
+    /// with a rank-ordered id fetch. `count_total = false` skips the exact
+    /// COUNT (a lower-bound total comes back) — the caller overlays its
+    /// cached exact number.
     pub(super) fn run_data_pass(
         &mut self,
         cx: &mut Context<Self>,

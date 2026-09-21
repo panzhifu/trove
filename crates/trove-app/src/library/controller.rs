@@ -384,19 +384,6 @@ impl LibraryController {
         self.generation += 1;
     }
 
-    /// Browse the fonts view: all live assets filtered to kind = Font.
-    pub fn select_fonts(&mut self) {
-        self.current_collection = None;
-        self.showing_trash = false;
-        self.showing_recent = false;
-        self.active_smart = None;
-        self.selected_assets = Rc::new(Vec::new());
-        self.filter_kind = Some(AssetKind::Font);
-        self.close_visual_search();
-        self.reset_grid_page();
-        self.generation += 1;
-    }
-
     /// Record `asset` as viewed in the history table. Debounced per asset:
     /// a repeated selection of the same asset within [`VIEW_DEBOUNCE`] is
     /// ignored, anything else is written immediately. Failures are silent —
