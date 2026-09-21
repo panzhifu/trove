@@ -56,10 +56,21 @@ impl AppHistory {
     /// Record a picked colour: moved to the front, deduplicated, capped.
     /// Persists immediately.
     pub fn push_color(&mut self, hex: &str) -> Result<()> {
+        self.push_color_in_memory(hex);
+        self.save()
+    }
+
+    /// The bookkeeping half of [`push_color`], without the write.
+    ///
+    /// Split out for the test, and only for the test: what has a rule in it is
+    /// the dedupe / newest-first / cap, and that part needs no filesystem —
+    /// while a test that goes through [`push_color`] writes the *user's*
+    /// `~/.config/trove/history.json` (it did, on every full test run, until
+    /// this split). `save` is one call either way.
+    fn push_color_in_memory(&mut self, hex: &str) {
         self.colors.retain(|c| c != hex);
         self.colors.insert(0, hex.to_string());
         self.colors.truncate(COLOR_HISTORY_CAP);
-        self.save()
     }
 
     /// Forget every picked colour and persist.
@@ -73,18 +84,21 @@ impl AppHistory {
 mod tests {
     use super::*;
 
+    /// Deliberately does **not** call [`AppHistory::push_color`]: that one
+    /// persists, and `history_file()` is the user's real config directory.
+    /// Exercise the rule here; leave the write to the app.
     #[test]
     fn color_history_dedupes_and_caps() {
         let mut h = AppHistory::default();
         for i in 0..(COLOR_HISTORY_CAP + 5) {
-            h.push_color(&format!("#{i:06x}")).unwrap();
+            h.push_color_in_memory(&format!("#{i:06x}"));
         }
         assert_eq!(h.colors().len(), COLOR_HISTORY_CAP);
         assert_eq!(h.colors()[0], format!("#{:06x}", COLOR_HISTORY_CAP + 4));
 
         // Re-picking an older colour moves it to the front.
         let old = h.colors().last().unwrap().clone();
-        h.push_color(&old).unwrap();
+        h.push_color_in_memory(&old);
         assert_eq!(h.colors()[0], old);
     }
 }
