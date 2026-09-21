@@ -28,7 +28,7 @@ cargo run -p trove-app
 
 This README summarizes what ships. The **[Chinese README](./README.md)** is the canonical, most up-to-date document.
 
-[docs/](docs/README.md) · [Feature gaps](docs/FEATURE-GAPS.md)
+[docs/](docs/README.md)
 
 ---
 
@@ -121,7 +121,7 @@ cargo run -p trove-app
 
 **Baseline: `trove-core` 401 + `trove-app` 34 all pass; `cargo fmt --check` clean; clippy 0 warnings workspace-wide.** Two real-GPU smoke tests live in `trove-app` (EDL, meshlet culling) and skip automatically on headless machines.
 
-What is still missing vs. Eagle / Billfish / digiKam / Adobe Bridge is mapped in [docs/FEATURE-GAPS.md](docs/FEATURE-GAPS.md).
+Per-module implementation notes are indexed in [docs/README.md](docs/README.md).
 
 ---
 
