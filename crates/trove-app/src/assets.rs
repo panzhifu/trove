@@ -15,7 +15,8 @@ use gpui_kit::{AssetSource, Result, SharedString};
 
 // Volume-1/2/X and Shrink: the video player. RotateCcw and the two flips and
 // Pencil: the preview toolbar's pixel-edit buttons. Axis3d and LocateFixed:
-// the model viewport's scene-axes and trihedron switches. None of the six
+// the model viewport's scene-axes and trihedron switches. Trash and Eraser:
+// the title bar's empty-the-trash and clear-the-history actions. None of them
 // are in `default-icons.txt`, so without listing them here they render blank.
 icon_assets!(
     pub(crate) ExtraIcons,
@@ -30,6 +31,8 @@ icon_assets!(
         Pencil,
         Axis3d,
         LocateFixed,
+        Trash,
+        Eraser,
     ]
 );
 
@@ -72,6 +75,8 @@ mod tests {
             "icons/pencil.svg",
             "icons/axis-3d.svg",
             "icons/locate-fixed.svg",
+            "icons/trash.svg",
+            "icons/eraser.svg",
         ] {
             assert!(
                 ExtraIcons.load(path).unwrap().is_some(),
