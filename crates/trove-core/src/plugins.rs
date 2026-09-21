@@ -19,7 +19,7 @@
 //!
 //! Plugins are compiled in for now. A separate API crate (so an external
 //! crate can implement `Plugin` without linking all of trove-core) and
-//! dynamic loading are the next steps — see `docs/PLUGINS.md`.
+//! dynamic loading are the next steps — see `docs/PLUGIN-SYSTEM.md`.
 
 use std::sync::{Arc, Mutex, OnceLock};
 

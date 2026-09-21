@@ -26,7 +26,7 @@ cargo run -p trove-app
 
 > 需要 [Rust 工具链](https://www.rust-lang.org/tools/install)。首次启动打开**欢迎界面**：左边列出已有的素材库，右边给它起个名字就能开始。素材库由 Trove 按系统约定存放，不必（也不能）自己挑目录。
 
-[Trove 文档索引](docs/README.md) · [功能差距分析](docs/FEATURE-GAPS.md)
+[Trove 文档索引](docs/README.md)
 
 ---
 
@@ -196,7 +196,7 @@ cargo run -p trove-app
 
 **当前测试基线：`trove-core` 401 + `trove-app` 34 全部通过；`cargo fmt --check` 干净；clippy 全工作区 0 告警。** `trove-app` 含 2 个真机 GPU 冒烟测试（EDL、meshlet 剔除），无显卡的机器自动跳过。
 
-对标同类软件的功能差距与路线图见 [docs/FEATURE-GAPS.md](docs/FEATURE-GAPS.md)。
+各模块的实现细节按主题整理在 [docs/README.md](docs/README.md) 索引里。
 
 ---
 
