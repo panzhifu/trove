@@ -16,8 +16,10 @@ use gpui_kit::{AssetSource, Result, SharedString};
 // Volume-1/2/X and Shrink: the video player. RotateCcw and the two flips and
 // Pencil: the preview toolbar's pixel-edit buttons. Axis3d and LocateFixed:
 // the model viewport's scene-axes and trihedron switches. Trash and Eraser:
-// the title bar's empty-the-trash and clear-the-history actions. None of them
-// are in `default-icons.txt`, so without listing them here they render blank.
+// the title bar's empty-the-trash and clear-the-history actions. Sparkles:
+// the AI tagging action, where `Bot` (the settings page) would read as
+// "chat" rather than "do something to these assets". None of them are in
+// `default-icons.txt`, so without listing them here they render blank.
 icon_assets!(
     pub(crate) ExtraIcons,
     [
@@ -33,6 +35,7 @@ icon_assets!(
         LocateFixed,
         Trash,
         Eraser,
+        Sparkles,
     ]
 );
 
@@ -77,6 +80,7 @@ mod tests {
             "icons/locate-fixed.svg",
             "icons/trash.svg",
             "icons/eraser.svg",
+            "icons/sparkles.svg",
         ] {
             assert!(
                 ExtraIcons.load(path).unwrap().is_some(),

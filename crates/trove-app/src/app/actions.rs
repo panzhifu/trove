@@ -27,6 +27,7 @@ gpui_kit::actions!(
         BatchRename,
         BatchConvert,
         BatchEdit,
+        AutoTag,
         SelectAll,
         ClearSelection,
         TrashSelected,

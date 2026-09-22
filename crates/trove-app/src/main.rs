@@ -129,6 +129,7 @@ pub(crate) fn register_keys(cx: &mut App) {
     // Menu-only until the user binds a key in Settings ▸ Shortcuts.
     bind!(BatchRename, "BatchRename");
     bind!(BatchConvert, "BatchConvert");
+    bind!(AutoTag, "AutoTag");
     bind!(CopyImage, "CopyImage");
     // Paste import is global (works wherever focus is).
     bindings.push(KeyBinding::new("ctrl-shift-v", PasteImport, None));
