@@ -14,12 +14,13 @@ use gpui_kit::component::notification::Notification;
 use gpui_kit::*;
 
 use trove_core::media::import::ImportStorage;
+use trove_core::tasks::autotag::{AutoTagOutcome, AutoTagRequest, UndoOutcome};
 use trove_core::tasks::embed::EmbedOutcome;
 use trove_core::tasks::import::{self, ImportOptions, ImportOutcome, ImportSource};
 use trove_core::tasks::watch::{self, WatchSignal};
 use trove_core::tasks::{TaskEvent, TaskId, TaskKind, TaskManager, TaskStatus};
 
-use crate::library::{AiProbe, LibraryController};
+use crate::library::{AiProbe, ChatProbe, LibraryController};
 
 /// Marker type for the import progress toast: pushing with the same id
 /// replaces the previous toast instead of stacking a new one.
@@ -1175,5 +1176,340 @@ fn embedding_outcome_toast(outcome: &EmbedOutcome) -> Notification {
             )
             .to_string(),
         ))
+    }
+}
+
+// ============================ automatic tagging ==============================
+
+/// Marker for the keyed auto-tag toast: pushing with the same id replaces the
+/// previous one instead of stacking a toast per progress event.
+pub struct AutoTagNotice;
+
+/// What a tagging run is asked to tag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AutoTagTarget {
+    /// The assets selected right now. What the grid's menu and toolbar ask
+    /// for: an action on a selection should stay on it.
+    Selection,
+    /// Every live asset. Only the settings page asks for this, and it says
+    /// so on the button.
+    WholeLibrary,
+}
+
+/// Prove the chat endpoint works (Settings ▸ AI, tagging half): send one
+/// throwaway prompt and show what came back.
+///
+/// Deliberately not a task-manager job, for the same reasons the embedding
+/// probe is not: it writes no rows, must not occupy the tagging slot a real
+/// run needs, and its answer is one line of text on the page.
+pub fn test_chat_endpoint_app(controller: &Entity<LibraryController>, cx: &mut App) {
+    if controller.read(cx).chat_probe.is_running() {
+        return;
+    }
+    let Some(config) = trove_core::config::AppConfig::load()
+        .ai_chat
+        .filter(trove_core::config::ChatConfig::is_configured)
+    else {
+        set_chat_probe(
+            controller,
+            chat_probe_failure(rust_i18n::t!("settings.ai_not_configured").to_string()),
+            cx,
+        );
+        return;
+    };
+    let provider = match trove_core::ai::OpenAIChat::new(&config) {
+        Ok(provider) => provider,
+        Err(error) => {
+            set_chat_probe(controller, chat_probe_failure(error.to_string()), cx);
+            return;
+        }
+    };
+
+    set_chat_probe(controller, ChatProbe::Running, cx);
+    let controller = controller.clone();
+    cx.spawn(async move |cx| {
+        // The reply is the test result, so it has to come back as a string:
+        // that also keeps the awaited payload trivially `Send`.
+        let result: Result<String, String> = cx
+            .background_executor()
+            .spawn(async move {
+                use trove_core::ai::ChatProvider as _;
+                provider
+                    .complete(&trove_core::ai::ChatRequest {
+                        system: "Reply with one short sentence confirming you received this.",
+                        user: PROBE_TEXT,
+                        image: None,
+                    })
+                    .map(|reply| reply.trim().to_string())
+                    .map_err(|error| error.to_string())
+            })
+            .await;
+        let probe = match result {
+            Ok(reply) if !reply.is_empty() => ChatProbe::Ok {
+                reply: shorten(&reply),
+            },
+            // A success with nothing in it means the server answered a shape
+            // we cannot use; a green line would be a lie.
+            Ok(_) => chat_probe_failure(rust_i18n::t!("settings.ai_probe_empty").to_string()),
+            Err(message) => chat_probe_failure(message),
+        };
+        controller.update(cx, |ctl, cx| {
+            ctl.chat_probe = probe;
+            cx.notify();
+        });
+    })
+    .detach();
+}
+
+/// Start a tagging run from the settings page or the grid.
+///
+/// Returns `false` when the endpoint is not configured, nothing is selected
+/// (for [`AutoTagTarget::Selection`]) or another run already holds the slot —
+/// in each case a toast says which.
+pub fn start_auto_tag_app(
+    controller: &Entity<LibraryController>,
+    target: AutoTagTarget,
+    window: &mut Window,
+    cx: &mut App,
+) -> bool {
+    let chat = trove_core::config::AppConfig::load()
+        .ai_chat
+        .unwrap_or_default();
+    if !chat.is_configured() {
+        window.push_notification(
+            Notification::warning(rust_i18n::t!("settings.ai_not_configured").to_string()),
+            cx,
+        );
+        return false;
+    }
+    let provider: std::sync::Arc<dyn trove_core::ai::ChatProvider> =
+        match trove_core::ai::OpenAIChat::new(&chat) {
+            Ok(provider) => std::sync::Arc::new(provider),
+            Err(error) => {
+                window.push_notification(Notification::warning(error.to_string()), cx);
+                return false;
+            }
+        };
+
+    let only = match target {
+        AutoTagTarget::Selection => {
+            let selection = controller.read(cx).selected_assets.as_ref().clone();
+            if selection.is_empty() {
+                window.push_notification(
+                    Notification::warning(rust_i18n::t!("autotag.empty_selection").to_string()),
+                    cx,
+                );
+                return false;
+            }
+            selection
+        }
+        AutoTagTarget::WholeLibrary => Vec::new(),
+    };
+
+    let request = AutoTagRequest {
+        only: only.clone(),
+        ..AutoTagRequest::default()
+    };
+    let manager = controller.read(cx).library.tasks().clone();
+    let started = controller.update(cx, |ctl, _| ctl.library.start_auto_tag(provider, request));
+    let Ok((task_id, rx)) = started else {
+        return false; // one run at a time; the running toast is already up
+    };
+
+    let started_text = if only.is_empty() {
+        rust_i18n::t!("autotag.started_all").to_string()
+    } else {
+        rust_i18n::t!("autotag.started", count = only.len()).to_string()
+    };
+    window.push_notification(
+        Notification::info(started_text).id1::<AutoTagNotice>("autotag-progress"),
+        cx,
+    );
+    watch_auto_tag_job(
+        controller.clone(),
+        manager,
+        task_id,
+        rx,
+        window.window_handle(),
+        |outcome: &AutoTagOutcome| autotag_outcome_toast(outcome),
+        cx,
+    );
+    true
+}
+
+/// Detach every tag the automatic tagger ever added. Needs no endpoint.
+pub fn start_auto_tag_undo_app(
+    controller: &Entity<LibraryController>,
+    window: &mut Window,
+    cx: &mut App,
+) -> bool {
+    let manager = controller.read(cx).library.tasks().clone();
+    let started = controller.update(cx, |ctl, _| {
+        ctl.library.start_auto_tag_undo(AutoTagRequest::default())
+    });
+    let Ok((task_id, rx)) = started else {
+        return false; // a run or an undo is already going
+    };
+    window.push_notification(
+        Notification::info(rust_i18n::t!("autotag.undo_running").to_string())
+            .id1::<AutoTagNotice>("autotag-progress"),
+        cx,
+    );
+    watch_auto_tag_job(
+        controller.clone(),
+        manager,
+        task_id,
+        rx,
+        window.window_handle(),
+        |outcome: &UndoOutcome| undo_outcome_toast(outcome),
+        cx,
+    );
+    true
+}
+
+/// Ask the running tagging job to stop at its next cancellation checkpoint (a
+/// batch boundary); the outcome toast replaces the progress toast.
+pub fn cancel_auto_tag_app(controller: &Entity<LibraryController>, cx: &mut App) {
+    let manager = controller.read(cx).library.tasks().clone();
+    if let Some(task) = manager
+        .snapshot()
+        .into_iter()
+        .find(|task| task.kind == TaskKind::AutoTag && task.status == TaskStatus::Running)
+    {
+        manager.cancel(task.id);
+    }
+}
+
+/// Poll a tagging job until it settles, translating events into toasts — the
+/// loop [`watch_embedding`] runs, generic here because the two tagging jobs
+/// (a run and an undo) differ only in what they return.
+fn watch_auto_tag_job<T: Send + 'static>(
+    controller: Entity<LibraryController>,
+    manager: TaskManager,
+    task_id: TaskId,
+    rx: std::sync::mpsc::Receiver<T>,
+    handle: gpui::AnyWindowHandle,
+    settle: impl Fn(&T) -> Notification + Send + 'static,
+    cx: &mut App,
+) {
+    cx.spawn(async move |cx| {
+        loop {
+            cx.background_executor().timer(POLL_INTERVAL).await;
+            let mut settled: Option<Notification> = None;
+            for event in manager.poll_events() {
+                if event_task_id(&event) != Some(task_id) {
+                    continue;
+                }
+                match event {
+                    TaskEvent::Progress { done, total, .. } => {
+                        let _ = handle.update(cx, |_view, window, cx| {
+                            window.push_notification(
+                                Notification::info(
+                                    rust_i18n::t!("autotag.running", done = done, total = total)
+                                        .to_string(),
+                                )
+                                .id1::<AutoTagNotice>("autotag-progress"),
+                                cx,
+                            );
+                        });
+                    }
+                    TaskEvent::Failed { error, .. } => {
+                        settled = Some(keyed_autotag(Notification::warning(
+                            rust_i18n::t!("autotag.failed", error = error).to_string(),
+                        )));
+                    }
+                    TaskEvent::Cancelled { .. } => {
+                        settled = Some(keyed_autotag(Notification::info(
+                            rust_i18n::t!("autotag.cancelled").to_string(),
+                        )));
+                    }
+                    _ => {}
+                }
+            }
+
+            match rx.try_recv() {
+                Ok(outcome) => settled = Some(settle(&outcome)),
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                // No value: a terminal event above already set the toast.
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {}
+            }
+
+            if let Some(note) = settled {
+                let _ = handle.update(cx, |_view, window, cx| {
+                    window.push_notification(note, cx);
+                });
+                // The settings page's buttons read `is_running` per paint; the
+                // labels panel needs repainting because tags just moved.
+                controller.update(cx, |_, cx| cx.refresh_windows());
+                break;
+            }
+        }
+    })
+    .detach();
+}
+
+/// Attach the progress toast's key so a settle replaces it, never stacks.
+fn keyed_autotag(note: Notification) -> Notification {
+    note.id1::<AutoTagNotice>("autotag-progress")
+}
+
+fn autotag_outcome_toast(outcome: &AutoTagOutcome) -> Notification {
+    let mut text = rust_i18n::t!(
+        "autotag.done",
+        tagged = outcome.tagged,
+        unchanged = outcome.unchanged,
+        skipped = outcome.skipped,
+        failed = outcome.failed
+    )
+    .to_string();
+    if outcome.images_rejected {
+        // Worth saying rather than hiding: the endpoint could not take the
+        // thumbnails, so the tags came from text alone.
+        text.push(' ');
+        text.push_str(rust_i18n::t!("autotag.text_only").as_ref());
+    }
+    if outcome.failed > 0 {
+        keyed_autotag(Notification::warning(text))
+    } else {
+        keyed_autotag(Notification::success(text))
+    }
+}
+
+fn undo_outcome_toast(outcome: &UndoOutcome) -> Notification {
+    let text = rust_i18n::t!(
+        "autotag.undo_done",
+        detached = outcome.detached,
+        assets = outcome.assets
+    )
+    .to_string();
+    keyed_autotag(Notification::info(text))
+}
+
+/// A [`ChatProbe::Failed`] carrying a localized reason.
+fn chat_probe_failure(reason: impl Into<String>) -> ChatProbe {
+    ChatProbe::Failed {
+        message: reason.into(),
+    }
+}
+
+/// Record a chat-probe result and repaint, so the page shows it whether the
+/// test finished on the UI thread (bad configuration) or a worker (a call).
+fn set_chat_probe(controller: &Entity<LibraryController>, probe: ChatProbe, cx: &mut App) {
+    controller.update(cx, |ctl, cx| {
+        ctl.chat_probe = probe;
+        cx.notify();
+    });
+    cx.refresh_windows();
+}
+
+/// Squeeze a model's reply onto one settings row.
+fn shorten(reply: &str) -> String {
+    let collapsed = reply.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.chars().count() <= 80 {
+        collapsed
+    } else {
+        let mut short: String = collapsed.chars().take(80).collect();
+        short.push('…');
+        short
     }
 }

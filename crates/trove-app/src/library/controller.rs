@@ -66,6 +66,36 @@ impl AiProbe {
     }
 }
 
+/// Outcome of the last chat-endpoint connection test (Settings ▸ AI, the
+/// tagging half).
+///
+/// A sibling of [`AiProbe`] rather than a reuse of it. An embedding endpoint
+/// answers with a vector and a width; a chat endpoint answers with words, and
+/// the two are configured separately — a machine can easily have one
+/// reachable and the other not.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum ChatProbe {
+    /// Never run, or cleared by a library swap.
+    #[default]
+    Idle,
+    /// A test is in flight — the button is disabled meanwhile.
+    Running,
+    /// The model answered. `reply` is what it said, which is the only proof
+    /// the request reached a *model* rather than some web server that
+    /// happens to accept POSTs.
+    Ok { reply: String },
+    /// Unreachable, refused, or misconfigured. The message is the reason the
+    /// user has to read: this surfaces without a log window.
+    Failed { message: String },
+}
+
+impl ChatProbe {
+    /// Whether a test is in flight (the settings button guards on this).
+    pub fn is_running(&self) -> bool {
+        matches!(self, Self::Running)
+    }
+}
+
 /// Page size of the workspace asset grid: how many assets one page of the
 /// paged queries loads. Scrolling near the end loads the next page.
 pub const GRID_PAGE_SIZE: usize = 200;
@@ -211,6 +241,11 @@ pub struct LibraryController {
     /// task-manager job: it is one call against a server the user typed in,
     /// so it reports inline on the page and never blocks a job slot.
     pub ai_probe: AiProbe,
+    /// Result of the last chat-endpoint connection test (Settings ▸ AI, the
+    /// tagging half). Same reasoning as [`Self::ai_probe`]: one call against
+    /// a server the user typed in, answered inline on the page, no job slot
+    /// taken.
+    pub chat_probe: ChatProbe,
     /// The embedding of the committed search term, when one has been fetched
     /// (`jobs::request_query_embedding_app` runs after Enter). The workspace
     /// hands it to the query, which fuses it into the text ranking for as
@@ -281,6 +316,7 @@ impl LibraryController {
             integrity_report: None,
             busy: false,
             ai_probe: AiProbe::Idle,
+            chat_probe: ChatProbe::Idle,
             query_vector: None,
             duplicates: None,
             duplicates_computing: false,
@@ -597,6 +633,7 @@ impl LibraryController {
         // endpoint; a result from before the swap would be about a store that
         // is no longer open.
         self.ai_probe = AiProbe::Idle;
+        self.chat_probe = ChatProbe::Idle;
         // Same for the query embedding: it was computed against the previous
         // library's model rows.
         self.query_vector = None;
