@@ -10,12 +10,16 @@
 
 use serde_json::{Map, Value, json};
 
+use trove_core::ai::OpenAIChat;
 use trove_core::media::import::ImportStorage;
 use trove_core::model::{AssetPatch, NewCollection};
+use trove_core::tasks::autotag::AutoTagRequest;
 use trove_core::tasks::import::{ImportOptions, ImportSource};
 use trove_core::tasks::{TaskKind, TaskManager};
 
-use crate::cli::{CollectionCommand, Ids, ImportArgs, IndexCommand, PurgeArgs, SetArgs, TagArgs};
+use crate::cli::{
+    AutotagArgs, CollectionCommand, Ids, ImportArgs, IndexCommand, PurgeArgs, SetArgs, TagArgs,
+};
 use crate::ctx::{CliError, Env, Rendered, parse_asset_ids, resolve_collection};
 
 // ---------------------------------------------------------------------------
@@ -515,4 +519,143 @@ pub fn index(env: &Env, command: &IndexCommand) -> Result<Rendered, CliError> {
             ))
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// autotag
+// ---------------------------------------------------------------------------
+
+/// Ask a chat model to tag assets, or take a previous run's tags back.
+///
+/// The endpoint and the model come from the library's stored chat
+/// configuration, not from flags: a model name is a setting, not something to
+/// retype on every invocation. Everything the run may disagree with it about
+/// has a flag.
+pub fn autotag(
+    env: &Env,
+    args: &AutotagArgs,
+    style: &crate::ctx::Style,
+) -> Result<Rendered, CliError> {
+    let request = AutoTagRequest {
+        only: parse_asset_ids(&args.ids)?,
+        limit: args.limit,
+        force: args.force,
+        send_images: match (args.no_images, args.with_images) {
+            (true, _) => Some(false),
+            (_, true) => Some(true),
+            _ => None,
+        },
+        max_new_tags: args.max_new_tags,
+        new_tag_parent: args.parent_tag.clone(),
+        language: args.language.clone(),
+        dry_run: args.dry_run,
+        threads: args.threads,
+    };
+
+    if args.undo {
+        return undo_autotag(env, request);
+    }
+
+    let config = trove_core::config::AppConfig::load();
+    let chat = config.ai_chat.clone().unwrap_or_default();
+    if !chat.is_configured() {
+        return Err(CliError::usage(
+            "no chat endpoint is configured: set `ai_chat` (base_url, model, api_key) in \
+             Trove's config.json — the same host as `ai_embedding` usually works",
+        ));
+    }
+    // Built even for a dry run: the fingerprint deciding what counts as
+    // already done includes the model name, so a dry run that invented one
+    // would not answer the question it was asked. It is never called.
+    let provider = std::sync::Arc::new(OpenAIChat::new(&chat)?);
+    let options = env.library.auto_tag_options(&request);
+
+    style.progress(&format!(
+        "{}: {}",
+        chat.model,
+        if args.dry_run {
+            "counting what would be tagged"
+        } else if options.send_images {
+            "tagging, with thumbnails"
+        } else {
+            "tagging, text only"
+        },
+    ));
+
+    let (_, receiver) = env
+        .library
+        .start_auto_tag(provider, request)
+        .map_err(|error| CliError::runtime(format!("cannot start the tagging job: {error:?}")))?;
+    let outcome = receiver
+        .recv()
+        .map_err(|_| CliError::runtime("the tagging job did not run to completion"))?;
+    if let Some(error) = &outcome.error {
+        return Err(CliError::runtime(format!("tagging failed: {error}")));
+    }
+
+    let result = json!({
+        "model": chat.model,
+        "dry_run": args.dry_run,
+        "planned": outcome.planned,
+        "tagged": outcome.tagged,
+        "unchanged": outcome.unchanged,
+        "skipped": outcome.skipped,
+        "failed": outcome.failed,
+        "created_tags": outcome.created_tags,
+        // The endpoint would not take an image, so the run went text-only
+        // rather than failing — worth knowing, because it is a quality drop.
+        "images_rejected": outcome.images_rejected,
+        "cancelled": outcome.cancelled,
+    });
+
+    let human = if args.dry_run {
+        format!(
+            "would tag {} asset(s); {} already done",
+            outcome.planned, outcome.skipped
+        )
+    } else {
+        let mut line = format!(
+            "{} tagged, {} unchanged, {} skipped, {} failed",
+            outcome.tagged, outcome.unchanged, outcome.skipped, outcome.failed,
+        );
+        if !outcome.created_tags.is_empty() {
+            line.push_str(&format!("; new: {}", outcome.created_tags.join(", ")));
+        }
+        if outcome.images_rejected {
+            line.push_str("; the endpoint refused images, so the run went text-only");
+        }
+        line
+    };
+    Ok(Rendered::new(result, human))
+}
+
+fn undo_autotag(env: &Env, request: AutoTagRequest) -> Result<Rendered, CliError> {
+    let (_, receiver) = env
+        .library
+        .start_auto_tag_undo(request)
+        .map_err(|error| CliError::runtime(format!("cannot start the undo job: {error:?}")))?;
+    let outcome = receiver
+        .recv()
+        .map_err(|_| CliError::runtime("the undo job did not run to completion"))?;
+    if let Some(error) = &outcome.error {
+        return Err(CliError::runtime(format!("undo failed: {error}")));
+    }
+
+    let result = json!({
+        "assets": outcome.assets,
+        "detached": outcome.detached,
+        "orphaned_tags": outcome.orphaned,
+        "cancelled": outcome.cancelled,
+    });
+    let mut human = format!(
+        "{} tag(s) detached from {} asset(s)",
+        outcome.detached, outcome.assets
+    );
+    if !outcome.orphaned.is_empty() {
+        human.push_str(&format!(
+            "; now empty: {} (reported, not deleted)",
+            outcome.orphaned.join(", ")
+        ));
+    }
+    Ok(Rendered::new(result, human))
 }
