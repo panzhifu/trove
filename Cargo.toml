@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/trove-core", "crates/trove-app"]
+members = ["crates/trove-cli", "crates/trove-core", "crates/trove-app"]
 resolver = "3"
 
 [profile.release]
@@ -49,6 +49,12 @@ rusqlite = { version = "0.37", features = ["bundled", "chrono", "uuid", "serde_j
 # ride in the graph (`oo7` via `gpui-pre` pins 0.10, `gpui-kit-assets` asks
 # for 0.11) — that is upstream's business, not a pin of ours to maintain.
 blake3 = { version = "1", features = ["rayon"] }
+
+# CLI parsing for the headless `trove` binary (`crates/trove-cli`). Declared
+# here like every other dependency so the workspace keeps one copy; `derive`
+# is what turns the command tree into the `--help` page that scripts and
+# agents read to learn the surface.
+clap = { version = "4", features = ["derive"] }
 
 # Utilities
 chrono = { version = "0.4", features = ["serde"] }
