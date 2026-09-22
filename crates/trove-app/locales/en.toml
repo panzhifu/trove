@@ -376,7 +376,7 @@ ai_not_configured = "Fill in the endpoint address and model name above first"
 
 chat_endpoint = "Analysis model"
 chat_vendor = "Vendor"
-chat_vendor_desc = "Which vendor's API shape to speak: openai, anthropic, gemini or dashscope."
+chat_vendor_desc = "Which vendor's API shape to speak. Supported: OpenAI, Anthropic, Google Gemini, Alibaba DashScope. Picking one fills in its official endpoint; a relay or local server can be typed over it below."
 chat_model = "Model"
 chat_send_images = "Send thumbnails"
 chat_send_images_desc = "Attach each asset's thumbnail so the model can look at it. Turn this off for a text-only model — otherwise the first request discovers that by being refused."

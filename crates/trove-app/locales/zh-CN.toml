@@ -374,7 +374,7 @@ ai_not_configured = "请先在上方填写接口地址与模型名称"
 
 chat_endpoint = "分析模型"
 chat_vendor = "厂商"
-chat_vendor_desc = "使用哪家的 API 形态：openai、anthropic、gemini 或 dashscope。"
+chat_vendor_desc = "使用哪家的 API 形态，支持 OpenAI、Anthropic、Google Gemini、Alibaba DashScope。选择后会自动填入官方接口地址，中转或本地服务可在下方地址栏改回。"
 chat_model = "模型"
 chat_send_images = "发送缩略图"
 chat_send_images_desc = "把素材缩略图一并发给模型。纯文本模型请关闭——否则第一次请求会以「被拒」的方式发现这件事。"

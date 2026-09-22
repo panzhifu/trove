@@ -52,6 +52,32 @@ pub(super) use trove_core::config::{AppConfig, Appearance};
 pub(super) use trove_core::keybindings;
 pub(super) use trove_core::store::stats::LibraryStats;
 
+/// The AI vendors Trove can talk to, as `(stored id, display name)` pairs in
+/// the shape [`SettingField::dropdown`] takes. Shared by every settings page
+/// that configures an endpoint (ai, search) so the option lists cannot drift.
+pub(super) fn vendor_options() -> Vec<(SharedString, SharedString)> {
+    use trove_core::ai::vendor::VendorId;
+    [
+        (VendorId::OpenAI, "OpenAI"),
+        (VendorId::Anthropic, "Anthropic"),
+        (VendorId::Gemini, "Google Gemini"),
+        (VendorId::DashScope, "Alibaba DashScope"),
+    ]
+    .into_iter()
+    .map(|(id, name)| (SharedString::from(id.as_str()), SharedString::from(name)))
+    .collect()
+}
+
+/// Apply a vendor choice from a settings dropdown: store the id and point
+/// the endpoint at that vendor's official address. The endpoint field stays
+/// editable, so a relay or a local server can be typed over it afterwards.
+pub(super) fn apply_vendor_choice(vendor: &mut String, base_url: &mut String, value: &str) {
+    *vendor = value.to_string();
+    if let Ok(id) = value.parse::<trove_core::ai::vendor::VendorId>() {
+        *base_url = id.default_base_url().to_string();
+    }
+}
+
 /// Which page a freshly-opened settings window shows. Menu items and other
 /// entry points deep-link here; the index must track the `.page(...)` order
 /// in [`SettingsView::render`].
