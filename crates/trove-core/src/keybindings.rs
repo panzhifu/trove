@@ -116,6 +116,11 @@ pub fn default_keybindings() -> Vec<KeyBindingConfig> {
             context: Some("Workspace"),
         },
         KeyBindingConfig {
+            action: "AutoTag",
+            key: "",
+            context: Some("Workspace"),
+        },
+        KeyBindingConfig {
             // `f`, as in mpv/VLC/YouTube. The context is the video preview's,
             // not `Workspace`: a bare letter bound there would shadow typing
             // in the search box, which lives in the same context.

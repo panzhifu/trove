@@ -134,6 +134,7 @@ fn build_menus() -> Vec<Menu> {
                     BatchConvert,
                 ),
                 MenuItem::action(rust_i18n::t!("edit.menu").to_string(), BatchEdit),
+                MenuItem::action(rust_i18n::t!("autotag.menu").to_string(), AutoTag),
             ],
             disabled: false,
         },

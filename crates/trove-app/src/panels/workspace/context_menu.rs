@@ -18,7 +18,7 @@ use super::open_with_apps::discover_apps;
 /// Build the right-click context menu for an asset cell.
 pub(crate) fn asset_context_menu(
     menu: PopupMenu,
-    _window: &mut Window,
+    window: &mut Window,
     cx: &mut Context<PopupMenu>,
     controller: &Entity<LibraryController>,
     asset_id: Uuid,
@@ -69,16 +69,16 @@ pub(crate) fn asset_context_menu(
     let c_status = controller.clone();
     let c_commercial = controller.clone();
 
-    let add_submenu = PopupMenu::build(_window, cx, move |menu, _window, cx| {
+    let add_submenu = PopupMenu::build(window, cx, move |menu, _window, cx| {
         build_collection_submenu(menu, &ctl_build, asset_id, cx)
     });
-    let status_submenu = PopupMenu::build(_window, cx, {
+    let status_submenu = PopupMenu::build(window, cx, {
         let c_status = c_status.clone();
         move |menu, _window, _cx| {
             build_usage_status_submenu(menu, &c_status, asset_id, current_status)
         }
     });
-    let commercial_submenu = PopupMenu::build(_window, cx, move |menu, _window, _cx| {
+    let commercial_submenu = PopupMenu::build(window, cx, move |menu, _window, _cx| {
         build_commercial_use_submenu(menu, &c_commercial, asset_id, current_clearance)
     });
 
@@ -93,6 +93,19 @@ pub(crate) fn asset_context_menu(
 
     let mut menu = menu
         .min_w(px(200.))
+        .item(
+            PopupMenuItem::new(rust_i18n::t!("autotag.menu").to_string()).on_click({
+                let controller = controller.clone();
+                move |_, window, cx| {
+                    crate::library::jobs::start_auto_tag_app(
+                        &controller,
+                        crate::library::jobs::AutoTagTarget::Selection,
+                        window,
+                        cx,
+                    );
+                }
+            }),
+        )
         .item(
             PopupMenuItem::new(if favorite {
                 rust_i18n::t!("workspace.remove_from_favorites").to_string()
@@ -159,7 +172,7 @@ pub(crate) fn asset_context_menu(
         );
         // --- Open With submenu ---
         let open_with_menu =
-            build_open_with_submenu(_window, cx, controller, asset_id, path.clone());
+            build_open_with_submenu(window, cx, controller, asset_id, path.clone());
         menu = menu.item(PopupMenuItem::submenu(
             rust_i18n::t!("workspace.open_with").to_string(),
             open_with_menu,

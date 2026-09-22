@@ -143,6 +143,27 @@ pub(crate) fn selection_toolbar(
                     }),
             )
             .child(
+                Button::new("sel-autotag")
+                    .xsmall()
+                    .ghost()
+                    // `assets::IconName`, not `component::IconName`: the
+                    // latter is gpui-kit's default subset, which has no
+                    // sparkle — the variant exists, the SVG does not.
+                    .icon(gpui_kit::assets::IconName::Sparkles)
+                    .tooltip(rust_i18n::t!("autotag.menu").to_string())
+                    .on_click({
+                        let controller = controller.clone();
+                        move |_, window, cx| {
+                            crate::library::jobs::start_auto_tag_app(
+                                &controller,
+                                crate::library::jobs::AutoTagTarget::Selection,
+                                window,
+                                cx,
+                            );
+                        }
+                    }),
+            )
+            .child(
                 Button::new("sel-fav")
                     .xsmall()
                     .ghost()

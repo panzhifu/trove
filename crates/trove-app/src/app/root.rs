@@ -1187,6 +1187,17 @@ impl Render for AppView {
             .on_action(cx.listener(|this, _: &BatchEdit, window, cx| {
                 crate::dialogs::edit::EditDialog::open(window, cx, this.controller.clone());
             }))
+            // Acts on the selection, like the other batch actions: hitting it
+            // with nothing selected is a mistake worth naming rather than a
+            // reason to spend money on the whole library.
+            .on_action(cx.listener(|this, _: &AutoTag, window, cx| {
+                crate::library::jobs::start_auto_tag_app(
+                    &this.controller,
+                    crate::library::jobs::AutoTagTarget::Selection,
+                    window,
+                    cx,
+                );
+            }))
             .on_action(cx.listener(|this, _: &ExportXmp, window, cx| {
                 crate::library::jobs::export_xmp_app(&this.controller, window, cx);
             }))
