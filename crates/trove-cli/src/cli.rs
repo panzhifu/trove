@@ -106,6 +106,15 @@ pub enum Command {
     /// Import files or directories.
     Import(ImportArgs),
 
+    /// Ask a chat model to tag assets.
+    ///
+    /// Tags already in the library are offered to the model to reuse; the few
+    /// it invents are filed under a parent tag so the whole run can be
+    /// reviewed — or thrown away with `--undo`. Assets a previous run already
+    /// described are skipped, so running it twice costs nothing the second
+    /// time.
+    Autotag(AutotagArgs),
+
     /// Edit an asset's metadata.
     Set(SetArgs),
 
@@ -263,6 +272,67 @@ pub struct ImportArgs {
     /// Report what would be imported without importing anything.
     #[arg(long)]
     pub dry_run: bool,
+}
+
+/// What `autotag` runs with. Everything is optional: what is left out comes
+/// from the library's stored chat configuration, which is also where the
+/// endpoint and the model live.
+#[derive(Debug, Args)]
+pub struct AutotagArgs {
+    /// Tag only these assets. Omit for every live asset.
+    #[arg(long, value_name = "UUID")]
+    pub ids: Vec<String>,
+
+    /// Stop after this many assets.
+    #[arg(long, short = 'n', value_name = "N")]
+    pub limit: Option<u64>,
+
+    /// Report what would be tagged and stop. No request is sent, nothing is
+    /// written — not even an empty tag.
+    #[arg(long)]
+    pub dry_run: bool,
+
+    /// Re-tag assets a previous run already described, instead of skipping
+    /// them.
+    #[arg(long)]
+    pub force: bool,
+
+    /// Send text only, even when the endpoint would take an image. Worth
+    /// setting for a text-only model: without it the first request discovers
+    /// that by being refused.
+    #[arg(long, conflicts_with = "with_images")]
+    pub no_images: bool,
+
+    /// Send the asset's thumbnail as well, overriding a stored
+    /// `send_images: false`.
+    #[arg(long, conflicts_with = "no_images")]
+    pub with_images: bool,
+
+    /// How many tags per asset the model may invent. `0` restricts it to the
+    /// library's existing vocabulary.
+    #[arg(long, value_name = "N")]
+    pub max_new_tags: Option<u32>,
+
+    /// Parent tag for the invented ones; pass an empty string to file them at
+    /// the root.
+    #[arg(long, value_name = "TAG")]
+    pub parent_tag: Option<String>,
+
+    /// Language to write tags in (`zh-CN`, `en`, …); defaults to the
+    /// library's interface language.
+    #[arg(long, value_name = "LOCALE")]
+    pub language: Option<String>,
+
+    /// Requests in flight. Four by default; one for a rate-limited endpoint.
+    #[arg(long, value_name = "N")]
+    pub threads: Option<usize>,
+
+    /// Detach everything previous runs added, and forget they ran.
+    ///
+    /// Needs no endpoint: taking tags back asks no model anything. Tags left
+    /// without assets are reported, never deleted.
+    #[arg(long, conflicts_with_all = ["dry_run", "force", "no_images", "with_images", "max_new_tags", "parent_tag", "limit"])]
+    pub undo: bool,
 }
 
 #[derive(Debug, Args)]

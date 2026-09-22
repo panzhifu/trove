@@ -59,6 +59,7 @@ fn dispatch(args: &Cli) -> Result<(), CliError> {
                 Command::Folders => read::folders(&env)?,
                 Command::Doctor => read::doctor(&env)?,
                 Command::Import(import) => write::import(&env, import, &style)?,
+                Command::Autotag(autotag) => write::autotag(&env, autotag, &style)?,
                 Command::Set(set) => write::set(&env, set)?,
                 Command::Tag(tag) => write::tag(&env, tag)?,
                 Command::Trash(ids) => write::trash(&env, ids)?,
