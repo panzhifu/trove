@@ -97,9 +97,9 @@ pub(crate) fn asset_context_menu(
             PopupMenuItem::new(rust_i18n::t!("autotag.menu").to_string()).on_click({
                 let controller = controller.clone();
                 move |_, window, cx| {
-                    crate::library::jobs::start_auto_tag_app(
+                    crate::library::jobs::start_analysis_app(
                         &controller,
-                        crate::library::jobs::AutoTagTarget::Selection,
+                        crate::library::jobs::AnalysisTarget::Selection,
                         window,
                         cx,
                     );

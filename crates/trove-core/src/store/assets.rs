@@ -238,9 +238,12 @@ fn query_items(
     let mut sql = format!("SELECT {COLS} FROM assets {where_sql}");
     let order_col = match q.sort {
         crate::model::AssetSort::CreatedAt => "created_at",
+        crate::model::AssetSort::UpdatedAt => "updated_at",
         crate::model::AssetSort::Name => "file_name COLLATE NOCASE",
         crate::model::AssetSort::SizeBytes => "size_bytes",
         crate::model::AssetSort::Rating => "rating",
+        crate::model::AssetSort::Duration => "duration_ms",
+        crate::model::AssetSort::Color => "json_extract(extra, '$.visual.dominant_color')",
     };
     let dir = if q.sort_desc { "DESC" } else { "ASC" };
     sql.push_str(&format!(" ORDER BY {order_col} {dir}, id ASC"));

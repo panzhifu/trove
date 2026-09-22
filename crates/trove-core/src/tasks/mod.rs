@@ -30,7 +30,7 @@ use std::time::{Duration, Instant};
 use crate::model::new_id;
 use uuid::Uuid;
 
-pub mod autotag;
+pub mod ai_analysis;
 pub mod embed;
 pub mod import;
 pub mod watch;
@@ -57,6 +57,9 @@ pub enum TaskKind {
     /// Asking a chat model to tag assets. Serial by nature — one request per
     /// asset — so it is the longest-running job the library has.
     AutoTag,
+    /// Multimodal AI analysis: description, tags, and rating from a vision
+    /// model. One API call per asset.
+    AiAnalysis,
 }
 
 impl TaskKind {
@@ -73,6 +76,7 @@ impl TaskKind {
             TaskKind::WatchScan => "watch-scan",
             TaskKind::EmbeddingBackfill => "embedding-backfill",
             TaskKind::AutoTag => "auto-tag",
+            TaskKind::AiAnalysis => "ai-analysis",
         }
     }
 }

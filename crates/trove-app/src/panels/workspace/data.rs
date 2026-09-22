@@ -260,6 +260,9 @@ impl WorkspacePanel {
             tag: key.tag,
             folder: key.folder.clone(),
             search: key.search.clone(),
+            // The AI plan for this term, when the planner tier is on and it
+            // has answered. `browse` consults it only when `tiers.ai` is set.
+            ai_plan: ctl.ai_plan.clone(),
             kind: key.filter_kind,
             is_favorite: key.filter_favorite,
             orientation: key.filter_orientation,
@@ -273,6 +276,9 @@ impl WorkspacePanel {
             // yet, or a vector for a term the user has typed past — is the
             // ordinary text-only search; the query checks the term itself.
             vector: ctl.query_vector.clone(),
+            // Which search legs may run, resolved from the config onto the
+            // controller.
+            tiers: ctl.search_tiers,
         };
         let conn = ctl.library.store().conn();
         // Flush pending outbox rows first so a just-finished write (import,
@@ -284,10 +290,12 @@ impl WorkspacePanel {
         let drained = ctl.library.drain_search_queue();
         let text_index = ctl.library.text_index();
         // The index the vector leg scores against — the same cached one the
-        // semantic search uses, fetched only when this pass has a vector.
+        // semantic search uses, fetched only when this pass has a vector and
+        // the semantic tier is actually on.
         let vector_index = ctx
             .vector
             .as_ref()
+            .filter(|_| ctx.tiers.semantic)
             .map(|query| ctl.library.cached_vector_index(&query.model, query.space));
         let page = match if count_total {
             ctx.run(conn, text_index, limit, vector_index.as_ref())

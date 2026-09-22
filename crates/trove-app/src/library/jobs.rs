@@ -14,13 +14,13 @@ use gpui_kit::component::notification::Notification;
 use gpui_kit::*;
 
 use trove_core::media::import::ImportStorage;
-use trove_core::tasks::autotag::{AutoTagOutcome, AutoTagRequest, UndoOutcome};
+use trove_core::tasks::ai_analysis::{AiAnalysisOutcome, AiAnalysisRunRequest, UndoOutcome};
 use trove_core::tasks::embed::EmbedOutcome;
 use trove_core::tasks::import::{self, ImportOptions, ImportOutcome, ImportSource};
 use trove_core::tasks::watch::{self, WatchSignal};
 use trove_core::tasks::{TaskEvent, TaskId, TaskKind, TaskManager, TaskStatus};
 
-use crate::library::{AiProbe, ChatProbe, LibraryController};
+use crate::library::{AiProbe, AnalysisProbe, LibraryController};
 
 /// Marker type for the import progress toast: pushing with the same id
 /// replaces the previous toast instead of stacking a new one.
@@ -1009,6 +1009,11 @@ pub fn request_query_embedding_app(controller: &Entity<LibraryController>, cx: &
     if text.is_empty() {
         return;
     }
+    // The semantic tier must be on: a disabled or unconfigured leg is a no-op
+    // and the search stays text-only.
+    if !controller.read(cx).search_tiers.semantic {
+        return;
+    }
     let already_have_it = controller
         .read(cx)
         .query_vector
@@ -1017,21 +1022,18 @@ pub fn request_query_embedding_app(controller: &Entity<LibraryController>, cx: &
     if already_have_it {
         return;
     }
-    let Some(config) = trove_core::config::AppConfig::load()
-        .ai_embedding
-        .filter(trove_core::config::EmbeddingConfig::is_configured)
-    else {
+    let Some(endpoint) = trove_core::config::AppConfig::load().semantic_endpoint() else {
         return;
     };
     let provider: std::sync::Arc<dyn trove_core::ai::EmbeddingProvider> =
-        match trove_core::ai::OpenAICompatible::new(&config) {
+        match trove_core::ai::OpenAICompatible::new(&endpoint) {
             Ok(provider) => std::sync::Arc::new(provider),
             Err(error) => {
                 tracing::warn!(%error, "query embedding skipped: endpoint is misconfigured");
                 return;
             }
         };
-    let model = config.model.trim().to_string();
+    let model = endpoint.model.trim().to_string();
     let space = provider.asset_space();
     let controller = controller.clone();
 
@@ -1065,6 +1067,82 @@ pub fn request_query_embedding_app(controller: &Entity<LibraryController>, cx: &
                 vector,
             });
             // Re-run the query so the fused ranking replaces the text-only
+            // one that is on screen right now.
+            ctl.generation += 1;
+            cx.notify();
+        });
+    })
+    .detach();
+}
+
+/// Ask the planner for a structured plan for the just-committed search term,
+/// when the AI tier is on.
+///
+/// Silent by design, exactly like [`request_query_embedding_app`]: an
+/// unreachable planner, a bad model or a reply the validator rejects all
+/// leave the search exactly as it was — the raw term is already a complete
+/// answer, so the failure is logged rather than toasted.
+///
+/// The response is dropped unless the term is still the committed one, so a
+/// slow planner can never repaint an answer to a question the user has moved
+/// past.
+pub fn request_ai_plan_app(controller: &Entity<LibraryController>, cx: &mut App) {
+    let text = controller.read(cx).search_text.trim().to_string();
+    if text.is_empty() {
+        return;
+    }
+    if !controller.read(cx).search_tiers.ai {
+        return;
+    }
+    let config = trove_core::config::AppConfig::load().search.ai;
+    if !config.is_configured() {
+        return;
+    }
+    let provider: std::sync::Arc<dyn trove_core::ai::vendor::VendorAdapter> =
+        match config
+            .vendor
+            .parse::<trove_core::ai::vendor::VendorId>()
+            .map_err(|error| error.to_string())
+            .and_then(|vendor| {
+                trove_core::ai::vendor::build_adapter(
+                    vendor,
+                    &config.base_url,
+                    &config.api_key,
+                    &config.model,
+                )
+                .map_err(|error| error.to_string())
+            }) {
+            Ok(adapter) => std::sync::Arc::from(adapter),
+            Err(error) => {
+                tracing::warn!(%error, "AI search plan skipped: endpoint is misconfigured");
+                return;
+            }
+        };
+    let controller = controller.clone();
+
+    cx.spawn(async move |cx| {
+        let asked = text.clone();
+        let result: Result<trove_core::ai::search_planner::AiSearchPlan, String> = cx
+            .background_executor()
+            .spawn(async move {
+                let cancel = std::sync::atomic::AtomicBool::new(false);
+                trove_core::ai::search_planner::plan(provider.as_ref(), &asked, &cancel)
+                    .map_err(|error| error.to_string())
+            })
+            .await;
+        let plan = match result {
+            Ok(plan) => plan,
+            Err(error) => {
+                tracing::warn!(%error, "AI search plan failed; searching with the raw term");
+                return;
+            }
+        };
+        controller.update(cx, |ctl, cx| {
+            if ctl.search_text.trim() != text {
+                return; // the user moved on while the request was in flight
+            }
+            ctl.ai_plan = Some(plan);
+            // Re-run the query so the planned search replaces the raw-term
             // one that is on screen right now.
             ctl.generation += 1;
             cx.notify();
@@ -1179,15 +1257,15 @@ fn embedding_outcome_toast(outcome: &EmbedOutcome) -> Notification {
     }
 }
 
-// ============================ automatic tagging ==============================
+// ============================ AI analysis ===================================
 
-/// Marker for the keyed auto-tag toast: pushing with the same id replaces the
+/// Marker for the keyed analysis toast: pushing with the same id replaces the
 /// previous one instead of stacking a toast per progress event.
-pub struct AutoTagNotice;
+pub struct AnalysisNotice;
 
-/// What a tagging run is asked to tag.
+/// What an analysis run is asked to look at.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AutoTagTarget {
+pub enum AnalysisTarget {
     /// The assets selected right now. What the grid's menu and toolbar ask
     /// for: an action on a selection should stay on it.
     Selection,
@@ -1196,36 +1274,36 @@ pub enum AutoTagTarget {
     WholeLibrary,
 }
 
-/// Prove the chat endpoint works (Settings ▸ AI, tagging half): send one
-/// throwaway prompt and show what came back.
+/// Prove the analysis endpoint works (Settings ▸ AI): send one throwaway
+/// prompt and show what came back.
 ///
 /// Deliberately not a task-manager job, for the same reasons the embedding
-/// probe is not: it writes no rows, must not occupy the tagging slot a real
+/// probe is not: it writes no rows, must not occupy the analysis slot a real
 /// run needs, and its answer is one line of text on the page.
-pub fn test_chat_endpoint_app(controller: &Entity<LibraryController>, cx: &mut App) {
-    if controller.read(cx).chat_probe.is_running() {
+pub fn test_analysis_endpoint_app(controller: &Entity<LibraryController>, cx: &mut App) {
+    if controller.read(cx).analysis_probe.is_running() {
         return;
     }
     let Some(config) = trove_core::config::AppConfig::load()
-        .ai_chat
-        .filter(trove_core::config::ChatConfig::is_configured)
+        .ai_analysis
+        .filter(trove_core::config::AiAnalysisConfig::is_configured)
     else {
-        set_chat_probe(
+        set_analysis_probe(
             controller,
-            chat_probe_failure(rust_i18n::t!("settings.ai_not_configured").to_string()),
+            analysis_probe_failure(rust_i18n::t!("settings.ai_not_configured").to_string()),
             cx,
         );
         return;
     };
-    let provider = match trove_core::ai::OpenAIChat::new(&config) {
+    let provider = match trove_core::ai::vendor::build_from_config(&config) {
         Ok(provider) => provider,
         Err(error) => {
-            set_chat_probe(controller, chat_probe_failure(error.to_string()), cx);
+            set_analysis_probe(controller, analysis_probe_failure(error.to_string()), cx);
             return;
         }
     };
 
-    set_chat_probe(controller, ChatProbe::Running, cx);
+    set_analysis_probe(controller, AnalysisProbe::Running, cx);
     let controller = controller.clone();
     cx.spawn(async move |cx| {
         // The reply is the test result, so it has to come back as a string:
@@ -1233,58 +1311,80 @@ pub fn test_chat_endpoint_app(controller: &Entity<LibraryController>, cx: &mut A
         let result: Result<String, String> = cx
             .background_executor()
             .spawn(async move {
-                use trove_core::ai::ChatProvider as _;
+                let cancel = std::sync::atomic::AtomicBool::new(false);
                 provider
-                    .complete(&trove_core::ai::ChatRequest {
-                        system: "Reply with one short sentence confirming you received this.",
-                        user: PROBE_TEXT,
-                        image: None,
-                    })
+                    .analyze(&probe_request(), &cancel)
                     .map(|reply| reply.trim().to_string())
-                    .map_err(|error| error.to_string())
+                    .map_err(|error| error.message)
             })
             .await;
         let probe = match result {
-            Ok(reply) if !reply.is_empty() => ChatProbe::Ok {
+            Ok(reply) if !reply.is_empty() => AnalysisProbe::Ok {
                 reply: shorten(&reply),
             },
             // A success with nothing in it means the server answered a shape
             // we cannot use; a green line would be a lie.
-            Ok(_) => chat_probe_failure(rust_i18n::t!("settings.ai_probe_empty").to_string()),
-            Err(message) => chat_probe_failure(message),
+            Ok(_) => analysis_probe_failure(rust_i18n::t!("settings.ai_probe_empty").to_string()),
+            Err(message) => analysis_probe_failure(message),
         };
         controller.update(cx, |ctl, cx| {
-            ctl.chat_probe = probe;
+            ctl.analysis_probe = probe;
             cx.notify();
         });
     })
     .detach();
 }
 
-/// Start a tagging run from the settings page or the grid.
+/// The throwaway request the probe sends: no image, one field, no vocabulary.
+fn probe_request() -> trove_core::ai::analysis::AiAnalysisRequest {
+    use trove_core::ai::analysis::{
+        AiAnalysisFields, AiAnalysisRequest, AiAnalysisSettings, MediaType,
+    };
+    AiAnalysisRequest {
+        asset_id: uuid::Uuid::nil(),
+        display_name: "probe".into(),
+        file_name: "probe".into(),
+        mime: "text/plain".into(),
+        media_type: MediaType::Other,
+        thumbnail_jpeg: None,
+        contact_sheet_jpeg: None,
+        language: "en".into(),
+        enabled_fields: AiAnalysisFields {
+            description: true,
+            tags: false,
+            rating: false,
+        },
+        metadata_lines: vec![],
+        existing_tag_names: vec![],
+        vocabulary: vec![],
+        settings: AiAnalysisSettings::default(),
+    }
+}
+
+/// Start an analysis run from the settings page or the grid.
 ///
 /// Returns `false` when the endpoint is not configured, nothing is selected
-/// (for [`AutoTagTarget::Selection`]) or another run already holds the slot —
+/// (for [`AnalysisTarget::Selection`]) or another run already holds the slot —
 /// in each case a toast says which.
-pub fn start_auto_tag_app(
+pub fn start_analysis_app(
     controller: &Entity<LibraryController>,
-    target: AutoTagTarget,
+    target: AnalysisTarget,
     window: &mut Window,
     cx: &mut App,
 ) -> bool {
-    let chat = trove_core::config::AppConfig::load()
-        .ai_chat
+    let analysis = trove_core::config::AppConfig::load()
+        .ai_analysis
         .unwrap_or_default();
-    if !chat.is_configured() {
+    if !analysis.is_configured() {
         window.push_notification(
             Notification::warning(rust_i18n::t!("settings.ai_not_configured").to_string()),
             cx,
         );
         return false;
     }
-    let provider: std::sync::Arc<dyn trove_core::ai::ChatProvider> =
-        match trove_core::ai::OpenAIChat::new(&chat) {
-            Ok(provider) => std::sync::Arc::new(provider),
+    let provider: std::sync::Arc<dyn trove_core::ai::vendor::VendorAdapter> =
+        match trove_core::ai::vendor::build_from_config(&analysis) {
+            Ok(provider) => std::sync::Arc::from(provider),
             Err(error) => {
                 window.push_notification(Notification::warning(error.to_string()), cx);
                 return false;
@@ -1292,7 +1392,7 @@ pub fn start_auto_tag_app(
         };
 
     let only = match target {
-        AutoTagTarget::Selection => {
+        AnalysisTarget::Selection => {
             let selection = controller.read(cx).selected_assets.as_ref().clone();
             if selection.is_empty() {
                 window.push_notification(
@@ -1303,15 +1403,15 @@ pub fn start_auto_tag_app(
             }
             selection
         }
-        AutoTagTarget::WholeLibrary => Vec::new(),
+        AnalysisTarget::WholeLibrary => Vec::new(),
     };
 
-    let request = AutoTagRequest {
+    let request = AiAnalysisRunRequest {
         only: only.clone(),
-        ..AutoTagRequest::default()
+        ..AiAnalysisRunRequest::default()
     };
     let manager = controller.read(cx).library.tasks().clone();
-    let started = controller.update(cx, |ctl, _| ctl.library.start_auto_tag(provider, request));
+    let started = controller.update(cx, |ctl, _| ctl.library.start_ai_analysis(provider, request));
     let Ok((task_id, rx)) = started else {
         return false; // one run at a time; the running toast is already up
     };
@@ -1322,40 +1422,41 @@ pub fn start_auto_tag_app(
         rust_i18n::t!("autotag.started", count = only.len()).to_string()
     };
     window.push_notification(
-        Notification::info(started_text).id1::<AutoTagNotice>("autotag-progress"),
+        Notification::info(started_text).id1::<AnalysisNotice>("autotag-progress"),
         cx,
     );
-    watch_auto_tag_job(
+    watch_analysis_job(
         controller.clone(),
         manager,
         task_id,
         rx,
         window.window_handle(),
-        |outcome: &AutoTagOutcome| autotag_outcome_toast(outcome),
+        |outcome: &AiAnalysisOutcome| analysis_outcome_toast(outcome),
         cx,
     );
     true
 }
 
-/// Detach every tag the automatic tagger ever added. Needs no endpoint.
-pub fn start_auto_tag_undo_app(
+/// Detach every tag the analysis ever added. Needs no endpoint.
+pub fn start_analysis_undo_app(
     controller: &Entity<LibraryController>,
     window: &mut Window,
     cx: &mut App,
 ) -> bool {
     let manager = controller.read(cx).library.tasks().clone();
     let started = controller.update(cx, |ctl, _| {
-        ctl.library.start_auto_tag_undo(AutoTagRequest::default())
+        ctl.library
+            .start_ai_analysis_undo(AiAnalysisRunRequest::default())
     });
     let Ok((task_id, rx)) = started else {
         return false; // a run or an undo is already going
     };
     window.push_notification(
         Notification::info(rust_i18n::t!("autotag.undo_running").to_string())
-            .id1::<AutoTagNotice>("autotag-progress"),
+            .id1::<AnalysisNotice>("autotag-progress"),
         cx,
     );
-    watch_auto_tag_job(
+    watch_analysis_job(
         controller.clone(),
         manager,
         task_id,
@@ -1367,23 +1468,23 @@ pub fn start_auto_tag_undo_app(
     true
 }
 
-/// Ask the running tagging job to stop at its next cancellation checkpoint (a
+/// Ask the running analysis job to stop at its next cancellation checkpoint (a
 /// batch boundary); the outcome toast replaces the progress toast.
-pub fn cancel_auto_tag_app(controller: &Entity<LibraryController>, cx: &mut App) {
+pub fn cancel_analysis_app(controller: &Entity<LibraryController>, cx: &mut App) {
     let manager = controller.read(cx).library.tasks().clone();
     if let Some(task) = manager
         .snapshot()
         .into_iter()
-        .find(|task| task.kind == TaskKind::AutoTag && task.status == TaskStatus::Running)
+        .find(|task| task.kind == TaskKind::AiAnalysis && task.status == TaskStatus::Running)
     {
         manager.cancel(task.id);
     }
 }
 
-/// Poll a tagging job until it settles, translating events into toasts — the
-/// loop [`watch_embedding`] runs, generic here because the two tagging jobs
+/// Poll an analysis job until it settles, translating events into toasts — the
+/// loop [`watch_embedding`] runs, generic here because the two analysis jobs
 /// (a run and an undo) differ only in what they return.
-fn watch_auto_tag_job<T: Send + 'static>(
+fn watch_analysis_job<T: Send + 'static>(
     controller: Entity<LibraryController>,
     manager: TaskManager,
     task_id: TaskId,
@@ -1408,18 +1509,18 @@ fn watch_auto_tag_job<T: Send + 'static>(
                                     rust_i18n::t!("autotag.running", done = done, total = total)
                                         .to_string(),
                                 )
-                                .id1::<AutoTagNotice>("autotag-progress"),
+                                .id1::<AnalysisNotice>("autotag-progress"),
                                 cx,
                             );
                         });
                     }
                     TaskEvent::Failed { error, .. } => {
-                        settled = Some(keyed_autotag(Notification::warning(
+                        settled = Some(keyed_analysis(Notification::warning(
                             rust_i18n::t!("autotag.failed", error = error).to_string(),
                         )));
                     }
                     TaskEvent::Cancelled { .. } => {
-                        settled = Some(keyed_autotag(Notification::info(
+                        settled = Some(keyed_analysis(Notification::info(
                             rust_i18n::t!("autotag.cancelled").to_string(),
                         )));
                     }
@@ -1449,14 +1550,14 @@ fn watch_auto_tag_job<T: Send + 'static>(
 }
 
 /// Attach the progress toast's key so a settle replaces it, never stacks.
-fn keyed_autotag(note: Notification) -> Notification {
-    note.id1::<AutoTagNotice>("autotag-progress")
+fn keyed_analysis(note: Notification) -> Notification {
+    note.id1::<AnalysisNotice>("autotag-progress")
 }
 
-fn autotag_outcome_toast(outcome: &AutoTagOutcome) -> Notification {
+fn analysis_outcome_toast(outcome: &AiAnalysisOutcome) -> Notification {
     let mut text = rust_i18n::t!(
         "autotag.done",
-        tagged = outcome.tagged,
+        tagged = outcome.analysed,
         unchanged = outcome.unchanged,
         skipped = outcome.skipped,
         failed = outcome.failed
@@ -1464,14 +1565,14 @@ fn autotag_outcome_toast(outcome: &AutoTagOutcome) -> Notification {
     .to_string();
     if outcome.images_rejected {
         // Worth saying rather than hiding: the endpoint could not take the
-        // thumbnails, so the tags came from text alone.
+        // thumbnails, so the result came from text alone.
         text.push(' ');
         text.push_str(rust_i18n::t!("autotag.text_only").as_ref());
     }
     if outcome.failed > 0 {
-        keyed_autotag(Notification::warning(text))
+        keyed_analysis(Notification::warning(text))
     } else {
-        keyed_autotag(Notification::success(text))
+        keyed_analysis(Notification::success(text))
     }
 }
 
@@ -1482,21 +1583,22 @@ fn undo_outcome_toast(outcome: &UndoOutcome) -> Notification {
         assets = outcome.assets
     )
     .to_string();
-    keyed_autotag(Notification::info(text))
+    keyed_analysis(Notification::info(text))
 }
 
-/// A [`ChatProbe::Failed`] carrying a localized reason.
-fn chat_probe_failure(reason: impl Into<String>) -> ChatProbe {
-    ChatProbe::Failed {
+/// An [`AnalysisProbe::Failed`] carrying a localized reason.
+fn analysis_probe_failure(reason: impl Into<String>) -> AnalysisProbe {
+    AnalysisProbe::Failed {
         message: reason.into(),
     }
 }
 
-/// Record a chat-probe result and repaint, so the page shows it whether the
-/// test finished on the UI thread (bad configuration) or a worker (a call).
-fn set_chat_probe(controller: &Entity<LibraryController>, probe: ChatProbe, cx: &mut App) {
+/// Record an analysis-probe result and repaint, so the page shows it whether
+/// the test finished on the UI thread (bad configuration) or a worker (a
+/// call).
+fn set_analysis_probe(controller: &Entity<LibraryController>, probe: AnalysisProbe, cx: &mut App) {
     controller.update(cx, |ctl, cx| {
-        ctl.chat_probe = probe;
+        ctl.analysis_probe = probe;
         cx.notify();
     });
     cx.refresh_windows();

@@ -1,25 +1,25 @@
-//! AI embedding providers: the seam between Trove and the model servers.
+//! AI providers: the seam between Trove and the model servers.
 //!
-//! Trove owns the vectors — where they live, how they are scored, when they
-//! are stale — and stays deliberately unopinionated about where they come
-//! from. That seam is [`EmbeddingProvider`]: one trait with two concrete
-//! shapes, [`openai::OpenAICompatible`] for every OpenAI-compatible server
-//! (OpenAI, Ollama, LM Studio, vLLM, proxies) and [`mock::MockProvider`]
-//! for tests. Future providers (a local CLIP, a multimodal endpoint) implement
-//! the same trait and inherit the whole storage/search/backfill stack.
+//! Two distinct AI capabilities share this module:
+//!
+//! - **Embeddings** ([`EmbeddingProvider`]): turn text into vectors for
+//!   semantic search. One vector per (asset, model, space).
+//! - **Multimodal analysis** ([`analysis::VendorAdapter`]): hand a vision
+//!   model an asset's thumbnail and metadata; get back a description, tags,
+//!   and optional rating. See the [`analysis`] and [`vendor`] modules.
 //!
 //! Everything here is synchronous by design: providers run on background
 //! task threads ([`crate::tasks`]), which are plain `std::thread`s.
 
-pub mod chat;
+pub mod analysis;
+pub mod search_planner;
 mod http;
 pub mod mock;
-pub mod openai;
-pub mod tagging;
+mod embedding_openai;
+pub mod vendor;
 
-pub use chat::{ChatProvider, ChatRequest, OpenAIChat};
+pub use embedding_openai::OpenAICompatible;
 pub use mock::MockProvider;
-pub use openai::OpenAICompatible;
 
 use crate::error::Result;
 use crate::model::{Asset, EmbeddingSpace};

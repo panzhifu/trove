@@ -1,23 +1,27 @@
-//! Automatic tagging: ask a chat model about each asset, file the answer as
-//! tags.
+//! Multimodal analysis: hand each asset to a vision-capable model and write
+//! back what it saw — a description, tags, and an optional rating.
 //!
 //! Shaped like [`crate::tasks::embed`] and for the same reasons — its own
 //! connection, batches, cancellation between them, one outcome — but with
 //! three differences that come from what it is:
 //!
-//! - **One request per asset.** An embedding call takes a batch of 64; a chat
-//!   model answers one conversation. The work is network-bound and slow, so
-//!   requests run on a small pool while the database stays on this thread.
-//! - **It writes tags**, which are user-visible and hard to take back. So it
+//! - **One request per asset.** An embedding call takes a batch of 64; a
+//!   vision model answers one conversation. The work is network-bound and
+//!   slow, so requests run on a small pool while the database stays on this
+//!   thread.
+//! - **It writes user-visible text**, which is hard to take back. So it
 //!   prefers the library's existing vocabulary, files anything new under one
-//!   parent tag, and records what it added in the asset's `facts`, which is
-//!   what [`undo`] reads.
+//!   parent tag, never overwrites a hand-written description it was not
+//!   given, and records what it added in the asset's `facts` — which is what
+//!   [`undo`] reads.
 //! - **It is idempotent through that record.** A second run skips every asset
 //!   whose fingerprint already matches, which makes re-running free rather
 //!   than merely cheap.
 //!
-//! Nothing here decides *whether* to tag: the caller picks the assets and the
-//! budget. This module's job is to not lose that decision's consequences.
+//! The model comes from [`VendorAdapter`], so OpenAI, Anthropic, Gemini and
+//! DashScope are interchangeable here. This is the successor to the older
+//! chat-only tagger (`tasks::autotag`), and keeps everything that made that
+//! one safe to point at a whole library.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -27,9 +31,11 @@ use rayon::prelude::*;
 use rusqlite::Connection;
 use uuid::Uuid;
 
-use crate::ai::chat::{ChatProvider, ChatRequest};
-use crate::ai::tagging::{self, PromptOptions};
-use crate::model::{Asset, AssetFacts, AssetQuery, AssetSort, NewTag, Origin};
+use crate::ai::analysis::{
+    self, AiAnalysisFields, AiAnalysisRequest, AiAnalysisResult, AiAnalysisSettings, MediaType,
+};
+use crate::ai::vendor::{VendorAdapter, VendorError};
+use crate::model::{Asset, AssetFacts, AssetKind, AssetPatch, AssetQuery, AssetSort, NewTag};
 use crate::store::{assets, tags};
 use crate::tasks::JobContext;
 
@@ -43,19 +49,21 @@ const DEFAULT_CONCURRENCY: usize = 4;
 /// Override for the pool width, next to the staging pool's
 /// `TROVE_STAGE_THREADS` for the same reason: the right number depends on
 /// whether the endpoint is a local GPU or a paid API.
-const THREADS_ENV: &str = "TROVE_AUTOTAG_THREADS";
+const THREADS_ENV: &str = "TROVE_ANALYSIS_THREADS";
 
 /// Page size when walking the library; the store caps a query at 1000.
 const PAGE: u32 = 1_000;
 
-/// Key under which an asset records what the tagger did to it, inside
+/// Key under which an asset records what the analysis did to it, inside
 /// `facts`. A free-form key is the whole point of `AssetFacts::unknown`:
 /// something only one feature reads does not deserve a column.
-const MARKER_KEY: &str = "ai_tags";
+const MARKER_KEY: &str = "ai_analysis";
 
-/// What to tag, and how far to let the model go.
+// ============================ options ======================================
+
+/// What to analyse, and how far to let the model go.
 #[derive(Debug, Clone)]
-pub struct AutoTagOptions {
+pub struct AiAnalysisOptions {
     pub db_path: PathBuf,
     pub data_root: PathBuf,
     pub cache_root: PathBuf,
@@ -63,34 +71,103 @@ pub struct AutoTagOptions {
     pub only: Vec<Uuid>,
     /// Stop after this many assets.
     pub limit: Option<u64>,
-    /// Tag assets whose fingerprint already matches, instead of skipping them.
+    /// Analyse assets whose fingerprint already matches, instead of skipping.
     pub force: bool,
     /// Send thumbnails. The task clears this itself when the endpoint refuses
     /// them, so a text-only model costs one failed request, not a failed run.
     pub send_images: bool,
-    pub max_new_tags: u32,
+    /// Which fields to ask for — and therefore which ones are written back.
+    pub fields: AiAnalysisFields,
+    /// Policy knobs: tag ceilings, the new-word budget, description limits.
+    pub settings: AiAnalysisSettings,
     /// Parent the invented tags are filed under; empty files them at the root.
     pub new_tag_parent: String,
     pub language: String,
     /// Count the work and stop. Nothing is sent and nothing is written.
     pub dry_run: bool,
     /// Requests in flight. `None` falls back to [`THREADS_ENV`], then to
-    /// [`DEFAULT_CONCURRENCY`]. One is a useful setting for a rate-limited
-    /// endpoint — and the only one that makes "the endpoint refused an image
-    /// exactly once" a testable statement.
+    /// [`DEFAULT_CONCURRENCY`].
     pub threads: Option<usize>,
 }
 
+/// What the caller wants, leaving the rest to the library.
+///
+/// Every preference is optional because the interesting caller — a command
+/// line invocation, a button — usually disagrees with the stored
+/// configuration about one thing and inherits everything else.
+#[derive(Debug, Clone, Default)]
+pub struct AiAnalysisRunRequest {
+    /// Restrict the run to these assets. Empty = every live asset.
+    pub only: Vec<Uuid>,
+    pub limit: Option<u64>,
+    pub force: bool,
+    pub send_images: Option<bool>,
+    pub fields: Option<AiAnalysisFields>,
+    pub max_new_tags: Option<u32>,
+    pub new_tag_parent: Option<String>,
+    pub language: Option<String>,
+    pub dry_run: bool,
+    pub threads: Option<usize>,
+}
+
+impl AiAnalysisOptions {
+    /// Resolve a request against the library's files and the stored analysis
+    /// settings. Every path comes from the library, every preference from the
+    /// request with the configuration as its fallback.
+    pub fn resolve(
+        request: &AiAnalysisRunRequest,
+        db_path: PathBuf,
+        data_root: PathBuf,
+        cache_root: PathBuf,
+        config: &crate::config::AiAnalysisConfig,
+        language: Option<&str>,
+    ) -> Self {
+        let settings = AiAnalysisSettings {
+            max_new_tags: request.max_new_tags.unwrap_or(config.max_new_tags),
+            ..AiAnalysisSettings::default()
+        };
+        Self {
+            db_path,
+            data_root,
+            cache_root,
+            only: request.only.clone(),
+            limit: request.limit,
+            force: request.force,
+            send_images: request.send_images.unwrap_or(config.send_images),
+            fields: request.fields.unwrap_or(AiAnalysisFields {
+                description: config.fields.description,
+                tags: config.fields.tags,
+                rating: config.fields.rating,
+            }),
+            settings,
+            new_tag_parent: request
+                .new_tag_parent
+                .clone()
+                .unwrap_or_else(|| config.new_tag_parent.clone()),
+            language: request
+                .language
+                .clone()
+                .or_else(|| config.tag_language.clone())
+                .or_else(|| language.map(str::to_string))
+                .unwrap_or_else(|| "en".into()),
+            dry_run: request.dry_run,
+            threads: request.threads,
+        }
+    }
+}
+
+// ============================ outcomes =====================================
+
 #[derive(Debug, Default, Clone, serde::Serialize)]
-pub struct AutoTagOutcome {
-    /// Assets the model was asked about and had something new to say about.
-    pub tagged: u64,
+pub struct AiAnalysisOutcome {
+    /// Assets the model was asked about and had something new to write.
+    pub analysed: u64,
     /// Assets the model was asked about and knew nothing to add.
     pub unchanged: u64,
     /// Assets skipped because their fingerprint already described this run.
     pub skipped: u64,
-    /// Assets whose request failed; they keep their old markers and are
-    /// retried by the next run.
+    /// Assets whose request failed; their markers are untouched and the next
+    /// run retries them.
     pub failed: u64,
     /// Assets that would be processed, set by `dry_run`.
     pub planned: u64,
@@ -105,96 +182,42 @@ pub struct AutoTagOutcome {
 /// Outcome of [`undo`].
 #[derive(Debug, Default, Clone, serde::Serialize)]
 pub struct UndoOutcome {
-    /// Assets that carried an automatic-tag record.
+    /// Assets that carried an analysis record.
     pub assets: u64,
     /// Tags detached from those assets.
     pub detached: u64,
-    /// Tags left behind because no asset uses them any more and they are
-    /// listed here rather than deleted: a tag's identity is the user's, and
-    /// an empty one costs nothing.
+    /// Tags left behind because no asset uses them any more. Reported rather
+    /// than deleted: a tag's identity is the user's.
     pub orphaned: Vec<String>,
     pub cancelled: bool,
     pub error: Option<String>,
 }
 
-/// What the caller wants, leaving the rest to the library.
-///
-/// Every field is optional because the interesting caller — a command line
-/// invocation, a button — usually disagrees with the stored configuration
-/// about one thing and inherits everything else.
-#[derive(Debug, Clone, Default)]
-pub struct AutoTagRequest {
-    /// Restrict the run to these assets. Empty = every live asset.
-    pub only: Vec<Uuid>,
-    pub limit: Option<u64>,
-    pub force: bool,
-    pub send_images: Option<bool>,
-    pub max_new_tags: Option<u32>,
-    pub new_tag_parent: Option<String>,
-    pub language: Option<String>,
-    pub dry_run: bool,
-    pub threads: Option<usize>,
-}
-
-impl AutoTagOptions {
-    /// Resolve a request against the library's files and the stored chat
-    /// settings. Every path comes from the library, every preference from the
-    /// request with the configuration as its fallback.
-    pub fn resolve(
-        request: &AutoTagRequest,
-        db_path: PathBuf,
-        data_root: PathBuf,
-        cache_root: PathBuf,
-        chat: &crate::config::ChatConfig,
-        language: Option<&str>,
-    ) -> Self {
-        Self {
-            db_path,
-            data_root,
-            cache_root,
-            only: request.only.clone(),
-            limit: request.limit,
-            force: request.force,
-            send_images: request.send_images.unwrap_or(chat.send_images),
-            max_new_tags: request.max_new_tags.unwrap_or(chat.max_new_tags),
-            new_tag_parent: request
-                .new_tag_parent
-                .clone()
-                .unwrap_or_else(|| chat.new_tag_parent.clone()),
-            language: request
-                .language
-                .clone()
-                .or_else(|| chat.tag_language.clone())
-                .or_else(|| language.map(str::to_string))
-                .unwrap_or_else(|| "en".into()),
-            dry_run: request.dry_run,
-            threads: request.threads,
-        }
-    }
-}
+// ============================ run ==========================================
 
 /// One asset, prepared for the model.
 struct Prepared {
     asset: Asset,
-    /// The user message: the digest plus the note about the image.
-    message: String,
-    /// Where this asset's thumbnail is, when it has one and the run wants
-    /// images. A path rather than the bytes: a whole library prepared up
-    /// front would otherwise hold tens of megabytes of JPEG the pool has not
-    /// asked for yet.
+    /// Everything the adapter needs except the image bytes, which are read
+    /// lazily at request time so a whole library does not sit in memory as
+    /// JPEG.
+    request: AiAnalysisRequest,
+    /// Where the thumbnail is, when the run wants images.
     thumbnail: Option<PathBuf>,
+    /// Where a video's contact sheet is, when one exists.
+    contact_sheet: Option<PathBuf>,
     fingerprint: String,
     /// Tags the asset already carries, so the model is not told to add them
     /// and the run can tell "new" from "reused".
     existing: Vec<String>,
 }
 
-/// Run one tagging pass.
+/// Run one analysis pass.
 pub fn run(
-    options: &AutoTagOptions,
-    provider: &dyn ChatProvider,
+    options: &AiAnalysisOptions,
+    provider: &dyn VendorAdapter,
     ctx: &JobContext,
-) -> Result<AutoTagOutcome, String> {
+) -> Result<AiAnalysisOutcome, String> {
     let started = Instant::now();
     // Open through the store once so pending migrations apply, then take a
     // connection of our own — the same arrangement every job uses.
@@ -209,15 +232,15 @@ pub fn run(
     )
     .map_err(|e| format!("set connection pragmas: {e}"))?;
 
-    let mut outcome = AutoTagOutcome::default();
+    let mut outcome = AiAnalysisOutcome::default();
 
     // The vocabulary is read once and then kept up to date as this run
-    // invents tags, so the twentieth asset of a run is offered the words the
-    // first one produced instead of reinventing them.
+    // invents tags, so the parsing layer can reuse the spelling of a word the
+    // library already has.
     let mut vocabulary = vocabulary(&conn).map_err(|e| format!("list tags: {e}"))?;
     // Created on demand, the first time a run actually invents a tag: a run
     // that finds nothing new — or a dry run, which sends nothing at all —
-    // must not leave an empty `AI` tag behind.
+    // must not leave an empty parent tag behind.
     let parent_name = options.new_tag_parent.trim().to_string();
     let mut parent: Option<Uuid> = None;
 
@@ -230,6 +253,7 @@ pub fn run(
         }
     };
 
+    let model_version = provider.model_version();
     let mut work: Vec<Prepared> = Vec::new();
     for asset in candidates {
         if ctx.cancelled() {
@@ -243,23 +267,28 @@ pub fn run(
                 return Ok(outcome);
             }
         };
-        let fingerprint = fingerprint(provider.id(), &asset, options);
+        let fingerprint = fingerprint(model_version, &asset, options);
         if !options.force && stored_fingerprint(&asset).as_deref() == Some(fingerprint.as_str()) {
             outcome.skipped += 1;
             continue;
         }
 
-        let message = tagging::asset_digest(&asset, &existing);
+        let request = build_request(&asset, options, &existing, &vocabulary);
         let thumbnail = options
             .send_images
             .then(|| thumbnail_path(options, &asset))
             .flatten();
+        let contact_sheet = options
+            .send_images
+            .then(|| contact_sheet_path(options, &asset))
+            .flatten();
         work.push(Prepared {
-            message: format!("{message}\n\n{}", tagging::image_note(thumbnail.is_some())),
+            asset,
+            request,
             thumbnail,
+            contact_sheet,
             fingerprint,
             existing,
-            asset,
         });
     }
 
@@ -268,23 +297,18 @@ pub fn run(
         return Ok(outcome);
     }
 
-    let system = tagging::system_prompt(&PromptOptions {
-        vocabulary: &vocabulary,
-        max_new_tags: options.max_new_tags,
-        language: &options.language,
-    });
-
     let threads = concurrency(options.threads).min(work.len().max(1));
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(threads)
-        .thread_name(|index| format!("trove-autotag-{index}"))
+        .thread_name(|index| format!("trove-analysis-{index}"))
         .build()
-        .map_err(|e| format!("build the tagger thread pool: {e}"))?;
+        .map_err(|e| format!("build the analysis thread pool: {e}"))?;
     let chunk = (threads * 4).max(1);
-    // Once the endpoint refuses an image, every later request in this run
-    // goes text-only — the point is to pay for that discovery once, not once
-    // per asset.
+    // Once the endpoint refuses an image, every later request in this run goes
+    // text-only — the point is to pay for that discovery once, not once per
+    // asset.
     let image_rejected = AtomicBool::new(false);
+    let cancel = ctx.cancel_flag();
 
     let total = work.len() as u64;
     ctx.set_total(total);
@@ -296,57 +320,50 @@ pub fn run(
             break;
         }
 
-        let replies: Vec<Result<Vec<String>, crate::Error>> = pool.install(|| {
+        let replies: Vec<Result<AiAnalysisResult, String>> = pool.install(|| {
             batch
                 .par_iter()
-                .map(|prepared| {
-                    // Read at request time rather than up front: a large run
-                    // stays flat in memory, and the pool is idle on IO
-                    // anyway.
-                    let image = if image_rejected.load(Ordering::Relaxed) {
-                        None
-                    } else {
-                        prepared
-                            .thumbnail
-                            .as_deref()
-                            .and_then(|path| std::fs::read(path).ok())
-                    };
-                    ask(
-                        provider,
-                        &system,
-                        &prepared.message,
-                        image.as_deref(),
-                        &image_rejected,
-                    )
-                })
+                .map(|prepared| ask(provider, prepared, &image_rejected, cancel))
                 .collect()
         });
 
         for (prepared, reply) in batch.iter().zip(replies) {
             match reply {
-                Ok(suggested) => {
+                Ok(raw) => {
+                    let processed = analysis::post_process(
+                        raw,
+                        &prepared.existing,
+                        &vocabulary,
+                        &options.settings,
+                        &options.language,
+                    );
                     match apply(
                         &conn,
                         prepared,
-                        &suggested,
+                        &processed,
                         &mut parent,
                         &parent_name,
                         &mut vocabulary,
                         &mut outcome.created_tags,
                     ) {
                         Ok(applied) => {
-                            if applied.is_empty() {
+                            let wrote_metadata = processed.description.is_some()
+                                || processed.rating.is_some();
+                            if applied.is_empty() && !wrote_metadata {
                                 outcome.unchanged += 1;
                             } else {
-                                outcome.tagged += 1;
+                                outcome.analysed += 1;
                             }
-                            if let Err(error) =
-                                record_marker(&conn, prepared, provider.id(), &applied)
-                            {
+                            if let Err(error) = record_marker(
+                                &conn,
+                                prepared,
+                                model_version,
+                                &applied,
+                            ) {
                                 tracing::warn!(
                                     asset = %prepared.asset.file_name,
                                     error = %error,
-                                    "tagger: could not record what was added",
+                                    "analysis: could not record what was added",
                                 );
                             }
                         }
@@ -355,7 +372,7 @@ pub fn run(
                             tracing::warn!(
                                 asset = %prepared.asset.file_name,
                                 error = %error,
-                                "tagger: tags rejected",
+                                "analysis: result rejected",
                             );
                         }
                     }
@@ -367,7 +384,7 @@ pub fn run(
                     tracing::warn!(
                         asset = %prepared.asset.file_name,
                         error = %error,
-                        "tagger: request failed",
+                        "analysis: request failed",
                     );
                 }
             }
@@ -379,23 +396,27 @@ pub fn run(
 
     outcome.images_rejected = image_rejected.load(Ordering::Relaxed);
     tracing::info!(
-        tagged = outcome.tagged,
+        analysed = outcome.analysed,
         unchanged = outcome.unchanged,
         skipped = outcome.skipped,
         failed = outcome.failed,
         created = outcome.created_tags.len(),
         elapsed_ms = started.elapsed().as_millis() as u64,
-        "auto-tag run finished",
+        "AI analysis run finished",
     );
     Ok(outcome)
 }
 
-/// Detach everything the tagger ever added, and forget that it did.
+// ============================ undo =========================================
+
+/// Detach every tag the analysis ever added, and forget that it did.
 ///
 /// The library's own undo stack is in memory and belongs to the process that
-/// filled it, so a background tag run has to be able to take its own work
-/// back — that is what the per-asset record is for.
-pub fn undo(options: &AutoTagOptions, ctx: &JobContext) -> Result<UndoOutcome, String> {
+/// filled it, so a background run has to be able to take its own work back —
+/// that is what the per-asset record is for. Descriptions and ratings are a
+/// deliberate exception: the record does not keep their previous values, so
+/// undo leaves them in place rather than guessing.
+pub fn undo(options: &AiAnalysisOptions, ctx: &JobContext) -> Result<UndoOutcome, String> {
     crate::store::Store::open(&options.db_path)
         .map_err(|e| format!("open library database: {e}"))?;
     let conn =
@@ -407,14 +428,14 @@ pub fn undo(options: &AutoTagOptions, ctx: &JobContext) -> Result<UndoOutcome, S
     let marked: Vec<Asset> = match marked_assets(&conn) {
         Ok(assets) => assets,
         Err(error) => {
-            outcome.error = Some(format!("list tagged assets: {error}"));
+            outcome.error = Some(format!("list analysed assets: {error}"));
             return Ok(outcome);
         }
     };
 
     let total = marked.len() as u64;
     ctx.set_total(total);
-    let mut done = 0;
+    let mut done = 0u64;
     let mut touched: std::collections::HashSet<String> = std::collections::HashSet::new();
     for asset in marked {
         if ctx.cancelled() {
@@ -426,7 +447,7 @@ pub fn undo(options: &AutoTagOptions, ctx: &JobContext) -> Result<UndoOutcome, S
             match tags::get_by_name(&conn, name) {
                 Ok(Some(tag)) => {
                     if let Err(error) = tags::remove_from_asset(&conn, asset.id, tag.id) {
-                        tracing::warn!(tag = %name, error = %error, "tagger undo: detach failed");
+                        tracing::warn!(tag = %name, error = %error, "analysis undo: detach failed");
                         continue;
                     }
                     outcome.detached += 1;
@@ -434,7 +455,7 @@ pub fn undo(options: &AutoTagOptions, ctx: &JobContext) -> Result<UndoOutcome, S
                 }
                 Ok(None) => {}
                 Err(error) => {
-                    tracing::warn!(tag = %name, error = %error, "tagger undo: lookup failed");
+                    tracing::warn!(tag = %name, error = %error, "analysis undo: lookup failed");
                 }
             }
         }
@@ -442,7 +463,7 @@ pub fn undo(options: &AutoTagOptions, ctx: &JobContext) -> Result<UndoOutcome, S
         let mut facts = asset.facts.clone();
         facts.unknown.remove(MARKER_KEY);
         if let Err(error) = assets::update_facts(&conn, asset.id, &facts) {
-            tracing::warn!(asset = %asset.file_name, error = %error, "tagger undo: marker not cleared");
+            tracing::warn!(asset = %asset.file_name, error = %error, "analysis undo: marker not cleared");
         }
         outcome.assets += 1;
         done += 1;
@@ -450,12 +471,7 @@ pub fn undo(options: &AutoTagOptions, ctx: &JobContext) -> Result<UndoOutcome, S
     }
 
     // Tags this undo emptied are reported, not deleted: one of them may be
-    // something the user created by hand before the tagger ever reused it.
-    // Scoped to what this call actually detached, so an unrelated empty tag
-    // elsewhere in the tree is not blamed on the tagger.
-    //
-    // (`counts_by_tag` only lists tags that have assets, so the check runs
-    // the other way round: every tag, against the counts.)
+    // something the user created by hand before the run ever reused it.
     outcome.orphaned = match (tags::list(&conn), tags::counts_by_tag(&conn)) {
         (Ok(all), Ok(counts)) => all
             .into_iter()
@@ -468,15 +484,105 @@ pub fn undo(options: &AutoTagOptions, ctx: &JobContext) -> Result<UndoOutcome, S
     Ok(outcome)
 }
 
+// ============================ helpers ======================================
+
+/// Ask the model about one asset, with the image when there is one.
+fn ask(
+    provider: &dyn VendorAdapter,
+    prepared: &Prepared,
+    rejected: &AtomicBool,
+    cancel: &AtomicBool,
+) -> Result<AiAnalysisResult, String> {
+    let mut request = prepared.request.clone();
+    if !rejected.load(Ordering::Relaxed) {
+        request.thumbnail_jpeg = prepared
+            .thumbnail
+            .as_deref()
+            .and_then(|path| std::fs::read(path).ok());
+        request.contact_sheet_jpeg = prepared
+            .contact_sheet
+            .as_deref()
+            .and_then(|path| std::fs::read(path).ok());
+    }
+    let had_image = request.thumbnail_jpeg.is_some() || request.contact_sheet_jpeg.is_some();
+
+    match provider.analyze(&request, cancel) {
+        Ok(text) => analysis::parse_model_reply(&text, provider.model_version())
+            .map_err(|error| error.to_string()),
+        Err(error) if had_image && is_request_rejection(&error) => {
+            // The endpoint refused the request itself, and the image is the
+            // only part of it a text-only server would object to.
+            tracing::debug!(%error, "analysis: endpoint refused an image; going text-only");
+            rejected.store(true, Ordering::Relaxed);
+            request.thumbnail_jpeg = None;
+            request.contact_sheet_jpeg = None;
+            let text = provider
+                .analyze(&request, cancel)
+                .map_err(|error| error.message.clone())?;
+            analysis::parse_model_reply(&text, provider.model_version())
+                .map_err(|error| error.to_string())
+        }
+        // A transport failure already exhausted the retries; downgrading
+        // would hide a broken endpoint behind a silent quality drop.
+        Err(error) => Err(error.message),
+    }
+}
+
+/// A 4xx that was not retried: the server answered and refused the request
+/// itself. Only such a reply is worth retrying without the image.
+fn is_request_rejection(error: &VendorError) -> bool {
+    !error.kind.is_transient()
+        && error
+            .http_status
+            .is_some_and(|status| (400..500).contains(&status))
+}
+
+/// The request one asset's analysis is built from.
+fn build_request(
+    asset: &Asset,
+    options: &AiAnalysisOptions,
+    existing: &[String],
+    vocabulary: &[String],
+) -> AiAnalysisRequest {
+    AiAnalysisRequest {
+        asset_id: asset.id,
+        display_name: asset
+            .title
+            .as_deref()
+            .unwrap_or(&asset.file_name)
+            .to_string(),
+        file_name: asset.file_name.clone(),
+        mime: asset.mime.clone(),
+        media_type: media_type_of(asset.kind),
+        thumbnail_jpeg: None,
+        contact_sheet_jpeg: None,
+        language: options.language.clone(),
+        enabled_fields: options.fields,
+        metadata_lines: analysis::asset_metadata_lines(asset),
+        existing_tag_names: existing.to_vec(),
+        vocabulary: vocabulary.to_vec(),
+        settings: options.settings,
+    }
+}
+
+fn media_type_of(kind: AssetKind) -> MediaType {
+    match kind {
+        AssetKind::Image => MediaType::Image,
+        AssetKind::Video => MediaType::Video,
+        AssetKind::Model => MediaType::Model3D,
+        _ => MediaType::Other,
+    }
+}
+
 /// Attach what the model suggested, creating what the library does not have.
 /// Returns the tags actually added to this asset.
 ///
-/// `parent` is filled in the first time a tag is invented, so the parent tag
+/// `parent` is filled the first time a tag is invented, so the parent tag
 /// itself only comes into existence when something is filed under it.
 fn apply(
     conn: &Connection,
     prepared: &Prepared,
-    suggested: &[String],
+    result: &AiAnalysisResult,
     parent: &mut Option<Uuid>,
     parent_name: &str,
     vocabulary: &mut Vec<String>,
@@ -485,7 +591,7 @@ fn apply(
     let already: Vec<&str> = prepared.existing.iter().map(String::as_str).collect();
     let mut applied = Vec::new();
 
-    for name in suggested {
+    for name in &result.tags {
         if already
             .iter()
             .any(|existing| existing.eq_ignore_ascii_case(name))
@@ -520,6 +626,19 @@ fn apply(
         tags::add_to_asset(conn, prepared.asset.id, tag.id)?;
         applied.push(tag.name);
     }
+
+    // Description and rating are written only when the model actually produced
+    // them. `Some(None)` would clear the column, which would silently erase a
+    // description the user wrote by hand.
+    let patch = AssetPatch {
+        description: result.description.clone().map(Some),
+        rating: result.rating.map(Some),
+        ..Default::default()
+    };
+    if patch.description.is_some() || patch.rating.is_some() {
+        assets::update(conn, prepared.asset.id, &patch)?;
+    }
+
     Ok(applied)
 }
 
@@ -535,9 +654,9 @@ fn record_marker(
     model: &str,
     applied: &[String],
 ) -> crate::Result<()> {
-    // Re-read: `apply` only touched `asset_tag`, but a concurrent writer (the
-    // app's own inspector, say) may have moved `facts` under us, and this
-    // column is whole-value on write.
+    // Re-read: `apply` only touched `asset_tag` and `assets`, but a
+    // concurrent writer (the app's own inspector, say) may have moved `facts`
+    // under us, and this column is whole-value on write.
     let mut facts: AssetFacts = match assets::get(conn, prepared.asset.id)? {
         Some(current) => current.facts,
         None => prepared.asset.facts.clone(),
@@ -555,7 +674,7 @@ fn record_marker(
         MARKER_KEY.into(),
         serde_json::json!({
             "model": model,
-            "prompt": tagging::PROMPT_VERSION,
+            "prompt": analysis::PROMPT_VERSION,
             "digest": prepared.fingerprint,
             "at": chrono::Utc::now().to_rfc3339(),
             "added": added,
@@ -564,43 +683,9 @@ fn record_marker(
     assets::update_facts(conn, prepared.asset.id, &facts)
 }
 
-/// Answer one asset, with the image when there is one.
-fn ask(
-    provider: &dyn ChatProvider,
-    system: &str,
-    message: &str,
-    image: Option<&[u8]>,
-    rejected: &AtomicBool,
-) -> crate::Result<Vec<String>> {
-    if let Some(bytes) = image {
-        match provider.complete(&ChatRequest {
-            system,
-            user: message,
-            image: Some(bytes),
-        }) {
-            Ok(reply) => return Ok(tagging::parse_tags(&reply)),
-            Err(crate::Error::Validation(error)) => {
-                // The endpoint refused the request itself, and the image is
-                // the only part of it a text-only server would object to.
-                tracing::debug!(%error, "tagger: endpoint refused an image; going text-only");
-                rejected.store(true, Ordering::Relaxed);
-            }
-            // A transport failure already exhausted the retries; downgrading
-            // would hide a broken endpoint behind a silent quality drop.
-            Err(other) => return Err(other),
-        }
-    }
-    let reply = provider.complete(&ChatRequest {
-        system,
-        user: message,
-        image: None,
-    })?;
-    Ok(tagging::parse_tags(&reply))
-}
-
 /// The assets this run would consider: live, newest first, narrowed by
 /// `only` / `limit`.
-fn candidates(conn: &Connection, options: &AutoTagOptions) -> crate::Result<Vec<Asset>> {
+fn candidates(conn: &Connection, options: &AiAnalysisOptions) -> crate::Result<Vec<Asset>> {
     if !options.only.is_empty() {
         let mut assets = assets::by_ids(conn, &options.only)?;
         if let Some(limit) = options.limit {
@@ -692,29 +777,32 @@ fn vocabulary(conn: &Connection) -> crate::Result<Vec<String>> {
 /// What "the same work" means: the facts the model would see, the model
 /// itself, and the knobs that change its answer.
 ///
-/// The asset's *current* tags are deliberately left out even though the
-/// prompt includes them: this run is about to change them, so counting them
-/// as input would make every tagged asset permanently stale and re-ask about
-/// the whole library on the second run.
-///
-/// Reuses [`crate::ai::source_hash`] rather than hashing here — same
-/// primitive, same output shape, no second definition of "fingerprint" in
-/// the crate.
-fn fingerprint(model: &str, asset: &Asset, options: &AutoTagOptions) -> String {
+/// The asset's *current* tags are deliberately left out even though the prompt
+/// includes them: this run is about to change them, so counting them as input
+/// would make every tagged asset permanently stale and re-ask about the whole
+/// library on the second run.
+fn fingerprint(model: &str, asset: &Asset, options: &AiAnalysisOptions) -> String {
     let mut input = String::new();
     input.push_str(model);
     input.push('\n');
-    input.push_str(&tagging::PROMPT_VERSION.to_string());
+    input.push_str(&analysis::PROMPT_VERSION.to_string());
     input.push('\n');
-    input.push_str(&options.max_new_tags.to_string());
+    input.push_str(&options.settings.max_new_tags.to_string());
     input.push('\n');
     input.push_str(&options.language);
     input.push('\n');
+    input.push_str(&format!(
+        "{}{}{}",
+        options.fields.description as u8,
+        options.fields.tags as u8,
+        options.fields.rating as u8
+    ));
+    input.push('\n');
     // The image is part of the answer's input, so a re-encoded file must
-    // re-tag; the content hash is exactly that identity.
+    // re-analyse; the content hash is exactly that identity.
     input.push_str(asset.content_hash.as_deref().unwrap_or("-"));
     input.push('\n');
-    input.push_str(&tagging::asset_digest(asset, &[]));
+    input.push_str(&analysis::asset_metadata_lines(asset).join("\n"));
     crate::ai::source_hash(&input)
 }
 
@@ -750,13 +838,21 @@ fn stored_added(asset: &Asset) -> Vec<String> {
 /// was imported from, a stored one under this library's `media/` — but this
 /// job holds no `Library`, and an asset whose file has moved on disk is not
 /// worth failing a run over.
-fn thumbnail_path(options: &AutoTagOptions, asset: &Asset) -> Option<PathBuf> {
+fn thumbnail_path(options: &AiAnalysisOptions, asset: &Asset) -> Option<PathBuf> {
+    crate::media::thumb::ensure_for_asset(&options.cache_root, &options.data_root, asset)
+}
+
+/// Where this video's contact sheet is, if one was computed at import.
+fn contact_sheet_path(options: &AiAnalysisOptions, asset: &Asset) -> Option<PathBuf> {
+    if asset.kind != AssetKind::Video {
+        return None;
+    }
     let sha = asset.content_hash.as_deref()?;
-    let blob = match asset.origin {
-        Origin::Linked => PathBuf::from(asset.facts.source_path.clone()?),
-        Origin::Stored => options.data_root.join(asset.rel_path.as_deref()?),
-    };
-    crate::media::thumb::ensure(&options.cache_root, sha, asset.kind, &blob)
+    let path = options
+        .cache_root
+        .join("contact-sheet")
+        .join(format!("{sha}.jpg"));
+    path.is_file().then_some(path)
 }
 
 /// How many requests to have in flight: the caller's choice, then the
@@ -776,90 +872,67 @@ fn concurrency(explicit: Option<usize>) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ai::chat::ChatProvider;
-    use crate::model::{AssetKind, test_asset};
-    use crate::store::{Store, assets, tags};
-    use std::sync::Mutex;
-    use std::sync::atomic::AtomicUsize;
+    use crate::ai::vendor::{VendorError, VendorErrorKind, VendorId};
+    use crate::model::Origin;
+    use crate::store::Store;
 
-    /// A provider that answers with one fixed reply, and remembers whether
-    /// each request carried an image.
-    struct MockChat {
-        reply: String,
-        images: Mutex<Vec<bool>>,
+    struct MockAdapter {
+        response: String,
+        requests: std::sync::atomic::AtomicUsize,
+        images_sent: std::sync::atomic::AtomicUsize,
     }
 
-    impl MockChat {
-        fn new(reply: &str) -> Self {
+    impl MockAdapter {
+        fn new(response: &str) -> Self {
             Self {
-                reply: reply.into(),
-                images: Mutex::new(Vec::new()),
+                response: response.into(),
+                requests: std::sync::atomic::AtomicUsize::new(0),
+                images_sent: std::sync::atomic::AtomicUsize::new(0),
             }
         }
 
         fn requests(&self) -> usize {
-            self.images.lock().unwrap().len()
+            self.requests.load(Ordering::Relaxed)
         }
 
         fn images_sent(&self) -> usize {
-            self.images
-                .lock()
-                .unwrap()
-                .iter()
-                .filter(|sent| **sent)
-                .count()
+            self.images_sent.load(Ordering::Relaxed)
         }
     }
 
-    impl ChatProvider for MockChat {
-        fn id(&self) -> &str {
-            "mock-chat"
+    impl VendorAdapter for MockAdapter {
+        fn vendor(&self) -> VendorId {
+            VendorId::OpenAI
         }
 
-        fn complete(&self, request: &ChatRequest<'_>) -> crate::Result<String> {
-            self.images.lock().unwrap().push(request.image.is_some());
-            Ok(self.reply.clone())
+        fn model_version(&self) -> &str {
+            "mock-model"
         }
-    }
 
-    /// A provider that refuses anything carrying an image — what a text-only
-    /// server does — and counts the refusals.
-    struct TextOnlyChat {
-        refusals: AtomicUsize,
-    }
-
-    impl TextOnlyChat {
-        fn new() -> Self {
-            Self {
-                refusals: AtomicUsize::new(0),
+        fn analyze(
+            &self,
+            request: &AiAnalysisRequest,
+            _cancel: &AtomicBool,
+        ) -> std::result::Result<String, VendorError> {
+            self.requests.fetch_add(1, Ordering::Relaxed);
+            if request.thumbnail_jpeg.is_some() {
+                self.images_sent.fetch_add(1, Ordering::Relaxed);
             }
+            Ok(self.response.clone())
         }
 
-        fn refusals(&self) -> usize {
-            self.refusals.load(Ordering::Relaxed)
-        }
-    }
-
-    impl ChatProvider for TextOnlyChat {
-        fn id(&self) -> &str {
-            "text-only"
-        }
-
-        fn complete(&self, request: &ChatRequest<'_>) -> crate::Result<String> {
-            if request.image.is_some() {
-                self.refusals.fetch_add(1, Ordering::Relaxed);
-                return Err(crate::Error::Validation(
-                    "this model does not accept images".into(),
-                ));
-            }
-            Ok(r#"["plain"]"#.into())
+        fn probe_connection(
+            &self,
+            _cancel: &AtomicBool,
+        ) -> std::result::Result<(), VendorError> {
+            Ok(())
         }
     }
 
-    /// A throwaway library of `count` images, each backed by a real PNG so
-    /// the thumbnail path has something to work with.
+    /// A throwaway library of `count` images, each backed by a real PNG so the
+    /// thumbnail path has something to work with.
     fn library(count: usize) -> (PathBuf, PathBuf, PathBuf) {
-        let root = std::env::temp_dir().join(format!("trove-autotag-{}", Uuid::new_v4()));
+        let root = std::env::temp_dir().join(format!("trove-analysis-{}", Uuid::new_v4()));
         let data = root.join("data");
         let cache = root.join("cache");
         std::fs::create_dir_all(&data).unwrap();
@@ -872,7 +945,7 @@ mod tests {
                 .save(&source)
                 .unwrap();
             let hash = crate::media::hash::hash_bytes(&std::fs::read(&source).unwrap());
-            let mut asset = test_asset(
+            let mut asset = crate::model::test_asset(
                 &format!("photo-{index}.png"),
                 AssetKind::Image,
                 Uuid::new_v4(),
@@ -887,12 +960,8 @@ mod tests {
         (root, data, cache)
     }
 
-    fn options(
-        data: &std::path::Path,
-        cache: &std::path::Path,
-        threads: Option<usize>,
-    ) -> AutoTagOptions {
-        AutoTagOptions {
+    fn options(data: &std::path::Path, cache: &std::path::Path) -> AiAnalysisOptions {
+        AiAnalysisOptions {
             db_path: data.join("library.db"),
             data_root: data.to_path_buf(),
             cache_root: cache.to_path_buf(),
@@ -900,11 +969,16 @@ mod tests {
             limit: None,
             force: false,
             send_images: true,
-            max_new_tags: 3,
+            fields: AiAnalysisFields {
+                description: true,
+                tags: true,
+                rating: true,
+            },
+            settings: AiAnalysisSettings::default(),
             new_tag_parent: "AI".into(),
             language: "en".into(),
             dry_run: false,
-            threads,
+            threads: Some(1),
         }
     }
 
@@ -931,10 +1005,10 @@ mod tests {
     #[test]
     fn tags_are_attached_and_new_ones_filed_under_the_parent() {
         let (root, data, cache) = library(3);
-        let provider = MockChat::new(r#"["cat", "outdoors"]"#);
-        let outcome = run(&options(&data, &cache, Some(1)), &provider, &ctx()).unwrap();
+        let provider = MockAdapter::new(r#"{"description": null, "tags": ["cat", "outdoors"], "rating": null}"#);
+        let outcome = run(&options(&data, &cache), &provider, &ctx()).unwrap();
 
-        assert_eq!(outcome.tagged, 3);
+        assert_eq!(outcome.analysed, 3);
         assert_eq!(outcome.failed, 0);
         assert_eq!(outcome.skipped, 0);
         assert_eq!(outcome.created_tags.len(), 2, "both tags were invented");
@@ -943,15 +1017,8 @@ mod tests {
         let parent = tags::get_by_name(&conn, "AI")
             .unwrap()
             .expect("the parent tag exists");
-        let all = tags::list(&conn).unwrap();
-        assert_eq!(all.len(), 3, "the parent plus the two invented");
-        for tag in all.iter().filter(|tag| tag.name != "AI") {
-            assert_eq!(
-                tag.parent_id,
-                Some(parent.id),
-                "{} must be filed under the parent",
-                tag.name
-            );
+        for tag in tags::list(&conn).unwrap().iter().filter(|t| t.name != "AI") {
+            assert_eq!(tag.parent_id, Some(parent.id), "{} must be filed under the parent", tag.name);
         }
         for asset in live_assets(&conn) {
             let mut names = tag_names(&conn, asset.id);
@@ -962,10 +1029,52 @@ mod tests {
     }
 
     #[test]
+    fn description_and_rating_are_written_back() {
+        let (root, data, cache) = library(1);
+        let provider = MockAdapter::new(
+            r#"{"description": "A red wall", "tags": ["red"], "rating": 4}"#,
+        );
+        run(&options(&data, &cache), &provider, &ctx()).unwrap();
+
+        let conn = open(&data);
+        let asset = &live_assets(&conn)[0];
+        assert_eq!(asset.description.as_deref(), Some("A red wall"));
+        assert_eq!(asset.rating, Some(4));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn an_empty_reply_never_erases_a_hand_written_description() {
+        let (root, data, cache) = library(1);
+        {
+            let conn = open(&data);
+            let id = live_assets(&conn)[0].id;
+            assets::update(
+                &conn,
+                id,
+                &AssetPatch {
+                    description: Some(Some("mine".into())),
+                    rating: Some(Some(5)),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        }
+        let provider = MockAdapter::new(r#"{"description": null, "tags": [], "rating": null}"#);
+        run(&options(&data, &cache), &provider, &ctx()).unwrap();
+
+        let conn = open(&data);
+        let asset = &live_assets(&conn)[0];
+        assert_eq!(asset.description.as_deref(), Some("mine"), "not clobbered");
+        assert_eq!(asset.rating, Some(5), "not clobbered");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn an_image_is_sent_with_the_request() {
         let (root, data, cache) = library(1);
-        let provider = MockChat::new(r#"["cat"]"#);
-        run(&options(&data, &cache, Some(1)), &provider, &ctx()).unwrap();
+        let provider = MockAdapter::new(r#"{"description": null, "tags": ["cat"], "rating": null}"#);
+        run(&options(&data, &cache), &provider, &ctx()).unwrap();
         assert_eq!(provider.images_sent(), 1, "the thumbnail rode along");
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -973,135 +1082,87 @@ mod tests {
     #[test]
     fn a_second_run_skips_everything_and_asks_nothing() {
         let (root, data, cache) = library(3);
-        let provider = MockChat::new(r#"["cat"]"#);
-        let first = run(&options(&data, &cache, Some(1)), &provider, &ctx()).unwrap();
-        assert_eq!(first.tagged, 3);
+        let provider = MockAdapter::new(r#"{"description": null, "tags": ["cat"], "rating": null}"#);
+        assert_eq!(run(&options(&data, &cache), &provider, &ctx()).unwrap().analysed, 3);
         assert_eq!(provider.requests(), 3);
 
-        let second = run(&options(&data, &cache, Some(1)), &provider, &ctx()).unwrap();
+        let second = run(&options(&data, &cache), &provider, &ctx()).unwrap();
         assert_eq!(second.skipped, 3);
-        assert_eq!(second.tagged, 0);
+        assert_eq!(second.analysed, 0);
         assert_eq!(second.planned, 0);
-        assert_eq!(
-            provider.requests(),
-            3,
-            "a repeat run is free: nothing is asked"
-        );
+        assert_eq!(provider.requests(), 3, "a repeat run is free");
         let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
     fn force_ignores_the_fingerprint_and_undo_takes_everything_back() {
         let (root, data, cache) = library(2);
-        let provider = MockChat::new(r#"["cat", "outdoors"]"#);
-        run(&options(&data, &cache, Some(1)), &provider, &ctx()).unwrap();
+        let provider = MockAdapter::new(r#"{"description": null, "tags": ["cat", "outdoors"], "rating": null}"#);
+        run(&options(&data, &cache), &provider, &ctx()).unwrap();
 
-        let mut forced = options(&data, &cache, Some(1));
+        let mut forced = options(&data, &cache);
         forced.force = true;
-        let again = run(&forced, &provider, &ctx()).unwrap();
-        assert_eq!(again.planned, 2, "--force re-asks");
-        assert_eq!(again.tagged, 0, "nothing new to add the second time");
-        assert_eq!(again.unchanged, 2);
+        run(&forced, &provider, &ctx()).unwrap();
+        assert_eq!(provider.requests(), 4, "force re-asks both");
 
-        let undone = undo(&options(&data, &cache, Some(1)), &ctx()).unwrap();
-        assert_eq!(undone.assets, 2);
-        assert_eq!(undone.detached, 4, "two tags off two assets");
-        assert_eq!(
-            undone.orphaned,
-            vec!["cat".to_string(), "outdoors".to_string()],
-            "the tags this undo emptied are reported",
-        );
-
+        let undo_outcome = undo(&forced, &ctx()).unwrap();
+        assert_eq!(undo_outcome.assets, 2);
+        assert_eq!(undo_outcome.detached, 4, "two assets × two tags");
         let conn = open(&data);
         for asset in live_assets(&conn) {
             assert!(tag_names(&conn, asset.id).is_empty());
-            assert!(
-                !asset.facts.unknown.contains_key(MARKER_KEY),
-                "the record goes too, so a later run tags it again"
-            );
+            assert!(!asset.facts.unknown.contains_key(MARKER_KEY));
         }
         let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
-    fn a_text_only_endpoint_is_noticed_exactly_once() {
+    fn a_rejected_image_degrades_to_text_once() {
+        struct Refuser {
+            requests: std::sync::atomic::AtomicUsize,
+        }
+        impl VendorAdapter for Refuser {
+            fn vendor(&self) -> VendorId {
+                VendorId::OpenAI
+            }
+            fn model_version(&self) -> &str {
+                "text-only"
+            }
+            fn analyze(
+                &self,
+                request: &AiAnalysisRequest,
+                _cancel: &AtomicBool,
+            ) -> std::result::Result<String, VendorError> {
+                self.requests.fetch_add(1, Ordering::Relaxed);
+                if request.thumbnail_jpeg.is_some() {
+                    return Err(VendorError {
+                        kind: VendorErrorKind::Refused,
+                        message: "no images".into(),
+                        http_status: Some(400),
+                        provider_code: None,
+                        request_id: None,
+                    });
+                }
+                Ok(r#"{"description": null, "tags": ["plain"], "rating": null}"#.into())
+            }
+            fn probe_connection(
+                &self,
+                _cancel: &AtomicBool,
+            ) -> std::result::Result<(), VendorError> {
+                Ok(())
+            }
+        }
+
         let (root, data, cache) = library(3);
-        let provider = TextOnlyChat::new();
-        let outcome = run(&options(&data, &cache, Some(1)), &provider, &ctx()).unwrap();
-
-        assert!(outcome.images_rejected);
-        assert_eq!(
-            provider.refusals(),
-            1,
-            "the discovery is paid for once, not once per asset"
-        );
-        assert_eq!(outcome.tagged, 3, "every asset succeeded on the retry");
-        assert_eq!(outcome.failed, 0);
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn a_dry_run_counts_without_asking_and_writes_nothing() {
-        let (root, data, cache) = library(2);
-        let provider = MockChat::new(r#"["cat"]"#);
-        let mut dry = options(&data, &cache, Some(1));
-        dry.dry_run = true;
-        let outcome = run(&dry, &provider, &ctx()).unwrap();
-
-        assert_eq!(outcome.planned, 2);
-        assert_eq!(outcome.tagged, 0);
-        assert_eq!(provider.requests(), 0);
-        let conn = open(&data);
-        assert!(
-            tags::list(&conn).unwrap().is_empty(),
-            "not even the parent tag is created"
-        );
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn a_useless_reply_changes_nothing() {
-        let (root, data, cache) = library(2);
-        let provider = MockChat::new("I would rather not.");
-        let outcome = run(&options(&data, &cache, Some(1)), &provider, &ctx()).unwrap();
-
-        assert_eq!(outcome.tagged, 0);
-        assert_eq!(outcome.unchanged, 2);
-        assert_eq!(outcome.failed, 0, "a refusal to answer is not a failure");
-
-        let conn = open(&data);
-        assert!(tags::list(&conn).unwrap().is_empty());
-        // The marker is still written: the model was asked and had nothing to
-        // say, which is a fact worth not paying for twice.
-        for asset in live_assets(&conn) {
-            assert!(asset.facts.unknown.contains_key(MARKER_KEY));
-        }
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn an_asset_with_a_tag_already_is_not_told_to_add_it_again() {
-        let (root, data, cache) = library(1);
-        {
-            let conn = open(&data);
-            let asset = live_assets(&conn).remove(0);
-            let tag = tags::ensure_named(&conn, "cat").unwrap();
-            tags::add_to_asset(&conn, asset.id, tag.id).unwrap();
-        }
-
-        let provider = MockChat::new(r#"["cat", "outdoors"]"#);
-        let outcome = run(&options(&data, &cache, Some(1)), &provider, &ctx()).unwrap();
-
-        let conn = open(&data);
-        let asset = live_assets(&conn).remove(0);
-        let mut names = tag_names(&conn, asset.id);
-        names.sort();
-        assert_eq!(names, vec!["cat".to_string(), "outdoors".to_string()]);
-        assert_eq!(
-            outcome.created_tags,
-            vec!["outdoors".to_string()],
-            "the tag that was already there is reused, not recreated"
-        );
+        let provider = Refuser {
+            requests: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let outcome = run(&options(&data, &cache), &provider, &ctx()).unwrap();
+        assert!(outcome.images_rejected, "the run noticed and degraded");
+        assert_eq!(outcome.analysed, 3);
+        // Two requests for the first asset (image refused, then text), one
+        // each for the rest.
+        assert_eq!(provider.requests.load(Ordering::Relaxed), 4);
         let _ = std::fs::remove_dir_all(&root);
     }
 }

@@ -18,6 +18,11 @@
 //! change arrives and there *are* libraries worth walking forward, a list can
 //! come back — with the rule that a step must be applicable from a shape that
 //! matches the version on record.
+//!
+//! That is where this file stands now: [`UPGRADES`] holds exactly one step,
+//! v14 → v15, because the `ai_analysis` cache table landed while v14
+//! libraries were already in the field. Everything not on the list is still
+//! refused by name.
 
 /// The schema this build creates, and the only shape it opens. A library at
 /// any other version is refused by name rather than guessed at.
@@ -26,7 +31,45 @@
 /// existence was written by a build whose chain ended there, and that shape
 /// is the pre-`asset_embeddings` subset of the one below — which is the only
 /// sense in which a version number means anything.
-pub const SCHEMA_VERSION: i64 = 14;
+pub const SCHEMA_VERSION: i64 = 15;
+
+/// One upgrade step: the DDL that takes a library from `from` to `to`.
+///
+/// A step applies to a shape that matches `from` exactly — the version on
+/// record is the whole guard, there is no fingerprint of the shape itself —
+/// and its DDL is written so that re-running it is harmless, because a crash
+/// between the DDL and the version bump must not brick the library.
+pub struct Upgrade {
+    pub from: i64,
+    pub to: i64,
+    pub sql: &'static str,
+}
+
+/// The upgrade list: each step may be applied to a library at its `from`
+/// version to reach its `to`. A library at any other version is still refused
+/// by name.
+pub const UPGRADES: &[Upgrade] = &[Upgrade {
+    from: 14,
+    to: 15,
+    sql: UPGRADE_14_TO_15,
+}];
+
+/// v14 → v15: the AI analysis cache.
+///
+/// Purely additive — no existing table is touched — so a v14 library that
+/// already carries the table (a hand-edited file, a build that ran ahead of
+/// the version bump) migrates cleanly too.
+const UPGRADE_14_TO_15: &str = r#"
+    CREATE TABLE IF NOT EXISTS ai_analysis (
+        asset_id      TEXT NOT NULL REFERENCES assets(id) ON DELETE CASCADE,
+        model_version TEXT NOT NULL,
+        result_json   TEXT NOT NULL,
+        analysed_at   TEXT NOT NULL,
+        PRIMARY KEY (asset_id, model_version)
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_ai_analysis_model ON ai_analysis(model_version);
+"#;
 
 /// Create the current shape from nothing.
 ///
@@ -212,4 +255,20 @@ pub const SCHEMA: &str = r#"
     );
 
     CREATE INDEX idx_asset_embeddings_model ON asset_embeddings(model, space);
+
+    -- AI analysis results, one row per (asset, model_version). The structured
+    -- output (description, tags, rating) is stored as JSON so the schema
+    -- evolves without migrations. `analysed_at` is used to skip unchanged
+    -- assets on re-runs. Tags applied from the analysis live in the
+    -- asset_tag table, not here — this table only caches the raw result.
+    -- Deleting an asset deletes its analysis rows with it (CASCADE).
+    CREATE TABLE ai_analysis (
+        asset_id      TEXT NOT NULL REFERENCES assets(id) ON DELETE CASCADE,
+        model_version TEXT NOT NULL,
+        result_json   TEXT NOT NULL,
+        analysed_at   TEXT NOT NULL,
+        PRIMARY KEY (asset_id, model_version)
+    );
+
+    CREATE INDEX idx_ai_analysis_model ON ai_analysis(model_version);
 "#;

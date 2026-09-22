@@ -118,19 +118,19 @@ pub struct AppConfig {
     /// means "this plugin's default".
     #[serde(default)]
     pub plugin_settings: HashMap<String, HashMap<String, serde_json::Value>>,
-    /// AI embedding settings (semantic search groundwork). `None` = the
-    /// feature is not configured and every AI-facing surface stays inert.
+    /// Search tiers: the local full-text index plus the two optional cloud
+    /// legs (embedding vectors and the LLM query planner). See
+    /// [`SearchConfig`].
+    #[serde(default)]
+    pub search: SearchConfig,
+    /// The embedding endpoint used by the L2 (semantic) search tier, when
+    /// [`SearchConfig::semantic_enabled`] is on. Configured on the AI page.
     #[serde(default)]
     pub ai_embedding: Option<EmbeddingConfig>,
-    /// AI chat settings (the automatic tagger). `None` = the tagger is not
-    /// configured and asks no model anything.
-    ///
-    /// Kept apart from `ai_embedding` on purpose: the two are different
-    /// models on the same server as often as not, and a machine that has
-    /// only one of them configured is the normal case rather than a broken
-    /// one.
+    /// AI analysis settings (the multimodal describer/tagger). `None` = the
+    /// feature is not configured and asks no model anything.
     #[serde(default)]
-    pub ai_chat: Option<ChatConfig>,
+    pub ai_analysis: Option<AiAnalysisConfig>,
 }
 
 /// Settings for an OpenAI-compatible embeddings endpoint — the shape every
@@ -145,11 +145,20 @@ pub struct EmbeddingConfig {
     #[serde(default)]
     pub api_key: String,
     /// Model name exactly as the server knows it
-    /// (`text-embedding-3-small`, `nomic-embed-text`, …). This string is the
-    /// `model` identity stored beside every vector, so renaming it orphans
-    /// the old rows (delete them from the settings page and re-embed).
+    /// (`text-embedding-3-small`, `nomic-embed-text`, `jina-clip-v2`, …).
+    /// This string is the `model` identity stored beside every vector, so
+    /// renaming it orphans the old rows (delete them from the settings page
+    /// and re-embed).
     #[serde(default)]
     pub model: String,
+    /// When true the endpoint is a multimodal (CLIP-style) embedder: an asset
+    /// is embedded from its **image**, and a text query lands in the same
+    /// vector space — so typing `猫` can find an untagged cat photo.
+    ///
+    /// Off by default, because a plain text endpoint rejects the object-shaped
+    /// `input` entries this mode sends.
+    #[serde(default)]
+    pub multimodal: bool,
 }
 
 /// `https://api.openai.com/v1` — the default [`EmbeddingConfig::base_url`].
@@ -163,6 +172,7 @@ impl Default for EmbeddingConfig {
             base_url: default_embedding_base_url(),
             api_key: String::new(),
             model: String::new(),
+            multimodal: false,
         }
     }
 }
@@ -172,51 +182,6 @@ impl EmbeddingConfig {
     pub fn is_configured(&self) -> bool {
         !self.model.trim().is_empty() && !self.base_url.trim().is_empty()
     }
-}
-
-/// Settings for an OpenAI-compatible chat endpoint: the half of the AI
-/// surface that *reads* an asset and says something about it, as opposed to
-/// [`EmbeddingConfig`], which turns one into a vector.
-///
-/// Same server shape, different path (`/chat/completions`), and almost always
-/// a different model — an embedding model cannot answer a prompt, and a chat
-/// model cannot embed — so the two are configured apart even when they point
-/// at the same host.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct ChatConfig {
-    /// Base URL of the server, without the `/chat/completions` tail.
-    #[serde(default = "default_embedding_base_url")]
-    pub base_url: String,
-    /// Bearer token. Empty is legitimate: local servers usually want none.
-    #[serde(default)]
-    pub api_key: String,
-    /// Model name exactly as the server knows it (`gpt-4o-mini`,
-    /// `qwen-vl-max`, `llava`, `minicpm-v`, …).
-    #[serde(default)]
-    pub model: String,
-    /// Send the asset's thumbnail alongside the text.
-    ///
-    /// On by default because the text side of a library asset is often just
-    /// its file name, and `IMG_4821.jpg` says nothing about the picture. A
-    /// text-only model rejects such a request, which the task notices and
-    /// degrades from — see [`crate::tasks::autotag`] — so the default is the
-    /// one that produces good tags when the model can take them.
-    #[serde(default = "default_true")]
-    pub send_images: bool,
-    /// How many tags per asset the model may invent beyond the library's
-    /// existing vocabulary. Zero means "reuse only", the safest setting for
-    /// a library whose tag tree is already deliberate.
-    #[serde(default = "default_max_new_tags")]
-    pub max_new_tags: u32,
-    /// Parent tag the invented tags are filed under, so one run can be
-    /// reviewed — and discarded — as a single subtree. Empty files them at
-    /// the root.
-    #[serde(default = "default_new_tag_parent")]
-    pub new_tag_parent: String,
-    /// Language the tags should be written in (`zh-CN`, `en`, …). `None`
-    /// follows the interface language.
-    #[serde(default)]
-    pub tag_language: Option<String>,
 }
 
 /// `true` — the serde default for a `bool` is `false`, which would silently
@@ -235,13 +200,148 @@ fn default_new_tag_parent() -> String {
     "AI".into()
 }
 
-impl Default for ChatConfig {
+/// Search configuration: one local tier and two optional cloud tiers.
+///
+/// The full-text index is local and nearly free, so it is the base every
+/// search falls back to. The other two are opt-in and each costs money per
+/// use — a user who wants purely local, offline search turns both off and
+/// keeps the full-text index.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SearchConfig {
+    /// L1 — the local Tantivy full-text index. On by default: with it off and
+    /// both cloud tiers off, a search matches nothing.
+    #[serde(default = "default_true")]
+    pub full_text: bool,
+    /// L2 — embedding vector search. The endpoint is
+    /// [`AppConfig::ai_embedding`], configured on the AI page; this is only
+    /// the switch. Off by default.
+    #[serde(default)]
+    pub semantic_enabled: bool,
+    /// L3 — the LLM query planner (natural language → structured plan).
+    #[serde(default)]
+    pub ai: AiSearchConfig,
+}
+
+impl Default for SearchConfig {
     fn default() -> Self {
         Self {
+            full_text: true,
+            semantic_enabled: false,
+            ai: AiSearchConfig::default(),
+        }
+    }
+}
+
+impl SearchConfig {
+    /// The embedding endpoint to use for L2, when the toggle is on and the
+    /// endpoint (configured on the AI page) is usable. `None` = run the text
+    /// leg only, which is also what an unconfigured endpoint gives.
+    pub fn semantic_endpoint(
+        &self,
+        endpoint: Option<&EmbeddingConfig>,
+    ) -> Option<EmbeddingConfig> {
+        let endpoint = endpoint?;
+        (self.semantic_enabled && endpoint.is_configured()).then(|| endpoint.clone())
+    }
+
+    /// Whether the L3 planner should run.
+    pub fn ai_enabled(&self) -> bool {
+        self.ai.enabled && self.ai.is_configured()
+    }
+}
+
+/// L3 settings: a text-only chat model that turns a natural-language query
+/// into a structured search plan. Deliberately separate from
+/// [`AiAnalysisConfig`]: planning is text-only and cheap, while analysis runs
+/// a vision model per asset.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AiSearchConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Vendor family: `openai`, `anthropic`, `gemini` or `dashscope`.
+    #[serde(default = "default_vendor")]
+    pub vendor: String,
+    #[serde(default = "default_embedding_base_url")]
+    pub base_url: String,
+    #[serde(default)]
+    pub api_key: String,
+    #[serde(default)]
+    pub model: String,
+}
+
+impl Default for AiSearchConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            vendor: default_vendor(),
+            base_url: default_embedding_base_url(),
+            api_key: String::new(),
+            model: String::new(),
+        }
+    }
+}
+
+impl AiSearchConfig {
+    /// Whether enough is configured to talk to the server at all.
+    pub fn is_configured(&self) -> bool {
+        !self.model.trim().is_empty() && !self.base_url.trim().is_empty()
+    }
+}
+
+/// Settings for the multimodal analysis endpoint: one vendor + model that
+/// *reads* an asset and answers with a description, tags and an optional
+/// rating.
+///
+/// This keeps the tagging policy
+/// (vocabulary reuse, a budget for new words, one parent tag for them) and
+/// adds the description/rating the analysis protocol can produce — plus the
+/// `vendor` field that makes OpenAI, Anthropic, Gemini and DashScope
+/// interchangeable.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AiAnalysisConfig {
+    /// Vendor family: `openai`, `anthropic`, `gemini` or `dashscope`.
+    #[serde(default = "default_vendor")]
+    pub vendor: String,
+    /// Base URL of the server, without the endpoint tail.
+    #[serde(default = "default_embedding_base_url")]
+    pub base_url: String,
+    /// Bearer token / API key. Empty is legitimate for local servers.
+    #[serde(default)]
+    pub api_key: String,
+    /// Model name exactly as the vendor knows it (`gpt-4o-mini`,
+    /// `claude-3-5-sonnet-latest`, `gemini-2.0-flash`, `qwen-vl-max`, …).
+    #[serde(default)]
+    pub model: String,
+    /// Send the asset's thumbnail (and a video contact sheet) alongside the
+    /// text.
+    #[serde(default = "default_true")]
+    pub send_images: bool,
+    /// Which fields the model is asked to produce.
+    #[serde(default)]
+    pub fields: AnalysisFieldsConfig,
+    /// How many tags per asset may be invented beyond the library
+    /// vocabulary. Zero means "reuse only".
+    #[serde(default = "default_max_new_tags")]
+    pub max_new_tags: u32,
+    /// Parent tag the invented tags are filed under. Empty files them at the
+    /// root.
+    #[serde(default = "default_new_tag_parent")]
+    pub new_tag_parent: String,
+    /// Language the text values are written in (`zh-CN`, `en`, …). `None`
+    /// follows the interface language.
+    #[serde(default)]
+    pub tag_language: Option<String>,
+}
+
+impl Default for AiAnalysisConfig {
+    fn default() -> Self {
+        Self {
+            vendor: default_vendor(),
             base_url: default_embedding_base_url(),
             api_key: String::new(),
             model: String::new(),
             send_images: default_true(),
+            fields: AnalysisFieldsConfig::default(),
             max_new_tags: default_max_new_tags(),
             new_tag_parent: default_new_tag_parent(),
             tag_language: None,
@@ -249,10 +349,36 @@ impl Default for ChatConfig {
     }
 }
 
-impl ChatConfig {
+impl AiAnalysisConfig {
     /// Whether enough is configured to talk to the server at all.
     pub fn is_configured(&self) -> bool {
         !self.model.trim().is_empty() && !self.base_url.trim().is_empty()
+    }
+}
+
+fn default_vendor() -> String {
+    "openai".into()
+}
+
+/// Which output fields the model is asked for. All three may be produced; the
+/// caller chooses which ones it wants written back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AnalysisFieldsConfig {
+    #[serde(default = "default_true")]
+    pub description: bool,
+    #[serde(default = "default_true")]
+    pub tags: bool,
+    #[serde(default)]
+    pub rating: bool,
+}
+
+impl Default for AnalysisFieldsConfig {
+    fn default() -> Self {
+        Self {
+            description: true,
+            tags: true,
+            rating: false,
+        }
     }
 }
 
@@ -451,6 +577,13 @@ fn quarantine_corrupt(path: &Path, error: &serde_json::Error) {
 }
 
 impl AppConfig {
+    /// The embedding endpoint to use for L2 semantic search, when the toggle
+    /// is on and [`Self::ai_embedding`] is configured. `None` = the search
+    /// runs its local full-text leg only.
+    pub fn semantic_endpoint(&self) -> Option<EmbeddingConfig> {
+        self.search.semantic_endpoint(self.ai_embedding.as_ref())
+    }
+
     /// Load the config from disk, or return a default config if none exists.
     ///
     /// A file that exists but does not parse is the dangerous case: this
@@ -735,6 +868,55 @@ impl AppConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn search_config_defaults_keep_the_pre_tier_behaviour() {
+        let search = SearchConfig::default();
+        assert!(search.full_text, "the local index is the base");
+        assert!(!search.semantic_enabled, "cloud legs are opt-in");
+        assert!(!search.ai.enabled, "cloud legs are opt-in");
+    }
+
+    #[test]
+    fn a_tier_needs_both_its_toggle_and_a_configured_endpoint() {
+        let endpoint = EmbeddingConfig {
+            base_url: "https://api.example.com/v1".into(),
+            api_key: String::new(),
+            model: "text-embedding-3-small".into(),
+            multimodal: false,
+        };
+
+        // Toggle off: inert even though an endpoint is configured.
+        let off = SearchConfig::default();
+        assert!(off.semantic_endpoint(Some(&endpoint)).is_none());
+
+        // Toggle on + configured: the endpoint is handed back.
+        let on = SearchConfig {
+            semantic_enabled: true,
+            ..SearchConfig::default()
+        };
+        assert_eq!(
+            on.semantic_endpoint(Some(&endpoint)),
+            Some(endpoint.clone())
+        );
+
+        // Toggle on but half-configured (or missing): still inert.
+        let unconfigured = EmbeddingConfig::default();
+        assert!(on.semantic_endpoint(Some(&unconfigured)).is_none());
+        assert!(on.semantic_endpoint(None).is_none());
+
+        // L3 likewise needs the toggle *and* a model.
+        assert!(!on.ai_enabled());
+        let ai = SearchConfig {
+            ai: AiSearchConfig {
+                enabled: true,
+                model: "gpt-4o-mini".into(),
+                ..AiSearchConfig::default()
+            },
+            ..SearchConfig::default()
+        };
+        assert!(ai.ai_enabled());
+    }
 
     #[test]
     fn the_launch_check_waits_a_day_between_probes() {

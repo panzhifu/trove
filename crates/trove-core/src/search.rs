@@ -504,12 +504,28 @@ impl TextIndex {
                 &TopDocs::with_limit(cap).order_by_score(),
             )
             .map_err(|e| Error::Db(format!("search index: {e}")))?;
+        Self::collect_ids(&searcher, self.f.asset_id, top)
+    }
+
+    /// Search using an AI-generated plan: keywords are ANDed (Must),
+    /// synonyms are ORed (Should), and exclusions are negated (MustNot).
+    /// Synonyms only boost ranking — a keyword-only match still returns.
+    pub fn search_plan(&self, plan: &crate::ai::search_planner::AiSearchPlan, cap: usize) -> Result<Vec<Uuid>> {
+        let searcher = self.reader.searcher();
+        let query = self.build_plan_query(plan);
+        let top = searcher
+            .search(&query, &TopDocs::with_limit(cap).order_by_score())
+            .map_err(|e| Error::Db(format!("search index: {e}")))?;
+        Self::collect_ids(&searcher, self.f.asset_id, top)
+    }
+
+    fn collect_ids(searcher: &tantivy::Searcher, asset_id: Field, top: Vec<(f32, tantivy::DocAddress)>) -> Result<Vec<Uuid>> {
         let mut ids = Vec::with_capacity(top.len());
         for (_, addr) in top {
             let Ok(doc) = searcher.doc::<TantivyDocument>(addr) else {
                 continue;
             };
-            if let Some(s) = doc.get_first(self.f.asset_id).and_then(|v| v.as_str())
+            if let Some(s) = doc.get_first(asset_id).and_then(|v| v.as_str())
                 && let Ok(id) = Uuid::parse_str(s)
             {
                 ids.push(id);
@@ -674,6 +690,40 @@ impl TextIndex {
             ));
         }
         Box::new(BooleanQuery::new(must))
+    }
+
+    /// Build a Tantivy query from an AI search plan. Keywords are ANDed
+    /// (Must), synonyms are ORed as optional boosts (Should), and
+    /// exclusions are negated (MustNot).
+    fn build_plan_query(&self, plan: &crate::ai::search_planner::AiSearchPlan) -> Box<dyn Query> {
+        let mut clauses: Vec<(Occur, Box<dyn Query>)> = Vec::new();
+
+        // Keywords: all must match (AND).
+        for keyword in &plan.keywords {
+            clauses.push((Occur::Must, self.term_query(keyword)));
+        }
+
+        // Synonyms: optional boost (OR) — only meaningful when at least one
+        // synonym matches.
+        for synonym in &plan.synonyms {
+            clauses.push((Occur::Should, self.term_query(synonym)));
+        }
+
+        // Exclusions: must NOT match.
+        for exclusion in &plan.exclusions {
+            clauses.push((Occur::MustNot, self.term_query(exclusion)));
+        }
+
+        if clauses.is_empty() {
+            clauses.push((
+                Occur::Must,
+                Box::new(TermQuery::new(
+                    Term::from_field_text(self.f.abbr, "\u{0}no-match"),
+                    IndexRecordOption::Basic,
+                )),
+            ));
+        }
+        Box::new(BooleanQuery::new(clauses))
     }
 }
 

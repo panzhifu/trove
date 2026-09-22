@@ -63,6 +63,13 @@ static EMBED_LAST_MS: AtomicU64 = AtomicU64::new(0);
 /// Semantic (vector) searches issued against the in-memory index.
 static VECTOR_SEARCHES: AtomicU64 = AtomicU64::new(0);
 
+// -- ai analysis ----------------------------------------------------------
+
+static AI_ANALYSIS_RUNS: AtomicU64 = AtomicU64::new(0);
+static AI_ANALYSIS_ASSETS: AtomicU64 = AtomicU64::new(0);
+static AI_ANALYSIS_FAILURES: AtomicU64 = AtomicU64::new(0);
+static AI_ANALYSIS_LAST_MS: AtomicU64 = AtomicU64::new(0);
+
 // -- library ----------------------------------------------------------------
 
 static LIBRARY_OPEN: AtomicU64 = AtomicU64::new(0);
@@ -143,6 +150,15 @@ pub fn note_vector_search() {
     VECTOR_SEARCHES.fetch_add(1, Ordering::Relaxed);
 }
 
+/// Record a settled AI analysis run: `analysed` assets written, `failed`
+/// assets rejected, and how long the whole run took.
+pub fn note_ai_analysis_run(analysed: usize, failed: usize, duration: Duration) {
+    AI_ANALYSIS_RUNS.fetch_add(1, Ordering::Relaxed);
+    AI_ANALYSIS_ASSETS.fetch_add(analysed as u64, Ordering::Relaxed);
+    AI_ANALYSIS_FAILURES.fetch_add(failed as u64, Ordering::Relaxed);
+    AI_ANALYSIS_LAST_MS.store(duration.as_millis() as u64, Ordering::Relaxed);
+}
+
 /// The registry as plain JSON-ready data — the `/health` body.
 #[derive(Debug, Serialize)]
 pub struct Snapshot {
@@ -154,6 +170,7 @@ pub struct Snapshot {
     thumb_cache: ThumbCacheHealth,
     queries: QueryHealth,
     embeddings: EmbedHealth,
+    ai_analysis: AiAnalysisHealth,
 }
 
 #[derive(Debug, Serialize)]
@@ -203,6 +220,14 @@ pub struct QueryHealth {
 pub struct EmbedHealth {
     runs_total: u64,
     vectors_total: u64,
+    failures_total: u64,
+    last_duration_ms: u64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AiAnalysisHealth {
+    runs_total: u64,
+    assets_total: u64,
     failures_total: u64,
     last_duration_ms: u64,
 }
@@ -264,6 +289,12 @@ pub fn snapshot() -> Snapshot {
             vectors_total: load(&EMBED_VECTORS),
             failures_total: load(&EMBED_FAILURES),
             last_duration_ms: load(&EMBED_LAST_MS),
+        },
+        ai_analysis: AiAnalysisHealth {
+            runs_total: load(&AI_ANALYSIS_RUNS),
+            assets_total: load(&AI_ANALYSIS_ASSETS),
+            failures_total: load(&AI_ANALYSIS_FAILURES),
+            last_duration_ms: load(&AI_ANALYSIS_LAST_MS),
         },
     }
 }

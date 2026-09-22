@@ -9,6 +9,123 @@
 use super::files::{finish_job, start_job};
 use super::*;
 
+// ============================ tiers =========================================
+
+/// The stored search configuration.
+fn search_config() -> trove_core::config::SearchConfig {
+    AppConfig::load().search
+}
+
+/// Persist a search-tier change and re-resolve the controller's tiers, so the
+/// next data pass sees the new switches without a restart.
+fn save_search(
+    controller: &Entity<LibraryController>,
+    edit: impl FnOnce(&mut trove_core::config::SearchConfig),
+    cx: &mut App,
+) {
+    let mut config = AppConfig::load();
+    edit(&mut config.search);
+    let _ = config.save();
+    controller.update(cx, |ctl, cx| {
+        ctl.refresh_search_tiers();
+        cx.notify();
+    });
+    cx.refresh_windows();
+}
+
+/// The three search legs and their toggles.
+///
+/// The full-text index is local and nearly free; the other two call a cloud
+/// endpoint and cost money per use, so each has its own switch. A leg that is
+/// on but unconfigured is inert — the search falls back to the layers below it
+/// rather than failing.
+fn tiers_group(controller: &Entity<LibraryController>) -> SettingGroup {
+    // Each setter owns a clone of the controller handle; the settings
+    // framework builds the row once and calls the closure later.
+    let full_text = controller.clone();
+    let semantic = controller.clone();
+    let ai = controller.clone();
+    let ai_vendor = controller.clone();
+    let ai_url = controller.clone();
+    let ai_key = controller.clone();
+    let ai_model = controller.clone();
+
+    SettingGroup::new()
+        .title(rust_i18n::t!("settings.search_tiers").to_string())
+        .item(
+            SettingItem::new(
+                rust_i18n::t!("settings.search_full_text").to_string(),
+                SettingField::switch(
+                    |_cx| search_config().full_text,
+                    move |value, cx| save_search(&full_text, |config| config.full_text = value, cx),
+                ),
+            )
+            .description(rust_i18n::t!("settings.search_full_text_desc").to_string()),
+        )
+        .item(
+            SettingItem::new(
+                rust_i18n::t!("settings.search_semantic").to_string(),
+                SettingField::switch(
+                    |_cx| search_config().semantic_enabled,
+                    move |value, cx| {
+                        save_search(&semantic, |config| config.semantic_enabled = value, cx)
+                    },
+                ),
+            )
+            .description(rust_i18n::t!("settings.search_semantic_desc").to_string()),
+        )
+        .item(
+            SettingItem::new(
+                rust_i18n::t!("settings.search_ai").to_string(),
+                SettingField::switch(
+                    |_cx| search_config().ai.enabled,
+                    move |value, cx| save_search(&ai, |config| config.ai.enabled = value, cx),
+                ),
+            )
+            .description(rust_i18n::t!("settings.search_ai_desc").to_string()),
+        )
+        .item(SettingItem::new(
+            rust_i18n::t!("settings.search_ai_vendor").to_string(),
+            SettingField::input(
+                |_cx| SharedString::from(search_config().ai.vendor.clone()),
+                move |value, cx| {
+                    save_search(
+                        &ai_vendor,
+                        |config| config.ai.vendor = value.to_string(),
+                        cx,
+                    )
+                },
+            ),
+        ))
+        .item(SettingItem::new(
+            rust_i18n::t!("settings.ai_base_url").to_string(),
+            SettingField::input(
+                |_cx| SharedString::from(search_config().ai.base_url.clone()),
+                move |value, cx| {
+                    save_search(&ai_url, |config| config.ai.base_url = value.to_string(), cx)
+                },
+            ),
+        ))
+        .item(SettingItem::new(
+            rust_i18n::t!("settings.ai_api_key").to_string(),
+            SettingField::input(
+                |_cx| SharedString::from(search_config().ai.api_key.clone()),
+                move |value, cx| {
+                    save_search(&ai_key, |config| config.ai.api_key = value.to_string(), cx)
+                },
+            ),
+        ))
+        .item(SettingItem::new(
+            rust_i18n::t!("settings.search_ai_model").to_string(),
+            SettingField::input(
+                |_cx| SharedString::from(search_config().ai.model.clone()),
+                move |value, cx| {
+                    save_search(&ai_model, |config| config.ai.model = value.to_string(), cx)
+                },
+            ),
+        ))
+}
+
 // ============================ search page ===================================
 
 /// Search ▸ the full-text index, and the per-image fingerprints that power
@@ -21,6 +138,7 @@ pub(super) fn search_page(
     SettingPage::new(rust_i18n::t!("settings.search").to_string())
         .icon(IconName::Search)
         .resettable(false)
+        .group(tiers_group(controller))
         .group(
             SettingGroup::new()
                 .title(rust_i18n::t!("settings.search_index").to_string())

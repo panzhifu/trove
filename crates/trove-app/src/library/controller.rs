@@ -9,6 +9,7 @@ use uuid::Uuid;
 use trove_core::config::AppConfig;
 use trove_core::library::Library;
 use trove_core::model::{AspectPreset, AssetKind, AssetSort, Orientation};
+use trove_core::store::browse::SearchTiers;
 use trove_core::store::view_history;
 
 /// Current import activity, shown by the Explorer panel.
@@ -66,15 +67,14 @@ impl AiProbe {
     }
 }
 
-/// Outcome of the last chat-endpoint connection test (Settings ▸ AI, the
-/// tagging half).
+/// Outcome of the last analysis-endpoint connection test (Settings ▸ AI).
 ///
 /// A sibling of [`AiProbe`] rather than a reuse of it. An embedding endpoint
-/// answers with a vector and a width; a chat endpoint answers with words, and
-/// the two are configured separately — a machine can easily have one
-/// reachable and the other not.
+/// answers with a vector and a width; an analysis endpoint answers with
+/// words, and the two are configured separately — a machine can easily have
+/// one reachable and the other not.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub enum ChatProbe {
+pub enum AnalysisProbe {
     /// Never run, or cleared by a library swap.
     #[default]
     Idle,
@@ -89,7 +89,7 @@ pub enum ChatProbe {
     Failed { message: String },
 }
 
-impl ChatProbe {
+impl AnalysisProbe {
     /// Whether a test is in flight (the settings button guards on this).
     pub fn is_running(&self) -> bool {
         matches!(self, Self::Running)
@@ -241,17 +241,25 @@ pub struct LibraryController {
     /// task-manager job: it is one call against a server the user typed in,
     /// so it reports inline on the page and never blocks a job slot.
     pub ai_probe: AiProbe,
-    /// Result of the last chat-endpoint connection test (Settings ▸ AI, the
-    /// tagging half). Same reasoning as [`Self::ai_probe`]: one call against
-    /// a server the user typed in, answered inline on the page, no job slot
-    /// taken.
-    pub chat_probe: ChatProbe,
+    /// Result of the last analysis-endpoint connection test (Settings ▸ AI).
+    /// Same reasoning as [`Self::ai_probe`]: one call against a server the
+    /// user typed in, answered inline on the page, no job slot taken.
+    pub analysis_probe: AnalysisProbe,
     /// The embedding of the committed search term, when one has been fetched
     /// (`jobs::request_query_embedding_app` runs after Enter). The workspace
     /// hands it to the query, which fuses it into the text ranking for as
     /// long as its `text` still matches the search box; `None` = the search
     /// is text-only, which is also what an unconfigured endpoint gives.
     pub query_vector: Option<trove_core::search::vector::QueryVector>,
+    /// The search legs the current query may use, resolved from the stored
+    /// config. A settings toggle re-resolves it through
+    /// [`Self::refresh_search_tiers`].
+    pub search_tiers: SearchTiers,
+    /// The AI plan for the current search term, when the AI tier is on and the
+    /// planner has answered (`jobs::request_ai_plan_app`). Cleared whenever
+    /// the term changes: a plan carries no term of its own, so a stale one
+    /// cannot be recognised the way a stale [`Self::query_vector`] can.
+    pub ai_plan: Option<trove_core::ai::search_planner::AiSearchPlan>,
     /// Cached duplicate clusters for the duplicates dialog: computed once on
     /// a backend thread (the O(n²) pHash pass must not run per render frame),
     /// invalidated on cleanup and library swap.
@@ -281,8 +289,22 @@ const VIEW_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(1500
 const IMPORT_REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
 const IMPORT_REFRESH_FILES: usize = 10;
 
+/// Resolve the three search legs from the stored config.
+///
+/// A tier is on only when its toggle is set *and* its endpoint is configured —
+/// an enabled-but-unconfigured leg is inert, which is what keeps a search from
+/// failing on a half-filled settings page.
+fn resolved_search_tiers(config: &AppConfig) -> SearchTiers {
+    SearchTiers {
+        full_text: config.search.full_text,
+        semantic: config.semantic_endpoint().is_some(),
+        ai: config.search.ai_enabled(),
+    }
+}
+
 impl LibraryController {
     pub fn new(library: Library) -> Self {
+        let config = AppConfig::load();
         Self {
             library,
             generation: 0,
@@ -309,15 +331,17 @@ impl LibraryController {
             selection_anchor: None,
             last_view_record: None,
             grid_loaded: GRID_PAGE_SIZE,
-            row_height_scale: AppConfig::load().grid_zoom(),
+            row_height_scale: config.grid_zoom(),
             selection_source: SelectionSource::None,
             visual_results: None,
             notice: None,
             integrity_report: None,
             busy: false,
             ai_probe: AiProbe::Idle,
-            chat_probe: ChatProbe::Idle,
+            analysis_probe: AnalysisProbe::Idle,
             query_vector: None,
+            search_tiers: resolved_search_tiers(&config),
+            ai_plan: None,
             duplicates: None,
             duplicates_computing: false,
             watch_task: None,
@@ -633,10 +657,11 @@ impl LibraryController {
         // endpoint; a result from before the swap would be about a store that
         // is no longer open.
         self.ai_probe = AiProbe::Idle;
-        self.chat_probe = ChatProbe::Idle;
-        // Same for the query embedding: it was computed against the previous
-        // library's model rows.
+        self.analysis_probe = AnalysisProbe::Idle;
+        // Same for the query embedding and the search plan: they were
+        // computed against the previous library's model rows and index.
         self.query_vector = None;
+        self.ai_plan = None;
         // Duplicate clusters belong to the library they were computed in; the
         // field doc says "invalidated on cleanup and library swap" and this
         // is the swap half of that. A stale cache here would show the
@@ -657,6 +682,10 @@ impl LibraryController {
 
     pub fn set_search(&mut self, text: String) {
         self.search_text = text;
+        // A plan is term-specific and carries no term of its own, so any
+        // change invalidates it; the AI tier fetches a fresh one when it is
+        // on.
+        self.ai_plan = None;
         if self.search_text.trim().is_empty() {
             // A cleared search has nothing to fuse with. A *changed* term
             // deliberately keeps the old vector: the query compares the
@@ -669,6 +698,17 @@ impl LibraryController {
             self.close_visual_search();
         }
         self.reset_grid_page();
+        self.generation += 1;
+    }
+
+    /// Re-resolve the search tiers from the stored config. The settings page
+    /// calls this when a toggle changes, so the next data pass sees the new
+    /// choice without a restart.
+    pub fn refresh_search_tiers(&mut self) {
+        self.search_tiers = resolved_search_tiers(&AppConfig::load());
+        // A tier change alters what the same search term returns, so the
+        // workspace's cached data pass must be invalidated; `generation` is
+        // part of its key.
         self.generation += 1;
     }
 
