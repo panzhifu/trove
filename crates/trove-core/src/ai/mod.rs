@@ -11,9 +11,13 @@
 //! Everything here is synchronous by design: providers run on background
 //! task threads ([`crate::tasks`]), which are plain `std::thread`s.
 
+pub mod chat;
+mod http;
 pub mod mock;
 pub mod openai;
+pub mod tagging;
 
+pub use chat::{ChatProvider, ChatRequest, OpenAIChat};
 pub use mock::MockProvider;
 pub use openai::OpenAICompatible;
 

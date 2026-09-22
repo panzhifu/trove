@@ -98,6 +98,12 @@ rodio = { version = "0.19", default-features = false }
 # Local collect service: URL fetching for the inbox (extension / curl)
 ureq = "3"
 
+# Data-URI encoding for the multimodal chat endpoint: a thumbnail handed to a
+# vision model travels as `data:image/jpeg;base64,…` in the request body.
+# Already in the lock file as a transitive dependency, so declaring it here
+# costs no new download.
+base64 = "0.22"
+
 # Folder watching: kernel events (inotify/FSEvents/ReadDirectoryChangesW) for
 # the watch roots. The periodic sweep stays as the fallback — network mounts
 # and fuse have no events to give, and an overflowed kernel queue drops them.
