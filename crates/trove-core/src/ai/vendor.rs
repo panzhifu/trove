@@ -40,6 +40,20 @@ impl VendorId {
             VendorId::DashScope => "dashscope",
         }
     }
+
+    /// The vendor's official API endpoint, in the shape the adapters'
+    /// `new(base_url, ..)` expects — the prefix they append their operation
+    /// path to (`/chat/completions`, `/v1/messages`, …). Settings use it to
+    /// pre-fill the endpoint when the user picks a vendor; relays and local
+    /// servers are typed over it afterwards.
+    pub fn default_base_url(self) -> &'static str {
+        match self {
+            VendorId::OpenAI => "https://api.openai.com/v1",
+            VendorId::Anthropic => "https://api.anthropic.com",
+            VendorId::Gemini => "https://generativelanguage.googleapis.com",
+            VendorId::DashScope => "https://dashscope.aliyuncs.com",
+        }
+    }
 }
 
 impl std::str::FromStr for VendorId {

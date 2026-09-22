@@ -296,10 +296,20 @@ fn analysis_group(controller: &Entity<LibraryController>, probe: &AnalysisProbe)
         .item(
             SettingItem::new(
                 rust_i18n::t!("settings.chat_vendor").to_string(),
-                SettingField::input(
+                SettingField::dropdown(
+                    vendor_options(),
                     |_cx| SharedString::from(analysis_config().vendor.clone()),
                     |value, cx| {
-                        save_analysis_config(|config| config.vendor = value.to_string(), cx)
+                        save_analysis_config(
+                            |config| {
+                                apply_vendor_choice(
+                                    &mut config.vendor,
+                                    &mut config.base_url,
+                                    &value,
+                                )
+                            },
+                            cx,
+                        )
                     },
                 ),
             )
@@ -391,7 +401,9 @@ fn analysis_group(controller: &Entity<LibraryController>, probe: &AnalysisProbe)
         .item(SettingItem::new(
             rust_i18n::t!("settings.chat_language").to_string(),
             SettingField::input(
-                |_cx| SharedString::from(analysis_config().tag_language.clone().unwrap_or_default()),
+                |_cx| {
+                    SharedString::from(analysis_config().tag_language.clone().unwrap_or_default())
+                },
                 |value, cx| {
                     let value = value.trim().to_string();
                     save_analysis_config(
@@ -527,5 +539,10 @@ fn analysis_buttons(controller: &Entity<LibraryController>, cx: &mut App) -> Div
             })
     };
 
-    h_flex().w_full().justify_end().gap_2().child(run).child(undo)
+    h_flex()
+        .w_full()
+        .justify_end()
+        .gap_2()
+        .child(run)
+        .child(undo)
 }

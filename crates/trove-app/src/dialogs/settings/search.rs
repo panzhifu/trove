@@ -86,12 +86,19 @@ fn tiers_group(controller: &Entity<LibraryController>) -> SettingGroup {
         )
         .item(SettingItem::new(
             rust_i18n::t!("settings.search_ai_vendor").to_string(),
-            SettingField::input(
+            SettingField::dropdown(
+                vendor_options(),
                 |_cx| SharedString::from(search_config().ai.vendor.clone()),
                 move |value, cx| {
                     save_search(
                         &ai_vendor,
-                        |config| config.ai.vendor = value.to_string(),
+                        |config| {
+                            apply_vendor_choice(
+                                &mut config.ai.vendor,
+                                &mut config.ai.base_url,
+                                &value,
+                            )
+                        },
                         cx,
                     )
                 },
