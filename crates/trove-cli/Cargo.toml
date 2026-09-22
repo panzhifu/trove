@@ -1,0 +1,20 @@
+[package]
+name = "trove-cli"
+version = "0.4.6"
+edition = "2024"
+license = "MIT"
+description = "Command-line access to a Trove library, for scripts and agents."
+
+[[bin]]
+name = "trove"
+path = "src/main.rs"
+
+[dependencies]
+trove-core = { path = "../trove-core" }
+clap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
