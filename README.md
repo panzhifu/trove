@@ -153,6 +153,12 @@ crates/
     │   ├── dialogs/         # 设置六页、规则编辑器、重复文件查找、批量重命名、格式转换
     │   ├── panels/          # 资源管理器、文件夹、工作区、标签、检查器
     │   └── components/      # 预览组件（图片 / 视频 / 字体 / 3D / 音频 / 回退）
+└── trove-cli/           # 无界面的 `trove` 命令行（脚本与 AI 使用）
+    └── src/
+        ├── cli.rs           # clap 命令树 —— `--help` 即完整契约
+        ├── ctx.rs           # 库打开、输出契约、退出码
+        ├── read.rs          # 只读命令：libraries / info / list / search / get / doctor …
+        └── write.rs         # 写命令：import / set / tag / trash / collection / index
 ```
 
 核心数据表：
@@ -186,6 +192,35 @@ view_history       最近查看记录（上限 200 条）
 
 ---
 
+## 命令行
+
+`trove-cli` 是桌面版的无声兄弟：与 app 共用同一份 `trove-core`，读同一个数据库、遵守同一套规则，并且**可以在桌面版开着的时候运行**——此时素材库以只读方式打开，查询照常，写入只落数据库，索引的更新留给持有它的那个进程。
+
+```sh
+cargo build -p trove-cli            # 产出 target/debug/trove
+
+trove libraries                     # 列出机器上的所有库
+trove info                          # 当前库概览：数量、体积、索引状态
+trove list --kind image -n 20       # 列素材（筛选参数见 --help）
+trove search 猫 --aspect wechat-cover
+trove get <uuid>                    # 完整记录，附文件的绝对路径
+trove import ~/Pictures --into 参考图
+trove tag <uuid> --add 动物
+trove trash <uuid>                  # 软删除，可 restore；purge --yes 才永久删
+trove collection create 参考图
+trove doctor                        # 库、索引、ffmpeg 自检
+```
+
+约定只有三条：
+
+- **stdout 永远是一个 JSON 文档**，`--human` 才换成表格；
+- **退出码决定是否值得解析它**：0 成功、1 失败、2 用法错误、3 素材库不可用（不存在、schema 版本不符，或需要写索引但已被占用）；
+- 诊断信息走 stderr，`--quiet` 只留错误。
+
+`--help` 是完整的命令契约。库可用 `--library <slug>` 指定；`TROVE_DATA_DIR` / `TROVE_CONFIG_DIR` / `TROVE_CACHE_DIR` 可以把整个环境搬到别处跑。
+
+---
+
 ## 构建与测试
 
 ```sh
@@ -194,7 +229,7 @@ cargo test -p trove-core
 cargo run -p trove-app
 ```
 
-**当前测试基线：`trove-core` 401 + `trove-app` 34 全部通过；`cargo fmt --check` 干净；clippy 全工作区 0 告警。** `trove-app` 含 2 个真机 GPU 冒烟测试（EDL、meshlet 剔除），无显卡的机器自动跳过。
+**当前测试基线：`trove-core` 519 + `trove-app` 48 全部通过；`cargo fmt --check` 干净；clippy 全工作区 0 告警。** `trove-app` 含 2 个真机 GPU 冒烟测试（EDL、meshlet 剔除），无显卡的机器自动跳过。
 
 各模块的实现细节按主题整理在 [docs/README.md](docs/README.md) 索引里。
 
