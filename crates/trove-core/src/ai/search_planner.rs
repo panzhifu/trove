@@ -122,7 +122,12 @@ impl AiSearchPlan {
         let synonyms = normalize_terms(raw.synonyms);
         let exclusions = normalize_terms(raw.exclusions);
 
-        if keywords.is_empty() && synonyms.is_empty() && exclusions.is_empty() && raw.filters.is_empty() && raw.sort.is_none() {
+        if keywords.is_empty()
+            && synonyms.is_empty()
+            && exclusions.is_empty()
+            && raw.filters.is_empty()
+            && raw.sort.is_none()
+        {
             return Err("empty plan".into());
         }
 
@@ -139,10 +144,16 @@ impl AiSearchPlan {
                 raw::FilterField::Width | raw::FilterField::Height | raw::FilterField::DurationMs
             );
             if is_numeric && raw_filter.ranges.is_empty() {
-                return Err(format!("filter {:?}: numeric filters require ranges", raw_filter.field));
+                return Err(format!(
+                    "filter {:?}: numeric filters require ranges",
+                    raw_filter.field
+                ));
             }
             if !is_numeric && !raw_filter.ranges.is_empty() {
-                return Err(format!("filter {:?}: categorical filters cannot have ranges", raw_filter.field));
+                return Err(format!(
+                    "filter {:?}: categorical filters cannot have ranges",
+                    raw_filter.field
+                ));
             }
             let values = if is_numeric {
                 vec![]
@@ -160,7 +171,14 @@ impl AiSearchPlan {
                     raw::FilterField::DurationMs => PlanFilterField::DurationMs,
                 },
                 values,
-                ranges: raw_filter.ranges.into_iter().map(|r| PlanRange { min: r.min, max: r.max }).collect(),
+                ranges: raw_filter
+                    .ranges
+                    .into_iter()
+                    .map(|r| PlanRange {
+                        min: r.min,
+                        max: r.max,
+                    })
+                    .collect(),
                 exclude: raw_filter.exclude,
             });
         }
@@ -181,7 +199,13 @@ impl AiSearchPlan {
             },
         });
 
-        Ok(Self { keywords, synonyms, exclusions, filters, sort })
+        Ok(Self {
+            keywords,
+            synonyms,
+            exclusions,
+            filters,
+            sort,
+        })
     }
 }
 
@@ -306,25 +330,26 @@ pub fn plan(
         },
     });
 
-    let raw_text = provider.analyze(
-        &crate::ai::analysis::AiAnalysisRequest {
-            asset_id: uuid::Uuid::nil(),
-            display_name: "search-plan".into(),
-            file_name: "search-plan".into(),
-            mime: "text/plain".into(),
-            media_type: crate::ai::analysis::MediaType::Other,
-            thumbnail_jpeg: None,
-            contact_sheet_jpeg: None,
-            language: "en".into(),
-            enabled_fields: crate::ai::analysis::AiAnalysisFields::default(),
-            existing_tag_names: vec![],
-            vocabulary: vec![],
-            metadata_lines: vec![],
-            settings: crate::ai::analysis::AiAnalysisSettings::default(),
-        },
-        cancel,
-    )
-    .map_err(|e| Error::Validation(format!("search planner failed: {e}")))?;
+    let raw_text = provider
+        .analyze(
+            &crate::ai::analysis::AiAnalysisRequest {
+                asset_id: uuid::Uuid::nil(),
+                display_name: "search-plan".into(),
+                file_name: "search-plan".into(),
+                mime: "text/plain".into(),
+                media_type: crate::ai::analysis::MediaType::Other,
+                thumbnail_jpeg: None,
+                contact_sheet_jpeg: None,
+                language: "en".into(),
+                enabled_fields: crate::ai::analysis::AiAnalysisFields::default(),
+                existing_tag_names: vec![],
+                vocabulary: vec![],
+                metadata_lines: vec![],
+                settings: crate::ai::analysis::AiAnalysisSettings::default(),
+            },
+            cancel,
+        )
+        .map_err(|e| Error::Validation(format!("search planner failed: {e}")))?;
 
     // Parse the JSON plan from the model's reply.
     let raw_plan: raw::Plan = parse_raw_plan(&raw_text)?;
@@ -334,13 +359,14 @@ pub fn plan(
 fn parse_raw_plan(text: &str) -> std::result::Result<raw::Plan, Error> {
     let trimmed = text.trim();
     // Strip optional markdown fences.
-    let unfenced = trimmed
-        .trim_start_matches('`')
-        .trim_end_matches('`')
-        .trim();
+    let unfenced = trimmed.trim_start_matches('`').trim_end_matches('`').trim();
     // Find the first JSON object.
-    let start = unfenced.find('{').ok_or_else(|| Error::Validation("no JSON in plan".into()))?;
-    let end = unfenced.rfind('}').ok_or_else(|| Error::Validation("no JSON in plan".into()))?;
+    let start = unfenced
+        .find('{')
+        .ok_or_else(|| Error::Validation("no JSON in plan".into()))?;
+    let end = unfenced
+        .rfind('}')
+        .ok_or_else(|| Error::Validation("no JSON in plan".into()))?;
     if end <= start {
         return Err(Error::Validation("malformed JSON in plan".into()));
     }
@@ -473,7 +499,10 @@ mod tests {
             filters: vec![raw::Filter {
                 field: raw::FilterField::Width,
                 values: vec![],
-                ranges: vec![raw::Range { min: Some(100.0), max: None }],
+                ranges: vec![raw::Range {
+                    min: Some(100.0),
+                    max: None,
+                }],
                 exclude: false,
             }],
             sort: None,

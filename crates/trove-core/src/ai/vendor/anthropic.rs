@@ -26,7 +26,9 @@ impl AnthropicAdapter {
             return Err(Error::Validation("no base URL".into()));
         }
         if !base_url.starts_with("http://") && !base_url.starts_with("https://") {
-            return Err(Error::Validation(format!("must be http(s), got {base_url:?}")));
+            return Err(Error::Validation(format!(
+                "must be http(s), got {base_url:?}"
+            )));
         }
         let model = model.trim();
         if model.is_empty() {
@@ -211,14 +213,19 @@ fn extract_content(body: &str) -> std::result::Result<String, VendorError> {
     })?;
 
     for block in &parsed.content {
-        if block.block_type == "tool_use" {
-            if let Some(input) = &block.input {
-                return Ok(serde_json::to_string_pretty(input).unwrap_or_default());
-            }
+        if block.block_type == "tool_use"
+            && let Some(input) = &block.input
+        {
+            return Ok(serde_json::to_string_pretty(input).unwrap_or_default());
         }
     }
 
-    let text: String = parsed.content.iter().filter_map(|b| b.text.as_deref()).collect::<Vec<_>>().join("\n");
+    let text: String = parsed
+        .content
+        .iter()
+        .filter_map(|b| b.text.as_deref())
+        .collect::<Vec<_>>()
+        .join("\n");
     if text.trim().is_empty() {
         Err(VendorError {
             kind: VendorErrorKind::InvalidResponse,
@@ -250,12 +257,18 @@ fn classify_http_error(status: u16, body: &str) -> VendorErrorKind {
 
 fn parse_error(body: &str) -> Option<String> {
     let parsed: serde_json::Value = serde_json::from_str(body).ok()?;
-    parsed.pointer("/error/message").and_then(|v| v.as_str()).map(str::to_string)
+    parsed
+        .pointer("/error/message")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
 }
 
 fn extract_code(body: &str) -> Option<String> {
     let parsed: serde_json::Value = serde_json::from_str(body).ok()?;
-    parsed.pointer("/error/code").and_then(|v| v.as_str()).map(str::to_string)
+    parsed
+        .pointer("/error/code")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
 }
 
 #[cfg(test)]
@@ -263,7 +276,12 @@ mod tests {
     use super::*;
 
     fn adapter() -> AnthropicAdapter {
-        AnthropicAdapter::new("https://api.anthropic.com", "sk-ant-xxx", "claude-3-haiku-20240307").unwrap()
+        AnthropicAdapter::new(
+            "https://api.anthropic.com",
+            "sk-ant-xxx",
+            "claude-3-haiku-20240307",
+        )
+        .unwrap()
     }
 
     #[test]

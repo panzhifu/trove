@@ -350,13 +350,20 @@ fn apply_plan_filters(plan: &crate::ai::search_planner::AiSearchPlan, q: &mut As
             }
             crate::ai::search_planner::PlanFilterField::Rating => {
                 // Take the highest minimum rating from the plan.
-                let min_from_plan = filter.values.iter().filter_map(|v| v.parse::<u8>().ok()).max();
+                let min_from_plan = filter
+                    .values
+                    .iter()
+                    .filter_map(|v| v.parse::<u8>().ok())
+                    .max();
                 if let Some(min) = min_from_plan {
                     q.min_rating = Some(q.min_rating.map_or(min, |existing| existing.max(min)));
                 }
             }
             crate::ai::search_planner::PlanFilterField::Favorite => {
-                let want_favorite = filter.values.first().is_some_and(|v| v == "true" || v == "1");
+                let want_favorite = filter
+                    .values
+                    .first()
+                    .is_some_and(|v| v == "true" || v == "1");
                 if want_favorite && !filter.exclude {
                     q.is_favorite = Some(true);
                 }

@@ -347,19 +347,16 @@ pub fn run(
                         &mut outcome.created_tags,
                     ) {
                         Ok(applied) => {
-                            let wrote_metadata = processed.description.is_some()
-                                || processed.rating.is_some();
+                            let wrote_metadata =
+                                processed.description.is_some() || processed.rating.is_some();
                             if applied.is_empty() && !wrote_metadata {
                                 outcome.unchanged += 1;
                             } else {
                                 outcome.analysed += 1;
                             }
-                            if let Err(error) = record_marker(
-                                &conn,
-                                prepared,
-                                model_version,
-                                &applied,
-                            ) {
+                            if let Err(error) =
+                                record_marker(&conn, prepared, model_version, &applied)
+                            {
                                 tracing::warn!(
                                     asset = %prepared.asset.file_name,
                                     error = %error,
@@ -793,9 +790,7 @@ fn fingerprint(model: &str, asset: &Asset, options: &AiAnalysisOptions) -> Strin
     input.push('\n');
     input.push_str(&format!(
         "{}{}{}",
-        options.fields.description as u8,
-        options.fields.tags as u8,
-        options.fields.rating as u8
+        options.fields.description as u8, options.fields.tags as u8, options.fields.rating as u8
     ));
     input.push('\n');
     // The image is part of the answer's input, so a re-encoded file must
@@ -921,10 +916,7 @@ mod tests {
             Ok(self.response.clone())
         }
 
-        fn probe_connection(
-            &self,
-            _cancel: &AtomicBool,
-        ) -> std::result::Result<(), VendorError> {
+        fn probe_connection(&self, _cancel: &AtomicBool) -> std::result::Result<(), VendorError> {
             Ok(())
         }
     }
@@ -1005,7 +997,9 @@ mod tests {
     #[test]
     fn tags_are_attached_and_new_ones_filed_under_the_parent() {
         let (root, data, cache) = library(3);
-        let provider = MockAdapter::new(r#"{"description": null, "tags": ["cat", "outdoors"], "rating": null}"#);
+        let provider = MockAdapter::new(
+            r#"{"description": null, "tags": ["cat", "outdoors"], "rating": null}"#,
+        );
         let outcome = run(&options(&data, &cache), &provider, &ctx()).unwrap();
 
         assert_eq!(outcome.analysed, 3);
@@ -1018,7 +1012,12 @@ mod tests {
             .unwrap()
             .expect("the parent tag exists");
         for tag in tags::list(&conn).unwrap().iter().filter(|t| t.name != "AI") {
-            assert_eq!(tag.parent_id, Some(parent.id), "{} must be filed under the parent", tag.name);
+            assert_eq!(
+                tag.parent_id,
+                Some(parent.id),
+                "{} must be filed under the parent",
+                tag.name
+            );
         }
         for asset in live_assets(&conn) {
             let mut names = tag_names(&conn, asset.id);
@@ -1031,9 +1030,8 @@ mod tests {
     #[test]
     fn description_and_rating_are_written_back() {
         let (root, data, cache) = library(1);
-        let provider = MockAdapter::new(
-            r#"{"description": "A red wall", "tags": ["red"], "rating": 4}"#,
-        );
+        let provider =
+            MockAdapter::new(r#"{"description": "A red wall", "tags": ["red"], "rating": 4}"#);
         run(&options(&data, &cache), &provider, &ctx()).unwrap();
 
         let conn = open(&data);
@@ -1073,7 +1071,8 @@ mod tests {
     #[test]
     fn an_image_is_sent_with_the_request() {
         let (root, data, cache) = library(1);
-        let provider = MockAdapter::new(r#"{"description": null, "tags": ["cat"], "rating": null}"#);
+        let provider =
+            MockAdapter::new(r#"{"description": null, "tags": ["cat"], "rating": null}"#);
         run(&options(&data, &cache), &provider, &ctx()).unwrap();
         assert_eq!(provider.images_sent(), 1, "the thumbnail rode along");
         let _ = std::fs::remove_dir_all(&root);
@@ -1082,8 +1081,14 @@ mod tests {
     #[test]
     fn a_second_run_skips_everything_and_asks_nothing() {
         let (root, data, cache) = library(3);
-        let provider = MockAdapter::new(r#"{"description": null, "tags": ["cat"], "rating": null}"#);
-        assert_eq!(run(&options(&data, &cache), &provider, &ctx()).unwrap().analysed, 3);
+        let provider =
+            MockAdapter::new(r#"{"description": null, "tags": ["cat"], "rating": null}"#);
+        assert_eq!(
+            run(&options(&data, &cache), &provider, &ctx())
+                .unwrap()
+                .analysed,
+            3
+        );
         assert_eq!(provider.requests(), 3);
 
         let second = run(&options(&data, &cache), &provider, &ctx()).unwrap();
@@ -1097,7 +1102,9 @@ mod tests {
     #[test]
     fn force_ignores_the_fingerprint_and_undo_takes_everything_back() {
         let (root, data, cache) = library(2);
-        let provider = MockAdapter::new(r#"{"description": null, "tags": ["cat", "outdoors"], "rating": null}"#);
+        let provider = MockAdapter::new(
+            r#"{"description": null, "tags": ["cat", "outdoors"], "rating": null}"#,
+        );
         run(&options(&data, &cache), &provider, &ctx()).unwrap();
 
         let mut forced = options(&data, &cache);

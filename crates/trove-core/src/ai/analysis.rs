@@ -325,7 +325,11 @@ pub fn asset_metadata_lines(asset: &Asset) -> Vec<String> {
     }
     push_line(&mut lines, "artist", asset.facts.media.artist.as_deref());
     push_line(&mut lines, "album", asset.facts.media.album.as_deref());
-    push_line(&mut lines, "font family", asset.facts.font.family.as_deref());
+    push_line(
+        &mut lines,
+        "font family",
+        asset.facts.font.family.as_deref(),
+    );
     push_line(&mut lines, "font style", asset.facts.font.style.as_deref());
     lines
 }
@@ -445,7 +449,7 @@ pub fn post_process(
     }
 
     // Rating: clamp to 1..=5, reject 0.
-    result.rating = result.rating.filter(|&r| r >= 1 && r <= 5);
+    result.rating = result.rating.filter(|&r| (1..=5).contains(&r));
 
     result
 }
@@ -475,7 +479,9 @@ pub fn parse_model_reply(text: &str, model_version: &str) -> Result<AiAnalysisRe
             .rfind('}')
             .ok_or_else(|| Error::Validation("model reply did not contain a JSON object".into()))?;
         if end <= start {
-            return Err(Error::Validation("model reply did not contain a JSON object".into()));
+            return Err(Error::Validation(
+                "model reply did not contain a JSON object".into(),
+            ));
         }
         serde_json::from_str(&unfenced[start..=end])
             .map_err(|e| Error::Validation(format!("model reply contained invalid JSON: {e}")))
@@ -485,20 +491,18 @@ pub fn parse_model_reply(text: &str, model_version: &str) -> Result<AiAnalysisRe
         .as_object()
         .ok_or_else(|| Error::Validation("model reply was not a JSON object".into()))?;
 
-    let description = obj
-        .get("description")
-        .and_then(|v| match v {
-            serde_json::Value::Null => None,
-            serde_json::Value::String(s) => {
-                let t = s.trim();
-                if t.is_empty() {
-                    None
-                } else {
-                    Some(t.to_string())
-                }
+    let description = obj.get("description").and_then(|v| match v {
+        serde_json::Value::Null => None,
+        serde_json::Value::String(s) => {
+            let t = s.trim();
+            if t.is_empty() {
+                None
+            } else {
+                Some(t.to_string())
             }
-            other => Some(other.to_string()),
-        });
+        }
+        other => Some(other.to_string()),
+    });
 
     let tags = obj
         .get("tags")
@@ -510,13 +514,11 @@ pub fn parse_model_reply(text: &str, model_version: &str) -> Result<AiAnalysisRe
         })
         .unwrap_or_default();
 
-    let rating = obj.get("rating").and_then(|v| {
-        match v {
-            serde_json::Value::Null => None,
-            serde_json::Value::Number(n) => n.as_u64().map(|u| u as u8),
-            serde_json::Value::String(s) => s.trim().parse::<u8>().ok(),
-            _ => None,
-        }
+    let rating = obj.get("rating").and_then(|v| match v {
+        serde_json::Value::Null => None,
+        serde_json::Value::Number(n) => n.as_u64().map(|u| u as u8),
+        serde_json::Value::String(s) => s.trim().parse::<u8>().ok(),
+        _ => None,
     });
 
     Ok(AiAnalysisResult {
@@ -632,7 +634,10 @@ mod tests {
             model_version: "test".into(),
         };
         let processed = post_process(result, &["beach".into()], &[], &settings, "en");
-        assert_eq!(processed.tags, vec!["ocean".to_string(), "beach".to_string()]);
+        assert_eq!(
+            processed.tags,
+            vec!["ocean".to_string(), "beach".to_string()]
+        );
     }
 
     #[test]

@@ -1098,26 +1098,25 @@ pub fn request_ai_plan_app(controller: &Entity<LibraryController>, cx: &mut App)
     if !config.is_configured() {
         return;
     }
-    let provider: std::sync::Arc<dyn trove_core::ai::vendor::VendorAdapter> =
-        match config
-            .vendor
-            .parse::<trove_core::ai::vendor::VendorId>()
+    let provider: std::sync::Arc<dyn trove_core::ai::vendor::VendorAdapter> = match config
+        .vendor
+        .parse::<trove_core::ai::vendor::VendorId>()
+        .map_err(|error| error.to_string())
+        .and_then(|vendor| {
+            trove_core::ai::vendor::build_adapter(
+                vendor,
+                &config.base_url,
+                &config.api_key,
+                &config.model,
+            )
             .map_err(|error| error.to_string())
-            .and_then(|vendor| {
-                trove_core::ai::vendor::build_adapter(
-                    vendor,
-                    &config.base_url,
-                    &config.api_key,
-                    &config.model,
-                )
-                .map_err(|error| error.to_string())
-            }) {
-            Ok(adapter) => std::sync::Arc::from(adapter),
-            Err(error) => {
-                tracing::warn!(%error, "AI search plan skipped: endpoint is misconfigured");
-                return;
-            }
-        };
+        }) {
+        Ok(adapter) => std::sync::Arc::from(adapter),
+        Err(error) => {
+            tracing::warn!(%error, "AI search plan skipped: endpoint is misconfigured");
+            return;
+        }
+    };
     let controller = controller.clone();
 
     cx.spawn(async move |cx| {
@@ -1411,7 +1410,9 @@ pub fn start_analysis_app(
         ..AiAnalysisRunRequest::default()
     };
     let manager = controller.read(cx).library.tasks().clone();
-    let started = controller.update(cx, |ctl, _| ctl.library.start_ai_analysis(provider, request));
+    let started = controller.update(cx, |ctl, _| {
+        ctl.library.start_ai_analysis(provider, request)
+    });
     let Ok((task_id, rx)) = started else {
         return false; // one run at a time; the running toast is already up
     };

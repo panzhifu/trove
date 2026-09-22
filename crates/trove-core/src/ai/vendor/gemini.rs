@@ -26,7 +26,9 @@ impl GeminiAdapter {
             return Err(Error::Validation("no base URL".into()));
         }
         if !base_url.starts_with("http://") && !base_url.starts_with("https://") {
-            return Err(Error::Validation(format!("must be http(s), got {base_url:?}")));
+            return Err(Error::Validation(format!(
+                "must be http(s), got {base_url:?}"
+            )));
         }
         let model = model.trim();
         if model.is_empty() {
@@ -110,7 +112,10 @@ impl GeminiAdapter {
         body: &serde_json::Value,
         cancel: &AtomicBool,
     ) -> std::result::Result<String, VendorError> {
-        let url = format!("{}/v1beta/models/{}:generateContent", self.base_url, self.model);
+        let url = format!(
+            "{}/v1beta/models/{}:generateContent",
+            self.base_url, self.model
+        );
         let body_str = body.to_string();
         let mut last_error = None;
 
@@ -205,28 +210,25 @@ fn extract_content(body: &str) -> std::result::Result<String, VendorError> {
         text: Option<String>,
     }
 
-    let parsed: Response = serde_json::from_str(body).map_err(|e| {
-        VendorError {
-            kind: VendorErrorKind::InvalidResponse,
-            message: format!("unparseable: {e}"),
+    let parsed: Response = serde_json::from_str(body).map_err(|e| VendorError {
+        kind: VendorErrorKind::InvalidResponse,
+        message: format!("unparseable: {e}"),
+        http_status: None,
+        provider_code: None,
+        request_id: None,
+    })?;
+
+    if let Some(fb) = &parsed.prompt_feedback
+        && let Some(reason) = &fb.block_reason
+        && !reason.is_empty()
+    {
+        return Err(VendorError {
+            kind: VendorErrorKind::Refused,
+            message: format!("blocked: {reason}"),
             http_status: None,
             provider_code: None,
             request_id: None,
-        }
-    })?;
-
-    if let Some(fb) = &parsed.prompt_feedback {
-        if let Some(reason) = &fb.block_reason {
-            if !reason.is_empty() {
-                return Err(VendorError {
-                    kind: VendorErrorKind::Refused,
-                    message: format!("blocked: {reason}"),
-                    http_status: None,
-                    provider_code: None,
-                    request_id: None,
-                });
-            }
-        }
+        });
     }
 
     let candidate = parsed.candidates.first().ok_or(VendorError {
@@ -237,19 +239,25 @@ fn extract_content(body: &str) -> std::result::Result<String, VendorError> {
         request_id: None,
     })?;
 
-    if let Some(ref reason) = candidate.finish_reason {
-        if ["SAFETY", "BLOCKLIST", "PROHIBITED_CONTENT"].contains(&reason.as_str()) {
-            return Err(VendorError {
-                kind: VendorErrorKind::Refused,
-                message: format!("refused: {reason}"),
-                http_status: None,
-                provider_code: None,
-                request_id: None,
-            });
-        }
+    if let Some(ref reason) = candidate.finish_reason
+        && ["SAFETY", "BLOCKLIST", "PROHIBITED_CONTENT"].contains(&reason.as_str())
+    {
+        return Err(VendorError {
+            kind: VendorErrorKind::Refused,
+            message: format!("refused: {reason}"),
+            http_status: None,
+            provider_code: None,
+            request_id: None,
+        });
     }
 
-    let text: String = candidate.content.parts.iter().filter_map(|p| p.text.as_deref()).collect::<Vec<_>>().join("\n");
+    let text: String = candidate
+        .content
+        .parts
+        .iter()
+        .filter_map(|p| p.text.as_deref())
+        .collect::<Vec<_>>()
+        .join("\n");
     if text.trim().is_empty() {
         Err(VendorError {
             kind: VendorErrorKind::InvalidResponse,
@@ -287,12 +295,18 @@ fn classify_http_error(status: u16, body: &str) -> VendorErrorKind {
 
 fn parse_error(body: &str) -> Option<String> {
     let parsed: serde_json::Value = serde_json::from_str(body).ok()?;
-    parsed.pointer("/error/message").and_then(|v| v.as_str()).map(str::to_string)
+    parsed
+        .pointer("/error/message")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
 }
 
 fn extract_code(body: &str) -> Option<String> {
     let parsed: serde_json::Value = serde_json::from_str(body).ok()?;
-    parsed.pointer("/error/code").and_then(|v| v.as_str()).map(str::to_string)
+    parsed
+        .pointer("/error/code")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
 }
 
 #[cfg(test)]
@@ -300,7 +314,12 @@ mod tests {
     use super::*;
 
     fn adapter() -> GeminiAdapter {
-        GeminiAdapter::new("https://generativelanguage.googleapis.com", "AIza-xxx", "gemini-1.5-flash").unwrap()
+        GeminiAdapter::new(
+            "https://generativelanguage.googleapis.com",
+            "AIza-xxx",
+            "gemini-1.5-flash",
+        )
+        .unwrap()
     }
 
     #[test]
@@ -320,12 +339,19 @@ mod tests {
     #[test]
     fn extract_detects_block_reason() {
         let body = r#"{"promptFeedback":{"blockReason":"SAFETY"},"candidates":[]}"#;
-        assert_eq!(extract_content(body).unwrap_err().kind, VendorErrorKind::Refused);
+        assert_eq!(
+            extract_content(body).unwrap_err().kind,
+            VendorErrorKind::Refused
+        );
     }
 
     #[test]
     fn extract_detects_finish_reason() {
-        let body = r#"{"candidates":[{"finishReason":"SAFETY","content":{"parts":[{"text":"ok"}]}}]}"#;
-        assert_eq!(extract_content(body).unwrap_err().kind, VendorErrorKind::Refused);
+        let body =
+            r#"{"candidates":[{"finishReason":"SAFETY","content":{"parts":[{"text":"ok"}]}}]}"#;
+        assert_eq!(
+            extract_content(body).unwrap_err().kind,
+            VendorErrorKind::Refused
+        );
     }
 }
