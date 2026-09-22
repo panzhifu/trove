@@ -63,6 +63,7 @@ pub enum TaskKind {
     VisualBackfill,      // 视觉签名回填
     WatchScan,           // 监视扫描
     EmbeddingBackfill,   // 嵌入向量回填
+    AutoTag,             // AI 自动打标签（一个素材一次请求，最慢的作业）
 }
 ```
 
