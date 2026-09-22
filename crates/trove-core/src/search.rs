@@ -182,43 +182,140 @@ fn indexed_basic(tokenizer: &str) -> TextOptions {
 
 /// The Tantivy index. Lives in the same single-threaded `Rc` world as the
 /// store connection; `Rc` fields keep `Library`'s `Clone` derive valid.
+/// How hard [`TextIndex::open_with`] tries to take Tantivy's writer lock.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WriterLock {
+    /// Fail when another process holds it (the desktop app's own open).
+    Required,
+    /// Serve reads from `reader` alone when it is held elsewhere.
+    Optional,
+}
+
 #[derive(Clone)]
 pub struct TextIndex {
-    writer: Rc<RefCell<IndexWriter>>,
+    /// `None` for a read-only handle: Tantivy's `INDEX_WRITER_LOCK` belongs
+    /// to another process, so searches are answered from `reader` alone.
+    /// Every write path goes through [`TextIndex::writer`], which fails
+    /// loudly rather than dropping documents on the floor.
+    writer: Option<Rc<RefCell<IndexWriter>>>,
     reader: IndexReader,
     f: Fields,
 }
 
 impl TextIndex {
-    /// Open (or create) the index under `dir`. A missing, corrupted or
-    /// version-mismatched index is wiped and recreated — it is rebuilt from
-    /// SQLite through the queue, so nothing is lost.
+    /// Open (or create) the index under `dir`, taking the writer lock. A
+    /// missing, corrupted or version-mismatched index is wiped and
+    /// recreated — it is rebuilt from SQLite through the queue, so nothing
+    /// is lost. Fails when another process already holds the lock.
     pub fn open(dir: &Path) -> Result<Self> {
+        Self::open_with(dir, WriterLock::Required)
+    }
+
+    /// Open an index for querying that does not require the writer lock, so
+    /// a second process (the CLI) can read a library the desktop app has
+    /// open. Writes are unavailable in that case and
+    /// [`TextIndex::is_writable`] says so.
+    ///
+    /// The one thing this variant never does is repair: an index that exists
+    /// but is outdated or unreadable is left exactly as it is, because the
+    /// lock it could not take is a reason to touch nothing — it answers from
+    /// an empty index instead, until a writable handle rebuilds it. A
+    /// directory holding *no* index is a different matter: there is nothing
+    /// to preserve and nobody to disturb, so one is created. That is the
+    /// state a freshly created library is in, and refusing to build its index
+    /// would leave it permanently unsearchable from the CLI.
+    pub fn open_read_only(dir: &Path) -> Result<Self> {
+        Self::open_with(dir, WriterLock::Optional)
+    }
+
+    fn open_with(dir: &Path, lock: WriterLock) -> Result<Self> {
+        let writable = lock == WriterLock::Required;
+        // A Tantivy directory identifies itself with a `meta.json`; without
+        // one there is no index on disk at all.
+        let existing = dir.join("meta.json").is_file();
         let version_file = dir.join("trove-index-version");
         let version_ok = std::fs::read_to_string(&version_file)
             .is_ok_and(|s| s.trim() == INDEX_VERSION.to_string());
-        if !version_ok {
+
+        if existing && !version_ok && !writable {
+            tracing::debug!(
+                dir = %dir.display(),
+                "search index is missing or outdated; read-only handle serves an empty index",
+            );
+            return Self::empty();
+        }
+        if existing && !version_ok {
             let _ = std::fs::remove_dir_all(dir);
         }
+
         std::fs::create_dir_all(dir)?;
         let index = match Index::open_in_dir(dir) {
             Ok(index) => index,
-            Err(_) => {
+            Err(error) => {
+                // Unreadable with an index supposedly present: clearing it out
+                // is the writable path's repair, not something to do here.
+                if !writable && existing {
+                    return Err(Error::Db(format!("search index: {error}")));
+                }
                 let _ = std::fs::remove_dir_all(dir);
                 std::fs::create_dir_all(dir)?;
                 Index::create_in_dir(dir, Self::schema())
                     .map_err(|e| Error::Db(format!("search index: {e}")))?
             }
         };
-        let this = Self::finish(index);
-        let _ = std::fs::write(version_file, INDEX_VERSION.to_string());
+        let writer = match index.writer(WRITER_HEAP) {
+            Ok(writer) => Some(writer),
+            Err(e) => match lock {
+                WriterLock::Required => {
+                    return Err(Error::Db(format!("search index writer: {e}")));
+                }
+                WriterLock::Optional => {
+                    tracing::debug!(
+                        dir = %dir.display(),
+                        error = %e,
+                        "search index writer held elsewhere; serving reads only",
+                    );
+                    None
+                }
+            },
+        };
+        let this = Self::finish(index, writer);
+        // Only a handle that actually owns the writer may stamp the version:
+        // a read-only one did not create anything worth recording.
+        if this.is_writable() {
+            let _ = std::fs::write(version_file, INDEX_VERSION.to_string());
+        }
         Ok(this)
     }
 
     /// An in-memory index (tests).
     pub fn in_ram() -> Result<Self> {
         let index = Index::create_in_ram(Self::schema());
-        Ok(Self::finish(index))
+        let writer = index.writer(WRITER_HEAP).expect("in-memory index writer");
+        Ok(Self::finish(index, Some(writer)))
+    }
+
+    /// A writer-less empty index, the read-only fallback when there is no
+    /// usable index on disk: searches match nothing instead of erroring.
+    fn empty() -> Result<Self> {
+        Ok(Self::finish(Index::create_in_ram(Self::schema()), None))
+    }
+
+    /// Whether this handle owns the index writer. `false` means the index
+    /// belongs to another process: reads work, writes are refused.
+    pub fn is_writable(&self) -> bool {
+        self.writer.is_some()
+    }
+
+    /// The writer, or an error explaining that the index is read-only. The
+    /// single gate every mutating entry point goes through.
+    fn writer(&self) -> Result<std::cell::RefMut<'_, IndexWriter>> {
+        match self.writer.as_ref() {
+            Some(writer) => Ok(writer.borrow_mut()),
+            None => Err(Error::Validation(
+                "search index is read-only: another process holds its writer lock".into(),
+            )),
+        }
     }
 
     fn schema() -> Schema {
@@ -235,9 +332,11 @@ impl TextIndex {
         builder.build()
     }
 
-    /// Register the tokenizers and wire up writer/reader. Must run before
-    /// any documents are indexed.
-    fn finish(index: Index) -> Self {
+    /// Register the tokenizers and assemble the handle. `writer` is `None`
+    /// for a read-only handle — see [`TextIndex::open_read_only`]; the
+    /// tokenizer registry is shared with the searchers either way, so it has
+    /// to be filled before the reader exists.
+    fn finish(index: Index, writer: Option<IndexWriter>) -> Self {
         index
             .tokenizers()
             .register(TOK_JIEBA, TextAnalyzer::from(JiebaTokenizer(jieba())));
@@ -275,12 +374,9 @@ impl TextIndex {
             pinyin: field("pinyin"),
             abbr: field("pinyin_abbr"),
         };
-        let writer = index
-            .writer(WRITER_HEAP)
-            .expect("index writer with valid heap");
         let reader = index.reader().expect("index reader");
         Self {
-            writer: Rc::new(RefCell::new(writer)),
+            writer: writer.map(|w| Rc::new(RefCell::new(w))),
             reader,
             f,
         }
@@ -294,12 +390,14 @@ impl TextIndex {
     /// cascade fires while the asset itself is being deleted), and the row is
     /// the only authority on whether the asset exists.
     pub fn index_asset(&self, conn: &Connection, asset_id: Uuid) -> Result<()> {
+        let writer = self.writer()?;
         let Some(a) = assets::get(conn, asset_id)? else {
-            self.remove_asset(asset_id);
+            self.remove_asset_with(&writer, asset_id);
             return Ok(());
         };
         let tags = assets::tags_for_index(conn, asset_id)?;
         self.index_asset_text(
+            &writer,
             &asset_id.to_string(),
             &a.file_name,
             a.title.as_deref(),
@@ -309,9 +407,12 @@ impl TextIndex {
         Ok(())
     }
 
-    /// Low-level upsert from already-resolved text.
+    /// Low-level upsert from already-resolved text. Takes the writer as an
+    /// argument rather than borrowing it, so [`TextIndex::writer`] stays the
+    /// single place a read-only handle is refused.
     fn index_asset_text(
         &self,
+        writer: &IndexWriter,
         id: &str,
         file_name: &str,
         title: Option<&str>,
@@ -344,7 +445,6 @@ impl TextIndex {
         doc.add_text(self.f.pinyin, &pinyin);
         doc.add_text(self.f.abbr, &abbr);
 
-        let writer = self.writer.borrow_mut();
         writer.delete_term(Term::from_field_text(self.f.asset_id, id));
         writer
             .add_document(doc)
@@ -352,8 +452,13 @@ impl TextIndex {
     }
 
     /// Drop one asset's document (purge).
-    pub fn remove_asset(&self, asset_id: Uuid) {
-        let writer = self.writer.borrow_mut();
+    pub fn remove_asset(&self, asset_id: Uuid) -> Result<()> {
+        let writer = self.writer()?;
+        self.remove_asset_with(&writer, asset_id);
+        Ok(())
+    }
+
+    fn remove_asset_with(&self, writer: &IndexWriter, asset_id: Uuid) {
         writer.delete_term(Term::from_field_text(
             self.f.asset_id,
             &asset_id.to_string(),
@@ -362,7 +467,7 @@ impl TextIndex {
 
     /// Flush pending changes and publish them to readers.
     pub fn commit(&self) -> Result<()> {
-        let mut writer = self.writer.borrow_mut();
+        let mut writer = self.writer()?;
         writer
             .commit()
             .map_err(|e| Error::Db(format!("search index: {e}")))?;
@@ -374,11 +479,12 @@ impl TextIndex {
 
     /// Drop every document (the queue rebuild picks up from here).
     pub fn wipe(&self) -> Result<()> {
-        let writer = self.writer.borrow_mut();
-        writer
-            .delete_all_documents()
-            .map_err(|e| Error::Db(format!("search index: {e}")))?;
-        drop(writer);
+        {
+            let writer = self.writer()?;
+            writer
+                .delete_all_documents()
+                .map_err(|e| Error::Db(format!("search index: {e}")))?;
+        }
         self.commit()
     }
 
@@ -602,6 +708,15 @@ const DRAIN_BATCH: i64 = 8_000;
 /// that the UI thread paid real time on the read path that triggered it.
 const SLOW_DRAIN: std::time::Duration = std::time::Duration::from_secs(1);
 
+/// Rows waiting in the `search_queue` outbox — how far the index is behind
+/// the database. Non-zero is routine in a second process (the rows belong to
+/// whoever owns the writer) and is what a read-only CLI handle reports, since
+/// it cannot drain them itself.
+pub fn pending_count(conn: &Connection) -> Result<u64> {
+    let count = crate::store::rows::query_count(conn, "SELECT COUNT(*) FROM search_queue", vec![])?;
+    Ok(count.max(0) as u64)
+}
+
 /// Flush the `search_queue` outbox into the index: upsert rows whose assets
 /// still exist, drop documents for purged ones. Cheap when the queue is empty
 /// (one small SELECT), so every search can afford to call it. Lives on the
@@ -620,6 +735,12 @@ const SLOW_DRAIN: std::time::Duration = std::time::Duration::from_secs(1);
 /// [`TextIndex::index_asset`] also drops a doc whose row has vanished). The
 /// converse order would lose index updates silently.
 pub fn drain(conn: &Connection, index: &TextIndex) -> Result<()> {
+    // A read-only handle owns no writer, so it cannot move rows out of the
+    // outbox. Leaving them queued is the point: the next writable open (the
+    // app, or a CLI command that got the lock) drains the same backlog.
+    if !index.is_writable() {
+        return Ok(());
+    }
     let started = std::time::Instant::now();
     let mut rows: u64 = 0;
     loop {
@@ -655,7 +776,7 @@ pub fn drain(conn: &Connection, index: &TextIndex) -> Result<()> {
         }
         for (id, deleted) in &actions {
             if *deleted {
-                index.remove_asset(*id);
+                index.remove_asset(*id)?;
             } else {
                 index.index_asset(conn, *id)?;
             }
@@ -707,11 +828,20 @@ pub fn drain(conn: &Connection, index: &TextIndex) -> Result<()> {
 mod tests {
     use super::TextIndex;
 
+    /// A throwaway index directory, named so parallel tests never collide.
+    fn temp_index_dir() -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "trove-index-test-{}",
+            crate::model::new_id().simple()
+        ))
+    }
+
     /// The in-RAM index accepts documents and serves them after commit.
     #[test]
     fn in_ram_roundtrip() {
         let idx = TextIndex::in_ram().unwrap();
         idx.index_asset_text(
+            &idx.writer().unwrap(),
             "11111111-1111-1111-1111-111111111111",
             "flower.png",
             None,
@@ -721,5 +851,69 @@ mod tests {
         idx.commit().unwrap();
         assert_eq!(idx.num_docs(), 1);
         assert!(!idx.search("flower", 10).unwrap().is_empty());
+    }
+
+    /// A held writer lock is an error, not a panic — the desktop app and the
+    /// CLI are allowed to be open on the same library at the same time.
+    #[test]
+    fn open_refuses_a_held_writer_lock_without_panicking() {
+        let dir = temp_index_dir();
+        let owner = TextIndex::open(&dir).expect("the first open owns the index");
+        assert!(owner.is_writable());
+
+        let second = TextIndex::open(&dir);
+        assert!(
+            second.is_err(),
+            "a second writable handle must be refused while the first holds the lock",
+        );
+
+        // ... and the read-only constructor is what the second process uses.
+        let reader = TextIndex::open_read_only(&dir).expect("read-only open succeeds");
+        assert!(!reader.is_writable());
+        assert!(reader.commit().is_err(), "reads-only handle refuses writes");
+        assert!(reader.search("anything", 10).unwrap().is_empty());
+
+        drop(owner);
+        drop(reader);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A read-only handle builds an index when there is none at all — the
+    /// state a CLI finds a freshly created library in — but never repairs one
+    /// that exists, because that directory may belong to another process.
+    #[test]
+    fn open_read_only_builds_only_an_absent_index() {
+        let fresh = temp_index_dir();
+        let idx = TextIndex::open_read_only(&fresh).unwrap();
+        assert!(idx.is_writable(), "there was no index to conflict with");
+        assert_eq!(idx.num_docs(), 0);
+        drop(idx);
+        assert!(fresh.join("meta.json").is_file(), "an index was created");
+        let _ = std::fs::remove_dir_all(&fresh);
+
+        let stale = temp_index_dir();
+        drop(TextIndex::open(&stale).unwrap());
+        std::fs::write(stale.join("trove-index-version"), "99").unwrap();
+        let before = directory_entries(&stale);
+
+        let reader = TextIndex::open_read_only(&stale).unwrap();
+        assert!(!reader.is_writable());
+        assert_eq!(reader.num_docs(), 0);
+        assert_eq!(
+            before,
+            directory_entries(&stale),
+            "a read-only open must leave an existing index untouched",
+        );
+        let _ = std::fs::remove_dir_all(&stale);
+    }
+
+    fn directory_entries(dir: &std::path::Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
     }
 }

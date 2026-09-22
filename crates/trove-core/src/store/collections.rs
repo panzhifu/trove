@@ -219,6 +219,21 @@ pub fn count_assets(conn: &Connection, collection_id: Uuid) -> Result<u64> {
     )? as u64)
 }
 
+/// The collections one asset belongs to, name-ordered. The reverse of
+/// [`asset_ids`], for callers that start from a single record.
+pub fn for_asset(conn: &Connection, asset_id: Uuid) -> Result<Vec<Collection>> {
+    rows::query_map(
+        conn,
+        "SELECT c.id, c.parent_id, c.name, c.position, c.created_at, c.updated_at
+         FROM collections c
+         JOIN asset_collection ac ON ac.collection_id = c.id
+         WHERE ac.asset_id = ?1
+         ORDER BY c.name COLLATE NOCASE",
+        vec![rows::uuid(asset_id).into()],
+        collection_from_row,
+    )
+}
+
 // -- helpers -----------------------------------------------------------------
 
 fn collection_from_row(row: &rusqlite::Row) -> Result<Collection> {
