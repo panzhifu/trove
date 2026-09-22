@@ -19,10 +19,10 @@
 //! come back — with the rule that a step must be applicable from a shape that
 //! matches the version on record.
 //!
-//! That is where this file stands now: [`UPGRADES`] holds exactly one step,
-//! v14 → v15, because the `ai_analysis` cache table landed while v14
-//! libraries were already in the field. Everything not on the list is still
-//! refused by name.
+//! That is where this file stands now: [`UPGRADES`] holds two steps, because
+//! both landed while the version before them was already in the field —
+//! v14 → v15 for the `ai_analysis` cache, v15 → v16 for a container's
+//! appearance. Everything not on the list is still refused by name.
 
 /// The schema this build creates, and the only shape it opens. A library at
 /// any other version is refused by name rather than guessed at.
@@ -31,28 +31,138 @@
 /// existence was written by a build whose chain ended there, and that shape
 /// is the pre-`asset_embeddings` subset of the one below — which is the only
 /// sense in which a version number means anything.
-pub const SCHEMA_VERSION: i64 = 15;
+pub const SCHEMA_VERSION: i64 = 17;
 
-/// One upgrade step: the DDL that takes a library from `from` to `to`.
+/// One upgrade step: the DDL that takes a library from `from` to `to`, and the
+/// data that DDL cannot move.
 ///
 /// A step applies to a shape that matches `from` exactly — the version on
 /// record is the whole guard, there is no fingerprint of the shape itself —
-/// and its DDL is written so that re-running it is harmless, because a crash
-/// between the DDL and the version bump must not brick the library.
+/// and re-running it must be harmless, because a crash between the DDL and the
+/// version bump would otherwise leave the library unopenable. For additive DDL
+/// `IF NOT EXISTS` says that; for a step that *changes* a table's shape the
+/// same claim is made by [`Store::apply_upgrade`](super::Store::apply_upgrade)
+/// tolerating the two ways an `ALTER` reports "already done", and by the data
+/// step writing only what has not been written yet.
 pub struct Upgrade {
     pub from: i64,
     pub to: i64,
     pub sql: &'static str,
+    /// Runs after `sql`, in the same transaction, and may itself change the shape
+    /// (see [`migrate_appearance`]).
+    pub data: Option<fn(&rusqlite::Connection) -> crate::error::Result<()>>,
 }
 
 /// The upgrade list: each step may be applied to a library at its `from`
 /// version to reach its `to`. A library at any other version is still refused
 /// by name.
-pub const UPGRADES: &[Upgrade] = &[Upgrade {
-    from: 14,
-    to: 15,
-    sql: UPGRADE_14_TO_15,
-}];
+pub const UPGRADES: &[Upgrade] = &[
+    Upgrade {
+        from: 14,
+        to: 15,
+        sql: UPGRADE_14_TO_15,
+        data: None,
+    },
+    Upgrade {
+        from: 15,
+        to: 16,
+        sql: UPGRADE_15_TO_16,
+        data: Some(migrate_appearance),
+    },
+    Upgrade {
+        from: 16,
+        to: 17,
+        sql: UPGRADE_16_TO_17,
+        data: None,
+    },
+];
+
+/// v16 → v17: the 3D viewport's look, per asset.
+///
+/// A side table rather than a column on `assets`, the way `view_history` is: a
+/// column there would have to be threaded through the row struct, the insert
+/// list, the positional reader and every `Asset` literal in the app, for a
+/// preference that only the viewport reads. `NULL`-by-absence says "the
+/// default look" without a sentinel.
+const UPGRADE_16_TO_17: &str = r#"
+    CREATE TABLE IF NOT EXISTS model_looks (
+        asset_id TEXT PRIMARY KEY REFERENCES assets(id) ON DELETE CASCADE,
+        look     TEXT NOT NULL
+    );
+"#;
+
+/// v15 → v16: a container's own glyph and accent.
+///
+/// One nullable JSON column per container table — the shape the smart
+/// collection's rule tree already uses, and `NULL` for the folders that ask for
+/// nothing. The v15 accent column is dropped once [`migrate_appearance`] has
+/// folded it in, so no second source of the same fact is left on disk.
+const UPGRADE_15_TO_16: &str = r#"
+    ALTER TABLE collections ADD COLUMN appearance TEXT;
+    ALTER TABLE smart_collections ADD COLUMN appearance TEXT;
+"#;
+
+/// Fold the free-form accent a v15 smart collection could pick onto the named
+/// palette, nearest first, then retire the column that held it.
+///
+/// The translation is a judgment rather than a move, which is why it is here
+/// and not in SQL: a stored hex was chosen against whichever theme was open
+/// when it was chosen, and the palette entry it maps to is the closest thing
+/// this build can say about it. One click in the picker puts the user's
+/// intention right; refusing to open the library over it would not.
+///
+/// Both halves are safe to land twice: only rows with a colour and no
+/// appearance are folded, and the column is dropped only while it is there.
+fn migrate_appearance(conn: &rusqlite::Connection) -> crate::error::Result<()> {
+    use crate::model::{Accent, Appearance};
+
+    if !column_exists(conn, "smart_collections", "color")? {
+        return Ok(());
+    }
+    let doomed: Vec<(String, Appearance)> = {
+        let mut stmt =
+            conn.prepare("SELECT id, color FROM smart_collections WHERE color IS NOT NULL")?;
+        let rows = stmt.query_map([], |row| {
+            let id: String = row.get(0)?;
+            let hex: String = row.get(1)?;
+            Ok((id, hex))
+        })?;
+        let mut out = Vec::new();
+        for row in rows.flatten() {
+            if let Some(accent) = Accent::from_hex(&row.1) {
+                let appearance = Appearance {
+                    glyph: None,
+                    accent: Some(accent),
+                };
+                out.push((row.0, appearance));
+            }
+        }
+        out
+    };
+    for (id, appearance) in doomed {
+        conn.execute(
+            "UPDATE smart_collections SET appearance = ?1 WHERE id = ?2 AND appearance IS NULL",
+            rusqlite::params![appearance.to_storage(), id],
+        )?;
+    }
+    conn.execute("ALTER TABLE smart_collections DROP COLUMN color", [])?;
+    Ok(())
+}
+
+/// Whether a table has a column, which is how a step asks whether it has
+/// already been applied without guessing at an error message.
+pub(super) fn column_exists(
+    conn: &rusqlite::Connection,
+    table: &str,
+    column: &str,
+) -> crate::error::Result<bool> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let names = stmt
+        .query_map([], |row| row.get::<_, String>(1))?
+        .flatten()
+        .collect::<Vec<String>>();
+    Ok(names.iter().any(|name| name == column))
+}
 
 /// v14 → v15: the AI analysis cache.
 ///
@@ -127,6 +237,9 @@ pub const SCHEMA: &str = r#"
         id         TEXT PRIMARY KEY,
         parent_id  TEXT REFERENCES collections(id) ON DELETE CASCADE,
         name       TEXT NOT NULL,
+        -- This folder's own glyph and accent as JSON, or NULL for the default
+        -- folder look (see `crate::model::Appearance`).
+        appearance TEXT,
         position   INTEGER NOT NULL DEFAULT 0,
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL
@@ -171,7 +284,10 @@ pub const SCHEMA: &str = r#"
         id         TEXT PRIMARY KEY,
         name       TEXT NOT NULL,
         query      TEXT NOT NULL,
-        color      TEXT,
+        -- Same column and same type as `collections.appearance`: the folder
+        -- tree draws the two alike. It replaces v15's free-form `color`, which
+        -- could only ever be right in the theme it was picked in.
+        appearance TEXT,
         position   INTEGER NOT NULL DEFAULT 0,
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL,
@@ -189,6 +305,15 @@ pub const SCHEMA: &str = r#"
     );
 
     CREATE INDEX idx_view_history_viewed ON view_history(viewed_at);
+
+    -- The 3D viewport's look, one row per asset the user has tuned: which field
+    -- is painted, along which axis, with which colour scale. A *reference* to a
+    -- scale by id, so editing or deleting that scale reaches every model that
+    -- names it. See [`UPGRADE_16_TO_17`].
+    CREATE TABLE IF NOT EXISTS model_looks (
+        asset_id TEXT PRIMARY KEY REFERENCES assets(id) ON DELETE CASCADE,
+        look     TEXT NOT NULL
+    );
 
     -- The Tantivy outbox: filled by the triggers below on every asset and tag
     -- write, so no mutation site has to remember the index, and the drain

@@ -176,25 +176,47 @@ pub fn expand_dirs(paths: Vec<PathBuf>) -> (Vec<PathBuf>, Vec<import::ImportSkip
 }
 
 /// Every regular file below `roots`, skipping hidden entries (dot files and
-/// dot directories) at any depth. Symlinks and non-UTF-8 names are reported
-/// into `skipped` — see [`expand_dirs`].
+/// dot directories) at any depth and whatever the folders themselves ask to be
+/// left out — the `.gitignore` files in them, see [`super::ignore`]. Symlinks
+/// and non-UTF-8 names are reported into `skipped` — see [`expand_dirs`].
 pub fn all_files(roots: &[PathBuf], skipped: &mut Vec<import::ImportSkip>) -> Vec<PathBuf> {
     let mut out = Vec::new();
     for root in roots {
-        walk(root, 0, &mut out, skipped);
+        // One rule set per root: a folder watched in its own right carries no
+        // rules of a folder that happens to contain it.
+        walk(root, &mut Vec::new(), 0, &mut out, skipped);
     }
     out.sort();
     out
 }
 
-fn walk(dir: &Path, depth: usize, out: &mut Vec<PathBuf>, skipped: &mut Vec<import::ImportSkip>) {
+/// Depth-first listing of one folder, with the ignore rules of the folders
+/// above it: `rules` is empty at a root and grows downward, so a rule a folder
+/// declares binds its whole subtree and nothing beside it.
+fn walk(
+    dir: &Path,
+    rules: &mut super::ignore::Rules,
+    depth: usize,
+    out: &mut Vec<PathBuf>,
+    skipped: &mut Vec<import::ImportSkip>,
+) {
     if depth > MAX_DEPTH {
         return;
     }
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
-    for entry in entries.flatten() {
+    let entries: Vec<_> = entries.flatten().collect();
+    let listed: Vec<_> = entries.iter().map(|entry| entry.file_name()).collect();
+    let names: Vec<_> = listed.iter().filter_map(|name| name.to_str()).collect();
+    // What this folder declares about its contents, taken from the listing
+    // already in hand: an absent ignore file then costs a comparison, where
+    // probing the names costs an `open()` per folder per sweep.
+    let carried = rules.len();
+    if let Some(declared) = super::ignore::own_rules(dir, Some(&names)) {
+        rules.push(declared);
+    }
+    for entry in entries {
         let path = entry.path();
         let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
             // A name the library cannot record; keeping it out is right,
@@ -209,8 +231,18 @@ fn walk(dir: &Path, depth: usize, out: &mut Vec<PathBuf>, skipped: &mut Vec<impo
             continue;
         }
         match entry.file_type() {
-            Ok(ft) if ft.is_dir() => walk(&path, depth + 1, out, skipped),
-            Ok(ft) if ft.is_file() => out.push(path),
+            // A folder left out is not entered, which is what makes a `!` rule
+            // below it as moot here as it is in Git.
+            Ok(ft) if ft.is_dir() => {
+                if !super::ignore::is_left_out(rules, &path, true) {
+                    walk(&path, rules, depth + 1, out, skipped);
+                }
+            }
+            Ok(ft) if ft.is_file() => {
+                if !super::ignore::is_left_out(rules, &path, false) {
+                    out.push(path);
+                }
+            }
             // Symlinks are left out on purpose (a link can point at the
             // directory being walked), but the leave-out is on the record.
             Ok(_) => skipped.push(import::ImportSkip {
@@ -223,6 +255,7 @@ fn walk(dir: &Path, depth: usize, out: &mut Vec<PathBuf>, skipped: &mut Vec<impo
             }),
         }
     }
+    rules.truncate(carried);
 }
 
 /// Run one import to completion. Synchronous and self-contained: tests call
@@ -248,6 +281,7 @@ pub fn run(options: &ImportOptions, ctx: &JobContext) -> Result<ImportOutcome, S
             Vec::new(),
         ),
     };
+    ctx.park_if_paused();
     if ctx.cancelled() {
         return Ok(ImportOutcome {
             report: ImportReport::default(),
@@ -313,20 +347,40 @@ pub fn run(options: &ImportOptions, ctx: &JobContext) -> Result<ImportOutcome, S
     let mut cancelled = false;
     let mut error: Option<String> = None;
     let window = stage_window();
+    // Staging (hash + decode + thumbnail) is the slow half of an import, and
+    // the old shape staged a whole window before reporting anything — so the
+    // progress number sat at 0 for the bulk of the work, then jumped at the
+    // first commit. Stage each window in `stage_stride`-sized sub-batches and
+    // report after each, so `done` tracks the files actually being processed.
+    let stage_stride = commit_batch().max(1);
 
     'windows: for slice in paths.chunks(window) {
+        ctx.park_if_paused();
         if ctx.cancelled() {
             cancelled = true;
             break;
         }
-        let staged = import::stage_all(
-            &options.data_root,
-            &options.cache_root,
-            slice,
-            options.storage,
-            ctx.cancel_flag(),
-        );
+        let mut staged: Vec<std::result::Result<import::StagedFile, import::ImportSkip>> =
+            Vec::with_capacity(slice.len());
+        for sub in slice.chunks(stage_stride) {
+            ctx.park_if_paused();
+            if ctx.cancelled() {
+                cancelled = true;
+                break 'windows;
+            }
+            let part = import::stage_all(
+                &options.data_root,
+                &options.cache_root,
+                sub,
+                options.storage,
+                ctx.cancel_flag(),
+            );
+            done += part.len() as u64;
+            ctx.progress(done, total);
+            staged.extend(part);
+        }
         for chunk in staged.chunks(commit_batch()) {
+            ctx.park_if_paused();
             if ctx.cancelled() {
                 cancelled = true;
                 break 'windows;
@@ -353,8 +407,6 @@ pub fn run(options: &ImportOptions, ctx: &JobContext) -> Result<ImportOutcome, S
                     });
                 }
             }
-            done += chunk.len() as u64;
-            ctx.progress(done, total);
         }
     }
 
@@ -473,6 +525,7 @@ fn cleanup_inbox(sidecars: &HashMap<PathBuf, Option<PathBuf>>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tasks::{TaskEvent, TaskKind, TaskManager};
     use std::fs;
     use tempdir::Temp;
 
@@ -516,6 +569,72 @@ mod tests {
         assert!(!outcome.cancelled);
     }
 
+    /// Drive the real import through a real [`TaskManager`] and collect the
+    /// events exactly the way the UI's `poll_events_for(task_id)` does. This is
+    /// the load-bearing check behind "the import notification shows real
+    /// numbers": if the done/total never leave the backend, no toast or panel
+    /// row can show them.
+    #[test]
+    fn import_progress_events_carry_real_numbers_to_the_poller() {
+        let root = Temp::new("task-import-events");
+        let src = root.path().join("src");
+        fs::create_dir_all(&src).unwrap();
+        let n = commit_batch() * 2 + 1;
+        let mut paths = Vec::new();
+        for i in 0..n {
+            let p = src.join(format!("img{i}.png"));
+            fs::write(&p, [PNG_1X1, &[i as u8][..]].concat()).unwrap();
+            paths.push(p);
+        }
+        let options = ImportOptions {
+            data_root: root.path().to_path_buf(),
+            cache_root: root.path().join("cache"),
+            storage: ImportStorage::Link,
+            source: ImportSource::Paths {
+                paths,
+                into_collection: None,
+            },
+        };
+
+        let manager = TaskManager::new();
+        let (id, rx) = manager
+            .start(TaskKind::Import, "import", move |ctx| run(&options, ctx))
+            .unwrap();
+
+        let mut progress: Vec<(u64, u64)> = Vec::new();
+        loop {
+            for event in manager.poll_events_for(id) {
+                if let TaskEvent::Progress { done, total, .. } = event {
+                    progress.push((done, total));
+                }
+            }
+            match rx.try_recv() {
+                Ok(_) => break,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+            }
+        }
+        // The final progress may land just before the value closes the channel.
+        for event in manager.poll_events_for(id) {
+            if let TaskEvent::Progress { done, total, .. } = event {
+                progress.push((done, total));
+            }
+        }
+
+        assert!(
+            progress.iter().any(|&(_, total)| total == n as u64),
+            "no Progress event ever carried the real total ({n}); saw {progress:?}"
+        );
+        assert!(
+            progress
+                .iter()
+                .any(|&(done, total)| done == total && total > 0),
+            "no Progress event ever reported completion (done == total); saw {progress:?}"
+        );
+    }
+
     #[test]
     fn expand_dirs_skips_hidden_and_dedupes() {
         let root = Temp::new("task-expand");
@@ -545,6 +664,49 @@ mod tests {
         // Hidden entries are policy (not offered), but they are not
         // "skipped" either — only entries a walk *found* and cannot use
         // belong in the report.
+        assert!(skipped.is_empty(), "{skipped:?}");
+    }
+
+    /// A dropped folder's own ignore files are read too: the walk is one rule
+    /// for every caller, and nobody who drops a source folder means its build
+    /// output. Left out by policy rather than for want of a way in, so nothing
+    /// lands in the skip report either.
+    ///
+    /// The sibling folders are here for the stack the walk carries: a folder
+    /// that declares no rules must leave the ones above it in place, and one
+    /// that declares some must not leave them behind on the way out. Which
+    /// order `read_dir` lists them in is the filesystem's, so this asserts the
+    /// whole expected listing rather than one folder's fate.
+    #[test]
+    fn expand_dirs_leaves_out_what_the_folder_leaves_out() {
+        let root = Temp::new("task-ignore");
+        let folder = root.path().join("folder");
+        for dir in ["build/nested", "dist", "logs", "src/vendor"] {
+            fs::create_dir_all(folder.join(dir)).unwrap();
+        }
+        fs::write(folder.join(".gitignore"), "build/\ndist/\nlogs/\n").unwrap();
+        fs::write(folder.join("src/.gitignore"), "scratch.tmp\n").unwrap();
+        for file in [
+            "build/nested/out.png",
+            "dist/app.js",
+            "logs/run.log",
+            "src/scratch.tmp",
+            "src/a.png",
+            "src/vendor/b.png",
+            "keep.png",
+        ] {
+            fs::write(folder.join(file), b"x").unwrap();
+        }
+
+        let (expanded, skipped) = expand_dirs(vec![folder.clone()]);
+        assert_eq!(
+            expanded,
+            vec![
+                folder.join("keep.png"),
+                folder.join("src/a.png"),
+                folder.join("src/vendor/b.png"),
+            ]
+        );
         assert!(skipped.is_empty(), "{skipped:?}");
     }
 

@@ -129,6 +129,9 @@ Trove 的配置分为两个层级：
 |----|------|------|
 | `watch_folders` | `string[]` | 监视文件夹列表 |
 
+被监视文件夹跳过哪些内容不是配置项：文件夹自己的 `.gitignore` / `.ignore` /
+`.git/info/exclude` 说了算，规则同 Git —— 见 [TASKS-BACKGROUND.md](TASKS-BACKGROUND.md) 的「忽略规则」。
+
 ---
 
 ## 快捷键

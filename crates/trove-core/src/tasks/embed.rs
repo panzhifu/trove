@@ -116,6 +116,7 @@ pub fn run(
         .map_err(|e| format!("list assets: {e}"))?;
     let mut work: Vec<Work> = Vec::new();
     for (asset, stored) in candidates {
+        ctx.park_if_paused();
         if ctx.cancelled() {
             outcome.cancelled = true;
             return Ok(outcome);
@@ -158,6 +159,7 @@ pub fn run(
     ctx.set_total(total);
     let mut done: u64 = 0;
     for batch in work.chunks(BATCH) {
+        ctx.park_if_paused();
         if ctx.cancelled() {
             outcome.cancelled = true;
             break;

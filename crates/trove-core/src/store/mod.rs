@@ -6,6 +6,7 @@ pub mod browse;
 pub use browse::BrowseContext;
 pub mod collections;
 pub mod embeddings;
+pub mod model_look;
 pub(crate) mod rows;
 pub mod schema;
 pub mod smart;
@@ -111,10 +112,39 @@ impl Store {
                     schema::SCHEMA_VERSION
                 )));
             };
-            self.apply(step.sql)?;
+            self.apply_upgrade(step)?;
             self.set_user_version(step.to)?;
             current = step.to;
         }
+        Ok(())
+    }
+
+    /// Apply one upgrade step: its DDL and then the data that DDL cannot move,
+    /// in one transaction so a step either lands or has not happened.
+    ///
+    /// Each statement is run on its own, and an `ALTER` that answers "already
+    /// done" — the column is there, the column is gone — is taken as the redo
+    /// it is. That is the whole price of a step that changes a shape rather
+    /// than only adding to one; any other error still fails the migration and
+    /// leaves the library at its recorded version.
+    fn apply_upgrade(&self, step: &schema::Upgrade) -> Result<()> {
+        let mut conn = self.conn.borrow_mut();
+        let tx = conn.transaction()?;
+        for statement in step.sql.split(';') {
+            let statement = statement.trim();
+            if statement.is_empty() {
+                continue;
+            }
+            if let Err(error) = tx.execute_batch(statement)
+                && !already_applied(statement, &error.to_string())
+            {
+                return Err(error.into());
+            }
+        }
+        if let Some(data) = step.data {
+            data(&tx)?;
+        }
+        tx.commit().map_err(crate::error::Error::from)?;
         Ok(())
     }
 
@@ -170,6 +200,15 @@ impl Store {
     }
 }
 
+/// Whether a failed `ALTER` is the harmless second attempt: the column a step
+/// adds is already there, or the column it drops is already gone. Only an
+/// `ALTER` may be excused this way, so a statement with a typo in it still
+/// fails the migration.
+fn already_applied(statement: &str, message: &str) -> bool {
+    statement.to_ascii_uppercase().starts_with("ALTER TABLE")
+        && (message.contains("duplicate column name") || message.contains("no such column"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{Store, schema};
@@ -177,7 +216,7 @@ mod tests {
         Asset, AssetKind, AssetPatch, AssetQuery, NewCollection, NewTag, Origin, Page, UsageStatus,
         now,
     };
-    use crate::store::{assets, collections, tags};
+    use crate::store::{assets, collections, smart_collections, tags};
     use uuid::Uuid;
 
     fn sample_asset(name: &str, kind: AssetKind) -> Asset {
@@ -327,7 +366,6 @@ mod tests {
                 parent_id: None,
                 name: "pics".into(),
                 query: serde_json::json!({"op": "match", "field": "kind", "value": "image"}),
-                color: None,
                 position: 0,
             },
         )
@@ -341,19 +379,20 @@ mod tests {
                 {"op": "match", "field": "tag", "value": "三毛"}
             ]
         });
-        smart_collections::update_query(store.conn(), sc.id, &tree, Some("#3b82f6")).unwrap();
+        smart_collections::update_query(store.conn(), sc.id, &tree).unwrap();
         let stored = smart_collections::get(store.conn(), sc.id)
             .unwrap()
             .unwrap();
         assert_eq!(stored.query, tree);
-        assert_eq!(stored.color.as_deref(), Some("#3b82f6"));
+        // Saving a rule tree leaves the folder's look alone: the two are
+        // edited apart and neither may undo the other behind the user's back.
+        assert!(stored.appearance.is_plain());
 
         // A garbage tree is refused and the stored one survives.
         assert!(smart_collections::update_query(
             store.conn(),
             sc.id,
             &serde_json::json!({"op": "match", "field": "text", "compare": "gte", "value": "x"}),
-            None,
         )
         .is_err());
         assert_eq!(
@@ -363,9 +402,7 @@ mod tests {
                 .query,
             tree
         );
-        assert!(
-            smart_collections::update_query(store.conn(), Uuid::new_v4(), &tree, None).is_err()
-        );
+        assert!(smart_collections::update_query(store.conn(), Uuid::new_v4(), &tree).is_err());
     }
 
     #[test]
@@ -423,6 +460,128 @@ mod tests {
         let store = Store::open(&path).unwrap();
         assert_eq!(store.user_version().unwrap(), schema::SCHEMA_VERSION);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// v15 → v16 changes a shape rather than only adding to one, so this
+    /// covers both halves of the promise a step has to keep: the fold lands,
+    /// and a step that runs *twice* — the crash between the DDL and the
+    /// version bump — still opens the library.
+    #[test]
+    fn a_v15_library_folds_its_accent_and_survives_a_replay() {
+        use crate::model::{Accent, Appearance};
+
+        let dir = std::env::temp_dir().join(format!("trove-schema-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("library.db");
+        let smart_id = Uuid::new_v4().to_string();
+
+        // A v15 library: the current shape with the appearance columns gone and
+        // the free-form accent column they replaced back.
+        {
+            let store = Store::open(&path).unwrap();
+            store
+                .conn()
+                .execute_batch(
+                    "ALTER TABLE smart_collections DROP COLUMN appearance;
+                     ALTER TABLE collections DROP COLUMN appearance;
+                     ALTER TABLE smart_collections ADD COLUMN color TEXT;
+                     PRAGMA user_version = 15;",
+                )
+                .unwrap();
+            store
+                .conn()
+                .execute(
+                    "INSERT INTO smart_collections
+                     (id, parent_id, name, query, position, created_at, updated_at, color)
+                 VALUES (?1, NULL, 'Warm', '{\"op\":\"all\"}', 0,
+                         '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00', '#8b0000')",
+                    rusqlite::params![smart_id],
+                )
+                .unwrap();
+        }
+
+        let store = Store::open(&path).unwrap();
+        assert_eq!(store.user_version().unwrap(), schema::SCHEMA_VERSION);
+        let found = smart_collections::get(store.conn(), Uuid::parse_str(&smart_id).unwrap())
+            .unwrap()
+            .expect("the row survived its own migration");
+        assert_eq!(
+            found.appearance,
+            Appearance {
+                glyph: None,
+                accent: Some(Accent::Red),
+            },
+            "the nearest palette entry was not folded in"
+        );
+        assert!(
+            !schema::column_exists(store.conn(), "smart_collections", "color").unwrap(),
+            "the retired column is still on disk"
+        );
+
+        // The crash case: the shape has moved and the record has not, so the
+        // step runs again against a library it has already applied.
+        drop(store);
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .execute_batch("PRAGMA user_version = 15")
+            .unwrap();
+        let store = Store::open(&path).unwrap();
+        assert_eq!(store.user_version().unwrap(), schema::SCHEMA_VERSION);
+        let again = smart_collections::get(store.conn(), Uuid::parse_str(&smart_id).unwrap())
+            .unwrap()
+            .expect("the replay kept the row");
+        assert_eq!(again.appearance.accent, Some(Accent::Red));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A folder's look is stored with the folder and read back with it, for
+    /// both container kinds.
+    #[test]
+    fn a_collection_appearance_round_trips() {
+        use crate::model::{Accent, Appearance, Glyph};
+
+        let store = Store::in_memory().unwrap();
+        let conn = store.conn();
+        let created = collections::create(
+            conn,
+            &crate::model::NewCollection {
+                parent_id: None,
+                name: "Photos".into(),
+                position: 0,
+            },
+        )
+        .unwrap();
+        assert!(
+            created.appearance.is_plain(),
+            "a new folder starts with the default look"
+        );
+        collections::set_appearance(
+            conn,
+            created.id,
+            &Appearance {
+                glyph: Some(Glyph::Emoji("📷".into())),
+                accent: Some(Accent::Cyan),
+            },
+        )
+        .unwrap();
+        let fetched = collections::get(conn, created.id).unwrap().unwrap();
+        assert_eq!(
+            fetched.appearance,
+            Appearance {
+                glyph: Some(Glyph::Emoji("📷".into())),
+                accent: Some(Accent::Cyan),
+            }
+        );
+        // Children and the per-asset listing carry it too — the tree draws
+        // every one of those rows.
+        assert_eq!(
+            collections::children_of(conn, None).unwrap()[0].appearance,
+            fetched.appearance
+        );
+        assert!(
+            collections::set_appearance(conn, Uuid::new_v4(), &Appearance::default()).is_err(),
+            "an unknown folder is not silently accepted"
+        );
     }
 
     /// A library from a version with no upgrade step is refused rather than
@@ -1561,7 +1720,6 @@ mod tests {
             query: serde_json::json!({
                 "op": "match", "field": "is_favorite", "value": true
             }),
-            color: Some("#f00".into()),
             position: 0,
         };
         let created = super::smart_collections::create(store.conn(), &input).unwrap();
@@ -1572,6 +1730,40 @@ mod tests {
         assert_eq!(fetched.query, input.query);
         let listed = super::smart_collections::list(store.conn()).unwrap();
         assert_eq!(listed.len(), 1);
+        // The look of the folder round-trips, and clearing it stores nothing
+        // rather than an empty object.
+        super::smart_collections::set_appearance(
+            store.conn(),
+            created.id,
+            &crate::model::Appearance {
+                glyph: Some(crate::model::Glyph::Icon("image-plus".into())),
+                accent: Some(crate::model::Accent::Cyan),
+            },
+        )
+        .unwrap();
+        let looked = super::smart_collections::get(store.conn(), created.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            looked.appearance,
+            crate::model::Appearance {
+                glyph: Some(crate::model::Glyph::Icon("image-plus".into())),
+                accent: Some(crate::model::Accent::Cyan),
+            }
+        );
+        super::smart_collections::set_appearance(
+            store.conn(),
+            created.id,
+            &crate::model::Appearance::default(),
+        )
+        .unwrap();
+        assert!(
+            super::smart_collections::get(store.conn(), created.id)
+                .unwrap()
+                .unwrap()
+                .appearance
+                .is_plain()
+        );
         super::smart_collections::rename(store.conn(), created.id, "Renamed").unwrap();
         assert_eq!(
             super::smart_collections::get(store.conn(), created.id)
@@ -1600,7 +1792,6 @@ mod tests {
             parent_id,
             name: name.into(),
             query: fav.clone(),
-            color: None,
             position: 0,
         };
 
@@ -1868,7 +2059,6 @@ mod tests {
                 query: serde_json::json!({
                     "op": "match", "field": "is_favorite", "value": true
                 }),
-                color: None,
                 position: 0,
             },
         )
@@ -1945,5 +2135,74 @@ mod tests {
         // Clear wipes everything.
         view_history::clear(conn).unwrap();
         assert_eq!(view_history::live_count(conn).unwrap(), 0);
+    }
+
+    #[test]
+    fn a_model_look_round_trips_and_follows_its_asset() {
+        use crate::media::height_color::{Field, HeightMode, StoredLook};
+        use crate::store::model_look;
+        let store = Store::in_memory().unwrap();
+        let conn = store.conn();
+        let model = sample_asset("terrain.ply", AssetKind::Model);
+        let other = sample_asset("statue.obj", AssetKind::Model);
+        assets::insert(conn, &model).unwrap();
+        assets::insert(conn, &other).unwrap();
+
+        // Untuned: no row, and reading one back is not an error.
+        assert_eq!(model_look::get(conn, model.id).unwrap(), None);
+
+        let look = StoredLook {
+            mode: HeightMode::Bands.key().to_string(),
+            field: Field::Aspect.key().to_string(),
+            axis: 2,
+            scale: "custom:4".to_string(),
+            period: 0.5,
+        };
+        model_look::set(conn, model.id, &look).unwrap();
+        assert_eq!(
+            model_look::get(conn, model.id).unwrap().as_ref(),
+            Some(&look)
+        );
+        // Overwriting replaces rather than accumulating, and the other model is
+        // untouched by it.
+        model_look::set(
+            conn,
+            model.id,
+            &StoredLook {
+                scale: "bgyr".into(),
+                ..look.clone()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            model_look::get(conn, model.id).unwrap().unwrap().scale,
+            "bgyr"
+        );
+        assert_eq!(model_look::get(conn, other.id).unwrap(), None);
+
+        // The default look is stored as no row at all, which is the same fact.
+        model_look::set(conn, model.id, &StoredLook::default()).unwrap();
+        assert_eq!(model_look::get(conn, model.id).unwrap(), None);
+
+        // Purging the asset takes the row with it.
+        model_look::set(conn, model.id, &look).unwrap();
+        super::rows::execute(
+            conn,
+            "DELETE FROM assets WHERE id = ?1",
+            vec![super::rows::uuid(model.id).into()],
+        )
+        .unwrap();
+        assert_eq!(model_look::get(conn, model.id).unwrap(), None);
+
+        // A row whose text this build cannot read reads as the default rather
+        // than refusing to list the library.
+        model_look::set(conn, other.id, &look).unwrap();
+        super::rows::execute(
+            conn,
+            "UPDATE model_looks SET look = '{not json' WHERE asset_id = ?1",
+            vec![super::rows::uuid(other.id).into()],
+        )
+        .unwrap();
+        assert_eq!(model_look::get(conn, other.id).unwrap(), None);
     }
 }

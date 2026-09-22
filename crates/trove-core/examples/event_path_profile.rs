@@ -1,6 +1,6 @@
 //! Task-event path profiler: what the `TaskManager`'s locks cost per import,
-//! and therefore the *ceiling* on what replacing them with per-job channels
-//! could win.
+//! and what one watcher's poll costs — now that the queue is a bucket per job
+//! and a poll takes only its own bucket.
 //!
 //! Run:
 //!   cargo run --release -p trove-core --example event_path_profile [calls] [polls] [per_file_ms]
@@ -9,14 +9,17 @@
 //!
 //! Progress reports take the registry lock, then the event-queue lock — both
 //! of which the UI thread also takes when it drains events
-//! (`TaskManager::poll_events`) and reads the job registry. The import job
+//! (`TaskManager::poll_events_for`) and reads the job registry. The import job
 //! reports once per file, so the question is whether those locks are a
 //! throughput limiter — if they are not, a per-job channel / events-channel
 //! rewrite cannot pay for itself on speed.
 //!
 //! A. `progress()`, one writer, uncontended — the per-file cost the import job
 //!    actually pays.
-//! B. `poll_events()` on an empty queue — the per-poll cost the UI pays.
+//! B. `poll_events_for()` on an empty bucket — the per-poll cost the UI pays.
+//! B2. The same poll with four *other* jobs' full buckets in the queue — the
+//!     case the buckets were added for: a watcher's cost must not follow how
+//!     much backlog someone else left.
 //! C. Four writers hammering the event lock while this thread polls — the
 //!    *worst case* the refactor is meant to protect against (every staging
 //!    thread reporting independently), reported as poll latency percentiles
@@ -28,6 +31,7 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use trove_core::media::import::{self, ImportStorage};
@@ -64,11 +68,15 @@ fn main() {
 
     println!("event_path_profile: {calls} progress calls, {polls} polls");
     println!("(reference per-file import cost: {per_file_ms:.1} ms)");
+    println!(
+        "(one TaskEvent is {} B)",
+        std::mem::size_of::<trove_core::tasks::TaskEvent>()
+    );
     println!();
 
     // --- A: one writer, uncontended -----------------------------------------
     let manager = TaskManager::new();
-    let (_, rx) = manager
+    let (probe_id, rx) = manager
         .start(TaskKind::Import, "probe", move |ctx| {
             for _ in 0..10_000 {
                 ctx.progress(0, calls);
@@ -88,16 +96,64 @@ fn main() {
         per_call / 1e6 / per_file_ms * 100.0
     );
 
-    // --- B: empty poll -------------------------------------------------------
+    // --- B: an idle poll of one's own bucket ---------------------------------
+    manager.poll_events_for(probe_id); // take what job A left behind
     let t = Instant::now();
     for _ in 0..polls {
-        std::hint::black_box(manager.poll_events());
+        std::hint::black_box(manager.poll_events_for(probe_id));
     }
     let b = t.elapsed();
     println!(
-        "B poll_events(), idle       : {:>7.1} ns/call",
+        "B poll_events_for(), idle     : {:>7.1} ns/call",
         ns(b) / polls as f64
     );
+
+    // --- B2: the same poll, with four foreign backlogs in the queue ----------
+    // The shared queue made a watcher scan every job's backlog to find its own
+    // events; the buckets should make this line read the same as B's.
+    let mut releases = Vec::new();
+    let mut fillers = Vec::new();
+    for kind in [
+        TaskKind::CollectInbox,
+        TaskKind::Maintenance,
+        TaskKind::ModelPreview,
+        TaskKind::VideoDecode,
+    ] {
+        // One channel per job: `recv` wakes a single waiter, and every filler
+        // has to be let go for its thread to end.
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        releases.push(release_tx);
+        let (_, rx) = manager
+            .start(kind, "backlog", move |ctx| {
+                for i in 0..1_000 {
+                    ctx.set_total(i); // an unthrottled event per call
+                }
+                let _ = release_rx.recv(); // hold the bucket until measured
+                Ok(())
+            })
+            .expect("start backlog job");
+        fillers.push(rx);
+    }
+    // Give the four fillers time to publish. Nothing polls their buckets here:
+    // taking them out would be taking them *out of the queue*, and the point is
+    // to poll a live backlog.
+    std::thread::sleep(Duration::from_millis(200));
+
+    let t = Instant::now();
+    for _ in 0..polls {
+        std::hint::black_box(manager.poll_events_for(probe_id));
+    }
+    let b2 = t.elapsed();
+    println!(
+        "B2 same poll, 4 foreign buckets full: {:>7.1} ns/call",
+        ns(b2) / polls as f64
+    );
+    for release_tx in releases {
+        let _ = release_tx.send(()); // let the fillers finish
+    }
+    for rx in fillers {
+        let _ = rx.recv();
+    }
 
     // --- C: four writers, this thread polls ---------------------------------
     let stop = Arc::new(AtomicBool::new(false));
@@ -126,7 +182,7 @@ fn main() {
     let mut lat = Vec::with_capacity(polls);
     for _ in 0..polls {
         let t = Instant::now();
-        std::hint::black_box(manager.poll_events());
+        std::hint::black_box(manager.poll_events_for(probe_id));
         lat.push(t.elapsed());
     }
     stop.store(true, Ordering::Relaxed);
@@ -140,7 +196,7 @@ fn main() {
     }
     lat.sort();
     println!(
-        "C poll under 4 writers      : p50 {:>7.1} ns   p99 {:>8.1} ns   max {:>8.1} ns",
+        "C poll_events_for under 4 writers: p50 {:>7.1} ns   p99 {:>8.1} ns   max {:>8.1} ns",
         ns(pct(&lat, 0.50)),
         ns(pct(&lat, 0.99)),
         ns(lat[lat.len() - 1])

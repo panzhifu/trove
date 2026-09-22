@@ -24,6 +24,7 @@
 
 use super::formats::point_cloud::Frustum;
 use super::formats::types::{Bounds, Mesh};
+use super::height_color::HeightField;
 
 /// Vertical field of view used to frame a model, in degrees.
 pub const FOV_DEG: f32 = 35.0;
@@ -65,12 +66,6 @@ pub const VIGNETTE: f32 = 0.35;
 /// bakes in no constants of its own.
 pub const POINT_RADIUS: f32 = 1.15;
 
-/// Height band size for the elevation colouring, in model units.
-///
-/// Every this many units of model-space `y` gets its own hue, so the count of
-/// bands follows the file's real scale rather than its pixel size.
-pub const HEIGHT_BAND: f32 = 10.0;
-
 /// The three axis colours, the usual red/green/blue: X, Y, Z. The viewport's
 /// pivot symbol paints its three rings with these, so which ring belongs to
 /// which axis reads the same way it does in CloudCompare.
@@ -80,52 +75,6 @@ pub const AXIS_Z: [f32; 3] = [0.30, 0.47, 0.90];
 /// Amber for the centre of the three axes, standing apart from the three axis
 /// colours.
 pub const AXIS_ORIGIN: [f32; 3] = [0.95, 0.76, 0.25];
-
-/// Hue step between neighbouring height bands, in turns.
-///
-/// The golden angle, so neighbouring bands are as far apart as possible and
-/// the sequence keeps finding new hues instead of cycling after a handful.
-const BAND_HUE_STEP: f32 = 0.618_034;
-
-/// `HSV(hue, 1, 1)` as RGB, with the hue `t` in turns.
-fn hue_rgb(t: f32) -> [f32; 3] {
-    let h = t.rem_euclid(1.0) * 6.0;
-    let x = 1.0 - (h.rem_euclid(2.0) - 1.0).abs();
-    match h as u32 {
-        0 => [1.0, x, 0.0],
-        1 => [x, 1.0, 0.0],
-        2 => [0.0, 1.0, x],
-        3 => [0.0, x, 1.0],
-        4 => [x, 0.0, 1.0],
-        _ => [1.0, 0.0, x],
-    }
-}
-
-/// The colour one height band is painted with.
-///
-/// Each [`HEIGHT_BAND`] units of model-space `y` gets its own hue, counted
-/// from the model's own floor (`base`) so the first band starts at the model's
-/// feet rather than at world zero. `gpu3d.wgsl` mirrors this function, which
-/// is what keeps a thumbnail and its viewport frame the same picture.
-pub fn height_tint(y: f32, base: f32) -> [f32; 3] {
-    hue_rgb(((y - base) / HEIGHT_BAND).floor() * BAND_HUE_STEP)
-}
-
-/// Pack the height-colouring uniform into its four floats.
-///
-/// `x` = colouring on (1) or off (0), `y` = the band size, `z` = the model's
-/// floor (where the bands count from). `w` is unused — the GPU reads this as
-/// one `vec4<f32>`, and a four-component vector is what the uniform block's
-/// 16-byte stride asks for. The packing lives here rather than at the call
-/// site so the shader and the CPU agree on it in one place.
-pub fn bands_uniform(height_color: bool, base_y: f32) -> [f32; 4] {
-    [
-        if height_color { 1.0 } else { 0.0 },
-        HEIGHT_BAND,
-        base_y,
-        0.0,
-    ]
-}
 
 /// An orbiting camera aimed at the centre of the model.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -295,7 +244,7 @@ impl Scratch {
 ///
 /// Both default to off, so [`render`] — and every caller that did not ask —
 /// keeps producing exactly the frame it always did.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct RenderOptions {
     /// Skip the back faces of a closed, outward-wound mesh.
     ///
@@ -311,12 +260,13 @@ pub struct RenderOptions {
     /// camera, which is what makes the form legible; gap filling closes the
     /// single-pixel holes between neighbouring discs.
     pub enhance_points: bool,
-    /// Paint the surface by height instead of the flat material colour.
+    /// How the surface is painted by height, rather than by the material.
     ///
-    /// Every [`HEIGHT_BAND`] units of model-space `y` gets its own hue, which
-    /// turns a mesh into a readable elevation map. Off by default, so nothing
-    /// that did not ask for it keeps the picture it always had.
-    pub height_color: bool,
+    /// How the surface is painted by its field values, already measured against
+    /// the range the caller chose. [`HeightMode::Off`](crate::media::height_color::HeightMode)
+    /// — the default — keeps the flat material for a mesh and the file's own
+    /// colours for a cloud, so nothing that did not ask gets a look change.
+    pub height: HeightField,
 }
 
 /// [`render`], reusing the caller's buffers. The interactive path goes through
@@ -788,13 +738,7 @@ fn paint(
             height: h,
             framing,
         };
-        paint_points(
-            &mut target,
-            mesh,
-            point_radius,
-            quality,
-            options.height_color,
-        );
+        paint_points(&mut target, mesh, point_radius, quality, options.height);
         return;
     }
     if mesh.triangles.is_empty() {
@@ -817,8 +761,6 @@ fn paint(
     let (near, _) = framing.depth_range();
     let vertex_count = mesh.positions.len();
     let gouraud = mesh.has_vertex_normals();
-    // Height bands count from the model's own floor, not from world zero.
-    let base_y = mesh.bounds.min[1];
 
     {
         let mut target = Target {
@@ -867,26 +809,26 @@ fn paint(
 
             let mut corners = [Vertex::default(); 3];
             for (slot, index) in [i0, i1, i2].into_iter().enumerate() {
-                let normal = if gouraud {
+                let geometric = if gouraud {
                     let n = normalize(mesh.normals[index]);
-                    if n == [0.0; 3] {
-                        shaded_face
-                    } else if dot(n, to_camera) < 0.0 {
-                        neg(n)
-                    } else {
-                        n
-                    }
+                    if n == [0.0; 3] { face } else { n }
                 } else {
-                    shaded_face
+                    face
                 };
-                // Height colouring is decided per vertex, so a band boundary
-                // lands on the geometry rather than on a pixel; the shader
-                // does the same from the same model-space `y`.
-                let c = if options.height_color {
-                    height_tint(mesh.positions[index][1], base_y)
+                // The lighting normal is the geometric one flipped to face the
+                // camera, so an open shell never shows a black back face.
+                let normal = if dot(geometric, to_camera) < 0.0 {
+                    neg(geometric)
                 } else {
-                    MATERIAL
+                    geometric
                 };
+                // Field colouring is decided per vertex, so a band boundary
+                // lands on the geometry rather than on a pixel; the shader does
+                // the same from the same model-space position and normal.
+                let c = options
+                    .height
+                    .tint_at(mesh.positions[index], geometric)
+                    .unwrap_or(MATERIAL);
                 corners[slot] = Vertex {
                     p: view[index],
                     i: AMBIENT + DIFFUSE * dot(normal, light).max(0.0),
@@ -923,7 +865,7 @@ fn paint_points(
     mesh: &Mesh,
     radius: f32,
     quality: f32,
-    height_color: bool,
+    height: HeightField,
 ) {
     let (near, _) = target.framing.depth_range();
     let eye = target.framing.eye_in_model_space();
@@ -938,22 +880,23 @@ fn paint_points(
         if view[2] <= near {
             continue; // Behind the eye, or inside the near plane.
         }
-        let normal = point_normal(mesh, index);
+        // The geometry's own normal, which is what the instance buffer hands
+        // the GPU and what a dip direction has to be read off — before the flip
+        // below turns it to face the camera.
+        let geometric = point_normal(mesh, index);
         let to_eye = normalize(sub(eye, *position));
         // Two-sided, exactly as the triangle path is.
-        let normal = if dot(normal, to_eye) < 0.0 {
-            neg(normal)
+        let normal = if dot(geometric, to_eye) < 0.0 {
+            neg(geometric)
         } else {
-            normal
+            geometric
         };
         let intensity = AMBIENT + DIFFUSE * dot(normal, light).max(0.0);
-        // Height colouring wins over the file's own colours; that is the
-        // whole point of switching it on.
-        let base = if height_color {
-            height_tint(position[1], mesh.bounds.min[1])
-        } else {
-            base_color(mesh, index)
-        };
+        // Field colouring wins over the file's own colours; that is the whole
+        // point of switching it on.
+        let base = height
+            .tint_at(*position, geometric)
+            .unwrap_or_else(|| base_color(mesh, index));
         let rgb = [
             base[0] * intensity,
             base[1] * intensity,
@@ -1524,7 +1467,7 @@ mod tests {
             RenderOptions {
                 cull_backfaces: false,
                 enhance_points: true,
-                height_color: false,
+                height: HeightField::default(),
             },
             &mut Scratch::default(),
         )
@@ -1640,7 +1583,7 @@ mod tests {
             RenderOptions {
                 cull_backfaces: true,
                 enhance_points: false,
-                height_color: false,
+                height: HeightField::default(),
             },
             &mut Scratch::default(),
         );
@@ -1678,7 +1621,7 @@ mod tests {
             RenderOptions {
                 cull_backfaces: true,
                 enhance_points: false,
-                height_color: false,
+                height: HeightField::default(),
             },
             &mut Scratch::default(),
         );
@@ -1813,17 +1756,6 @@ mod tests {
         let mut camera = Camera::default();
         camera.orbit(-std::f32::consts::TAU * 2.0 - 1.0, 0.0);
         assert!((camera.yaw - -0.38).abs() < 1e-3, "yaw={}", camera.yaw);
-    }
-
-    #[test]
-    fn a_height_band_keeps_one_colour_and_its_neighbour_differs() {
-        let base = 100.0;
-        // Constant inside one band...
-        assert_eq!(height_tint(base, base), height_tint(base + 9.9, base));
-        // ...and a different colour in the next.
-        assert_ne!(height_tint(base, base), height_tint(base + 10.0, base));
-        // Bands count from the model's own floor, not from world zero.
-        assert_eq!(height_tint(0.0, 0.0), height_tint(base, base));
     }
 
     #[test]

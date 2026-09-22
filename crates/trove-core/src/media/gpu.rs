@@ -13,13 +13,15 @@
 //! * [`unpack_bgra`] — stripping that padding back off and swizzling to the
 //!   BGRA order the UI expects.
 
+use super::height_color::{HeightUniforms, RAMP_STOPS};
 use super::render3d::{
-    AMBIENT, BG_BOTTOM, BG_TOP, DIFFUSE, EDL_STRENGTH, Framing, HEIGHT_BAND, KEY_LIGHT, MATERIAL,
-    POINT_RADIUS, SHININESS, SPECULAR, VIGNETTE,
+    AMBIENT, BG_BOTTOM, BG_TOP, DIFFUSE, EDL_STRENGTH, Framing, KEY_LIGHT, MATERIAL, POINT_RADIUS,
+    SHININESS, SPECULAR, VIGNETTE,
 };
 
-/// Bytes of [`Uniforms`]: one `mat4x4<f32>` plus nine `vec4<f32>`.
-pub const UNIFORM_SIZE: usize = 64 + 9 * 16;
+/// Bytes of [`Uniforms`]: one `mat4x4<f32>`, ten `vec4<f32>` and the colour
+/// scale's stop table.
+pub const UNIFORM_SIZE: usize = 64 + 10 * 16 + RAMP_STOPS * 16;
 
 /// The uniform block read by the model and backdrop shaders.
 ///
@@ -47,14 +49,16 @@ pub struct Uniforms {
     pub viewport: [f32; 4],
     /// Backdrop gradient, top then bottom.
     pub background: [[f32; 4]; 2],
-    /// Height colouring.
-    ///
-    /// `x` = height colouring on (1) or off (0), `y` = band size in model
-    /// units, `z` = the model's floor (the bands' origin), `w` unused — kept so
-    /// the vector is the 16 bytes the uniform block's stride asks for. Packed
-    /// by [`bands_uniform`] rather than baked into the vertex buffer
-    /// so toggling costs a uniform write instead of a re-upload.
-    pub bands: [f32; 4],
+    /// Height colouring: mode, axis, and the range the height is normalised
+    /// against. Packed by [`HeightUniforms`] rather than baked into the vertex
+    /// buffer, so changing the look costs a uniform write instead of a
+    /// re-upload.
+    pub coloring: [f32; 4],
+    /// `x` = band width in model units, `y` = how many `ramp` entries are live.
+    pub coloring_params: [f32; 4],
+    /// The active colour scale: `rgb` plus `w` = position along the scale,
+    /// ascending, zero-padded past the live count.
+    pub ramp: [[f32; 4]; RAMP_STOPS],
 }
 
 impl Uniforms {
@@ -80,15 +84,19 @@ impl Uniforms {
                 [BG_TOP[0], BG_TOP[1], BG_TOP[2], 0.0],
                 [BG_BOTTOM[0], BG_BOTTOM[1], BG_BOTTOM[2], 0.0],
             ],
-            bands: [0.0, HEIGHT_BAND, 0.0, 0.0],
+            // Height colouring off, and a stop table of nothing to read: a
+            // caller that never asks for a look gets the picture it always had.
+            coloring: [0.0; 4],
+            coloring_params: [0.0; 4],
+            ramp: [[0.0; 4]; RAMP_STOPS],
         }
     }
 
-    /// Set the height-colouring uniform from a packed [`bands_uniform`] vector.
-    ///
-    /// [`bands_uniform`]: crate::media::render3d::bands_uniform
-    pub fn with_bands(mut self, bands: [f32; 4]) -> Self {
-        self.bands = bands;
+    /// Set the height-colouring uniforms from a packed [`HeightUniforms`].
+    pub fn with_height(mut self, height: HeightUniforms) -> Self {
+        self.coloring = height.coloring;
+        self.coloring_params = height.params;
+        self.ramp = height.ramp;
         self
     }
 
@@ -113,9 +121,13 @@ impl Uniforms {
             self.viewport,
             self.background[0],
             self.background[1],
-            self.bands,
+            self.coloring,
+            self.coloring_params,
         ] {
             push(&vector, &mut at);
+        }
+        for row in &self.ramp {
+            push(row, &mut at);
         }
         debug_assert_eq!(at, floats.len());
 
@@ -208,6 +220,7 @@ fn normalize3(v: [f32; 3]) -> [f32; 3] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::media::height_color::{Field, HeightLook, HeightMode, Scale, scale_by_id};
     use crate::media::render3d::Camera;
 
     fn framing() -> Framing {
@@ -222,10 +235,54 @@ mod tests {
 
     #[test]
     fn the_uniform_block_is_the_size_the_shader_expects() {
-        // 64 bytes of matrix + nine vec4 = 208, a multiple of 16.
-        assert_eq!(UNIFORM_SIZE, 208);
+        // 64 bytes of matrix + ten vec4 + a 16-stop colour scale = 480, a
+        // multiple of 16.
+        assert_eq!(UNIFORM_SIZE, 480);
         assert_eq!(UNIFORM_SIZE % 16, 0);
-        assert_eq!(Uniforms::new(&framing(), (800, 600)).to_bytes().len(), 208);
+        assert_eq!(Uniforms::new(&framing(), (800, 600)).to_bytes().len(), 480);
+    }
+
+    /// The height look is the payload the viewport's panel changes, so its
+    /// three parts have to land where the shader reads them.
+    #[test]
+    fn a_height_look_lands_at_the_end_of_the_block() {
+        let look = HeightLook {
+            mode: HeightMode::Ramp,
+            field: Field::Height,
+            axis: 1,
+            scale: Scale::Preset(scale_by_id("grey")),
+            period: 4.0,
+        };
+        let bounds = crate::media::formats::types::Bounds {
+            min: [0.0, 0.0, 0.0],
+            max: [1.0, 8.0, 1.0],
+        };
+        let bytes = Uniforms::new(&framing(), (800, 600))
+            .with_height(look.resolve(&bounds).uniforms())
+            .to_bytes();
+        let float_at =
+            |offset: usize| f32::from_ne_bytes(bytes[offset..offset + 4].try_into().unwrap());
+
+        // Eight vec4s follow the matrix, and the look is the ninth and tenth.
+        let coloring = 64 + 8 * 16;
+        assert_eq!(float_at(coloring), HeightMode::Ramp.index() as f32, "mode");
+        assert_eq!(float_at(coloring + 4), 1.0, "axis");
+        assert_eq!(float_at(coloring + 8), 0.0, "the range floor");
+        assert!(
+            (float_at(coloring + 12) - 1.0 / 8.0).abs() < 1e-6,
+            "1 / the range span"
+        );
+        assert_eq!(float_at(coloring + 16 + 4), 2.0, "two live stops");
+
+        // Then the scale, stop by stop, with the padding after it silent.
+        let ramp = coloring + 32;
+        assert_eq!(float_at(ramp + 12), 0.0, "the first stop's position");
+        assert_eq!(float_at(ramp + 16 + 12), 1.0, "the second stop's position");
+        assert_eq!(
+            float_at(ramp + 16 + 12 + 16),
+            0.0,
+            "a padded stop says nothing"
+        );
     }
 
     #[test]

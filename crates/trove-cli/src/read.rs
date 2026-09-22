@@ -425,6 +425,23 @@ pub fn tags(env: &Env) -> Result<Rendered, CliError> {
     Ok(Rendered::new(json!({ "tags": items }), human))
 }
 
+/// A container's own look, or `null` for the folder tree's default. Said as
+/// `kind` + `value` because the two glyph kinds mean different things to a
+/// script: an emoji is a literal, an icon is a name in the app's catalogue.
+fn appearance_json(appearance: &trove_core::model::Appearance) -> Value {
+    use trove_core::model::Glyph;
+    if appearance.is_plain() {
+        return Value::Null;
+    }
+    json!({
+        "glyph": appearance.glyph.as_ref().map(|glyph| match glyph {
+            Glyph::Emoji(text) => json!({ "kind": "emoji", "value": text }),
+            Glyph::Icon(name) => json!({ "kind": "icon", "value": name }),
+        }),
+        "accent": appearance.accent.map(|accent| accent.as_str()),
+    })
+}
+
 /// The collection tree, plus smart collections.
 pub fn collections(env: &Env) -> Result<Rendered, CliError> {
     let conn = env.library.store().conn();
@@ -440,6 +457,7 @@ pub fn collections(env: &Env) -> Result<Rendered, CliError> {
             "position": collection.position,
             "assets": trove_core::store::collections::count_assets(conn, collection.id)?,
             "kind": "collection",
+            "appearance": appearance_json(&collection.appearance),
         }));
     }
     let smart_items: Vec<Value> = smart
@@ -450,6 +468,7 @@ pub fn collections(env: &Env) -> Result<Rendered, CliError> {
                 "name": collection.name,
                 "parent_id": collection.parent_id,
                 "kind": "smart",
+                "appearance": appearance_json(&collection.appearance),
             })
         })
         .collect();

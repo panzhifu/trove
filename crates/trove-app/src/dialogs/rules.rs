@@ -15,13 +15,15 @@
 //! cannot own state). Every mutation bumps [`RuleDraft::revision`]; the
 //! dialog recomputes the live match count whenever the revision moved.
 //!
-//! The accent color is picked with the gpui-kit base [`ColorPickerState`],
-//! reusing the workspace colour filter's panels (`color_panel`): a
-//! palette / HSLA tab pair over the shared picker state. The dialog is a
-//! two-column layout — conditions on the left, the color column on the right.
+//! The right column is the folder's own look — the same
+//! [`crate::panels::appearance::Picker`] a folder's context menu carries, so a
+//! smart collection can be given its glyph and accent while it is still a
+//! draft. Here it writes nothing: the host reads the chooser on save and persists
+//! the look with the row. It replaced the free-form colour panel: a stored hex
+//! could only ever be right in the theme it was picked in, see
+//! [`trove_core::model::Appearance`]. The dialog is a two-column layout —
+//! conditions on the left, the appearance column on the right.
 
-use gpui::{Hsla, Rgba};
-use gpui_kit::base::{ColorPickerEvent, ColorPickerState};
 use gpui_kit::base::{h_flex, v_flex};
 use gpui_kit::component::WindowExt as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
@@ -35,7 +37,7 @@ use trove_core::store::{smart, smart_collections, tags};
 use uuid::Uuid;
 
 use crate::library::LibraryController;
-use crate::panels::workspace::{color_panel, recent_picker_colors};
+use crate::panels::appearance;
 
 // ============================ draft state ====================================
 
@@ -107,14 +109,10 @@ struct RuleDraft {
     rows: Vec<ConditionRow>,
     /// Tag names for the tag dropdown (snapshot at open).
     tag_names: Vec<String>,
-    /// Display color of the smart collection itself (`#rrggbb` or none).
-    color: Option<String>,
-    /// gpui-kit picker state: owns the hex field and the HSL sliders and
-    /// keeps them synced with [`Self::color`].
-    picker: Entity<ColorPickerState>,
-    /// Lives with the draft: when the dialog closes the draft (and these)
-    /// drop, unsubscribing the picker.
-    _subs: Vec<Subscription>,
+    /// The folder's glyph and accent, held by the shared chooser so this
+    /// dialog and a folder's context menu cannot offer different looks for the
+    /// same question. It is persisted with the row, not with the rule tree.
+    chooser: Entity<appearance::Picker>,
     /// Bumped by every mutation; the dialog recomputes the match count when
     /// it drifts from `evaluated`.
     revision: u64,
@@ -203,18 +201,6 @@ impl RuleDraft {
         if let Some(row) = self.rows.get_mut(ix) {
             row.orientation = orientation;
         }
-        self.touch(cx);
-    }
-
-    /// Set the color from a preset swatch (or clear it) and sync the picker
-    /// state (hex field + sliders follow automatically).
-    fn set_color(&mut self, color: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
-        self.color = color.clone();
-        let hsla = color.as_deref().and_then(hex_to_hsla);
-        self.picker.update(cx, |picker, cx| match hsla {
-            Some(c) => picker.set_value(c, window, cx),
-            None => picker.clear_value(window, cx),
-        });
         self.touch(cx);
     }
 
@@ -339,37 +325,7 @@ fn join_tree(match_all: bool, matches: Vec<SmartNode>) -> SmartNode {
     }
 }
 
-// ============================ color helpers ==================================
-
-fn u32_to_hsla(n: u32) -> Hsla {
-    Rgba {
-        r: ((n >> 16) & 0xff) as f32 / 255.,
-        g: ((n >> 8) & 0xff) as f32 / 255.,
-        b: (n & 0xff) as f32 / 255.,
-        a: 1.,
-    }
-    .into()
-}
-
-/// `#rrggbb` → opaque [`Hsla`], for feeding the picker state.
-fn hex_to_hsla(hex: &str) -> Option<Hsla> {
-    let hex = normalize_color(hex)?;
-    let n = u32::from_str_radix(hex.trim_start_matches('#'), 16).ok()?;
-    Some(u32_to_hsla(n))
-}
-
-/// [`Hsla`] → `#rrggbb` (lowercase). Alpha is dropped: smart-collection
-/// colors have no transparency semantics.
-fn picker_hex(color: Hsla) -> String {
-    let rgba = Rgba::from(color);
-    let channel = |value: f32| (value * 255.) as u8;
-    format!(
-        "#{:02x}{:02x}{:02x}",
-        channel(rgba.r),
-        channel(rgba.g),
-        channel(rgba.b)
-    )
-}
+// ============================ value normalisation ============================
 
 fn normalize_extension(raw: &str) -> String {
     raw.trim().trim_start_matches('.').to_lowercase()
@@ -494,20 +450,16 @@ pub fn open_rule_editor(
             .map(|list| list.into_iter().map(|t| t.name).collect())
             .unwrap_or_default()
     };
-    let color = editing
-        .as_ref()
-        .and_then(|sc| sc.color.clone())
-        .and_then(|c| normalize_color(&c));
-    let init = color.as_deref().and_then(hex_to_hsla);
-    let picker = cx.new(|cx| {
-        let state = ColorPickerState::new(window, cx);
-        match init {
-            Some(hsla) => state.default_value(hsla),
-            None => state,
-        }
-    });
-    // Flush the builder-supplied value into the hex field and sliders.
-    picker.update(cx, |picker, cx| picker.sync_pending_value(window, cx));
+    let chooser = appearance::Picker::draft(
+        editing
+            .as_ref()
+            .map(|sc| sc.appearance.clone())
+            .unwrap_or_default(),
+        // A draft has no name of its own yet — the preview keeps the placeholder
+        // rather than going stale against the name being typed.
+        String::new(),
+        cx,
+    );
     let draft = cx.new(|_| RuleDraft {
         controller,
         editing: editing.map(|sc| sc.id),
@@ -516,25 +468,12 @@ pub fn open_rule_editor(
         match_all,
         rows,
         tag_names,
-        color,
-        picker: picker.clone(),
-        _subs: Vec::new(),
+        chooser: chooser.clone(),
         revision: 1,
         evaluated: 0,
         match_total: None,
         error: None,
     });
-
-    // Picker → draft: the component keeps hex field and sliders in sync and
-    // reports the committed color here. The color does not touch the rule
-    // tree, so the revision is left alone.
-    let d = draft.clone();
-    let sub = cx.subscribe(&picker, move |_, event: &ColorPickerEvent, cx| {
-        d.update(cx, |d, _| match event {
-            ColorPickerEvent::Change(color) => d.color = color.map(picker_hex),
-        });
-    });
-    draft.update(cx, |d, _| d._subs = vec![sub]);
 
     window.open_dialog(cx, move |dialog, _, cx| {
         draft.update(cx, RuleDraft::recompute_if_stale);
@@ -587,7 +526,7 @@ fn save_draft(draft: &Entity<RuleDraft>, cx: &mut App) -> bool {
     let outcome = draft.update(cx, |d, cx| {
         let conn = d.controller.read(cx).library.store().conn();
         match d.editing {
-            Some(id) => smart_collections::update_query(conn, id, &json, d.color.as_deref())
+            Some(id) => smart_collections::update_query(conn, id, &json)
                 .map(|_| id)
                 .map_err(|e| e.to_string()),
             None => {
@@ -600,7 +539,6 @@ fn save_draft(draft: &Entity<RuleDraft>, cx: &mut App) -> bool {
                     parent_id: d.parent,
                     name: name.clone(),
                     query: json,
-                    color: d.color.clone(),
                     position,
                 };
                 // Name checks live in the model; the condition tree is
@@ -616,6 +554,15 @@ fn save_draft(draft: &Entity<RuleDraft>, cx: &mut App) -> bool {
 
     match outcome {
         Ok(saved) => {
+            // The look rides along with the save but is written apart from the
+            // rule tree: the two are edited in different places, and neither may
+            // quietly rewrite the other.
+            let appearance = draft.read(cx).chooser.read(cx).appearance().clone();
+            if let Err(error) = appearance::Target::Smart(saved)
+                .write(draft.read(cx).controller.read(cx), &appearance)
+            {
+                return fail(error, draft, cx);
+            }
             draft.update(cx, |d, cx| {
                 let created = d.editing.is_none();
                 d.controller.update(cx, |ctl, cx| {
@@ -724,42 +671,8 @@ fn render_body(
             .items_start()
             .gap_4()
             .child(conditions)
-            .child(render_color_panel(draft, cx)),
+            .child(appearance::column(&draft.read(cx).chooser, cx)),
     )
-}
-
-/// Right column: the accent color, rendered with the same panels as the
-/// workspace colour filter (palette / HSLA tabs over the shared picker
-/// state). A smart collection's color is optional, so a clear button sits
-/// beside the label.
-fn render_color_panel(draft: &Entity<RuleDraft>, cx: &mut App) -> Div {
-    let picker = draft.read(cx).picker.clone();
-    let featured = recent_picker_colors(cx);
-    let d = draft.clone();
-
-    v_flex()
-        .w(px(300.))
-        .flex_shrink_0()
-        .gap_2()
-        .border_l_1()
-        .border_color(cx.theme().border)
-        .pl_4()
-        .child(
-            h_flex()
-                .justify_between()
-                .items_center()
-                .child(field_label(cx, "rules.color"))
-                .child(
-                    Button::new("color-clear")
-                        .xsmall()
-                        .ghost()
-                        .label(rust_i18n::t!("tags.no_color").to_string())
-                        .on_click(move |_, window, cx| {
-                            d.update(cx, |d, cx| d.set_color(None, window, cx));
-                        }),
-                ),
-        )
-        .child(color_panel(&picker, featured, cx))
 }
 
 fn render_row(

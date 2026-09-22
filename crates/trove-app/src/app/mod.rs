@@ -8,8 +8,11 @@ pub mod i18n;
 pub mod theme;
 pub mod title_bar;
 
+mod capture;
 pub mod library_manager;
 mod root;
+mod status_bar;
+mod task_panel;
 mod tray;
 
 pub use library_manager::LibraryManagerView;
@@ -21,4 +24,4 @@ pub(crate) use root::run_update_check;
 // lists the compositor's windows, and elsewhere the platform's own region
 // picker is the whole interaction (see `take_screenshot`).
 #[cfg(target_os = "linux")]
-pub(crate) use root::capture_picked_window;
+pub(crate) use capture::capture_picked_window;

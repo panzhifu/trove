@@ -5,10 +5,6 @@
 //! a whole-window file-drop surface. `main` only boots the window and mounts
 //! this view inside a `Root`.
 
-use std::path::PathBuf;
-
-use gpui_kit::base::h_flex;
-use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::component::Sizable as _;
 use gpui_kit::component::WindowExt as _;
 use gpui_kit::component::dock::{
@@ -25,8 +21,9 @@ use gpui_kit::*;
 use crate::app::actions::*;
 use crate::app::title_bar::TitleBarView;
 use crate::app::tray;
+use crate::app::{capture, status_bar};
 use crate::library::jobs;
-use crate::library::{ImportPhase, LibraryController, SelectionSource};
+use crate::library::{LibraryController, SelectionSource};
 use crate::panels::{ExplorerPanel, FoldersPanel, InspectorPanel, TagsPanel, WorkspacePanel};
 use trove_core::config::AppConfig;
 use trove_core::library::Library;
@@ -42,21 +39,6 @@ fn open_library_at_startup() -> Library {
         .ensure_active_library()
         .unwrap_or_else(|e| panic!("prepare library: {e}"));
     Library::open(entry.dir(), entry.cache_dir()).unwrap_or_else(|e| panic!("open library: {e}"))
-}
-
-/// The release worth telling the user about, or `None`.
-///
-/// The status bar asks on every frame, so the config file is only read when a
-/// newer release is actually on the table — and a version the user already
-/// waved off is filtered out here rather than inside the update service,
-/// which knows nothing about preferences.
-fn pending_update() -> Option<(String, String)> {
-    let (version, page) = update::available()?;
-    let skipped = AppConfig::load().skipped_version().map(str::to_string);
-    if skipped.as_deref() == Some(version.as_str()) {
-        return None;
-    }
-    Some((version, page))
 }
 
 /// Ask GitHub for the newest release on the background executor, then stamp
@@ -90,6 +72,21 @@ fn spawn_update_check(cx: &mut App, delay: std::time::Duration) {
 /// moment the user asks for it.
 pub(crate) fn run_update_check(cx: &mut App) {
     spawn_update_check(cx, std::time::Duration::ZERO);
+}
+
+/// The release worth telling the user about, or `None`.
+///
+/// The status bar and the About dialog both ask on every frame, so the config
+/// file is only read when a newer release is actually on the table — and a
+/// version the user already waved off is filtered out here rather than inside
+/// the update service, which knows nothing about preferences.
+pub(crate) fn pending_update() -> Option<(String, String)> {
+    let (version, page) = update::available()?;
+    let skipped = AppConfig::load().skipped_version().map(str::to_string);
+    if skipped.as_deref() == Some(version.as_str()) {
+        return None;
+    }
+    Some((version, page))
 }
 
 /// The running session's controller, registered by [`AppView::new`]. The
@@ -499,12 +496,12 @@ impl AppView {
         );
 
         #[cfg(target_os = "linux")]
-        open_capture_picker(controller, dest, handle, cx);
+        capture::open_capture_picker(controller, dest, handle, cx);
 
         // No in-process overlay to draw on these platforms: `screencapture -i`
         // is the region picker, and the chain reports back what it wrote.
         #[cfg(not(target_os = "linux"))]
-        run_capture_chain(
+        capture::run_capture_chain(
             screenshot::CaptureTarget::PickArea,
             None,
             dest,
@@ -647,137 +644,6 @@ impl AppView {
             }
         })
         .detach();
-    }
-
-    /// Bottom status bar: selection count, library path, import state and the
-    /// latest notice (errors surface here even outside Settings).
-    fn status_bar(&self, cx: &Context<Self>) -> Div {
-        let ctl = self.controller.read(cx);
-        let selected = ctl.selected_assets.len();
-        let root = ctl.library.root().display().to_string();
-        let import = match &ctl.import_phase {
-            ImportPhase::Idle => rust_i18n::t!("statusbar.import_idle").to_string(),
-            ImportPhase::Running { total, done } => {
-                // Zero is the job's "counting the folder" state: there is no
-                // fraction to show until the walk on the backend thread ends.
-                if *total == 0 {
-                    rust_i18n::t!("statusbar.import_scanning").to_string()
-                } else {
-                    rust_i18n::t!("statusbar.import_running", done = done, total = total)
-                        .to_string()
-                }
-            }
-            ImportPhase::Done { imported, skipped } => rust_i18n::t!(
-                "statusbar.import_done",
-                imported = imported,
-                skipped = skipped
-            )
-            .to_string(),
-        };
-        let notice = ctl.notice.clone();
-        let (undo_len, redo_len) = (ctl.library.undo_len(), ctl.library.redo_len());
-        // Recent-operation descriptions for the status-bar history tooltip.
-        let undo_entries = ctl.library.undo_entries(5);
-        let redo_entries = ctl.library.redo_entries(3);
-        let history_tooltip = if undo_len == 0 && redo_len == 0 {
-            None
-        } else {
-            let mut lines: Vec<String> = undo_entries.iter().map(describe_op).collect();
-            if !redo_entries.is_empty() {
-                lines.push(rust_i18n::t!("statusbar.redo_header").to_string());
-                lines.extend(redo_entries.iter().map(describe_op));
-            }
-            Some(lines.join("\n"))
-        };
-        h_flex()
-            .h(px(26.))
-            .px_3()
-            .items_center()
-            .gap_4()
-            .flex_shrink_0()
-            .border_t_1()
-            .border_color(cx.theme().border)
-            .bg(cx.theme().secondary)
-            .text_xs()
-            .text_color(cx.theme().muted_foreground)
-            .child(rust_i18n::t!("statusbar.selected", count = selected).to_string())
-            .when(undo_len > 0 || redo_len > 0, {
-                let history_tooltip = history_tooltip.clone();
-                move |bar| {
-                    let history_seg = div()
-                        .id("statusbar-history")
-                        .when(undo_len > 0, |seg| {
-                            seg.child(rust_i18n::t!("statusbar.undo", count = undo_len).to_string())
-                        })
-                        .when(undo_len > 0 && redo_len > 0, |seg| seg.child(" · "))
-                        .when(redo_len > 0, |seg| {
-                            seg.child(rust_i18n::t!("statusbar.redo", count = redo_len).to_string())
-                        });
-                    let seg = match history_tooltip {
-                        Some(text) => {
-                            let text = SharedString::from(text);
-                            history_seg.tooltip(move |window, cx| {
-                                gpui_kit::component::tooltip::Tooltip::new(text.clone())
-                                    .build(window, cx)
-                            })
-                        }
-                        None => history_seg,
-                    };
-                    bar.child(seg)
-                }
-            })
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .truncate()
-                    .child(rust_i18n::t!("statusbar.library", path = root).to_string()),
-            )
-            // Which renderer is drawing an open 3D model: the GPU adapter, a
-            // CPU fallback reason, or the progress of a load that is still
-            // running. The model viewport used to carry this in the panel's
-            // title bar; the status bar is where machine-level facts belong,
-            // and the vacated title-bar room is where the preview's next
-            // tools go.
-            .when_some(self.viewport_backend.clone(), |bar, backend| {
-                bar.child(div().max_w(px(360.)).truncate().child(backend))
-            })
-            .child(import)
-            // The release badge: the only place a pending update is announced
-            // without the user asking. Clicking it opens the release page —
-            // installing is the user's call, not ours.
-            .when_some(pending_update(), |bar, (version, page)| {
-                bar.child(
-                    div()
-                        .id("statusbar-update")
-                        .cursor_pointer()
-                        .text_color(cx.theme().info)
-                        .hover(|style| style.underline())
-                        .child(
-                            rust_i18n::t!("statusbar.update_available", version = version)
-                                .to_string(),
-                        )
-                        .tooltip({
-                            let hint = rust_i18n::t!("statusbar.update_hint").to_string();
-                            move |window, cx| {
-                                gpui_kit::component::tooltip::Tooltip::new(hint.clone())
-                                    .build(window, cx)
-                            }
-                        })
-                        .on_click(move |_, _, _| {
-                            let _ = trove_core::services::open_external::open_url(&page);
-                        }),
-                )
-            })
-            .when_some(notice, |bar, notice| {
-                bar.child(
-                    div()
-                        .max_w(px(420.))
-                        .truncate()
-                        .text_color(cx.theme().warning)
-                        .child(notice),
-                )
-            })
     }
 
     /// File ▸ Import files… : system file picker, then background import.
@@ -1244,23 +1110,15 @@ impl Render for AppView {
             }))
             .child(self.title_bar.clone())
             .child(div().flex_1().min_h_0().child(self.dock.clone()))
-            .child(self.status_bar(cx))
+            .child(status_bar::status_bar(
+                &self.controller,
+                self.viewport_backend.clone(),
+                cx,
+            ))
             .children(dialog_layer)
             .children(sheet_layer)
             .children(notification_layer)
             .into_any_element()
-    }
-}
-
-/// One history line for the status-bar tooltip: localized verb plus the
-/// recorded target (name when a single object was touched, a count
-/// otherwise).
-fn describe_op(desc: &trove_core::history::undo::OpDesc) -> String {
-    let action = rust_i18n::t!(desc.action.key()).to_string();
-    match (&desc.target, desc.count) {
-        (Some(name), _) => format!("{action} {name}"),
-        (None, n) if n > 1 => format!("{action} ×{n}"),
-        (None, _) => action,
     }
 }
 
@@ -1281,195 +1139,4 @@ fn start_collect_server(_cx: &mut Context<AppView>) {
             // still drains any inbox files the other instance wrote.
         }
     }
-}
-
-/// Run a capture on the background executor and import what it wrote.
-///
-/// `fallback` is the second chance when the first target fails — the picker
-/// uses it for the rectangle it highlighted, so a window that vanished
-/// between the click and the capture still hands over those pixels.
-///
-/// A cancelled capture (the user answered the platform's own picker with
-/// Esc) is not an error: nothing was written, so nothing is imported and
-/// nothing is reported.
-fn run_capture_chain(
-    target: trove_core::services::screenshot::CaptureTarget,
-    fallback: Option<trove_core::services::screenshot::CaptureTarget>,
-    dest: PathBuf,
-    controller: Entity<LibraryController>,
-    handle: AnyWindowHandle,
-    cx: &mut App,
-) {
-    use trove_core::services::screenshot::{self, Error};
-
-    let requested = format!("{target:?}");
-    cx.spawn(async move |cx| {
-        let path = dest.clone();
-        let outcome = cx
-            .background_executor()
-            .spawn(async move {
-                match screenshot::capture(&target, &path) {
-                    Ok(source) => Ok(source),
-                    Err(Error::Cancelled) => Err(Error::Cancelled),
-                    Err(first) => match fallback {
-                        Some(fallback) => {
-                            tracing::warn!(
-                                error = %first.message(),
-                                "screenshot target failed; trying the highlighted rectangle"
-                            );
-                            screenshot::capture(&fallback, &path).map_err(|second| {
-                                // Both reasons, so the log names what actually
-                                // refused rather than just the first attempt.
-                                Error::Failed(format!(
-                                    "{}; then the highlighted rectangle: {}",
-                                    first.message(),
-                                    second.message()
-                                ))
-                            })
-                        }
-                        None => Err(first),
-                    },
-                }
-            })
-            .await;
-        let _ = handle.update(cx, |_, window, cx| match outcome {
-            Ok(source) => {
-                tracing::info!(
-                    source = ?source,
-                    dest = %dest.display(),
-                    "screenshot captured; importing"
-                );
-                jobs::import_paths_app(&controller, vec![dest], window, cx);
-            }
-            Err(Error::Cancelled) => {
-                tracing::info!(target = %requested, "screenshot cancelled");
-            }
-            Err(error) => {
-                tracing::error!(error = %error.message(), "screenshot capture failed");
-                window.push_notification(
-                    Notification::warning(
-                        rust_i18n::t!("notice.screenshot_failed", error = error.message())
-                            .to_string(),
-                    ),
-                    cx,
-                );
-            }
-        });
-    })
-    .detach();
-}
-
-/// Open the screenshot picker over a frozen frame.
-///
-/// Both halves of the preparation are D-Bus round trips — the frame, then
-/// the compositor's window list (bounded by its own timeout) — so they run
-/// on the background executor, never on the UI thread. When even the frame
-/// cannot be had, the platform's own picker takes over: on Linux that is
-/// `grim -g "$(slurp)"` or `scrot -s`, a working region capture without the
-/// window snapping.
-#[cfg(target_os = "linux")]
-fn open_capture_picker(
-    controller: Entity<LibraryController>,
-    dest: PathBuf,
-    handle: AnyWindowHandle,
-    cx: &mut App,
-) {
-    use trove_core::services::screenshot::CaptureTarget;
-
-    let fallback = {
-        let (dest, controller) = (dest.clone(), controller.clone());
-        move |cx: &mut App| {
-            run_capture_chain(CaptureTarget::PickArea, None, dest, controller, handle, cx);
-        }
-    };
-    cx.spawn(async move |cx| {
-        let prepared = cx
-            .background_executor()
-            .spawn(async { prepare_pick() })
-            .await;
-        match prepared {
-            Ok((frame, candidates)) => {
-                let _ = handle.update(cx, |_, _, cx| {
-                    crate::components::capture_pick::open(
-                        frame, candidates, dest, controller, handle, cx,
-                    );
-                });
-            }
-            Err(reason) => {
-                tracing::warn!(reason, "no in-process picker; using the platform picker");
-                let _ = handle.update(cx, |_, _, cx| fallback(cx));
-            }
-        }
-    })
-    .detach();
-}
-
-/// The frame the picker freezes on, plus the windows it can snap to.
-///
-/// The window list is a bonus, never a requirement: without it (no scripting
-/// interface, a compositor that did not answer in time) the picker still drags
-/// rectangles, it just never highlights a window. On a session without KWin
-/// there is not even a frame to freeze — the compositor's own picker takes
-/// over, which is the same region capture with a plainer interface.
-#[cfg(target_os = "linux")]
-fn prepare_pick() -> Result<
-    (
-        image::RgbaImage,
-        Vec<crate::components::capture_pick::Candidate>,
-    ),
-    String,
-> {
-    use crate::components::capture_pick::{Candidate, window_label};
-    use trove_core::services::{kwin, kwin_script};
-
-    if !kwin::available() {
-        return Err("this session has no compositor interface for a frozen frame".into());
-    }
-    let frame = kwin::capture_workspace_image().map_err(|failure| failure.labelled())?;
-    let candidates = kwin_script::window_list()
-        .unwrap_or_default()
-        .into_iter()
-        .map(|window| Candidate {
-            handle: window.handle,
-            label: window_label(&window.app, &window.caption),
-            x: window.x,
-            y: window.y,
-            width: window.width,
-            height: window.height,
-        })
-        .collect();
-    Ok((frame, candidates))
-}
-
-/// A window the picker highlighted: the compositor renders that window
-/// itself (decoration included, native resolution, nothing else in frame),
-/// and the rectangle the user clicked is the fallback if the window is gone
-/// by the time we ask for it.
-#[cfg(target_os = "linux")]
-pub(crate) fn capture_picked_window(
-    picked: crate::components::capture_pick::Candidate,
-    dest: PathBuf,
-    controller: Entity<LibraryController>,
-    window: &mut Window,
-    cx: &mut App,
-) {
-    use trove_core::services::screenshot::CaptureTarget;
-
-    let target = CaptureTarget::Window {
-        handle: picked.handle,
-    };
-    let fallback = CaptureTarget::Area {
-        x: picked.x,
-        y: picked.y,
-        width: picked.width,
-        height: picked.height,
-    };
-    run_capture_chain(
-        target,
-        Some(fallback),
-        dest,
-        controller,
-        window.window_handle(),
-        cx,
-    );
 }

@@ -3,13 +3,24 @@
 
 use std::sync::Arc;
 
-use gpui_kit::base::{ElementExt as _, h_flex};
+use gpui_kit::base::{Disableable as _, ElementExt as _, h_flex, v_flex};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::popover::Popover;
+use gpui_kit::component::separator::Separator;
+use gpui_kit::component::tab::{Tab, TabBar};
 use gpui_kit::component::{ActiveTheme, IconName, Sizable};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
-use super::{Backend, Drag, ModelViewport, drag_for};
+use gpui_kit::base::{ColorPickerEvent, ColorPickerState};
+use gpui_kit::component::color_picker::ColorPicker;
+use gpui_kit::component::scroll::ScrollableElement as _;
+use trove_core::media::height_color::{
+    COLOR_SCALES, ColorScale, ColorStop, CustomScale, Field, HeightField,
+    HeightLook, HeightMode, MAX_PERIOD, MIN_PERIOD, RAMP_STOPS, Ramp, Scale, nice_ticks,
+};
+
+use super::{Backend, Drag, ModelViewport, ModelViewportEvent, drag_for};
 
 /// The camera's distance bounds for the configured magnification limits.
 ///
@@ -20,6 +31,173 @@ use super::{Backend, Drag, ModelViewport, drag_for};
 /// inverted here — the smallest distance is the *largest* magnification.
 pub(super) fn distance_bounds(cfg: &trove_core::config::AppConfig) -> (f32, f32) {
     (1.0 / cfg.max_preview_zoom(), 1.0 / cfg.min_preview_zoom())
+}
+
+/// How many swatches a colour strip is drawn in: enough that a scale reads as
+/// continuous, few enough that a panel is not laying out a hundred divs.
+const STRIP_SEGMENTS: usize = 32;
+
+/// The height of the legend's bar. The labels ride beside it, so this is the
+/// only place the two halves of the legend have to agree.
+const LEGEND_HEIGHT: Pixels = px(96.);
+/// Intermediate labels to aim for on a field that names none of its own. Three
+/// inside the ends is as many as a bar this short carries without crowding.
+const LEGEND_TICKS: usize = 3;
+/// Half a line of `text_xs`, for centring a label on its own value.
+const LEGEND_TEXT_HALF: f32 = 7.0;
+/// Closer together than this and two labels are one label: the later is dropped.
+const LEGEND_LINE: f32 = 14.0;
+/// Slots the anchor editor cuts a scale into. Finer than anyone can aim at on a
+/// bar this short, coarse enough that a scale's anchors land on positions the
+/// strip can actually show.
+const ANCHOR_CELLS: usize = 24;
+
+/// The caption above a row of the height panel.
+fn section_label(text: impl Into<SharedString>, cx: &App) -> impl IntoElement {
+    div()
+        .text_xs()
+        .text_color(cx.theme().muted_foreground)
+        .child(text.into())
+}
+
+/// A colour scale drawn as a horizontal strip, so the thing being chosen is the
+/// thing being seen rather than a name that has to be imagined in colour.
+fn scale_strip(scale: &Scale, cx: &App) -> impl IntoElement {
+    h_flex()
+        .flex_shrink_0()
+        .w_24()
+        .h_4()
+        .overflow_hidden()
+        .rounded(cx.theme().radius)
+        .border_1()
+        .border_color(cx.theme().border)
+        .children(scale.gradient(STRIP_SEGMENTS).into_iter().map(|rgb| {
+            div().flex_1().h_full().bg(tint_color([
+                rgb[0] as f32 / 255.0,
+                rgb[1] as f32 / 255.0,
+                rgb[2] as f32 / 255.0,
+            ]))
+        }))
+}
+
+/// A scale stop, as a UI colour. Shared with the two picker states, which hold
+/// their colours the way the theme does.
+pub(super) fn rgb_hsla(rgb: [u8; 3]) -> Hsla {
+    tint_color([
+        rgb[0] as f32 / 255.0,
+        rgb[1] as f32 / 255.0,
+        rgb[2] as f32 / 255.0,
+    ])
+}
+
+/// The other way round, for a colour the picker just committed. Alpha is
+/// dropped: a scale stop is opaque, and the model behind it is not a layer.
+pub(super) fn hsla_rgb(color: Hsla) -> [u8; 3] {
+    let rgba = Rgba::from(color);
+    [
+        (rgba.r * 255.0).round() as u8,
+        (rgba.g * 255.0).round() as u8,
+        (rgba.b * 255.0).round() as u8,
+    ]
+}
+
+/// One of the colours a field look paints with — the same 0..=1 floats both
+/// renderers agree on — as a UI colour.
+fn tint_color(rgb: [f32; 3]) -> Hsla {
+    Rgba {
+        r: rgb[0],
+        g: rgb[1],
+        b: rgb[2],
+        a: 1.0,
+    }
+    .into()
+}
+
+/// The two ends of the bar, plus whatever the field calls a label.
+///
+/// Positions run from 0.0 at the bottom of the range to 1.0 at the top, because
+/// that is the order the strip is painted in.
+fn legend_values(field: &HeightField) -> Vec<(f32, f32)> {
+    let (min, max) = field.range();
+    let span = max - min;
+    if span <= 0.0 {
+        return vec![(min, 0.0)];
+    }
+    let position = |value: f32| (value - min) / span;
+    // The field's own labels where it has them — CloudCompare stores them on the
+    // scale — and round numbers over the model's range where it does not.
+    let interior: Vec<f32> = match field.field().labels() {
+        Some(values) => values
+            .iter()
+            .filter(|value| **value > min && **value < max)
+            .copied()
+            .collect(),
+        None => nice_ticks(min, max, LEGEND_TICKS),
+    };
+    let mut values = vec![(min, 0.0)];
+    values.extend(interior.into_iter().map(|value| (value, position(value))));
+    values.push((max, 1.0));
+    values
+}
+
+/// The bar's caption: the field's name, with the axis appended for the one
+/// field whose meaning depends on it.
+fn legend_caption(field: &HeightField) -> String {
+    let name = match field.field() {
+        Field::Height => rust_i18n::t!("viewport.height_field_height").to_string(),
+        Field::Slope => rust_i18n::t!("viewport.height_field_slope").to_string(),
+        Field::Aspect => rust_i18n::t!("viewport.height_field_aspect").to_string(),
+    };
+    match field.field() {
+        Field::Height => format!("{} · {}", name, ["X", "Y", "Z"][field.axis()]),
+        _ => name,
+    }
+}
+
+/// The labels beside the bar, each at the height of its own value.
+///
+/// Positioned by fraction rather than laid out, because a label belongs to a
+/// value and not to a row: three labels in a range that only fills half the bar
+/// sit in the bottom half, which is the whole point. Neighbours closer than a
+/// line of `text_xs` would drop the later one rather than overlap it.
+fn legend_labels(field: &HeightField, label: &dyn Fn(f32) -> String, cx: &App) -> AnyElement {
+    let mut column = div().relative().w(px(52.)).h(LEGEND_HEIGHT);
+    // Walking top down, so each label is measured against the last one kept.
+    let mut last_top = f32::NEG_INFINITY;
+    for (value, position) in legend_values(field).into_iter().rev() {
+        let top = LEGEND_HEIGHT.as_f32() * (1.0 - position) - LEGEND_TEXT_HALF;
+        if top - last_top < LEGEND_LINE {
+            continue;
+        }
+        last_top = top;
+        column = column.child(
+            div()
+                .absolute()
+                .left_0()
+                .top(px(top))
+                .flex()
+                .items_center()
+                .gap_1()
+                // The tick itself, so the number points at something.
+                .child(div().w_1().h(px(7.)).flex_shrink_0().bg(cx.theme().border))
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(label(value)),
+                ),
+        );
+    }
+    column.into_any_element()
+}
+
+/// A number in whatever units the field is measured in, with no more decimals
+/// than it needs: the legend's two values and the banding period read this way.
+fn format_units(value: f32) -> String {
+    format!("{value:.2}")
+        .trim_end_matches('0')
+        .trim_end_matches('.')
+        .to_string()
 }
 
 impl ModelViewport {
@@ -231,38 +409,364 @@ impl ModelViewport {
             // rotation centre should be stays readable even when the model is
             // in front of it.
             .child(self.pivot_symbol(cx))
-            .child(self.look_switches(cx))
+            .child(
+                div()
+                    .absolute()
+                    .top_2()
+                    .left_2()
+                    .child(self.height_control(cx)),
+            )
+            .child(self.height_legend(cx))
             .child(self.shortcuts_hint(cx))
     }
 
-    /// The one look switch, in the canvas's top-left corner: painting the
-    /// model by height.
+    /// The one look switch, in the canvas's top-left corner: how — or whether
+    /// — the model is painted by height.
+    ///
+    /// A popover, not a settings row, because the choice is made while looking
+    /// at the model: CloudCompare asks the same four questions in its
+    /// `ccColorGradientDlg` (direction, ramp, banding, frequency) and so does
+    /// this panel, with the ramp previewed where its name would be.
     ///
     /// On the canvas rather than in the toolbar because it changes what is
-    /// drawn, not the panel's chrome. A persisted toggle: flipping it redraws,
-    /// and the frame loop's periodic config re-read agrees with what is on
-    /// screen instead of flicking it back.
-    fn look_switches(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let height_on = self.height_color;
-        h_flex().absolute().top_2().left_2().gap_1().child(
-            Button::new("height-color")
-                .xsmall()
-                .when(height_on, |button| button.primary())
-                .when(!height_on, |button| button.ghost())
-                .icon(IconName::Palette)
-                .label(rust_i18n::t!("viewport.height_color").to_string())
-                .tooltip(rust_i18n::t!("viewport.height_color_tip").to_string())
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.height_color = !this.height_color;
-                    let mut config = trove_core::config::AppConfig::load();
-                    config.height_color = Some(this.height_color);
-                    let _ = config.save();
-                    this.enhance_checked = None;
-                    this.dirty = true;
-                    this.pump(cx);
-                    cx.notify();
-                })),
-        )
+    /// drawn, not the panel's chrome. Every choice persists as it is made, so
+    /// the next model opened looks the same way.
+    fn height_control(&self, cx: &mut Context<Self>) -> AnyElement {
+        let on = self.height.mode != HeightMode::Off;
+        Popover::new("height-color-popover")
+            .trigger(
+                Button::new("height-color")
+                    .xsmall()
+                    .when(on, |button| button.primary())
+                    .when(!on, |button| button.ghost())
+                    .icon(IconName::Palette)
+                    .label(rust_i18n::t!("viewport.height_color").to_string())
+                    .tooltip(rust_i18n::t!("viewport.height_color_tip").to_string()),
+            )
+            .child(height_panel(&self.height, cx.entity(), cx))
+            .into_any_element()
+    }
+
+    /// The anchor picker moved: recolour the anchor it is editing, and leave the
+    /// write to the close edge.
+    pub(super) fn on_height_colour(
+        &mut self,
+        _: Entity<ColorPickerState>,
+        event: &ColorPickerEvent,
+        cx: &mut Context<Self>,
+    ) {
+        let ColorPickerEvent::Change(color) = event;
+        let Some(color) = color else {
+            return;
+        };
+        self.paint_anchor(hsla_rgb(*color), false, cx);
+    }
+
+    /// The selected anchor's colour, as a new look.
+    pub(super) fn paint_anchor(&mut self, rgb: [u8; 3], persist: bool, cx: &mut Context<Self>) {
+        let Some(mut stops) = self.custom_stops() else {
+            return;
+        };
+        let index = self.height_anchor.min(stops.len().saturating_sub(1));
+        stops[index].rgb = rgb;
+        self.stow_scale(stops, persist, cx);
+    }
+
+    /// Click a cell of the editor strip: an anchor already there is selected,
+    /// and an empty cell takes a new one, coloured from the ramp at that point
+    /// so it starts invisible against its neighbours rather than as a hard step.
+    pub(super) fn click_anchor_cell(&mut self, cell: usize, cx: &mut Context<Self>) {
+        let Some(stops) = self.custom_stops() else {
+            return;
+        };
+        let Some(live) = anchor_at(&stops, cell) else {
+            if stops.len() >= RAMP_STOPS {
+                return;
+            }
+            let at = cell_position(cell);
+            let rgb = ramp_rgb(&stops, at);
+            let mut stops = stops;
+            stops.push(ColorStop::new(at, rgb));
+            self.height_anchor = anchor_at(&stops_after_sort(&stops), cell).unwrap_or(0);
+            self.stow_scale(stops, true, cx);
+            return;
+        };
+        self.height_anchor = live;
+        self.redraw(cx);
+    }
+
+    /// Slide the selected anchor one cell along the scale.
+    pub(super) fn nudge_anchor(&mut self, cells: i32, cx: &mut Context<Self>) {
+        let Some(stops) = self.custom_stops() else {
+            return;
+        };
+        let Some(index) = stops.get(self.height_anchor).map(|_| self.height_anchor) else {
+            return;
+        };
+        let at = (stops[index].at + cells as f32 / ANCHOR_CELLS as f32).clamp(0.0, 1.0);
+        let mut stops = stops;
+        stops[index].at = at;
+        // The ends are the ends: moving an anchor off one would silently shorten
+        // the scale's own range, which is what the sorted-then-pinned cleanup in
+        // `Ramp::custom` exists to refuse.
+        if at == 0.0 {
+            self.height_anchor = 0;
+        } else if at == 1.0 {
+            self.height_anchor = stops.len() - 1;
+        }
+        self.stow_scale(stops, true, cx);
+    }
+
+    /// Drop the selected anchor, as long as two are left to interpolate with.
+    pub(super) fn drop_anchor(&mut self, cx: &mut Context<Self>) {
+        let Some(stops) = self.custom_stops() else {
+            return;
+        };
+        if stops.len() <= 2 {
+            return;
+        }
+        let mut stops = stops;
+        stops.remove(self.height_anchor.min(stops.len() - 1));
+        self.height_anchor = self.height_anchor.min(stops.len() - 1);
+        self.stow_scale(stops, true, cx);
+    }
+
+    /// A new user scale, made current — which also switches the mode to the ramp
+    /// that uses it, the way choosing a scale does.
+    pub(super) fn add_custom_scale(&mut self, cx: &mut Context<Self>) {
+        let mut config = trove_core::config::AppConfig::load();
+        let id = config.add_custom_scale();
+        let _ = config.save();
+        self.height_scales = config.height_custom_scales;
+        let ramp = self
+            .height_scales
+            .iter()
+            .find(|custom| custom.id == id)
+            .map(CustomScale::ramp)
+            .unwrap_or_else(Ramp::defaults);
+        self.height_anchor = 0;
+        self.set_height(
+            HeightLook {
+                mode: HeightMode::Ramp,
+                scale: Scale::Custom { id, ramp },
+                ..self.height.clone()
+            },
+            cx,
+        );
+    }
+
+    /// Forget the scale in use, and hand the model back the default. Its anchors
+    /// may be named by another model's row; those read the fallback too, which is
+    /// the trade the reference-and-nothing-else storage made on purpose.
+    pub(super) fn delete_custom_scale(&mut self, cx: &mut Context<Self>) {
+        let Some(id) = self.height.scale.custom_id().map(str::to_string) else {
+            return;
+        };
+        let mut config = trove_core::config::AppConfig::load();
+        config.remove_custom_scale(&id);
+        let _ = config.save();
+        self.height_scales = config.height_custom_scales.clone();
+        self.set_height(
+            HeightLook {
+                scale: config.height_look().scale,
+                ..self.height.clone()
+            },
+            cx,
+        );
+    }
+
+    /// Choose one of the user's scales by id, from the list the viewport caches.
+    ///
+    /// By id rather than by value because the value lives in that list: picking
+    /// a row picks what the config currently holds for it, which is what keeps
+    /// the row's strip and the model's colours from disagreeing after an edit.
+    fn use_custom_scale(&mut self, id: &str, cx: &mut Context<Self>) {
+        let Some(custom) = self.height_scales.iter().find(|custom| custom.id == id) else {
+            return;
+        };
+        let scale = Scale::custom(custom);
+        self.height_anchor = 0;
+        self.set_height(
+            HeightLook {
+                mode: HeightMode::Ramp,
+                scale,
+                ..self.height.clone()
+            },
+            cx,
+        );
+    }
+
+    /// The anchors of the scale in use, when it is a user's own.
+    pub(super) fn custom_stops(&self) -> Option<Vec<ColorStop>> {
+        match &self.height.scale {
+            Scale::Custom { ramp, .. } => Some(ramp.stops().to_vec()),
+            Scale::Preset(_) => None,
+        }
+    }
+
+    /// Rebuild the scale from an edited anchor list and apply it.
+    ///
+    /// `persist` is false only for a colour drag; every anchor the strip adds,
+    /// moves or deletes is a finished decision and is written at once.
+    pub(super) fn stow_scale(
+        &mut self,
+        stops: Vec<ColorStop>,
+        persist: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let Scale::Custom { id, .. } = &self.height.scale else {
+            return;
+        };
+        let id = id.clone();
+        let ramp = Ramp::custom(&stops);
+        self.apply_height(
+            HeightLook {
+                scale: Scale::Custom { id, ramp },
+                ..self.height.clone()
+            },
+            persist,
+            cx,
+        );
+    }
+
+    /// Load the picker up with the selected anchor's colour, so opening it shows
+    /// what clicking it will change.
+    pub(super) fn sync_anchor_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(rgb) = self
+            .custom_stops()
+            .and_then(|stops| stops.get(self.height_anchor).map(|stop| stop.rgb))
+        else {
+            return;
+        };
+        self.height_colour.update(cx, |state, cx| {
+            state.set_value(rgb_hsla(rgb), window, cx);
+        });
+    }
+
+    /// Write a look and persist it: a click that chose it is done choosing.
+    pub(super) fn set_height(&mut self, look: HeightLook, cx: &mut Context<Self>) {
+        self.apply_height(look, true, cx);
+    }
+
+    /// Draw `look`, and — when `persist` — write it to the config, to the asset's
+    /// own row through the host, and to the cached scale list.
+    ///
+    /// The split exists because one control reports a value on every frame of a
+    /// drag: the picker's own sliders. The model should follow the drag, but the
+    /// library should be written once, when the pointer lets go — which is the
+    /// same lesson the workspace's colour filter records.
+    pub(super) fn apply_height(&mut self, look: HeightLook, persist: bool, cx: &mut Context<Self>) {
+        self.height = look;
+        if !persist {
+            self.height_unsaved = true;
+            self.redraw(cx);
+            return;
+        }
+        self.write_height(cx);
+        self.redraw(cx);
+    }
+
+    /// Persist the look that is on screen. Also where a staged colour stops
+    /// being staged.
+    pub(super) fn write_height(&mut self, cx: &mut Context<Self>) {
+        self.height_unsaved = false;
+        let mut config = trove_core::config::AppConfig::load();
+        config.set_height_look(self.height.clone());
+        let _ = config.save();
+        // The panel's rows come from this list, so a scale just edited is read
+        // back from exactly what was written.
+        self.height_scales = config.height_custom_scales;
+        // And this model now has a look of its own. The config write is the
+        // default for models that do not; both happen, because a change here is
+        // both a change to *this* model and what an untuned one starts from —
+        // which is how CloudCompare's last-used parameters already behave.
+        if self.asset.is_some() {
+            cx.emit(ModelViewportEvent::LookChanged(self.height.stored()));
+        }
+        // Say the config poll ran *after* that save, so the frame loop picks up
+        // what was just written rather than what was on disk when the model was
+        // opened.
+        self.enhance_checked = Some(std::time::Instant::now());
+    }
+
+    /// Draw the frame again after a look change, touching no stored value.
+    pub(super) fn redraw(&mut self, cx: &mut Context<Self>) {
+        self.dirty = true;
+        self.pump(cx);
+        cx.notify();
+    }
+
+    /// The user's scales the panel lists.
+    pub(super) fn height_scales(&self) -> &[CustomScale] {
+        &self.height_scales
+    }
+
+    /// The colour scale's legend, in the canvas's bottom-left corner: what is
+    /// painted, the strip it is painted with, and the values the strip runs
+    /// between.
+    ///
+    /// CloudCompare's scalar-field colour bar, and the reason any of this is
+    /// worth switching on: a ramp without its range is decoration. The labels
+    /// are the bar's other half, so they come from the field itself — a dip
+    /// reads 0 / 30 / 60 / 90 as CloudCompare's own `customLabels` say, and a
+    /// height gets round numbers out of the model's range rather than its
+    /// fourths.
+    fn height_legend(&self, cx: &mut Context<Self>) -> AnyElement {
+        let field = self.height.resolve(&self.scene_bounds);
+        if field.mode() == HeightMode::Off || self.scene_bounds.is_empty() {
+            return div().into_any_element();
+        }
+        // The legend says what the picture means, so it says it in the field's
+        // own units: degrees for a dip, the file's units for a height.
+        let unit = field.unit().unwrap_or("");
+        let label = |value: f32| format!("{}{}", format_units(value), unit);
+        h_flex()
+            .absolute()
+            .bottom_2()
+            .left_2()
+            .gap_1p5()
+            .items_start()
+            .child(
+                v_flex()
+                    .gap_1()
+                    // Which field is being painted, and along which axis when
+                    // that is what the field asks: with the panel closed, this
+                    // is the only place either is visible.
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(legend_caption(&field)),
+                    )
+                    .child(
+                        h_flex()
+                            .gap_1()
+                            .items_start()
+                            // Sampled through the field itself, so what the bar
+                            // shows is what the model was painted with —
+                            // including the bands it landed on.
+                            .child(
+                                div()
+                                    .w_3()
+                                    .h(LEGEND_HEIGHT)
+                                    .flex_shrink_0()
+                                    .flex()
+                                    .flex_col()
+                                    .overflow_hidden()
+                                    .rounded(cx.theme().radius)
+                                    .border_1()
+                                    .border_color(cx.theme().border)
+                                    .children(
+                                        field
+                                            .legend_steps(STRIP_SEGMENTS)
+                                            .into_iter()
+                                            .map(|rgb| div().flex_1().w_full().bg(tint_color(rgb))),
+                                    ),
+                            )
+                            .child(legend_labels(&field, &label, cx)),
+                    ),
+            )
+            .into_any_element()
     }
 
     /// The pivot symbol: the ball-and-rings marker CloudCompare shows while
@@ -610,13 +1114,640 @@ fn axis_tint(color: [f32; 3], alpha: f32) -> gpui::Rgba {
     }
 }
 
+/// The popover's body: the mode, then the knobs that mode reads.
+///
+/// Free functions rather than methods, because the elements they build must not
+/// hold a borrow of the render context: the viewport is captured by handle and
+/// updated when a choice is clicked.
+fn height_panel(look: &HeightLook, entity: Entity<ModelViewport>, cx: &App) -> AnyElement {
+    v_flex()
+        .w(px(280.))
+        .gap_3()
+        .child(mode_row(look, entity.clone()))
+        .when(look.mode != HeightMode::Off, |panel| {
+            panel
+                .child(field_row(look, entity.clone()))
+                .child(match look.mode {
+                    HeightMode::Ramp => scale_list(look, entity.clone(), cx),
+                    HeightMode::Bands => band_period_row(look, entity.clone(), cx),
+                    HeightMode::Off => div().into_any_element(),
+                })
+                .when(
+                    look.mode == HeightMode::Ramp && look.scale.custom_id().is_some(),
+                    |panel| panel.child(anchor_editor(look, entity.clone(), cx)),
+                )
+                .child(Separator::horizontal())
+                .child(axis_row(look, entity.clone(), cx))
+        })
+        .into_any_element()
+}
+
+/// 高度 / 坡度 / 坡向: which per-point value the colour runs along.
+///
+/// CloudCompare keeps this question in the scalar-field display rather than in
+/// `ccColorGradientDlg`, where only the dimension is asked; the three fields
+/// here are the ones the geometry already carries, so the choice costs no file
+/// format anything.
+fn field_row(look: &HeightLook, entity: Entity<ModelViewport>) -> AnyElement {
+    // No caption: the three names are the whole question, and the segmented
+    // control already reads as a choice between them.
+    v_flex()
+        .gap_1()
+        .child(
+            TabBar::new("height-field")
+                .segmented()
+                .selected_index(look.field.index() as usize)
+                .on_click(move |index: &usize, _, cx| {
+                    let field = Field::from_index(*index as u8);
+                    change_height(&entity, move |look| HeightLook { field, ..look }, cx);
+                })
+                .child(
+                    Tab::new()
+                        .flex_1()
+                        .label(rust_i18n::t!("viewport.height_field_height")),
+                )
+                .child(
+                    Tab::new()
+                        .flex_1()
+                        .label(rust_i18n::t!("viewport.height_field_slope")),
+                )
+                .child(
+                    Tab::new()
+                        .flex_1()
+                        .label(rust_i18n::t!("viewport.height_field_aspect")),
+                ),
+        )
+        .into_any_element()
+}
+
+/// Write a new look through the viewport, the one way every row changes it.
+fn change_height(
+    entity: &Entity<ModelViewport>,
+    change: impl FnOnce(HeightLook) -> HeightLook,
+    cx: &mut App,
+) {
+    entity.update(cx, |this, cx| {
+        let look = change(this.height.clone());
+        this.set_height(look, cx);
+    });
+}
+
+/// 关闭 / 渐变 / 分带: whether the model is painted by height at all, and
+/// whether that is one continuous scale or discrete bands. CloudCompare asks the
+/// same question with three radio buttons in `ccColorGradientDlg`.
+fn mode_row(look: &HeightLook, entity: Entity<ModelViewport>) -> AnyElement {
+    TabBar::new("height-mode")
+        .segmented()
+        .selected_index(look.mode.index() as usize)
+        .on_click(move |index: &usize, _, cx| {
+            let mode = HeightMode::from_index(*index as u8);
+            change_height(&entity, move |look| HeightLook { mode, ..look }, cx);
+        })
+        .child(
+            Tab::new()
+                .flex_1()
+                .label(rust_i18n::t!("viewport.height_off")),
+        )
+        .child(
+            Tab::new()
+                .flex_1()
+                .label(rust_i18n::t!("viewport.height_ramp")),
+        )
+        .child(
+            Tab::new()
+                .flex_1()
+                .label(rust_i18n::t!("viewport.height_bands")),
+        )
+        .into_any_element()
+}
+
+/// The scale list: every built-in strip, then the custom pair. Each row is the
+/// strip first and its name second, because the strip is what the choice is.
+///
+/// The list scrolls rather than the scales being cut: sixteen of them will not
+/// fit above a preview the height of a laptop window, and a scale whose colours
+/// you cannot see is not a choice. CloudCompare answers this with a dropdown
+/// selector; here the strips are the point, so they stay on screen.
+fn scale_list(look: &HeightLook, entity: Entity<ModelViewport>, cx: &App) -> AnyElement {
+    let mut rows = COLOR_SCALES
+        .iter()
+        .map(|scale| scale_row(scale, scale.id == look.scale.key(), entity.clone(), cx))
+        .collect::<Vec<_>>();
+    for (number, custom) in entity.read(cx).height_scales().iter().enumerate() {
+        rows.push(custom_row(custom, number + 1, look, entity.clone(), cx));
+    }
+    rows.push(new_scale_button(entity.clone(), cx));
+    v_flex()
+        .gap_1()
+        .child(section_label(rust_i18n::t!("viewport.height_scale"), cx))
+        .child(
+            v_flex()
+                .gap_1()
+                .max_h(px(220.))
+                .overflow_y_scrollbar()
+                .pr_1()
+                .children(rows),
+        )
+        .into_any_element()
+}
+
+/// One row of the scale list: the strip, then its name.
+fn scale_row(
+    preset: &'static ColorScale,
+    selected: bool,
+    entity: Entity<ModelViewport>,
+    cx: &App,
+) -> AnyElement {
+    let scale = Scale::Preset(preset);
+    div()
+        .id(SharedString::from(preset.id))
+        .w_full()
+        .flex()
+        .items_center()
+        .gap_2()
+        .px_1()
+        .py_0p5()
+        .rounded(cx.theme().radius)
+        .cursor_pointer()
+        .hover(|row| row.bg(cx.theme().accent))
+        .when(selected, |row| row.bg(cx.theme().accent))
+        .child(scale_strip(&scale, cx))
+        .child(scale_name(
+            rust_i18n::t!(format!("viewport.height_scale_{}", preset.name_key)).into(),
+            selected,
+            cx,
+        ))
+        .on_click(move |_, _, cx| {
+            change_height(
+                &entity,
+                move |look| HeightLook {
+                    mode: HeightMode::Ramp,
+                    // Rebuilt here rather than captured: a `Scale` carries an
+                    // id once it is a user's own, so it is not `Copy`.
+                    scale: Scale::Preset(preset),
+                    ..look
+                },
+                cx,
+            );
+        })
+        .into_any_element()
+}
+
+/// One of the user's scales in the list: the strip it paints, its number, and
+/// the anchor markers along it — so the row says at a glance how many anchors
+/// this one has, which is the only difference a list of strips otherwise hides.
+fn custom_row(
+    custom: &CustomScale,
+    number: usize,
+    look: &HeightLook,
+    entity: Entity<ModelViewport>,
+    cx: &App,
+) -> AnyElement {
+    let scale = Scale::custom(custom);
+    let selected = scale.key() == look.scale.key();
+    let id = custom.id.clone();
+    div()
+        .id(SharedString::from(format!("height-scale-{}", custom.id)))
+        .w_full()
+        .flex()
+        .items_center()
+        .gap_2()
+        .px_1()
+        .py_0p5()
+        .rounded(cx.theme().radius)
+        .cursor_pointer()
+        .hover(|row| row.bg(cx.theme().accent))
+        .when(selected, |row| row.bg(cx.theme().accent))
+        .child(scale_strip(&scale, cx))
+        .child(scale_name(
+            format!(
+                "{} {}",
+                rust_i18n::t!("viewport.height_scale_custom"),
+                number
+            )
+            .into(),
+            selected,
+            cx,
+        ))
+        .on_click(tap(&entity, move |this, cx| {
+            this.use_custom_scale(&id, cx);
+        }))
+        .into_any_element()
+}
+
+/// The row that ends the list: start a scale from nothing.
+fn new_scale_button(entity: Entity<ModelViewport>, cx: &App) -> AnyElement {
+    div()
+        .id("height-scale-new")
+        .w_full()
+        .px_1()
+        .py_0p5()
+        .rounded(cx.theme().radius)
+        .text_sm()
+        .text_color(cx.theme().muted_foreground)
+        .cursor_pointer()
+        .hover(|row| row.bg(cx.theme().accent))
+        .child(rust_i18n::t!("viewport.height_scale_new").to_string())
+        .on_click(tap(&entity, |this, cx| this.add_custom_scale(cx)))
+        .into_any_element()
+}
+
+/// The anchor editor, under the row of the scale being edited.
+///
+/// Every control here is a click rather than a drag, and that is what keeps the
+/// library quiet: a dragged handle would want a write per frame, and a
+/// `SliderState` would want one more entity to keep in step with the config
+/// poll. So the strip is cut into `ANCHOR_CELLS` slots — click an empty one to
+/// drop an anchor there, click a marked one to select it, and step it along with
+/// the arrows. CloudCompare drags its anchors; this picks them, at a resolution
+/// finer than anyone reads off a 96-pixel bar.
+fn anchor_editor(look: &HeightLook, entity: Entity<ModelViewport>, cx: &App) -> AnyElement {
+    let stops = look.scale.stops();
+    let selected = entity.read(cx).height_anchor_index();
+    let anchor = selected.min(stops.len().saturating_sub(1));
+    let cell = stops
+        .get(anchor)
+        .map(|stop| cell_index(stop.at))
+        .unwrap_or(0);
+    v_flex()
+        .gap_1()
+        .child(section_label(rust_i18n::t!("viewport.height_anchors"), cx))
+        .child(h_flex().w_full().children((0..ANCHOR_CELLS).map(|index| {
+            let here = anchor_at(&stops, index);
+            let rgb = ramp_rgb(&stops, cell_position(index));
+            div()
+                .id(SharedString::from(format!("height-anchor-{index}")))
+                .flex_1()
+                .h(px(22.))
+                .bg(tint_color([
+                    rgb[0] as f32 / 255.0,
+                    rgb[1] as f32 / 255.0,
+                    rgb[2] as f32 / 255.0,
+                ]))
+                .cursor_pointer()
+                // The marker is a dot rather than an outline: a cell is
+                // a few pixels wide, and a border there reads as part of
+                // the colour it is meant to point at.
+                .when(here.is_some(), |slot| {
+                    slot.flex().items_center().justify_center().child(
+                        div()
+                            .size_2()
+                            .rounded_full()
+                            .flex_shrink_0()
+                            .border_2()
+                            .border_color(if here == Some(anchor) {
+                                cx.theme().accent
+                            } else {
+                                cx.theme().muted_foreground
+                            })
+                            .bg(tint_color([
+                                rgb[0] as f32 / 255.0,
+                                rgb[1] as f32 / 255.0,
+                                rgb[2] as f32 / 255.0,
+                            ])),
+                    )
+                })
+                .on_click(tap(&entity, move |this, cx| {
+                    this.click_anchor_cell(index, cx);
+                }))
+        })))
+        .child(
+            h_flex()
+                .gap_1()
+                .items_center()
+                .child(
+                    ColorPicker::new(&entity.read(cx).height_colour_picker())
+                        .xsmall()
+                        .label(rust_i18n::t!("viewport.height_anchor_colour")),
+                )
+                .child(
+                    Button::new("height-anchor-left")
+                        .xsmall()
+                        .ghost()
+                        .label("◀")
+                        .disabled(cell == 0)
+                        .on_click(tap(&entity, |this, cx| this.nudge_anchor(-1, cx))),
+                )
+                .child(
+                    Button::new("height-anchor-right")
+                        .xsmall()
+                        .ghost()
+                        .label("▶")
+                        .disabled(cell == ANCHOR_CELLS - 1)
+                        .on_click(tap(&entity, |this, cx| this.nudge_anchor(1, cx))),
+                )
+                .child(
+                    Button::new("height-anchor-drop")
+                        .xsmall()
+                        .ghost()
+                        .label(rust_i18n::t!("viewport.height_anchor_remove"))
+                        .disabled(stops.len() <= 2)
+                        .on_click(tap(&entity, |this, cx| this.drop_anchor(cx))),
+                )
+                .child(div().flex_1())
+                .child(
+                    Button::new("height-scale-delete")
+                        .xsmall()
+                        .ghost()
+                        .label(rust_i18n::t!("viewport.height_scale_delete"))
+                        .on_click(tap(&entity, |this, cx| this.delete_custom_scale(cx))),
+                ),
+        )
+        .into_any_element()
+}
+
+/// A click handler that runs one edit through the viewport.
+///
+/// Every control in the panel needs the same three steps — take the handle,
+/// update the entity, notify — and a `tap` per button keeps the `entity.clone()`
+/// that each `move` closure needs out of the layout code.
+/// A click handler aimed at one edit of the viewport.
+type PanelClick = dyn Fn(&ClickEvent, &mut Window, &mut App);
+
+fn tap(
+    entity: &Entity<ModelViewport>,
+    edit: impl Fn(&mut ModelViewport, &mut Context<ModelViewport>) + 'static,
+) -> Box<PanelClick> {
+    let entity = entity.clone();
+    // `update` wants a `FnOnce`; `edit` is a plain `Fn`, so the wrapper calls
+    // through it rather than moving it in.
+    Box::new(move |_, _, cx| {
+        let edit = &edit;
+        entity.update(cx, |this, cx| edit(this, cx))
+    })
+}
+
+/// Which anchor, if any, sits in this slot.
+fn anchor_at(stops: &[ColorStop], cell: usize) -> Option<usize> {
+    stops.iter().position(|stop| cell_index(stop.at) == cell)
+}
+
+/// The slot a position falls in, with the ends folding into the outer ones.
+fn cell_index(at: f32) -> usize {
+    ((at.clamp(0.0, 1.0) * ANCHOR_CELLS as f32) as usize).min(ANCHOR_CELLS - 1)
+}
+
+/// The position a slot stands for: its middle.
+fn cell_position(cell: usize) -> f32 {
+    (cell as f32 + 0.5) / ANCHOR_CELLS as f32
+}
+
+/// The colour a new anchor takes when it is dropped into a scale: what the scale
+/// already says at that point, so adding one does not change the picture until
+/// its colour is moved too.
+fn ramp_rgb(stops: &[ColorStop], at: f32) -> [u8; 3] {
+    let rgb = Ramp::custom(stops).color_at(at);
+    [
+        (rgb[0] * 255.0).round() as u8,
+        (rgb[1] * 255.0).round() as u8,
+        (rgb[2] * 255.0).round() as u8,
+    ]
+}
+
+/// The anchors in the order `Ramp::custom` will put them, for the caller that
+/// has just appended one and needs to know where it landed.
+fn stops_after_sort(stops: &[ColorStop]) -> Vec<ColorStop> {
+    Ramp::custom(stops).stops().to_vec()
+}
+
+/// The label of a scale row: the strip is the choice, the name only a caption.
+fn scale_name(name: SharedString, selected: bool, cx: &App) -> impl IntoElement {
+    div()
+        .text_sm()
+        .text_color(if selected {
+            cx.theme().foreground
+        } else {
+            cx.theme().muted_foreground
+        })
+        .child(name)
+}
+
+/// Which axis the field is read against. Three models in one library can
+/// disagree about it — a scanner writes Z up, a game engine Y — so it is asked,
+/// not assumed.
+fn axis_row(look: &HeightLook, entity: Entity<ModelViewport>, cx: &App) -> AnyElement {
+    h_flex()
+        .gap_2()
+        .items_center()
+        // The same control answers a different question per field: where the
+        // elevations sit, versus what counts as up.
+        .child(section_label(
+            rust_i18n::t!(if look.field == Field::Height {
+                "viewport.height_axis"
+            } else {
+                "viewport.reference_axis"
+            }),
+            cx,
+        ))
+        .child(
+            h_flex()
+                .gap_1()
+                .flex_1()
+                .justify_end()
+                .child(axis_button(0, "X", look, entity.clone()))
+                .child(axis_button(1, "Y", look, entity.clone()))
+                .child(axis_button(2, "Z", look, entity)),
+        )
+        .into_any_element()
+}
+
+fn axis_button(
+    axis: usize,
+    name: &'static str,
+    look: &HeightLook,
+    entity: Entity<ModelViewport>,
+) -> AnyElement {
+    Button::new(SharedString::from(format!("height-axis-{name}")))
+        .xsmall()
+        .w(px(28.))
+        .justify_center()
+        .when(axis == look.axis, |button| button.primary())
+        .when(axis != look.axis, |button| button.ghost())
+        .label(name.to_string())
+        .on_click(move |_, _, cx| {
+            change_height(&entity, move |look| HeightLook { axis, ..look }, cx);
+        })
+        .into_any_element()
+}
+
+/// The banding period. Measured, not counted, because that is what the stripes
+/// are for: a cycle of a known number of model units is a ruler on the surface,
+/// and CloudCompare keeps its last period across objects the same way.
+///
+/// Stepped by doubling rather than by a fixed increment, since one file's useful
+/// period is another's noise by three orders of magnitude.
+fn band_period_row(look: &HeightLook, entity: Entity<ModelViewport>, cx: &App) -> AnyElement {
+    let period = look.period;
+    v_flex()
+        .gap_1()
+        .child(section_label(
+            rust_i18n::t!("viewport.height_band_period"),
+            cx,
+        ))
+        .child(
+            h_flex()
+                .gap_1()
+                .items_center()
+                .child({
+                    let entity = entity.clone();
+                    Button::new("height-period-less")
+                        .xsmall()
+                        .ghost()
+                        .label("\u{00d7} 1/2")
+                        .disabled(period <= MIN_PERIOD * 2.0)
+                        .on_click(move |_, _, cx| {
+                            change_height(
+                                &entity,
+                                move |look| HeightLook {
+                                    mode: HeightMode::Bands,
+                                    period: (look.period / 2.0).clamp(MIN_PERIOD, MAX_PERIOD),
+                                    ..look
+                                },
+                                cx,
+                            );
+                        })
+                })
+                .child(
+                    div()
+                        .flex_1()
+                        .text_center()
+                        .text_sm()
+                        .child(format_units(period)),
+                )
+                .child({
+                    let entity = entity.clone();
+                    Button::new("height-period-more")
+                        .xsmall()
+                        .ghost()
+                        .label("\u{00d7} 2")
+                        .disabled(period >= MAX_PERIOD / 2.0)
+                        .on_click(move |_, _, cx| {
+                            change_height(
+                                &entity,
+                                move |look| HeightLook {
+                                    mode: HeightMode::Bands,
+                                    period: (look.period * 2.0).clamp(MIN_PERIOD, MAX_PERIOD),
+                                    ..look
+                                },
+                                cx,
+                            );
+                        })
+                }),
+        )
+        .into_any_element()
+}
+
 #[cfg(test)]
 mod tests {
     // Explicit imports, not `use super::*`: the glob drags in a `test`
     // attribute macro from the gpui prelude (see `frame.rs`'s test module).
-    use super::{PivotLine, pivot_symbol_geometry};
+    use super::{
+        ANCHOR_CELLS, PivotLine, anchor_at, cell_index, cell_position, legend_values,
+        pivot_symbol_geometry, ramp_rgb, stops_after_sort,
+    };
     use trove_core::media::formats::types::Bounds;
+    use trove_core::media::height_color::{ColorStop, Field, HeightLook, HeightMode};
     use trove_core::media::render3d::{Camera, Framing};
+
+    fn painted(mode: HeightMode, field: Field, box_bounds: Bounds) -> Vec<(f32, f32)> {
+        legend_values(
+            &HeightLook {
+                mode,
+                field,
+                ..Default::default()
+            }
+            .resolve(&box_bounds),
+        )
+    }
+
+    #[test]
+    fn a_legends_labels_run_from_the_floor_to_the_ceiling() {
+        let values = painted(
+            HeightMode::Ramp,
+            Field::Height,
+            Bounds {
+                min: [0.0, 0.0, 0.0],
+                max: [1.0, 100.0, 1.0],
+            },
+        );
+        assert_eq!(values.first().unwrap(), &(0.0, 0.0));
+        assert_eq!(values.last().unwrap(), &(100.0, 1.0));
+        // Positions climb with their values, because the bar is painted bottom
+        // up and a label at 0.3 has to sit at 0.3 of it.
+        assert!(
+            values
+                .windows(2)
+                .all(|pair| pair[0].0 < pair[1].0 && pair[0].1 < pair[1].1)
+        );
+        // A model with no span has one label, not a divide by nothing.
+        let flat = painted(
+            HeightMode::Ramp,
+            Field::Height,
+            Bounds {
+                min: [0.0, 7.5, 0.0],
+                max: [1.0, 7.5, 1.0],
+            },
+        );
+        assert_eq!(flat, vec![(7.5, 0.0)]);
+    }
+
+    #[test]
+    fn an_absolute_legends_labels_are_the_ones_the_field_names() {
+        // A dip bar reads 0 / 30 / 60 / 90 wherever the model's bounds are,
+        // because those are the numbers CloudCompare prints on it.
+        let slope = painted(
+            HeightMode::Bands,
+            Field::Slope,
+            Bounds {
+                min: [0.0, 0.0, 0.0],
+                max: [1.0, 4_000.0, 1.0],
+            },
+        );
+        let values: Vec<f32> = slope.into_iter().map(|(value, _)| value).collect();
+        assert_eq!(values, vec![0.0, 30.0, 60.0, 90.0]);
+    }
+
+    #[test]
+    fn the_anchor_strip_and_the_scale_agree_on_positions() {
+        // The ends fold into the outer slots — an anchor at 1.0 is still the
+        // last slot, not one past it.
+        assert_eq!(cell_index(0.0), 0);
+        assert_eq!(cell_index(1.0), ANCHOR_CELLS - 1);
+        assert_eq!(cell_index(0.5), ANCHOR_CELLS / 2);
+        // A slot stands for its own middle, which is where its colour is read.
+        assert!((cell_position(0) - 0.5 / ANCHOR_CELLS as f32).abs() < 1e-6);
+        for cell in 0..ANCHOR_CELLS {
+            let stops = [ColorStop::new(cell_position(cell), [1, 2, 3])];
+            assert_eq!(anchor_at(&stops, cell), Some(0), "slot {cell}");
+        }
+        // An anchor between two slots marks neither of them.
+        assert_eq!(anchor_at(&[ColorStop::new(0.0, [0, 0, 0])], 5), None);
+    }
+
+    #[test]
+    fn a_dropped_anchor_starts_as_the_colour_already_there() {
+        // So that adding one is not itself an edit: the strip is unchanged until
+        // the new anchor's colour is moved.
+        let stops = vec![
+            ColorStop::new(0.0, [0, 0, 0]),
+            ColorStop::new(1.0, [255, 255, 255]),
+        ];
+        assert_eq!(ramp_rgb(&stops, 0.5), [128, 128, 128]);
+        assert_eq!(ramp_rgb(&stops, 0.0), [0, 0, 0]);
+        assert_eq!(ramp_rgb(&stops, 1.0), [255, 255, 255]);
+        // A caller that has just appended one needs to know where it landed,
+        // because the scale sorts them.
+        let after = stops_after_sort(&[
+            ColorStop::new(0.25, [9, 9, 9]),
+            ColorStop::new(1.0, [255, 255, 255]),
+            ColorStop::new(0.0, [0, 0, 0]),
+        ]);
+        assert_eq!(
+            after.iter().map(|stop| stop.at).collect::<Vec<_>>(),
+            vec![0.0, 0.25, 1.0]
+        );
+        assert_eq!(anchor_at(&after, cell_index(0.25)), Some(1));
+    }
 
     /// The canvas the tests place the symbol on: 900×600, so the shorter edge
     /// is 600 and a ring's radius is `0.4 * 600 = 240` px.

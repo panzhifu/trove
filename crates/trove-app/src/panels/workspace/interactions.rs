@@ -40,7 +40,6 @@ impl WorkspacePanel {
                                         "field": "text",
                                         "value": search,
                                     }),
-                                    color: None,
                                     position: 0,
                                 };
                                 match ctl.library.create_smart_collection(&input) {
@@ -275,7 +274,7 @@ impl WorkspacePanel {
         // A mesh is worth more than a picture of a mesh: the viewport lets it
         // be turned and zoomed, and a static picture is no way to look at one.
         if let Some((name, path)) = model_source(self.controller.read(cx), id) {
-            self.open_model_preview(name, path, window, cx);
+            self.open_model_preview(name, path, id, window, cx);
             return;
         }
         self.open_asset_preview(id, window, cx);
@@ -287,15 +286,20 @@ impl WorkspacePanel {
         &mut self,
         name: String,
         path: PathBuf,
+        asset: Uuid,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let tasks = self.controller.read(cx).library.tasks().clone();
-        let viewport = ModelViewport::spawn(name, path, tasks, cx);
-        let subscription = cx.subscribe(&viewport, |this, _, event: &ModelViewportEvent, cx| {
-            if *event == ModelViewportEvent::Closed {
-                this.forget_preview(cx);
-            }
+        let saved = self.controller.read(cx).model_look(asset);
+        let viewport = ModelViewport::spawn(name, path, tasks, Some(asset), saved, window, cx);
+        let subscription = cx.subscribe(&viewport, move |this, _, event, cx| match event {
+            ModelViewportEvent::Closed => this.forget_preview(cx),
+            // The look is the model's own, so it lands on the asset row rather
+            // than only in the app-wide config.
+            ModelViewportEvent::LookChanged(look) => this
+                .controller
+                .update(cx, |ctl, _| ctl.remember_model_look(asset, look.clone())),
         });
         // The status bar shows which renderer is painting the model. The
         // viewport notifies on every frame, so this watcher only carries the

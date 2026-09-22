@@ -21,6 +21,7 @@ use std::sync::mpsc;
 use trove_core::media::formats::meshlet::{self, Meshlet};
 use trove_core::media::formats::types::{Mesh, Winding};
 use trove_core::media::gpu::{self, UNIFORM_SIZE, Uniforms};
+use trove_core::media::height_color::HeightUniforms;
 use trove_core::media::render3d::{self, Framing};
 
 /// Colour formats this renderer can use, in order of preference.
@@ -923,6 +924,11 @@ impl GpuRenderer {
     /// cloud wants. It is honoured only on a settled frame that multisampled,
     /// which is exactly when the effect is visible; `false` leaves the frame
     /// as the rasterizer drew it, matching the CPU path's own opt-out.
+    ///
+    /// `look` is the packed [`HeightLook`]: the mode, the axis, the range and
+    /// the colour scale, all of which the vertex stage resolves per vertex.
+    ///
+    /// [`HeightLook`]: trove_core::media::height_color::HeightLook
     pub fn render(
         &self,
         mesh: &GpuMesh,
@@ -930,14 +936,14 @@ impl GpuRenderer {
         size: (u32, u32),
         interactive: bool,
         enhance_points: bool,
-        bands: [f32; 4],
+        look: HeightUniforms,
     ) -> Option<Vec<u8>> {
         let (width, height) = (size.0.max(1), size.1.max(1));
         self.queue.write_buffer(
             &self.uniforms,
             0,
             &Uniforms::new(framing, (width, height))
-                .with_bands(bands)
+                .with_height(look)
                 .to_bytes(),
         );
         let extent = wgpu::Extent3d {
@@ -1254,7 +1260,7 @@ mod tests {
         let layout = uniform_layout(&module);
 
         // (name, bytes) in declaration order — the Rust packing order.
-        let expected: [(&str, u32); 10] = [
+        let expected: [(&str, u32); 12] = [
             ("view_proj", 64),
             ("light", 16),
             ("material", 16),
@@ -1264,7 +1270,12 @@ mod tests {
             ("viewport", 16),
             ("bg_top", 16),
             ("bg_bottom", 16),
-            ("bands", 16),
+            ("coloring", 16),
+            ("coloring_params", 16),
+            (
+                "ramp",
+                trove_core::media::height_color::RAMP_STOPS as u32 * 16,
+            ),
         ];
 
         assert_eq!(layout.len(), expected.len(), "member count");
@@ -1325,10 +1336,24 @@ mod tests {
         let size = (160, 120);
 
         let plain = renderer
-            .render(&uploaded, &framing, size, false, false, [0.0; 4])
+            .render(
+                &uploaded,
+                &framing,
+                size,
+                false,
+                false,
+                HeightUniforms::default(),
+            )
             .expect("a plain frame comes back");
         let enhanced = renderer
-            .render(&uploaded, &framing, size, false, true, [0.0; 4])
+            .render(
+                &uploaded,
+                &framing,
+                size,
+                false,
+                true,
+                HeightUniforms::default(),
+            )
             .expect("an enhanced frame comes back");
         assert_eq!(plain.len(), enhanced.len());
         assert_ne!(
@@ -1404,7 +1429,14 @@ mod tests {
         assert!(!visible.is_empty() && visible.len() < uploaded.meshlets.len());
 
         let frame = renderer
-            .render(&uploaded, &close, (160, 120), false, false, [0.0; 4])
+            .render(
+                &uploaded,
+                &close,
+                (160, 120),
+                false,
+                false,
+                HeightUniforms::default(),
+            )
             .expect("a frame comes back");
         assert!(
             frame

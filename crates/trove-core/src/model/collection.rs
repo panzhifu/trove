@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value as Json;
 use uuid::Uuid;
 
-use super::MAX_NAME_LEN;
+use super::{Appearance, MAX_NAME_LEN};
 
 // ---------------------------------------------------------------------------
 // Collection
@@ -26,6 +26,9 @@ pub struct Collection {
     pub id: Uuid,
     pub parent_id: Option<Uuid>,
     pub name: String,
+    /// The user's own glyph and accent for this folder, or nothing.
+    #[serde(default)]
+    pub appearance: Appearance,
     /// Order among siblings within the same parent.
     pub position: i64,
     pub created_at: DateTime<Utc>,
@@ -64,19 +67,26 @@ pub struct SmartCollection {
     pub name: String,
     /// The condition tree (`SmartNode`), serialized as JSON.
     pub query: Json,
-    pub color: Option<String>,
+    /// The user's own glyph and accent for this folder, or nothing. Same
+    /// column and same type as a plain [`Collection`]'s: the tree draws the two
+    /// alike, and `color` — a free-form hex only this field's picker could
+    /// produce — is what the named accent replaced.
+    #[serde(default)]
+    pub appearance: Appearance,
     /// Order among siblings within the same parent.
     pub position: i64,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
 
+/// Creating a container never sets its look: an appearance is something a user
+/// adds to an existing folder, so it goes through `set_appearance` and the two
+/// create paths stay about the row's substance.
 #[derive(Debug, Clone)]
 pub struct NewSmartCollection {
     pub parent_id: Option<Uuid>,
     pub name: String,
     pub query: Json,
-    pub color: Option<String>,
     pub position: i64,
 }
 

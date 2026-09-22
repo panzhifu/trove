@@ -17,7 +17,7 @@
 // Embeds `locales/*.toml` into the binary (compile-time parse; `en.toml` is
 // the fallback catalog). After this, `rust_i18n::t!` resolves keys and
 // `rust_i18n::set_locale` switches the process-global language — see `i18n`.
-rust_i18n::i18n!("locales", fallback = "en");
+rust_i18n::i18n!("locales", fallback = "zh-CN");
 
 use gpui_kit::component::Root;
 use gpui_kit::*;

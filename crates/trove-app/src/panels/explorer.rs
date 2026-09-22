@@ -11,6 +11,7 @@
 
 use std::collections::{HashMap, HashSet};
 
+use gpui_kit::assets;
 use gpui_kit::base::{h_flex, v_flex};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::dock::{BasePanel, Panel as DockPanel, PanelControl, PanelEvent};
@@ -25,10 +26,12 @@ use trove_core::store::{collections, smart_collections};
 use uuid::Uuid;
 
 use crate::library::LibraryController;
+use crate::panels::appearance;
+use trove_core::model::Appearance;
 
 use super::common::{
-    AssetsDrag, CollectionDrag, SmartDrag, hex_to_rgb, live_count, observe_controller,
-    separator_label, trash_count,
+    AssetsDrag, CollectionDrag, SmartDrag, live_count, observe_controller, separator_label,
+    trash_count,
 };
 
 // ============================================================================
@@ -82,6 +85,7 @@ struct CollectionRow {
     name: String,
     is_root: bool,
     count: u64,
+    appearance: Appearance,
 }
 
 /// A smart collection row, flattened for rendering.
@@ -90,7 +94,7 @@ struct SmartRow {
     id: Uuid,
     name: String,
     count: u64,
-    accent: Option<u32>,
+    appearance: Appearance,
     /// Nesting level below the section's own top level (0 = top).
     depth: usize,
 }
@@ -162,7 +166,7 @@ fn flat_smart_rows(ctl: &LibraryController) -> Vec<SmartRow> {
                 id: sc.id,
                 name: sc.name.clone(),
                 count,
-                accent: sc.color.as_deref().and_then(hex_to_rgb),
+                appearance: sc.appearance.clone(),
                 depth,
             }
         })
@@ -199,6 +203,7 @@ impl Snapshot {
                     name: root.name.clone(),
                     is_root: true,
                     count: collections::count_assets(conn, root.id).unwrap_or(0),
+                    appearance: root.appearance.clone(),
                 });
                 if let Ok(children) = collections::children_of(conn, Some(root.id)) {
                     for child in children {
@@ -207,6 +212,7 @@ impl Snapshot {
                             name: child.name.clone(),
                             is_root: false,
                             count: collections::count_assets(conn, child.id).unwrap_or(0),
+                            appearance: child.appearance.clone(),
                         });
                     }
                 }
@@ -515,9 +521,12 @@ impl Render for ExplorerPanel {
                 self.controller.clone(),
                 None,
                 rust_i18n::t!("app.all_assets").to_string(),
-                snap.all_count,
-                snap.all_selected(),
-                true,
+                RowView {
+                    count: snap.all_count,
+                    selected: snap.all_selected(),
+                    is_root: true,
+                    folder: &Appearance::default(),
+                },
             )
             .into_any_element(),
         );
@@ -557,9 +566,12 @@ impl Render for ExplorerPanel {
                     self.controller.clone(),
                     Some(row.id),
                     row.name.clone(),
-                    row.count,
-                    snap.current == Some(row.id) && !snap.showing_trash,
-                    row.is_root,
+                    RowView {
+                        count: row.count,
+                        selected: snap.current == Some(row.id) && !snap.showing_trash,
+                        is_root: row.is_root,
+                        folder: &row.appearance,
+                    },
                 )
                 .context_menu({
                     let explorer = explorer.clone();
@@ -649,16 +661,22 @@ impl Render for ExplorerPanel {
                         h_flex()
                             .w_full()
                             .items_center()
+                            .gap_2()
+                            // A saved search is found by searching, so that is
+                            // its default mark; a glyph the user chose replaces
+                            // it the same way it does on a folder row.
+                            .child(appearance::glyph(
+                                Some(&row.appearance),
+                                assets::IconName::Search,
+                                cx,
+                            ))
                             .child(
                                 div()
                                     .flex_1()
                                     .min_w_0()
                                     .truncate()
                                     .text_sm()
-                                    .text_color(cx.theme().foreground)
-                                    .when_some(row.accent, |this, rgb| {
-                                        this.text_color(gpui_kit::rgb(rgb))
-                                    })
+                                    .text_color(appearance::label_color(&row.appearance, cx))
                                     .child(row.name.clone()),
                             )
                             .child(
@@ -717,6 +735,7 @@ fn pseudo_row(
     label: String,
     count: u64,
     selected: bool,
+    icon: assets::IconName,
 ) -> Stateful<Div> {
     div()
         .id(row_id)
@@ -730,6 +749,10 @@ fn pseudo_row(
             h_flex()
                 .w_full()
                 .items_center()
+                .gap_2()
+                // The same leading slot a folder row carries, so the names
+                // line up whether or not the folder has a glyph of its own.
+                .child(appearance::glyph(None, icon, cx))
                 .child(
                     div()
                         .flex_1()
@@ -774,6 +797,7 @@ fn recent_row(
         rust_i18n::t!("app.recent_viewed").to_string(),
         count,
         selected,
+        assets::IconName::Clock,
     )
     .on_click(move |_ev: &ClickEvent, _window, cx| {
         click.update(cx, |ctl, _| ctl.select_recent());
@@ -795,6 +819,7 @@ fn trash_row(
         rust_i18n::t!("app.trash").to_string(),
         count,
         selected,
+        assets::IconName::Trash,
     )
     .on_click(move |_ev: &ClickEvent, _window, cx| {
         click.update(cx, |ctl, _| ctl.select_trash());
@@ -845,6 +870,16 @@ fn smart_section_header(
         .into_any_element()
 }
 
+/// What a row draws that is not its identity: its count, whether it is the
+/// browsed one, how deep it sits, and the look its folder asks for.
+#[derive(Clone, Copy)]
+struct RowView<'a> {
+    count: u64,
+    selected: bool,
+    is_root: bool,
+    folder: &'a Appearance,
+}
+
 /// A single row in the collections list. `id == None` renders the
 /// non-managed "All assets" pseudo-row.
 fn collection_row(
@@ -852,13 +887,18 @@ fn collection_row(
     controller: Entity<LibraryController>,
     id: Option<Uuid>,
     name: String,
-    count: u64,
-    selected: bool,
-    is_root: bool,
+    view: RowView<'_>,
 ) -> Stateful<Div> {
+    let RowView {
+        count,
+        selected,
+        is_root,
+        folder,
+    } = view;
     let row_id = id
         .map(|v| v.to_string())
         .unwrap_or_else(|| "all".to_string());
+    let folder = folder.clone();
 
     let mut row = div()
         .id(format!("collection-row-{row_id}"))
@@ -877,13 +917,23 @@ fn collection_row(
             h_flex()
                 .w_full()
                 .items_center()
+                .gap_2()
+                .child(appearance::glyph(
+                    Some(&folder),
+                    match id {
+                        Some(_) => assets::IconName::Folder,
+                        // The whole library, not a folder in it.
+                        None => assets::IconName::Library,
+                    },
+                    cx,
+                ))
                 .child(
                     div()
                         .flex_1()
                         .min_w_0()
                         .truncate()
                         .text_sm()
-                        .text_color(cx.theme().foreground)
+                        .text_color(appearance::label_color(&folder, cx))
                         .child(name),
                 )
                 .child(
@@ -1045,8 +1095,8 @@ struct SmartTarget {
 /// Right-click menu for a smart collection.
 fn smart_menu(
     menu: PopupMenu,
-    _window: &mut Window,
-    _cx: &mut Context<PopupMenu>,
+    window: &mut Window,
+    cx: &mut Context<PopupMenu>,
     controller: &Entity<LibraryController>,
     explorer: &Entity<ExplorerPanel>,
     target: SmartTarget,
@@ -1057,6 +1107,8 @@ fn smart_menu(
     let ctl_delete = controller.clone();
     let ctl_inside = controller.clone();
     let ctl_top = controller.clone();
+    let ctl_look = controller.clone();
+    let look_name = name.clone();
     menu.min_w(px(180.))
         .item(
             PopupMenuItem::new(rust_i18n::t!("explorer.new_smart_inside").to_string()).on_click(
@@ -1095,6 +1147,13 @@ fn smart_menu(
                 },
             ),
         )
+        .item(appearance::submenu_item(
+            window,
+            cx,
+            ctl_look,
+            appearance::Target::Smart(id),
+            look_name,
+        ))
         .when(nested, |menu| {
             menu.separator().item(
                 PopupMenuItem::new(rust_i18n::t!("explorer.move_to_top").to_string()).on_click(
@@ -1125,8 +1184,8 @@ fn smart_menu(
 /// Right-click menu for a managed collection.
 fn collection_menu(
     menu: PopupMenu,
-    _window: &mut Window,
-    _cx: &mut Context<PopupMenu>,
+    window: &mut Window,
+    cx: &mut Context<PopupMenu>,
     explorer: &Entity<ExplorerPanel>,
     id: Uuid,
     name: String,
@@ -1134,6 +1193,9 @@ fn collection_menu(
     let explorer_new = explorer.clone();
     let explorer_rename = explorer.clone();
     let explorer_delete = explorer.clone();
+    // Read out front: the submenu wants `cx` mutably to build itself with.
+    let look_controller = explorer.read(cx).controller.clone();
+    let look_name = name.clone();
 
     menu.min_w(px(180.))
         .item(
@@ -1151,6 +1213,13 @@ fn collection_menu(
                 },
             ),
         )
+        .item(appearance::submenu_item(
+            window,
+            cx,
+            look_controller,
+            appearance::Target::Collection(id),
+            look_name,
+        ))
         .separator()
         .item(
             PopupMenuItem::new(rust_i18n::t!("explorer.delete").to_string()).on_click(

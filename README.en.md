@@ -49,6 +49,7 @@ This README summarizes what ships. The **[Chinese README](./README.md)** is the 
 - **Paste to import** — `Ctrl+Shift+V` sends a clipboard image straight into the library.
 - **Import from URL** — downloads in the background, imports, records the source URL.
 - **Watched folders** — add a directory in Settings; new files are imported automatically.
+- **Git-style ignores** — a folder's own `.gitignore`, `.ignore` or `.git/info/exclude` decides what a watched folder (or a dropped one) leaves out, with Git's precedence; an ignored directory is never entered.
 - **Import mode** — link only, never copy: files stay where you keep them and Trove records the path plus a content hash. A moved original can be re-linked after a SHA-256 check.
 - **RAW / HEIC / SVG / PSD** — camera RAW through the rawler pipeline; HEIC via system `heif-dec`; SVG rasterized, PSD composites its embedded preview.
 - **Design-format thumbnails** — mines EXIF / audio tags / font family·style·weight / MP4 dimensions; video poster when ffmpeg is present.

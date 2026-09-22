@@ -256,6 +256,7 @@ pub fn run(
     let model_version = provider.model_version();
     let mut work: Vec<Prepared> = Vec::new();
     for asset in candidates {
+        ctx.park_if_paused();
         if ctx.cancelled() {
             outcome.cancelled = true;
             return Ok(outcome);
@@ -315,6 +316,7 @@ pub fn run(
     let mut done: u64 = 0;
 
     for batch in work.chunks(chunk) {
+        ctx.park_if_paused();
         if ctx.cancelled() {
             outcome.cancelled = true;
             break;
@@ -435,6 +437,7 @@ pub fn undo(options: &AiAnalysisOptions, ctx: &JobContext) -> Result<UndoOutcome
     let mut done = 0u64;
     let mut touched: std::collections::HashSet<String> = std::collections::HashSet::new();
     for asset in marked {
+        ctx.park_if_paused();
         if ctx.cancelled() {
             outcome.cancelled = true;
             break;

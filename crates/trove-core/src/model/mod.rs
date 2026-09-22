@@ -6,10 +6,12 @@
 //!
 //! Layout: [`asset`] holds the asset record and its enums, [`facts`] the
 //! typed per-kind metadata persisted in the `extra` JSON column,
-//! [`collection`] the two container types (manual and smart), [`smart_query`]
+//! [`collection`] the two container types (manual and smart), [`appearance`]
+//! how either draws itself in the folder tree, [`smart_query`]
 //! the saved-search condition tree, [`tag`] the tag tree, and [`query`] the
 //! listing filters and paging types.
 
+mod appearance;
 mod asset;
 mod collection;
 mod embedding;
@@ -18,6 +20,7 @@ mod query;
 mod smart_query;
 mod tag;
 
+pub use appearance::{Accent, Appearance, Glyph};
 pub use asset::{
     ASPECT_TOLERANCE, AspectPreset, Asset, AssetKind, AssetPatch, NewAsset, Orientation, Origin,
     UsageStatus,

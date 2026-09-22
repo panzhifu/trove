@@ -5,6 +5,10 @@
 // here, so a model lit on the GPU matches the same model's thumbnail, which was
 // rendered on the CPU at import time.
 
+// How many stops a colour scale may carry. `height_color::RAMP_STOPS`, and the
+// uniform block is sized from it, so the two cannot drift apart silently.
+const RAMP_STOPS: u32 = 16u;
+
 struct Uniforms {
     // Model space -> clip space, column-major.
     view_proj: mat4x4<f32>,
@@ -25,38 +29,127 @@ struct Uniforms {
     bg_top: vec4<f32>,
     // rgb = gradient bottom.
     bg_bottom: vec4<f32>,
-    // x = height colouring on (1) / off (0), y = band size in model units,
-    // z = the model's floor (where the bands count from), w unused.
-    bands: vec4<f32>,
+    // x = the height mode (0 none, 1 colour scale, 2 bands), y = which axis is
+    // the height (0=X, 1=Y, 2=Z), z = the range floor, w = 1 / the range span.
+    coloring: vec4<f32>,
+    // x = banding radians per field unit, y = how many `ramp` entries are
+    // live, z = which field is being read (0 height, 1 slope, 2 aspect).
+    coloring_params: vec4<f32>,
+    // The active colour scale: rgb = colour, w = position along the scale,
+    // ascending, zero-padded past the live count.
+    ramp: array<vec4<f32>, RAMP_STOPS>,
 };
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
 
-// The hue step between height bands, matching `render3d::BAND_HUE_STEP`.
-const BAND_HUE_STEP: f32 = 0.618034;
+// How far behind the red channel the green and blue ones start, matching
+// `height_color::BAND_PHASE_2` and `_3`.
+const BAND_PHASE_2: f32 = 2.0944;
+const BAND_PHASE_3: f32 = 4.1888;
 
-// HSV(hue, 1, 1) as RGB, hue in turns.
-//
-// The familiar `n + h/60 mod 6` form, kept branchless so there is no select
-// chain to hold in step with the CPU's `hue_rgb`.
-fn hue_rgb(t: f32) -> vec3<f32> {
-    let base = vec3<f32>(5.0, 3.0, 1.0) + t * 6.0;
-    let k = base - 6.0 * floor(base / 6.0);
-    return vec3<f32>(1.0) - clamp(min(k, vec3<f32>(4.0) - k), vec3<f32>(0.0), vec3<f32>(1.0));
-}
-
-// The colour one height band is painted with. Mirrors `render3d::height_tint`.
-fn band_color(y: f32) -> vec3<f32> {
-    return hue_rgb(floor((y - u.bands.z) / u.bands.y) * BAND_HUE_STEP);
-}
-
-// The base colour for a point at height `y`: the file's own colour, or the
-// height band when the mode is on.
-fn surface_color(y: f32, own: vec3<f32>) -> vec3<f32> {
-    if u.bands.x > 0.5 {
-        return band_color(y);
+// One component of a vector by the chosen axis: 0 = x, 1 = y, 2 = z. The index
+// is a runtime value, so this is a switch rather than a subscript, and it is the
+// same switch the CPU makes in `height_color::component`.
+fn component(v: vec3<f32>, axis: u32) -> f32 {
+    switch (axis) {
+        case 0u: { return v.x; }
+        case 1u: { return v.y; }
+        default: { return v.z; }
     }
-    return own;
+}
+
+// The two components that are not the chosen axis, in the fixed order
+// `height_color::horizontal` documents. A lean's bearing is `atan2` of these
+// two, so the two renderers have to agree on which is which.
+fn horizontal(v: vec3<f32>, axis: u32) -> vec2<f32> {
+    switch (axis) {
+        case 0u: { return vec2<f32>(v.y, v.z); }
+        case 1u: { return vec2<f32>(v.x, v.z); }
+        default: { return vec2<f32>(v.x, v.y); }
+    }
+}
+
+// How far a normal leans away from the chosen axis, in degrees: 0 flat along it,
+// 90 across. Folded with `abs`, because facing down the axis is as flat as
+// facing up — which is what a dip means.
+fn dip_degrees(n: vec3<f32>, axis: u32) -> f32 {
+    let length = length(n);
+    if length < 1e-6 {
+        return 0.0;
+    }
+    return degrees(acos(clamp(abs(component(n, axis)) / length, 0.0, 1.0)));
+}
+
+// The bearing of that lean, folded into one turn the same way the CPU's
+// `rem_euclid` is.
+fn aspect_degrees(n: vec3<f32>, axis: u32) -> f32 {
+    let lean = horizontal(n, axis);
+    return fract(degrees(atan2(lean.x, lean.y)) / 360.0) * 360.0;
+}
+
+// The value the colour runs along, for whichever field the look reads.
+//
+// `n` is the geometry's own normal from the vertex attribute, not the one the
+// fragment stage flips to face the camera: dip direction reads a 180 degree
+// difference out of it.
+fn field_value(p: vec3<f32>, n: vec3<f32>) -> f32 {
+    let axis = u32(u.coloring.y + 0.5);
+    switch (u32(u.coloring_params.z + 0.5)) {
+        case 1u: { return dip_degrees(n, axis); }
+        case 2u: { return aspect_degrees(n, axis); }
+        default: { return component(p, axis); }
+    }
+}
+
+// The colour the scale gives at position `t`, interpolating between the stops
+// around it and clamped outside the ends. Mirrors `height_color::scale_color`,
+// which is itself `ccColorScale`'s interval walk over its resampled stops.
+fn ramp_color(t: f32) -> vec3<f32> {
+    let count = u32(u.coloring_params.y);
+    if count < 2u {
+        // Nothing to interpolate between: the CPU paints an invalid scale
+        // black, and so does this.
+        return vec3<f32>(0.0);
+    }
+    let x = clamp(t, 0.0, 1.0);
+    var interval = 0u;
+    while interval + 2u < count && u.ramp[interval + 1u].w < x {
+        interval = interval + 1u;
+    }
+    let before = u.ramp[interval];
+    let after = u.ramp[interval + 1u];
+    let span = after.w - before.w;
+    let alpha = select(0.0, (x - before.w) / span, span > 0.0);
+    return mix(before.rgb, after.rgb, alpha);
+}
+
+// The colour one band of the stripe cycle is painted with: three sines a third
+// of a cycle apart, whose sum — and so whose brightness — stays constant.
+// CloudCompare's `setRGBColorByBanding`, with `coloring_params.x` as its
+// `bands` term. The value is the raw one rather than a distance from the range
+// floor, which is what makes a cycle a known distance to read off.
+fn band_color(value: f32) -> vec3<f32> {
+    let z = u.coloring_params.x * value;
+    return vec3<f32>(
+        sin(z) * 0.5 + 0.5,
+        sin(z + BAND_PHASE_2) * 0.5 + 0.5,
+        sin(z + BAND_PHASE_3) * 0.5 + 0.5,
+    );
+}
+
+// The base colour for a model-space point: the file's own colour, or what the
+// field look asks for.
+//
+// Resolved here, from the model-space position and normal, so changing the look
+// costs a uniform write rather than a vertex-buffer re-upload — which is what
+// makes it affordable on a streamed cloud of tens of millions of points.
+fn surface_color(p: vec3<f32>, n: vec3<f32>, own: vec3<f32>) -> vec3<f32> {
+    let value = field_value(p, n);
+    switch (u32(u.coloring.x + 0.5)) {
+        case 1u: { return ramp_color((value - u.coloring.z) * u.coloring.w); }
+        case 2u: { return band_color(value); }
+        default: { return own; }
+    }
 }
 
 struct ModelOut {
@@ -65,8 +158,8 @@ struct ModelOut {
     // are defined, without transforming them per vertex.
     @location(0) model_pos: vec3<f32>,
     @location(1) normal: vec3<f32>,
-    // Base colour: the material, or a height band when that mode is on.
-    // Resolved here — from the model-space Y — so toggling it costs a uniform
+    // Base colour: the material, or what the height look asks for. Resolved
+    // here, from the model-space position, so toggling the look costs a uniform
     // write rather than a vertex-buffer re-upload.
     @location(2) tint: vec3<f32>,
 };
@@ -80,7 +173,7 @@ fn vs_model(
     out.clip = u.view_proj * vec4<f32>(position, 1.0);
     out.model_pos = position;
     out.normal = normal;
-    out.tint = surface_color(position.y, u.material.rgb);
+    out.tint = surface_color(position, normal, u.material.rgb);
     return out;
 }
 
@@ -146,7 +239,7 @@ fn vs_point(
     out.model_pos = position;
     out.normal = normal;
     out.offset = corner;
-    out.color = surface_color(position.y, color);
+    out.color = surface_color(position, normal, color);
     return out;
 }
 
