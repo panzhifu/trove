@@ -598,6 +598,78 @@ impl Library {
         )
     }
 
+    /// Start an automatic tagging run on a background thread: every live
+    /// asset whose fingerprint does not already describe this run is sent to
+    /// `provider`, and the tags it suggests are attached — words the library
+    /// does not have yet are filed under the configured parent tag.
+    ///
+    /// One run at a time (mutual exclusion is per [`crate::tasks::TaskKind`]);
+    /// progress and lifecycle events come off [`Self::tasks`].
+    pub fn start_auto_tag(
+        &self,
+        provider: std::sync::Arc<dyn crate::ai::ChatProvider>,
+        request: crate::tasks::autotag::AutoTagRequest,
+    ) -> std::result::Result<
+        (
+            crate::tasks::TaskId,
+            std::sync::mpsc::Receiver<crate::tasks::autotag::AutoTagOutcome>,
+        ),
+        crate::tasks::StartError,
+    > {
+        let options = self.auto_tag_options(&request);
+        let label = format!("auto tag ({})", provider.id());
+        self.tasks
+            .start(crate::tasks::TaskKind::AutoTag, label, move |ctx| {
+                crate::tasks::autotag::run(&options, provider.as_ref(), ctx)
+            })
+    }
+
+    /// Detach everything a previous tagging run added.
+    ///
+    /// The undo stack below is in memory and belongs to whichever process
+    /// filled it, so a background tagging run cannot lean on it; the record
+    /// the run writes onto each asset instead is what this reads. No provider
+    /// is involved — taking tags back asks no model anything.
+    pub fn start_auto_tag_undo(
+        &self,
+        request: crate::tasks::autotag::AutoTagRequest,
+    ) -> std::result::Result<
+        (
+            crate::tasks::TaskId,
+            std::sync::mpsc::Receiver<crate::tasks::autotag::UndoOutcome>,
+        ),
+        crate::tasks::StartError,
+    > {
+        let options = self.auto_tag_options(&request);
+        self.tasks.start(
+            crate::tasks::TaskKind::AutoTag,
+            "auto tag undo",
+            move |ctx| crate::tasks::autotag::undo(&options, ctx),
+        )
+    }
+
+    /// The settings a run would use, resolved against this library's files
+    /// and the stored chat configuration.
+    ///
+    /// Public so a caller can show what is about to happen — and so a dry run
+    /// and the real run agree on exactly which assets are in scope, which is
+    /// the only way a preview is worth anything.
+    pub fn auto_tag_options(
+        &self,
+        request: &crate::tasks::autotag::AutoTagRequest,
+    ) -> crate::tasks::autotag::AutoTagOptions {
+        let config = crate::config::AppConfig::load();
+        let chat = config.ai_chat.clone().unwrap_or_default();
+        crate::tasks::autotag::AutoTagOptions::resolve(
+            request,
+            self.root.join("library.db"),
+            self.root.clone(),
+            self.cache.clone(),
+            &chat,
+            config.language.as_deref(),
+        )
+    }
+
     /// Pure semantic search: embed `query` with `provider`, score the model's
     /// stored vectors by cosine, and narrow the top candidates with `q`'s
     /// structural filters — the same rank-intersect-then-page pipeline the
