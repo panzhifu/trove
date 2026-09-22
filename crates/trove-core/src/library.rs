@@ -248,6 +248,63 @@ impl Library {
         std::fs::create_dir_all(&cache)?;
         let store = Store::open(&root.join("library.db"))?;
         let text_index = crate::search::TextIndex::open(&cache.join("search_index"))?;
+        let lib = Self::assemble(root, cache, store, text_index);
+        // Reconcile the search index with the asset rows: a fresh, wiped or
+        // outdated index re-derives itself from the store here, so `search`
+        // never silently returns nothing for assets that predate it.
+        lib.reconcile_search_index()?;
+        // Daily safety snapshot (24h throttle, rolling 10 files). Best-effort:
+        // a failed backup never blocks opening the library.
+        crate::services::backup::maybe_auto_backup(&lib.root, lib.store.conn());
+        Ok(lib)
+    }
+
+    /// Open a library for a process that is *not* its sole owner — the CLI,
+    /// running while the desktop app holds the same library open.
+    ///
+    /// Two deliberate differences from [`Library::open`], both of them
+    /// consequences of not being alone:
+    ///
+    /// - The search index is opened read-only *when the lock is taken*. While
+    ///   the app holds Tantivy's writer lock, queries are still answered from
+    ///   the index on disk instead of failing; when the lock is free this
+    ///   handle takes it and behaves exactly like [`Library::open`], including
+    ///   reconciling an index that is behind the store. Either way the
+    ///   `search_queue` outbox keeps accumulating rows for whoever can drain
+    ///   them, so no mutation is lost because a reader was around.
+    /// - The daily backup snapshot is skipped: opening a library to read one
+    ///   asset is not a reason to write a copy of it.
+    pub fn open_read_only(
+        data_root: impl AsRef<Path>,
+        cache_root: impl AsRef<Path>,
+    ) -> Result<Self> {
+        let root = data_root.as_ref().to_path_buf();
+        let cache = cache_root.as_ref().to_path_buf();
+        std::fs::create_dir_all(&root)?;
+        std::fs::create_dir_all(&cache)?;
+        let store = Store::open(&root.join("library.db"))?;
+        let text_index = crate::search::TextIndex::open_read_only(&cache.join("search_index"))?;
+        let lib = Self::assemble(root, cache, store, text_index);
+        // Housekeeping belongs to whoever owns the index. With the lock in
+        // hand this process is the library's de facto owner and owes it the
+        // same reconciliation `open` does — without which a CLI run after a
+        // cache wipe would search an index that knows only about the assets
+        // the outbox still remembered. Without the lock it touches nothing.
+        if lib.text_index().is_writable() {
+            lib.reconcile_search_index()?;
+        }
+        Ok(lib)
+    }
+
+    /// Shared tail of the two constructors: the fields, plus the size gauge
+    /// the health endpoint leads with. A failed count is not worth failing
+    /// the open over — the gauge just stays at zero.
+    fn assemble(
+        root: PathBuf,
+        cache: PathBuf,
+        store: Store,
+        text_index: crate::search::TextIndex,
+    ) -> Self {
         let lib = Self {
             store,
             root,
@@ -257,20 +314,10 @@ impl Library {
             text_index,
             vector_index: std::cell::RefCell::new(None),
         };
-        // Reconcile the search index with the asset rows: a fresh, wiped or
-        // outdated index re-derives itself from the store here, so `search`
-        // never silently returns nothing for assets that predate it.
-        lib.reconcile_search_index()?;
-        // Health headline: a library is open and here is its size — the two
-        // gauges a /health scrape leads with. A failed count is not worth
-        // failing the open over; the gauge just stays at zero.
         let assets =
             rows::query_count(lib.store.conn(), "SELECT COUNT(*) FROM assets", vec![]).unwrap_or(0);
         crate::metrics::set_library_open(assets.max(0) as u64);
-        // Daily safety snapshot (24h throttle, rolling 10 files). Best-effort:
-        // a failed backup never blocks opening the library.
-        crate::services::backup::maybe_auto_backup(&lib.root, lib.store.conn());
-        Ok(lib)
+        lib
     }
 
     /// Write a backup snapshot of the database now (also prunes old ones).

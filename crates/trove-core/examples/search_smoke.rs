@@ -449,7 +449,7 @@ fn drain_batched(
         for (id, deleted) in &actions {
             let id = Uuid::parse_str(id).unwrap();
             if *deleted {
-                index.remove_asset(id);
+                index.remove_asset(id).unwrap();
             } else {
                 index.index_asset(conn, id)?;
             }
@@ -497,7 +497,7 @@ fn drain_row_by_row(
         for (id, deleted) in &pending {
             let id = Uuid::parse_str(id).unwrap();
             if *deleted {
-                index.remove_asset(id);
+                index.remove_asset(id).unwrap();
             } else {
                 index.index_asset(conn, id)?;
             }
