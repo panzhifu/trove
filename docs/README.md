@@ -13,6 +13,7 @@
 | [SEARCH-INDEXING.md](./SEARCH-INDEXING.md) | 搜索与索引 — 全文搜索 (Tantivy)、视觉搜索、向量嵌入、智能集合 |
 | [PREVIEW-SYSTEM.md](./PREVIEW-SYSTEM.md) | 预览系统 — 图片/视频/音频/3D/字体/Lottie 多格式预览 |
 | [AI-EMBEDDING.md](./AI-EMBEDDING.md) | AI 与嵌入 — OpenAI 兼容嵌入、向量语义搜索、模型管理 |
+| [AI-TAGGING.md](./AI-TAGGING.md) | AI 自动打标签 — 聊天模型读素材、受控词表、幂等与撤销 |
 | [TAG-COLLECTION.md](./TAG-COLLECTION.md) | 标签与集合 — 层级标签、合集、智能合集、批量操作 |
 | [BROWSER-EXTENSION.md](./BROWSER-EXTENSION.md) | 浏览器扩展 — Chrome MV3 扩展、本地采集服务 |
 | [TASKS-BACKGROUND.md](./TASKS-BACKGROUND.md) | 任务与后台作业 — 任务管理器、进度、取消、重试 |
