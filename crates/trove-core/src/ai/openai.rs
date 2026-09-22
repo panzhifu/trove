@@ -14,6 +14,7 @@ use std::time::Duration;
 use serde::Deserialize;
 
 use super::EmbeddingProvider;
+use super::http::{parse_error, read_body};
 use crate::config::EmbeddingConfig;
 use crate::error::{Error, Result};
 use crate::model::EmbeddingSpace;
@@ -103,7 +104,7 @@ impl OpenAICompatible {
             match response {
                 Ok(mut response) => {
                     let status = response.status().as_u16();
-                    let text = read_body(&mut response)?;
+                    let text = read_body(&mut response, MAX_BODY)?;
                     if (200..300).contains(&status) {
                         let vectors = parse_response(&text, inputs.len())?;
                         if let Some(dim) = vectors.first().map(Vec::len) {
@@ -159,16 +160,6 @@ impl EmbeddingProvider for OpenAICompatible {
     }
 }
 
-/// Read the response body as text under the byte cap.
-fn read_body(response: &mut ureq::http::Response<ureq::Body>) -> Result<String> {
-    response
-        .body_mut()
-        .with_config()
-        .limit(MAX_BODY)
-        .read_to_string()
-        .map_err(|e| Error::Io(std::io::Error::other(e.to_string())))
-}
-
 /// Parse a successful `/embeddings` body: one vector per input, in input
 /// order (the wire order is arbitrary — the `index` field is authoritative).
 fn parse_response(text: &str, expected: usize) -> Result<Vec<Vec<f32>>> {
@@ -222,36 +213,10 @@ fn parse_response(text: &str, expected: usize) -> Result<Vec<Vec<f32>>> {
     Ok(vectors)
 }
 
-/// Pull a human-readable message out of an error body, trying the OpenAI
-/// error shape before falling back to the raw text (truncated).
-fn parse_error(text: &str) -> Option<String> {
-    #[derive(Deserialize)]
-    struct Body {
-        error: Option<Detail>,
-    }
-    #[derive(Deserialize)]
-    struct Detail {
-        message: Option<String>,
-    }
-
-    let body: Body = serde_json::from_str(text).ok()?;
-    let message = body.error?.message?;
-    Some(truncate(&message, 300))
-}
-
-fn truncate(text: &str, cap: usize) -> String {
-    if text.chars().count() <= cap {
-        text.to_string()
-    } else {
-        let mut out: String = text.chars().take(cap).collect();
-        out.push('…');
-        out
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ai::http::truncate;
 
     fn config(base_url: &str, model: &str) -> EmbeddingConfig {
         EmbeddingConfig {

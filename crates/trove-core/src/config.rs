@@ -122,6 +122,15 @@ pub struct AppConfig {
     /// feature is not configured and every AI-facing surface stays inert.
     #[serde(default)]
     pub ai_embedding: Option<EmbeddingConfig>,
+    /// AI chat settings (the automatic tagger). `None` = the tagger is not
+    /// configured and asks no model anything.
+    ///
+    /// Kept apart from `ai_embedding` on purpose: the two are different
+    /// models on the same server as often as not, and a machine that has
+    /// only one of them configured is the normal case rather than a broken
+    /// one.
+    #[serde(default)]
+    pub ai_chat: Option<ChatConfig>,
 }
 
 /// Settings for an OpenAI-compatible embeddings endpoint — the shape every
@@ -159,6 +168,88 @@ impl Default for EmbeddingConfig {
 }
 
 impl EmbeddingConfig {
+    /// Whether enough is configured to talk to the server at all.
+    pub fn is_configured(&self) -> bool {
+        !self.model.trim().is_empty() && !self.base_url.trim().is_empty()
+    }
+}
+
+/// Settings for an OpenAI-compatible chat endpoint: the half of the AI
+/// surface that *reads* an asset and says something about it, as opposed to
+/// [`EmbeddingConfig`], which turns one into a vector.
+///
+/// Same server shape, different path (`/chat/completions`), and almost always
+/// a different model — an embedding model cannot answer a prompt, and a chat
+/// model cannot embed — so the two are configured apart even when they point
+/// at the same host.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ChatConfig {
+    /// Base URL of the server, without the `/chat/completions` tail.
+    #[serde(default = "default_embedding_base_url")]
+    pub base_url: String,
+    /// Bearer token. Empty is legitimate: local servers usually want none.
+    #[serde(default)]
+    pub api_key: String,
+    /// Model name exactly as the server knows it (`gpt-4o-mini`,
+    /// `qwen-vl-max`, `llava`, `minicpm-v`, …).
+    #[serde(default)]
+    pub model: String,
+    /// Send the asset's thumbnail alongside the text.
+    ///
+    /// On by default because the text side of a library asset is often just
+    /// its file name, and `IMG_4821.jpg` says nothing about the picture. A
+    /// text-only model rejects such a request, which the task notices and
+    /// degrades from — see [`crate::tasks::autotag`] — so the default is the
+    /// one that produces good tags when the model can take them.
+    #[serde(default = "default_true")]
+    pub send_images: bool,
+    /// How many tags per asset the model may invent beyond the library's
+    /// existing vocabulary. Zero means "reuse only", the safest setting for
+    /// a library whose tag tree is already deliberate.
+    #[serde(default = "default_max_new_tags")]
+    pub max_new_tags: u32,
+    /// Parent tag the invented tags are filed under, so one run can be
+    /// reviewed — and discarded — as a single subtree. Empty files them at
+    /// the root.
+    #[serde(default = "default_new_tag_parent")]
+    pub new_tag_parent: String,
+    /// Language the tags should be written in (`zh-CN`, `en`, …). `None`
+    /// follows the interface language.
+    #[serde(default)]
+    pub tag_language: Option<String>,
+}
+
+/// `true` — the serde default for a `bool` is `false`, which would silently
+/// turn the vision path off for every existing config file.
+fn default_true() -> bool {
+    true
+}
+
+/// Three is the "useful without being noisy" point: one or two new concepts
+/// usually do describe the asset, and the run is easy to review afterwards.
+fn default_max_new_tags() -> u32 {
+    3
+}
+
+fn default_new_tag_parent() -> String {
+    "AI".into()
+}
+
+impl Default for ChatConfig {
+    fn default() -> Self {
+        Self {
+            base_url: default_embedding_base_url(),
+            api_key: String::new(),
+            model: String::new(),
+            send_images: default_true(),
+            max_new_tags: default_max_new_tags(),
+            new_tag_parent: default_new_tag_parent(),
+            tag_language: None,
+        }
+    }
+}
+
+impl ChatConfig {
     /// Whether enough is configured to talk to the server at all.
     pub fn is_configured(&self) -> bool {
         !self.model.trim().is_empty() && !self.base_url.trim().is_empty()

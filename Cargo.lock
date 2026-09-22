@@ -8835,6 +8835,7 @@ dependencies = [
 name = "trove-core"
 version = "0.4.6"
 dependencies = [
+ "base64 0.22.1",
  "blake3",
  "chrono",
  "dirs 5.0.1",
