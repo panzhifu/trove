@@ -106,14 +106,16 @@ pub enum Command {
     /// Import files or directories.
     Import(ImportArgs),
 
-    /// Ask a chat model to tag assets.
+    /// Analyse assets with a multimodal model.
     ///
-    /// Tags already in the library are offered to the model to reuse; the few
-    /// it invents are filed under a parent tag so the whole run can be
-    /// reviewed — or thrown away with `--undo`. Assets a previous run already
-    /// described are skipped, so running it twice costs nothing the second
-    /// time.
-    Autotag(AutotagArgs),
+    /// Each asset's thumbnail and metadata are handed to the configured
+    /// vendor (OpenAI / Anthropic / Gemini / DashScope); the description,
+    /// tags and rating it returns are written back. Tags already in the
+    /// library are offered to the model to reuse, and the few it invents are
+    /// filed under a parent tag so the whole run can be reviewed — or thrown
+    /// away with `--undo`. Assets a previous run already described are
+    /// skipped, so running it twice costs nothing the second time.
+    Analyze(AnalyzeArgs),
 
     /// Edit an asset's metadata.
     Set(SetArgs),
@@ -274,11 +276,11 @@ pub struct ImportArgs {
     pub dry_run: bool,
 }
 
-/// What `autotag` runs with. Everything is optional: what is left out comes
-/// from the library's stored chat configuration, which is also where the
-/// endpoint and the model live.
+/// What `analyze` runs with. Everything is optional: what is left out comes
+/// from the library's stored analysis configuration, which is also where the
+/// vendor, the endpoint and the model live.
 #[derive(Debug, Args)]
-pub struct AutotagArgs {
+pub struct AnalyzeArgs {
     /// Tag only these assets. Omit for every live asset.
     #[arg(long, value_name = "UUID")]
     pub ids: Vec<String>,
@@ -292,8 +294,8 @@ pub struct AutotagArgs {
     #[arg(long)]
     pub dry_run: bool,
 
-    /// Re-tag assets a previous run already described, instead of skipping
-    /// them.
+    /// Re-analyse assets a previous run already described, instead of
+    /// skipping them.
     #[arg(long)]
     pub force: bool,
 
@@ -313,6 +315,22 @@ pub struct AutotagArgs {
     #[arg(long, value_name = "N")]
     pub max_new_tags: Option<u32>,
 
+    /// Ask for a description too (overrides the stored `fields`).
+    #[arg(long, conflicts_with = "no_description")]
+    pub description: bool,
+
+    /// Do not ask for a description.
+    #[arg(long)]
+    pub no_description: bool,
+
+    /// Ask for an aesthetic rating too.
+    #[arg(long, conflicts_with = "no_rating")]
+    pub rating: bool,
+
+    /// Do not ask for a rating.
+    #[arg(long)]
+    pub no_rating: bool,
+
     /// Parent tag for the invented ones; pass an empty string to file them at
     /// the root.
     #[arg(long, value_name = "TAG")]
@@ -330,8 +348,9 @@ pub struct AutotagArgs {
     /// Detach everything previous runs added, and forget they ran.
     ///
     /// Needs no endpoint: taking tags back asks no model anything. Tags left
-    /// without assets are reported, never deleted.
-    #[arg(long, conflicts_with_all = ["dry_run", "force", "no_images", "with_images", "max_new_tags", "parent_tag", "limit"])]
+    /// without assets are reported, never deleted. Descriptions and ratings
+    /// are left in place.
+    #[arg(long, conflicts_with_all = ["dry_run", "force", "no_images", "with_images", "max_new_tags", "parent_tag", "limit", "description", "no_description", "rating", "no_rating"])]
     pub undo: bool,
 }
 

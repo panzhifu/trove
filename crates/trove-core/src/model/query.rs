@@ -13,12 +13,18 @@ pub enum AssetSort {
     /// Import time (newest first by default).
     #[default]
     CreatedAt,
+    /// Last modified time.
+    UpdatedAt,
     /// File name, case-insensitive.
     Name,
     /// File size in bytes.
     SizeBytes,
     /// Star rating (un-rated assets sort last when descending).
     Rating,
+    /// Media duration (for video/audio).
+    Duration,
+    /// Dominant color.
+    Color,
 }
 
 /// Filtering + paging options for listing assets.

@@ -16,6 +16,35 @@ use crate::error::{Error, Result};
 use crate::model::{AspectPreset, Asset, AssetKind, AssetQuery, AssetSort, Orientation, Page};
 use crate::search::vector::{self, QueryVector, VECTOR_CANDIDATE_CAP, VectorIndex};
 
+/// Which search legs a browse may run.
+///
+/// The legs degrade downward: the local full-text index is the base, the
+/// vector ranking is fused into it, and the AI plan rewrites the query before
+/// either runs. A leg that is off — or whose endpoint is unconfigured or
+/// failed — contributes nothing, so the search still returns the layers below
+/// it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SearchTiers {
+    /// L1: the local Tantivy full-text index.
+    pub full_text: bool,
+    /// L2: embedding vector search, fused into L1 by reciprocal rank.
+    pub semantic: bool,
+    /// L3: the LLM query planner. It rewrites the query; it adds no ranking
+    /// of its own.
+    pub ai: bool,
+}
+
+impl Default for SearchTiers {
+    /// Local full-text only — the behaviour before the tiers existed.
+    fn default() -> Self {
+        Self {
+            full_text: true,
+            semantic: false,
+            ai: false,
+        }
+    }
+}
+
 /// How the workspace grid is currently browsing the library.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct BrowseContext {
@@ -33,6 +62,11 @@ pub struct BrowseContext {
     pub folder: Option<String>,
     /// Active full-text search term. Overrides the other views when set.
     pub search: String,
+    /// An AI-generated search plan. When set, it drives the Tantivy query
+    /// instead of [`Self::search`] — keywords become AND, synonyms become
+    /// OR, exclusions become NOT. The two are mutually exclusive: a plan
+    /// overrides the raw text.
+    pub ai_plan: Option<crate::ai::search_planner::AiSearchPlan>,
     /// The search term's embedding when the caller has one — the vector leg
     /// of the hybrid ranking, scored against the index passed to
     /// [`Self::run`].
@@ -42,6 +76,10 @@ pub struct BrowseContext {
     /// model/space that disagrees with the index, the text ranking stands
     /// alone — exactly the pre-hybrid behaviour.
     pub vector: Option<QueryVector>,
+    /// Which search legs this browse may run. See [`SearchTiers`]. Defaults
+    /// to full-text only, so a caller that does not set it keeps the old
+    /// behaviour.
+    pub tiers: SearchTiers,
     /// Grid filters. Every view honours them — the trash and the recent
     /// list included — so the filter bar means the same thing wherever it
     /// is shown.
@@ -157,7 +195,13 @@ impl BrowseContext {
         vector: Option<&VectorIndex>,
         count: bool,
     ) -> Result<Page<Asset>> {
-        let search_active = !self.in_trash && !self.in_recent && !self.search.trim().is_empty();
+        // A search is active when at least one leg is on and the box has a
+        // term. The term is the entry point for both legs: the text leg
+        // matches it, the vector leg embeds it.
+        let search_active = (self.tiers.full_text || self.tiers.semantic)
+            && !self.in_trash
+            && !self.in_recent
+            && !self.search.trim().is_empty();
 
         if self.in_recent {
             // Recently viewed: ids ordered by last view time. That order
@@ -172,19 +216,39 @@ impl BrowseContext {
             let items = assets::page_assets(&ids, &q, conn)?;
             Ok(Page::new(total, items))
         } else if search_active {
-            // Ranked candidates come from the Tantivy index (words, typo
-            // tolerance, gram substrings, pinyin); the compound grid filters
-            // stay in SQL and narrow the ranked set, preserving rank order.
-            let text_ranked = text.search(&self.search, crate::search::CANDIDATE_CAP)?;
-            // A configured embedding endpoint turns the same term into a
-            // second ranking, and the two are fused rather than one replacing
-            // the other: an asset both legs like outranks either leg's
-            // favourite. Nothing to fuse with ⇒ the text ranking stands.
-            let candidates = match self.fused_candidates(conn, vector, &text_ranked)? {
-                Some(fused) => fused,
-                None => text_ranked,
+            // L3: the plan participates only when its tier is on. It rewrites
+            // the query rather than ranking, so it feeds the text leg below.
+            let plan = self.tiers.ai.then_some(self.ai_plan.as_ref()).flatten();
+
+            // L1: the local full-text ranking. With the tier off this is an
+            // empty list, and the vector leg (if any) stands alone — RRF of
+            // one list is that list.
+            let text_ranked = if self.tiers.full_text {
+                match plan {
+                    Some(plan) => text.search_plan(plan, crate::search::CANDIDATE_CAP)?,
+                    None => text.search(&self.search, crate::search::CANDIDATE_CAP)?,
+                }
+            } else {
+                Vec::new()
             };
-            let q = self.filter_query(limit);
+
+            // L2: fuse the vector ranking in, but only when the tier is on and
+            // the caller supplied a vector for this exact term. Every other
+            // case leaves the text ranking standing.
+            let candidates = if self.tiers.semantic {
+                match self.fused_candidates(conn, vector, &text_ranked)? {
+                    Some(fused) => fused,
+                    None => text_ranked,
+                }
+            } else {
+                text_ranked
+            };
+
+            let mut q = self.filter_query(limit);
+            // Apply AI plan filters on top of the grid filters.
+            if let Some(plan) = plan {
+                apply_plan_filters(plan, &mut q);
+            }
             let (total, ids) = assets::rank_intersect(conn, &candidates, &q)?;
             let page = assets::page_assets(&ids, &q, conn)?;
             Ok(Page::new(total, page))
@@ -267,6 +331,44 @@ impl BrowseContext {
     }
 }
 
+/// Apply an AI search plan's structured filters to an [`AssetQuery`]. Only
+/// the fields the query understands are mapped; numeric filters (width,
+/// height, duration) fall through to post-filtering in the search path.
+fn apply_plan_filters(plan: &crate::ai::search_planner::AiSearchPlan, q: &mut AssetQuery) {
+    for filter in &plan.filters {
+        match filter.field {
+            crate::ai::search_planner::PlanFilterField::Format => {
+                if !filter.values.is_empty() {
+                    // Merge with any existing ext filter — union, not replace.
+                    let mut exts: Vec<String> = match &q.ext {
+                        Some(e) => vec![e.clone()],
+                        None => vec![],
+                    };
+                    exts.extend(filter.values.iter().cloned());
+                    q.ext = Some(exts.join(","));
+                }
+            }
+            crate::ai::search_planner::PlanFilterField::Rating => {
+                // Take the highest minimum rating from the plan.
+                let min_from_plan = filter.values.iter().filter_map(|v| v.parse::<u8>().ok()).max();
+                if let Some(min) = min_from_plan {
+                    q.min_rating = Some(q.min_rating.map_or(min, |existing| existing.max(min)));
+                }
+            }
+            crate::ai::search_planner::PlanFilterField::Favorite => {
+                let want_favorite = filter.values.first().is_some_and(|v| v == "true" || v == "1");
+                if want_favorite && !filter.exclude {
+                    q.is_favorite = Some(true);
+                }
+            }
+            // Tag, Width, Height, DurationMs need separate handling — tags
+            // require UUID resolution, dimensions need SQL expressions. These
+            // are applied as post-filters in the search path.
+            _ => {}
+        }
+    }
+}
+
 /// Orientation of one asset row, mirroring the SQL CASE in
 /// `assets::build_where`.
 fn orientation_of(a: &Asset) -> Option<Orientation> {
@@ -345,6 +447,12 @@ mod tests {
         let ctx = |mutate: &dyn Fn(&mut BrowseContext)| {
             let mut c = BrowseContext {
                 search: "sunset".into(),
+                // This test is about the fused ranking, so the vector tier is
+                // on; the default is off (full-text only).
+                tiers: SearchTiers {
+                    semantic: true,
+                    ..Default::default()
+                },
                 ..Default::default()
             };
             mutate(&mut c);
@@ -381,6 +489,127 @@ mod tests {
         .run(conn, &idx, None, Some(&index))
         .unwrap();
         assert_eq!(page.total, 1, "a model mismatch must not fuse");
+    }
+
+    #[test]
+    fn search_tiers_gate_each_leg() {
+        use crate::ai::search_planner::AiSearchPlan;
+        use crate::model::{EmbeddingSpace, NewEmbedding};
+        use crate::store::embeddings;
+
+        let store = Store::in_memory().unwrap();
+        let conn = store.conn();
+        let mut shot = test_asset("a.png", AssetKind::Image, Uuid::new_v4());
+        shot.title = Some("sunset shot".into());
+        assets::insert(conn, &shot).unwrap();
+        let mut beach = test_asset("b.png", AssetKind::Image, Uuid::new_v4());
+        beach.title = Some("beach walk".into());
+        assets::insert(conn, &beach).unwrap();
+
+        let idx = crate::search::TextIndex::in_ram().unwrap();
+        idx.index_asset(conn, shot.id).unwrap();
+        idx.index_asset(conn, beach.id).unwrap();
+        idx.commit().unwrap();
+
+        // The vector points at `beach` only.
+        embeddings::upsert(
+            conn,
+            &NewEmbedding {
+                asset_id: beach.id,
+                model: "test-model".into(),
+                space: EmbeddingSpace::Text,
+                vector: vec![1.0, 0.0],
+                source_hash: "h".into(),
+            },
+        )
+        .unwrap();
+        let index = VectorIndex::new("test-model", EmbeddingSpace::Text);
+        let vector = QueryVector {
+            text: "sunset".into(),
+            model: "test-model".into(),
+            space: EmbeddingSpace::Text,
+            vector: vec![1.0, 0.0],
+        };
+
+        // L1 only (the default): the text match alone, even though a vector
+        // for this exact term is available.
+        let page = BrowseContext {
+            search: "sunset".into(),
+            vector: Some(vector.clone()),
+            ..Default::default()
+        }
+        .run(conn, &idx, None, Some(&index))
+        .unwrap();
+        assert_eq!(page.total, 1, "semantic off ⇒ the text ranking stands");
+        assert_eq!(page.items[0].id, shot.id);
+
+        // L1 + L2: the vector leg adds its own hit.
+        let page = BrowseContext {
+            search: "sunset".into(),
+            vector: Some(vector.clone()),
+            tiers: SearchTiers {
+                full_text: true,
+                semantic: true,
+                ai: false,
+            },
+            ..Default::default()
+        }
+        .run(conn, &idx, None, Some(&index))
+        .unwrap();
+        assert_eq!(page.total, 2, "semantic on ⇒ fused");
+
+        // L2 only: full-text off, the vector ranking stands alone.
+        let page = BrowseContext {
+            search: "sunset".into(),
+            vector: Some(vector),
+            tiers: SearchTiers {
+                full_text: false,
+                semantic: true,
+                ai: false,
+            },
+            ..Default::default()
+        }
+        .run(conn, &idx, None, Some(&index))
+        .unwrap();
+        assert_eq!(page.total, 1);
+        assert_eq!(page.items[0].id, beach.id, "vector alone ranks its own hit");
+
+        // L3 off ignores a plan that is present …
+        let plan = AiSearchPlan {
+            keywords: vec!["beach".into()],
+            ..Default::default()
+        };
+        let page = BrowseContext {
+            search: "sunset".into(),
+            ai_plan: Some(plan.clone()),
+            ..Default::default()
+        }
+        .run(conn, &idx, None, None)
+        .unwrap();
+        assert_eq!(page.total, 1);
+        assert_eq!(
+            page.items[0].id, shot.id,
+            "ai off ⇒ the raw term drives the search"
+        );
+
+        // … and uses it when the tier is on.
+        let page = BrowseContext {
+            search: "sunset".into(),
+            ai_plan: Some(plan),
+            tiers: SearchTiers {
+                full_text: true,
+                semantic: false,
+                ai: true,
+            },
+            ..Default::default()
+        }
+        .run(conn, &idx, None, None)
+        .unwrap();
+        assert_eq!(page.total, 1);
+        assert_eq!(
+            page.items[0].id, beach.id,
+            "ai on ⇒ the plan drives the search"
+        );
     }
 
     #[test]

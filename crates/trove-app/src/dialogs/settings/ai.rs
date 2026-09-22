@@ -12,7 +12,7 @@
 use gpui_kit::component::setting::NumberFieldOptions;
 
 use super::*;
-use crate::library::{AiProbe, ChatProbe};
+use crate::library::{AiProbe, AnalysisProbe};
 
 // ============================ config ========================================
 
@@ -54,7 +54,7 @@ pub(super) fn ai_page(controller: &Entity<LibraryController>, cx: &App) -> Setti
         None
     };
     let probe = controller.read(cx).ai_probe.clone();
-    let chat_probe = controller.read(cx).chat_probe.clone();
+    let analysis_probe = controller.read(cx).analysis_probe.clone();
 
     SettingPage::new(rust_i18n::t!("settings.ai").to_string())
         .icon(IconName::Bot)
@@ -62,8 +62,8 @@ pub(super) fn ai_page(controller: &Entity<LibraryController>, cx: &App) -> Setti
         .resettable(false)
         .group(endpoint_group(controller, &probe))
         .group(vector_group(controller, coverage))
-        .group(chat_group(controller, &chat_probe))
-        .group(tagging_group(controller))
+        .group(analysis_group(controller, &analysis_probe))
+        .group(analysis_run_group(controller))
 }
 
 // ============================ endpoint ======================================
@@ -96,6 +96,16 @@ fn endpoint_group(controller: &Entity<LibraryController>, probe: &AiProbe) -> Se
                 |value, cx| save_embedding_config(|c| c.model = value.to_string(), cx),
             ),
         ))
+        .item(
+            SettingItem::new(
+                rust_i18n::t!("settings.embed_multimodal").to_string(),
+                SettingField::switch(
+                    |_cx| embedding_config().multimodal,
+                    |value, cx| save_embedding_config(|c| c.multimodal = value, cx),
+                ),
+            )
+            .description(rust_i18n::t!("settings.embed_multimodal_desc").to_string()),
+        )
         .item(
             SettingItem::new(
                 rust_i18n::t!("settings.ai_probe").to_string(),
@@ -259,57 +269,94 @@ fn ai_delete_row(controller: Entity<LibraryController>, embedded: u64, cx: &mut 
 
 // ============================ tagging (chat endpoint) ========================
 
-/// The saved chat config, or defaults when the tagger has never been
+/// The saved analysis config, or defaults when the analysis has never been
 /// configured.
-fn chat_config() -> trove_core::config::ChatConfig {
-    AppConfig::load().ai_chat.unwrap_or_default()
+fn analysis_config() -> trove_core::config::AiAnalysisConfig {
+    AppConfig::load().ai_analysis.unwrap_or_default()
 }
 
-/// Persist one field change to the chat config (`config.json`, like every
+/// Persist one field change to the analysis config (`config.json`, like every
 /// other setting).
-fn save_chat_config(edit: impl FnOnce(&mut trove_core::config::ChatConfig), cx: &mut App) {
+fn save_analysis_config(
+    edit: impl FnOnce(&mut trove_core::config::AiAnalysisConfig),
+    cx: &mut App,
+) {
     let mut config = AppConfig::load();
-    edit(config.ai_chat.get_or_insert_with(Default::default));
+    edit(config.ai_analysis.get_or_insert_with(Default::default));
     let _ = config.save();
     cx.refresh_windows();
 }
 
-/// The model the automatic tagger asks. Same shape as the embedding endpoint
-/// above and configured apart from it: the two are different models on the
-/// same server as often as not.
-fn chat_group(controller: &Entity<LibraryController>, probe: &ChatProbe) -> SettingGroup {
+/// The model that reads each asset. Vendor, endpoint and model are stored
+/// together; the embedding endpoint above is configured apart from it, since
+/// the two are different models on the same host as often as not.
+fn analysis_group(controller: &Entity<LibraryController>, probe: &AnalysisProbe) -> SettingGroup {
     SettingGroup::new()
         .title(rust_i18n::t!("settings.chat_endpoint").to_string())
+        .item(
+            SettingItem::new(
+                rust_i18n::t!("settings.chat_vendor").to_string(),
+                SettingField::input(
+                    |_cx| SharedString::from(analysis_config().vendor.clone()),
+                    |value, cx| {
+                        save_analysis_config(|config| config.vendor = value.to_string(), cx)
+                    },
+                ),
+            )
+            .description(rust_i18n::t!("settings.chat_vendor_desc").to_string()),
+        )
         .item(SettingItem::new(
             rust_i18n::t!("settings.ai_base_url").to_string(),
             SettingField::input(
-                |_cx| SharedString::from(chat_config().base_url.clone()),
-                |value, cx| save_chat_config(|config| config.base_url = value.to_string(), cx),
+                |_cx| SharedString::from(analysis_config().base_url.clone()),
+                |value, cx| save_analysis_config(|config| config.base_url = value.to_string(), cx),
             ),
         ))
         .item(SettingItem::new(
             rust_i18n::t!("settings.ai_api_key").to_string(),
             SettingField::input(
-                |_cx| SharedString::from(chat_config().api_key.clone()),
-                |value, cx| save_chat_config(|config| config.api_key = value.to_string(), cx),
+                |_cx| SharedString::from(analysis_config().api_key.clone()),
+                |value, cx| save_analysis_config(|config| config.api_key = value.to_string(), cx),
             ),
         ))
         .item(SettingItem::new(
             rust_i18n::t!("settings.chat_model").to_string(),
             SettingField::input(
-                |_cx| SharedString::from(chat_config().model.clone()),
-                |value, cx| save_chat_config(|config| config.model = value.to_string(), cx),
+                |_cx| SharedString::from(analysis_config().model.clone()),
+                |value, cx| save_analysis_config(|config| config.model = value.to_string(), cx),
             ),
         ))
         .item(
             SettingItem::new(
                 rust_i18n::t!("settings.chat_send_images").to_string(),
                 SettingField::switch(
-                    |_cx| chat_config().send_images,
-                    |value, cx| save_chat_config(|config| config.send_images = value, cx),
+                    |_cx| analysis_config().send_images,
+                    |value, cx| save_analysis_config(|config| config.send_images = value, cx),
                 ),
             )
             .description(rust_i18n::t!("settings.chat_send_images_desc").to_string()),
+        )
+        .item(
+            SettingItem::new(
+                rust_i18n::t!("settings.chat_describe").to_string(),
+                SettingField::switch(
+                    |_cx| analysis_config().fields.description,
+                    |value, cx| {
+                        save_analysis_config(|config| config.fields.description = value, cx)
+                    },
+                ),
+            )
+            .description(rust_i18n::t!("settings.chat_describe_desc").to_string()),
+        )
+        .item(
+            SettingItem::new(
+                rust_i18n::t!("settings.chat_rate").to_string(),
+                SettingField::switch(
+                    |_cx| analysis_config().fields.rating,
+                    |value, cx| save_analysis_config(|config| config.fields.rating = value, cx),
+                ),
+            )
+            .description(rust_i18n::t!("settings.chat_rate_desc").to_string()),
         )
         .item(
             SettingItem::new(
@@ -320,10 +367,10 @@ fn chat_group(controller: &Entity<LibraryController>, probe: &ChatProbe) -> Sett
                         max: 10.0,
                         step: 1.0,
                     },
-                    |_cx| chat_config().max_new_tags as f64,
+                    |_cx| analysis_config().max_new_tags as f64,
                     |value, cx| {
                         let value = value.clamp(0.0, 10.0) as u32;
-                        save_chat_config(|config| config.max_new_tags = value, cx)
+                        save_analysis_config(|config| config.max_new_tags = value, cx)
                     },
                 ),
             )
@@ -333,9 +380,9 @@ fn chat_group(controller: &Entity<LibraryController>, probe: &ChatProbe) -> Sett
             SettingItem::new(
                 rust_i18n::t!("settings.chat_parent_tag").to_string(),
                 SettingField::input(
-                    |_cx| SharedString::from(chat_config().new_tag_parent.clone()),
+                    |_cx| SharedString::from(analysis_config().new_tag_parent.clone()),
                     |value, cx| {
-                        save_chat_config(|config| config.new_tag_parent = value.to_string(), cx)
+                        save_analysis_config(|config| config.new_tag_parent = value.to_string(), cx)
                     },
                 ),
             )
@@ -344,10 +391,10 @@ fn chat_group(controller: &Entity<LibraryController>, probe: &ChatProbe) -> Sett
         .item(SettingItem::new(
             rust_i18n::t!("settings.chat_language").to_string(),
             SettingField::input(
-                |_cx| SharedString::from(chat_config().tag_language.clone().unwrap_or_default()),
+                |_cx| SharedString::from(analysis_config().tag_language.clone().unwrap_or_default()),
                 |value, cx| {
                     let value = value.trim().to_string();
-                    save_chat_config(
+                    save_analysis_config(
                         move |config| config.tag_language = (!value.is_empty()).then_some(value),
                         cx,
                     )
@@ -360,33 +407,37 @@ fn chat_group(controller: &Entity<LibraryController>, probe: &ChatProbe) -> Sett
                 SettingField::render({
                     let controller = controller.clone();
                     let probe = probe.clone();
-                    move |_, _, cx| chat_probe_row(&controller, &probe, cx)
+                    move |_, _, cx| analysis_probe_row(&controller, &probe, cx)
                 }),
             )
             .description(rust_i18n::t!("settings.chat_probe_desc").to_string()),
         )
 }
 
-/// The connection-test row for the chat endpoint: the model's own words on
+/// The connection-test row for the analysis endpoint: the model's own words on
 /// the left, the button on the right.
 ///
 /// Showing what the model *said* is the point — a green tick only proves
 /// something answered, while a sentence proves a model did.
-fn chat_probe_row(controller: &Entity<LibraryController>, probe: &ChatProbe, cx: &mut App) -> Div {
+fn analysis_probe_row(
+    controller: &Entity<LibraryController>,
+    probe: &AnalysisProbe,
+    cx: &mut App,
+) -> Div {
     let (text, color) = match probe {
-        ChatProbe::Idle => (
+        AnalysisProbe::Idle => (
             rust_i18n::t!("settings.ai_probe_idle").to_string(),
             cx.theme().muted_foreground,
         ),
-        ChatProbe::Running => (
+        AnalysisProbe::Running => (
             rust_i18n::t!("settings.ai_probe_running").to_string(),
             cx.theme().muted_foreground,
         ),
-        ChatProbe::Ok { reply } => (
+        AnalysisProbe::Ok { reply } => (
             rust_i18n::t!("settings.chat_probe_ok", reply = reply.as_str()).to_string(),
             cx.theme().success,
         ),
-        ChatProbe::Failed { message } => (
+        AnalysisProbe::Failed { message } => (
             rust_i18n::t!("settings.ai_probe_failed", error = message.as_str()).to_string(),
             cx.theme().danger,
         ),
@@ -400,19 +451,19 @@ fn chat_probe_row(controller: &Entity<LibraryController>, probe: &ChatProbe, cx:
         .gap_2()
         .child(div().text_sm().text_color(color).child(text))
         .child(
-            Button::new("chat-probe")
+            Button::new("analysis-probe")
                 .outline()
                 .small()
                 .disabled(running)
                 .label(rust_i18n::t!("settings.ai_probe_run").to_string())
                 .on_click(move |_, _, cx| {
-                    crate::library::jobs::test_chat_endpoint_app(&controller, cx);
+                    crate::library::jobs::test_analysis_endpoint_app(&controller, cx);
                 }),
         )
 }
 
-/// The tagging run: what it does, and the buttons that control it.
-fn tagging_group(controller: &Entity<LibraryController>) -> SettingGroup {
+/// The analysis run: what it does, and the buttons that control it.
+fn analysis_run_group(controller: &Entity<LibraryController>) -> SettingGroup {
     SettingGroup::new()
         .title(rust_i18n::t!("settings.autotag").to_string())
         .item(
@@ -420,7 +471,7 @@ fn tagging_group(controller: &Entity<LibraryController>) -> SettingGroup {
                 rust_i18n::t!("settings.autotag_scope").to_string(),
                 SettingField::render({
                     let controller = controller.clone();
-                    move |_, _, cx| autotag_buttons(&controller, cx)
+                    move |_, _, cx| analysis_buttons(&controller, cx)
                 }),
             )
             .description(rust_i18n::t!("settings.autotag_scope_desc").to_string()),
@@ -432,32 +483,32 @@ fn tagging_group(controller: &Entity<LibraryController>) -> SettingGroup {
 /// The buttons are rebuilt here rather than captured because the row is
 /// rendered once per paint: the run button has to read `is_running` at that
 /// moment, and a captured element would freeze the state it was built with.
-fn autotag_buttons(controller: &Entity<LibraryController>, cx: &mut App) -> Div {
+fn analysis_buttons(controller: &Entity<LibraryController>, cx: &mut App) -> Div {
     let running = controller
         .read(cx)
         .library
         .tasks()
-        .is_running(trove_core::tasks::TaskKind::AutoTag);
+        .is_running(trove_core::tasks::TaskKind::AiAnalysis);
 
     let run = if running {
         let controller = controller.clone();
-        Button::new("autotag-cancel")
+        Button::new("analysis-cancel")
             .outline()
             .small()
             .label(rust_i18n::t!("settings.ai_cancel").to_string())
             .on_click(move |_, _, cx| {
-                crate::library::jobs::cancel_auto_tag_app(&controller, cx);
+                crate::library::jobs::cancel_analysis_app(&controller, cx);
             })
     } else {
         let controller = controller.clone();
-        Button::new("autotag-run")
+        Button::new("analysis-run")
             .outline()
             .small()
             .label(rust_i18n::t!("settings.autotag_run").to_string())
             .on_click(move |_, window, cx| {
-                crate::library::jobs::start_auto_tag_app(
+                crate::library::jobs::start_analysis_app(
                     &controller,
-                    crate::library::jobs::AutoTagTarget::WholeLibrary,
+                    crate::library::jobs::AnalysisTarget::WholeLibrary,
                     window,
                     cx,
                 );
@@ -466,20 +517,15 @@ fn autotag_buttons(controller: &Entity<LibraryController>, cx: &mut App) -> Div 
 
     let undo = {
         let controller = controller.clone();
-        Button::new("autotag-undo")
+        Button::new("analysis-undo")
             .outline()
             .small()
             .disabled(running)
             .label(rust_i18n::t!("settings.autotag_undo").to_string())
             .on_click(move |_, window, cx| {
-                crate::library::jobs::start_auto_tag_undo_app(&controller, window, cx);
+                crate::library::jobs::start_analysis_undo_app(&controller, window, cx);
             })
     };
 
-    h_flex()
-        .w_full()
-        .justify_end()
-        .gap_2()
-        .child(run)
-        .child(undo)
+    h_flex().w_full().justify_end().gap_2().child(run).child(undo)
 }

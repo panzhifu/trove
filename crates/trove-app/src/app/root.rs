@@ -1191,9 +1191,9 @@ impl Render for AppView {
             // with nothing selected is a mistake worth naming rather than a
             // reason to spend money on the whole library.
             .on_action(cx.listener(|this, _: &AutoTag, window, cx| {
-                crate::library::jobs::start_auto_tag_app(
+                crate::library::jobs::start_analysis_app(
                     &this.controller,
-                    crate::library::jobs::AutoTagTarget::Selection,
+                    crate::library::jobs::AnalysisTarget::Selection,
                     window,
                     cx,
                 );

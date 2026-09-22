@@ -47,7 +47,7 @@ pub trait EmbeddingProvider: Send + Sync {
     fn asset_space(&self) -> EmbeddingSpace;  // Text / Image
     fn dim(&self) -> Option<usize>; // 向量维度（可延迟学习）
     fn embed_texts(&self, texts: &[String]) -> Result<Vec<Vec<f32>>>;
-    fn embed_images(&self, paths: &[PathBuf]) -> Result<Vec<Vec<f32>>>; // 可选
+    fn embed_images(&self, paths: &[PathBuf]) -> Result<Vec<Vec<f32>>>; // 多模态 provider 才实现
 }
 ```
 
@@ -173,19 +173,62 @@ CREATE TABLE asset_embeddings (
 
 ---
 
-## 图像嵌入（规划中）
+## 图像嵌入（多模态）
 
-### CLIP 风格多模态
+### CLIP 风格联合空间
 
-- 文本查询 → 搜索图像
-- 需要实现 `embed_images()` 方法
-- 模型推荐：CLIP ViT-B/336 (ONNX)
+打开多模态模式后，**素材按缩略图建索引，查询仍是文本**——两个编码器分开，但被训练进同一个向量空间，所以向量可以直接比较。这就是「输入一个猫字，找到没有标签的猫照片」。
 
-### 本地推理（规划中）
+```
+素材侧：embed_images(缩略图)  → Image 空间
+查询侧：embed_texts("猫")     → 同一空间
+                                 ↓
+                          余弦相似度直接可比
+```
+
+开关：设置 ▸ AI 嵌入 ▸ **多模态（图像）嵌入**（`ai_embedding.multimodal`）。
+
+### 回填任务的输入选择
+
+回填按 provider 的 `asset_space()` 决定每个素材嵌什么：
+
+| provider 空间 | 素材有缩略图 | 嵌什么 |
+|--------------|------------|--------|
+| `Text` | — | 元数据文本（标题 / 描述 / 标签） |
+| `Image` | ✅ | **缩略图**，指纹用 `content_hash` |
+| `Image` | ❌（字体、音频、无预览格式） | 回退到元数据文本——CLIP 的文本编码器落在同一空间，所以素材仍然可搜 |
+
+一批里可以同时有图像和文本输入，任务会把它们拆成两次调用再按顺序拼回去。
+
+### 端点要求
+
+多模态模式需要**联合嵌入端点**。OpenAI 的 `/embeddings` **不支持图像输入**；已实现的是 OpenAI 兼容的「对象输入」形状：
+
+```json
+{"model": "jina-clip-v2", "input": [{"text": "猫"}]}
+{"model": "jina-clip-v2", "input": [{"image": "data:image/jpeg;base64,..."}]}
+```
+
+> 其他形状（火山方舟 `doubao-embedding-vision` 的 `/embeddings/multimodal`、DashScope 的 `input.contents`、Jina 自托管的 `image_base64`）目前没有适配，需要另写 provider。
+
+### 与多模态分析的区别
+
+| | 图像嵌入（本节） | [多模态分析](./AI-TAGGING.md) |
+|---|---|---|
+| 产出 | 一个向量，不产生标签 | 人类可读的标签 / 描述 / 评分 |
+| 成本 | 便宜 | 贵（每个素材一次 VLM 调用） |
+| 可编辑 / 可复用 | ❌ | ✅ |
+| 走全文索引 / 智能集合 | ❌ | ✅ |
+
+两者互补：嵌入负责「文搜图」的召回，分析负责产出可复用的标签资产。只上嵌入而元数据为空时，向量腿实际上只按文件名相似度召回，反而会给 RRF 融合引入噪声。
+
+---
+
+## 本地推理（规划中）
 
 | 模型 | 大小 | 用途 |
 |------|------|------|
-| CLIP ViT-B/32 | ~330MB | 文本-图像联合嵌入 |
+| CLIP ViT-B/32 | ~330MB | 本地文本-图像联合嵌入 |
 | MobileNetV3 | ~15MB | 本地图像标签 |
 | RMBG-1.4 | ~80MB | 本地智能抠图 |
 
@@ -197,19 +240,23 @@ CREATE TABLE asset_embeddings (
 
 ```json
 {
-  "embedding": {
+  "ai_embedding": {
     "base_url": "https://api.openai.com/v1",
     "api_key": "sk-...",
-    "model": "text-embedding-3-small"
+    "model": "text-embedding-3-small",
+    "multimodal": false
   }
 }
 ```
+
+`multimodal: true` 时端点必须是联合嵌入模型（如 `jina-clip-v2`），素材改按缩略图嵌入。
 
 ### 设置页
 
 - Base URL 输入框
 - API Key 输入框
 - 模型名称输入框
+- **多模态（图像）嵌入**开关
 - 测试连接按钮
 - 手动触发回填按钮
 

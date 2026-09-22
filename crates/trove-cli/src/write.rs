@@ -10,15 +10,15 @@
 
 use serde_json::{Map, Value, json};
 
-use trove_core::ai::OpenAIChat;
+use trove_core::ai::vendor::build_from_config;
 use trove_core::media::import::ImportStorage;
 use trove_core::model::{AssetPatch, NewCollection};
-use trove_core::tasks::autotag::AutoTagRequest;
+use trove_core::tasks::ai_analysis::AiAnalysisRunRequest;
 use trove_core::tasks::import::{ImportOptions, ImportSource};
 use trove_core::tasks::{TaskKind, TaskManager};
 
 use crate::cli::{
-    AutotagArgs, CollectionCommand, Ids, ImportArgs, IndexCommand, PurgeArgs, SetArgs, TagArgs,
+    AnalyzeArgs, CollectionCommand, Ids, ImportArgs, IndexCommand, PurgeArgs, SetArgs, TagArgs,
 };
 use crate::ctx::{CliError, Env, Rendered, parse_asset_ids, resolve_collection};
 
@@ -522,21 +522,24 @@ pub fn index(env: &Env, command: &IndexCommand) -> Result<Rendered, CliError> {
 }
 
 // ---------------------------------------------------------------------------
-// autotag
+// analyze
 // ---------------------------------------------------------------------------
 
-/// Ask a chat model to tag assets, or take a previous run's tags back.
+/// Analyse assets with a multimodal model, or take a previous run's tags
+/// back.
 ///
-/// The endpoint and the model come from the library's stored chat
+/// The vendor, endpoint and model come from the library's stored analysis
 /// configuration, not from flags: a model name is a setting, not something to
 /// retype on every invocation. Everything the run may disagree with it about
 /// has a flag.
-pub fn autotag(
+pub fn analyze(
     env: &Env,
-    args: &AutotagArgs,
+    args: &AnalyzeArgs,
     style: &crate::ctx::Style,
 ) -> Result<Rendered, CliError> {
-    let request = AutoTagRequest {
+    let config = trove_core::config::AppConfig::load();
+    let analysis = config.ai_analysis.clone().unwrap_or_default();
+    let request = AiAnalysisRunRequest {
         only: parse_asset_ids(&args.ids)?,
         limit: args.limit,
         force: args.force,
@@ -545,6 +548,7 @@ pub fn autotag(
             (_, true) => Some(true),
             _ => None,
         },
+        fields: analysis_fields(args, &analysis),
         max_new_tags: args.max_new_tags,
         new_tag_parent: args.parent_tag.clone(),
         language: args.language.clone(),
@@ -553,51 +557,50 @@ pub fn autotag(
     };
 
     if args.undo {
-        return undo_autotag(env, request);
+        return undo_analysis(env, request);
     }
 
-    let config = trove_core::config::AppConfig::load();
-    let chat = config.ai_chat.clone().unwrap_or_default();
-    if !chat.is_configured() {
+    if !analysis.is_configured() {
         return Err(CliError::usage(
-            "no chat endpoint is configured: set `ai_chat` (base_url, model, api_key) in \
-             Trove's config.json — the same host as `ai_embedding` usually works",
+            "no analysis endpoint is configured: set `ai_analysis` (vendor, base_url, model, \
+             api_key) in Trove's config.json",
         ));
     }
     // Built even for a dry run: the fingerprint deciding what counts as
     // already done includes the model name, so a dry run that invented one
     // would not answer the question it was asked. It is never called.
-    let provider = std::sync::Arc::new(OpenAIChat::new(&chat)?);
-    let options = env.library.auto_tag_options(&request);
+    let provider = std::sync::Arc::from(build_from_config(&analysis)?);
+    let options = env.library.ai_analysis_options(&request);
 
     style.progress(&format!(
         "{}: {}",
-        chat.model,
+        analysis.model,
         if args.dry_run {
-            "counting what would be tagged"
+            "counting what would be analysed"
         } else if options.send_images {
-            "tagging, with thumbnails"
+            "analysing, with thumbnails"
         } else {
-            "tagging, text only"
+            "analysing, text only"
         },
     ));
 
     let (_, receiver) = env
         .library
-        .start_auto_tag(provider, request)
-        .map_err(|error| CliError::runtime(format!("cannot start the tagging job: {error:?}")))?;
+        .start_ai_analysis(provider, request)
+        .map_err(|error| CliError::runtime(format!("cannot start the analysis job: {error:?}")))?;
     let outcome = receiver
         .recv()
-        .map_err(|_| CliError::runtime("the tagging job did not run to completion"))?;
+        .map_err(|_| CliError::runtime("the analysis job did not run to completion"))?;
     if let Some(error) = &outcome.error {
-        return Err(CliError::runtime(format!("tagging failed: {error}")));
+        return Err(CliError::runtime(format!("analysis failed: {error}")));
     }
 
     let result = json!({
-        "model": chat.model,
+        "model": analysis.model,
+        "vendor": analysis.vendor,
         "dry_run": args.dry_run,
         "planned": outcome.planned,
-        "tagged": outcome.tagged,
+        "analysed": outcome.analysed,
         "unchanged": outcome.unchanged,
         "skipped": outcome.skipped,
         "failed": outcome.failed,
@@ -610,13 +613,13 @@ pub fn autotag(
 
     let human = if args.dry_run {
         format!(
-            "would tag {} asset(s); {} already done",
+            "would analyse {} asset(s); {} already done",
             outcome.planned, outcome.skipped
         )
     } else {
         let mut line = format!(
-            "{} tagged, {} unchanged, {} skipped, {} failed",
-            outcome.tagged, outcome.unchanged, outcome.skipped, outcome.failed,
+            "{} analysed, {} unchanged, {} skipped, {} failed",
+            outcome.analysed, outcome.unchanged, outcome.skipped, outcome.failed,
         );
         if !outcome.created_tags.is_empty() {
             line.push_str(&format!("; new: {}", outcome.created_tags.join(", ")));
@@ -629,10 +632,41 @@ pub fn autotag(
     Ok(Rendered::new(result, human))
 }
 
-fn undo_autotag(env: &Env, request: AutoTagRequest) -> Result<Rendered, CliError> {
+/// Resolve `--description` / `--no-description` / `--rating` / `--no-rating`
+/// into a field set, or `None` to inherit the stored configuration verbatim.
+fn analysis_fields(
+    args: &AnalyzeArgs,
+    config: &trove_core::config::AiAnalysisConfig,
+) -> Option<trove_core::ai::analysis::AiAnalysisFields> {
+    let touched = args.description || args.no_description || args.rating || args.no_rating;
+    if !touched {
+        return None;
+    }
+    // A flag pair is mutually exclusive by clap, so at most one of each lands.
+    let mut fields = trove_core::ai::analysis::AiAnalysisFields {
+        description: config.fields.description,
+        tags: config.fields.tags,
+        rating: config.fields.rating,
+    };
+    if args.description {
+        fields.description = true;
+    }
+    if args.no_description {
+        fields.description = false;
+    }
+    if args.rating {
+        fields.rating = true;
+    }
+    if args.no_rating {
+        fields.rating = false;
+    }
+    Some(fields)
+}
+
+fn undo_analysis(env: &Env, request: AiAnalysisRunRequest) -> Result<Rendered, CliError> {
     let (_, receiver) = env
         .library
-        .start_auto_tag_undo(request)
+        .start_ai_analysis_undo(request)
         .map_err(|error| CliError::runtime(format!("cannot start the undo job: {error:?}")))?;
     let outcome = receiver
         .recv()

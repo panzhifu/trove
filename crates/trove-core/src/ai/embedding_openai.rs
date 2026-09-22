@@ -41,6 +41,9 @@ pub struct OpenAICompatible {
     base_url: String,
     api_key: String,
     model: String,
+    /// The endpoint is a multimodal (CLIP-style) embedder: assets are
+    /// embedded from their image and a text query lands in the same space.
+    multimodal: bool,
     /// Learned from the first successful response (`None` until then) —
     /// servers vary the dimension per model and the model card is not
     /// always reachable.
@@ -73,13 +76,15 @@ impl OpenAICompatible {
             base_url,
             api_key: config.api_key.trim().to_string(),
             model,
+            multimodal: config.multimodal,
             known_dim: OnceLock::new(),
         })
     }
 
-    /// One HTTP round trip for `inputs`, parsed and validated.
-    fn request(&self, inputs: &[String]) -> Result<Vec<Vec<f32>>> {
-        let body = serde_json::json!({ "model": self.model, "input": inputs }).to_string();
+    /// One HTTP round trip for `input`, parsed and validated. `expected` is
+    /// how many vectors the caller is waiting for, which is the input count.
+    fn request(&self, input: serde_json::Value, expected: usize) -> Result<Vec<Vec<f32>>> {
+        let body = serde_json::json!({ "model": self.model, "input": input }).to_string();
         let url = format!("{}/embeddings", self.base_url);
 
         let mut last_error: Option<String> = None;
@@ -106,7 +111,7 @@ impl OpenAICompatible {
                     let status = response.status().as_u16();
                     let text = read_body(&mut response, MAX_BODY)?;
                     if (200..300).contains(&status) {
-                        let vectors = parse_response(&text, inputs.len())?;
+                        let vectors = parse_response(&text, expected)?;
                         if let Some(dim) = vectors.first().map(Vec::len) {
                             let _ = self.known_dim.set(dim);
                         }
@@ -144,7 +149,15 @@ impl EmbeddingProvider for OpenAICompatible {
     }
 
     fn asset_space(&self) -> EmbeddingSpace {
-        EmbeddingSpace::Text
+        // A multimodal endpoint files its **asset** rows under the image
+        // space while its queries stay text: the two encoders are different,
+        // but they were trained into one space, so the vectors are directly
+        // comparable. That is the whole point of this mode.
+        if self.multimodal {
+            EmbeddingSpace::Image
+        } else {
+            EmbeddingSpace::Text
+        }
     }
 
     fn dim(&self) -> Option<usize> {
@@ -154,10 +167,71 @@ impl EmbeddingProvider for OpenAICompatible {
     fn embed_texts(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
         let mut out = Vec::with_capacity(texts.len());
         for chunk in texts.chunks(REQUEST_BATCH) {
-            out.extend(self.request(chunk)?);
+            let input = self.text_input(chunk);
+            out.extend(self.request(input, chunk.len())?);
         }
         Ok(out)
     }
+
+    fn embed_images(&self, paths: &[std::path::PathBuf]) -> Result<Vec<Vec<f32>>> {
+        if !self.multimodal {
+            return Err(Error::Validation(format!(
+                "provider {} is text-only; turn on multimodal mode to embed images",
+                self.id()
+            )));
+        }
+        let mut out = Vec::with_capacity(paths.len());
+        for chunk in paths.chunks(REQUEST_BATCH) {
+            let mut input = Vec::with_capacity(chunk.len());
+            for path in chunk {
+                input.push(serde_json::json!({ "image": image_data_uri(path)? }));
+            }
+            out.extend(self.request(serde_json::Value::Array(input), chunk.len())?);
+        }
+        Ok(out)
+    }
+}
+
+impl OpenAICompatible {
+    /// The `input` array for a batch of texts: bare strings for a plain
+    /// embedding endpoint, modality-tagged objects for a multimodal one.
+    fn text_input(&self, texts: &[String]) -> serde_json::Value {
+        if self.multimodal {
+            serde_json::Value::Array(
+                texts
+                    .iter()
+                    .map(|text| serde_json::json!({ "text": text }))
+                    .collect(),
+            )
+        } else {
+            serde_json::Value::Array(texts.iter().map(|text| serde_json::json!(text)).collect())
+        }
+    }
+}
+
+/// A thumbnail as a `data:` URI — the inline form multimodal embedding APIs
+/// accept. The bytes are already a small JPEG (see [`crate::media::thumb`]).
+fn image_data_uri(path: &std::path::Path) -> Result<String> {
+    use base64::Engine as _;
+    let bytes = std::fs::read(path).map_err(|error| {
+        Error::Io(std::io::Error::other(format!(
+            "read image {}: {error}",
+            path.display()
+        )))
+    })?;
+    let mime = match path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("png") => "image/png",
+        Some("webp") => "image/webp",
+        Some("gif") => "image/gif",
+        _ => "image/jpeg",
+    };
+    let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
+    Ok(format!("data:{mime};base64,{encoded}"))
 }
 
 /// Parse a successful `/embeddings` body: one vector per input, in input
@@ -223,6 +297,7 @@ mod tests {
             base_url: base_url.into(),
             api_key: String::new(),
             model: model.into(),
+            multimodal: false,
         }
     }
 
@@ -298,5 +373,70 @@ mod tests {
         let cut = truncate(&long, 300);
         assert_eq!(cut.chars().count(), 301, "300 chars plus the ellipsis");
         assert!(cut.ends_with('…'));
+    }
+
+    fn multimodal_config(model: &str) -> EmbeddingConfig {
+        EmbeddingConfig {
+            base_url: "https://api.example.com/v1".into(),
+            api_key: String::new(),
+            model: model.into(),
+            multimodal: true,
+        }
+    }
+
+    #[test]
+    fn a_multimodal_provider_files_assets_under_the_image_space() {
+        let multi = OpenAICompatible::new(&multimodal_config("jina-clip-v2")).unwrap();
+        assert_eq!(multi.asset_space(), EmbeddingSpace::Image);
+
+        let plain = OpenAICompatible::new(&config("https://api.example.com/v1", "m")).unwrap();
+        assert_eq!(plain.asset_space(), EmbeddingSpace::Text);
+    }
+
+    #[test]
+    fn multimodal_input_labels_each_modality() {
+        let plain = OpenAICompatible::new(&config("https://api.example.com/v1", "m")).unwrap();
+        assert_eq!(
+            plain.text_input(&["cat".to_string()]),
+            serde_json::json!(["cat"]),
+            "a plain endpoint takes bare strings"
+        );
+
+        let multi = OpenAICompatible::new(&multimodal_config("jina-clip-v2")).unwrap();
+        assert_eq!(
+            multi.text_input(&["猫".to_string()]),
+            serde_json::json!([{ "text": "猫" }]),
+            "a multimodal endpoint needs the modality tag"
+        );
+    }
+
+    #[test]
+    fn images_become_data_uris_with_the_right_mime() {
+        let dir = std::env::temp_dir().join(format!("trove-embed-uri-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let png = dir.join("a.png");
+        std::fs::write(&png, [0x89, b'P', b'N', b'G']).unwrap();
+        assert!(image_data_uri(&png).unwrap().starts_with("data:image/png;base64,"));
+
+        let jpg = dir.join("a.jpg");
+        std::fs::write(&jpg, [0xFF, 0xD8, 0xFF]).unwrap();
+        assert!(image_data_uri(&jpg).unwrap().starts_with("data:image/jpeg;base64,"));
+
+        // An unreadable path is an error, never a silent empty vector.
+        assert!(image_data_uri(&dir.join("missing.png")).is_err());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn only_a_multimodal_provider_accepts_images() {
+        let plain = OpenAICompatible::new(&config("https://api.example.com/v1", "m")).unwrap();
+        assert!(
+            plain.embed_images(&[]).is_err(),
+            "a text endpoint must refuse images even for an empty batch"
+        );
+
+        let multi = OpenAICompatible::new(&multimodal_config("jina-clip-v2")).unwrap();
+        assert!(multi.embed_images(&[]).unwrap().is_empty());
     }
 }

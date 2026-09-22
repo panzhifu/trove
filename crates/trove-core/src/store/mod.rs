@@ -81,17 +81,18 @@ impl Store {
         Ok(())
     }
 
-    /// Open a new library, or check that an existing one is the shape this
-    /// build reads.
+    /// Open a new library, check that an existing one is a shape this build
+    /// reads, or walk it forward along [`schema::UPGRADES`].
     ///
     /// A fresh file (version 0) gets [`schema::SCHEMA`] whole. A library at
-    /// [`schema::SCHEMA_VERSION`] is left alone. Anything else is refused with
-    /// both versions in the message — before a statement has run, so the file
-    /// is untouched and the user's next move (back it up, start a new one) is
-    /// theirs to make on intact data. There is no upgrade chain; see
-    /// [`crate::store::schema`] for why.
+    /// [`schema::SCHEMA_VERSION`] is left alone. A library sitting at the
+    /// `from` of an upgrade step is migrated in place, one step at a time
+    /// until the shape is current. Anything else is refused with both
+    /// versions in the message — before a statement has run, so the file is
+    /// untouched and the user's next move (back it up, start a new one) is
+    /// theirs to make on intact data.
     pub fn migrate(&self) -> Result<()> {
-        let current = self.user_version()?;
+        let mut current = self.user_version()?;
         if current == schema::SCHEMA_VERSION {
             return Ok(());
         }
@@ -99,11 +100,22 @@ impl Store {
             self.apply(schema::SCHEMA)?;
             return self.set_user_version(schema::SCHEMA_VERSION);
         }
-        Err(crate::error::Error::Validation(format!(
-            "library schema v{current}, this build reads v{} only: \
-             back the library up and start a new one",
-            schema::SCHEMA_VERSION
-        )))
+        // Walk the upgrade list to the current shape. Every step's DDL is
+        // additive and re-runnable, so a crash between the DDL and the
+        // version bump only costs a redo, never a bricked library.
+        while current != schema::SCHEMA_VERSION {
+            let Some(step) = schema::UPGRADES.iter().find(|step| step.from == current) else {
+                return Err(crate::error::Error::Validation(format!(
+                    "library schema v{current}, this build reads v{} only: \
+                     back the library up and start a new one",
+                    schema::SCHEMA_VERSION
+                )));
+            };
+            self.apply(step.sql)?;
+            self.set_user_version(step.to)?;
+            current = step.to;
+        }
+        Ok(())
     }
 
     /// Apply one DDL script atomically.
@@ -363,16 +375,63 @@ mod tests {
         store.migrate().unwrap();
     }
 
-    /// A library from another build is refused rather than guessed at — and
-    /// refused *before anything runs*, so the file the user has is the file
-    /// they had. That is the whole argument for a version gate over an
-    /// upgrade chain: the failure mode is a message, not a half-applied
-    /// shape.
+    /// A library sitting at the `from` of an upgrade step is walked forward
+    /// instead of refused — the case the version gate was waiting for.
+    #[test]
+    fn a_v14_library_is_upgraded_in_place() {
+        let dir = std::env::temp_dir().join(format!("trove-schema-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("library.db");
+        let asset = sample_asset("kept.png", AssetKind::Image);
+
+        {
+            let store = Store::open(&path).unwrap();
+            assets::insert(store.conn(), &asset).unwrap();
+        }
+
+        // Rewind to exactly the v14 shape: v15 added only this table and its
+        // index.
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .execute_batch(
+                "DROP INDEX IF EXISTS idx_ai_analysis_model;\n                 DROP TABLE IF EXISTS ai_analysis;\n                 PRAGMA user_version = 14;",
+            )
+            .unwrap();
+
+        let store = Store::open(&path).unwrap();
+        assert_eq!(
+            store.user_version().unwrap(),
+            schema::SCHEMA_VERSION,
+            "the step ran and the version moved"
+        );
+        let tables: i64 = store
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'ai_analysis'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(tables, 1, "the upgrade created the cache table");
+        assert!(
+            assets::get(store.conn(), asset.id).unwrap().is_some(),
+            "the upgrade is additive: existing rows survive"
+        );
+
+        // Re-opening a migrated library is a no-op.
+        drop(store);
+        let store = Store::open(&path).unwrap();
+        assert_eq!(store.user_version().unwrap(), schema::SCHEMA_VERSION);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A library from a version with no upgrade step is refused rather than
+    /// guessed at — and refused *before anything runs*, so the file the user
+    /// has is the file they had. That is the whole argument for a version
+    /// gate: the failure mode is a message, not a half-applied shape.
     ///
-    /// v13 is the interesting case, because it is the version this build's
-    /// immediate predecessor wrote: those libraries differ from a current one
-    /// by one column name, and they are still refused (the rename used to be
-    /// an upgrade step; see [`crate::store::schema`]).
+    /// Only v14 has a step (see [`schema::UPGRADES`]); everything else is
+    /// refused, including the v13 whose only difference was a column name.
     #[test]
     fn a_library_from_another_version_is_refused_untouched() {
         let dir = std::env::temp_dir().join(format!("trove-schema-{}", Uuid::new_v4()));

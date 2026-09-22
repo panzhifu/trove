@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 
 use image::GenericImageView;
 
-use crate::model::AssetKind;
+use crate::model::{Asset, AssetKind, Origin};
 
 /// Longest edge of generated thumbnails, in pixels.
 pub const THUMB_MAX: u32 = 512;
@@ -40,6 +40,20 @@ pub fn ensure(root: &Path, sha: &str, kind: AssetKind, blob_path: &Path) -> Opti
         AssetKind::Model => write_model_card(blob_path, &out),
         _ => None,
     }
+}
+
+/// The cached thumbnail for a whole asset, generated on demand.
+///
+/// The two blob-path rules are `Library::asset_file`'s — a linked file lives
+/// where it was imported from, a stored one under the library's `media/` —
+/// repeated here for the background jobs that hold no `Library`.
+pub fn ensure_for_asset(cache_root: &Path, data_root: &Path, asset: &Asset) -> Option<PathBuf> {
+    let sha = asset.content_hash.as_deref()?;
+    let blob = match asset.origin {
+        Origin::Linked => PathBuf::from(asset.facts.source_path.clone()?),
+        Origin::Stored => data_root.join(asset.rel_path.as_deref()?),
+    };
+    ensure(cache_root, sha, asset.kind, &blob)
 }
 
 /// Regenerate a thumbnail unconditionally, overwriting any existing file.

@@ -25,10 +25,16 @@ const BATCH: usize = 64;
 /// UI's reads.
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Where the job's connection points — the library's `library.db`.
+/// Where the job's connection points, and where the library's files are.
 #[derive(Debug, Clone)]
 pub struct EmbedOptions {
+    /// The library's `library.db`.
     pub db_path: PathBuf,
+    /// Library root — where a stored asset's blob lives, needed to generate a
+    /// thumbnail when the provider embeds images.
+    pub data_root: PathBuf,
+    /// Cache root — where thumbnails live.
+    pub cache_root: PathBuf,
 }
 
 /// What one settled run did. `error` is set when the run stopped early (the
@@ -41,6 +47,30 @@ pub struct EmbedOutcome {
     pub failed: u64,
     pub cancelled: bool,
     pub error: Option<String>,
+}
+
+/// What one asset contributes to the index.
+///
+/// Decided by the provider's space: a text embedder files the asset's
+/// metadata, a multimodal one files its image. For a CLIP-style provider the
+/// two encoders share one space, so a text query is comparable with either.
+enum Input {
+    Text(String),
+    Image(PathBuf),
+}
+
+/// One asset queued for the next batches.
+struct Work {
+    asset: Asset,
+    input: Input,
+    /// Fingerprint of the input that produced the vector; a change means the
+    /// stored row is stale.
+    hash: String,
+}
+
+/// The thumbnail an image-space embedder should read, generated on demand.
+fn thumbnail_for(options: &EmbedOptions, asset: &Asset) -> Option<PathBuf> {
+    crate::media::thumb::ensure_for_asset(&options.cache_root, &options.data_root, asset)
 }
 
 /// Run one backfill to completion against `provider`. Synchronous and
@@ -84,7 +114,7 @@ pub fn run(
     ctx.set_summary("scanning library".into());
     let candidates = embeddings::embeddable_assets(&conn, &model, space)
         .map_err(|e| format!("list assets: {e}"))?;
-    let mut work: Vec<(Asset, String, String)> = Vec::new();
+    let mut work: Vec<Work> = Vec::new();
     for (asset, stored) in candidates {
         if ctx.cancelled() {
             outcome.cancelled = true;
@@ -95,12 +125,36 @@ pub fn run(
             .into_iter()
             .map(|t| t.name)
             .collect();
-        let text = asset_embed_text(&asset, &tag_names);
-        let hash = source_hash(&text);
+        // What goes into the vector depends on the provider's space. An
+        // image-space asset with no usable thumbnail falls back to its
+        // metadata text: a CLIP-style text encoder lands in the same space as
+        // its image encoder, so the asset stays searchable rather than being
+        // dropped.
+        let (input, hash) = match space {
+            EmbeddingSpace::Image => {
+                match (thumbnail_for(options, &asset), asset.content_hash.clone()) {
+                    (Some(path), Some(hash)) => (Input::Image(path), hash),
+                    _ => {
+                        let text = asset_embed_text(&asset, &tag_names);
+                        let hash = source_hash(&text);
+                        (Input::Text(text), hash)
+                    }
+                }
+            }
+            EmbeddingSpace::Text => {
+                let text = asset_embed_text(&asset, &tag_names);
+                let hash = source_hash(&text);
+                (Input::Text(text), hash)
+            }
+        };
         if stored.as_deref() == Some(hash.as_str()) {
             outcome.skipped += 1;
         } else {
-            work.push((asset, text, hash));
+            work.push(Work {
+                asset,
+                input,
+                hash,
+            });
         }
     }
 
@@ -113,21 +167,68 @@ pub fn run(
             break;
         }
 
-        let texts: Vec<String> = batch.iter().map(|(_, text, _)| text.clone()).collect();
-        let vectors = match provider.embed_texts(&texts) {
-            Ok(v) => v,
-            Err(e) => {
-                outcome.error = Some(format!("embedding provider failed: {e}"));
-                return Ok(outcome);
+        // A batch can mix the two input kinds — an image space falls back to
+        // text for assets with no thumbnail — and the provider exposes one
+        // call per kind. Split, call, then put the answers back in batch
+        // order.
+        let texts: Vec<String> = batch
+            .iter()
+            .filter_map(|work| match &work.input {
+                Input::Text(text) => Some(text.clone()),
+                Input::Image(_) => None,
+            })
+            .collect();
+        let images: Vec<PathBuf> = batch
+            .iter()
+            .filter_map(|work| match &work.input {
+                Input::Image(path) => Some(path.clone()),
+                Input::Text(_) => None,
+            })
+            .collect();
+
+        // An empty leg is skipped entirely: a text-only provider *errors* on
+        // `embed_images(&[])`, so calling it blindly would fail every batch.
+        let text_vectors = if texts.is_empty() {
+            Vec::new()
+        } else {
+            match provider.embed_texts(&texts) {
+                Ok(vectors) => vectors,
+                Err(error) => {
+                    outcome.error = Some(format!("embedding provider failed: {error}"));
+                    return Ok(outcome);
+                }
             }
         };
-        if vectors.len() != batch.len() {
+        let image_vectors = if images.is_empty() {
+            Vec::new()
+        } else {
+            match provider.embed_images(&images) {
+                Ok(vectors) => vectors,
+                Err(error) => {
+                    outcome.error = Some(format!("embedding provider failed: {error}"));
+                    return Ok(outcome);
+                }
+            }
+        };
+        if text_vectors.len() != texts.len() || image_vectors.len() != images.len() {
             outcome.error = Some(format!(
-                "embedding provider returned {} vectors for {} inputs",
-                vectors.len(),
+                "embedding provider returned {} text and {} image vectors for {} inputs",
+                text_vectors.len(),
+                image_vectors.len(),
                 batch.len()
             ));
             return Ok(outcome);
+        }
+
+        // Reassemble in batch order, which is the order the rows are written.
+        let mut vectors: Vec<Vec<f32>> = Vec::with_capacity(batch.len());
+        let mut text_iter = text_vectors.into_iter();
+        let mut image_iter = image_vectors.into_iter();
+        for work in batch {
+            match &work.input {
+                Input::Text(_) => vectors.push(text_iter.next().unwrap_or_default()),
+                Input::Image(_) => vectors.push(image_iter.next().unwrap_or_default()),
+            }
         }
         if provider.dim().is_none()
             && let Some(dim) = vectors.first().map(Vec::len)
@@ -140,13 +241,13 @@ pub fn run(
         let tx = conn
             .transaction()
             .map_err(|e| format!("begin batch: {e}"))?;
-        for ((asset, _, hash), vector) in batch.iter().zip(vectors) {
+        for (work, vector) in batch.iter().zip(vectors) {
             let embedding = NewEmbedding {
-                asset_id: asset.id,
+                asset_id: work.asset.id,
                 model: model.clone(),
                 space,
                 vector,
-                source_hash: hash.clone(),
+                source_hash: work.hash.clone(),
             };
             match embeddings::upsert(&tx, &embedding) {
                 Ok(()) => outcome.embedded += 1,
@@ -154,7 +255,7 @@ pub fn run(
                 // still mismatches, so the next run retries it.
                 Err(e) => {
                     outcome.failed += 1;
-                    tracing::warn!(asset = %asset.file_name, error = %e, "embedding row rejected");
+                    tracing::warn!(asset = %work.asset.file_name, error = %e, "embedding row rejected");
                 }
             }
         }
@@ -237,6 +338,8 @@ mod tests {
         seed(&dir, 10);
         let options = EmbedOptions {
             db_path: dir.join("library.db"),
+            data_root: dir.clone(),
+            cache_root: dir.join("cache"),
         };
         let ctx = bare_ctx();
         let outcome = run(&options, &MockProvider::new("mock", 8), &ctx).unwrap();
@@ -268,6 +371,8 @@ mod tests {
         seed(&dir, 5);
         let options = EmbedOptions {
             db_path: dir.join("library.db"),
+            data_root: dir.clone(),
+            cache_root: dir.join("cache"),
         };
         let ctx = bare_ctx();
         run(&options, &MockProvider::new("mock", 8), &ctx).unwrap();
@@ -283,6 +388,8 @@ mod tests {
         seed(&dir, 2);
         let options = EmbedOptions {
             db_path: dir.join("library.db"),
+            data_root: dir.clone(),
+            cache_root: dir.join("cache"),
         };
         let ctx = bare_ctx();
         run(&options, &MockProvider::new("mock", 8), &ctx).unwrap();
@@ -312,6 +419,8 @@ mod tests {
         seed(&dir, 3);
         let options = EmbedOptions {
             db_path: dir.join("library.db"),
+            data_root: dir.clone(),
+            cache_root: dir.join("cache"),
         };
         let ctx = bare_ctx();
         run(&options, &MockProvider::new("mock", 8), &ctx).unwrap();
@@ -341,9 +450,102 @@ mod tests {
 
         let options = EmbedOptions {
             db_path: dir.join("library.db"),
+            data_root: dir.clone(),
+            cache_root: dir.join("cache"),
         };
         let outcome = run(&options, &MockProvider::new("mock", 8), &bare_ctx()).unwrap();
         assert_eq!(outcome.embedded, 3);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A multimodal mock: image space, and it counts the images it saw so the
+    /// test can prove the backfill reached for the thumbnail.
+    struct MockImageProvider {
+        model: String,
+        dim: usize,
+        images_seen: std::sync::atomic::AtomicUsize,
+    }
+
+    impl EmbeddingProvider for MockImageProvider {
+        fn id(&self) -> &str {
+            &self.model
+        }
+        fn asset_space(&self) -> EmbeddingSpace {
+            EmbeddingSpace::Image
+        }
+        fn dim(&self) -> Option<usize> {
+            Some(self.dim)
+        }
+        fn embed_texts(&self, texts: &[String]) -> crate::error::Result<Vec<Vec<f32>>> {
+            Ok(texts.iter().map(|_| vec![1.0; self.dim]).collect())
+        }
+        fn embed_images(
+            &self,
+            paths: &[std::path::PathBuf],
+        ) -> crate::error::Result<Vec<Vec<f32>>> {
+            self.images_seen.fetch_add(paths.len(), std::sync::atomic::Ordering::Relaxed);
+            Ok(paths.iter().map(|_| vec![0.5; self.dim]).collect())
+        }
+    }
+
+    #[test]
+    fn an_image_space_provider_embeds_the_thumbnail_not_the_metadata() {
+        use crate::model::Origin;
+
+        let root = library_dir();
+        let data = root.join("data");
+        let cache = root.join("cache");
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::create_dir_all(&cache).unwrap();
+
+        // A real PNG behind a linked asset, so a thumbnail can be generated.
+        let store = Store::open(&data.join("library.db")).unwrap();
+        let source = data.join("cat.png");
+        image::RgbImage::from_pixel(32, 32, image::Rgb([200, 60, 40]))
+            .save(&source)
+            .unwrap();
+        let hash = crate::media::hash::hash_bytes(&std::fs::read(&source).unwrap());
+        let mut asset = test_asset("cat.png", crate::model::AssetKind::Image, Uuid::new_v4());
+        asset.origin = Origin::Linked;
+        asset.content_hash = Some(hash);
+        asset.width = Some(32);
+        asset.height = Some(32);
+        asset.facts.source_path = Some(source.display().to_string());
+        assets::insert(store.conn(), &asset).unwrap();
+
+        let options = EmbedOptions {
+            db_path: data.join("library.db"),
+            data_root: data.clone(),
+            cache_root: cache.clone(),
+        };
+        let provider = MockImageProvider {
+            model: "mock-clip".into(),
+            dim: 8,
+            images_seen: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let outcome = run(&options, &provider, &bare_ctx()).unwrap();
+        assert_eq!(outcome.embedded, 1, "{outcome:?}");
+        assert_eq!(
+            provider.images_seen.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "the image leg was used"
+        );
+
+        // The row is filed under the image space, at the provider's width.
+        let store = Store::open(&data.join("library.db")).unwrap();
+        assert_eq!(
+            embeddings::coverage(store.conn(), "mock-clip", EmbeddingSpace::Image).unwrap(),
+            (1, 1)
+        );
+        let vector = embeddings::get(store.conn(), asset.id, "mock-clip", EmbeddingSpace::Image)
+            .unwrap()
+            .expect("an image-space row");
+        assert_eq!(vector.len(), 8);
+
+        // Its fingerprint is the content hash, so a second run is free.
+        let again = run(&options, &provider, &bare_ctx()).unwrap();
+        assert_eq!(again.skipped, 1);
+        assert_eq!(again.embedded, 0);
+        std::fs::remove_dir_all(&root).ok();
     }
 }

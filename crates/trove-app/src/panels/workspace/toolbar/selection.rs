@@ -154,9 +154,9 @@ pub(crate) fn selection_toolbar(
                     .on_click({
                         let controller = controller.clone();
                         move |_, window, cx| {
-                            crate::library::jobs::start_auto_tag_app(
+                            crate::library::jobs::start_analysis_app(
                                 &controller,
-                                crate::library::jobs::AutoTagTarget::Selection,
+                                crate::library::jobs::AnalysisTarget::Selection,
                                 window,
                                 cx,
                             );
