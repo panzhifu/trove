@@ -15,9 +15,10 @@
 //! <slug>/`. Removing a library therefore removes two directories and touches
 //! no user file — assets are linked where they already live.
 //!
-//! `TROVE_DATA_DIR` relocates the data root for tests, benchmarks and
-//! portable installs. The other three roots have no override: nothing outside
-//! `data` is worth relocating.
+//! `config`, `data` and `cache` each have an environment override
+//! (`TROVE_CONFIG_DIR`, `TROVE_DATA_DIR`, `TROVE_CACHE_DIR`) so a test run, a
+//! benchmark or a second profile can live entirely elsewhere. `state` has
+//! none — the only thing under it is a log file.
 
 use std::path::{Path, PathBuf};
 
@@ -29,6 +30,14 @@ pub const DEFAULT_LIBRARY_SLUG: &str = "default";
 
 /// Environment variable relocating the data root.
 pub const DATA_DIR_ENV: &str = "TROVE_DATA_DIR";
+
+/// Environment variable relocating the config root. A second profile, or a
+/// test run that must not read or write the user's real settings.
+pub const CONFIG_DIR_ENV: &str = "TROVE_CONFIG_DIR";
+
+/// Environment variable relocating the cache root. Same purpose as
+/// [`CONFIG_DIR_ENV`]: a test run must not fill the user's real cache.
+pub const CACHE_DIR_ENV: &str = "TROVE_CACHE_DIR";
 
 /// `<platform root>/trove`, falling back to a dot-directory in `$HOME` when
 /// the platform reports no root at all (a stripped container, a broken
@@ -42,28 +51,39 @@ fn platform_root(pick: fn() -> Option<PathBuf>, kind: &str) -> PathBuf {
     }
 }
 
-/// `~/.config/trove` — settings, themes, history.
-pub fn config_dir() -> PathBuf {
-    platform_root(dirs::config_dir, "config")
+/// The root for a given XDG category: the override when present, the platform
+/// root otherwise. Split out of the callers so the rule is testable without
+/// mutating the process environment (racy under a parallel test run).
+fn resolve_root(
+    override_dir: Option<PathBuf>,
+    pick: fn() -> Option<PathBuf>,
+    kind: &str,
+) -> PathBuf {
+    override_dir.unwrap_or_else(|| platform_root(pick, kind))
 }
 
-/// The data root for a given override value: the override when present, the
-/// platform root otherwise. Split out of [`data_dir`] so the rule is testable
-/// without mutating the process environment (racy under a parallel test run).
-fn resolve_data_dir(override_dir: Option<PathBuf>) -> PathBuf {
-    override_dir.unwrap_or_else(|| platform_root(dirs::data_dir, "data"))
+/// The value of a root's override variable, if it is set.
+fn env_dir(variable: &str) -> Option<PathBuf> {
+    std::env::var_os(variable).map(PathBuf::from)
+}
+
+/// `~/.config/trove` — settings, themes, history. Relocatable with
+/// [`CONFIG_DIR_ENV`].
+pub fn config_dir() -> PathBuf {
+    resolve_root(env_dir(CONFIG_DIR_ENV), dirs::config_dir, "config")
 }
 
 /// `~/.local/share/trove` — library databases, backups, incoming files.
 /// Relocatable with [`DATA_DIR_ENV`].
 pub fn data_dir() -> PathBuf {
-    resolve_data_dir(std::env::var_os(DATA_DIR_ENV).map(PathBuf::from))
+    resolve_root(env_dir(DATA_DIR_ENV), dirs::data_dir, "data")
 }
 
 /// `~/.cache/trove` — thumbnails and the full-text index. Safe to delete:
 /// everything here is derived from the database and the linked files.
+/// Relocatable with [`CACHE_DIR_ENV`].
 pub fn cache_dir() -> PathBuf {
-    platform_root(dirs::cache_dir, "cache")
+    resolve_root(env_dir(CACHE_DIR_ENV), dirs::cache_dir, "cache")
 }
 
 /// `~/.local/state/trove` — logs. XDG_STATE_HOME is a Linux convention;
@@ -147,11 +167,21 @@ mod tests {
         assert!(themes_dir().starts_with(config_dir()));
     }
 
-    /// The data root is the one root that can be moved by the environment.
+    /// The roots that can be moved by the environment resolve to their
+    /// override, and to the platform root otherwise.
     #[test]
-    fn the_data_root_honours_its_override() {
+    fn the_roots_honour_their_overrides() {
         let override_dir = PathBuf::from("/nonexistent/trove-data-override");
-        assert_eq!(resolve_data_dir(Some(override_dir.clone())), override_dir);
-        assert!(resolve_data_dir(None).ends_with(APP_DIR));
+        assert_eq!(
+            resolve_root(Some(override_dir.clone()), dirs::data_dir, "data"),
+            override_dir
+        );
+        for (pick, kind) in [
+            (dirs::data_dir as fn() -> Option<PathBuf>, "data"),
+            (dirs::config_dir, "config"),
+            (dirs::cache_dir, "cache"),
+        ] {
+            assert!(resolve_root(None, pick, kind).ends_with(APP_DIR));
+        }
     }
 }
