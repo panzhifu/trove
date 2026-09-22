@@ -9,8 +9,10 @@
 //! needs — the endpoint, its coverage, generating it, deleting it — is on
 //! this page, in the order a user meets it.
 
+use gpui_kit::component::setting::NumberFieldOptions;
+
 use super::*;
-use crate::library::AiProbe;
+use crate::library::{AiProbe, ChatProbe};
 
 // ============================ config ========================================
 
@@ -52,6 +54,7 @@ pub(super) fn ai_page(controller: &Entity<LibraryController>, cx: &App) -> Setti
         None
     };
     let probe = controller.read(cx).ai_probe.clone();
+    let chat_probe = controller.read(cx).chat_probe.clone();
 
     SettingPage::new(rust_i18n::t!("settings.ai").to_string())
         .icon(IconName::Bot)
@@ -59,6 +62,8 @@ pub(super) fn ai_page(controller: &Entity<LibraryController>, cx: &App) -> Setti
         .resettable(false)
         .group(endpoint_group(controller, &probe))
         .group(vector_group(controller, coverage))
+        .group(chat_group(controller, &chat_probe))
+        .group(tagging_group(controller))
 }
 
 // ============================ endpoint ======================================
@@ -250,4 +255,231 @@ fn ai_delete_row(controller: Entity<LibraryController>, embedded: u64, cx: &mut 
                 crate::library::jobs::delete_embeddings_app(&controller, window, cx);
             }),
     )
+}
+
+// ============================ tagging (chat endpoint) ========================
+
+/// The saved chat config, or defaults when the tagger has never been
+/// configured.
+fn chat_config() -> trove_core::config::ChatConfig {
+    AppConfig::load().ai_chat.unwrap_or_default()
+}
+
+/// Persist one field change to the chat config (`config.json`, like every
+/// other setting).
+fn save_chat_config(edit: impl FnOnce(&mut trove_core::config::ChatConfig), cx: &mut App) {
+    let mut config = AppConfig::load();
+    edit(config.ai_chat.get_or_insert_with(Default::default));
+    let _ = config.save();
+    cx.refresh_windows();
+}
+
+/// The model the automatic tagger asks. Same shape as the embedding endpoint
+/// above and configured apart from it: the two are different models on the
+/// same server as often as not.
+fn chat_group(controller: &Entity<LibraryController>, probe: &ChatProbe) -> SettingGroup {
+    SettingGroup::new()
+        .title(rust_i18n::t!("settings.chat_endpoint").to_string())
+        .item(SettingItem::new(
+            rust_i18n::t!("settings.ai_base_url").to_string(),
+            SettingField::input(
+                |_cx| SharedString::from(chat_config().base_url.clone()),
+                |value, cx| save_chat_config(|config| config.base_url = value.to_string(), cx),
+            ),
+        ))
+        .item(SettingItem::new(
+            rust_i18n::t!("settings.ai_api_key").to_string(),
+            SettingField::input(
+                |_cx| SharedString::from(chat_config().api_key.clone()),
+                |value, cx| save_chat_config(|config| config.api_key = value.to_string(), cx),
+            ),
+        ))
+        .item(SettingItem::new(
+            rust_i18n::t!("settings.chat_model").to_string(),
+            SettingField::input(
+                |_cx| SharedString::from(chat_config().model.clone()),
+                |value, cx| save_chat_config(|config| config.model = value.to_string(), cx),
+            ),
+        ))
+        .item(
+            SettingItem::new(
+                rust_i18n::t!("settings.chat_send_images").to_string(),
+                SettingField::switch(
+                    |_cx| chat_config().send_images,
+                    |value, cx| save_chat_config(|config| config.send_images = value, cx),
+                ),
+            )
+            .description(rust_i18n::t!("settings.chat_send_images_desc").to_string()),
+        )
+        .item(
+            SettingItem::new(
+                rust_i18n::t!("settings.chat_new_tags").to_string(),
+                SettingField::number_input(
+                    NumberFieldOptions {
+                        min: 0.0,
+                        max: 10.0,
+                        step: 1.0,
+                    },
+                    |_cx| chat_config().max_new_tags as f64,
+                    |value, cx| {
+                        let value = value.clamp(0.0, 10.0) as u32;
+                        save_chat_config(|config| config.max_new_tags = value, cx)
+                    },
+                ),
+            )
+            .description(rust_i18n::t!("settings.chat_new_tags_desc").to_string()),
+        )
+        .item(
+            SettingItem::new(
+                rust_i18n::t!("settings.chat_parent_tag").to_string(),
+                SettingField::input(
+                    |_cx| SharedString::from(chat_config().new_tag_parent.clone()),
+                    |value, cx| {
+                        save_chat_config(|config| config.new_tag_parent = value.to_string(), cx)
+                    },
+                ),
+            )
+            .description(rust_i18n::t!("settings.chat_parent_tag_desc").to_string()),
+        )
+        .item(SettingItem::new(
+            rust_i18n::t!("settings.chat_language").to_string(),
+            SettingField::input(
+                |_cx| SharedString::from(chat_config().tag_language.clone().unwrap_or_default()),
+                |value, cx| {
+                    let value = value.trim().to_string();
+                    save_chat_config(
+                        move |config| config.tag_language = (!value.is_empty()).then_some(value),
+                        cx,
+                    )
+                },
+            ),
+        ))
+        .item(
+            SettingItem::new(
+                rust_i18n::t!("settings.ai_probe").to_string(),
+                SettingField::render({
+                    let controller = controller.clone();
+                    let probe = probe.clone();
+                    move |_, _, cx| chat_probe_row(&controller, &probe, cx)
+                }),
+            )
+            .description(rust_i18n::t!("settings.chat_probe_desc").to_string()),
+        )
+}
+
+/// The connection-test row for the chat endpoint: the model's own words on
+/// the left, the button on the right.
+///
+/// Showing what the model *said* is the point — a green tick only proves
+/// something answered, while a sentence proves a model did.
+fn chat_probe_row(controller: &Entity<LibraryController>, probe: &ChatProbe, cx: &mut App) -> Div {
+    let (text, color) = match probe {
+        ChatProbe::Idle => (
+            rust_i18n::t!("settings.ai_probe_idle").to_string(),
+            cx.theme().muted_foreground,
+        ),
+        ChatProbe::Running => (
+            rust_i18n::t!("settings.ai_probe_running").to_string(),
+            cx.theme().muted_foreground,
+        ),
+        ChatProbe::Ok { reply } => (
+            rust_i18n::t!("settings.chat_probe_ok", reply = reply.as_str()).to_string(),
+            cx.theme().success,
+        ),
+        ChatProbe::Failed { message } => (
+            rust_i18n::t!("settings.ai_probe_failed", error = message.as_str()).to_string(),
+            cx.theme().danger,
+        ),
+    };
+    let running = probe.is_running();
+    let controller = controller.clone();
+    h_flex()
+        .w_full()
+        .items_center()
+        .justify_end()
+        .gap_2()
+        .child(div().text_sm().text_color(color).child(text))
+        .child(
+            Button::new("chat-probe")
+                .outline()
+                .small()
+                .disabled(running)
+                .label(rust_i18n::t!("settings.ai_probe_run").to_string())
+                .on_click(move |_, _, cx| {
+                    crate::library::jobs::test_chat_endpoint_app(&controller, cx);
+                }),
+        )
+}
+
+/// The tagging run: what it does, and the buttons that control it.
+fn tagging_group(controller: &Entity<LibraryController>) -> SettingGroup {
+    SettingGroup::new()
+        .title(rust_i18n::t!("settings.autotag").to_string())
+        .item(
+            SettingItem::new(
+                rust_i18n::t!("settings.autotag_scope").to_string(),
+                SettingField::render({
+                    let controller = controller.clone();
+                    move |_, _, cx| autotag_buttons(&controller, cx)
+                }),
+            )
+            .description(rust_i18n::t!("settings.autotag_scope_desc").to_string()),
+        )
+}
+
+/// Run / cancel, plus the undo that takes a whole run back.
+///
+/// The buttons are rebuilt here rather than captured because the row is
+/// rendered once per paint: the run button has to read `is_running` at that
+/// moment, and a captured element would freeze the state it was built with.
+fn autotag_buttons(controller: &Entity<LibraryController>, cx: &mut App) -> Div {
+    let running = controller
+        .read(cx)
+        .library
+        .tasks()
+        .is_running(trove_core::tasks::TaskKind::AutoTag);
+
+    let run = if running {
+        let controller = controller.clone();
+        Button::new("autotag-cancel")
+            .outline()
+            .small()
+            .label(rust_i18n::t!("settings.ai_cancel").to_string())
+            .on_click(move |_, _, cx| {
+                crate::library::jobs::cancel_auto_tag_app(&controller, cx);
+            })
+    } else {
+        let controller = controller.clone();
+        Button::new("autotag-run")
+            .outline()
+            .small()
+            .label(rust_i18n::t!("settings.autotag_run").to_string())
+            .on_click(move |_, window, cx| {
+                crate::library::jobs::start_auto_tag_app(
+                    &controller,
+                    crate::library::jobs::AutoTagTarget::WholeLibrary,
+                    window,
+                    cx,
+                );
+            })
+    };
+
+    let undo = {
+        let controller = controller.clone();
+        Button::new("autotag-undo")
+            .outline()
+            .small()
+            .disabled(running)
+            .label(rust_i18n::t!("settings.autotag_undo").to_string())
+            .on_click(move |_, window, cx| {
+                crate::library::jobs::start_auto_tag_undo_app(&controller, window, cx);
+            })
+    };
+
+    h_flex()
+        .w_full()
+        .justify_end()
+        .gap_2()
+        .child(run)
+        .child(undo)
 }
