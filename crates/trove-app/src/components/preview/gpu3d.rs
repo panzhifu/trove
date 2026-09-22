@@ -112,10 +112,6 @@ pub struct GpuMesh {
     /// partitioned. Each is one draw call the frustum can skip; empty means
     /// "draw the whole index buffer in one call".
     meshlets: Vec<Meshlet>,
-    /// The axis gizmo's vertices, sized to this mesh's bounds.
-    axis: wgpu::Buffer,
-    /// Vertices in `axis`; `0` when the mesh had no extent to build one from.
-    axis_count: u32,
 }
 
 impl GpuMesh {
@@ -180,8 +176,6 @@ struct Pipelines {
     /// Model pipeline that draws both faces.
     model_two_sided: wgpu::RenderPipeline,
     point: wgpu::RenderPipeline,
-    /// The axis gizmo: flat, unlit triangles carrying a colour per vertex.
-    axis: wgpu::RenderPipeline,
     backdrop: wgpu::RenderPipeline,
 }
 
@@ -624,52 +618,10 @@ impl GpuRenderer {
                 cache: None,
             });
 
-            // The axis gizmo: unlit triangles with a colour per vertex, so
-            // it needs none of the model pipeline's lighting inputs.
-            let axis_attributes = wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3];
-            let axis = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some("trove-3d-axis"),
-                layout: Some(&pipeline_layout),
-                vertex: wgpu::VertexState {
-                    module: &shader,
-                    entry_point: Some("vs_axis"),
-                    compilation_options: wgpu::PipelineCompilationOptions::default(),
-                    buffers: &[wgpu::VertexBufferLayout {
-                        array_stride: gpu::AxisData::STRIDE,
-                        step_mode: wgpu::VertexStepMode::Vertex,
-                        attributes: &axis_attributes,
-                    }],
-                },
-                primitive: wgpu::PrimitiveState {
-                    topology: wgpu::PrimitiveTopology::TriangleList,
-                    strip_index_format: None,
-                    front_face: wgpu::FrontFace::Ccw,
-                    // A thin rod is seen from both sides as the camera turns;
-                    // culling either face would make it flicker.
-                    cull_mode: None,
-                    unclipped_depth: false,
-                    polygon_mode: wgpu::PolygonMode::Fill,
-                    conservative: false,
-                },
-                // Depth-tested and depth-written, like the model: the gizmo
-                // belongs to the scene rather than floating over it.
-                depth_stencil: depth_stencil(true),
-                multisample,
-                fragment: Some(wgpu::FragmentState {
-                    module: &shader,
-                    entry_point: Some("fs_axis"),
-                    compilation_options: wgpu::PipelineCompilationOptions::default(),
-                    targets: &[target(format, Some(wgpu::BlendState::REPLACE))],
-                }),
-                multiview_mask: None,
-                cache: None,
-            });
-
             Pipelines {
                 model_culled,
                 model_two_sided: model,
                 point,
-                axis,
                 backdrop,
             }
         };
@@ -892,7 +844,6 @@ impl GpuRenderer {
                 mapped_at_creation: false,
             });
             self.queue.write_buffer(&points, 0, &data.bytes());
-            let (axis, axis_count) = self.upload_axis(mesh);
             return GpuMesh {
                 vertices: points,
                 indices: None,
@@ -902,8 +853,6 @@ impl GpuRenderer {
                 // A sprite is always facing the camera, whatever its winding.
                 cull_backfaces: false,
                 meshlets: Vec::new(),
-                axis,
-                axis_count,
             };
         }
 
@@ -950,7 +899,6 @@ impl GpuRenderer {
             buffer
         });
 
-        let (axis, axis_count) = self.upload_axis(mesh);
         GpuMesh {
             vertices,
             indices,
@@ -959,27 +907,7 @@ impl GpuRenderer {
             point_count: 0,
             cull_backfaces: winding != Winding::TwoSided,
             meshlets,
-            axis,
-            axis_count,
         }
-    }
-
-    /// The axis gizmo's vertices for `mesh`, sized to its bounding box.
-    ///
-    /// Rebuilt with the mesh because it is derived from the bounds, which are
-    /// only known once the file is parsed. Uploaded once per model, not per
-    /// frame: the toggle is a uniform flag, so switching it on costs nothing.
-    fn upload_axis(&self, mesh: &Mesh) -> (wgpu::Buffer, u32) {
-        let data = gpu::axis_data(mesh);
-        let bytes = data.bytes();
-        let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("trove-3d-axis"),
-            size: (bytes.len() as u64).max(4),
-            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        self.queue.write_buffer(&buffer, 0, &bytes);
-        (buffer, data.count)
     }
 
     /// Draw one frame and read it back as tightly packed BGRA, `width *
@@ -1101,15 +1029,6 @@ impl GpuRenderer {
                         pass.draw(0..mesh.vertex_count, 0..1);
                     }
                 }
-            }
-
-            // The gizmo last, so it depth-tests against whatever was drawn
-            // above and shows wherever the model is not in the way.
-            if bands[3] > 0.5 && mesh.axis_count > 0 {
-                pass.set_pipeline(&pipelines.axis);
-                pass.set_bind_group(0, &self.bind_group, &[]);
-                pass.set_vertex_buffer(0, mesh.axis.slice(..));
-                pass.draw(0..mesh.axis_count, 0..1);
             }
         }
 
@@ -1271,12 +1190,10 @@ mod tests {
         assert_eq!(
             found,
             vec![
-                ("fs_axis", naga::ShaderStage::Fragment),
                 ("fs_backdrop", naga::ShaderStage::Fragment),
                 ("fs_edl", naga::ShaderStage::Fragment),
                 ("fs_model", naga::ShaderStage::Fragment),
                 ("fs_point", naga::ShaderStage::Fragment),
-                ("vs_axis", naga::ShaderStage::Vertex),
                 ("vs_backdrop", naga::ShaderStage::Vertex),
                 ("vs_model", naga::ShaderStage::Vertex),
                 ("vs_point", naga::ShaderStage::Vertex),

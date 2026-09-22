@@ -14,8 +14,7 @@ use gpui_kit::assets::{Assets, icon_assets};
 use gpui_kit::{AssetSource, Result, SharedString};
 
 // Volume-1/2/X and Shrink: the video player. RotateCcw and the two flips and
-// Pencil: the preview toolbar's pixel-edit buttons. Axis3d and LocateFixed:
-// the model viewport's scene-axes and trihedron switches. Trash and Eraser:
+// Pencil: the preview toolbar's pixel-edit buttons. Trash and Eraser:
 // the title bar's empty-the-trash and clear-the-history actions. Sparkles:
 // the AI tagging action, where `Bot` (the settings page) would read as
 // "chat" rather than "do something to these assets". None of them are in
@@ -31,8 +30,6 @@ icon_assets!(
         FlipHorizontal2,
         FlipVertical2,
         Pencil,
-        Axis3d,
-        LocateFixed,
         Trash,
         Eraser,
         Sparkles,
@@ -76,8 +73,6 @@ mod tests {
             "icons/flip-horizontal-2.svg",
             "icons/flip-vertical-2.svg",
             "icons/pencil.svg",
-            "icons/axis-3d.svg",
-            "icons/locate-fixed.svg",
             "icons/trash.svg",
             "icons/eraser.svg",
             "icons/sparkles.svg",

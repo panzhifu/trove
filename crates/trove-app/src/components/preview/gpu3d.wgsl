@@ -26,7 +26,7 @@ struct Uniforms {
     // rgb = gradient bottom.
     bg_bottom: vec4<f32>,
     // x = height colouring on (1) / off (0), y = band size in model units,
-    // z = the model's floor (where the bands count from), w = draw the axes.
+    // z = the model's floor (where the bands count from), w unused.
     bands: vec4<f32>,
 };
 
@@ -168,32 +168,6 @@ fn fs_point(in: PointOut) -> @location(0) vec4<f32> {
     let intensity = u.material.w + u.params.x * diffuse;
 
     return vec4<f32>(in.color * intensity, 1.0);
-}
-
-// The X/Y/Z gizmo: flat, unlit triangles in model space.
-//
-// The CPU rasteriser draws the very same triangle list (see
-// `render3d::axis_triangles`), which is why this pass carries a colour per
-// vertex and no lighting at all — there is nothing here to keep in step.
-struct AxisOut {
-    @builtin(position) clip: vec4<f32>,
-    @location(0) color: vec3<f32>,
-};
-
-@vertex
-fn vs_axis(
-    @location(0) position: vec3<f32>,
-    @location(1) color: vec3<f32>,
-) -> AxisOut {
-    var out: AxisOut;
-    out.clip = u.view_proj * vec4<f32>(position, 1.0);
-    out.color = color;
-    return out;
-}
-
-@fragment
-fn fs_axis(in: AxisOut) -> @location(0) vec4<f32> {
-    return vec4<f32>(in.color, 1.0);
 }
 
 // A single oversized triangle covering the viewport, so the backdrop gets the

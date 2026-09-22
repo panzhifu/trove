@@ -134,7 +134,7 @@ Three conventions:
 | Center | Workspace | Justified thumbnail grid + search |
 | Right | Tags + Inspector | Tag filter and per-asset details |
 
-**Settings** opens a window with six pages — About (version, release check, language) · Appearance (light/dark, themes, custom themes) · Files (storage, libraries, watched folders, thumbnails, backups, cleanup) · Model (point-cloud look, axes, preview zoom) · Search (full-text index, visual fingerprints) · Shortcuts. With no library yet, launch opens the **welcome window** instead of the main one.
+**Settings** opens a window with six pages — About (version, release check, language) · Appearance (light/dark, themes, custom themes) · Files (storage, libraries, watched folders, thumbnails, backups, cleanup) · Model (point-cloud look, preview zoom) · Search (full-text index, visual fingerprints) · Shortcuts. With no library yet, launch opens the **welcome window** instead of the main one.
 
 - **System tray** — closing the window minimizes to the tray (KDE/freedesktop StatusNotifierItem / Windows notification icon / macOS NSStatusItem); the tray menu restores the window or quits for good.
 
