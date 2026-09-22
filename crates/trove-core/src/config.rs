@@ -79,21 +79,10 @@ pub struct AppConfig {
     #[serde(default)]
     pub max_preview_zoom: Option<f32>,
     /// Paint 3D previews by height — every [`crate::media::render3d::HEIGHT_BAND`]
-    /// units gets its own hue — with the axis gizmo for reference. Off by
-    /// default so a model looks the way the file intended.
+    /// units gets its own hue. Off by default so a model looks the way the file
+    /// intended.
     #[serde(default)]
     pub height_color: Option<bool>,
-    /// Draw the scene's X/Y/Z axes on the model's bounding box. On by
-    /// default: a model viewer whose axes cannot be told apart is measuring
-    /// nothing. Independent of `height_color`, which used to be the only way
-    /// to get them.
-    #[serde(default)]
-    pub scene_axes: Option<bool>,
-    /// Draw the corner trihedron — a small X/Y/Z axis indicator pinned to the
-    /// viewport's bottom-right corner, turning with the camera. On by default,
-    /// the way every 3D viewer ships it.
-    #[serde(default)]
-    pub corner_axis: Option<bool>,
     /// Check GitHub for a newer release on launch. On by default. The check
     /// only reads the newest tag and offers a link; Trove never downloads or
     /// replaces its own binary (see [`crate::services::update`]).
@@ -802,16 +791,6 @@ impl AppConfig {
     /// Whether 3D previews are painted by height rather than the material.
     pub fn height_color(&self) -> bool {
         self.height_color.unwrap_or(false)
-    }
-
-    /// Whether the 3D preview draws the scene's X/Y/Z axes (on by default).
-    pub fn scene_axes(&self) -> bool {
-        self.scene_axes.unwrap_or(true)
-    }
-
-    /// Whether the 3D preview draws the corner trihedron (on by default).
-    pub fn corner_axis(&self) -> bool {
-        self.corner_axis.unwrap_or(true)
     }
 
     /// Whether to look for a newer release on launch (on by default).

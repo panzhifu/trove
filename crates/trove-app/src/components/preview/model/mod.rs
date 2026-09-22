@@ -240,14 +240,17 @@ pub struct ModelViewport {
     /// Whether the model is painted by height, cached from the same config
     /// read as `enhance_points`.
     height_color: bool,
-    /// Whether the scene's X/Y/Z axes are drawn, cached from the same config
-    /// read. Independent of `height_color` — see [`ModelViewport::axis_toggle`].
-    show_scene_axes: bool,
-    /// Whether the corner trihedron is drawn, cached from the same config
-    /// read.
-    show_corner_axis: bool,
     /// When `enhance_points` was last re-read.
     enhance_checked: Option<Instant>,
+    /// Whether the pivot symbol is on screen: CloudCompare's
+    /// `m_pivotSymbolShown` (`ccGLWindowInterface.cpp`).
+    ///
+    /// A rotation turns it on and the rotation stopping turns it back off,
+    /// which is all of CloudCompare's default `PIVOT_SHOW_ON_MOVE` mode. The
+    /// other two modes it offers (`PIVOT_HIDE`, `PIVOT_ALWAYS_SHOW`) are not
+    /// represented at all: this is deliberately not a setting, so the symbol
+    /// costs nothing to configure and cannot be turned off by accident.
+    pivot_shown: bool,
 }
 
 impl EventEmitter<ModelViewportEvent> for ModelViewport {}
@@ -315,9 +318,8 @@ impl ModelViewport {
                 gesture_armed: false,
                 enhance_points: true,
                 height_color: cfg.height_color(),
-                show_scene_axes: cfg.scene_axes(),
-                show_corner_axis: cfg.corner_axis(),
                 enhance_checked: None,
+                pivot_shown: false,
             };
             this.start_load(path, cx);
             this

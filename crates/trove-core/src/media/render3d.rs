@@ -71,12 +71,14 @@ pub const POINT_RADIUS: f32 = 1.15;
 /// bands follows the file's real scale rather than its pixel size.
 pub const HEIGHT_BAND: f32 = 10.0;
 
-/// Axis gizmo colours: X, Y, Z, the usual red/green/blue.
+/// The three axis colours, the usual red/green/blue: X, Y, Z. The viewport's
+/// pivot symbol paints its three rings with these, so which ring belongs to
+/// which axis reads the same way it does in CloudCompare.
 pub const AXIS_X: [f32; 3] = [0.87, 0.28, 0.28];
 pub const AXIS_Y: [f32; 3] = [0.30, 0.74, 0.34];
 pub const AXIS_Z: [f32; 3] = [0.30, 0.47, 0.90];
-/// Amber marker at the gizmo's centre — the origin, standing apart from the
-/// three axis colours.
+/// Amber for the centre of the three axes, standing apart from the three axis
+/// colours.
 pub const AXIS_ORIGIN: [f32; 3] = [0.95, 0.76, 0.25];
 
 /// Hue step between neighbouring height bands, in turns.
@@ -109,18 +111,19 @@ pub fn height_tint(y: f32, base: f32) -> [f32; 3] {
     hue_rgb(((y - base) / HEIGHT_BAND).floor() * BAND_HUE_STEP)
 }
 
-/// Pack the height-colouring / axis uniform into its four floats.
+/// Pack the height-colouring uniform into its four floats.
 ///
 /// `x` = colouring on (1) or off (0), `y` = the band size, `z` = the model's
-/// floor (where the bands count from), `w` = draw the axis gizmo (1) or not.
-/// The GPU reads this as the `bands` vector, so the packing lives here rather
-/// than at the call site.
-pub fn bands_uniform(height_color: bool, show_axes: bool, base_y: f32) -> [f32; 4] {
+/// floor (where the bands count from). `w` is unused — the GPU reads this as
+/// one `vec4<f32>`, and a four-component vector is what the uniform block's
+/// 16-byte stride asks for. The packing lives here rather than at the call
+/// site so the shader and the CPU agree on it in one place.
+pub fn bands_uniform(height_color: bool, base_y: f32) -> [f32; 4] {
     [
         if height_color { 1.0 } else { 0.0 },
         HEIGHT_BAND,
         base_y,
-        if show_axes { 1.0 } else { 0.0 },
+        0.0,
     ]
 }
 
@@ -314,8 +317,6 @@ pub struct RenderOptions {
     /// turns a mesh into a readable elevation map. Off by default, so nothing
     /// that did not ask for it keeps the picture it always had.
     pub height_color: bool,
-    /// Draw the X/Y/Z axis gizmo on the bounding box's floor corner.
-    pub show_axes: bool,
 }
 
 /// [`render`], reusing the caller's buffers. The interactive path goes through
@@ -794,9 +795,6 @@ fn paint(
             quality,
             options.height_color,
         );
-        if options.show_axes {
-            target.paint_axes(mesh);
-        }
         return;
     }
     if mesh.triangles.is_empty() {
@@ -901,12 +899,6 @@ fn paint(
             for k in 1..count.saturating_sub(1) {
                 target.triangle(polygon[0], polygon[k], polygon[k + 1], spec);
             }
-        }
-
-        // After the model, so the gizmo depth-tests against it and shows
-        // wherever the model is not in the way.
-        if options.show_axes {
-            target.paint_axes(mesh);
         }
     }
 }
@@ -1111,211 +1103,6 @@ impl Target<'_> {
             }
         }
     }
-
-    /// The X/Y/Z gizmo, as unlit triangles through the same rasteriser and
-    /// depth test as the model — so it belongs to the scene rather than
-    /// floating over it.
-    fn paint_axes(&mut self, mesh: &Mesh) {
-        let triangles = axis_triangles(mesh);
-        for tri in triangles.as_chunks::<3>().0 {
-            // Intensity 1 and no specular is what makes it unlit: a
-            // measurement aid reads better flat, and it keeps the GPU's axis
-            // pass, which has no lighting at all, in agreement.
-            let view: Vec<Vertex> = tri
-                .iter()
-                .map(|(p, c)| Vertex {
-                    p: self.framing.to_view(*p),
-                    i: 1.0,
-                    c: *c,
-                })
-                .collect();
-            self.triangle(view[0], view[1], view[2], 0.0);
-        }
-    }
-}
-
-/// The X/Y/Z gizmo as flat triangles, `(position, colour)` per vertex with
-/// three vertices per triangle.
-///
-/// Shared by both renderers — the CPU rasterises this list, the GPU uploads
-/// it — so the gizmo cannot drift between the two pictures. The gizmo is
-/// centred on the scene: a long rod per axis through the middle, one ring
-/// orthogonal to each axis (largest on X, shrinking towards Z, so the three
-/// stay tellable apart at any angle) and a small octahedron marking the
-/// origin. Everything runs through the model's depth test, so the model
-/// occludes the far half of the rings just like a real object would.
-pub fn axis_triangles(mesh: &Mesh) -> Vec<([f32; 3], [f32; 3])> {
-    let bounds = mesh.bounds;
-    if bounds.is_empty() {
-        return Vec::new();
-    }
-    let center = scale(add(bounds.min, bounds.max), 0.5);
-    let span = sub(bounds.max, bounds.min);
-    // The bounding-sphere radius: every gizmo size derives from it, so the
-    // gizmo keeps its proportions whatever the model's aspect.
-    let radius = 0.5
-        * (span[0] * span[0] + span[1] * span[1] + span[2] * span[2])
-            .sqrt()
-            .max(1e-6);
-    let half = radius * 0.006;
-    let reach = radius * 1.25;
-    let mut out = Vec::new();
-    for (axis, color) in [
-        ([1.0, 0.0, 0.0], AXIS_X),
-        ([0.0, 1.0, 0.0], AXIS_Y),
-        ([0.0, 0.0, 1.0], AXIS_Z),
-    ] {
-        push_rod(
-            &mut out,
-            sub(center, scale(axis, reach)),
-            add(center, scale(axis, reach)),
-            half,
-            color,
-        );
-    }
-    for (normal, ring_radius, color) in [
-        ([1.0, 0.0, 0.0], radius, AXIS_X),
-        ([0.0, 1.0, 0.0], radius * 0.72, AXIS_Y),
-        ([0.0, 0.0, 1.0], radius * 0.45, AXIS_Z),
-    ] {
-        push_ring(&mut out, center, normal, ring_radius, half * 0.8, color);
-    }
-    push_octahedron(&mut out, center, half * 4.0, AXIS_ORIGIN);
-    out
-}
-
-/// Append one square rod from `a` to `b` as eight triangles.
-fn push_rod(
-    out: &mut Vec<([f32; 3], [f32; 3])>,
-    a: [f32; 3],
-    b: [f32; 3],
-    half: f32,
-    color: [f32; 3],
-) {
-    let dir = normalize(sub(b, a));
-    // Any axis not parallel to the rod; a vertical rod is the one case where
-    // the Y slot degenerates, hence the flip.
-    let seed = if dir[1].abs() < 0.9 {
-        [0.0, 1.0, 0.0]
-    } else {
-        [1.0, 0.0, 0.0]
-    };
-    let u = normalize(cross(dir, seed));
-    let v = cross(dir, u);
-    let ring = |p: [f32; 3]| {
-        let corner = |du: f32, dv: f32| add(p, add(scale(u, du * half), scale(v, dv * half)));
-        [
-            corner(-1.0, -1.0),
-            corner(1.0, -1.0),
-            corner(1.0, 1.0),
-            corner(-1.0, 1.0),
-        ]
-    };
-    let (ra, rb) = (ring(a), ring(b));
-    for i in 0..4 {
-        let j = (i + 1) % 4;
-        for corner in [ra[i], ra[j], rb[j]] {
-            out.push((corner, color));
-        }
-        for corner in [ra[i], rb[j], rb[i]] {
-            out.push((corner, color));
-        }
-    }
-}
-
-/// Append one square-section ring — a circle of `radius` around `normal`,
-/// centred on `center` — as two triangles per segment. The section frame is
-/// the radial direction plus the local tangent, so the tube stays an even
-/// thickness all the way round and the seam at segment zero closes on shared
-/// corner positions.
-fn push_ring(
-    out: &mut Vec<([f32; 3], [f32; 3])>,
-    center: [f32; 3],
-    normal: [f32; 3],
-    radius: f32,
-    half: f32,
-    color: [f32; 3],
-) {
-    const SEGMENTS: usize = 64;
-    // Any axis not parallel to the normal; same flip as `push_rod`.
-    let seed = if normal[1].abs() < 0.9 {
-        [0.0, 1.0, 0.0]
-    } else {
-        [1.0, 0.0, 0.0]
-    };
-    let u = normalize(cross(normal, seed));
-    let v = cross(normal, u);
-    let point = |s: usize| {
-        let angle = (s as f32) * (std::f32::consts::TAU / SEGMENTS as f32);
-        add(
-            center,
-            add(
-                scale(u, angle.cos() * radius),
-                scale(v, angle.sin() * radius),
-            ),
-        )
-    };
-    for i in 0..SEGMENTS {
-        let j = (i + 1) % SEGMENTS;
-        let (pi, pj) = (point(i), point(j));
-        let r = normalize(sub(pi, center));
-        let t = normalize(sub(pj, pi));
-        let corner =
-            |p: [f32; 3], dr: f32, dt: f32| add(p, add(scale(r, dr * half), scale(t, dt * half)));
-        let qa = [
-            corner(pi, -1.0, -1.0),
-            corner(pi, 1.0, -1.0),
-            corner(pi, 1.0, 1.0),
-            corner(pi, -1.0, 1.0),
-        ];
-        let qb = [
-            corner(pj, -1.0, -1.0),
-            corner(pj, 1.0, -1.0),
-            corner(pj, 1.0, 1.0),
-            corner(pj, -1.0, 1.0),
-        ];
-        for k in 0..4 {
-            let n = (k + 1) % 4;
-            for corner in [qa[k], qa[n], qb[n]] {
-                out.push((corner, color));
-            }
-            for corner in [qa[k], qb[n], qb[k]] {
-                out.push((corner, color));
-            }
-        }
-    }
-}
-
-/// Append a small octahedron marking the origin. Eight triangles, wound
-/// consistently but irrelevant — neither renderer culls backfaces here.
-fn push_octahedron(
-    out: &mut Vec<([f32; 3], [f32; 3])>,
-    center: [f32; 3],
-    size: f32,
-    color: [f32; 3],
-) {
-    let apex = [
-        add(center, [size, 0.0, 0.0]),
-        add(center, [-size, 0.0, 0.0]),
-        add(center, [0.0, size, 0.0]),
-        add(center, [0.0, -size, 0.0]),
-        add(center, [0.0, 0.0, size]),
-        add(center, [0.0, 0.0, -size]),
-    ];
-    for (a, b, c) in [
-        (4, 0, 2),
-        (4, 2, 1),
-        (4, 1, 3),
-        (4, 3, 0),
-        (5, 0, 2),
-        (5, 2, 1),
-        (5, 1, 3),
-        (5, 3, 0),
-    ] {
-        out.push((apex[a], color));
-        out.push((apex[b], color));
-        out.push((apex[c], color));
-    }
 }
 
 /// A view-space vertex; `i` is the shading intensity and `c` the base colour,
@@ -1325,7 +1112,7 @@ struct Vertex {
     /// x right, y up, z forward.
     p: [f32; 3],
     i: f32,
-    /// Base surface colour: the material, a height band, or an axis colour.
+    /// Base surface colour: the material or a height band.
     c: [f32; 3],
 }
 
@@ -1738,7 +1525,6 @@ mod tests {
                 cull_backfaces: false,
                 enhance_points: true,
                 height_color: false,
-                show_axes: false,
             },
             &mut Scratch::default(),
         )
@@ -1855,7 +1641,6 @@ mod tests {
                 cull_backfaces: true,
                 enhance_points: false,
                 height_color: false,
-                show_axes: false,
             },
             &mut Scratch::default(),
         );
@@ -1894,7 +1679,6 @@ mod tests {
                 cull_backfaces: true,
                 enhance_points: false,
                 height_color: false,
-                show_axes: false,
             },
             &mut Scratch::default(),
         );
@@ -2040,73 +1824,6 @@ mod tests {
         assert_ne!(height_tint(base, base), height_tint(base + 10.0, base));
         // Bands count from the model's own floor, not from world zero.
         assert_eq!(height_tint(0.0, 0.0), height_tint(base, base));
-    }
-
-    #[test]
-    fn the_axis_gizmo_is_centred_with_rings_in_three_colours() {
-        let mesh = Mesh {
-            positions: vec![[0.0, 0.0, 0.0], [3.0, 4.0, 5.0]],
-            triangles: Vec::new(),
-            bounds: Bounds {
-                min: [0.0; 3],
-                max: [3.0, 4.0, 5.0],
-            },
-            ..Mesh::default()
-        };
-        let triangles = axis_triangles(&mesh);
-        assert!(!triangles.is_empty());
-        assert_eq!(triangles.len() % 3, 0, "three vertices per triangle");
-        // Every vertex carries one of the three axis colours or the origin
-        // marker — and each axis colour really shows up.
-        for (_, color) in &triangles {
-            assert!(
-                [AXIS_X, AXIS_Y, AXIS_Z, AXIS_ORIGIN].contains(color),
-                "unexpected colour {color:?}"
-            );
-        }
-        for color in [AXIS_X, AXIS_Y, AXIS_Z, AXIS_ORIGIN] {
-            assert!(
-                triangles.iter().any(|(_, c)| c == &color),
-                "colour {color:?} missing"
-            );
-        }
-        // Centred on the scene: the rods cross the middle and overshoot the
-        // bounding box by a fixed reach in both directions.
-        let center = [1.5f32, 2.0, 2.5];
-        let radius = 0.5 * (9.0f32 + 16.0 + 25.0).sqrt();
-        let reach = radius * 1.25;
-        let extreme = |ix: usize, fold: fn(f32, f32) -> f32, seed: f32| {
-            triangles.iter().map(|(p, _)| p[ix]).fold(seed, fold)
-        };
-        for (ix, c) in center.iter().enumerate() {
-            let hi = extreme(ix, f32::max, f32::NEG_INFINITY);
-            let lo = extreme(ix, f32::min, f32::INFINITY);
-            assert!(
-                (hi - (c + reach)).abs() < 1e-3 * radius,
-                "axis {ix} reaches +{reach} from the centre, got {hi}"
-            );
-            assert!(
-                (lo - (c - reach)).abs() < 1e-3 * radius,
-                "axis {ix} reaches -{reach} from the centre, got {lo}"
-            );
-        }
-        // Nothing flies further than the rods.
-        for (p, _) in &triangles {
-            let d = ((p[0] - center[0]).powi(2)
-                + (p[1] - center[1]).powi(2)
-                + (p[2] - center[2]).powi(2))
-            .sqrt();
-            assert!(d <= radius * 1.3, "within reach: {p:?}");
-        }
-    }
-
-    #[test]
-    fn a_mesh_with_no_bounds_has_no_axis() {
-        let mesh = Mesh {
-            bounds: Bounds::empty(),
-            ..Mesh::default()
-        };
-        assert!(axis_triangles(&mesh).is_empty());
     }
 
     #[test]

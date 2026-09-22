@@ -11,8 +11,8 @@ use gpui_kit::component::setting::NumberFieldOptions;
 
 // =============================== model page ==================================
 
-/// Model ▸ the point cloud's look, the scene's reference axes, and the zoom
-/// range shared by image and model previews.
+/// Model ▸ the point cloud's look and the zoom range shared by image and model
+/// previews.
 pub(super) fn model_page() -> SettingPage {
     let t = |k: &str| rust_i18n::t!(k).to_string();
     SettingPage::new(t("settings.model"))
@@ -38,28 +38,6 @@ pub(super) fn model_page() -> SettingPage {
                         }),
                     )
                     .description(t("settings.height_color_desc")),
-                ),
-        )
-        .group(
-            SettingGroup::new()
-                .title(t("settings.model_axes"))
-                .item(
-                    SettingItem::new(
-                        t("settings.scene_axes"),
-                        config_switch(AppConfig::scene_axes, |config, on| {
-                            config.scene_axes = Some(on);
-                        }),
-                    )
-                    .description(t("settings.scene_axes_desc")),
-                )
-                .item(
-                    SettingItem::new(
-                        t("settings.corner_axis"),
-                        config_switch(AppConfig::corner_axis, |config, on| {
-                            config.corner_axis = Some(on);
-                        }),
-                    )
-                    .description(t("settings.corner_axis_desc")),
                 ),
         )
         .group(zoom_group())

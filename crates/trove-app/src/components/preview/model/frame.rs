@@ -145,8 +145,6 @@ impl ModelViewport {
             let cfg = trove_core::config::AppConfig::load();
             self.enhance_points = cfg.point_enhance();
             self.height_color = cfg.height_color();
-            self.show_scene_axes = cfg.scene_axes();
-            self.show_corner_axis = cfg.corner_axis();
             // The zoom limits live in the same file: clamp so lowering the
             // range while a model is open pulls the camera back in, instead
             // of leaving it parked outside the configured limits.
@@ -173,11 +171,7 @@ impl ModelViewport {
             // they are worth it on a settled frame and wasted on a draft the
             // user is dragging past.
             enhance_points: !interactive && self.enhance_points,
-            // Height colouring and the scene axes are separate switches now:
-            // the axes answer "where is X/Y/Z" whether or not the model is
-            // painted by height, so each follows its own config value.
             height_color: self.height_color,
-            show_axes: self.show_scene_axes,
         };
 
         self.dirty = false;
@@ -311,6 +305,9 @@ impl ModelViewport {
             return;
         }
         self.gesture_armed = false;
+        // The keyboard's stand-in for the mouse release: a turn has no button
+        // to come up, so the symbol goes away with the gesture that carried it.
+        self.pivot_shown = false;
         self.dirty = true;
         self.pump(cx);
         cx.notify();
@@ -348,6 +345,10 @@ impl ModelViewport {
             return;
         }
         self.drag = None;
+        // CloudCompare hides the pivot symbol on mouse release when its
+        // visibility is the default `PIVOT_SHOW_ON_MOVE` — i.e. the symbol is
+        // the gesture's, not the pose's.
+        self.pivot_shown = false;
         // The drag only moved the camera; redraw so the cursor and any pending
         // camera move settle together, at full resolution and with the LOD the
         // camera has earned by stopping.
@@ -428,7 +429,7 @@ fn draw(shot: Shot<'_>) -> Rendered {
         let framing = camera.framing(bounds, aspect);
         // The bands count from the model's own floor, exactly as the CPU
         // rasteriser counts them, so the two pictures agree.
-        let bands = render3d::bands_uniform(options.height_color, options.show_axes, bounds.min[1]);
+        let bands = render3d::bands_uniform(options.height_color, bounds.min[1]);
         if let Some(bytes) = renderer.render(
             uploaded,
             &framing,
