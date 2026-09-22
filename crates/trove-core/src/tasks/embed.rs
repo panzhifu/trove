@@ -150,11 +150,7 @@ pub fn run(
         if stored.as_deref() == Some(hash.as_str()) {
             outcome.skipped += 1;
         } else {
-            work.push(Work {
-                asset,
-                input,
-                hash,
-            });
+            work.push(Work { asset, input, hash });
         }
     }
 
@@ -483,7 +479,8 @@ mod tests {
             &self,
             paths: &[std::path::PathBuf],
         ) -> crate::error::Result<Vec<Vec<f32>>> {
-            self.images_seen.fetch_add(paths.len(), std::sync::atomic::Ordering::Relaxed);
+            self.images_seen
+                .fetch_add(paths.len(), std::sync::atomic::Ordering::Relaxed);
             Ok(paths.iter().map(|_| vec![0.5; self.dim]).collect())
         }
     }
@@ -526,7 +523,9 @@ mod tests {
         let outcome = run(&options, &provider, &bare_ctx()).unwrap();
         assert_eq!(outcome.embedded, 1, "{outcome:?}");
         assert_eq!(
-            provider.images_seen.load(std::sync::atomic::Ordering::Relaxed),
+            provider
+                .images_seen
+                .load(std::sync::atomic::Ordering::Relaxed),
             1,
             "the image leg was used"
         );

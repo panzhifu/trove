@@ -417,11 +417,19 @@ mod tests {
 
         let png = dir.join("a.png");
         std::fs::write(&png, [0x89, b'P', b'N', b'G']).unwrap();
-        assert!(image_data_uri(&png).unwrap().starts_with("data:image/png;base64,"));
+        assert!(
+            image_data_uri(&png)
+                .unwrap()
+                .starts_with("data:image/png;base64,")
+        );
 
         let jpg = dir.join("a.jpg");
         std::fs::write(&jpg, [0xFF, 0xD8, 0xFF]).unwrap();
-        assert!(image_data_uri(&jpg).unwrap().starts_with("data:image/jpeg;base64,"));
+        assert!(
+            image_data_uri(&jpg)
+                .unwrap()
+                .starts_with("data:image/jpeg;base64,")
+        );
 
         // An unreadable path is an error, never a silent empty vector.
         assert!(image_data_uri(&dir.join("missing.png")).is_err());

@@ -12,10 +12,10 @@
 //! task threads ([`crate::tasks`]), which are plain `std::thread`s.
 
 pub mod analysis;
-pub mod search_planner;
+mod embedding_openai;
 mod http;
 pub mod mock;
-mod embedding_openai;
+pub mod search_planner;
 pub mod vendor;
 
 pub use embedding_openai::OpenAICompatible;

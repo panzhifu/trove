@@ -623,11 +623,10 @@ impl Library {
     > {
         let options = self.ai_analysis_options(&request);
         let label = format!("ai analysis ({})", provider.model_version());
-        self.tasks.start(
-            crate::tasks::TaskKind::AiAnalysis,
-            label,
-            move |ctx| crate::tasks::ai_analysis::run(&options, provider.as_ref(), ctx),
-        )
+        self.tasks
+            .start(crate::tasks::TaskKind::AiAnalysis, label, move |ctx| {
+                crate::tasks::ai_analysis::run(&options, provider.as_ref(), ctx)
+            })
     }
 
     /// Detach everything a previous analysis run added.

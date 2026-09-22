@@ -1,5 +1,5 @@
-use std::sync::atomic::AtomicBool;
 use std::sync::OnceLock;
+use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 use serde::Deserialize;
@@ -35,7 +35,9 @@ impl OpenAiAdapter {
             return Err(Error::Validation("no base URL".into()));
         }
         if !base_url.starts_with("http://") && !base_url.starts_with("https://") {
-            return Err(Error::Validation(format!("must be http(s), got {base_url:?}")));
+            return Err(Error::Validation(format!(
+                "must be http(s), got {base_url:?}"
+            )));
         }
         let model = model.trim();
         if model.is_empty() {
@@ -311,22 +313,26 @@ fn extract_content(body: &str, _model: &str) -> std::result::Result<String, Vend
         request_id: None,
     })?;
 
-    if let Some(refusal) = &choice.message.refusal {
-        if !refusal.trim().is_empty() {
-            return Err(VendorError {
-                kind: VendorErrorKind::Refused,
-                message: refusal.trim().to_string(),
-                http_status: None,
-                provider_code: None,
-                request_id: None,
-            });
-        }
+    if let Some(refusal) = &choice.message.refusal
+        && !refusal.trim().is_empty()
+    {
+        return Err(VendorError {
+            kind: VendorErrorKind::Refused,
+            message: refusal.trim().to_string(),
+            http_status: None,
+            provider_code: None,
+            request_id: None,
+        });
     }
 
     match &choice.message.content {
         Content::Text(text) if !text.trim().is_empty() => Ok(text.clone()),
         Content::Parts(parts) => {
-            let text: String = parts.iter().filter_map(|p| p.text.as_deref()).collect::<Vec<_>>().join("\n");
+            let text: String = parts
+                .iter()
+                .filter_map(|p| p.text.as_deref())
+                .collect::<Vec<_>>()
+                .join("\n");
             if text.trim().is_empty() {
                 Err(VendorError {
                     kind: VendorErrorKind::InvalidResponse,
@@ -366,24 +372,36 @@ fn classify_http_error(status: u16, body: &str) -> VendorErrorKind {
 }
 
 fn is_format_rejection(err: &VendorError) -> bool {
-    let Some(status) = err.http_status else { return false };
+    let Some(status) = err.http_status else {
+        return false;
+    };
     if status != 400 && status != 422 {
         return false;
     }
     let lower = err.message.to_lowercase();
-    let fmt = lower.contains("response_format") || lower.contains("json_schema") || lower.contains("json_object");
-    let rejected = lower.contains("unsupported") || lower.contains("not supported") || lower.contains("does not support");
+    let fmt = lower.contains("response_format")
+        || lower.contains("json_schema")
+        || lower.contains("json_object");
+    let rejected = lower.contains("unsupported")
+        || lower.contains("not supported")
+        || lower.contains("does not support");
     fmt && rejected
 }
 
 fn parse_error(body: &str) -> Option<String> {
     let parsed: serde_json::Value = serde_json::from_str(body).ok()?;
-    parsed.pointer("/error/message").and_then(|v| v.as_str()).map(str::to_string)
+    parsed
+        .pointer("/error/message")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
 }
 
 fn extract_code(body: &str) -> Option<String> {
     let parsed: serde_json::Value = serde_json::from_str(body).ok()?;
-    parsed.pointer("/error/code").and_then(|v| v.as_str()).map(str::to_string)
+    parsed
+        .pointer("/error/code")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
 }
 
 #[cfg(test)]
@@ -432,7 +450,12 @@ mod tests {
         let content = OpenAiAdapter::build_user_content(&req, "metadata");
         let arr = content.as_array().unwrap();
         assert_eq!(arr.len(), 2);
-        assert!(arr[1]["image_url"]["url"].as_str().unwrap().starts_with("data:image/jpeg;base64,"));
+        assert!(
+            arr[1]["image_url"]["url"]
+                .as_str()
+                .unwrap()
+                .starts_with("data:image/jpeg;base64,")
+        );
     }
 
     #[test]
@@ -443,8 +466,12 @@ mod tests {
 
     #[test]
     fn extract_content_reads_text() {
-        let body = r#"{"choices":[{"message":{"role":"assistant","content":"{\"tags\":[\"beach\"]}"}}]}"#;
-        assert_eq!(extract_content(body, "m").unwrap(), "{\"tags\":[\"beach\"]}");
+        let body =
+            r#"{"choices":[{"message":{"role":"assistant","content":"{\"tags\":[\"beach\"]}"}}]}"#;
+        assert_eq!(
+            extract_content(body, "m").unwrap(),
+            "{\"tags\":[\"beach\"]}"
+        );
     }
 
     #[test]

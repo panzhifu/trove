@@ -26,7 +26,9 @@ impl DashScopeAdapter {
             return Err(Error::Validation("no base URL".into()));
         }
         if !base_url.starts_with("http://") && !base_url.starts_with("https://") {
-            return Err(Error::Validation(format!("must be http(s), got {base_url:?}")));
+            return Err(Error::Validation(format!(
+                "must be http(s), got {base_url:?}"
+            )));
         }
         let model = model.trim();
         if model.is_empty() {
@@ -223,7 +225,11 @@ fn extract_content(body: &str) -> std::result::Result<String, VendorError> {
     match &choice.message.content {
         Content::Text(text) if !text.trim().is_empty() => Ok(text.clone()),
         Content::Parts(parts) => {
-            let text: String = parts.iter().filter_map(|p| p.text.as_deref()).collect::<Vec<_>>().join("\n");
+            let text: String = parts
+                .iter()
+                .filter_map(|p| p.text.as_deref())
+                .collect::<Vec<_>>()
+                .join("\n");
             if text.trim().is_empty() {
                 Err(VendorError {
                     kind: VendorErrorKind::InvalidResponse,
@@ -264,12 +270,18 @@ fn classify_http_error(status: u16, body: &str) -> VendorErrorKind {
 
 fn parse_error(body: &str) -> Option<String> {
     let parsed: serde_json::Value = serde_json::from_str(body).ok()?;
-    parsed.get("message").and_then(|v| v.as_str()).map(str::to_string)
+    parsed
+        .get("message")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
 }
 
 fn extract_code(body: &str) -> Option<String> {
     let parsed: serde_json::Value = serde_json::from_str(body).ok()?;
-    parsed.get("code").and_then(|v| v.as_str()).map(str::to_string)
+    parsed
+        .get("code")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
 }
 
 #[cfg(test)]

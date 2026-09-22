@@ -510,7 +510,11 @@ impl TextIndex {
     /// Search using an AI-generated plan: keywords are ANDed (Must),
     /// synonyms are ORed (Should), and exclusions are negated (MustNot).
     /// Synonyms only boost ranking — a keyword-only match still returns.
-    pub fn search_plan(&self, plan: &crate::ai::search_planner::AiSearchPlan, cap: usize) -> Result<Vec<Uuid>> {
+    pub fn search_plan(
+        &self,
+        plan: &crate::ai::search_planner::AiSearchPlan,
+        cap: usize,
+    ) -> Result<Vec<Uuid>> {
         let searcher = self.reader.searcher();
         let query = self.build_plan_query(plan);
         let top = searcher
@@ -519,7 +523,11 @@ impl TextIndex {
         Self::collect_ids(&searcher, self.f.asset_id, top)
     }
 
-    fn collect_ids(searcher: &tantivy::Searcher, asset_id: Field, top: Vec<(f32, tantivy::DocAddress)>) -> Result<Vec<Uuid>> {
+    fn collect_ids(
+        searcher: &tantivy::Searcher,
+        asset_id: Field,
+        top: Vec<(f32, tantivy::DocAddress)>,
+    ) -> Result<Vec<Uuid>> {
         let mut ids = Vec::with_capacity(top.len());
         for (_, addr) in top {
             let Ok(doc) = searcher.doc::<TantivyDocument>(addr) else {

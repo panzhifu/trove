@@ -236,10 +236,7 @@ impl SearchConfig {
     /// The embedding endpoint to use for L2, when the toggle is on and the
     /// endpoint (configured on the AI page) is usable. `None` = run the text
     /// leg only, which is also what an unconfigured endpoint gives.
-    pub fn semantic_endpoint(
-        &self,
-        endpoint: Option<&EmbeddingConfig>,
-    ) -> Option<EmbeddingConfig> {
+    pub fn semantic_endpoint(&self, endpoint: Option<&EmbeddingConfig>) -> Option<EmbeddingConfig> {
         let endpoint = endpoint?;
         (self.semantic_enabled && endpoint.is_configured()).then(|| endpoint.clone())
     }
