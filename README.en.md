@@ -96,6 +96,35 @@ This README summarizes what ships. The **[Chinese README](./README.md)** is the 
 
 ---
 
+## Command line
+
+`trove-cli` is the headless sibling of the desktop app: same `trove-core`, same database, same rules — and it runs **while the app has the library open**, in which case the library is opened read-only, queries behave as usual, writes go to the database, and index updates are left to whichever process owns them.
+
+```sh
+cargo build -p trove-cli            # produces target/debug/trove
+
+trove libraries                     # every library on this machine
+trove info                          # counts, sizes, index state
+trove list --kind image -n 20       # list assets (all filters are in --help)
+trove search 猫 --aspect wechat-cover
+trove get <uuid>                    # full record, with the file's absolute path
+trove import ~/Pictures --into Reference
+trove tag <uuid> --add animal
+trove trash <uuid>                  # reversible; `purge --yes` is not
+trove collection create Reference
+trove doctor                        # library, index and ffmpeg self-check
+```
+
+Three conventions:
+
+- **stdout is always one JSON document**; `--human` swaps in tables.
+- **The exit status decides whether to parse it**: 0 ok, 1 failed, 2 misuse, 3 library unusable (absent, wrong schema version, or a write that needs an index another process holds).
+- Diagnostics go to stderr; `--quiet` keeps errors only.
+
+`--help` is the whole contract. `--library <slug>` picks a library, and `TROVE_DATA_DIR` / `TROVE_CONFIG_DIR` / `TROVE_CACHE_DIR` relocate the entire environment.
+
+---
+
 ## Layout
 
 | Dock | Panel | Purpose |
@@ -119,7 +148,7 @@ cargo test -p trove-core
 cargo run -p trove-app
 ```
 
-**Baseline: `trove-core` 401 + `trove-app` 34 all pass; `cargo fmt --check` clean; clippy 0 warnings workspace-wide.** Two real-GPU smoke tests live in `trove-app` (EDL, meshlet culling) and skip automatically on headless machines.
+**Baseline: `trove-core` 519 + `trove-app` 48 all pass; `cargo fmt --check` clean; clippy 0 warnings workspace-wide.** Two real-GPU smoke tests live in `trove-app` (EDL, meshlet culling) and skip automatically on headless machines.
 
 Per-module implementation notes are indexed in [docs/README.md](docs/README.md).
 
