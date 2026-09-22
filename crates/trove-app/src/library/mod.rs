@@ -6,5 +6,5 @@ mod controller;
 pub mod jobs;
 
 pub use controller::{
-    AiProbe, GRID_PAGE_SIZE, ImportPhase, LibraryController, SelectionSource, ViewMode,
+    AiProbe, ChatProbe, GRID_PAGE_SIZE, ImportPhase, LibraryController, SelectionSource, ViewMode,
 };
