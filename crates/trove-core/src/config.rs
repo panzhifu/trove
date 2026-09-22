@@ -19,6 +19,10 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::error::Result;
+use crate::media::height_color::{
+    CustomScale, DEFAULT_PERIOD, Field, HeightLook, HeightMode, MAX_PERIOD, MIN_PERIOD, Scale,
+    scale_by_id,
+};
 use crate::paths;
 
 /// Application configuration, persisted as JSON in [`paths::config_file`].
@@ -78,11 +82,43 @@ pub struct AppConfig {
     /// Maximum preview zoom (image and 3D model). Clamped on read.
     #[serde(default)]
     pub max_preview_zoom: Option<f32>,
-    /// Paint 3D previews by height — every [`crate::media::render3d::HEIGHT_BAND`]
-    /// units gets its own hue. Off by default so a model looks the way the file
-    /// intended.
+    /// Paint 3D previews by a per-point field rather than by the flat material
+    /// colour.
+    ///
+    /// The master switch: which look it turns on is the fields below it.
+    /// Off by default so a model looks the way the file intended.
     #[serde(default)]
     pub height_color: Option<bool>,
+    /// Whether that height look is discrete bands rather than one continuous
+    /// colour scale. Only read while [`Self::height_color`] is on.
+    #[serde(default)]
+    pub height_banding: Option<bool>,
+    /// Which scale a ramp reads, by [`ColorScale`](crate::media::height_color::ColorScale)
+    /// id — or `custom` for the pair below. An id this version does not know
+    /// falls back to the default scale rather than failing.
+    #[serde(default)]
+    pub height_scale: Option<String>,
+    /// The scales the user built, by anchor. `height_scale` names one of these
+    /// with a `custom:<id>` key, so an edit here is an edit everywhere it is
+    /// used — and a model row that names a deleted one falls back to the
+    /// built-in default rather than failing to open.
+    #[serde(default)]
+    pub height_custom_scales: Vec<CustomScale>,
+    /// Which per-point value the colour runs along: `height` (the default),
+    /// `slope` or `aspect` — CloudCompare's height, dip and dip direction.
+    #[serde(default)]
+    pub height_field: Option<String>,
+    /// Which model-space axis the field is read against: 0 = X, 1 = Y, 2 = Z.
+    /// For height it is where the elevations sit; for the two normal-based
+    /// fields it is what counts as up. Y is the viewport's up axis, so that is
+    /// the default; a cloud scanned in a Z-up tool wants Z either way.
+    #[serde(default)]
+    pub height_axis: Option<u8>,
+    /// Field units per cycle of the banding stripes — CloudCompare's *Period*.
+    /// An absolute measurement on purpose, so the stripes stay a ruler; clamped
+    /// on read.
+    #[serde(default)]
+    pub height_band_period: Option<f32>,
     /// Check GitHub for a newer release on launch. On by default. The check
     /// only reads the newest tag and offers a link; Trove never downloads or
     /// replaces its own binary (see [`crate::services::update`]).
@@ -789,8 +825,103 @@ impl AppConfig {
     }
 
     /// Whether 3D previews are painted by height rather than the material.
+    ///
+    /// The master switch only. What the look actually is — a colour scale or
+    /// bands, on which axis — the four fields beside it say, and
+    /// [`Self::height_look`] reads them all together.
     pub fn height_color(&self) -> bool {
         self.height_color.unwrap_or(false)
+    }
+
+    /// The height look as configured.
+    ///
+    /// Deliberately not resolved to a range here: the range belongs to the
+    /// file on screen, not to the config, so a frame calls
+    /// [`HeightLook::resolve`] with its own bounds.
+    pub fn height_look(&self) -> HeightLook {
+        HeightLook {
+            mode: match (self.height_color(), self.height_banding.unwrap_or(false)) {
+                (false, _) => HeightMode::Off,
+                (true, false) => HeightMode::Ramp,
+                (true, true) => HeightMode::Bands,
+            },
+            field: Field::from_key(self.height_field.as_deref().unwrap_or("")),
+            axis: usize::from(self.height_axis.unwrap_or(1).min(2)),
+            scale: self.height_scale(),
+            period: self
+                .height_band_period
+                .unwrap_or(DEFAULT_PERIOD)
+                .clamp(MIN_PERIOD, MAX_PERIOD),
+        }
+    }
+
+    /// The scale the config names: a built-in one by id, or one of
+    /// [`Self::height_custom_scales`] by its `custom:<id>` key.
+    fn height_scale(&self) -> Scale {
+        match CustomScale::id_of(self.height_scale.as_deref().unwrap_or("")) {
+            Some(id) => self
+                .height_custom_scales
+                .iter()
+                .find(|custom| custom.id == id)
+                .map(Scale::custom)
+                .unwrap_or_default(),
+            None => Scale::Preset(scale_by_id(self.height_scale.as_deref().unwrap_or(""))),
+        }
+    }
+
+    /// A new user scale: black to white, under an id nothing else uses, stored
+    /// and named as the active scale in one move.
+    pub fn add_custom_scale(&mut self) -> String {
+        let taken: Vec<&str> = self
+            .height_custom_scales
+            .iter()
+            .map(|custom| custom.id.as_str())
+            .collect();
+        let id = (1..)
+            .map(|n| n.to_string())
+            .find(|candidate| !taken.contains(&candidate.as_str()))
+            .unwrap_or_default();
+        self.height_custom_scales
+            .push(CustomScale::seed(id.clone()));
+        self.height_scale = Some(format!("custom:{id}"));
+        id
+    }
+
+    /// Forget a user scale. The next read falls back to the default, because a
+    /// scale that is gone should cost a colour and nothing else.
+    pub fn remove_custom_scale(&mut self, id: &str) {
+        self.height_custom_scales.retain(|custom| custom.id != id);
+        if self.height_scale.as_deref() == Some(&format!("custom:{id}")) {
+            self.height_scale = Some(scale_by_id("").id.to_string());
+        }
+    }
+
+    /// Store a height look, spreading it back over the fields
+    /// [`Self::height_look`] reads.
+    pub fn set_height_look(&mut self, look: HeightLook) {
+        self.height_color = Some(look.mode != HeightMode::Off);
+        self.height_banding = Some(look.mode == HeightMode::Bands);
+        self.height_field = Some(look.field.key().to_string());
+        self.height_scale = Some(look.scale.key());
+        // A custom scale travels with the look that uses it: the anchors are
+        // written back into the stored list here, which is the one place that
+        // knows both the id and what the look currently holds.
+        if let Scale::Custom { id, ramp } = &look.scale {
+            let stops = ramp.stops().to_vec();
+            match self
+                .height_custom_scales
+                .iter_mut()
+                .find(|custom| &custom.id == id)
+            {
+                Some(custom) => custom.stops = stops,
+                None => self.height_custom_scales.push(CustomScale {
+                    id: id.clone(),
+                    stops,
+                }),
+            }
+        }
+        self.height_axis = Some(look.axis.min(2) as u8);
+        self.height_band_period = Some(look.period.clamp(MIN_PERIOD, MAX_PERIOD));
     }
 
     /// Whether to look for a newer release on launch (on by default).
@@ -844,6 +975,108 @@ impl AppConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::media::height_color::{ColorStop as Stop, Ramp};
+
+    #[test]
+    fn a_height_look_round_trips_through_the_config() {
+        for look in [
+            HeightLook::default(),
+            HeightLook {
+                mode: HeightMode::Ramp,
+                field: Field::Aspect,
+                axis: 2,
+                scale: Scale::Preset(scale_by_id("viridis")),
+                period: 40.0,
+            },
+            HeightLook {
+                mode: HeightMode::Bands,
+                field: Field::Slope,
+                axis: 0,
+                scale: Scale::Preset(scale_by_id("bwr")),
+                period: 4.0,
+            },
+            HeightLook {
+                mode: HeightMode::Ramp,
+                field: Field::Height,
+                axis: 1,
+                scale: Scale::Custom {
+                    id: "1".into(),
+                    ramp: Ramp::custom(&[
+                        Stop::new(0.0, [10, 20, 30]),
+                        Stop::new(0.5, [200, 0, 200]),
+                        Stop::new(1.0, [240, 250, 255]),
+                    ]),
+                },
+                period: DEFAULT_PERIOD,
+            },
+        ] {
+            let mut config = AppConfig::default();
+            config.set_height_look(look.clone());
+            let back = config.height_look();
+            assert_eq!(back, look);
+        }
+    }
+
+    #[test]
+    fn a_custom_scale_is_added_edited_and_removed_by_id() {
+        let mut config = AppConfig::default();
+        // Adding one makes it the active scale, so the panel can put a new
+        // strip on screen and let the user start moving anchors at once.
+        let id = config.add_custom_scale();
+        assert_eq!(id, "1");
+        assert_eq!(config.height_scale.as_deref(), Some("custom:1"));
+        assert_eq!(config.height_custom_scales.len(), 1);
+        assert_eq!(config.height_look().scale.key(), "custom:1");
+        // A second one gets the next free id rather than a collision.
+        assert_eq!(config.add_custom_scale(), "2");
+        assert_eq!(config.height_custom_scales.len(), 2);
+        // Editing the look writes the anchors back into the stored scale, which
+        // is the whole reason the look carries an id rather than a copy.
+        let edited = HeightLook {
+            scale: Scale::Custom {
+                id: "1".into(),
+                ramp: Ramp::custom(&[Stop::new(0.0, [9, 9, 9]), Stop::new(1.0, [70, 70, 70])]),
+            },
+            ..config.height_look()
+        };
+        config.set_height_look(edited);
+        assert_eq!(config.height_custom_scales[0].stops.len(), 2);
+        assert_eq!(config.height_custom_scales[0].stops[1].rgb, [70, 70, 70]);
+        // The other one is untouched by all of that.
+        assert_eq!(config.height_custom_scales[1].stops.len(), 2);
+        // Removing the one in use falls back to the built-in default, so no
+        // model is left naming a scale that has gone.
+        config.remove_custom_scale("1");
+        assert_eq!(config.height_custom_scales.len(), 1);
+        assert_eq!(config.height_scale.as_deref(), Some("bgyr"));
+        assert_eq!(config.height_look().scale.key(), "bgyr");
+    }
+
+    #[test]
+    fn the_band_period_is_clamped_to_what_a_stepper_can_reach() {
+        let mut config = AppConfig::default();
+        config.set_height_look(HeightLook {
+            mode: HeightMode::Bands,
+            period: 1e9,
+            ..Default::default()
+        });
+        assert_eq!(config.height_look().period, MAX_PERIOD);
+        config.height_band_period = Some(0.0);
+        assert_eq!(config.height_look().period, MIN_PERIOD);
+    }
+
+    #[test]
+    fn an_old_height_config_turns_the_ramp_on() {
+        // The switch predates the panel; a config that only ever flipped it on
+        // gets the continuous scale, which is the look the panel defaults to.
+        let config = AppConfig {
+            height_color: Some(true),
+            ..Default::default()
+        };
+        assert_eq!(config.height_look().mode, HeightMode::Ramp);
+        assert_eq!(config.height_look().scale.key(), "bgyr");
+        assert_eq!(config.height_look().axis, 1);
+    }
 
     #[test]
     fn search_config_defaults_keep_the_pre_tier_behaviour() {

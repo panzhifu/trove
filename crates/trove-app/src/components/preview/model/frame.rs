@@ -144,7 +144,16 @@ impl ModelViewport {
         {
             let cfg = trove_core::config::AppConfig::load();
             self.enhance_points = cfg.point_enhance();
-            self.height_color = cfg.height_color();
+            // The look only follows the config while the model has no look of
+            // its own, and never in the middle of a drag whose value has not
+            // been written yet — that would flick the colour back to where the
+            // pointer started from.
+            if self.asset.is_none() && !self.height_unsaved {
+                self.height = cfg.height_look();
+            }
+            if !self.height_unsaved {
+                self.height_scales = cfg.height_custom_scales.clone();
+            }
             // The zoom limits live in the same file: clamp so lowering the
             // range while a model is open pulls the camera back in, instead
             // of leaving it parked outside the configured limits.
@@ -163,6 +172,10 @@ impl ModelViewport {
         let interactive = self.is_interacting();
         let quality = if interactive { 0.25 } else { 1.0 };
         let scratch = self.scratch.clone();
+        // Measured against the scene's bounds rather than this frame's mesh,
+        // which for a streamed cloud is a different subset every frame: the
+        // colours then stay put while the points arrive, on both renderers.
+        let height = self.height.resolve(&bounds);
         let options = RenderOptions {
             // Skipping back faces is free for a closed mesh and wrong for
             // anything else, so it follows the winding exactly.
@@ -171,7 +184,7 @@ impl ModelViewport {
             // they are worth it on a settled frame and wasted on a draft the
             // user is dragging past.
             enhance_points: !interactive && self.enhance_points,
-            height_color: self.height_color,
+            height,
         };
 
         self.dirty = false;
@@ -427,16 +440,15 @@ fn draw(shot: Shot<'_>) -> Rendered {
         // function, so the two renderers cannot disagree about what "framed"
         // means.
         let framing = camera.framing(bounds, aspect);
-        // The bands count from the model's own floor, exactly as the CPU
-        // rasteriser counts them, so the two pictures agree.
-        let bands = render3d::bands_uniform(options.height_color, bounds.min[1]);
+        // One shared packing point, so the shader and the CPU rasteriser cannot
+        // disagree about where the range starts or how wide a band is.
         if let Some(bytes) = renderer.render(
             uploaded,
             &framing,
             size,
             interactive,
             options.enhance_points,
-            bands,
+            options.height.uniforms(),
         ) && let Some(frame) = frame_image(size, bytes)
         {
             return Rendered::Frame(frame);

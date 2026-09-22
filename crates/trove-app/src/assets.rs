@@ -19,9 +19,15 @@ use gpui_kit::{AssetSource, Result, SharedString};
 // the AI tagging action, where `Bot` (the settings page) would read as
 // "chat" rather than "do something to these assets". None of them are in
 // `default-icons.txt`, so without listing them here they render blank.
+// The appearance catalogue: every glyph a folder can be given, plus the four
+// the collection tree falls back to. They are listed here because the default
+// bundle carries only a tenth of the catalog — an icon outside it loads as empty
+// and paints invisible, which is the failure `every_appearance_icon_is_bundled`
+// keeps from coming back.
 icon_assets!(
     pub(crate) ExtraIcons,
     [
+        // The video player, the preview toolbar and the title bar.
         Volume1,
         Volume2,
         VolumeX,
@@ -33,6 +39,54 @@ icon_assets!(
         Trash,
         Eraser,
         Sparkles,
+        // What a folder may be given.
+        Archive,
+        Award,
+        Bookmark,
+        Box,
+        Briefcase,
+        Brush,
+        Cake,
+        Camera,
+        Car,
+        Circle,
+        Clock,
+        Cloud,
+        Diamond,
+        FileArchive,
+        FileBox,
+        Film,
+        Flame,
+        Flower,
+        FolderHeart,
+        FolderKey,
+        FolderLock,
+        Folders,
+        GalleryThumbnails,
+        Gift,
+        House,
+        Image,
+        Images,
+        Layers,
+        LayoutGrid,
+        Leaf,
+        Library,
+        MapPin,
+        Mic,
+        Mountain,
+        Music,
+        Package,
+        Plane,
+        Shapes,
+        Ship,
+        ShoppingBag,
+        Tag,
+        Tags,
+        TreePine,
+        Type,
+        Video,
+        X,
+        Zap,
     ]
 );
 
@@ -80,6 +134,22 @@ mod tests {
             assert!(
                 ExtraIcons.load(path).unwrap().is_some(),
                 "{path} is not embedded; add it to ExtraIcons"
+            );
+        }
+    }
+
+    /// The folder-look catalogue is generated from a list of ~60 names, so it is
+    /// checked against the bundle rather than by eye: an icon the picker offers
+    /// but the asset source does not carry paints a blank cell, and the user
+    /// sees a picker full of nothing.
+    #[test]
+    fn every_appearance_icon_is_bundled() {
+        for name in crate::panels::appearance::catalog_icons() {
+            let path = name.path();
+            assert!(
+                TroveAssets.load(&path).unwrap().is_some(),
+                "{path} is offered by the appearance catalogue but not embedded; \
+                 add it to `ExtraIcons`"
             );
         }
     }

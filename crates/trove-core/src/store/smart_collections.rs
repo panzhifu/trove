@@ -10,9 +10,9 @@ use chrono::Utc;
 use rusqlite::{Connection, types::Value};
 use uuid::Uuid;
 
-use super::rows::{self, bind_opt_str, bind_opt_uuid, req_ts, req_uuid};
+use super::rows::{self, bind_opt_uuid, req_ts, req_uuid};
 use crate::error::{Error, Result};
-use crate::model::{NewSmartCollection, SmartCollection};
+use crate::model::{Appearance, NewSmartCollection, SmartCollection};
 
 /// Insert a smart collection, creating its id and timestamps.
 pub fn create(conn: &Connection, input: &NewSmartCollection) -> Result<SmartCollection> {
@@ -28,14 +28,13 @@ pub fn create(conn: &Connection, input: &NewSmartCollection) -> Result<SmartColl
     let query = serde_json::to_string(&input.query)?;
     rows::execute(
         conn,
-        "INSERT INTO smart_collections (id, parent_id, name, query, color, position, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)",
+        "INSERT INTO smart_collections (id, parent_id, name, query, position, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)",
         vec![
             rows::uuid(id).into(),
             bind_opt_uuid(input.parent_id),
             input.name.trim().to_string().into(),
             query.into(),
-            bind_opt_str(input.color.as_deref()),
             Value::Integer(input.position),
             rows::ts(now).into(),
         ],
@@ -45,7 +44,7 @@ pub fn create(conn: &Connection, input: &NewSmartCollection) -> Result<SmartColl
         parent_id: input.parent_id,
         name: input.name.trim().to_string(),
         query: input.query.clone(),
-        color: input.color.clone(),
+        appearance: Appearance::default(),
         position: input.position,
         created_at: now,
         updated_at: now,
@@ -55,7 +54,7 @@ pub fn create(conn: &Connection, input: &NewSmartCollection) -> Result<SmartColl
 pub fn get(conn: &Connection, id: Uuid) -> Result<Option<SmartCollection>> {
     rows::query_one(
         conn,
-        "SELECT id, parent_id, name, query, color, position, created_at, updated_at
+        "SELECT id, parent_id, name, query, position, created_at, updated_at, appearance
          FROM smart_collections WHERE id = ?1",
         vec![rows::uuid(id).into()],
         collection_from_row,
@@ -66,7 +65,7 @@ pub fn get(conn: &Connection, id: Uuid) -> Result<Option<SmartCollection>> {
 pub fn list(conn: &Connection) -> Result<Vec<SmartCollection>> {
     rows::query_map(
         conn,
-        "SELECT id, parent_id, name, query, color, position, created_at, updated_at
+        "SELECT id, parent_id, name, query, position, created_at, updated_at, appearance
          FROM smart_collections ORDER BY position ASC, created_at ASC",
         vec![],
         collection_from_row,
@@ -99,23 +98,45 @@ pub fn rename(conn: &Connection, id: Uuid, name: &str) -> Result<()> {
 
 /// Replace the stored condition tree of a smart collection. The tree is
 /// validated by compiling it before the row is touched.
-pub fn update_query(
-    conn: &Connection,
-    id: Uuid,
-    query: &serde_json::Value,
-    color: Option<&str>,
-) -> Result<()> {
+///
+/// The look of the folder is not part of this: rules and appearance are edited
+/// in different places and rewriting one while saving the other would quietly
+/// undo an edit made in between.
+pub fn update_query(conn: &Connection, id: Uuid, query: &serde_json::Value) -> Result<()> {
     // Validate up front: an uncompilable tree must not land in the store.
     let node = super::smart::node_from_json(query)?;
     super::smart::compile(None, None, &node)?;
     let changed = rows::execute(
         conn,
-        "UPDATE smart_collections SET query = ?1, color = ?2, updated_at = ?3 WHERE id = ?4",
+        "UPDATE smart_collections SET query = ?1, updated_at = ?2 WHERE id = ?3",
         vec![
             serde_json::to_string(query)
                 .map_err(|e| Error::Db(format!("serialize query: {e}")))?
                 .into(),
-            color.map(|c| c.to_string()).into(),
+            rows::ts(Utc::now()).into(),
+            rows::uuid(id).into(),
+        ],
+    )?;
+    if changed == 0 {
+        return Err(Error::NotFound("smart_collection"));
+    }
+    Ok(())
+}
+
+/// Set (or clear) a smart collection's own glyph and accent — see
+/// [`super::collections::set_appearance`], which this mirrors.
+pub fn set_appearance(conn: &Connection, id: Uuid, appearance: &Appearance) -> Result<()> {
+    let changed = rows::execute(
+        conn,
+        "UPDATE smart_collections SET appearance = ?1, updated_at = ?2 WHERE id = ?3",
+        vec![
+            appearance
+                .clone()
+                .sanitized()
+                .as_ref()
+                .and_then(|a| a.to_storage())
+                .map(Value::Text)
+                .unwrap_or(Value::Null),
             rows::ts(Utc::now()).into(),
             rows::uuid(id).into(),
         ],
@@ -211,10 +232,10 @@ fn collection_from_row(row: &rusqlite::Row) -> Result<SmartCollection> {
         parent_id: rows::opt_uuid(row, 1)?,
         name: rows::req_str(row, 2)?,
         query,
-        color: rows::opt_str(row, 4)?,
-        position: rows::int(row, 5)?,
-        created_at: req_ts(row, 6)?,
-        updated_at: req_ts(row, 7)?,
+        position: rows::int(row, 4)?,
+        created_at: req_ts(row, 5)?,
+        updated_at: req_ts(row, 6)?,
+        appearance: Appearance::from_storage(rows::opt_str(row, 7)?.as_deref()),
     })
 }
 

@@ -8841,6 +8841,7 @@ dependencies = [
  "dirs 5.0.1",
  "fontdue",
  "gltf",
+ "ignore",
  "image",
  "jieba-rs",
  "jxl-oxide",

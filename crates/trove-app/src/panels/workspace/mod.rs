@@ -72,7 +72,6 @@ pub(crate) use data::recent_picker_colors;
 use rows::{
     materialize_rows, next_cell_row, prev_cell_row, refill_rows, timeline_header, timeline_rows,
 };
-pub(crate) use toolbar::color_panel;
 use toolbar::{
     add_filter_button, color_filter, format_filter, kind_filter, kind_key, rating_filter,
     selection_toolbar, shape_filter, tag_filter, title_controls,

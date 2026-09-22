@@ -658,7 +658,6 @@ mod tests {
                 query: serde_json::json!({
                     "op": "match", "field": "kind", "value": "document"
                 }),
-                color: None,
                 position: 0,
             },
         )
@@ -881,7 +880,6 @@ mod tests {
                     query: serde_json::json!({
                         "op": "match", "field": "kind", "value": "image"
                     }),
-                    color: None,
                     position: 0,
                 },
             )

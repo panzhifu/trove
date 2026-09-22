@@ -19,7 +19,9 @@
 //! Scan semantics: watch roots are baselined on first sight (attaching a watch
 //! never retro-imports what is already there) and only *new* files are
 //! signalled. A file is only offered once it has stopped changing — see
-//! [`SETTLE`].
+//! [`SETTLE`]. What the scanned folders ask to be left out with their
+//! [`.gitignore` files](super::ignore) is left out of both halves of the scan,
+//! so a burst the kernel reports is decided the same way a sweep decides it.
 //!
 //! The job keeps offering a file until the embedder says it has it: a refusal
 //! (another import still running) has to retry, so a refused batch is simply
@@ -38,6 +40,7 @@ use std::time::{Duration, Instant, SystemTime};
 use notify::{RecursiveMode, Watcher};
 
 use super::JobContext;
+use super::ignore::Ignores;
 use crate::config::{AppConfig, LibraryConfig};
 
 /// Full-sweep cadence for the watch roots, and the interval the two configs
@@ -109,6 +112,10 @@ pub fn run(
     let mut config = AppConfig::load();
     let mut library = LibraryConfig::load(&library_dir);
     let mut roots: Vec<PathBuf> = library.watched_folders.clone();
+    // The ignore rules for the event path, which has no walk to carry them.
+    // Re-read on the settings cadence, so an ignore file the user edits applies
+    // within one tick of the sweep noticing.
+    let mut ignores = Ignores::default();
 
     loop {
         if ctx.cancelled() {
@@ -137,6 +144,7 @@ pub fn run(
             config = AppConfig::load();
             library = LibraryConfig::load(&library_dir);
             roots = library.watched_folders.clone();
+            ignores.clear();
         }
 
         if config.collect_enabled() {
@@ -181,7 +189,7 @@ pub fn run(
             let mut fresh = Vec::new();
             if let Some(watch) = events.as_mut() {
                 watch.sync(&roots);
-                fresh = watch.drain(&roots, &seen, &mut recent, interval, SETTLE);
+                fresh = watch.drain(&roots, &seen, &mut recent, &mut ignores, interval, SETTLE);
             }
             if now >= next_sweep {
                 // The sweep exists to catch what the kernel cannot report. When
@@ -302,12 +310,14 @@ impl Events {
     ///
     /// `seen` is the same filter the sweep applies — baselined files and files
     /// the embedder has already acknowledged — so the two sources agree on what
-    /// still needs offering.
+    /// still needs offering. `ignores` decides what the scanned folders ask to
+    /// be left out, which the sweep gets from its walk and this path has to read.
     fn drain(
         &mut self,
         roots: &[PathBuf],
         seen: &HashSet<PathBuf>,
         recent: &mut HashMap<PathBuf, Instant>,
+        ignores: &mut Ignores,
         cooldown: Duration,
         settle: Duration,
     ) -> Vec<PathBuf> {
@@ -325,6 +335,12 @@ impl Events {
                 continue; // an unwatched root: its events are stale
             };
             if hidden_under(root, &path) || !still_wanted(&path, seen) {
+                continue;
+            }
+            // After the two free filters, because this one reads: a file the
+            // watcher reports again once it has been acknowledged costs nothing
+            // here, and a new folder's rules are read once, not per file in it.
+            if ignores.is_left_out(root, &path, false) {
                 continue;
             }
             if !settled(&path, now, settle) {
@@ -559,6 +575,37 @@ mod tests {
         assert!(hidden_under(&root, &PathBuf::from("/elsewhere/a.jpg")));
     }
 
+    /// What the folder leaves out with its own ignore files the sweep leaves
+    /// out too — the same rule the kernel path applies, so the two agree on
+    /// what still needs offering.
+    #[test]
+    fn the_sweep_leaves_out_what_the_folder_leaves_out() {
+        let root = temp_dir("sweep-ignored");
+        std::fs::write(root.join(".gitignore"), b"build/\n*.tmp\n").unwrap();
+        std::fs::create_dir_all(root.join("build/nested")).unwrap();
+        std::fs::write(root.join("build/nested/out.png"), b"x").unwrap();
+        std::fs::write(root.join("scratch.tmp"), b"x").unwrap();
+        std::fs::write(root.join("keep.png"), b"x").unwrap();
+        let roots = std::slice::from_ref(&root);
+        let mut seen = HashSet::new();
+        let mut baselined = HashSet::new();
+
+        // The baseline holds only the kept file: an ignored path is not a
+        // candidate at all, so dropping the rule later presents it as new —
+        // which is what removing an ignore rule is for.
+        assert!(
+            sweep(roots, &mut seen, &mut baselined, Duration::ZERO).is_empty(),
+            "the first sweep baselines, so it reports nothing"
+        );
+        std::fs::write(root.join("keep2.png"), b"x").unwrap();
+        assert_eq!(
+            sweep(roots, &mut seen, &mut baselined, Duration::ZERO),
+            vec![root.join("keep2.png")]
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
     #[test]
     fn a_file_is_only_settled_once_it_stops_changing() {
         let dir = temp_dir("settle");
@@ -682,9 +729,17 @@ mod tests {
         let roots = std::slice::from_ref(&root);
         let mut seen = HashSet::new();
         let mut recent = HashMap::new();
+        let mut ignores = Ignores::default();
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
-            let fresh = events.drain(roots, &seen, &mut recent, Duration::ZERO, Duration::ZERO);
+            let fresh = events.drain(
+                roots,
+                &seen,
+                &mut recent,
+                &mut ignores,
+                Duration::ZERO,
+                Duration::ZERO,
+            );
             if fresh.iter().any(|p| p.ends_with("new.png")) {
                 break;
             }
@@ -701,7 +756,14 @@ mod tests {
         seen.insert(root.join("new.png"));
         assert!(
             events
-                .drain(roots, &seen, &mut recent, Duration::ZERO, Duration::ZERO)
+                .drain(
+                    roots,
+                    &seen,
+                    &mut recent,
+                    &mut ignores,
+                    Duration::ZERO,
+                    Duration::ZERO
+                )
                 .is_empty()
         );
 
@@ -713,11 +775,62 @@ mod tests {
                     roots,
                     &HashSet::new(),
                     &mut recent,
+                    &mut ignores,
                     Duration::from_secs(60),
                     Duration::ZERO
                 )
                 .is_empty()
         );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The fast path reads the same ignore files the sweep does. The kernel
+    /// reports what lands inside a folder the scan would never enter — a build
+    /// directory a watcher filled in one go — so the decision has to be made
+    /// per reported path, or the excluded tree arrives anyway.
+    ///
+    /// Not run on macOS, for the reason given on
+    /// [`kernel_events_reach_the_buffer_until_they_are_acknowledged`].
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn a_reported_file_the_folder_leaves_out_is_not_offered() {
+        let root = temp_dir("events-ignored");
+        std::fs::write(root.join(".gitignore"), b"build/\n").unwrap();
+        let Some(mut events) = Events::start(std::slice::from_ref(&root)) else {
+            return;
+        };
+        std::fs::create_dir_all(root.join("build/nested")).unwrap();
+        std::fs::write(root.join("build/nested/out.png"), b"x").unwrap();
+        std::fs::write(root.join("kept.png"), b"x").unwrap();
+
+        let roots = std::slice::from_ref(&root);
+        let seen = HashSet::new();
+        let mut recent = HashMap::new();
+        let mut ignores = Ignores::default();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let fresh = events.drain(
+                roots,
+                &seen,
+                &mut recent,
+                &mut ignores,
+                Duration::ZERO,
+                Duration::ZERO,
+            );
+            if fresh.iter().any(|p| p.ends_with("kept.png")) {
+                assert!(
+                    !fresh.iter().any(|p| p.ends_with("out.png")),
+                    "a file under an ignored folder was offered: {fresh:?}"
+                );
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "no event for a new file within 5s"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
 
         std::fs::remove_dir_all(&root).ok();
     }

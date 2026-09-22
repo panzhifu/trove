@@ -142,6 +142,13 @@ fn insert_collection_tree(
         },
     )
     .ok()?;
+    // A restore carries the folder's look too: creation has no appearance
+    // parameter (a look is something added later), so it is written here —
+    // and a field that is not threaded through this call silently does not
+    // survive an export/import round trip.
+    if !coll.appearance.is_plain() {
+        let _ = collections::set_appearance(conn, created.id, &coll.appearance);
+    }
     map.insert(coll.id, created.id);
     report.collections += 1;
     Some(created.id)
@@ -1705,12 +1712,15 @@ impl Library {
                 parent_id: None,
                 name: sc.name.clone(),
                 query: sc.query.clone(),
-                color: sc.color.clone(),
                 position: sc.position,
             };
             if input.validate().is_ok() && smart::validate_json(&input.query).is_ok() {
                 match smart_collections::create(conn, &input) {
                     Ok(created) => {
+                        if !sc.appearance.is_plain() {
+                            let _ =
+                                smart_collections::set_appearance(conn, created.id, &sc.appearance);
+                        }
                         sc_map.insert(sc.id, created.id);
                         created_smarts.push((created.id, sc.parent_id, sc.position));
                         report.smart_collections += 1;
@@ -2350,7 +2360,6 @@ mod tests {
                         { "op": "match", "field": "is_favorite", "value": true },
                     ]
                 }),
-                color: None,
                 position: 0,
             })
             .unwrap();
@@ -2454,7 +2463,6 @@ mod tests {
                     "field": "text",
                     "value": "x",
                 }),
-                color: None,
                 position: 0,
             })
             .unwrap();
@@ -2710,7 +2718,6 @@ mod tests {
                 parent_id: Some(coll.id),
                 name: "in-trip".into(),
                 query: fav.clone(),
-                color: None,
                 position: 0,
             })
             .unwrap();
@@ -2719,7 +2726,6 @@ mod tests {
                 parent_id: None,
                 name: "outer".into(),
                 query: fav.clone(),
-                color: None,
                 position: 1,
             })
             .unwrap();
@@ -2728,7 +2734,6 @@ mod tests {
                 parent_id: Some(outer.id),
                 name: "inner".into(),
                 query: fav,
-                color: None,
                 position: 0,
             })
             .unwrap();

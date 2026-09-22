@@ -48,6 +48,7 @@ macro_rules! panel {
     };
 }
 
+pub mod appearance;
 pub mod common;
 mod explorer;
 mod folders;

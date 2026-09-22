@@ -227,7 +227,7 @@ fn ai_action_row(controller: Entity<LibraryController>, cx: &mut App) -> Div {
         .read(cx)
         .library
         .tasks()
-        .is_running(trove_core::tasks::TaskKind::EmbeddingBackfill);
+        .is_active(trove_core::tasks::TaskKind::EmbeddingBackfill);
     let button = if running {
         let controller = controller.clone();
         Button::new("embedding-cancel")
@@ -500,7 +500,7 @@ fn analysis_buttons(controller: &Entity<LibraryController>, cx: &mut App) -> Div
         .read(cx)
         .library
         .tasks()
-        .is_running(trove_core::tasks::TaskKind::AiAnalysis);
+        .is_active(trove_core::tasks::TaskKind::AiAnalysis);
 
     let run = if running {
         let controller = controller.clone();

@@ -36,9 +36,12 @@ use std::time::Instant;
 
 use gpui_kit::base::v_flex;
 use gpui_kit::*;
+use uuid::Uuid;
 
+use gpui_kit::base::ColorPickerState;
 use trove_core::media::formats::streaming_point_cloud::StreamingPointCloud;
 use trove_core::media::formats::types::{Bounds as MeshBounds, Mesh, Winding};
+use trove_core::media::height_color::{CustomScale, DEFAULT_COLOUR_LOW, HeightLook, StoredLook};
 use trove_core::media::index::IndexedCloud;
 use trove_core::media::render3d::{self, Camera};
 
@@ -70,11 +73,32 @@ pub enum Backend {
     Unavailable(String),
 }
 
+/// The viewport's own handles for the panel, so the element builders in `ui`
+/// do not reach into fields across the module boundary.
+impl ModelViewport {
+    /// The anchor the editor is pointing at.
+    pub(super) fn height_anchor_index(&self) -> usize {
+        self.height_anchor
+    }
+
+    /// The picker beside it.
+    pub(super) fn height_colour_picker(&self) -> Entity<ColorPickerState> {
+        self.height_colour.clone()
+    }
+}
+
 /// What the viewport tells its host, the workspace panel.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum ModelViewportEvent {
     /// The user left the viewport (Escape, or the back button).
     Closed,
+    /// The look changed, so the host can keep it against this asset.
+    ///
+    /// Emitted rather than written here because the viewport has no library to
+    /// write to: its host owns the connection, and — like
+    /// `LibraryController::record_view` — the write is a convenience that must
+    /// not be able to fail a colour change.
+    LookChanged(StoredLook),
 }
 
 /// What a held mouse button does to the camera.
@@ -119,6 +143,10 @@ const ENHANCE_REFRESH: std::time::Duration = std::time::Duration::from_millis(50
 pub struct ModelViewport {
     /// Display name, as the grid shows it.
     name: String,
+    /// The library row this preview belongs to, when it came from one. Opening
+    /// a file straight off disk leaves it `None`, and then there is nothing to
+    /// remember a look against.
+    asset: Option<Uuid>,
     /// Backend task manager (shared from the library): runs the mesh parse
     /// as a registered, cancellable job.
     tasks: trove_core::tasks::TaskManager,
@@ -237,9 +265,31 @@ pub struct ModelViewport {
     /// Cached `AppConfig::point_enhance`, so the frame path does not read the
     /// config file every time it draws.
     enhance_points: bool,
-    /// Whether the model is painted by height, cached from the same config
-    /// read as `enhance_points`.
-    height_color: bool,
+    /// How the model is painted by its field values, cached from the same
+    /// config read as `enhance_points`. Resolved against the scene's bounds per
+    /// frame, so a streamed cloud keeps one range while it loads.
+    height: HeightLook,
+    /// The user's own colour scales, cached from the same config read as
+    /// `height`: the panel lists them, and a scale list is not something to
+    /// re-read from disk on every frame.
+    height_scales: Vec<CustomScale>,
+    /// The picker that edits the selected anchor of a custom colour scale, and
+    /// which anchor that is.
+    ///
+    /// One picker rather than CloudCompare's two colour buttons, because a Trove
+    /// scale has as many anchors as the user clicks: the pair it starts with is
+    /// the same two ends, just with room to grow.
+    height_colour: Entity<ColorPickerState>,
+    height_anchor: usize,
+    /// A colour moved but not yet written anywhere: the picker's own sliders
+    /// report every frame of a drag, and writing the config — and the asset
+    /// row — sixty times a second is the "it confirms before I let go" mistake
+    /// the workspace's colour filter already documents. The look is applied as
+    /// it drags, so the model is the preview; the write waits for the close.
+    height_unsaved: bool,
+    /// Whether the anchor picker was open last time it was observed, which is
+    /// how [`Self::height_unsaved`] finds the edge that means "done picking".
+    colour_open: bool,
     /// When `enhance_points` was last re-read.
     enhance_checked: Option<Instant>,
     /// Whether the pivot symbol is on screen: CloudCompare's
@@ -264,6 +314,9 @@ impl ModelViewport {
         name: String,
         path: PathBuf,
         tasks: trove_core::tasks::TaskManager,
+        asset: Option<Uuid>,
+        saved: Option<StoredLook>,
+        window: &mut Window,
         cx: &mut App,
     ) -> Entity<Self> {
         cx.new(|cx| {
@@ -273,8 +326,27 @@ impl ModelViewport {
             let loading_mesh = Arc::new(Mesh::default());
             // One config read for every setting the viewport starts with.
             let cfg = trove_core::config::AppConfig::load();
+            // This model's own look if it has one, and otherwise the app-wide
+            // default. A stored look names its colour scale rather than copying
+            // it, so it resolves against the scales as they are now — one that
+            // has since been deleted costs a fallback, not a broken row.
+            let height = saved
+                .map(|saved| saved.resolve(&cfg.height_custom_scales))
+                .unwrap_or_else(|| cfg.height_look());
+            // The picker starts on the first anchor of whatever scale is in use,
+            // so opening it shows the colour it will change rather than a
+            // default that happens to match.
+            let seed = height
+                .scale
+                .stops()
+                .first()
+                .map(|stop| stop.rgb)
+                .unwrap_or(DEFAULT_COLOUR_LOW);
+            let height_colour =
+                cx.new(|cx| ColorPickerState::new(window, cx).default_value(ui::rgb_hsla(seed)));
             let mut this = Self {
                 name,
+                asset,
                 tasks,
                 load_task: None,
                 mesh: loading_mesh,
@@ -317,10 +389,40 @@ impl ModelViewport {
                 last_camera_move: None,
                 gesture_armed: false,
                 enhance_points: true,
-                height_color: cfg.height_color(),
+                height,
+                height_scales: cfg.height_custom_scales.clone(),
+                height_colour,
+                height_anchor: 0,
+                height_unsaved: false,
+                colour_open: false,
                 enhance_checked: None,
                 pivot_shown: false,
             };
+            // Each endpoint writes the look as it is picked: there is no
+            // staging here, because the model on screen is the preview.
+            // The colour lands on the look as it is picked, and on disk when the
+            // picker closes.
+            cx.subscribe(&this.height_colour, Self::on_height_colour)
+                .detach();
+            // Both edges of the picker matter, and both need the window: going
+            // open loads it with the colour of the anchor about to be moved,
+            // going closed writes the colour that was picked. Committing on the
+            // way *in* would save a value halfway to where the user was going,
+            // which is the same reason the workspace's colour filter stages.
+            cx.observe_in(&this.height_colour, window, |this, picker, window, cx| {
+                let open = picker.read(cx).is_open();
+                let was = std::mem::replace(&mut this.colour_open, open);
+                if open == was {
+                    return;
+                }
+                if open {
+                    this.sync_anchor_picker(window, cx);
+                } else if this.height_unsaved {
+                    this.write_height(cx);
+                    this.redraw(cx);
+                }
+            })
+            .detach();
             this.start_load(path, cx);
             this
         })

@@ -8,8 +8,10 @@ use uuid::Uuid;
 
 use trove_core::config::AppConfig;
 use trove_core::library::Library;
+use trove_core::media::height_color::StoredLook;
 use trove_core::model::{AspectPreset, AssetKind, AssetSort, Orientation};
 use trove_core::store::browse::SearchTiers;
+use trove_core::store::model_look;
 use trove_core::store::view_history;
 
 /// Current import activity, shown by the Explorer panel.
@@ -25,6 +27,61 @@ pub enum ImportPhase {
         imported: usize,
         skipped: usize,
     },
+}
+
+/// One row of the status-bar task panel: a live or recently-settled job.
+///
+/// Mirrors the backend [`TaskStatus`] plus the last progress numbers the
+/// watchers saw. Kept on the controller (not read live from
+/// [`trove_core::tasks::TaskManager::snapshot`]) so a *finished* job lingers
+/// long enough to be retried — the core registry purges a job as soon as the
+/// next one starts.
+#[derive(Debug, Clone)]
+pub struct TaskCard {
+    pub id: trove_core::tasks::TaskId,
+    pub kind: trove_core::tasks::TaskKind,
+    pub label: String,
+    pub status: trove_core::tasks::TaskStatus,
+    pub done: u64,
+    pub total: u64,
+}
+
+impl TaskCard {
+    /// A settled row: nothing runs, but a failed/cancelled one can be retried.
+    pub fn finished(&self) -> bool {
+        matches!(
+            self.status,
+            trove_core::tasks::TaskStatus::Completed
+                | trove_core::tasks::TaskStatus::Failed
+                | trove_core::tasks::TaskStatus::Cancelled
+        )
+    }
+}
+
+/// What it takes to re-run a job the user can retry. The provider is rebuilt
+/// from the saved config on retry, so only the run's *inputs* are stored here.
+#[derive(Debug, Clone)]
+pub enum Retryable {
+    Import {
+        kind: trove_core::tasks::TaskKind,
+        options: trove_core::tasks::import::ImportOptions,
+        total: usize,
+    },
+    Embedding,
+    Analysis {
+        request: trove_core::tasks::ai_analysis::AiAnalysisRunRequest,
+        undo: bool,
+    },
+}
+
+/// The kind of a [`Retryable`], used as its map key.
+pub fn retryable_kind(retryable: &Retryable) -> trove_core::tasks::TaskKind {
+    use trove_core::tasks::TaskKind;
+    match retryable {
+        Retryable::Import { kind, .. } => *kind,
+        Retryable::Embedding => TaskKind::EmbeddingBackfill,
+        Retryable::Analysis { .. } => TaskKind::AiAnalysis,
+    }
 }
 
 /// Presentation of the workspace asset area.
@@ -151,6 +208,15 @@ pub struct LibraryController {
     /// The running import job, if any: what the cancel button presses and
     /// what a library swap must stop before it can swap the store.
     pub(crate) import_task: Option<crate::library::jobs::ImportTaskHandle>,
+    /// Every live and recently-settled job the status-bar panel lists. The
+    /// watchers add a row when a job starts and update it from the job's
+    /// events; finished rows linger (bounded) so the user can retry them.
+    pub tasks: Vec<TaskCard>,
+    /// How to re-run each kind the last time it ran, so the panel's Retry
+    /// button can restart a failed/cancelled job. Keyed by kind.
+    pub retryable: std::collections::HashMap<trove_core::tasks::TaskKind, Retryable>,
+    /// Whether the status-bar task panel is expanded.
+    pub task_panel_open: bool,
     /// Monotonic revision of the library *contents* (imports, edits, trash,
     /// renames, collection/tag mutations, browse switches). Keys every data
     /// cache: the explorer snapshot, the folder/tag/extension scans, the
@@ -348,6 +414,9 @@ impl LibraryController {
             watch_handle: None,
             import_task: None,
             last_import_refresh: None,
+            tasks: Vec::new(),
+            retryable: std::collections::HashMap::new(),
+            task_panel_open: false,
         }
     }
 
@@ -357,14 +426,20 @@ impl LibraryController {
         self.generation += 1;
     }
 
-    /// Called by the import pump on its poll cadence. The done count always
-    /// lands (progress display), but the generation bump — and with it the
-    /// workspace's full re-query — is coalesced to
+    /// Called by the import pump on its poll cadence. Both `done` and `total`
+    /// come straight from the progress event: the real total only becomes
+    /// known mid-run (after the backend walk expands folders), so carrying it
+    /// here is what lets the bar switch from "Scanning…" to a real fraction.
+    /// The done count always lands (progress display), but the generation
+    /// bump — and with it the workspace's full re-query — is coalesced to
     /// [`IMPORT_REFRESH_INTERVAL`] / [`IMPORT_REFRESH_FILES`].
-    pub fn import_progress(&mut self, done: usize) {
-        if let ImportPhase::Running { total, .. } = &mut self.import_phase {
+    pub fn import_progress(&mut self, done: usize, total: usize) {
+        if let ImportPhase::Running {
+            total: cur_total, ..
+        } = &mut self.import_phase
+        {
             self.import_phase = ImportPhase::Running {
-                total: *total,
+                total: if total > 0 { total } else { *cur_total },
                 done,
             };
             let due = match self.last_import_refresh {
@@ -401,6 +476,110 @@ impl LibraryController {
 
     pub fn is_importing(&self) -> bool {
         matches!(self.import_phase, ImportPhase::Running { .. })
+    }
+
+    // -- status-bar task center --------------------------------------------
+
+    /// Add (or reset) a live row for a job that just started, dropping the
+    /// previous settled row of the same kind so one kind never shows twice.
+    pub fn begin_task(
+        &mut self,
+        id: trove_core::tasks::TaskId,
+        kind: trove_core::tasks::TaskKind,
+        label: impl Into<String>,
+    ) {
+        let label = label.into();
+        self.tasks
+            .retain(|c| c.id == id || c.kind != kind || !c.finished());
+        match self.tasks.iter_mut().find(|c| c.id == id) {
+            Some(card) => {
+                card.kind = kind;
+                card.label = label;
+                card.status = trove_core::tasks::TaskStatus::Running;
+                card.done = 0;
+                card.total = 0;
+            }
+            None => self.tasks.push(TaskCard {
+                id,
+                kind,
+                label,
+                status: trove_core::tasks::TaskStatus::Running,
+                done: 0,
+                total: 0,
+            }),
+        }
+        self.prune_tasks();
+    }
+
+    /// Update a row's progress numbers. A `total` of 0 is "not known yet" and
+    /// leaves the stored total untouched (the folder-walk case).
+    pub fn update_task(&mut self, id: trove_core::tasks::TaskId, done: u64, total: u64) {
+        if let Some(card) = self.tasks.iter_mut().find(|c| c.id == id) {
+            card.done = done;
+            if total > 0 {
+                card.total = total;
+            }
+        }
+    }
+
+    pub fn set_task_status(
+        &mut self,
+        id: trove_core::tasks::TaskId,
+        status: trove_core::tasks::TaskStatus,
+    ) {
+        if let Some(card) = self.tasks.iter_mut().find(|c| c.id == id) {
+            card.status = status;
+        }
+    }
+
+    /// Remember how to re-run a job. The panel offers Retry for a settled row
+    /// whose kind has an entry here.
+    pub fn record_retry(&mut self, retryable: Retryable) {
+        let kind = retryable_kind(&retryable);
+        self.retryable.insert(kind, retryable);
+    }
+
+    /// The stored re-run inputs for `kind`, if any.
+    pub fn retry_inputs(&self, kind: trove_core::tasks::TaskKind) -> Option<&Retryable> {
+        self.retryable.get(&kind)
+    }
+
+    pub fn pause_task(&mut self, id: trove_core::tasks::TaskId) {
+        let manager = self.library.tasks().clone();
+        manager.pause(id);
+        self.set_task_status(id, trove_core::tasks::TaskStatus::Paused);
+    }
+
+    pub fn resume_task(&mut self, id: trove_core::tasks::TaskId) {
+        let manager = self.library.tasks().clone();
+        manager.resume(id);
+        self.set_task_status(id, trove_core::tasks::TaskStatus::Running);
+    }
+
+    pub fn cancel_task(&mut self, id: trove_core::tasks::TaskId) {
+        let manager = self.library.tasks().clone();
+        manager.cancel(id);
+    }
+
+    /// Drop the oldest finished rows beyond a small cap so the panel and the
+    /// retry map stay bounded across a long session.
+    fn prune_tasks(&mut self) {
+        const MAX_FINISHED: usize = 8;
+        let finished: Vec<usize> = self
+            .tasks
+            .iter()
+            .enumerate()
+            .filter(|(_, card)| card.finished())
+            .map(|(index, _)| index)
+            .collect();
+        if finished.len() <= MAX_FINISHED {
+            return;
+        }
+        let drop: Vec<trove_core::tasks::TaskId> = finished[..finished.len() - MAX_FINISHED]
+            .iter()
+            .map(|&index| self.tasks[index].id)
+            .collect();
+        self.tasks.retain(|card| !drop.contains(&card.id));
     }
 
     /// Reset the grid pagination cursor; every view switch starts a fresh
@@ -466,6 +645,25 @@ impl LibraryController {
                 self.generation += 1;
             }
         }
+    }
+
+    /// The 3D look this asset was last left in, or `None` while it still uses
+    /// the app-wide default.
+    pub fn model_look(&self, asset: Uuid) -> Option<StoredLook> {
+        let conn = self.library.store().conn();
+        model_look::get(conn, asset).ok().flatten()
+    }
+
+    /// Remember `look` as this asset's own, so reopening the model puts the
+    /// colours back the way they were left.
+    ///
+    /// Silent on failure, like [`Self::record_view`]: a library whose row cannot
+    /// be written should still let the user paint the model, and the panel has
+    /// already applied the look on screen. Nothing here bumps a generation —
+    /// the look is not part of any listing.
+    pub fn remember_model_look(&mut self, asset: Uuid, look: StoredLook) {
+        let conn = self.library.store().conn();
+        let _ = model_look::set(conn, asset, &look);
     }
 
     /// Set the active smart collection; `None` returns to "All assets".
@@ -626,7 +824,9 @@ impl LibraryController {
         if let Some(task) = self.import_task.take() {
             task.manager.cancel(task.task_id);
             let deadline = std::time::Instant::now() + IMPORT_CANCEL_WAIT;
-            while task.manager.is_task_running(task.task_id) {
+            // Wait on active, not merely running: a paused import still holds
+            // the store and, once cancelled, wakes to unwind.
+            while task.manager.is_task_active(task.task_id) {
                 if std::time::Instant::now() >= deadline {
                     return Err(trove_core::Error::Validation(
                         "import did not stop in time".into(),
@@ -652,6 +852,11 @@ impl LibraryController {
         self.filter_min_rating = None;
         self.filter_ext = None;
         self.import_phase = ImportPhase::Idle;
+        // The task panel and its retry map describe the previous library's
+        // jobs; a stale retry would target the swapped-out store.
+        self.tasks.clear();
+        self.retryable.clear();
+        self.task_panel_open = false;
         self.integrity_report = None;
         // The probe described the other library's vectors as much as its
         // endpoint; a result from before the swap would be about a store that

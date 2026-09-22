@@ -5,9 +5,9 @@ use chrono::Utc;
 use rusqlite::{Connection, types::Value};
 use uuid::Uuid;
 
-use super::rows::{self, bind_opt_uuid, int, req_str, req_ts, req_uuid};
+use super::rows::{self, bind_opt_uuid, int, opt_str, req_str, req_ts, req_uuid};
 use crate::error::{Error, Result};
-use crate::model::{Collection, NewCollection};
+use crate::model::{Appearance, Collection, NewCollection};
 
 /// Insert a collection, creating its id and timestamps.
 pub fn create(conn: &Connection, input: &NewCollection) -> Result<Collection> {
@@ -29,6 +29,7 @@ pub fn create(conn: &Connection, input: &NewCollection) -> Result<Collection> {
         id,
         parent_id: input.parent_id,
         name: input.name.trim().to_string(),
+        appearance: Appearance::default(),
         position: input.position,
         created_at: now,
         updated_at: now,
@@ -38,7 +39,7 @@ pub fn create(conn: &Connection, input: &NewCollection) -> Result<Collection> {
 pub fn get(conn: &Connection, id: Uuid) -> Result<Option<Collection>> {
     rows::query_one(
         conn,
-        "SELECT id, parent_id, name, position, created_at, updated_at
+        "SELECT id, parent_id, name, position, created_at, updated_at, appearance
          FROM collections WHERE id = ?1",
         vec![rows::uuid(id).into()],
         collection_from_row,
@@ -54,7 +55,7 @@ pub fn roots(conn: &Connection) -> Result<Vec<Collection>> {
 pub fn list(conn: &Connection) -> Result<Vec<Collection>> {
     rows::query_map(
         conn,
-        "SELECT id, parent_id, name, position, created_at, updated_at
+        "SELECT id, parent_id, name, position, created_at, updated_at, appearance
          FROM collections
          ORDER BY created_at ASC, position ASC, name ASC",
         vec![],
@@ -67,13 +68,13 @@ pub fn list(conn: &Connection) -> Result<Vec<Collection>> {
 pub fn children_of(conn: &Connection, parent: Option<Uuid>) -> Result<Vec<Collection>> {
     let (sql, params) = match parent {
         Some(id) => (
-            "SELECT id, parent_id, name, position, created_at, updated_at
+            "SELECT id, parent_id, name, position, created_at, updated_at, appearance
              FROM collections WHERE parent_id = ?1
              ORDER BY position ASC, name ASC",
             vec![rows::uuid(id).into()],
         ),
         None => (
-            "SELECT id, parent_id, name, position, created_at, updated_at
+            "SELECT id, parent_id, name, position, created_at, updated_at, appearance
              FROM collections WHERE parent_id IS NULL
              ORDER BY position ASC, name ASC",
             vec![],
@@ -120,6 +121,32 @@ pub fn rename(conn: &Connection, id: Uuid, name: &str) -> Result<()> {
         "UPDATE collections SET name = ?1, updated_at = ?2 WHERE id = ?3",
         vec![
             name.to_string().into(),
+            rows::ts(Utc::now()).into(),
+            rows::uuid(id).into(),
+        ],
+    )?;
+    if changed == 0 {
+        return Err(Error::NotFound("collection"));
+    }
+    Ok(())
+}
+
+/// Set (or clear) a collection's own glyph and accent.
+///
+/// The stored form is `NULL` for a plain appearance, so clearing is as simple
+/// as setting: no empty JSON is left behind to be read back forever.
+pub fn set_appearance(conn: &Connection, id: Uuid, appearance: &Appearance) -> Result<()> {
+    let changed = rows::execute(
+        conn,
+        "UPDATE collections SET appearance = ?1, updated_at = ?2 WHERE id = ?3",
+        vec![
+            appearance
+                .clone()
+                .sanitized()
+                .as_ref()
+                .and_then(|a| a.to_storage())
+                .map(Value::Text)
+                .unwrap_or(Value::Null),
             rows::ts(Utc::now()).into(),
             rows::uuid(id).into(),
         ],
@@ -224,7 +251,7 @@ pub fn count_assets(conn: &Connection, collection_id: Uuid) -> Result<u64> {
 pub fn for_asset(conn: &Connection, asset_id: Uuid) -> Result<Vec<Collection>> {
     rows::query_map(
         conn,
-        "SELECT c.id, c.parent_id, c.name, c.position, c.created_at, c.updated_at
+        "SELECT c.id, c.parent_id, c.name, c.position, c.created_at, c.updated_at, c.appearance
          FROM collections c
          JOIN asset_collection ac ON ac.collection_id = c.id
          WHERE ac.asset_id = ?1
@@ -250,6 +277,7 @@ fn collection_from_row(row: &rusqlite::Row) -> Result<Collection> {
         position: int(row, 3)?,
         created_at: req_ts(row, 4)?,
         updated_at: req_ts(row, 5)?,
+        appearance: Appearance::from_storage(opt_str(row, 6)?.as_deref()),
     })
 }
 

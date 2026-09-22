@@ -10,6 +10,7 @@ pub mod formats;
 pub mod gpu;
 pub mod hash;
 pub mod hash_cache;
+pub mod height_color;
 pub mod import;
 pub mod index;
 pub mod metadata;
