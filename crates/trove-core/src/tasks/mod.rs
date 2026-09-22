@@ -30,6 +30,7 @@ use std::time::{Duration, Instant};
 use crate::model::new_id;
 use uuid::Uuid;
 
+pub mod autotag;
 pub mod embed;
 pub mod import;
 pub mod watch;
@@ -53,6 +54,9 @@ pub enum TaskKind {
     VisualBackfill,
     WatchScan,
     EmbeddingBackfill,
+    /// Asking a chat model to tag assets. Serial by nature — one request per
+    /// asset — so it is the longest-running job the library has.
+    AutoTag,
 }
 
 impl TaskKind {
@@ -68,6 +72,7 @@ impl TaskKind {
             TaskKind::VisualBackfill => "visual-backfill",
             TaskKind::WatchScan => "watch-scan",
             TaskKind::EmbeddingBackfill => "embedding-backfill",
+            TaskKind::AutoTag => "auto-tag",
         }
     }
 }
