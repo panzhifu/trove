@@ -24,7 +24,7 @@
 
 use super::formats::point_cloud::Frustum;
 use super::formats::types::{Bounds, Mesh};
-use super::height_color::HeightField;
+use super::height_color::{HeightField, Sample};
 
 /// Vertical field of view used to frame a model, in degrees.
 pub const FOV_DEG: f32 = 35.0;
@@ -647,15 +647,20 @@ pub fn vertex_data_with(mesh: &Mesh, flip_winding: bool) -> VertexData {
 /// points themselves.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PointData {
-    /// Interleaved `[x, y, z, nx, ny, nz, r, g, b]` per point.
+    /// Interleaved `[x, y, z, nx, ny, nz, r, g, b, intensity, class]` per point.
     pub points: Vec<f32>,
-    /// Points in the buffer, i.e. `points.len() / 9`.
+    /// Points in the buffer, i.e. `points.len() / 11`.
     pub count: u32,
 }
 
 impl PointData {
-    /// Bytes of one interleaved point: position, normal and base colour.
-    pub const STRIDE: u64 = 3 * 3 * 4;
+    /// Bytes of one interleaved point: position, normal, base colour and the two
+    /// scalar channels.
+    ///
+    /// The channels are two separate floats rather than a `vec2` because a vertex
+    /// attribute's offset must be a multiple of its format's size, and the tenth
+    /// float sits at byte 36, which no two-component attribute can start at.
+    pub const STRIDE: u64 = 3 * 3 * 4 + 2 * 4;
 
     /// The point array as bytes, ready for `Queue::write_buffer`.
     pub fn bytes(&self) -> Vec<u8> {
@@ -665,10 +670,15 @@ impl PointData {
 
 /// Flatten a point cloud into the instance data its pipeline reads.
 pub fn point_data(mesh: &Mesh) -> PointData {
-    let mut points = Vec::with_capacity(mesh.positions.len() * 9);
+    let mut points = Vec::with_capacity(mesh.positions.len() * 11);
     for (index, position) in mesh.positions.iter().enumerate() {
         let normal = point_normal(mesh, index);
         let color = base_color(mesh, index);
+        // The same read the CPU rasteriser makes when it colours this point, so
+        // the two cannot disagree about which channel value belongs to which
+        // point. A channel the file has no room for arrives as zero, which is
+        // inert: the viewport will not offer a field it cannot fill.
+        let sample = Sample::of(mesh, index, normal);
         points.extend_from_slice(&[
             position[0],
             position[1],
@@ -679,6 +689,8 @@ pub fn point_data(mesh: &Mesh) -> PointData {
             color[0],
             color[1],
             color[2],
+            sample.intensity,
+            sample.class,
         ]);
     }
     PointData {
@@ -827,7 +839,7 @@ fn paint(
                 // the same from the same model-space position and normal.
                 let c = options
                     .height
-                    .tint_at(mesh.positions[index], geometric)
+                    .tint_at(&Sample::of(mesh, index, geometric))
                     .unwrap_or(MATERIAL);
                 corners[slot] = Vertex {
                     p: view[index],
@@ -895,7 +907,7 @@ fn paint_points(
         // Field colouring wins over the file's own colours; that is the whole
         // point of switching it on.
         let base = height
-            .tint_at(*position, geometric)
+            .tint_at(&Sample::of(mesh, index, geometric))
             .unwrap_or_else(|| base_color(mesh, index));
         let rgb = [
             base[0] * intensity,
@@ -1401,6 +1413,9 @@ fn lerp3(a: [f32; 3], b: [f32; 3], t: f32) -> [f32; 3] {
 mod tests {
     use super::*;
     use crate::media::formats::load_obj;
+    use crate::media::height_color::{
+        Field, FieldData, HeightLook, HeightMode, Scale, scale_by_id,
+    };
 
     /// A closed cube in the unit range, two triangles per face.
     fn cube() -> Mesh {
@@ -2274,6 +2289,25 @@ mod tests {
         crate::media::formats::load_ply(ply.as_bytes()).expect("cloud parses")
     }
 
+    /// A scan that carries the two attributes a surveyor's PLY does: return
+    /// strength and classification.
+    fn scan_cloud(points: &[[f32; 3]], intensities: &[f32], classes: &[u8]) -> Mesh {
+        let mut ply = format!(
+            "ply\nformat ascii 1.0\nelement vertex {}\n\
+             property float x\nproperty float y\nproperty float z\n\
+             property float intensity\nproperty uchar classification\n\
+             end_header\n",
+            points.len()
+        );
+        for ((point, intensity), class) in points.iter().zip(intensities).zip(classes) {
+            ply.push_str(&format!(
+                "{} {} {} {} {}\n",
+                point[0], point[1], point[2], intensity, class
+            ));
+        }
+        crate::media::formats::load_ply(ply.as_bytes()).expect("scan parses")
+    }
+
     /// Pixels the renderer touched, i.e. everything that left the background.
     fn painted(frame: &Frame) -> usize {
         frame
@@ -2352,11 +2386,13 @@ mod tests {
         let mesh = cloud(&[[1.0, 0.0, 0.0], [-1.0, 0.0, 0.0]]);
         let data = point_data(&mesh);
         assert_eq!(data.count, 2);
-        assert_eq!(data.points.len(), 18);
-        assert_eq!(PointData::STRIDE, 3 * 3 * 4);
+        assert_eq!(data.points.len(), 22);
+        assert_eq!(PointData::STRIDE, 3 * 3 * 4 + 2 * 4);
         // The file carries no colour, so both points fall back to the material.
+        // It carries no channels either, and the last two floats of a point are
+        // then the inert zero rather than a hole in the buffer.
         assert_eq!(
-            &data.points[0..9],
+            &data.points[0..11],
             &[
                 1.0,
                 0.0,
@@ -2366,11 +2402,13 @@ mod tests {
                 0.0,
                 MATERIAL[0],
                 MATERIAL[1],
-                MATERIAL[2]
+                MATERIAL[2],
+                0.0,
+                0.0
             ]
         );
         assert_eq!(
-            &data.points[9..18],
+            &data.points[11..22],
             &[
                 -1.0,
                 0.0,
@@ -2380,8 +2418,49 @@ mod tests {
                 0.0,
                 MATERIAL[0],
                 MATERIAL[1],
-                MATERIAL[2]
+                MATERIAL[2],
+                0.0,
+                0.0
             ]
+        );
+    }
+
+    /// The two scanner attributes reach the buffer the shader reads, at the slots
+    /// the WGSL's vertex inputs name, and reach the CPU colouring the same way.
+    #[test]
+    fn a_clouds_channels_reach_both_renderers() {
+        let mesh = scan_cloud(
+            &[[1.0, 0.0, 0.0], [-1.0, 0.0, 0.0]],
+            &[234.0, 12.0],
+            &[6, 2],
+        );
+        assert_eq!(mesh.intensity_range(), Some((12.0, 234.0)));
+        assert_eq!(mesh.class_count(), Some(7));
+
+        let data = point_data(&mesh);
+        assert_eq!(&data.points[9..11], &[234.0, 6.0]);
+        assert_eq!(&data.points[20..22], &[12.0, 2.0]);
+
+        // The CPU path reads the same arrays through the same lookup, so an
+        // intensity of 234 is the top of the scale for this cloud.
+        let look = HeightLook {
+            mode: HeightMode::Ramp,
+            field: Field::Intensity,
+            scale: Scale::Preset(scale_by_id("grey")),
+            ..Default::default()
+        };
+        let tinted = look.resolve(&FieldData {
+            bounds: &mesh.bounds,
+            intensities: mesh.intensity_range(),
+            classes: None,
+        });
+        assert_eq!(
+            tinted.tint_at(&Sample::of(&mesh, 0, [1.0, 0.0, 0.0])),
+            Some([1.0; 3])
+        );
+        assert_eq!(
+            tinted.tint_at(&Sample::of(&mesh, 1, [-1.0, 0.0, 0.0])),
+            Some([0.0; 3])
         );
     }
 

@@ -9,12 +9,59 @@
 //! a point cloud (no triangles). It carries no reference to the original
 //! data and can be cheaply cloned for the renderer to hold.
 
-use crate::media::formats::types::{Bounds, Mesh};
+use crate::media::formats::types::{Bounds, CloudFields, Mesh};
 
 /// Maximum points per octree leaf before it splits (unless `max_depth` is hit).
 pub const MAX_POINTS_PER_NODE: usize = 1024;
 /// Maximum tree depth. 20 levels → 1M³ resolution at unit scale.
 pub const MAX_DEPTH: u32 = 20;
+
+/// Add one value to a per-point channel, keeping the channel parallel with the
+/// positions it belongs to.
+///
+/// A channel nobody has ever supplied stays empty; one that has been is padded
+/// with its neutral value, because a short array reads as absent and the whole
+/// channel would then be dropped as unusable — every point losing its class
+/// because the first one arrived before the file's column was known.
+fn push_channel<T: Copy>(channel: &mut Vec<T>, at: usize, value: Option<T>, neutral: T) {
+    if value.is_none() && channel.is_empty() {
+        return;
+    }
+    while channel.len() < at {
+        channel.push(neutral);
+    }
+    channel.push(value.unwrap_or(neutral));
+}
+
+/// Every other entry of a channel, or nothing when it had stopped being
+/// parallel to the positions — a half-length array is a mismatch, not a subset.
+fn halved<T: Copy>(channel: &[T], positions: usize) -> Vec<T> {
+    if channel.len() != positions {
+        return Vec::new();
+    }
+    channel.iter().step_by(2).copied().collect()
+}
+
+/// One sampled channel: the entries at `indices`, or nothing when the channel
+/// did not cover every point to begin with.
+fn gather<T: Copy>(channel: &[T], positions: usize, indices: &[usize]) -> Vec<T> {
+    if channel.len() != positions {
+        return Vec::new();
+    }
+    indices.iter().map(|&index| channel[index]).collect()
+}
+
+/// The scalar channels of a mesh sampled out of a tree, in the shape the
+/// renderers read: `None` when the cloud carried neither.
+fn sampled_fields(intensities: Vec<f32>, classes: Vec<u8>) -> Option<Box<CloudFields>> {
+    let none = intensities.is_empty() && classes.is_empty();
+    (!none).then(|| {
+        Box::new(CloudFields {
+            intensities,
+            classes,
+        })
+    })
+}
 
 /// Colour given to a point in a coloured cloud that carries none of its own.
 ///
@@ -202,6 +249,11 @@ pub struct Octree {
     colors: Vec<[f32; 3]>,
     /// Optional per-point normals (parallel to `positions`).
     normals: Vec<[f32; 3]>,
+    /// The scanner attributes, parallel to `positions` or empty. A tree that
+    /// lost them could not hand them back: a class belongs to the point it came
+    /// with, and sampling picks points by index.
+    intensities: Vec<f32>,
+    classes: Vec<u8>,
 }
 
 impl Octree {
@@ -214,6 +266,10 @@ impl Octree {
         let positions = mesh.positions.clone();
         let colors = mesh.colors.clone();
         let normals = mesh.normals.clone();
+        let (intensities, classes) = match mesh.fields.as_deref() {
+            Some(fields) => (fields.intensities.clone(), fields.classes.clone()),
+            None => (Vec::new(), Vec::new()),
+        };
 
         // Compute overall bounds.
         let mut bounds = Bounds::empty();
@@ -252,6 +308,8 @@ impl Octree {
             positions,
             colors,
             normals,
+            intensities,
+            classes,
         })
     }
 
@@ -422,34 +480,19 @@ impl Octree {
         // Build the simplified mesh.
         let point_count = indices.len();
         let mut positions = Vec::with_capacity(point_count);
-        let has_colors = self.colors.len() == self.positions.len();
-        let has_normals = self.normals.len() == self.positions.len();
-        let mut colors = if has_colors {
-            Vec::with_capacity(point_count)
-        } else {
-            Vec::new()
-        };
-        let mut normals = if has_normals {
-            Vec::with_capacity(point_count)
-        } else {
-            Vec::new()
-        };
-
-        for &idx in &indices {
-            positions.push(self.positions[idx]);
-            if has_colors {
-                colors.push(self.colors[idx]);
-            }
-            if has_normals {
-                normals.push(self.normals[idx]);
-            }
+        for &index in &indices {
+            positions.push(self.positions[index]);
         }
-
+        let total = self.positions.len();
         let bounds = bounds_from_points(&positions);
         Mesh {
+            fields: sampled_fields(
+                gather(&self.intensities, total, &indices),
+                gather(&self.classes, total, &indices),
+            ),
             positions,
-            normals,
-            colors,
+            normals: gather(&self.normals, total, &indices),
+            colors: gather(&self.colors, total, &indices),
             triangles: Vec::new(),
             bounds,
         }
@@ -491,6 +534,14 @@ pub struct StreamingOctree {
     root: OctreeNode,
     positions: Vec<[f32; 3]>,
     colors: Vec<[f32; 3]>,
+    /// The scanner attributes, each either parallel to `positions` or empty.
+    ///
+    /// They are carried point by point beside the positions rather than looked
+    /// up from the source file, because a tree that has thinned itself knows
+    /// which points are left and nothing else does: a class read back by the
+    /// original index would belong to a different point.
+    intensities: Vec<f32>,
+    classes: Vec<u8>,
     bounds: Bounds,
     /// Bounds grown by 2× each time a point falls outside. Rebuilds on grow.
     allocated_bounds: Bounds,
@@ -528,6 +579,8 @@ impl StreamingOctree {
             },
             positions: Vec::new(),
             colors: Vec::new(),
+            intensities: Vec::new(),
+            classes: Vec::new(),
             bounds: initial_bounds,
             allocated_bounds: initial_bounds,
             dirty: false,
@@ -567,24 +620,9 @@ impl StreamingOctree {
 
         let index = self.positions.len();
         self.positions.push(position);
-        match color {
-            Some(color) => {
-                // A cloud that has colours anywhere has them everywhere: the
-                // points that arrived before the file's first colour are
-                // back-filled, or the array would stay shorter than `positions`
-                // and every colour would be dropped as unusable.
-                while self.colors.len() < index {
-                    self.colors.push(POINT_FALLBACK_COLOR);
-                }
-                self.colors.push(color);
-            }
-            None => {
-                if !self.colors.is_empty() {
-                    // Pad, so the two arrays stay parallel.
-                    self.colors.push(POINT_FALLBACK_COLOR);
-                }
-            }
-        }
+        push_channel(&mut self.colors, index, color, POINT_FALLBACK_COLOR);
+        push_channel(&mut self.intensities, index, None, 0.0);
+        push_channel(&mut self.classes, index, None, 0);
 
         // Check if we need to expand bounds.
         if !bounds_contains(&self.allocated_bounds, position) {
@@ -614,15 +652,21 @@ impl StreamingOctree {
     /// Insert many points at once.
     ///
     /// The same rules as [`StreamingOctree::insert_point`] — the stride skips
-    /// what earlier thinning rejected, colours stay parallel to positions, the
-    /// budget is enforced — but the batch is appended in one pass and the tree
+    /// what earlier thinning rejected, every channel stays parallel to the
+    /// positions it arrived with, the budget is enforced — but the batch is
+    /// appended in one pass and the tree
     /// is rebuilt once at the end. Routing a batch through `insert_point`
     /// instead rebuilds every ten thousand points, which makes loading a chunk
     /// cost the size of everything already resident: the index reader hands
     /// over whole chunks, and that is the difference between reading its
     /// regions and re-indexing the cloud for each one.
-    pub fn insert_points(&mut self, positions: &[[f32; 3]], colors: &[[f32; 3]]) {
-        let has_colors = !colors.is_empty();
+    pub fn insert_points(
+        &mut self,
+        positions: &[[f32; 3]],
+        colors: &[[f32; 3]],
+        intensities: &[f32],
+        classes: &[u8],
+    ) {
         for (index, position) in positions.iter().enumerate() {
             self.seen += 1;
             if self.stride > 1 && !self.seen.is_multiple_of(self.stride) {
@@ -636,16 +680,25 @@ impl StreamingOctree {
             }
             let at = self.positions.len();
             self.positions.push(*position);
-            if has_colors {
-                while self.colors.len() < at {
-                    self.colors.push(POINT_FALLBACK_COLOR);
-                }
-                self.colors
-                    .push(colors.get(index).copied().unwrap_or(POINT_FALLBACK_COLOR));
-            } else if !self.colors.is_empty() {
-                // Pad, so the two arrays stay parallel.
-                self.colors.push(POINT_FALLBACK_COLOR);
-            }
+            push_channel(
+                &mut self.colors,
+                at,
+                (!colors.is_empty())
+                    .then(|| colors.get(index).copied().unwrap_or(POINT_FALLBACK_COLOR)),
+                POINT_FALLBACK_COLOR,
+            );
+            push_channel(
+                &mut self.intensities,
+                at,
+                (!intensities.is_empty()).then(|| intensities.get(index).copied().unwrap_or(0.0)),
+                0.0,
+            );
+            push_channel(
+                &mut self.classes,
+                at,
+                (!classes.is_empty()).then(|| classes.get(index).copied().unwrap_or(0)),
+                0,
+            );
             if !bounds_contains(&self.allocated_bounds, *position) {
                 self.expand_bounds_to_include(*position);
             }
@@ -679,13 +732,15 @@ impl StreamingOctree {
     /// most `2b` points.
     fn decimate(&mut self) {
         let kept: Vec<[f32; 3]> = self.positions.iter().step_by(2).copied().collect();
-        let colors: Vec<[f32; 3]> = if self.colors.len() == self.positions.len() {
-            self.colors.iter().step_by(2).copied().collect()
-        } else {
-            Vec::new()
-        };
+        // Every channel is halved the same way, and a channel that had stopped
+        // being parallel is dropped rather than left to mis-pair what survives.
+        let colors = halved(&self.colors, self.positions.len());
+        let intensities = halved(&self.intensities, self.positions.len());
+        let classes = halved(&self.classes, self.positions.len());
         self.positions = kept;
         self.colors = colors;
+        self.intensities = intensities;
+        self.classes = classes;
         // Half of what is here now has to last until the next thinning, so
         // take one in two arrivals from here on.
         self.stride = self.stride.saturating_mul(2).max(2);
@@ -795,25 +850,20 @@ impl StreamingOctree {
         let indices = spread_sample(visible, max_points);
 
         let count = indices.len();
-        let has_colors = self.colors.len() == self.positions.len();
         let mut positions = Vec::with_capacity(count);
-        let mut colors = if has_colors {
-            Vec::with_capacity(count)
-        } else {
-            Vec::new()
-        };
-        for &idx in &indices {
-            positions.push(self.positions[idx]);
-            if has_colors {
-                colors.push(self.colors[idx]);
-            }
+        for &index in &indices {
+            positions.push(self.positions[index]);
         }
-
+        let total = self.positions.len();
         let bounds = bounds_from_points(&positions);
         Mesh {
+            fields: sampled_fields(
+                gather(&self.intensities, total, &indices),
+                gather(&self.classes, total, &indices),
+            ),
             positions,
             normals: Vec::new(),
-            colors,
+            colors: gather(&self.colors, total, &indices),
             triangles: Vec::new(),
             bounds,
         }
@@ -975,6 +1025,7 @@ mod tests {
             colors: Vec::new(),
             triangles: Vec::new(),
             bounds: Bounds::empty(),
+            fields: None,
         };
 
         let octree = Octree::from_point_cloud(&mesh).expect("octree builds");
@@ -1038,6 +1089,7 @@ mod tests {
             colors: Vec::new(),
             triangles: Vec::new(),
             bounds: Bounds::empty(),
+            fields: None,
         };
 
         let octree = Octree::from_point_cloud(&mesh).expect("octree builds");
@@ -1087,6 +1139,7 @@ mod tests {
             colors: Vec::new(),
             triangles: Vec::new(),
             bounds: Bounds::empty(),
+            fields: None,
         };
         let behind_octree = Octree::from_point_cloud(&behind_mesh).expect("builds");
         let visible = behind_octree.query_frustum(&front_frustum, [0.0, 0.0, 0.0], usize::MAX);
@@ -1116,6 +1169,7 @@ mod tests {
             colors: Vec::new(),
             triangles: Vec::new(),
             bounds: Bounds::empty(),
+            fields: None,
         };
         let octree = Octree::from_point_cloud(&mesh).expect("octree builds");
 
@@ -1211,7 +1265,7 @@ mod tests {
             one.insert_point(*point, Some(*color));
         }
         let mut batch = StreamingOctree::empty();
-        batch.insert_points(&positions, &colors);
+        batch.insert_points(&positions, &colors, &[], &[]);
 
         assert_eq!(one.kept_points(), batch.kept_points());
         let frustum = full_frustum();
@@ -1219,6 +1273,45 @@ mod tests {
         let b = batch.to_mesh_lod(&frustum, [0.0, 0.0, 0.0], 12_000);
         assert_eq!(a.positions, b.positions);
         assert_eq!(a.colors, b.colors);
+    }
+
+    /// Thinning is the tree's own doing, and it is where a channel can be left
+    /// behind or shifted by one: a class that lands on its neighbour paints a
+    /// ground point as a building, and nothing downstream can tell.
+    #[test]
+    fn a_thinned_cloud_keeps_every_class_with_its_own_point() {
+        let count = 400;
+        let positions: Vec<[f32; 3]> = (0..count)
+            .map(|index| [index as f32, (index % 7) as f32, 0.0])
+            .collect();
+        let intensities: Vec<f32> = (0..count).map(|index| index as f32 * 3.0).collect();
+        let classes: Vec<u8> = (0..count).map(|index| (index % 23) as u8).collect();
+
+        let mut octree = StreamingOctree::empty();
+        // Well under the point count, so the tree thins itself several times
+        // over — each halving is a chance for an array to fall out of step.
+        octree.set_budget(60);
+        octree.insert_points(&positions, &[], &intensities, &classes);
+        let mesh = octree.to_mesh_lod(&full_frustum(), [0.0, 0.0, 0.0], usize::MAX);
+        assert!(
+            mesh.vertex_count() < count,
+            "the budget should have thinned the cloud"
+        );
+        assert!(mesh.colors.is_empty(), "this cloud has none");
+        let fields = mesh.fields.as_deref().expect("the channels came along");
+        assert_eq!(fields.intensities.len(), mesh.vertex_count());
+        assert_eq!(fields.classes.len(), mesh.vertex_count());
+        for (point, (intensity, class)) in mesh
+            .positions
+            .iter()
+            .zip(fields.intensities.iter().zip(&fields.classes))
+        {
+            // The intensity is the surviving point's own index, so this is the
+            // pairing check rather than a search for it.
+            let index = (intensity / 3.0).round() as usize;
+            assert_eq!(point, &positions[index], "a class outlived its point");
+            assert_eq!(*class, classes[index], "point {index} lost its class");
+        }
     }
 
     /// A non-finite point must not be inserted. `expand_bounds_to_include`
@@ -1237,6 +1330,8 @@ mod tests {
                 [f32::INFINITY, 0.0, 0.0],
                 [f32::NEG_INFINITY, 0.0, 0.0],
             ],
+            &[],
+            &[],
             &[],
         );
         octree.rebuild();

@@ -24,11 +24,22 @@ use super::order::{Grid, spatial_key};
 /// there are more runs than this.
 pub const MERGE_FAN_IN: usize = 16;
 
-/// Bytes of one spilled record: the key, the position, and the colour.
-const RECORD_BYTES: usize = 8 + 12 + 12;
+/// Bytes of one spilled record: the key, the position, the colour and the two
+/// scanner attributes. Padded to a round 40 — the scratch file is deleted when
+/// the index is finished, so its record width is a memory question rather than
+/// a format one.
+const RECORD_BYTES: usize = 8 + 12 + 12 + 4 + 1 + 3;
 
-/// A point with its colour: what the sorter hands back in order.
-pub type Point = ([f32; 3], [f32; 3]);
+/// One point as the sorter carries it, with everything that travels with it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SortedPoint {
+    pub position: [f32; 3],
+    pub color: [f32; 3],
+    /// Zero when the cloud carries no intensity: the index records whether the
+    /// channel exists, so a reader never has to guess what a zero meant.
+    pub intensity: f32,
+    pub class: u8,
+}
 
 /// One point as the sorter carries it between sorting and writing out.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -36,6 +47,8 @@ struct Record {
     key: u64,
     position: [f32; 3],
     color: [f32; 3],
+    intensity: f32,
+    class: u8,
 }
 
 impl Record {
@@ -48,7 +61,19 @@ impl Record {
             let at = 20 + axis * 4;
             bytes[at..at + 4].copy_from_slice(&self.color[axis].to_le_bytes());
         }
+        bytes[32..36].copy_from_slice(&self.intensity.to_le_bytes());
+        bytes[36] = self.class;
         out.write_all(&bytes)
+    }
+
+    /// The point as the index's callers want it: everything but the key.
+    fn point(&self) -> SortedPoint {
+        SortedPoint {
+            position: self.position,
+            color: self.color,
+            intensity: self.intensity,
+            class: self.class,
+        }
     }
 
     fn read(from: &[u8; RECORD_BYTES]) -> Self {
@@ -57,6 +82,8 @@ impl Record {
             key: u64::from_le_bytes(from[0..8].try_into().unwrap()),
             position: [float(8), float(12), float(16)],
             color: [float(20), float(24), float(28)],
+            intensity: float(32),
+            class: from[36],
         }
     }
 }
@@ -96,6 +123,10 @@ pub struct SpatialSorter {
     total: u64,
     /// Whether any colour has been seen: a cloud is coloured or it is not.
     colors: bool,
+    /// And the same for the two scanner attributes, which the file's layout
+    /// decides once.
+    intensity: bool,
+    class: bool,
     scratch: Scratch,
     writer: Option<BufWriter<File>>,
 }
@@ -112,6 +143,8 @@ impl SpatialSorter {
             appended: 0,
             total: 0,
             colors: false,
+            intensity: false,
+            class: false,
             scratch: Scratch {
                 path: scratch.join(format!(
                     "trove-sort-{}.bin",
@@ -138,17 +171,46 @@ impl SpatialSorter {
         self.colors
     }
 
+    /// Whether the cloud has carried return strength, or a classification.
+    pub fn has_intensity(&self) -> bool {
+        self.intensity
+    }
+
+    pub fn has_class(&self) -> bool {
+        self.class
+    }
+
     /// Add a batch of points, in whatever order the file holds them.
     ///
-    /// `colors` is either empty or parallel to `points`.
-    pub fn push(&mut self, points: &[[f32; 3]], colors: &[[f32; 3]]) -> Result<(), String> {
+    /// Each of `colors`, `intensities` and `classes` is either empty or
+    /// parallel to `points`, and which of them are present is decided by the
+    /// first batch that carries them: one PLY has one header, so a cloud that
+    /// mixes batches with and without a channel is not a file this reads, and
+    /// the absent ones would otherwise be written as zeros that look like data.
+    pub fn push(
+        &mut self,
+        points: &[[f32; 3]],
+        colors: &[[f32; 3]],
+        intensities: &[f32],
+        classes: &[u8],
+    ) -> Result<(), String> {
         let has_colors = colors.len() == points.len() && !colors.is_empty();
+        let has_intensity = intensities.len() == points.len() && !intensities.is_empty();
+        let has_class = classes.len() == points.len() && !classes.is_empty();
         self.colors |= has_colors;
+        self.intensity |= has_intensity;
+        self.class |= has_class;
         for (index, position) in points.iter().enumerate() {
             self.buffer.push(Record {
                 key: spatial_key(&self.grid, *position),
                 position: *position,
                 color: if has_colors { colors[index] } else { [0.0; 3] },
+                intensity: if has_intensity {
+                    intensities[index]
+                } else {
+                    0.0
+                },
+                class: if has_class { classes[index] } else { 0 },
             });
             self.total += 1;
             if self.buffer.len() >= self.capacity {
@@ -376,12 +438,12 @@ impl SortedPoints {
     }
 
     /// The next point in spatial order.
-    pub fn next_point(&mut self) -> Result<Option<Point>, String> {
+    pub fn next_point(&mut self) -> Result<Option<SortedPoint>, String> {
         match &mut self.source {
             Source::Memory { records, at } => match records.get(*at) {
                 Some(record) => {
                     *at += 1;
-                    Ok(Some((record.position, record.color)))
+                    Ok(Some(record.point()))
                 }
                 None => Ok(None),
             },
@@ -414,7 +476,7 @@ impl SortedPoints {
                         cursor: entry.cursor,
                     });
                 }
-                Ok(Some((record.position, record.color)))
+                Ok(Some(record.point()))
             }
         }
     }
@@ -465,12 +527,13 @@ mod tests {
         let (points, colors) = scrambled(500);
         let mut sorter =
             SpatialSorter::new(grid_for(&points), 1_000, &scratch_dir("fits")).unwrap();
-        sorter.push(&points, &colors).unwrap();
+        sorter.push(&points, &colors, &[], &[]).unwrap();
         let mut sorted = sorter.finish().unwrap();
         assert_eq!(sorted.spilled_runs(), 0, "nothing should have been spilled");
 
         let mut got = Vec::new();
-        while let Some((position, _)) = sorted.next_point().unwrap() {
+        while let Some(point) = sorted.next_point().unwrap() {
+            let position = point.position;
             got.push(position);
         }
         let expected = sort_spatially(points, colors, 12);
@@ -489,7 +552,9 @@ mod tests {
         for batch in 0..40 {
             let from = batch * 100;
             let to = (from + 100).min(points.len());
-            sorter.push(&points[from..to], &colors[from..to]).unwrap();
+            sorter
+                .push(&points[from..to], &colors[from..to], &[], &[])
+                .unwrap();
         }
         assert!(sorter.spilled_runs() > MERGE_FAN_IN);
 
@@ -503,7 +568,10 @@ mod tests {
         );
         let mut got = Vec::new();
         let mut got_colors = Vec::new();
-        while let Some((position, color)) = sorted.next_point().unwrap() {
+        while let Some(SortedPoint {
+            position, color, ..
+        }) = sorted.next_point().unwrap()
+        {
             got.push(position);
             got_colors.push(color);
         }
@@ -521,15 +589,48 @@ mod tests {
         let (points, colors) = scrambled(1_000);
         let mut sorter =
             SpatialSorter::new(grid_for(&points), 64, &scratch_dir("colours")).unwrap();
-        sorter.push(&points, &colors).unwrap();
+        sorter.push(&points, &colors, &[], &[]).unwrap();
         let mut sorted = sorter.finish().unwrap();
         let mut seen = 0;
-        while let Some((position, color)) = sorted.next_point().unwrap() {
+        while let Some(SortedPoint {
+            position, color, ..
+        }) = sorted.next_point().unwrap()
+        {
             let index = color[0] as usize;
             assert_eq!(position, points[index], "colour {index} lost its point");
             seen += 1;
         }
         assert_eq!(seen, points.len());
+    }
+
+    /// The same for the two scanner attributes, which is what makes the index
+    /// worth version 2: a class belongs to its point across a spill, a merge and
+    /// a reordering that has nothing to do with the file's order.
+    #[test]
+    fn spilled_points_keep_their_own_channels() {
+        let (points, _) = scrambled(1_000);
+        // The intensity carries the point's own identity, and the class is
+        // derived from it, so the two can only come back together if they
+        // travelled with the same record.
+        let intensities: Vec<f32> = (0..points.len()).map(|index| index as f32 * 7.0).collect();
+        let classes: Vec<u8> = (0..points.len()).map(|index| (index % 23) as u8).collect();
+        let mut sorter =
+            SpatialSorter::new(grid_for(&points), 64, &scratch_dir("channels")).unwrap();
+        sorter.push(&points, &[], &intensities, &classes).unwrap();
+        let mut sorted = sorter.finish().unwrap();
+        assert!(
+            sorted.spilled_runs() > 1,
+            "a spill is the path being tested: {} runs",
+            sorted.spilled_runs()
+        );
+        let mut seen = std::collections::HashSet::new();
+        while let Some(point) = sorted.next_point().unwrap() {
+            let index = (point.intensity / 7.0).round() as usize;
+            assert_eq!(point.position, points[index], "intensity lost its point");
+            assert_eq!(point.class, classes[index], "point {index} lost its class");
+            assert!(seen.insert(index), "point {index} came back twice");
+        }
+        assert_eq!(seen.len(), points.len(), "every point came back");
     }
 
     /// A cloud with no colours comes back with none, rather than with zeros
@@ -538,7 +639,7 @@ mod tests {
     fn an_uncoloured_cloud_reports_no_colours() {
         let (points, _) = scrambled(300);
         let mut sorter = SpatialSorter::new(grid_for(&points), 50, &scratch_dir("plain")).unwrap();
-        sorter.push(&points, &[]).unwrap();
+        sorter.push(&points, &[], &[], &[]).unwrap();
         assert!(!sorter.has_colors());
         let mut sorted = sorter.finish().unwrap();
         let mut count = 0;
@@ -557,7 +658,7 @@ mod tests {
         let (points, colors) = scrambled(400);
         {
             let mut sorter = SpatialSorter::new(grid_for(&points), 32, &dir).unwrap();
-            sorter.push(&points, &colors).unwrap();
+            sorter.push(&points, &colors, &[], &[]).unwrap();
             // Every run lives in one file, not one file per run.
             assert_eq!(
                 std::fs::read_dir(&dir).unwrap().count(),

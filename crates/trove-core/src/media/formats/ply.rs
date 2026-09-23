@@ -109,6 +109,29 @@ pub(crate) struct PlyBody {
     normals: Vec<[f32; 3]>,
     colors: Vec<[f32; 3]>,
     triangles: Vec<[u32; 3]>,
+    /// The scanner attributes, for the cloud that carries them. Filled vertex
+    /// by vertex beside the positions, and handed to [`CloudFields`] by whoever
+    /// builds the mesh.
+    ///
+    /// [`CloudFields`]: super::types::CloudFields
+    intensities: Vec<f32>,
+    classes: Vec<u8>,
+}
+
+impl PlyBody {
+    /// Append one parsed chunk, every array in turn.
+    ///
+    /// A method rather than five `extend_from_slice` lines at each merge, because
+    /// a merge that remembers the geometry and forgets a channel is invisible:
+    /// the cloud renders, and only the colouring knows the intensity was dropped.
+    fn absorb(&mut self, mut part: Self) {
+        self.positions.append(&mut part.positions);
+        self.normals.append(&mut part.normals);
+        self.colors.append(&mut part.colors);
+        self.triangles.append(&mut part.triangles);
+        self.intensities.append(&mut part.intensities);
+        self.classes.append(&mut part.classes);
+    }
 }
 
 /// Where the values worth reading sit inside the `vertex` element: column
@@ -120,6 +143,11 @@ pub(crate) struct VertexColumns {
     pub(crate) z: usize,
     pub(crate) normals: Option<[usize; 3]>,
     pub(crate) colors: Option<[usize; 3]>,
+    /// Scanner attributes, each with the two spellings in the wild: the
+    /// PLY/LAS convention, and what a CloudCompare export writes for the same
+    /// number. A file with neither just cannot be painted by that field.
+    pub(crate) intensity: Option<usize>,
+    pub(crate) class: Option<usize>,
 }
 
 /// Resolve the vertex columns; `None` when the element carries no scalar
@@ -134,6 +162,7 @@ pub(crate) fn vertex_columns(properties: &[PlyProperty]) -> Option<VertexColumns
     let triple = |names: [&str; 3]| -> Option<[usize; 3]> {
         Some([scalar(names[0])?, scalar(names[1])?, scalar(names[2])?])
     };
+    let any = |names: [&str; 2]| -> Option<usize> { names.iter().find_map(|name| scalar(name)) };
     Some(VertexColumns {
         x: scalar("x")?,
         y: scalar("y")?,
@@ -143,6 +172,8 @@ pub(crate) fn vertex_columns(properties: &[PlyProperty]) -> Option<VertexColumns
         // write `diffuse_*` often enough to take both.
         colors: triple(["red", "green", "blue"])
             .or_else(|| triple(["diffuse_red", "diffuse_green", "diffuse_blue"])),
+        intensity: any(["intensity", "scalar_intensity"]),
+        class: any(["classification", "class"]),
     })
 }
 
@@ -278,8 +309,16 @@ pub fn load_ply(bytes: &[u8]) -> Result<Mesh, String> {
         )
         .ok_or_else(|| "the PLY file contains no triangles".to_string())
     } else {
-        Mesh::finish_points(parsed.positions, parsed.normals, parsed.colors)
-            .ok_or_else(|| "the PLY file contains no vertices".to_string())
+        Mesh::finish_points_with(
+            parsed.positions,
+            parsed.normals,
+            parsed.colors,
+            super::types::CloudFields {
+                intensities: parsed.intensities,
+                classes: parsed.classes,
+            },
+        )
+        .ok_or_else(|| "the PLY file contains no vertices".to_string())
     }
 }
 
@@ -369,6 +408,8 @@ fn read_binary_vertices(
     );
     let normals = cols.normals.map(|n| n.map(|c| (offset(c), ty(c))));
     let colors = cols.colors.map(|n| n.map(|c| (offset(c), ty(c))));
+    let intensity = cols.intensity.map(|c| (offset(c), ty(c)));
+    let class = cols.class.map(|c| (offset(c), ty(c)));
 
     out.positions.reserve(element.count);
     if cols.normals.is_some() {
@@ -376,6 +417,12 @@ fn read_binary_vertices(
     }
     if cols.colors.is_some() {
         out.colors.reserve(element.count);
+    }
+    if cols.intensity.is_some() {
+        out.intensities.reserve(element.count);
+    }
+    if cols.class.is_some() {
+        out.classes.reserve(element.count);
     }
     for row in body[*cursor..end].chunks_exact(stride) {
         // Row length is exactly `stride` and every column offset plus width
@@ -391,6 +438,14 @@ fn read_binary_vertices(
                 scalar_row(row, n[1].0, n[1].1, order) as f32,
                 scalar_row(row, n[2].0, n[2].1, order) as f32,
             ]);
+        }
+        if let Some(s) = intensity {
+            out.intensities
+                .push(scalar_row(row, s.0, s.1, order) as f32);
+        }
+        if let Some(s) = class {
+            out.classes
+                .push(class_byte(scalar_row(row, s.0, s.1, order)));
         }
         if let Some(c) = colors {
             out.colors.push([
@@ -525,9 +580,7 @@ fn read_ascii_vertices(
         None => exact_vertex_section(body, *cursor, element, cols)?,
     };
     *cursor = end;
-    out.positions.extend_from_slice(&parsed.body.positions);
-    out.normals.extend_from_slice(&parsed.body.normals);
-    out.colors.extend_from_slice(&parsed.body.colors);
+    out.absorb(parsed.body);
     Ok(())
 }
 
@@ -590,12 +643,7 @@ fn parse_vertex_section(
     };
     for part in parts {
         parsed.records += part.records;
-        parsed
-            .body
-            .positions
-            .extend_from_slice(&part.body.positions);
-        parsed.body.normals.extend_from_slice(&part.body.normals);
-        parsed.body.colors.extend_from_slice(&part.body.colors);
+        parsed.body.absorb(part.body);
     }
     Ok(parsed)
 }
@@ -621,11 +669,12 @@ fn parse_ascii_vertex_chunk(
 ) -> Result<ParsedSection, String> {
     let mut part = PlyBody::default();
     // What each column feeds: 1-3 the position, 4-6 the normal, 7-9 the
-    // colour channel, 0 nothing worth a parse.
+    // colour channel, 10-11 the two scanner attributes, 0 nothing worth a parse.
     let last_col = [cols.x, cols.y, cols.z]
         .into_iter()
         .chain(cols.normals.into_iter().flatten())
         .chain(cols.colors.into_iter().flatten())
+        .chain(cols.intensity.into_iter().chain(cols.class))
         .max()
         .unwrap_or(0);
     let mut plan = vec![0u8; last_col + 1];
@@ -642,6 +691,12 @@ fn parse_ascii_vertex_chunk(
         plan[g] = 8;
         plan[b] = 9;
     }
+    if let Some(column) = cols.intensity {
+        plan[column] = 10;
+    }
+    if let Some(column) = cols.class {
+        plan[column] = 11;
+    }
 
     let mut at = 0usize;
     while at < chunk.len() {
@@ -657,7 +712,7 @@ fn parse_ascii_vertex_chunk(
         let Some(first) = tokens.next_token() else {
             continue; // a blank line between records
         };
-        let mut record = [0.0f64; 9];
+        let mut record = [0.0f64; 11];
         let mut column = 0usize;
         let mut token = Some(first);
         while let Some(value) = token {
@@ -686,6 +741,12 @@ fn parse_ascii_vertex_chunk(
                 unit_colour(record[7], properties[g].ty),
                 unit_colour(record[8], properties[b].ty),
             ]);
+        }
+        if cols.intensity.is_some() {
+            part.intensities.push(record[9] as f32);
+        }
+        if cols.class.is_some() {
+            part.classes.push(class_byte(record[10]));
         }
     }
     Ok(ParsedSection {
@@ -857,6 +918,15 @@ pub(crate) fn color_row(row: &[u8], at: usize, ty: PlyType, order: PlyEndian) ->
     }
 }
 
+/// The classification column as the byte it indexes.
+///
+/// Clamped rather than wrapped: a file that declared `int` and wrote something
+/// outside 0..=255 gets the nearest class the palette has, rather than one a
+/// two's-complement cast happened to land on.
+pub(crate) fn class_byte(value: impl Into<f64>) -> u8 {
+    value.into().clamp(0.0, 255.0) as u8
+}
+
 /// One colour channel: 0..=255 in an integer field, 0..=1 as a float — the
 /// declared type travels with the header — clamped so a broken file still
 /// renders.
@@ -890,6 +960,16 @@ fn push_vertex_record(
             unit_colour(scalars[g], properties[g].ty),
             unit_colour(scalars[b], properties[b].ty),
         ]);
+    }
+    // The ASCII path reads a record's properties into `scalars` already, so a
+    // channel is one more column to pick up. Both channels keep the file's own
+    // number: the colouring normalises against the range, and a classification
+    // is an index rather than a value to scale.
+    if let Some(column) = cols.intensity {
+        out.intensities.push(scalars[column] as f32);
+    }
+    if let Some(column) = cols.class {
+        out.classes.push(class_byte(scalars[column]));
     }
 }
 
@@ -1000,6 +1080,106 @@ end_header
         assert_eq!(mesh.colors, vec![[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]);
     }
 
+    /// The two scanner attributes, under the spelling CloudCompare's own
+    /// exporter uses rather than the LAS one.
+    #[test]
+    fn a_scan_reads_its_channels_under_either_spelling() {
+        let ply = "\
+ply
+format ascii 1.0
+element vertex 2
+property float x
+property float y
+property float z
+property uchar scalar_intensity
+property uchar class
+end_header
+0 0 0 255 6
+1 1 1 12 2
+";
+        let mesh = load_ply(ply.as_bytes()).expect("a CloudCompare export parses");
+        let fields = mesh.fields.as_deref().expect("both channels read");
+        assert_eq!(fields.intensities, vec![255.0, 12.0]);
+        assert_eq!(fields.classes, vec![6, 2]);
+        assert_eq!(mesh.intensity_range(), Some((12.0, 255.0)));
+        assert_eq!(mesh.class_count(), Some(7));
+    }
+
+    /// A classification column declared wider than the byte it indexes: the
+    /// nearest class the palette has wins, rather than whatever a wrapped cast
+    /// happened to land on.
+    #[test]
+    fn an_out_of_range_class_is_clamped_not_wrapped() {
+        let ply = "\
+ply
+format ascii 1.0
+element vertex 2
+property float x
+property float y
+property float z
+property int classification
+end_header
+0 0 0 300
+1 1 1 -5
+";
+        let mesh = load_ply(ply.as_bytes()).expect("the odd header parses");
+        let fields = mesh.fields.as_deref().expect("the class channel reads");
+        assert_eq!(fields.classes, vec![255, 0]);
+    }
+
+    /// A file whose records are not all usable: the vertex with a NaN
+    /// coordinate goes, and its two channel entries must go with it, or every
+    /// point after it is painted with the neighbour's values.
+    #[test]
+    fn a_dropped_vertex_takes_its_channels_with_it() {
+        let ply = "\
+ply
+format ascii 1.0
+element vertex 3
+property float x
+property float y
+property float z
+property float intensity
+property uchar classification
+end_header
+0 0 0 10 1
+nan 0 0 20 2
+1 1 1 30 3
+";
+        let mesh = load_ply(ply.as_bytes()).expect("the rest of the cloud parses");
+        assert_eq!(mesh.vertex_count(), 2);
+        let fields = mesh.fields.as_deref().expect("channels survive the drop");
+        assert_eq!(fields.intensities, vec![10.0, 30.0]);
+        assert_eq!(fields.classes, vec![1, 3]);
+    }
+
+    /// A surface keeps its triangles and loses its per-vertex attributes: the
+    /// renderers index a cloud's channels by vertex, and a mesh drawn from an
+    /// LOD level would index a subset that no longer lines up.
+    #[test]
+    fn a_triangle_mesh_carries_no_channels() {
+        let ply = "\
+ply
+format ascii 1.0
+element vertex 3
+property float x
+property float y
+property float z
+property float intensity
+element face 1
+property list uchar int vertex_indices
+end_header
+0 0 0 10
+1 0 0 20
+0 1 0 30
+3 0 1 2
+";
+        let mesh = load_ply(ply.as_bytes()).expect("the surface parses");
+        assert!(!mesh.is_point_cloud());
+        assert!(mesh.fields.is_none());
+        assert_eq!(mesh.intensity_range(), None);
+    }
+
     #[test]
     fn a_ply_without_faces_loads_as_a_point_cloud() {
         let ply = "\
@@ -1042,6 +1222,44 @@ end_header
         let mesh = load_ply(&bytes).expect("binary cloud parses");
         assert!(mesh.is_point_cloud());
         assert_eq!(mesh.bounds.max, [2.0, 1.0, 0.0]);
+    }
+
+    /// The same two attributes on the other side of the format, with the
+    /// channels sitting between the position and the colour so the byte offsets
+    /// are checked rather than assumed.
+    #[test]
+    fn a_binary_scan_reads_its_channels() {
+        let header = "\
+ply
+format binary_little_endian 1.0
+element vertex 2
+property float x
+property float y
+property float z
+property uchar intensity
+property uchar classification
+property uchar red
+property uchar green
+property uchar blue
+end_header
+";
+        let mut bytes = header.as_bytes().to_vec();
+        for (point, intensity, class, color) in [
+            ([0f32, 0.0, 0.0], 250u8, 6u8, [255u8, 0, 0]),
+            ([2.0, 1.0, 0.0], 12, 2, [0, 255, 0]),
+        ] {
+            for value in point {
+                bytes.extend_from_slice(&value.to_le_bytes());
+            }
+            bytes.extend_from_slice(&[intensity, class]);
+            bytes.extend_from_slice(&color);
+        }
+        let mesh = load_ply(&bytes).expect("binary scan parses");
+        let fields = mesh.fields.as_deref().expect("both channels read");
+        assert_eq!(fields.intensities, vec![250.0, 12.0]);
+        assert_eq!(fields.classes, vec![6, 2]);
+        // And the colour after them still lands in the right slot.
+        assert_eq!(mesh.colors, vec![[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]);
     }
 
     /// A `face` element that declares records but yields no usable triangle

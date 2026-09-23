@@ -235,11 +235,11 @@ mod tests {
 
     #[test]
     fn the_uniform_block_is_the_size_the_shader_expects() {
-        // 64 bytes of matrix + ten vec4 + a 16-stop colour scale = 480, a
+        // 64 bytes of matrix + ten vec4 + a 32-stop colour scale = 736, a
         // multiple of 16.
-        assert_eq!(UNIFORM_SIZE, 480);
+        assert_eq!(UNIFORM_SIZE, 736);
         assert_eq!(UNIFORM_SIZE % 16, 0);
-        assert_eq!(Uniforms::new(&framing(), (800, 600)).to_bytes().len(), 480);
+        assert_eq!(Uniforms::new(&framing(), (800, 600)).to_bytes().len(), 736);
     }
 
     /// The height look is the payload the viewport's panel changes, so its
@@ -258,7 +258,10 @@ mod tests {
             max: [1.0, 8.0, 1.0],
         };
         let bytes = Uniforms::new(&framing(), (800, 600))
-            .with_height(look.resolve(&bounds).uniforms())
+            .with_height(
+                look.resolve(&crate::media::height_color::FieldData::geometry(&bounds))
+                    .uniforms(),
+            )
             .to_bytes();
         let float_at =
             |offset: usize| f32::from_ne_bytes(bytes[offset..offset + 4].try_into().unwrap());

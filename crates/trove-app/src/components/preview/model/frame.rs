@@ -172,10 +172,10 @@ impl ModelViewport {
         let interactive = self.is_interacting();
         let quality = if interactive { 0.25 } else { 1.0 };
         let scratch = self.scratch.clone();
-        // Measured against the scene's bounds rather than this frame's mesh,
-        // which for a streamed cloud is a different subset every frame: the
-        // colours then stay put while the points arrive, on both renderers.
-        let height = self.height.resolve(&bounds);
+        // Measured against the scene's bounds and the channels the file
+        // carried, both of which stay put while a cloud streams in — and off
+        // altogether when the field it asks for has no values to read.
+        let height = self.height_field();
         let options = RenderOptions {
             // Skipping back faces is free for a closed mesh and wrong for
             // anything else, so it follows the winding exactly.

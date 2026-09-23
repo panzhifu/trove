@@ -16,8 +16,8 @@ use gpui_kit::base::{ColorPickerEvent, ColorPickerState};
 use gpui_kit::component::color_picker::ColorPicker;
 use gpui_kit::component::scroll::ScrollableElement as _;
 use trove_core::media::height_color::{
-    COLOR_SCALES, ColorScale, ColorStop, CustomScale, Field, HeightField,
-    HeightLook, HeightMode, MAX_PERIOD, MIN_PERIOD, RAMP_STOPS, Ramp, Scale, nice_ticks,
+    COLOR_SCALES, ColorScale, ColorStop, CustomScale, Field, HeightField, HeightLook, HeightMode,
+    MAX_PERIOD, MIN_PERIOD, RAMP_STOPS, Ramp, Scale, nice_ticks, scale_by_id,
 };
 
 use super::{Backend, Drag, ModelViewport, ModelViewportEvent, drag_for};
@@ -132,22 +132,43 @@ fn legend_values(field: &HeightField) -> Vec<(f32, f32)> {
             .filter(|value| **value > min && **value < max)
             .copied()
             .collect(),
+        // A class is a whole number, so a half-class step is not a label: a
+        // two-class cloud's range is 0 to 2, and the natural tick falls at half.
+        // What survives the filter is the whole part of it.
+        None if field.field().is_integral() => nice_ticks(min, max, LEGEND_TICKS)
+            .into_iter()
+            .filter(|value| (value - value.round()).abs() < 1e-3)
+            .collect(),
         None => nice_ticks(min, max, LEGEND_TICKS),
+    };
+    // The last class is one short of the palette's count, and no point is ever
+    // painted past it, so that is the number the top of the bar carries.
+    let top = if field.field().is_integral() {
+        max - 1.0
+    } else {
+        max
     };
     let mut values = vec![(min, 0.0)];
     values.extend(interior.into_iter().map(|value| (value, position(value))));
-    values.push((max, 1.0));
+    values.push((top, 1.0));
     values
+}
+
+/// What a field is called, in the user's language.
+fn field_name(field: Field) -> String {
+    match field {
+        Field::Height => rust_i18n::t!("viewport.height_field_height").to_string(),
+        Field::Slope => rust_i18n::t!("viewport.height_field_slope").to_string(),
+        Field::Aspect => rust_i18n::t!("viewport.height_field_aspect").to_string(),
+        Field::Intensity => rust_i18n::t!("viewport.height_field_intensity").to_string(),
+        Field::Class => rust_i18n::t!("viewport.height_field_class").to_string(),
+    }
 }
 
 /// The bar's caption: the field's name, with the axis appended for the one
 /// field whose meaning depends on it.
 fn legend_caption(field: &HeightField) -> String {
-    let name = match field.field() {
-        Field::Height => rust_i18n::t!("viewport.height_field_height").to_string(),
-        Field::Slope => rust_i18n::t!("viewport.height_field_slope").to_string(),
-        Field::Aspect => rust_i18n::t!("viewport.height_field_aspect").to_string(),
-    };
+    let name = field_name(field.field());
     match field.field() {
         Field::Height => format!("{} · {}", name, ["X", "Y", "Z"][field.axis()]),
         _ => name,
@@ -548,7 +569,10 @@ impl ModelViewport {
         self.set_height(
             HeightLook {
                 mode: HeightMode::Ramp,
-                scale: Scale::Custom { id, ramp },
+                scale: Scale::Custom {
+                    id,
+                    ramp: Box::new(ramp),
+                },
                 ..self.height.clone()
             },
             cx,
@@ -618,10 +642,13 @@ impl ModelViewport {
             return;
         };
         let id = id.clone();
-        let ramp = Ramp::custom(&stops);
+        let ramp = Ramp::custom(&stops, false);
         self.apply_height(
             HeightLook {
-                scale: Scale::Custom { id, ramp },
+                scale: Scale::Custom {
+                    id,
+                    ramp: Box::new(ramp),
+                },
                 ..self.height.clone()
             },
             persist,
@@ -712,7 +739,7 @@ impl ModelViewport {
     /// height gets round numbers out of the model's range rather than its
     /// fourths.
     fn height_legend(&self, cx: &mut Context<Self>) -> AnyElement {
-        let field = self.height.resolve(&self.scene_bounds);
+        let field = self.height_field();
         if field.mode() == HeightMode::Off || self.scene_bounds.is_empty() {
             return div().into_any_element();
         }
@@ -1126,7 +1153,7 @@ fn height_panel(look: &HeightLook, entity: Entity<ModelViewport>, cx: &App) -> A
         .child(mode_row(look, entity.clone()))
         .when(look.mode != HeightMode::Off, |panel| {
             panel
-                .child(field_row(look, entity.clone()))
+                .child(field_row(look, entity.clone(), cx))
                 .child(match look.mode {
                     HeightMode::Ramp => scale_list(look, entity.clone(), cx),
                     HeightMode::Bands => band_period_row(look, entity.clone(), cx),
@@ -1142,41 +1169,85 @@ fn height_panel(look: &HeightLook, entity: Entity<ModelViewport>, cx: &App) -> A
         .into_any_element()
 }
 
-/// 高度 / 坡度 / 坡向: which per-point value the colour runs along.
+/// 高度 / 坡度 / 坡向 / 强度 / 分类: which per-point value the colour runs along.
 ///
 /// CloudCompare keeps this question in the scalar-field display rather than in
-/// `ccColorGradientDlg`, where only the dimension is asked; the three fields
-/// here are the ones the geometry already carries, so the choice costs no file
-/// format anything.
-fn field_row(look: &HeightLook, entity: Entity<ModelViewport>) -> AnyElement {
-    // No caption: the three names are the whole question, and the segmented
-    // control already reads as a choice between them.
+/// `ccColorGradientDlg`, where only the dimension is asked. The first three read
+/// the geometry, so a model always has them; the last two read a channel the
+/// file carried or did not, and a missing one is shown disabled rather than
+/// hidden — a control that comes and going reads as a bug, and the reason is
+/// worth the one line of copy.
+fn field_row(look: &HeightLook, entity: Entity<ModelViewport>, cx: &App) -> AnyElement {
+    // No caption for the row itself: the five names are the whole question, and
+    // the segmented control already reads as a choice between them.
+    let available = |field: Field| entity.read(cx).field_available(field);
+    // In `Field::index` order, which is how the click reads the position back.
+    let fields = [
+        Field::Height,
+        Field::Slope,
+        Field::Aspect,
+        Field::Intensity,
+        Field::Class,
+    ];
+    let enabled: Vec<Field> = fields
+        .iter()
+        .copied()
+        .filter(|field| available(*field))
+        .collect();
+    let mut row = TabBar::new("height-field").segmented().on_click({
+        let entity = entity.clone();
+        move |index: &usize, _, cx| {
+            let field = Field::from_index(*index as u8);
+            // A dimmed tab is still clickable in gpui-kit's segmented bar, so
+            // the guard belongs here as much as in the styling.
+            if !enabled.contains(&field) {
+                return;
+            }
+            change_height(
+                &entity,
+                move |look| HeightLook {
+                    field,
+                    // A class is a name, so the class palette is what the field asks
+                    // for the first time it is picked; a scale chosen on purpose —
+                    // the user's own, or any other preset — stays where it was.
+                    scale: if field == Field::Class
+                        && matches!(&look.scale, Scale::Preset(preset) if preset.id == "bgyr")
+                    {
+                        Scale::Preset(scale_by_id("asprs"))
+                    } else {
+                        look.scale.clone()
+                    },
+                    ..look
+                },
+                cx,
+            );
+        }
+    });
+    for field in fields {
+        let tab = Tab::new().flex_1().label(field_name(field));
+        row = row.child(if available(field) {
+            tab
+        } else {
+            tab.disabled(true)
+        });
+    }
     v_flex()
         .gap_1()
-        .child(
-            TabBar::new("height-field")
-                .segmented()
-                .selected_index(look.field.index() as usize)
-                .on_click(move |index: &usize, _, cx| {
-                    let field = Field::from_index(*index as u8);
-                    change_height(&entity, move |look| HeightLook { field, ..look }, cx);
-                })
-                .child(
-                    Tab::new()
-                        .flex_1()
-                        .label(rust_i18n::t!("viewport.height_field_height")),
-                )
-                .child(
-                    Tab::new()
-                        .flex_1()
-                        .label(rust_i18n::t!("viewport.height_field_slope")),
-                )
-                .child(
-                    Tab::new()
-                        .flex_1()
-                        .label(rust_i18n::t!("viewport.height_field_aspect")),
-                ),
-        )
+        .child(row.selected_index(look.field.index() as usize))
+        .when(!available(look.field), |row| {
+            row.child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(
+                        rust_i18n::t!(
+                            "viewport.height_field_unavailable",
+                            field = field_name(look.field)
+                        )
+                        .to_string(),
+                    ),
+            )
+        })
         .into_any_element()
 }
 
@@ -1496,7 +1567,7 @@ fn cell_position(cell: usize) -> f32 {
 /// already says at that point, so adding one does not change the picture until
 /// its colour is moved too.
 fn ramp_rgb(stops: &[ColorStop], at: f32) -> [u8; 3] {
-    let rgb = Ramp::custom(stops).color_at(at);
+    let rgb = Ramp::custom(stops, false).color_at(at);
     [
         (rgb[0] * 255.0).round() as u8,
         (rgb[1] * 255.0).round() as u8,
@@ -1507,7 +1578,7 @@ fn ramp_rgb(stops: &[ColorStop], at: f32) -> [u8; 3] {
 /// The anchors in the order `Ramp::custom` will put them, for the caller that
 /// has just appended one and needs to know where it landed.
 fn stops_after_sort(stops: &[ColorStop]) -> Vec<ColorStop> {
-    Ramp::custom(stops).stops().to_vec()
+    Ramp::custom(stops, false).stops().to_vec()
 }
 
 /// The label of a scale row: the strip is the choice, the name only a caption.
@@ -1646,7 +1717,9 @@ mod tests {
         pivot_symbol_geometry, ramp_rgb, stops_after_sort,
     };
     use trove_core::media::formats::types::Bounds;
-    use trove_core::media::height_color::{ColorStop, Field, HeightLook, HeightMode};
+    use trove_core::media::height_color::{
+        ColorStop, Field, FieldData, HeightLook, HeightMode, Scale, scale_by_id,
+    };
     use trove_core::media::render3d::{Camera, Framing};
 
     fn painted(mode: HeightMode, field: Field, box_bounds: Bounds) -> Vec<(f32, f32)> {
@@ -1656,8 +1729,60 @@ mod tests {
                 field,
                 ..Default::default()
             }
-            .resolve(&box_bounds),
+            .resolve(&FieldData::geometry(&box_bounds)),
         )
+    }
+
+    /// A class bar labels whole classes — `7.5` is not a class — and stops at
+    /// the last one the palette paints, because 23 is how many there are rather
+    /// than a number a point carries.
+    #[test]
+    fn a_class_bar_labels_whole_classes() {
+        let box_bounds = Bounds {
+            min: [0.0, 0.0, 0.0],
+            max: [1.0, 10.0, 1.0],
+        };
+        let look = HeightLook {
+            mode: HeightMode::Ramp,
+            field: Field::Class,
+            scale: Scale::Preset(scale_by_id("asprs")),
+            ..Default::default()
+        };
+        for classes in [23, 7, 2, 1] {
+            let values = legend_values(&look.resolve(&FieldData {
+                bounds: &box_bounds,
+                intensities: None,
+                classes: Some(classes),
+            }));
+            assert!(
+                values
+                    .iter()
+                    .all(|(value, _)| (value - value.round()).abs() < 1e-3),
+                "{classes} classes: {values:?}"
+            );
+            assert_eq!(values.first().unwrap().0, 0.0);
+            assert_eq!(values.last().unwrap().0, 22.0, "{classes} classes");
+        }
+        // A continuous scale reads the cloud's own classes instead, so the top
+        // of the bar is the highest one present.
+        let ramp = legend_values(
+            &HeightLook {
+                mode: HeightMode::Ramp,
+                field: Field::Class,
+                ..Default::default()
+            }
+            .resolve(&FieldData {
+                bounds: &box_bounds,
+                intensities: None,
+                classes: Some(7),
+            }),
+        );
+        assert_eq!(ramp.last().unwrap().0, 6.0);
+        assert!(
+            ramp.iter()
+                .all(|(value, _)| (value - value.round()).abs() < 1e-3),
+            "{ramp:?}"
+        );
     }
 
     #[test]

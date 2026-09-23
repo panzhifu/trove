@@ -5,9 +5,10 @@
 // here, so a model lit on the GPU matches the same model's thumbnail, which was
 // rendered on the CPU at import time.
 
-// How many stops a colour scale may carry. `height_color::RAMP_STOPS`, and the
-// uniform block is sized from it, so the two cannot drift apart silently.
-const RAMP_STOPS: u32 = 16u;
+// How many stops a colour scale may carry: `height_color::RAMP_STOPS`, which the
+// uniform block is sized from. The test that compares the two struct sizes
+// catches a drift; 32 is what CloudCompare's 23-anchor ASPRS palette needs.
+const RAMP_STOPS: u32 = 32u;
 
 struct Uniforms {
     // Model space -> clip space, column-major.
@@ -33,7 +34,8 @@ struct Uniforms {
     // the height (0=X, 1=Y, 2=Z), z = the range floor, w = 1 / the range span.
     coloring: vec4<f32>,
     // x = banding radians per field unit, y = how many `ramp` entries are
-    // live, z = which field is being read (0 height, 1 slope, 2 aspect).
+    // live, z = which field is being read (0 height, 1 slope, 2 aspect,
+    // 3 intensity, 4 class), w = whether the scale's anchors are bins.
     coloring_params: vec4<f32>,
     // The active colour scale: rgb = colour, w = position along the scale,
     // ascending, zero-padded past the live count.
@@ -91,18 +93,23 @@ fn aspect_degrees(n: vec3<f32>, axis: u32) -> f32 {
 //
 // `n` is the geometry's own normal from the vertex attribute, not the one the
 // fragment stage flips to face the camera: dip direction reads a 180 degree
-// difference out of it.
-fn field_value(p: vec3<f32>, n: vec3<f32>) -> f32 {
+// difference out of it. `intensity` and `class_id` come off the same instance
+// the colour does, and a mesh — which has no such attributes — never asks for
+// them: the viewport will not offer a field whose channel the model does not
+// carry.
+fn field_value(p: vec3<f32>, n: vec3<f32>, intensity: f32, class_id: f32) -> f32 {
     let axis = u32(u.coloring.y + 0.5);
     switch (u32(u.coloring_params.z + 0.5)) {
         case 1u: { return dip_degrees(n, axis); }
         case 2u: { return aspect_degrees(n, axis); }
+        case 3u: { return intensity; }
+        case 4u: { return class_id; }
         default: { return component(p, axis); }
     }
 }
 
 // The colour the scale gives at position `t`, interpolating between the stops
-// around it and clamped outside the ends. Mirrors `height_color::scale_color`,
+// around it and clamped outside the ends. Mirrors `height_color::Ramp::color_at`,
 // which is itself `ccColorScale`'s interval walk over its resampled stops.
 fn ramp_color(t: f32) -> vec3<f32> {
     let count = u32(u.coloring_params.y);
@@ -112,6 +119,12 @@ fn ramp_color(t: f32) -> vec3<f32> {
         return vec3<f32>(0.0);
     }
     let x = clamp(t, 0.0, 1.0);
+    if u.coloring_params.w > 0.5 {
+        // A classification scale: the value names a bin, and a bin's colour is
+        // its own. `height_color::Ramp::color_at` takes the same branch.
+        let bin = min(u32(x * f32(count)), count - 1u);
+        return u.ramp[bin].rgb;
+    }
     var interval = 0u;
     while interval + 2u < count && u.ramp[interval + 1u].w < x {
         interval = interval + 1u;
@@ -143,8 +156,14 @@ fn band_color(value: f32) -> vec3<f32> {
 // Resolved here, from the model-space position and normal, so changing the look
 // costs a uniform write rather than a vertex-buffer re-upload — which is what
 // makes it affordable on a streamed cloud of tens of millions of points.
-fn surface_color(p: vec3<f32>, n: vec3<f32>, own: vec3<f32>) -> vec3<f32> {
-    let value = field_value(p, n);
+fn surface_color(
+    p: vec3<f32>,
+    n: vec3<f32>,
+    intensity: f32,
+    class_id: f32,
+    own: vec3<f32>,
+) -> vec3<f32> {
+    let value = field_value(p, n, intensity, class_id);
     switch (u32(u.coloring.x + 0.5)) {
         case 1u: { return ramp_color((value - u.coloring.z) * u.coloring.w); }
         case 2u: { return band_color(value); }
@@ -173,7 +192,9 @@ fn vs_model(
     out.clip = u.view_proj * vec4<f32>(position, 1.0);
     out.model_pos = position;
     out.normal = normal;
-    out.tint = surface_color(position, normal, u.material.rgb);
+    // A triangle has no scalar channels to read: the attributes stop at the
+    // normal, and the two the point path carries are zero here by construction.
+    out.tint = surface_color(position, normal, 0.0, 0.0, u.material.rgb);
     return out;
 }
 
@@ -185,11 +206,11 @@ fn fs_model(in: ModelOut) -> @location(0) vec4<f32> {
     let n = select(-geometric, geometric, dot(geometric, to_eye) >= 0.0);
 
     let diffuse = max(dot(n, u.light.xyz), 0.0);
-    let intensity = u.material.w + u.params.x * diffuse;
+    let shading = u.material.w + u.params.x * diffuse;
     let half = normalize(u.light.xyz + to_eye);
     let spec = u.params.y * pow(max(dot(n, half), 0.0), u.params.z);
 
-    return vec4<f32>(in.tint * intensity + vec3<f32>(spec), 1.0);
+    return vec4<f32>(in.tint * shading + vec3<f32>(spec), 1.0);
 }
 
 // A point cloud is drawn one sprite per point, each a camera-facing square
@@ -213,6 +234,8 @@ fn vs_point(
     @location(0) position: vec3<f32>,
     @location(1) normal: vec3<f32>,
     @location(2) color: vec3<f32>,
+    @location(3) intensity: f32,
+    @location(4) class_id: f32,
 ) -> PointOut {
     var corners = array<vec2<f32>, 6>(
         vec2<f32>(-1.0, -1.0),
@@ -239,7 +262,7 @@ fn vs_point(
     out.model_pos = position;
     out.normal = normal;
     out.offset = corner;
-    out.color = surface_color(position, normal, color);
+    out.color = surface_color(position, normal, intensity, class_id, color);
     return out;
 }
 
@@ -258,9 +281,9 @@ fn fs_point(in: PointOut) -> @location(0) vec4<f32> {
     let n = select(-geometric, geometric, dot(geometric, to_eye) >= 0.0);
 
     let diffuse = max(dot(n, u.light.xyz), 0.0);
-    let intensity = u.material.w + u.params.x * diffuse;
+    let shading = u.material.w + u.params.x * diffuse;
 
-    return vec4<f32>(in.color * intensity, 1.0);
+    return vec4<f32>(in.color * shading, 1.0);
 }
 
 // A single oversized triangle covering the viewport, so the backdrop gets the

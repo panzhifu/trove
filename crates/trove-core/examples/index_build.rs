@@ -55,9 +55,28 @@ fn main() {
         summary.bytes as f64 / source_bytes.max(1) as f64 * 100.0,
         summary.bytes as f64 / points as f64
     );
+    // What each record carries beyond its position, since that is what decides
+    // whether the cloud can be painted by intensity or by class when read back.
+    let mut channels: Vec<&str> = Vec::new();
+    if summary.channels.colors {
+        channels.push("colours");
+    }
+    if summary.channels.intensity {
+        channels.push("intensity");
+    }
+    if summary.channels.class {
+        channels.push("class");
+    }
     println!(
-        "         {} points in {} chunks, colours {}, {} sorted runs spilled",
-        summary.points, summary.chunks, summary.has_colors, summary.spilled_runs
+        "         {} points in {} chunks, {}, {} sorted runs spilled",
+        summary.points,
+        summary.chunks,
+        if channels.is_empty() {
+            "geometry only".to_string()
+        } else {
+            channels.join(" + ")
+        },
+        summary.spilled_runs
     );
     println!(
         "build    {:.1} s ({:.1} Mpoints/s), scratch cleaned up",

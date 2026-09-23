@@ -41,7 +41,9 @@ use uuid::Uuid;
 use gpui_kit::base::ColorPickerState;
 use trove_core::media::formats::streaming_point_cloud::StreamingPointCloud;
 use trove_core::media::formats::types::{Bounds as MeshBounds, Mesh, Winding};
-use trove_core::media::height_color::{CustomScale, DEFAULT_COLOUR_LOW, HeightLook, StoredLook};
+use trove_core::media::height_color::{
+    Channel, CustomScale, DEFAULT_COLOUR_LOW, Field, FieldData, HeightField, HeightLook, StoredLook,
+};
 use trove_core::media::index::IndexedCloud;
 use trove_core::media::render3d::{self, Camera};
 
@@ -84,6 +86,66 @@ impl ModelViewport {
     /// The picker beside it.
     pub(super) fn height_colour_picker(&self) -> Entity<ColorPickerState> {
         self.height_colour.clone()
+    }
+
+    /// The ranges a look is measured against: the scene's bounding box, and the
+    /// scalar channels this model's own points carry.
+    ///
+    /// The box is the scene's rather than this frame's for the same reason the
+    /// camera frames on it: a streamed cloud hands back a different subset every
+    /// frame, and re-normalising against those would shift the colours as the
+    /// points arrive.
+    fn field_data(&self) -> FieldData<'_> {
+        FieldData {
+            bounds: &self.scene_bounds,
+            intensities: self.channel_intensities,
+            classes: self.channel_classes,
+        }
+    }
+
+    /// Whether this model can be painted by a field at all.
+    ///
+    /// The three that read the geometry always can. The two scanner attributes
+    /// need the channel the file either carried or did not, and a missing one is
+    /// not a bug to hide: painting every point the scale's first colour is a
+    /// convincing lie, so the panel keeps the field out of reach until there are
+    /// values to paint with.
+    pub(super) fn field_available(&self, field: Field) -> bool {
+        match field.channel() {
+            None => true,
+            Some(Channel::Intensity) => self.channel_intensities.is_some(),
+            Some(Channel::Class) => self.channel_classes.is_some(),
+        }
+    }
+
+    /// The current look resolved against this model, or nothing painted at all
+    /// when it asks for a field the file has no channel for.
+    ///
+    /// Both renderers and the legend ask through here, so the three cannot
+    /// disagree about whether the look is in effect.
+    pub(super) fn height_field(&self) -> HeightField {
+        if !self.field_available(self.height.field) {
+            return HeightField::default();
+        }
+        self.height.resolve(&self.field_data())
+    }
+
+    /// Fold one mesh's scalar channels into the ranges the colouring reads.
+    ///
+    /// Only ever widens, and never clears: the chunks that arrive later cover
+    /// points the earlier ones did not, and a range that shrank back would
+    /// repaint what is already on screen. An LOD level carries no channels at
+    /// all, and the model underneath it still has the values.
+    pub(super) fn note_channels(&mut self, mesh: &Mesh) {
+        if let Some((min, max)) = mesh.intensity_range() {
+            self.channel_intensities = Some(match self.channel_intensities {
+                Some((lo, hi)) => (lo.min(min), hi.max(max)),
+                None => (min, max),
+            });
+        }
+        if let Some(count) = mesh.class_count() {
+            self.channel_classes = Some(self.channel_classes.unwrap_or(0).max(count));
+        }
     }
 }
 
@@ -266,9 +328,21 @@ pub struct ModelViewport {
     /// config file every time it draws.
     enhance_points: bool,
     /// How the model is painted by its field values, cached from the same
-    /// config read as `enhance_points`. Resolved against the scene's bounds per
-    /// frame, so a streamed cloud keeps one range while it loads.
+    /// config read as `enhance_points`. Resolved per frame by
+    /// [`ModelViewport::height_field`], against the scene's bounds and the
+    /// channels the file carried.
     height: HeightLook,
+    /// The intensity range and class count of every point this viewport has
+    /// shown, which is what says whether the two scanner fields can be painted
+    /// at all.
+    ///
+    /// Widened as chunks arrive rather than measured from the displayed mesh per
+    /// frame: a range that jumped back every time a subset came in would repaint
+    /// the points already on screen, and the scan itself is a pass over the
+    /// cloud. Both are `None` for a file that carries neither channel — which is
+    /// most files, and most of the formats.
+    channel_intensities: Option<(f32, f32)>,
+    channel_classes: Option<usize>,
     /// The user's own colour scales, cached from the same config read as
     /// `height`: the panel lists them, and a scale list is not something to
     /// re-read from disk on every frame.
@@ -390,6 +464,8 @@ impl ModelViewport {
                 gesture_armed: false,
                 enhance_points: true,
                 height,
+                channel_intensities: None,
+                channel_classes: None,
                 height_scales: cfg.height_custom_scales.clone(),
                 height_colour,
                 height_anchor: 0,

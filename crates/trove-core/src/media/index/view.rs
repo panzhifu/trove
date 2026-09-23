@@ -142,6 +142,28 @@ impl IndexedCloud {
         self.index.has_colors()
     }
 
+    /// Whether the two scanner attributes are in the file, and what they span
+    /// across the *whole* cloud.
+    ///
+    /// The ranges come from the header rather than from the points resident so
+    /// far, which is the difference between colouring the first chunk the way
+    /// the last one will look and having the scale creep as the cloud arrives.
+    pub fn has_intensity(&self) -> bool {
+        self.index.has_intensity()
+    }
+
+    pub fn has_class(&self) -> bool {
+        self.index.has_class()
+    }
+
+    pub fn intensity_range(&self) -> Option<(f32, f32)> {
+        self.index.intensity_range()
+    }
+
+    pub fn class_count(&self) -> Option<usize> {
+        self.index.class_count()
+    }
+
     /// Whether a chunk's points are resident. A renderer asks this to tell
     /// "not loaded yet" from "loaded and empty".
     pub fn is_chunk_resident(&self, chunk: usize) -> bool {
@@ -189,7 +211,12 @@ impl IndexedCloud {
             // A run that cannot be read is skipped, not retried: one damaged
             // block must not stop the walk reaching the rest.
             if let Ok(batch) = self.index.read_chunk(chunk) {
-                self.octree.insert_points(&batch.points, &batch.colors);
+                self.octree.insert_points(
+                    &batch.points,
+                    &batch.colors,
+                    &batch.intensities,
+                    &batch.classes,
+                );
                 added += batch.points.len();
             }
             self.read[chunk] = true;
@@ -330,6 +357,8 @@ mod tests {
     struct Batches {
         points: Vec<[f32; 3]>,
         colors: Vec<[f32; 3]>,
+        intensities: Vec<f32>,
+        classes: Vec<u8>,
         at: usize,
     }
 
@@ -339,14 +368,29 @@ mod tests {
                 return Ok(None);
             }
             let to = (self.at + 64).min(self.points.len());
-            let points = self.points[self.at..to].to_vec();
-            let colors = if self.colors.is_empty() {
-                Vec::new()
-            } else {
-                self.colors[self.at..to].to_vec()
+            let slice = |values: &[f32]| -> Vec<f32> {
+                if values.is_empty() {
+                    Vec::new()
+                } else {
+                    values[self.at..to].to_vec()
+                }
+            };
+            let batch = PointBatch {
+                points: self.points[self.at..to].to_vec(),
+                colors: if self.colors.is_empty() {
+                    Vec::new()
+                } else {
+                    self.colors[self.at..to].to_vec()
+                },
+                intensities: slice(&self.intensities),
+                classes: if self.classes.is_empty() {
+                    Vec::new()
+                } else {
+                    self.classes[self.at..to].to_vec()
+                },
             };
             self.at = to;
-            Ok(Some(PointBatch { points, colors }))
+            Ok(Some(batch))
         }
     }
 
@@ -399,6 +443,8 @@ mod tests {
         let mut source = Batches {
             points,
             colors,
+            intensities: Vec::new(),
+            classes: Vec::new(),
             at: 0,
         };
         let out = dir.join("cloud.trovecloud");
@@ -437,6 +483,79 @@ mod tests {
             index_path_for(Path::new("/tmp/scan")),
             PathBuf::from("/tmp/scan.trovecloud")
         );
+    }
+
+    /// A cloud indexed with the two scanner attributes, so a test can ask what
+    /// the reader knows before it has read a point. The identity of each one is
+    /// a function of its position — its cluster from x, its intensity from y —
+    /// because the index reorders the cloud, and that is the point.
+    fn channel_cloud_index(dir: &Path, points: Vec<[f32; 3]>) -> PathBuf {
+        let mut bounds = Bounds::empty();
+        for point in &points {
+            bounds.extend(*point);
+        }
+        let cluster = |point: [f32; 3]| (point[0] / 6.0).round() as usize;
+        let mut source = Batches {
+            intensities: points.iter().map(|point| point[1] * 3.0).collect(),
+            classes: points.iter().map(|point| cluster(*point) as u8).collect(),
+            points,
+            colors: Vec::new(),
+            at: 0,
+        };
+        let out = dir.join("cloud.trovecloud");
+        build_index(
+            &mut source,
+            Grid::covering(bounds, 12),
+            IndexConfig {
+                points_per_chunk: 64,
+                ..Default::default()
+            },
+            dir,
+            &out,
+        )
+        .expect("an index with channels builds");
+        out
+    }
+
+    /// The header is the whole cloud seen once, so the ranges it reports are
+    /// there from the first open: the difference between painting the first
+    /// chunk the way the last one will look and a scale that creeps as the
+    /// cloud arrives.
+    #[test]
+    fn the_indexed_cloud_knows_its_channels_before_reading_any() {
+        let dir = scratch_dir("channels");
+        let points = clusters(4, 64);
+        let path = channel_cloud_index(&dir, points.clone());
+        let mut cloud = IndexedCloud::open(&path).expect("cloud opens");
+
+        assert!(cloud.has_intensity());
+        assert!(cloud.has_class());
+        // The highest y in the fixture is 63/64 of a unit, three times over.
+        assert_eq!(cloud.intensity_range(), Some((0.0, 63.0 / 64.0 * 3.0)));
+        assert_eq!(cloud.class_count(), Some(4));
+        assert_eq!(cloud.chunks_read(), 0, "measured without reading");
+
+        // And the mesh it renders carries them, each with its own point.
+        while !cloud.step(&Frustum::everything(), [0.5, 0.5, 0.5]).complete {}
+        let mesh = cloud.render_mesh([0.5, 0.5, 0.5]);
+        let fields = mesh.fields.as_deref().expect("the mesh has the channels");
+        assert_eq!(fields.intensities.len(), mesh.vertex_count());
+        for (point, (intensity, class)) in mesh
+            .positions
+            .iter()
+            .zip(fields.intensities.iter().zip(&fields.classes))
+        {
+            assert!(
+                (intensity - point[1] * 3.0).abs() < 1e-3,
+                "{point:?} carries {intensity}"
+            );
+            assert_eq!(
+                *class,
+                (point[0] / 6.0).round() as u8,
+                "{point:?} was painted with another cluster's class"
+            );
+        }
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

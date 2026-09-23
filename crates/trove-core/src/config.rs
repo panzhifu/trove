@@ -1001,11 +1001,14 @@ mod tests {
                 axis: 1,
                 scale: Scale::Custom {
                     id: "1".into(),
-                    ramp: Ramp::custom(&[
-                        Stop::new(0.0, [10, 20, 30]),
-                        Stop::new(0.5, [200, 0, 200]),
-                        Stop::new(1.0, [240, 250, 255]),
-                    ]),
+                    ramp: Box::new(Ramp::custom(
+                        &[
+                            Stop::new(0.0, [10, 20, 30]),
+                            Stop::new(0.5, [200, 0, 200]),
+                            Stop::new(1.0, [240, 250, 255]),
+                        ],
+                        false,
+                    )),
                 },
                 period: DEFAULT_PERIOD,
             },
@@ -1035,7 +1038,10 @@ mod tests {
         let edited = HeightLook {
             scale: Scale::Custom {
                 id: "1".into(),
-                ramp: Ramp::custom(&[Stop::new(0.0, [9, 9, 9]), Stop::new(1.0, [70, 70, 70])]),
+                ramp: Box::new(Ramp::custom(
+                    &[Stop::new(0.0, [9, 9, 9]), Stop::new(1.0, [70, 70, 70])],
+                    false,
+                )),
             },
             ..config.height_look()
         };
