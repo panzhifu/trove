@@ -76,6 +76,13 @@ impl ModelViewport {
                 // Frame the whole cloud from the header, not the part that has
                 // arrived: the model keeps its size on screen while it fills.
                 self.scene_bounds = cloud.bounds();
+                // And take the scalar channels' ranges from it too. The builder
+                // measured every point, so painting by intensity or class is
+                // correct from the first chunk instead of creeping as the rest
+                // of a twenty-gigabyte cloud arrives — which is the one thing
+                // the streamed path cannot promise, having no header to ask.
+                self.channel_intensities = cloud.intensity_range();
+                self.channel_classes = cloud.class_count();
                 self.indexed = Some(cloud);
                 self.backend = Backend::Indexed;
                 self.dirty = true;
@@ -169,6 +176,10 @@ impl ModelViewport {
         // viewport — LOD levels and streamed chunks change the geometry, not
         // the model's extent.
         self.scene_bounds = mesh.bounds;
+        // A whole file's geometry, so the ranges start from it rather than from
+        // whatever the last one measured.
+        self.channel_intensities = None;
+        self.channel_classes = None;
         self.swap_mesh(mesh);
 
         // Spawn QEM simplification in the background for large meshes.
@@ -217,6 +228,7 @@ impl ModelViewport {
 
     /// [`ModelViewport::swap_mesh`], with the winding already decided.
     fn swap_mesh_with(&mut self, mesh: Mesh, winding: Winding) {
+        self.note_channels(&mesh);
         self.mesh_winding = winding;
         self.mesh_serial += 1;
         self.mesh = Arc::new(mesh);

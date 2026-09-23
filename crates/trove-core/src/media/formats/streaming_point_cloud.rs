@@ -100,6 +100,18 @@ impl StreamingPointCloud {
         self.total_vertices
     }
 
+    /// Whether the file's header carries the two scanner attributes, which the
+    /// header answers before a single point has been read — so the viewport can
+    /// say "this model has no intensity" rather than waiting, and painting by a
+    /// channel that is not there is the one answer that has to be right.
+    pub fn has_intensity(&self) -> bool {
+        self.streamer.has_intensity()
+    }
+
+    pub fn has_class(&self) -> bool {
+        self.streamer.has_class()
+    }
+
     /// Whether all vertices have been loaded.
     pub fn is_loaded(&self) -> bool {
         self.loaded
@@ -209,7 +221,12 @@ impl StreamingPointCloud {
                     // ten thousand — which makes streaming a file cost its own
                     // size again for every position. The batch path keeps the
                     // budget and the thinning rules and skips only the churn.
-                    self.octree.insert_points(&chunk.positions, &chunk.colors);
+                    self.octree.insert_points(
+                        &chunk.positions,
+                        &chunk.colors,
+                        &chunk.intensities,
+                        &chunk.classes,
+                    );
                 }
                 if chunk.is_last {
                     self.loaded = true;
@@ -303,6 +320,59 @@ mod tests {
             }
         }
         std::fs::write(path, &file).unwrap();
+    }
+
+    /// The same two attributes on the streaming path, which is what most clouds
+    /// between a few hundred megabytes and a few gigabytes arrive by: no index,
+    /// just the file read in chunks. They have to come out of the file, through
+    /// the octree and into the mesh the renderers draw, or a scan can be painted
+    /// in its thumbnail and nowhere else.
+    #[test]
+    fn a_streamed_scan_renders_with_its_own_channels() {
+        let dir = temp("scan");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("scan.ply");
+        let count = 30usize;
+        let mut file = format!(
+            "ply\nformat binary_little_endian 1.0\nelement vertex {count}\n\
+             property float x\nproperty float y\nproperty float z\n\
+             property float intensity\nproperty uchar classification\nend_header\n"
+        )
+        .into_bytes();
+        for index in 0..count {
+            for value in [index as f32 * 0.5, 0.0, 0.0] {
+                file.extend_from_slice(&value.to_le_bytes());
+            }
+            // The intensity is the point's own number, and the class follows
+            // from it, so a pair that came back together says whose point it is.
+            file.extend_from_slice(&(index as f32 * 7.0).to_le_bytes());
+            file.push((index % 23) as u8);
+        }
+        std::fs::write(&path, &file).unwrap();
+
+        let mut cloud = StreamingPointCloud::open(&path).expect("a scan streams");
+        assert!(cloud.has_intensity());
+        assert!(cloud.has_class());
+        while !cloud.step().complete {}
+        let mesh = cloud.render_mesh_all([0.0, 0.0, 0.0]);
+        assert_eq!(mesh.vertex_count(), count);
+        let fields = mesh
+            .fields
+            .as_deref()
+            .expect("the mesh carries the channels");
+        for (point, (intensity, class)) in mesh
+            .positions
+            .iter()
+            .zip(fields.intensities.iter().zip(&fields.classes))
+        {
+            let index = (intensity / 7.0).round() as usize;
+            assert!(
+                (point[0] - index as f32 * 0.5).abs() < 1e-3,
+                "{point:?} carries the intensity {intensity}"
+            );
+            assert_eq!(*class as usize, index % 23, "{point:?} lost its class");
+        }
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// A scan written with NaN for its unobserved points must load, not hang.

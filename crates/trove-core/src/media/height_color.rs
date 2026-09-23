@@ -22,18 +22,22 @@
 //!   way CloudCompare's is, because stripes are a ruler laid across the surface
 //!   and only read as one if their period is a known distance.
 //!
-//! The fields are the ones the geometry already carries: positions give height,
-//! normals give dip and its direction. Nothing here needs a file format to
-//! change, which is what has kept intensity and classification — two more
-//! per-point attributes CloudCompare colours by — out of scope so far.
+//! The five fields split by where their values come from: positions give the
+//! height, normals give dip and its direction, and the two scanner attributes —
+//! return intensity and ASPRS classification — need the file to have carried
+//! that channel, which is the one thing a model can be missing. A [`Field`]
+//! whose channel is absent is not painted at all rather than painted zero, and
+//! it is the viewport's job to say so.
 
 use serde::{Deserialize, Serialize};
 
 use super::formats::types::Bounds;
 
-/// How many stops one colour scale may carry, which is also how many fit the
-/// uniform block the shader reads.
-pub const RAMP_STOPS: usize = 16;
+/// How many anchors one colour scale may carry, which is also how many fit the
+/// uniform block the shader reads: 32 because CloudCompare's ASPRS
+/// classification scale has 23 anchors, and a categorical scale is only exact
+/// when every class gets one of its own.
+pub const RAMP_STOPS: usize = 32;
 /// Field units per cycle of the banding stripes when nothing has been chosen
 /// yet — CloudCompare's own default, whose dialog labels the row *Period* while
 /// the widget behind it is still named `bandingFreqSpinBox`.
@@ -117,7 +121,9 @@ impl CustomScale {
     /// Anchors cleaned up for use: sorted, ends pinned to 0 and 1, duplicates
     /// gone, and no more than a uniform's worth.
     pub fn ramp(&self) -> Ramp {
-        Ramp::custom(&self.stops)
+        // Never bins: a scale the user assembled from anchors means what it
+        // says between them, which is the point of moving one.
+        Ramp::custom(&self.stops, false)
     }
 }
 
@@ -133,21 +139,35 @@ pub struct ColorScale {
     pub stops: &'static [ColorStop],
 }
 
+/// The built-in scales whose anchors are *bins* rather than points on a
+/// gradient: a classification scale's colour belongs to its class and to
+/// nothing between two classes.
+///
+/// A list of ids rather than a field on every literal, because exactly one of
+/// the sixteen tables is categorical and the other fifteen would each have had
+/// to say so.
+pub const CATEGORICAL_SCALES: [&str; 1] = ["asprs"];
+
 impl ColorScale {
+    /// Whether values land *on* an anchor rather than between two.
+    pub fn categorical(&self) -> bool {
+        CATEGORICAL_SCALES.contains(&self.id)
+    }
+
     /// The scale drawn as `steps` discrete colours, start to end.
     pub fn gradient(&self, steps: usize) -> Vec<[u8; 3]> {
         self.ramp().gradient(steps)
     }
 
     fn ramp(&self) -> Ramp {
-        Ramp::from_stops(self.stops)
+        Ramp::from_stops(self.stops, self.categorical())
     }
 }
 
 /// The scales the viewport offers, in the order it lists them. The first is the
 /// one a model gets when colouring is switched on and no scale was ever picked,
 /// so it is CloudCompare's default (`BGYR`, its `GetDefaultScale`).
-pub static COLOR_SCALES: [ColorScale; 15] = [
+pub static COLOR_SCALES: [ColorScale; 16] = [
     ColorScale {
         id: "bgyr",
         name_key: "bgyr",
@@ -288,6 +308,40 @@ pub static COLOR_SCALES: [ColorScale; 15] = [
         ],
     },
     ColorScale {
+        // CloudCompare's `ASPRS classes`, in class order: the bin a point falls
+        // in is its classification, and the colour is that class's, not a
+        // position between two. Class names are in the file's own metadata, so
+        // the legend shows numbers — which is what CC's `ASPRS_CLASSES` scale
+        // without labels is, and the reason the `WITH_LABELS` twin exists.
+        id: "asprs",
+        name_key: "asprs",
+        stops: &[
+            stop(0.0 / 23.0, [255, 255, 255]),
+            stop(1.0 / 23.0, [192, 192, 192]),
+            stop(2.0 / 23.0, [166, 116, 4]),
+            stop(3.0 / 23.0, [38, 114, 0]),
+            stop(4.0 / 23.0, [69, 229, 0]),
+            stop(5.0 / 23.0, [204, 240, 123]),
+            stop(6.0 / 23.0, [255, 255, 0]),
+            stop(7.0 / 23.0, [255, 0, 0]),
+            stop(8.0 / 23.0, [255, 0, 255]),
+            stop(9.0 / 23.0, [0, 0, 255]),
+            stop(10.0 / 23.0, [85, 85, 0]),
+            stop(11.0 / 23.0, [128, 128, 128]),
+            stop(12.0 / 23.0, [255, 170, 255]),
+            stop(13.0 / 23.0, [191, 231, 205]),
+            stop(14.0 / 23.0, [193, 230, 125]),
+            stop(15.0 / 23.0, [0, 0, 139]),
+            stop(16.0 / 23.0, [128, 128, 0]),
+            stop(17.0 / 23.0, [0, 139, 139]),
+            stop(18.0 / 23.0, [139, 0, 0]),
+            stop(19.0 / 23.0, [255, 170, 255]),
+            stop(20.0 / 23.0, [50, 255, 198]),
+            stop(21.0 / 23.0, [255, 250, 250]),
+            stop(22.0 / 23.0, [0, 0, 0]),
+        ],
+    },
+    ColorScale {
         // CloudCompare's `Dip [0-90]`, made for [`Field::Slope`].
         id: "dip",
         name_key: "dip",
@@ -338,7 +392,12 @@ pub fn scale_by_id(id: &str) -> &'static ColorScale {
 #[derive(Clone, Debug, PartialEq)]
 pub enum Scale {
     Preset(&'static ColorScale),
-    Custom { id: String, ramp: Ramp },
+    /// The ramp is boxed because a preset scale — which is what almost every
+    /// look is — should not pay for the 32 anchors a user's own carries.
+    Custom {
+        id: String,
+        ramp: Box<Ramp>,
+    },
 }
 
 impl Default for Scale {
@@ -369,15 +428,20 @@ impl Scale {
     pub fn custom(custom: &CustomScale) -> Self {
         Self::Custom {
             id: custom.id.clone(),
-            ramp: custom.ramp(),
+            ramp: Box::new(custom.ramp()),
         }
     }
 
     fn ramp(&self) -> Ramp {
         match self {
             Self::Preset(scale) => scale.ramp(),
-            Self::Custom { ramp, .. } => *ramp,
+            Self::Custom { ramp, .. } => **ramp,
         }
+    }
+
+    /// Whether the anchors are bins, whichever scale is in use.
+    pub fn categorical(&self) -> bool {
+        self.ramp().categorical()
     }
 
     /// The live anchors, for the editor: the built-ins' own, or the user's.
@@ -394,6 +458,116 @@ impl Scale {
     }
 }
 
+impl Sample {
+    /// A point with nothing but its position: enough for every field that reads
+    /// the geometry, which is most of what the tests and the legend ask.
+    pub fn at(point: [f32; 3]) -> Self {
+        Self {
+            point,
+            ..Default::default()
+        }
+    }
+
+    /// A point and the normal it faces, for the two fields read off the normal.
+    pub fn surface(point: [f32; 3], normal: [f32; 3]) -> Self {
+        Self {
+            point,
+            normal,
+            ..Default::default()
+        }
+    }
+}
+
+/// Which per-point channel a [`Field`] reads, and so which one a model has to
+/// have before that field can be painted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Channel {
+    Intensity,
+    Class,
+}
+
+/// One point, as both renderers see it.
+///
+/// A struct rather than four arguments because the two scalar channels are new
+/// and every caller of `tint_at` would otherwise have to remember which float is
+/// which: the shader takes them from the instance buffer's attributes, the CPU
+/// rasteriser from the model's own arrays, and the two must agree slot for slot.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Sample {
+    pub point: [f32; 3],
+    /// The geometry's own normal — not the one flipped to face the camera.
+    pub normal: [f32; 3],
+    /// Raw, as the file wrote it: unscaled, because the range is the model's.
+    pub intensity: f32,
+    /// The class number as a float, which is what the shader attribute is.
+    pub class: f32,
+}
+
+impl Sample {
+    /// One vertex of a model, with its channels.
+    ///
+    /// The single place a position, a normal and the two scanner attributes are
+    /// read together, so the CPU rasteriser cannot pick a channel up differently
+    /// from the instance buffer the GPU reads: both ask for the entry at the
+    /// vertex's own index, and both fall back to zero when the model has no such
+    /// channel — which the field's range already makes harmless, because a model
+    /// without one cannot have that field selected.
+    pub fn of(mesh: &super::formats::types::Mesh, index: usize, normal: [f32; 3]) -> Self {
+        // Two lookups rather than one helper: the channels are different types
+        // (`f32` and `u8`), and a closure generic over both costs more to read
+        // than the four lines it would save.
+        let fields = mesh.fields.as_deref();
+        let intensity = fields
+            .and_then(|fields| fields.intensities.get(index))
+            .copied()
+            .unwrap_or(0.0);
+        let class = fields
+            .and_then(|fields| fields.classes.get(index))
+            .copied()
+            .unwrap_or(0);
+        Self {
+            point: mesh.positions[index],
+            normal,
+            intensity,
+            class: class as f32,
+        }
+    }
+}
+
+/// The ranges a look is measured against: the bounding box, plus whatever
+/// scalar channels this particular model carries.
+#[derive(Clone, Copy, Debug)]
+pub struct FieldData<'a> {
+    pub bounds: &'a Bounds,
+    /// The intensity range, or `None` for a model with no such channel.
+    pub intensities: Option<(f32, f32)>,
+    /// The class count — highest class plus one — or `None` without the channel.
+    pub classes: Option<usize>,
+}
+impl<'a> FieldData<'a> {
+    /// Geometry only: the ranges of the three fields a model always has, and no
+    /// channels for the two it may lack. Useful to a caller that has a bounding
+    /// box and nothing else — the tests, above all.
+    pub fn geometry(bounds: &'a Bounds) -> Self {
+        Self {
+            bounds,
+            intensities: None,
+            classes: None,
+        }
+    }
+}
+
+/// One model's geometry plus its scalar channels, in the shape [`FieldData`]
+/// wants. Kept next to the renderers' shared entry point so a caller cannot ask
+/// for a look over a half-read model.
+pub fn field_data(mesh: &super::formats::types::Mesh) -> FieldData<'_> {
+    FieldData {
+        bounds: &mesh.bounds,
+        intensities: mesh.intensity_range(),
+        classes: mesh.class_count(),
+    }
+}
+
 /// A stop table resolved for use: built-in anchors or a user-picked pair,
 /// copied into a fixed-size array so nothing has to stay borrowed while it is
 /// read — which is what lets a custom pair ride the same uniform as a preset.
@@ -401,11 +575,12 @@ impl Scale {
 pub struct Ramp {
     stops: [ColorStop; RAMP_STOPS],
     count: usize,
+    categorical: bool,
 }
 
 impl Default for Ramp {
     fn default() -> Self {
-        Self::from_stops(&[])
+        Self::from_stops(&[], false)
     }
 }
 
@@ -417,7 +592,7 @@ impl Ramp {
     /// boundaries are `[0.0-1.0]`, then paint black if there is nothing to
     /// interpolate — done at the point a user's anchor list becomes a ramp, so
     /// no caller has to repeat it.
-    pub fn custom(stops: &[ColorStop]) -> Self {
+    pub fn custom(stops: &[ColorStop], categorical: bool) -> Self {
         let mut sorted = stops.to_vec();
         sorted.sort_by(|a, b| a.at.total_cmp(&b.at));
         sorted.dedup_by(|a, b| (a.at - b.at).abs() < 1e-6);
@@ -439,26 +614,36 @@ impl Ramp {
         if let Some(last) = kept.last_mut() {
             last.at = 1.0;
         }
-        Self::from_stops(&kept)
+        Self::from_stops(&kept, categorical)
     }
 
     /// The pair a new user scale starts from: black to white, as CloudCompare's
     /// two colour buttons do.
     pub fn defaults() -> Self {
-        Self::from_stops(&[
-            stop(0.0, DEFAULT_COLOUR_LOW),
-            stop(1.0, DEFAULT_COLOUR_HIGH),
-        ])
+        Self::from_stops(
+            &[
+                stop(0.0, DEFAULT_COLOUR_LOW),
+                stop(1.0, DEFAULT_COLOUR_HIGH),
+            ],
+            false,
+        )
     }
 
-    fn from_stops(stops: &[ColorStop]) -> Self {
+    fn from_stops(stops: &[ColorStop], categorical: bool) -> Self {
         let mut filled = [stop(0.0, [0, 0, 0]); RAMP_STOPS];
         let count = stops.len().min(RAMP_STOPS);
         filled[..count].copy_from_slice(&stops[..count]);
         Self {
             stops: filled,
             count,
+            categorical,
         }
+    }
+
+    /// Whether this ramp's anchors are bins. Read by the legend and by the
+    /// uniform, which is where the shader learns to stop interpolating.
+    pub fn categorical(&self) -> bool {
+        self.categorical
     }
 
     /// The live anchors, ascending by position. The editor reads them back out
@@ -480,6 +665,19 @@ impl Ramp {
             return [0.0; 3];
         }
         let x = t.clamp(0.0, 1.0);
+        if self.categorical {
+            // A bin, not a position: the class number picks the anchor and
+            // nothing is mixed. This is what CC's epsilon-spaced anchor pairs
+            // achieve by other means, and it is why the classes do not bleed
+            // into one another at a boundary.
+            let index = ((x * stops.len() as f32) as usize).min(stops.len() - 1);
+            let rgb = stops[index].rgb;
+            return [
+                rgb[0] as f32 / 255.0,
+                rgb[1] as f32 / 255.0,
+                rgb[2] as f32 / 255.0,
+            ];
+        }
         let mut interval = 0usize;
         while interval + 2 < stops.len() && stops[interval + 1].at < x {
             interval += 1;
@@ -500,7 +698,9 @@ impl Ramp {
         ]
     }
 
-    /// The ramp drawn as `steps` discrete colours, start to end.
+    /// The ramp drawn as `steps` discrete colours, start to end. A categorical
+    /// ramp is drawn as one cell per bin, because blending two class colours is
+    /// a colour no class has.
     pub fn gradient(&self, steps: usize) -> Vec<[u8; 3]> {
         let steps = steps.max(1);
         (0..steps)
@@ -597,6 +797,13 @@ pub enum Field {
     /// The bearing of that lean, in degrees: the dip direction, which
     /// CloudCompare colours with a hue scale that repeats twice round 360.
     Aspect,
+    /// The scanner's own return strength, as the file wrote it. Normalised
+    /// against the range the cloud actually spans, which is why a 12-bit and a
+    /// 16-bit intensity both fill the scale.
+    Intensity,
+    /// The ASPRS class number, coloured by bin: an index into a palette rather
+    /// than a value to interpolate. See [`CATEGORICAL_SCALES`].
+    Class,
 }
 
 impl Field {
@@ -605,6 +812,8 @@ impl Field {
             Self::Height => 0,
             Self::Slope => 1,
             Self::Aspect => 2,
+            Self::Intensity => 3,
+            Self::Class => 4,
         }
     }
 
@@ -612,6 +821,8 @@ impl Field {
         match index {
             1 => Self::Slope,
             2 => Self::Aspect,
+            3 => Self::Intensity,
+            4 => Self::Class,
             _ => Self::Height,
         }
     }
@@ -621,6 +832,8 @@ impl Field {
             Self::Height => "height",
             Self::Slope => "slope",
             Self::Aspect => "aspect",
+            Self::Intensity => "intensity",
+            Self::Class => "class",
         }
     }
 
@@ -628,7 +841,22 @@ impl Field {
         match key {
             "slope" => Self::Slope,
             "aspect" => Self::Aspect,
+            "intensity" => Self::Intensity,
+            "class" => Self::Class,
             _ => Self::Height,
+        }
+    }
+
+    /// Which per-point channel this field reads, if not the geometry: the two
+    /// scanner attributes live in [`CloudFields`] rather than in the position or
+    /// the normal, so they are the reason a model can be missing a field.
+    ///
+    /// [`CloudFields`]: super::formats::types::CloudFields
+    pub fn channel(self) -> Option<Channel> {
+        match self {
+            Self::Intensity => Some(Channel::Intensity),
+            Self::Class => Some(Channel::Class),
+            _ => None,
         }
     }
 
@@ -638,7 +866,7 @@ impl Field {
     /// the geometry, as [`Field::Height`] does.
     pub fn absolute_range(self) -> Option<(f32, f32)> {
         match self {
-            Self::Height => None,
+            Self::Height | Self::Intensity | Self::Class => None,
             Self::Slope => Some((0.0, 90.0)),
             Self::Aspect => Some((0.0, 360.0)),
         }
@@ -650,7 +878,7 @@ impl Field {
     /// numbers over the model's own range, as [`nice_ticks`].
     pub fn labels(self) -> Option<&'static [f32]> {
         match self {
-            Self::Height => None,
+            Self::Height | Self::Intensity | Self::Class => None,
             Self::Slope => Some(&[0.0, 30.0, 60.0, 90.0]),
             Self::Aspect => Some(&[0.0, 90.0, 180.0, 270.0, 360.0]),
         }
@@ -660,9 +888,15 @@ impl Field {
     /// carries, which are nobody's business but the model's.
     pub fn unit(self) -> Option<&'static str> {
         match self {
-            Self::Height => None,
+            Self::Height | Self::Intensity | Self::Class => None,
             Self::Slope | Self::Aspect => Some("°"),
         }
+    }
+
+    /// Whether a legend for this field labels whole numbers: a class number is
+    /// a name, and `7.5` is not a class.
+    pub fn is_integral(self) -> bool {
+        matches!(self, Self::Class)
     }
 }
 
@@ -702,33 +936,59 @@ impl HeightLook {
     /// bounds rather than the frame's: a streamed cloud hands back a different
     /// subset every frame, and re-normalising against those would make its
     /// colours shift while it loads.
-    pub fn resolve(&self, bounds: &Bounds) -> HeightField {
+    pub fn resolve(&self, data: &FieldData) -> HeightField {
         let axis = self.axis.min(2);
-        let (min, max) = match self.field.absolute_range() {
-            Some(range) => range,
-            None => {
-                let (min, max) = (bounds.min[axis], bounds.max[axis]);
-                // CloudCompare's flat-cloud branch: collapse the range, which
-                // the inverse below turns into "everyone is at position 0".
-                if max - min <= FLAT_SPAN {
-                    (min, min)
-                } else {
-                    (min, max)
+        let bounds = data.bounds;
+        let ramp = self.scale.ramp();
+        // A categorical scale's anchors *are* its domain: class 6 is the
+        // building yellow whether or not this model contains classes 2 to 5.
+        // That is CloudCompare's `ASPRS` range, which it sets absolute — 0 to
+        // 22.999, one plateau per class — rather than normalising over the
+        // classes present, and it is the reason a partial cloud still reads
+        // right.
+        let (min, max) = if ramp.categorical() && self.field == Field::Class {
+            (0.0, ramp.stops().len() as f32)
+        } else {
+            match self.field.absolute_range().or_else(|| match self.field {
+                // A model with no channel has no range either, which the inverse
+                // below turns into "everyone gets the first colour" — the same
+                // answer a flat model gets, and the panel keeps the field out of
+                // reach in the first place.
+                Field::Intensity => data.intensities,
+                // A class number counts whole units, so the range is the count
+                // rather than the highest class: class `i` of `n` sits at
+                // `i / n`, the start of its own bin.
+                Field::Class => data.classes.map(|count| (0.0, count as f32)),
+                _ => None,
+            }) {
+                Some(range) => range,
+                None => {
+                    let (min, max) = (bounds.min[axis], bounds.max[axis]);
+                    // CloudCompare's flat-cloud branch: collapse the range, which
+                    // the inverse below turns into "everyone is at position 0".
+                    if max - min <= FLAT_SPAN {
+                        (min, min)
+                    } else {
+                        (min, max)
+                    }
                 }
             }
         };
-        let span = max - min;
         HeightField {
             mode: self.mode,
             field: self.field,
             axis,
-            ramp: self.scale.ramp(),
+            ramp,
             min,
             max,
             // A model with no span gets `0` rather than the inverse of nothing,
             // so every point reads as position 0 of the scale — CloudCompare's
             // flat-cloud branch.
-            inv_span: if span > FLAT_SPAN { 1.0 / span } else { 0.0 },
+            inv_span: if max - min > FLAT_SPAN {
+                1.0 / (max - min)
+            } else {
+                0.0
+            },
             // Radians of banding cycle per field unit. The stripes are a ruler
             // over the value rather than a share of the range, so a model with
             // no height changes nothing about them.
@@ -799,9 +1059,13 @@ impl HeightField {
     /// one flipped to face the camera for two-sided shading — because that is
     /// what the shader's vertex stage sees, and dip direction reads a 180°
     /// difference out of it.
-    pub fn value_at(&self, point: [f32; 3], normal: [f32; 3]) -> f32 {
+    pub fn value_at(&self, sample: &Sample) -> f32 {
+        let point = sample.point;
+        let normal = sample.normal;
         match self.field {
             Field::Height => point[self.axis],
+            Field::Intensity => sample.intensity,
+            Field::Class => sample.class,
             // The angle away from the axis, folded to 0..=90: a surface facing
             // straight down the axis is as flat as one facing up, which is what
             // a dip means.
@@ -830,8 +1094,8 @@ impl HeightField {
     /// This and `surface_color` in `gpu3d.wgsl` are one function written twice;
     /// they must stay in step, because the CPU rasteriser's output is a
     /// thumbnail and the shader's is the frame the user compares it against.
-    pub fn tint_at(&self, point: [f32; 3], normal: [f32; 3]) -> Option<[f32; 3]> {
-        let value = self.value_at(point, normal);
+    pub fn tint_at(&self, sample: &Sample) -> Option<[f32; 3]> {
+        let value = self.value_at(sample);
         match self.mode {
             HeightMode::Off => None,
             HeightMode::Ramp => Some(self.ramp.color_at((value - self.min) * self.inv_span)),
@@ -854,7 +1118,9 @@ impl HeightField {
                 self.band_step,
                 self.ramp.stops().len() as f32,
                 self.field.index() as f32,
-                0.0,
+                // The one flag the shader needs that no float can be inferred
+                // from: bins do not interpolate.
+                if self.ramp.categorical() { 1.0 } else { 0.0 },
             ],
             ramp: self.ramp.pack(),
         }
@@ -874,19 +1140,24 @@ impl HeightField {
             .map(|index| {
                 let t = (index as f32 + 0.5) / steps as f32;
                 let value = self.min + (self.max - self.min) * t;
-                let (point, normal) = self.sample_at(value);
-                self.tint_at(point, normal).unwrap_or([0.0; 3])
+                self.tint_at(&self.sample_at(value)).unwrap_or([0.0; 3])
             })
             .collect()
     }
 
-    /// A point and normal whose value on this field is exactly `value`, so the
-    /// legend can ask the same [`HeightField::tint_at`] everything else does.
-    fn sample_at(&self, value: f32) -> ([f32; 3], [f32; 3]) {
+    /// A sample whose value on this field is exactly `value`, so the legend can
+    /// ask the same [`HeightField::tint_at`] everything else does.
+    fn sample_at(&self, value: f32) -> Sample {
         let mut point = [0.0f32; 3];
         let mut normal = [0.0f32; 3];
+        // The channel fields *are* the sample for the two scanner attributes;
+        // whatever the renderer would ignore for the others stays zero.
+        let mut intensity = 0.0;
+        let mut class = 0.0;
         match self.field {
             Field::Height => point[self.axis] = value,
+            Field::Intensity => intensity = value,
+            Field::Class => class = value,
             // Lean away from the axis by `value`: the normal sits in the plane
             // that contains the axis and one horizontal direction.
             Field::Slope => {
@@ -907,7 +1178,12 @@ impl HeightField {
                 };
             }
         }
-        (point, normal)
+        Sample {
+            point,
+            normal,
+            intensity,
+            class,
+        }
     }
 }
 
@@ -1089,7 +1365,7 @@ mod tests {
             mode,
             ..Default::default()
         }
-        .resolve(&box_bounds)
+        .resolve(&FieldData::geometry(&box_bounds))
     }
 
     #[test]
@@ -1106,7 +1382,27 @@ mod tests {
                 scale.id
             );
             assert_eq!(scale.stops.first().unwrap().at, 0.0, "{} floor", scale.id);
-            assert_eq!(scale.stops.last().unwrap().at, 1.0, "{} ceiling", scale.id);
+            // The list of categorical ids is a list of these ids, so it has to
+            // agree with the tables it names.
+            assert_eq!(
+                scale.categorical(),
+                CATEGORICAL_SCALES.contains(&scale.id),
+                "{} categorical",
+                scale.id
+            );
+            if scale.categorical() {
+                // A categorical scale's anchors are the bottoms of their bins, so
+                // the last one sits a bin short of the end. Nothing interpolates
+                // through them, but the panel lays its markers out along them.
+                let bins = scale.stops.len() as f32;
+                assert!(
+                    (scale.stops.last().unwrap().at - (bins - 1.0) / bins).abs() < 1e-6,
+                    "{} last bin",
+                    scale.id
+                );
+            } else {
+                assert_eq!(scale.stops.last().unwrap().at, 1.0, "{} ceiling", scale.id);
+            }
             for pair in scale.stops.windows(2) {
                 assert!(
                     pair[1].at > pair[0].at,
@@ -1164,35 +1460,41 @@ mod tests {
     fn a_users_anchor_list_is_cleaned_up_before_it_paints() {
         // Out of order, with the ends misplaced: sorted and pinned, which is
         // what `ccColorScale::update` does before it fills its table.
-        let ramp = Ramp::custom(&[
-            stop(0.8, [255, 0, 0]),
-            stop(0.0, [0, 0, 0]),
-            stop(0.4, [0, 255, 0]),
-        ]);
+        let ramp = Ramp::custom(
+            &[
+                stop(0.8, [255, 0, 0]),
+                stop(0.0, [0, 0, 0]),
+                stop(0.4, [0, 255, 0]),
+            ],
+            false,
+        );
         let at: Vec<f32> = ramp.stops().iter().map(|stop| stop.at).collect();
         assert_eq!(at, vec![0.0, 0.4, 1.0]);
         // A duplicate position is one anchor, not a division by zero later.
-        let ramp = Ramp::custom(&[
-            stop(0.0, [0, 0, 0]),
-            stop(0.5, [10, 10, 10]),
-            stop(0.5, [20, 20, 20]),
-            stop(1.0, [255, 255, 255]),
-        ]);
+        let ramp = Ramp::custom(
+            &[
+                stop(0.0, [0, 0, 0]),
+                stop(0.5, [10, 10, 10]),
+                stop(0.5, [20, 20, 20]),
+                stop(1.0, [255, 255, 255]),
+            ],
+            false,
+        );
         assert_eq!(ramp.stops().len(), 3);
         // Past the end of the table, and past what a uniform carries.
         let many: Vec<ColorStop> = (0..40)
             .map(|i| stop(i as f32 / 39.0, [i as u8, 0, 0]))
             .collect();
-        let ramp = Ramp::custom(&many);
+        let ramp = Ramp::custom(&many, false);
         assert_eq!(ramp.stops().len(), RAMP_STOPS);
         assert_eq!(ramp.stops().last().unwrap().at, 1.0);
         // Two anchors is the minimum that can interpolate; one is painted black,
         // as CloudCompare paints an invalid scale.
         assert_eq!(
-            Ramp::custom(&[stop(0.3, [9, 9, 9])]).color_at(0.5),
+            Ramp::custom(&[stop(0.3, [9, 9, 9])], false).color_at(0.5),
             [0.0, 0.0, 0.0]
         );
-        assert_eq!(Ramp::custom(&[]).color_at(0.5), [0.0, 0.0, 0.0]);
+        assert_eq!(Ramp::custom(&[], false).color_at(0.5), [0.0, 0.0, 0.0]);
     }
 
     #[test]
@@ -1256,11 +1558,11 @@ mod tests {
         for (min, max) in [(0.0, 1.0), (100.0, 101.0), (-5_000.0, 5_500.0)] {
             let tinted = field(HeightMode::Ramp, bounds([0.0, min, 0.0], [10.0, max, 10.0]));
             assert_eq!(
-                tinted.tint_at([0.0, min, 0.0], [0.0; 3]),
+                tinted.tint_at(&Sample::at([0.0, min, 0.0])),
                 Some(ramp.color_at(0.0))
             );
             assert_eq!(
-                tinted.tint_at([0.0, max, 0.0], [0.0; 3]),
+                tinted.tint_at(&Sample::at([0.0, max, 0.0])),
                 Some(ramp.color_at(1.0))
             );
         }
@@ -1280,7 +1582,8 @@ mod tests {
             };
             let expected = point[axis] / box_bounds.max[axis];
             assert_eq!(
-                look.resolve(&box_bounds).tint_at(point, [0.0; 3]),
+                look.resolve(&FieldData::geometry(&box_bounds))
+                    .tint_at(&Sample::at(point)),
                 Some(ramp.color_at(expected)),
                 "axis {axis}"
             );
@@ -1294,17 +1597,18 @@ mod tests {
             field: Field::Slope,
             ..Default::default()
         }
-        .resolve(&Bounds::default());
+        .resolve(&FieldData::geometry(&Bounds::default()));
         assert_eq!(tinted.range(), (0.0, 90.0));
         assert_eq!(tinted.unit(), Some("°"));
         // Along the axis is flat; across it is vertical, either way round.
-        assert!(tinted.value_at([0.0; 3], [0.0, 1.0, 0.0]).abs() < 1e-5);
-        assert!((tinted.value_at([0.0; 3], [1.0, 0.0, 0.0]) - 90.0).abs() < 1e-4);
-        assert!((tinted.value_at([0.0; 3], [-1.0, 0.0, 0.0]) - 90.0).abs() < 1e-4);
+        let slope_at = |normal: [f32; 3]| tinted.value_at(&Sample::surface([0.0; 3], normal));
+        assert!(slope_at([0.0, 1.0, 0.0]).abs() < 1e-5);
+        assert!((slope_at([1.0, 0.0, 0.0]) - 90.0).abs() < 1e-4);
+        assert!((slope_at([-1.0, 0.0, 0.0]) - 90.0).abs() < 1e-4);
         // 45° in between, and a degenerate normal is flat rather than NaN.
-        let halfway = tinted.value_at([0.0; 3], [0.707, 0.707, 0.0]);
+        let halfway = slope_at([0.707, 0.707, 0.0]);
         assert!((halfway - 45.0).abs() < 0.2, "{halfway}");
-        assert!(tinted.value_at([0.0; 3], [0.0, 0.0, 0.0]).is_finite());
+        assert!(slope_at([0.0, 0.0, 0.0]).is_finite());
     }
 
     #[test]
@@ -1314,9 +1618,9 @@ mod tests {
             field: Field::Aspect,
             ..Default::default()
         }
-        .resolve(&Bounds::default());
+        .resolve(&FieldData::geometry(&Bounds::default()));
         assert_eq!(tinted.range(), (0.0, 360.0));
-        let at = |n: [f32; 3]| tinted.value_at([0.0; 3], n);
+        let at = |n: [f32; 3]| tinted.value_at(&Sample::surface([0.0; 3], n));
         // The two horizontal directions the Y axis leaves, read in the order
         // `horizontal` promises: atan2(x, z). So +Z is where the bearing starts,
         // and it turns towards +X.
@@ -1341,19 +1645,22 @@ mod tests {
         };
         // A model with no height at all still gets a full dip range, because
         // 30° of dip is 30° wherever it is.
-        let flat = look.resolve(&bounds([0.0, 7.5, 0.0], [10.0, 7.5, 10.0]));
+        let flat = look.resolve(&FieldData::geometry(&bounds(
+            [0.0, 7.5, 0.0],
+            [10.0, 7.5, 10.0],
+        )));
         assert_eq!(flat.range(), (0.0, 90.0));
         assert_eq!(
-            flat.tint_at([1.0, 7.5, 2.0], [0.0, 0.0, 1.0]),
-            look.resolve(&Bounds::default())
-                .tint_at([0.0; 3], [0.0, 0.0, 1.0])
+            flat.tint_at(&Sample::surface([1.0, 7.5, 2.0], [0.0, 0.0, 1.0])),
+            look.resolve(&FieldData::geometry(&Bounds::default()))
+                .tint_at(&Sample::surface([0.0; 3], [0.0, 0.0, 1.0]))
         );
     }
 
     #[test]
     fn off_keeps_whatever_colour_the_caller_had() {
         let tinted = field(HeightMode::Off, bounds([0.0, 0.0, 0.0], [1.0, 10.0, 1.0]));
-        assert_eq!(tinted.tint_at([0.0, 5.0, 0.0], [0.0; 3]), None);
+        assert_eq!(tinted.tint_at(&Sample::at([0.0, 5.0, 0.0])), None);
         // Which is also what the uniform says, so the shader agrees.
         assert_eq!(
             tinted.uniforms().coloring[0],
@@ -1366,7 +1673,7 @@ mod tests {
         let flat = bounds([0.0, 7.5, 0.0], [10.0, 7.5, 10.0]);
         let ramp = field(HeightMode::Ramp, flat);
         assert_eq!(
-            ramp.tint_at([1.0, 7.5, 2.0], [0.0; 3]),
+            ramp.tint_at(&Sample::at([1.0, 7.5, 2.0])),
             Some(ramp.ramp.color_at(0.0))
         );
         assert_eq!(ramp.uniforms().coloring[3], 0.0);
@@ -1375,7 +1682,7 @@ mod tests {
         let banded = field(HeightMode::Bands, flat);
         assert!(
             banded
-                .tint_at([1.0, 7.5, 2.0], [0.0; 3])
+                .tint_at(&Sample::at([1.0, 7.5, 2.0]))
                 .unwrap()
                 .iter()
                 .all(|value| value.is_finite())
@@ -1389,8 +1696,11 @@ mod tests {
             period: 10.0,
             ..Default::default()
         };
-        let tinted = look.resolve(&bounds([0.0, 0.0, 0.0], [1.0, 100.0, 1.0]));
-        let at = |height: f32| tinted.tint_at([0.0, height, 0.0], [0.0; 3]).unwrap();
+        let tinted = look.resolve(&FieldData::geometry(&bounds(
+            [0.0, 0.0, 0.0],
+            [1.0, 100.0, 1.0],
+        )));
+        let at = |height: f32| tinted.tint_at(&Sample::at([0.0, height, 0.0])).unwrap();
         // One full period lands back where the last one started...
         let (here, next_cycle) = (at(3.0), at(13.0));
         for channel in 0..3 {
@@ -1410,9 +1720,14 @@ mod tests {
             period: 7.0,
             ..Default::default()
         };
-        let tinted = look.resolve(&bounds([0.0, 0.0, 0.0], [1.0, 100.0, 1.0]));
+        let tinted = look.resolve(&FieldData::geometry(&bounds(
+            [0.0, 0.0, 0.0],
+            [1.0, 100.0, 1.0],
+        )));
         for height in 0..=100 {
-            let rgb = tinted.tint_at([0.0, height as f32, 0.0], [0.0; 3]).unwrap();
+            let rgb = tinted
+                .tint_at(&Sample::at([0.0, height as f32, 0.0]))
+                .unwrap();
             // Three evenly spaced phases sum to a constant, which is what keeps
             // the stripes a colour pattern rather than a shading one.
             assert!(
@@ -1424,10 +1739,159 @@ mod tests {
         // The stripes are a ruler along the value, so they follow the coordinate
         // rather than the model's floor: the same height paints the same way
         // wherever the model happens to sit.
-        let lifted = look.resolve(&bounds([0.0, 100.0, 0.0], [1.0, 200.0, 1.0]));
+        let lifted = look.resolve(&FieldData::geometry(&bounds(
+            [0.0, 100.0, 0.0],
+            [1.0, 200.0, 1.0],
+        )));
         assert_eq!(
-            lifted.tint_at([0.0, 33.0, 0.0], [0.0; 3]),
-            tinted.tint_at([0.0, 33.0, 0.0], [0.0; 3])
+            lifted.tint_at(&Sample::at([0.0, 33.0, 0.0])),
+            tinted.tint_at(&Sample::at([0.0, 33.0, 0.0]))
+        );
+    }
+
+    /// The field's ranges, for a cloud that carries both scanner attributes.
+    fn channels<'a>(
+        box_bounds: &'a Bounds,
+        classes: Option<usize>,
+        intensities: Option<(f32, f32)>,
+    ) -> FieldData<'a> {
+        FieldData {
+            bounds: box_bounds,
+            intensities,
+            classes,
+        }
+    }
+
+    /// The ASPRS palette is a key rather than a gradient: class 2 is the ground
+    /// brown whether or not this cloud holds classes 3 to 5. CloudCompare gets
+    /// the same answer by setting that scale's range absolute, which is why the
+    /// palette — not the data — is what bounds a categorical field.
+    #[test]
+    fn a_class_palette_paints_by_number() {
+        let box_bounds = bounds([0.0, 0.0, 0.0], [1.0, 10.0, 1.0]);
+        let look = HeightLook {
+            mode: HeightMode::Ramp,
+            field: Field::Class,
+            scale: Scale::Preset(scale_by_id("asprs")),
+            ..Default::default()
+        };
+        // Seven classes is the count, and the highest one painted is 6.
+        let tinted = look.resolve(&channels(&box_bounds, Some(7), None));
+        let class = |number: u8| Sample {
+            class: number as f32,
+            ..Default::default()
+        };
+        assert_eq!(
+            tinted.tint_at(&class(2)),
+            Some([166.0 / 255.0, 116.0 / 255.0, 4.0 / 255.0]),
+            "ground"
+        );
+        assert_eq!(tinted.tint_at(&class(6)), Some([1.0, 1.0, 0.0]), "building");
+        // And every class of the palette keeps the colour the table gives it:
+        // the bin number is the class number, so the round trip through the
+        // range costs nothing. (Small whole numbers make that exact — see the
+        // boundary test below.)
+        for number in 0u8..23 {
+            let rgb = scale_by_id("asprs").stops[number as usize].rgb;
+            assert_eq!(
+                tinted.tint_at(&class(number)),
+                Some([
+                    rgb[0] as f32 / 255.0,
+                    rgb[1] as f32 / 255.0,
+                    rgb[2] as f32 / 255.0,
+                ]),
+                "class {number}"
+            );
+        }
+        // A class the file could not have — 200, say, past the palette's end —
+        // clamps to its last bin rather than wrapping into the first.
+        assert_eq!(
+            tinted.tint_at(&class(200)),
+            Some(scale_by_id("asprs").ramp().color_at(1.0))
+        );
+    }
+
+    /// Bins do not interpolate, which is the whole difference between a
+    /// categorical scale and the fifteen that are not.
+    #[test]
+    fn a_bin_boundary_belongs_to_the_bin_above() {
+        let ramp = scale_by_id("asprs").ramp();
+        assert!(ramp.categorical());
+        // The bottom edge of class 1's band, and anywhere above it short of
+        // class 2's, is class 1. A hair below the edge is class 0: an
+        // interpolation would have bled the two together there.
+        assert_eq!(ramp.color_at(1.0 / 23.0), ramp.color_at(1.5 / 23.0));
+        assert_eq!(ramp.color_at(1.0 / 23.0), ramp.color_at(2.0 / 23.0 - 0.01));
+        assert_eq!(ramp.color_at(1.0 / 23.0 - f32::EPSILON), ramp.color_at(0.0));
+        assert_eq!(ramp.color_at(0.75), ramp.color_at(17.0 / 23.0));
+        // A continuous scale has no such thing: it runs between its stops.
+        let grey = scale_by_id("grey").ramp();
+        assert!(!grey.categorical());
+        assert_ne!(grey.color_at(0.5), grey.color_at(0.6));
+    }
+
+    /// A continuous scale on the class field does read the cloud's own range,
+    /// because nothing about it says the values are names.
+    #[test]
+    fn a_continuous_scale_runs_the_classes_it_is_given() {
+        let box_bounds = bounds([0.0, 0.0, 0.0], [1.0, 10.0, 1.0]);
+        let look = HeightLook {
+            mode: HeightMode::Ramp,
+            field: Field::Class,
+            ..Default::default()
+        };
+        let tinted = look.resolve(&channels(&box_bounds, Some(7), None));
+        assert_eq!(tinted.range(), (0.0, 7.0));
+        assert_eq!(tinted.uniforms().params[3], 0.0, "bgyr is not a palette");
+        let asprs = HeightLook {
+            scale: Scale::Preset(scale_by_id("asprs")),
+            ..look
+        }
+        .resolve(&channels(&box_bounds, Some(7), None));
+        assert_eq!(asprs.range(), (0.0, 23.0), "the palette bounds it");
+        assert_eq!(asprs.uniforms().params[3], 1.0);
+    }
+
+    /// Intensity is normalised against the cloud's own span, so a 12-bit and a
+    /// 16-bit scan both fill the scale.
+    #[test]
+    fn an_intensity_range_is_the_clouds_own() {
+        let box_bounds = bounds([0.0, 0.0, 0.0], [1.0, 10.0, 1.0]);
+        let look = HeightLook {
+            mode: HeightMode::Ramp,
+            field: Field::Intensity,
+            scale: Scale::Preset(scale_by_id("grey")),
+            ..Default::default()
+        };
+        for (min, max) in [(0.0, 4095.0), (0.0, 65535.0), (120.0, 180.0)] {
+            let tinted = look.resolve(&channels(&box_bounds, None, Some((min, max))));
+            let intensity = |value: f32| Sample {
+                intensity: value,
+                ..Default::default()
+            };
+            assert_eq!(
+                tinted.tint_at(&intensity(min)),
+                Some([0.0; 3]),
+                "{min}..{max} floor"
+            );
+            assert_eq!(
+                tinted.tint_at(&intensity(max)),
+                Some([1.0; 3]),
+                "{min}..{max} ceiling"
+            );
+            // Half way up the range is half way up the scale, whatever the units.
+            let middle = tinted.tint_at(&intensity((min + max) / 2.0)).unwrap();
+            assert!((middle[0] - 0.5).abs() < 0.01, "{min}..{max} middle");
+        }
+        // A cloud with no intensity at all: the caller's gate keeps this out of
+        // reach, and the maths still has an answer that is not a NaN.
+        let blind = look.resolve(&FieldData::geometry(&box_bounds));
+        assert!(
+            blind
+                .tint_at(&Sample::at([0.0, 5.0, 0.0]))
+                .unwrap()
+                .iter()
+                .all(|value| value.is_finite())
         );
     }
 
@@ -1441,7 +1905,10 @@ mod tests {
             period: 4.0,
         };
         let uniforms = look
-            .resolve(&bounds([0.0, 0.0, -10.0], [1.0, 1.0, 10.0]))
+            .resolve(&FieldData::geometry(&bounds(
+                [0.0, 0.0, -10.0],
+                [1.0, 1.0, 10.0],
+            )))
             .uniforms();
         assert_eq!(uniforms.coloring[0], HeightMode::Ramp.index() as f32);
         assert_eq!(uniforms.coloring[1], 2.0, "the axis");
@@ -1478,17 +1945,17 @@ mod tests {
             period: 2.0,
             ..Default::default()
         }
-        .resolve(&box_bounds);
+        .resolve(&FieldData::geometry(&box_bounds));
         let steps = banded.legend_steps(8);
         assert_eq!(steps.len(), 8);
         // Highest first, and every swatch is a colour the model really got.
         assert_eq!(
             steps[0],
-            banded.tint_at([0.0, 3.75, 0.0], [0.0; 3]).unwrap()
+            banded.tint_at(&Sample::at([0.0, 3.75, 0.0])).unwrap()
         );
         assert_eq!(
             *steps.last().unwrap(),
-            banded.tint_at([0.0, 0.25, 0.0], [0.0; 3]).unwrap()
+            banded.tint_at(&Sample::at([0.0, 0.25, 0.0])).unwrap()
         );
         // A ramp is sampled the same way, so the bar runs its scale end to end.
         let ramp = field(HeightMode::Ramp, box_bounds);
@@ -1496,7 +1963,7 @@ mod tests {
         assert_eq!(steps.len(), 32);
         assert_eq!(
             *steps.last().unwrap(),
-            ramp.tint_at([0.0, 0.062_5, 0.0], [0.0; 3]).unwrap()
+            ramp.tint_at(&Sample::at([0.0, 0.062_5, 0.0])).unwrap()
         );
     }
 
@@ -1511,12 +1978,14 @@ mod tests {
                 axis: 1,
                 ..Default::default()
             }
-            .resolve(&bounds([0.0, 0.0, 0.0], [1.0, 4.0, 1.0]));
+            .resolve(&FieldData::geometry(&bounds(
+                [0.0, 0.0, 0.0],
+                [1.0, 4.0, 1.0],
+            )));
             let (min, max) = tinted.range();
             for step in 1..=5 {
                 let value = min + (max - min) * step as f32 / 6.0;
-                let (point, normal) = tinted.sample_at(value);
-                let back = tinted.value_at(point, normal);
+                let back = tinted.value_at(&tinted.sample_at(value));
                 assert!(
                     (back - value).abs() < 1e-3,
                     "{}: {value} sampled as {back}",
@@ -1595,10 +2064,23 @@ mod tests {
             assert_eq!(HeightMode::from_index(mode.index()), mode);
         }
         assert_eq!(HeightMode::from_key("nonsense"), HeightMode::Off);
-        for field in [Field::Height, Field::Slope, Field::Aspect] {
+        for field in [
+            Field::Height,
+            Field::Slope,
+            Field::Aspect,
+            Field::Intensity,
+            Field::Class,
+        ] {
             assert_eq!(Field::from_key(field.key()), field);
             assert_eq!(Field::from_index(field.index()), field);
         }
         assert_eq!(Field::from_key("nonsense"), Field::Height);
+        // The two scanner fields are the only ones that need a channel the file
+        // may not have carried, which is what the viewport gates them on.
+        assert_eq!(Field::Height.channel(), None);
+        assert_eq!(Field::Slope.channel(), None);
+        assert_eq!(Field::Aspect.channel(), None);
+        assert_eq!(Field::Intensity.channel(), Some(Channel::Intensity));
+        assert_eq!(Field::Class.channel(), Some(Channel::Class));
     }
 }

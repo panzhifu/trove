@@ -557,9 +557,15 @@ impl GpuRenderer {
 
             // Points: the sprite corners come from the shader's
             // `vertex_index`, so the only vertex buffer holds one instance per
-            // point — position, normal and the point's own colour.
-            let point_attributes =
-                wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x3];
+            // point — position, normal, the point's own colour, and the two
+            // scalar channels a field is read from.
+            let point_attributes = wgpu::vertex_attr_array![
+                0 => Float32x3,
+                1 => Float32x3,
+                2 => Float32x3,
+                3 => Float32,
+                4 => Float32
+            ];
             let point = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some("trove-3d-points"),
                 layout: Some(&pipeline_layout),
@@ -1122,6 +1128,9 @@ impl GpuRenderer {
 mod tests {
     use super::*;
     use naga::valid::{Capabilities, ValidationFlags, Validator};
+    use trove_core::media::height_color::{
+        Field, FieldData, HeightLook, HeightMode, Scale, scale_by_id,
+    };
 
     /// Parse and validate the shader, panicking with the diagnostic on error.
     fn module() -> naga::Module {
@@ -1207,15 +1216,34 @@ mod tests {
         );
     }
 
-    /// `vs_model` reads position and normal, `vs_point` also reads the point's
-    /// colour — one `vec3<f32>` per location its pipeline's vertex buffer
-    /// layout describes, in the same order and with the same stride.
+    /// `vs_model` reads position and normal; `vs_point` adds the point's own
+    /// colour and the two scalar channels. One input per attribute its
+    /// pipeline's vertex buffer layout describes, in the same order, with the
+    /// same widths — and a float apiece for the channels rather than a `vec2`,
+    /// which is what the tenth float's byte offset forces.
     #[test]
     fn the_vertex_inputs_match_the_buffer_layouts() {
         let module = module();
-        for (entry_point, locations, stride) in [
-            ("vs_model", 2, render3d::VertexData::STRIDE),
-            ("vs_point", 3, render3d::PointData::STRIDE),
+        // (location, kind, components) per input, in the order the shader takes
+        // them, and the floats one record holds.
+        let float = |location: u32, components: u8| (location, naga::ScalarKind::Float, components);
+        for (entry_point, expected, floats) in [
+            (
+                "vs_model",
+                vec![float(0, 3), float(1, 3)],
+                render3d::VertexData::STRIDE / 4,
+            ),
+            (
+                "vs_point",
+                vec![
+                    float(0, 3),
+                    float(1, 3),
+                    float(2, 3),
+                    float(3, 1),
+                    float(4, 1),
+                ],
+                render3d::PointData::STRIDE / 4,
+            ),
         ] {
             let entry = module
                 .entry_points
@@ -1223,30 +1251,29 @@ mod tests {
                 .find(|entry| entry.name == entry_point)
                 .unwrap_or_else(|| panic!("{entry_point} present"));
 
-            let mut inputs: Vec<(u32, naga::ScalarKind, naga::VectorSize)> = Vec::new();
+            let mut inputs: Vec<(u32, naga::ScalarKind, u8)> = Vec::new();
             for argument in &entry.function.arguments {
                 let Some(naga::Binding::Location { location, .. }) = argument.binding else {
                     continue;
                 };
-                let naga::TypeInner::Vector { size, scalar } = module.types[argument.ty].inner
-                else {
-                    panic!("{entry_point} input @location({location}) is not a vector");
+                // A scalar attribute is a whole float of its own, and a vector
+                // one per component: the same widths the vertex buffer's format
+                // names.
+                let (kind, components) = match module.types[argument.ty].inner {
+                    naga::TypeInner::Scalar(scalar) => (scalar.kind, 1u8),
+                    naga::TypeInner::Vector { size, scalar } => (scalar.kind, size as u8),
+                    _ => panic!("{entry_point} input @location({location}) is not a number"),
                 };
-                inputs.push((location, scalar.kind, size));
+                inputs.push((location, kind, components));
             }
             inputs.sort_by_key(|(location, _, _)| *location);
-            let expected: Vec<_> = (0..locations)
-                .map(|location| {
-                    (
-                        location as u32,
-                        naga::ScalarKind::Float,
-                        naga::VectorSize::Tri,
-                    )
-                })
-                .collect();
             assert_eq!(inputs, expected, "{entry_point} inputs");
-            // `locations` vec3<f32> per vertex or instance: the declared stride.
-            assert_eq!(stride, locations * 3 * 4, "{entry_point} stride");
+            // Every component of every input, times four bytes: the declared stride.
+            let width: u64 = inputs
+                .iter()
+                .map(|(_, _, components)| *components as u64)
+                .sum();
+            assert_eq!(width, floats, "{entry_point} stride");
         }
     }
 
@@ -1446,6 +1473,70 @@ mod tests {
                 .any(|pixel| pixel[0] > 0 || pixel[1] > 0 || pixel[2] > 0),
             "the culled mesh drew nothing"
         );
+    }
+
+    /// The classification has to arrive through the instance buffer and come back
+    /// out as the palette's colour, or the frame and the thumbnail disagree about
+    /// a cloud's classes — and neither looks wrong on its own.
+    #[test]
+    fn the_gpu_paints_a_cloud_from_its_classification() {
+        let Ok(renderer) = GpuRenderer::new() else {
+            eprintln!("no graphics device: skipping the classified frame test");
+            return;
+        };
+        let cloud = |classes: [u8; 2]| {
+            let ply = format!(
+                "ply\nformat ascii 1.0\nelement vertex 2\n\
+                 property float x\nproperty float y\nproperty float z\n\
+                 property uchar classification\nend_header\n\
+                 -0.4 0 0 {}\n0.4 0 0 {}\n",
+                classes[0], classes[1]
+            );
+            trove_core::media::formats::load_ply(ply.as_bytes()).expect("a classified cloud parses")
+        };
+        // The same look for both clouds: the ASPRS palette, whose domain is its
+        // own 23 classes rather than whatever a cloud happens to carry.
+        let look = HeightLook {
+            mode: HeightMode::Ramp,
+            field: Field::Class,
+            scale: Scale::Preset(scale_by_id("asprs")),
+            ..Default::default()
+        };
+        let frame = |classes: [u8; 2]| {
+            let mesh = cloud(classes);
+            let bounds = mesh.bounds;
+            let uploaded = renderer.upload(&mesh);
+            renderer
+                .render(
+                    &uploaded,
+                    &render3d::Camera::default().framing(bounds, 1.0),
+                    (160, 120),
+                    false,
+                    false,
+                    look.resolve(&FieldData::geometry(&bounds)).uniforms(),
+                )
+                .expect("a frame comes back")
+        };
+        let warm = |frame: &[u8]| {
+            frame
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .any(|pixel| pixel[2] as i32 - pixel[0] as i32 > 60)
+        };
+        // Class 6 is a building yellow and class 2 a ground brown. The material
+        // both paths fall back to — and the backdrop — are blue-grey, so a warm
+        // pixel can only have come out of the classification.
+        let buildings = frame([2, 6]);
+        assert!(warm(&buildings), "the palette's warm end never appeared");
+        // Class 0 is "not classified", which the palette paints white: the same
+        // two points, the same look, and nothing warm in the frame.
+        let unclassified = frame([0, 0]);
+        assert!(
+            !warm(&unclassified),
+            "a white class came out of the palette warm"
+        );
+        assert_ne!(buildings, unclassified, "the classes were ignored");
     }
 
     /// The members of the shader's `Uniforms` struct, in order.

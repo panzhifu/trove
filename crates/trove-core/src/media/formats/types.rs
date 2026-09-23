@@ -90,6 +90,51 @@ impl Default for Bounds {
     }
 }
 
+/// The per-point scalar channels a file carries beyond geometry — what
+/// CloudCompare colours by when it is not colouring by height.
+///
+/// Both are parallel to the vertex arrays and both are optional: a PLY written
+/// by a scanner has them, an OBJ or a simplified LOD level has not, and the
+/// renderers treat a missing channel as "this model cannot be painted by it"
+/// rather than as zeros, which would paint a convincing and wrong picture.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct CloudFields {
+    /// Raw intensity, unscaled: what the file says. Kept as read, so a 12-bit
+    /// and a 16-bit cloud keep their own range and the colouring normalises
+    /// against it.
+    pub intensities: Vec<f32>,
+    /// ASPRS-style classification, one byte per point. An index into a
+    /// categorical palette, not a value to interpolate.
+    pub classes: Vec<u8>,
+}
+
+impl CloudFields {
+    fn is_empty(&self) -> bool {
+        self.intensities.is_empty() && self.classes.is_empty()
+    }
+
+    /// The channels as they read after `remap` dropped vertices, each channel
+    /// gone entirely if it did not cover every vertex to begin with — the same
+    /// rule the normals follow.
+    fn filtered(mut self, remap: &[u32]) -> Self {
+        fn keep<T: Copy>(channel: &mut Vec<T>, remap: &[u32]) {
+            if channel.len() != remap.len() {
+                channel.clear();
+                return;
+            }
+            let source = std::mem::take(channel);
+            source
+                .into_iter()
+                .zip(remap)
+                .filter(|(_, to)| **to != u32::MAX)
+                .for_each(|(value, _)| channel.push(value));
+        }
+        keep(&mut self.intensities, remap);
+        keep(&mut self.classes, remap);
+        self
+    }
+}
+
 /// Usable geometry in model space: a triangle mesh, or a point cloud when the
 /// file carries no faces.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -104,6 +149,10 @@ pub struct Mesh {
     /// Triangles; empty for a point cloud, which is drawn vertex by vertex.
     pub triangles: Vec<[u32; 3]>,
     pub bounds: Bounds,
+    /// The scalar channels, for a file that carries any. Boxed because a mesh
+    /// without them — which is most files — should not pay for two empty `Vec`s
+    /// inside every geometry the renderers hand around.
+    pub fields: Option<Box<CloudFields>>,
 }
 
 impl Mesh {
@@ -201,6 +250,39 @@ impl Mesh {
         self.colors.len() == self.positions.len() && !self.colors.is_empty()
     }
 
+    /// Whether intensity can be painted on this model, and the range it spans.
+    ///
+    /// Only a point cloud qualifies: the channels ride the point instance buffer,
+    /// which the triangle pipeline does not read, so a mesh that somehow carried
+    /// one would have nothing to draw it with.
+    pub fn intensity_range(&self) -> Option<(f32, f32)> {
+        let intensities = &self.fields.as_ref()?.intensities;
+        if !(self.is_point_cloud() && intensities.len() == self.positions.len()) {
+            return None;
+        }
+        let (mut min, mut max) = (f32::INFINITY, f32::NEG_INFINITY);
+        for value in intensities.iter().filter(|v| v.is_finite()) {
+            min = min.min(*value);
+            max = max.max(*value);
+        }
+        // Nothing finite is as good as no channel at all: a range between two
+        // infinities would be a colour painted out of nothing.
+        (min <= max).then_some((min, max))
+    }
+
+    /// The highest classification present, plus one: the count a categorical
+    /// palette has to cover. `None` when there is no channel to read.
+    pub fn class_count(&self) -> Option<usize> {
+        let classes = &self.fields.as_ref()?.classes;
+        (self.is_point_cloud() && classes.len() == self.positions.len()).then(|| {
+            classes
+                .iter()
+                .copied()
+                .max()
+                .map_or(1, |max| max as usize + 1)
+        })
+    }
+
     /// Assemble a mesh from geometry that was not read from a file — a
     /// simplified LOD level, above all.
     ///
@@ -240,20 +322,50 @@ impl Mesh {
         Self::assemble(positions, normals, colors, Vec::new())
     }
 
-    /// Shared tail of both constructors: checks the vertices are usable,
-    /// drops degenerate triangles and computes the bounds.
+    /// A point cloud that also carried intensity and/or classification. The
+    /// point-cloud readers' path; every other reader keeps [`finish_points`].
+    pub(crate) fn finish_points_with(
+        positions: Vec<[f32; 3]>,
+        normals: Vec<[f32; 3]>,
+        colors: Vec<[f32; 3]>,
+        fields: CloudFields,
+    ) -> Option<Self> {
+        Self::assemble_with(positions, normals, colors, Vec::new(), fields)
+    }
+
+    /// Geometry with no scalar channels, which is what every format reader that
+    /// has none hands over.
     fn assemble(
         positions: Vec<[f32; 3]>,
         normals: Vec<[f32; 3]>,
         colors: Vec<[f32; 3]>,
         triangles: Vec<[u32; 3]>,
     ) -> Option<Self> {
+        Self::assemble_with(
+            positions,
+            normals,
+            colors,
+            triangles,
+            CloudFields::default(),
+        )
+    }
+
+    /// Shared tail of the constructors: checks the vertices are usable, drops
+    /// degenerate triangles and computes the bounds.
+    fn assemble_with(
+        positions: Vec<[f32; 3]>,
+        normals: Vec<[f32; 3]>,
+        colors: Vec<[f32; 3]>,
+        triangles: Vec<[u32; 3]>,
+        fields: CloudFields,
+    ) -> Option<Self> {
         // Normalise non-finite coordinates away first: nothing downstream can
         // use them, and several things (the bounds, the winding check, the
         // point-cloud octree) misbehave in ways that run from wrong to
         // non-terminating. Doing it once here covers every format reader.
-        let (positions, normals, colors, triangles) =
-            drop_non_finite((positions, normals, colors, triangles));
+        let (geometry, remap) = drop_non_finite((positions, normals, colors, triangles));
+        let (positions, normals, colors, triangles) = geometry;
+        let fields = fields.filtered(&remap);
         if positions.is_empty() {
             return None;
         }
@@ -286,6 +398,7 @@ impl Mesh {
             colors,
             triangles,
             bounds,
+            fields: (!fields.is_empty()).then(|| Box::new(fields)),
         })
     }
 }
@@ -305,10 +418,13 @@ type MeshArrays = (Vec<[f32; 3]>, Vec<[f32; 3]>, Vec<[f32; 3]>, Vec<[u32; 3]>);
 /// unobserved points often enough that normalising once here — for every
 /// format — is cheaper than teaching each reader about it. The all-finite
 /// case, which is the common one, moves the arrays through untouched.
-fn drop_non_finite(geometry: MeshArrays) -> MeshArrays {
+fn drop_non_finite(geometry: MeshArrays) -> (MeshArrays, Vec<u32>) {
     let (positions, normals, colors, triangles) = geometry;
     if positions.iter().all(|p| p.iter().all(|v| v.is_finite())) {
-        return (positions, normals, colors, triangles);
+        // Nothing dropped, so the identity map lets the scalar channels fall
+        // through the same filter as everything else.
+        let identity: Vec<u32> = (0..positions.len() as u32).collect();
+        return ((positions, normals, colors, triangles), identity);
     }
     let mut remap = vec![u32::MAX; positions.len()];
     let mut kept = Vec::with_capacity(positions.len());
@@ -341,7 +457,7 @@ fn drop_non_finite(geometry: MeshArrays) -> MeshArrays {
             (a != u32::MAX && b != u32::MAX && c != u32::MAX).then_some([a, b, c])
         })
         .collect();
-    (kept, normals, colors, triangles)
+    ((kept, normals, colors, triangles), remap)
 }
 
 #[cfg(test)]

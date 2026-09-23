@@ -1014,6 +1014,17 @@ fn vertex_columns(properties: &[PlyProperty]) -> Option<VertexColumns> {
         normals: triple(["nx", "ny", "nz"]),
         colors: triple(["red", "green", "blue"])
             .or_else(|| triple(["diffuse_red", "diffuse_green", "diffuse_blue"])),
+        // Deliberately not read on this path. This is the last-resort reader —
+        // what a PLY falls to when the index is absent and the streamer
+        // declined its layout — and it keeps one vertex in `lod_step`, so its
+        // mesh is a thinning of the cloud rather than the cloud. A channel read
+        // here would have to be thinned in step with the positions or it would
+        // belong to a different point, and a channel read *wrongly* would read
+        // as zeros that look like data. So the columns stay absent, the
+        // viewport reports the two scanner fields unavailable, and the reader
+        // that does carry them is the one built for large clouds: the index.
+        intensity: None,
+        class: None,
     })
 }
 

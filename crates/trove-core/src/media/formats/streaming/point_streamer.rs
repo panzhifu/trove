@@ -41,6 +41,12 @@ pub struct StreamChunk {
     pub positions: Vec<[f32; 3]>,
     /// Optional per-point colors (RGB 0..1), parallel to positions.
     pub colors: Vec<[f32; 3]>,
+    /// The scanner's return strength, raw as the file wrote it. Parallel to
+    /// `positions` when the file carried it, empty when it did not.
+    pub intensities: Vec<f32>,
+    /// The ASPRS class of each point, parallel to `positions` when the file
+    /// carried one.
+    pub classes: Vec<u8>,
     /// Whether this is the final chunk.
     pub is_last: bool,
 }
@@ -106,6 +112,11 @@ struct VertexChannels {
     position: [usize; 3],
     /// Property indices of `red`, `green`, `blue` (or `diffuse_*`).
     colors: Option<[usize; 3]>,
+    /// The two scanner attributes, by either spelling. A file with neither is
+    /// a file whose intensity and class cannot be painted, which is the answer
+    /// the viewport needs rather than a stream of zeros.
+    intensity: Option<usize>,
+    class: Option<usize>,
     /// Byte offset of every property inside a fixed-size binary record.
     offsets: Vec<usize>,
     /// Declared type of every property, for colour normalisation.
@@ -181,6 +192,8 @@ impl PointStreamer {
                 channels: VertexChannels {
                     position: [columns.x, columns.y, columns.z],
                     colors: columns.colors,
+                    intensity: columns.intensity,
+                    class: columns.class,
                     offsets,
                     types,
                 },
@@ -341,6 +354,16 @@ impl PointStreamer {
         self.channels.colors.is_some()
     }
 
+    /// Whether the file carries the two scanner attributes, which is what says
+    /// whether those two fields exist for this cloud at all.
+    pub fn has_intensity(&self) -> bool {
+        self.channels.intensity.is_some()
+    }
+
+    pub fn has_class(&self) -> bool {
+        self.channels.class.is_some()
+    }
+
     /// Read the next chunk of at most `max_points` points.
     pub fn next_chunk(&mut self, max_points: usize) -> Result<Option<StreamChunk>, String> {
         if self.vertices_read >= self.vertex_count || max_points == 0 {
@@ -348,12 +371,15 @@ impl PointStreamer {
         }
 
         let to_read = (self.vertex_count - self.vertices_read).min(max_points);
-        let has_colors = self.has_colors();
-        let mut positions = Vec::with_capacity(to_read);
-        let mut colors = if has_colors {
-            Vec::with_capacity(to_read)
-        } else {
-            Vec::new()
+        // A channel the file does not carry stays an empty `Vec`, so a reader
+        // can tell "absent" from "zero" without a second flag.
+        let room = |present: bool| if present { to_read } else { 0 };
+        let mut chunk = StreamChunk {
+            positions: Vec::with_capacity(to_read),
+            colors: Vec::with_capacity(room(self.has_colors())),
+            intensities: Vec::with_capacity(room(self.has_intensity())),
+            classes: Vec::with_capacity(room(self.has_class())),
+            is_last: false,
         };
 
         match self.format {
@@ -367,45 +393,44 @@ impl PointStreamer {
                     };
                     self.ascii_bytes += line.len() as u64 + 1;
                     let scalars = tokenise(&line);
-                    let position = self
-                        .channels
-                        .position
-                        .map(|index| scalars.get(index).copied().unwrap_or(0.0) as f32);
-                    positions.push(position);
+                    let scalar = |index: usize| scalars.get(index).copied().unwrap_or(0.0);
+                    chunk
+                        .positions
+                        .push(self.channels.position.map(|index| scalar(index) as f32));
                     if let Some([r, g, b]) = self.channels.colors {
-                        colors.push([r, g, b].map(|index| {
-                            let value = scalars.get(index).copied().unwrap_or(0.0);
-                            ply::unit_colour(value, self.channels.types[index])
+                        chunk.colors.push([r, g, b].map(|index| {
+                            ply::unit_colour(scalar(index), self.channels.types[index])
                         }));
+                    }
+                    if let Some(index) = self.channels.intensity {
+                        chunk.intensities.push(scalar(index) as f32);
+                    }
+                    if let Some(index) = self.channels.class {
+                        chunk.classes.push(ply::class_byte(scalar(index)));
                     }
                     self.vertices_read += 1;
                 }
             }
             PlyFormat::BinaryLittleEndian => {
-                self.read_binary(PlyEndian::Little, to_read, &mut positions, &mut colors)?;
+                self.read_binary(PlyEndian::Little, to_read, &mut chunk)?;
             }
             PlyFormat::BinaryBigEndian => {
-                self.read_binary(PlyEndian::Big, to_read, &mut positions, &mut colors)?;
+                self.read_binary(PlyEndian::Big, to_read, &mut chunk)?;
             }
         }
 
-        for position in &positions {
+        for position in &chunk.positions {
             self.bounds.extend(*position);
         }
-        let is_last = self.vertices_read >= self.vertex_count;
-        Ok(Some(StreamChunk {
-            positions,
-            colors,
-            is_last,
-        }))
+        chunk.is_last = self.vertices_read >= self.vertex_count;
+        Ok(Some(chunk))
     }
 
     fn read_binary(
         &mut self,
         order: PlyEndian,
         count: usize,
-        positions: &mut Vec<[f32; 3]>,
-        colors: &mut Vec<[f32; 3]>,
+        chunk: &mut StreamChunk,
     ) -> Result<(), String> {
         for _ in 0..count {
             self.reader
@@ -416,11 +441,21 @@ impl PointStreamer {
                 .channels
                 .position
                 .map(|index| self.channels.binary(index, order, &self.row) as f32);
-            positions.push(position);
+            chunk.positions.push(position);
             if let Some([r, g, b]) = self.channels.colors {
-                colors.push(
+                chunk.colors.push(
                     [r, g, b].map(|index| self.channels.binary_color(index, order, &self.row)),
                 );
+            }
+            if let Some(index) = self.channels.intensity {
+                chunk
+                    .intensities
+                    .push(self.channels.binary(index, order, &self.row) as f32);
+            }
+            if let Some(index) = self.channels.class {
+                chunk.classes.push(ply::class_byte(
+                    self.channels.binary(index, order, &self.row),
+                ));
             }
             self.vertices_read += 1;
         }

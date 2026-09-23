@@ -39,6 +39,8 @@ impl BatchSource for PlyBatches {
                 Ok(Some(PointBatch {
                     points: chunk.positions,
                     colors: chunk.colors,
+                    intensities: chunk.intensities,
+                    classes: chunk.classes,
                 }))
             }
             None => {
@@ -119,7 +121,12 @@ mod tests {
 
     /// A binary PLY cloud of `count` points on a scrambled grid, with
     /// `uchar` colours — the shape and the layout a scan file has.
-    fn write_cloud(path: &Path, count: usize, coloured: bool) -> (Vec<[f32; 3]>, Bounds) {
+    fn write_cloud(
+        path: &Path,
+        count: usize,
+        coloured: bool,
+        channels: bool,
+    ) -> (Vec<[f32; 3]>, Bounds) {
         let side = (count as f64).cbrt().ceil() as usize;
         let spacing = 10.0f32 / side as f32;
         let mut cells: Vec<(usize, usize, usize)> = Vec::new();
@@ -163,6 +170,9 @@ mod tests {
                 b"property uchar red\nproperty uchar green\nproperty uchar blue\n",
             );
         }
+        if channels {
+            file.extend_from_slice(b"property float intensity\nproperty uchar classification\n");
+        }
         file.extend_from_slice(b"end_header\n");
         for (index, point) in points.iter().enumerate() {
             for value in point {
@@ -172,9 +182,91 @@ mod tests {
                 let ramp = (index % 256) as u8;
                 file.extend_from_slice(&[ramp, 64, 200]);
             }
+            if channels {
+                file.extend_from_slice(&point[1].to_le_bytes());
+                file.push(class_of(point[1], spacing));
+            }
         }
         std::fs::write(path, &file).unwrap();
         (points, bounds)
+    }
+
+    /// The class a scan fixture gives a point: a function of its own position,
+    /// so a reader can check what came back against the point it landed on and
+    /// not against the record it was written in — the index reorders the cloud,
+    /// which is the entire point of it.
+    fn class_of(y: f32, spacing: f32) -> u8 {
+        ((y / spacing).round() as usize % 23) as u8
+    }
+
+    /// The whole upgrade on a real file: a scan with return strength and
+    /// classification goes in, and both come back through the streamer, the
+    /// spilled sort, the reordered file and the chunk reader — with the header
+    /// able to say what the cloud spans before a single point is read.
+    #[test]
+    fn a_scans_channels_survive_the_index_and_its_new_order() {
+        let dir = temp("channels");
+        std::fs::create_dir_all(&dir).unwrap();
+        let ply = dir.join("scan.ply");
+        let (points, _) = write_cloud(&ply, 4_000, true, true);
+        let spacing = 10.0f32 / (points.len() as f64).cbrt().ceil() as f32;
+        let out = dir.join("scan.trovecloud");
+
+        let summary = build_ply_index(
+            &ply,
+            IndexConfig {
+                points_per_chunk: 500,
+                sort_capacity: 300,
+                ..Default::default()
+            },
+            &dir,
+            &out,
+        )
+        .expect("a scan indexes");
+        assert!(summary.channels.colors, "the fixture has colours");
+        assert!(summary.channels.intensity, "and intensity");
+        assert!(summary.channels.class, "and a classification");
+        assert_eq!(
+            summary.channels.record_bytes(),
+            14,
+            "6 + 3 + 4 + 1 bytes a point"
+        );
+
+        let index = CloudIndex::open(&out).expect("the index opens");
+        // What the two fields span, from the header alone: this is what lets the
+        // viewport paint the first chunk the way the last one will look.
+        let (low, high) = index.intensity_range().expect("a range");
+        assert!(low.abs() < 1e-3, "{low}");
+        assert!((high - 10.0 * (1.0 - 1.0 / 16.0)).abs() < 0.7, "{high}");
+        assert_eq!(index.class_count(), Some(16), "the fixture uses 16 classes");
+
+        let mut seen = 0usize;
+        for chunk in 0..index.chunk_count() {
+            let batch = index.read_chunk(chunk).expect("the chunk reads");
+            assert_eq!(batch.intensities.len(), batch.points.len());
+            assert_eq!(batch.classes.len(), batch.points.len());
+            for (point, (intensity, class)) in batch
+                .points
+                .iter()
+                .zip(batch.intensities.iter().zip(&batch.classes))
+            {
+                // The intensity was written as the y coordinate, so a point
+                // that kept its own says so here — within what a chunk-local
+                // 16-bit fraction can move it.
+                assert!(
+                    (intensity - point[1]).abs() < 1e-3,
+                    "{point:?} carries {intensity}"
+                );
+                assert_eq!(
+                    *class,
+                    class_of(point[1], spacing),
+                    "{point:?} was painted with another point's class"
+                );
+                seen += 1;
+            }
+        }
+        assert_eq!(seen, points.len(), "and none of them went missing");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// The whole path, on a real file: a PLY goes in, a compact index comes
@@ -184,7 +276,7 @@ mod tests {
         let dir = temp("build");
         std::fs::create_dir_all(&dir).unwrap();
         let ply = dir.join("cloud.ply");
-        let (points, bounds) = write_cloud(&ply, 4_000, true);
+        let (points, bounds) = write_cloud(&ply, 4_000, true, false);
         let out = dir.join("cloud.trovecloud");
 
         let config = IndexConfig {
@@ -196,7 +288,7 @@ mod tests {
         };
         let summary = build_ply_index(&ply, config, &dir, &out).expect("index builds");
         assert_eq!(summary.points, points.len() as u64);
-        assert!(summary.has_colors);
+        assert!(summary.channels.colors);
         assert!(summary.spilled_runs > 1, "{}", summary.spilled_runs);
         assert!(summary.chunks > 1);
         // The index is far smaller than the file it came from: 9 bytes a point
@@ -281,10 +373,10 @@ mod tests {
         let dir = temp("plain");
         std::fs::create_dir_all(&dir).unwrap();
         let ply = dir.join("plain.ply");
-        write_cloud(&ply, 900, false);
+        write_cloud(&ply, 900, false, false);
         let out = dir.join("plain.trovecloud");
         let summary = build_ply_index(&ply, IndexConfig::default(), &dir, &out).expect("builds");
-        assert!(!summary.has_colors);
+        assert!(!summary.channels.colors);
         let index = CloudIndex::open(&out).expect("opens");
         assert!(!index.has_colors());
         assert!(index.read_chunk(0).unwrap().colors.is_empty());

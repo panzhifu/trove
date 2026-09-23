@@ -15,8 +15,10 @@ pub mod ply;
 pub mod sort;
 pub mod view;
 
-pub use file::{BatchSource, CloudIndex, IndexChunk, IndexConfig, IndexSummary, build_index};
+pub use file::{
+    BatchSource, Channels, CloudIndex, IndexChunk, IndexConfig, IndexSummary, build_index,
+};
 pub use order::{Chunk, Grid, SpatialOrder, chunked, morton_code, sort_spatially, spatial_key};
 pub use ply::{build_ply_index, build_ply_index_with_grid};
-pub use sort::{SortedPoints, SpatialSorter};
+pub use sort::{SortedPoint, SortedPoints, SpatialSorter};
 pub use view::{INDEX_EXTENSION, IndexStep, IndexedCloud, index_path_for};
