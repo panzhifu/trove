@@ -137,6 +137,16 @@ fn output_format(ext: &str) -> Option<(image::ImageFormat, &'static str)> {
     Some((format, mime))
 }
 
+/// Whether [`apply`] could rewrite this extension in place, i.e. whether the
+/// editor has an encoder for it. The preview toolbar asks so that its buttons
+/// never offer a rotation the backend is certain to refuse: several formats
+/// Trove can *show* — EXR, Radiance HDR, TGA, camera RAW, HEIF, PSD, SVG,
+/// JPEG-XL — are read-only here, and a high-dynamic-range file in particular
+/// must not be replaced by a tone-mapped 8-bit copy of itself.
+pub fn is_editable_ext(ext: &str) -> bool {
+    output_format(ext).is_some()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

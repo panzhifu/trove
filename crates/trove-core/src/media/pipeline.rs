@@ -927,6 +927,9 @@ mod tests {
         );
     }
 
+    /// A text file is the case where "skips the pixel stages" and "gets a card"
+    /// are both true: nothing decodes pixels, so the palette and the visual
+    /// signature stay absent, but its thumbnail is drawn from its own characters.
     #[test]
     fn a_non_image_skips_the_pixel_stages() {
         let root = std::env::temp_dir().join(format!("trove-pipe-{}", uuid::Uuid::new_v4()));
@@ -938,8 +941,12 @@ mod tests {
         default_pipeline().run(&mut io).unwrap();
         assert_eq!(io.kind, AssetKind::Document);
         assert!(!io.artifacts.has::<Decoded>());
-        assert!(io.thumb.is_none());
+        assert!(io.thumb.is_some(), "a text file is carded by its own lines");
         assert!(!io.content_hash.is_empty(), "the hash still ran");
+
+        // A card without pixels is still not a palette or a visual signature:
+        // both are computed from a decode this file never had.
+        assert!(io.mined.facts.visual.visual_phash.is_none());
         std::fs::remove_dir_all(&root).ok();
     }
 

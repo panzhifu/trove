@@ -6,9 +6,16 @@
 
 use super::*;
 use std::collections::HashMap;
+use std::ops::Range;
 use std::path::Path;
 use trove_core::model::Asset;
-use trove_core::store::BrowseContext;
+use trove_core::search::{expression::Target, highlight::Lexicon};
+use trove_core::store::{BrowseContext, BrowseSession};
+
+/// The surfaces a listing row shows: one string, the title when the asset has
+/// one and the file name when it does not. A term qualified against any other
+/// surface matched somewhere the row does not display, so it stays unmarked.
+pub(super) const ROW_TARGETS: &[Target] = &[Target::All, Target::Name, Target::Title];
 
 #[derive(Debug, Clone)]
 /// Data needed to paint one grid cell. Immutable per layout epoch;
@@ -23,6 +30,14 @@ pub(super) struct Cell {
     pub(super) trashed: bool,
     /// Display name + facts for the list view rows.
     pub(super) name: String,
+    /// Byte ranges of `name` holding a word the active search asked for.
+    /// Empty unless a search is running, which is also the only time the list
+    /// view's names are read as anything but a label.
+    pub(super) name_marks: Vec<Range<usize>>,
+    /// How close this asset was to what a visual search asked for, 0.0–1.0.
+    /// `None` for every ordinary listing: a browse has no score to show, and a
+    /// column that is empty for the whole view is worse than no column.
+    pub(super) score: Option<f32>,
     pub(super) size_bytes: u64,
     pub(super) added: String,
     /// Timeline bucket: the day this asset belongs to as `YYYY-MM-DD`.
@@ -47,11 +62,17 @@ impl Cell {
 ///
 /// A row may also carry `header` instead of cells: the timeline view inserts
 /// one such row per day section.
+///
+/// The two lists are reference-counted slices because a row is cloned twice
+/// for reasons that have nothing to do with its content: every visible row's
+/// cells are cloned into the element closure each frame, and appending a page
+/// clones the head rows to keep them (see `rows::append_rows`). A `Vec` here
+/// would re-allocate the whole listing on both paths.
 #[derive(Debug, Clone)]
 pub(super) struct Row {
     pub(super) height: f32,
-    pub(super) widths: Vec<f32>,
-    pub(super) cells: Vec<Cell>,
+    pub(super) widths: Rc<[f32]>,
+    pub(super) cells: Rc<[Cell]>,
     pub(super) header: Option<String>,
 }
 
@@ -63,8 +84,8 @@ impl Row {
     pub(super) fn section(label: String) -> Self {
         Self {
             height: TIMELINE_HEADER_HEIGHT,
-            widths: Vec::new(),
-            cells: Vec::new(),
+            widths: Rc::from(Vec::new()),
+            cells: Rc::from(Vec::new()),
             header: Some(label),
         }
     }
@@ -128,11 +149,11 @@ pub(super) struct DataKey {
     pub(super) filter_favorite: bool,
     pub(super) filter_orientation: Option<Orientation>,
     pub(super) filter_aspect: Option<trove_core::model::AspectPreset>,
+    pub(super) filter_resolution: Option<trove_core::model::ResolutionBand>,
     pub(super) filter_min_rating: Option<u8>,
     pub(super) filter_ext: Option<String>,
     pub(super) sort: AssetSort,
     pub(super) sort_desc: bool,
-    pub(super) grid_loaded: usize,
     /// The library's data root: where stored blobs live.
     pub(super) library_root: PathBuf,
     /// Its cache root: where thumbnails live. Separate because the two move
@@ -151,6 +172,12 @@ pub(super) struct ViewData {
     pub(super) key: DataKey,
     pub(super) cells: Rc<Vec<Cell>>,
     pub(super) total: usize,
+    /// `total` is a floor: the query ran out of candidates before it had seen
+    /// everything matching. The title bar says so.
+    pub(super) truncated: bool,
+    /// The listing the next page is cut from. `None` for a visual search, whose
+    /// id list is frozen on the controller instead.
+    pub(super) session: Option<BrowseSession>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -167,6 +194,11 @@ impl WorkspacePanel {
         cx: &mut Context<Self>,
         controller: Entity<LibraryController>,
     ) -> Self {
+        // The one live card. A frame arriving from its decode loop is a
+        // `notify` on that entity, and `observe` is what turns it into a
+        // repaint of the grid.
+        let hover = cx.new(|_| HoverCards::new());
+        cx.observe(&hover, |_, _, cx| cx.notify()).detach();
         let search_box = cx.new(|cx| SearchBox::new(window, cx, controller.clone()));
         let available_width = cx.new(|_| px(0.));
         let list_state = ListState::new(0, ListAlignment::Top, px(LIST_OVERDRAW_PX));
@@ -182,6 +214,23 @@ impl WorkspacePanel {
         });
         cx.subscribe_in(&zoom_slider, window, Self::on_zoom_slider)
             .detach();
+        // The colour filter's similarity rail. Like the zoom slider it commits
+        // on release: the value is a question width, and re-running the colour
+        // scan on every tick of a drag would replace the grid mid-gesture.
+        let initial_similarity = controller.read(cx).colour_similarity;
+        let colour_similarity_slider = cx.new(|_| {
+            SliderState::new()
+                .min(0.)
+                .max(100.)
+                .step(1.)
+                .default_value(initial_similarity)
+        });
+        cx.subscribe_in(
+            &colour_similarity_slider,
+            window,
+            Self::on_colour_similarity_slider,
+        )
+        .detach();
         // The framework picker: its palette tab carries the whole nine-family
         // ramp (plus whatever recent colours we feed it), which the local
         // hand-rolled panel never had.
@@ -203,6 +252,7 @@ impl WorkspacePanel {
         let this = Self {
             focus_handle: cx.focus_handle(),
             controller,
+            hover,
             search_box,
             color_picker,
             pending_color_search: None,
@@ -211,10 +261,13 @@ impl WorkspacePanel {
             rows: Rc::new(Vec::new()),
             list_state,
             zoom_slider,
+            colour_similarity_slider,
             view_key: None,
             data: None,
             covered: 0,
             last_total: 0,
+            last_truncated: false,
+            page_finished: false,
             relayout_pending: false,
             debounce_timer: None,
             preview: None,
@@ -232,25 +285,30 @@ impl WorkspacePanel {
         this
     }
 
-    /// Run the paged query for `key` and materialize the assets into cells.
-    /// The view dispatch itself lives in `trove_core::store::BrowseContext`;
-    /// this only maps the render-side [`DataKey`] onto it and surfaces query
-    /// errors. Called only when the [`DataKey`] changes — never on the
-    /// per-frame path. An active visual search replaces the browse query
-    /// with a rank-ordered id fetch. `count_total = false` skips the exact
-    /// COUNT (a lower-bound total comes back) — the caller overlays its
-    /// cached exact number.
+    /// Freeze this view's listing and materialize its first window.
+    ///
+    /// The [`BrowseSession`] that comes back is what every later page comes
+    /// from: a ranked listing would otherwise run the text leg and its
+    /// `id IN (…)` intersection again for each screenful the user scrolls into,
+    /// for an answer that cannot change inside one listing. The view dispatch
+    /// itself lives in `trove_core::store::BrowseContext`; this only maps the
+    /// render-side [`DataKey`] onto it and surfaces query errors, and runs only
+    /// when the key changes — never on the per-frame path.
+    ///
+    /// `count_total = false` skips the exact COUNT, so the total is a lower
+    /// bound and the caller overlays its cached number.
     pub(super) fn run_data_pass(
         &mut self,
         cx: &mut Context<Self>,
         key: &DataKey,
         count_total: bool,
-    ) -> (usize, Vec<Cell>) {
+        window: usize,
+    ) -> (usize, Vec<Cell>, bool, Option<BrowseSession>) {
         if let Some(ids) = &key.visual {
-            return self.run_visual_pass(cx, key, ids);
+            let (total, cells, truncated) = self.run_visual_pass(cx, key, ids, 0, window);
+            return (total, cells, truncated, None);
         }
 
-        let limit = Some(key.grid_loaded as u32);
         let ctl = self.controller.read(cx);
         let ctx = BrowseContext {
             collection: key.collection,
@@ -267,10 +325,14 @@ impl WorkspacePanel {
             is_favorite: key.filter_favorite,
             orientation: key.filter_orientation,
             aspect: key.filter_aspect,
+            resolution: key.filter_resolution,
             min_rating: key.filter_min_rating,
             ext: key.filter_ext.clone(),
             sort: key.sort,
             sort_desc: key.sort_desc,
+            // The window is taken from the session this call freezes, not from
+            // the browse itself — `offset` is for the one-shot `run` paths.
+            offset: 0,
             // The vector leg of a hybrid search, when the app holds one for
             // the current term. `None` — no endpoint configured, not fetched
             // yet, or a vector for a term the user has typed past — is the
@@ -297,53 +359,112 @@ impl WorkspacePanel {
             .as_ref()
             .filter(|_| ctx.tiers.semantic)
             .map(|query| ctl.library.cached_vector_index(&query.model, query.space));
-        let page = match if count_total {
-            ctx.run(conn, text_index, limit, vector_index.as_ref())
-        } else {
-            ctx.run_without_count(conn, text_index, limit, vector_index.as_ref())
-        } {
-            Ok(page) => page,
-            Err(e) => {
-                self.report_view_error(cx, e);
-                trove_core::model::Page::new(0, Vec::new())
-            }
-        };
+        let frozen = ctx
+            .snapshot(conn, text_index, vector_index.as_ref(), count_total)
+            .and_then(|session| {
+                session
+                    .page(conn, text_index, 0, Some(window))
+                    .map(|page| (session, page))
+            });
         if let Err(error) = drained {
             tracing::warn!(%error, "search outbox drain failed before a browse refresh");
             let msg =
                 rust_i18n::t!("workspace.index_sync_failed", error = error.to_string()).to_string();
             self.report_notice(cx, msg);
         }
-        let (total, list) = (page.total as usize, page.items);
-
-        let cells: Vec<Cell> = list
-            .iter()
-            .filter(|a| key.in_trash || a.trashed_at.is_none())
-            .map(|a| cell_from_asset(&key.library_root, &key.cache_root, a))
-            .collect();
-        (total, cells)
+        match frozen {
+            Ok((session, page)) => {
+                let (total, truncated) = (page.total as usize, page.truncated);
+                (total, cells_for(key, &page.items), truncated, Some(session))
+            }
+            Err(error) => {
+                self.report_view_error(cx, error);
+                (0, Vec::new(), false, None)
+            }
+        }
     }
 
-    /// Materialize the visual-search hits into cells, preserving rank
-    /// order. Missing records (deleted since the scan) drop out.
+    /// One more window of a listing that is already frozen.
+    ///
+    /// No query, no drain, no re-ranking: the session holds the answer, so a
+    /// page costs the slice of it plus the rows that slice needs. A visual
+    /// search has no session — its id list is already frozen on the controller —
+    /// and windows through the same slice. Returns the cells and whether the
+    /// window came back empty, which is the caller's sign to stop paging.
+    pub(super) fn run_page_pass(
+        &mut self,
+        cx: &mut Context<Self>,
+        key: &DataKey,
+        session: Option<&BrowseSession>,
+        offset: usize,
+        window: usize,
+    ) -> (Vec<Cell>, bool) {
+        let Some(session) = session else {
+            let Some(ids) = &key.visual else {
+                // Nothing to page and nothing frozen: the caller stops asking.
+                return (Vec::new(), true);
+            };
+            let (_, cells, _) = self.run_visual_pass(cx, key, ids, offset, window);
+            let empty = cells.is_empty();
+            return (cells, empty);
+        };
+        let ctl = self.controller.read(cx);
+        let conn = ctl.library.store().conn();
+        let page = session.page(conn, ctl.library.text_index(), offset, Some(window));
+        match page {
+            Ok(page) => {
+                let empty = page.items.is_empty();
+                (cells_for(key, &page.items), empty)
+            }
+            Err(error) => {
+                self.report_view_error(cx, error);
+                (Vec::new(), true)
+            }
+        }
+    }
+
+    /// Materialize one window of the visual-search hits into cells, preserving
+    /// rank order. Missing records (deleted since the scan) drop out, which is
+    /// why a window can come back shorter than asked without being the end of
+    /// the list — the caller stops on an *empty* window, not a short one.
     fn run_visual_pass(
         &mut self,
         cx: &mut Context<Self>,
         key: &DataKey,
         ids: &[Uuid],
-    ) -> (usize, Vec<Cell>) {
+        offset: usize,
+        window: usize,
+    ) -> (usize, Vec<Cell>, bool) {
         let conn = self.controller.read(cx).library.store().conn();
-        let by_id: HashMap<Uuid, _> = assets::by_ids(conn, ids)
+        let slice = &ids[offset.min(ids.len())..ids.len().min(offset + window)];
+        let by_id: HashMap<Uuid, _> = assets::by_ids(conn, slice)
             .unwrap_or_default()
             .into_iter()
             .map(|a| (a.id, a))
             .collect();
-        let cells: Vec<Cell> = ids
+        let marks = Lexicon::from_query(&key.search);
+        // The score each hit came back with. A visual search is a ranked answer
+        // and "how close was this one" is the one thing about it the grid can
+        // say — without it the list looks sorted by nothing in particular.
+        let scores: HashMap<Uuid, f32> = self
+            .controller
+            .read(cx)
+            .visual_results
+            .as_ref()
+            .map(|results| results.hits.iter().cloned().collect())
+            .unwrap_or_default();
+        let cells: Vec<Cell> = slice
             .iter()
             .filter_map(|id| by_id.get(id))
-            .map(|a| cell_from_asset(&key.library_root, &key.cache_root, a))
+            .map(|a| {
+                let mut cell = cell_from_asset(&key.library_root, &key.cache_root, a, &marks);
+                cell.score = scores.get(&a.id).copied();
+                cell
+            })
             .collect();
-        (cells.len(), cells)
+        // The hit list is the whole truth of a visual search — it is the
+        // ranking that was asked for, and it has no count behind it.
+        (ids.len(), cells, false)
     }
 
     /// Surface a view/query failure in the status bar.
@@ -364,19 +485,33 @@ impl WorkspacePanel {
     }
 }
 
-/// The view-identity part of a [`DataKey`]: the refresh counter and the
-/// pagination cursor are zeroed, so two keys compare equal when only churn
-/// (imports, edits) separates them. Keys the cached exact total.
+/// The view-identity part of a [`DataKey`] with the churn counter dropped, so
+/// two keys compare equal when only library mutations (imports, edits)
+/// separate them. The cached exact total is keyed on this: a mutation should
+/// not by itself buy another COUNT, the settle timer guarantees one.
 pub(super) fn total_identity(key: &DataKey) -> DataKey {
     let mut identity = key.clone();
     identity.generation = 0;
-    identity.grid_loaded = 0;
     identity
+}
+
+/// One listing window → the cells that paint it. Trash is already decided by
+/// the query, so the filter here is a belt on top of braces: a row that came
+/// back trashed while the view is live would otherwise be listed.
+fn cells_for(key: &DataKey, list: &[Asset]) -> Vec<Cell> {
+    // Parsed once for the window, not once per row: the same grammar the
+    // ranking ran on is what says which bytes to mark, so the two cannot
+    // disagree about what the user asked for.
+    let marks = Lexicon::from_query(&key.search);
+    list.iter()
+        .filter(|a| key.in_trash || a.trashed_at.is_none())
+        .map(|a| cell_from_asset(&key.library_root, &key.cache_root, a, &marks))
+        .collect()
 }
 
 /// One store record → one paintable cell. Shared by the browse query pass
 /// and the visual-search pass so both grids render identically.
-fn cell_from_asset(library_root: &Path, cache_root: &Path, a: &Asset) -> Cell {
+fn cell_from_asset(library_root: &Path, cache_root: &Path, a: &Asset, marks: &Lexicon) -> Cell {
     let thumb = a
         .content_hash
         .as_deref()
@@ -395,6 +530,8 @@ fn cell_from_asset(library_root: &Path, cache_root: &Path, a: &Asset) -> Cell {
     } else {
         (None, None)
     };
+    let name = display_name(a);
+    let name_marks = marks.ranges_in(ROW_TARGETS, &name);
     Cell {
         id: a.id,
         kind: a.kind,
@@ -402,7 +539,9 @@ fn cell_from_asset(library_root: &Path, cache_root: &Path, a: &Asset) -> Cell {
         width: a.width,
         height: a.height,
         trashed: a.trashed_at.is_some(),
-        name: display_name(a),
+        name,
+        name_marks,
+        score: None,
         size_bytes: a.size_bytes,
         added: a.created_at.format("%Y-%m-%d %H:%M").to_string(),
         // Capture date is what a timeline is about; files without EXIF fall

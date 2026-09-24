@@ -10,7 +10,7 @@ use gpui_kit::*;
 use gpui_kit::{Anchor, App};
 
 use trove_core::config::{AppConfig, FILTER_TOOLS};
-use trove_core::model::{AspectPreset, AssetKind, AssetSort, Orientation};
+use trove_core::model::{AspectPreset, AssetKind, AssetSort, Orientation, ResolutionBand};
 use trove_core::store::tags;
 
 use crate::library::{LibraryController, ViewMode};
@@ -353,6 +353,73 @@ pub(crate) fn shape_filter(controller: &Entity<LibraryController>, cx: &App) -> 
                             });
                         },
                     ));
+                }
+                menu
+            }
+        })
+}
+
+/// The short token a band is called on the button: `1K` / `2K` / `4K`. Locale
+/// text would be noise here — the three names are the same everywhere — and
+/// the ranges belong in the menu, where there is room for them.
+fn band_token(band: ResolutionBand) -> &'static str {
+    match band {
+        ResolutionBand::OneK => "1K",
+        ResolutionBand::TwoK => "2K",
+        ResolutionBand::FourK => "4K",
+    }
+}
+
+/// The resolution filter: the longer edge banded into 1K / 2K / 4K.
+///
+/// Its own button rather than a third section of the shape menu, because the
+/// two answer different questions and *compose*: shape compares proportions and
+/// says nothing about size, so a 1920×1080 frame and a 7680×4320 one are the
+/// same shape, and "4K and 16:9" is a meaningful pair to ask for at once.
+pub(crate) fn resolution_filter(
+    controller: &Entity<LibraryController>,
+    cx: &App,
+) -> impl IntoElement {
+    let current = controller.read(cx).filter_resolution;
+    let t = |k: &str| rust_i18n::t!(k).to_string();
+
+    let options: Vec<(Option<ResolutionBand>, String)> = vec![
+        (None, t("workspace.filter_all_resolutions")),
+        (Some(ResolutionBand::OneK), t("workspace.resolution_1k")),
+        (Some(ResolutionBand::TwoK), t("workspace.resolution_2k")),
+        (Some(ResolutionBand::FourK), t("workspace.resolution_4k")),
+    ];
+    let label = match current {
+        Some(band) => band_token(band).to_string(),
+        None => t("workspace.filter_resolution"),
+    };
+
+    Button::new("filter-resolution")
+        .ghost()
+        .xsmall()
+        .icon(IconName::ResizeCorner)
+        .label(label)
+        .selected(current.is_some())
+        .dropdown_menu_with_anchor(Anchor::TopLeft, {
+            let controller = controller.clone();
+            move |menu, _, _| {
+                let mut menu = menu.min_w(px(180.));
+                for (value, option_label) in &options {
+                    let checked = *value == current;
+                    let value = *value;
+                    let controller = controller.clone();
+                    menu = menu.item(
+                        PopupMenuItem::new(option_label.clone())
+                            .checked(checked)
+                            .on_click(move |_, _, cx| {
+                                controller.update(cx, |ctl, cx| {
+                                    // A band is its own filter: it neither sets
+                                    // nor clears the two shape filters.
+                                    ctl.set_filter_resolution(value);
+                                    cx.notify();
+                                });
+                            }),
+                    );
                 }
                 menu
             }

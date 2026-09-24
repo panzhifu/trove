@@ -527,20 +527,45 @@ impl Library {
         let prof = std::env::var_os("TROVE_PROFILE_QUERY").is_some();
         let t0 = std::time::Instant::now();
         let conn = self.store.conn();
-        if text.trim().is_empty() {
-            return Ok(crate::model::Page::new(0, Vec::new()));
+        // The same grammar the desktop box speaks, so `trove search` and the
+        // grid agree: qualifiers filter, terms rank.
+        let expr = crate::search::expression::parse(text).into_expression();
+        let has_terms = expr.groups.iter().any(|g| !g.atoms.is_empty());
+        let mut q = q.clone();
+        if !expr.filters.is_empty() {
+            q.conditions = crate::model::QueryCondition::fold(
+                std::mem::take(&mut q.conditions)
+                    .into_iter()
+                    .chain(expr.filters.iter().cloned())
+                    .collect(),
+            );
+        }
+        if !has_terms {
+            // Nothing to rank. Qualifiers alone are a filtered listing, so
+            // they still answer; a box holding only syntax characters has
+            // neither, which is the empty answer the old splitter gave for an
+            // empty box and stays the safe one.
+            if q.conditions.is_empty() {
+                return Ok(crate::model::Page::new(0, Vec::new()));
+            }
+            return assets::query(conn, &q);
         }
         // Pending outbox rows flush before the lookup, so a just-committed
         // mutation is visible to the same search.
         self.drain_search_queue()?;
         let t_drain = t0.elapsed();
-        let candidates = self.text_index.search(text, crate::search::CANDIDATE_CAP)?;
+        // The same pool sizing the grid uses: a query that is about to be
+        // filtered down is gathered wider, because the intersection below runs
+        // *after* the cap and can otherwise drop a match on the floor.
+        let (candidates, ran_out) =
+            self.text_index
+                .pool_for(text, &expr, None, q.rejects_rows())?;
         let t_index = t0.elapsed();
         // Free text is entirely the index's business; `q` only carries the
         // structural filters, so it goes straight into the SQL intersection.
-        let (total, ids) = assets::rank_intersect(conn, &candidates, q)?;
+        let (total, ids) = assets::rank_intersect(conn, &candidates, &q)?;
         let t_rank = t0.elapsed();
-        let page = assets::page_assets(&ids, q, conn)?;
+        let page = assets::page_assets(&ids, &q, conn)?;
         let t_page = t0.elapsed();
         // The whole query against the slow-query threshold; the drain inside
         // it warns separately through the outbox's own slow-drain log.
@@ -557,7 +582,11 @@ impl Library {
                 ms(t_page - t_rank),
             );
         }
-        Ok(crate::model::Page::new(total, page))
+        let mut result = crate::model::Page::new(total, page);
+        // The pool ran out, so `total` is a floor: the library holds at least
+        // this many matches, possibly more the caller never saw.
+        result.truncated = ran_out;
+        Ok(result)
     }
 
     // -- AI embeddings ---------------------------------------------------------
@@ -2313,6 +2342,55 @@ mod tests {
         )
         .unwrap();
         assert_eq!(trashed.items.len(), 1);
+    }
+
+    #[test]
+    fn search_assets_speaks_the_search_box_grammar() {
+        // The CLI and the grid must agree, so this exercises the same grammar
+        // through the facade `trove search` uses.
+        let (lib, root) = temp_library("grammar");
+        let png = write_source(&root, "photo.png", PNG_1X1);
+        let mp4 = write_source(&root, "reel.mp4", b"not really a video");
+        lib.import_into_store(&[png], None).unwrap();
+        lib.import_into_store(&[mp4], None).unwrap();
+        for asset in assets::query(lib.store().conn(), &AssetQuery::default())
+            .unwrap()
+            .items
+        {
+            assets::update(
+                lib.store().conn(),
+                asset.id,
+                &crate::model::AssetPatch {
+                    title: Some(Some("sunset frame".into())),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        }
+        lib.rebuild_text_index().unwrap();
+
+        let total = |query: &str| {
+            lib.search_assets(query, &AssetQuery::default())
+                .unwrap()
+                .total
+        };
+        let ids = |query: &str| {
+            let page = lib.search_assets(query, &AssetQuery::default()).unwrap();
+            let mut names: Vec<String> = page.items.iter().map(|a| a.file_name.clone()).collect();
+            names.sort();
+            names
+        };
+
+        // Both titles match; the ranking has nothing to narrow.
+        assert_eq!(total("sunset"), 2);
+        // A qualifier narrows the ranked set.
+        assert_eq!(ids("sunset ext:png"), vec!["photo.png"]);
+        assert_eq!(ids("sunset -kind:video"), vec!["photo.png"]);
+        // A qualifier alone is still an answer: the filtered listing.
+        assert_eq!(ids("ext:mp4"), vec!["reel.mp4"]);
+        // A box of pure syntax matches nothing rather than everything.
+        assert_eq!(total("\""), 0);
+        assert_eq!(total("--"), 0);
     }
 
     #[test]

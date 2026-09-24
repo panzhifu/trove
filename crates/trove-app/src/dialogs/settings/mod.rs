@@ -52,6 +52,26 @@ pub(super) use trove_core::config::{AppConfig, Appearance};
 pub(super) use trove_core::keybindings;
 pub(super) use trove_core::store::stats::LibraryStats;
 
+/// A boolean setting that reads and writes the on-disk config.
+///
+/// Shared by every page with a switch, because the write side is the part that
+/// is easy to get half-done: saving without `refresh_windows` leaves an open
+/// preview showing the old value until it is reopened.
+pub(super) fn config_switch(
+    read: fn(&AppConfig) -> bool,
+    write: impl Fn(&mut AppConfig, bool) + 'static,
+) -> SettingField<bool> {
+    SettingField::switch(
+        move |_cx| read(&AppConfig::load()),
+        move |value, cx| {
+            let mut config = AppConfig::load();
+            write(&mut config, value);
+            let _ = config.save();
+            cx.refresh_windows();
+        },
+    )
+}
+
 /// The AI vendors Trove can talk to, as `(stored id, display name)` pairs in
 /// the shape [`SettingField::dropdown`] takes. Shared by every settings page
 /// that configures an endpoint (ai, search) so the option lists cannot drift.

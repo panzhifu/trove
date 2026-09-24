@@ -523,6 +523,21 @@ impl Render for InspectorPanel {
             .when_some(asset.duration_ms, |this, ms| {
                 this.child(property_row(cx, "inspector.duration", format_duration(ms)))
             })
+            // Audio tags lofty mined at import. Absent for anything that
+            // carries no such tag, so a photo or a font does not show two
+            // empty rows.
+            .when_some(asset.facts.media.artist.clone(), |this, artist| {
+                this.child(property_row(cx, "inspector.artist", artist))
+            })
+            .when_some(asset.facts.media.album.clone(), |this, album| {
+                this.child(property_row(cx, "inspector.album", album))
+            })
+            // One line, not four: a media inspector reads as `48 kHz · 2 ch ·
+            // 160 kbps`, and each part is optional, so assembling beats
+            // showing three rows of dashes for a file that carries two.
+            .when_some(audio_format_line(&asset.facts.audio), |this, line| {
+                this.child(property_row(cx, "inspector.audio_format", line))
+            })
             .child(property_row(cx, "inspector.dimensions", dims))
             .child(property_row(cx, "inspector.added", added))
             .child(property_row(cx, "inspector.content_hash", hash))
@@ -1043,6 +1058,29 @@ fn format_duration(ms: u64) -> String {
     }
 }
 
+/// The technical line for an audio asset, from whichever properties lofty
+/// resolved at import. `None` when the file carried none, so the row is
+/// absent rather than a lone separator.
+fn audio_format_line(audio: &trove_core::model::AudioFacts) -> Option<String> {
+    let mut parts: Vec<String> = Vec::with_capacity(4);
+    if let Some(hz) = audio.sample_rate {
+        // 44100 reads as "44.1 kHz", 48000 as "48 kHz": trim the trailing zero
+        // rather than showing "44.10 kHz".
+        let khz = hz as f32 / 1000.0;
+        parts.push(format!("{} kHz", (khz * 10.0).round() / 10.0));
+    }
+    if let Some(ch) = audio.channels {
+        parts.push(format!("{ch} ch"));
+    }
+    if let Some(depth) = audio.bit_depth {
+        parts.push(format!("{depth} bit"));
+    }
+    if let Some(kbps) = audio.bitrate {
+        parts.push(format!("{kbps} kbps"));
+    }
+    (!parts.is_empty()).then(|| parts.join(" · "))
+}
+
 fn property_row(cx: &Context<impl Render>, key: &'static str, value: String) -> Div {
     h_flex()
         .w_full()
@@ -1101,4 +1139,35 @@ fn prompt_relink(controller: &Entity<LibraryController>, asset_id: Uuid, cx: &mu
         }
     })
     .detach();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::audio_format_line;
+    use trove_core::model::AudioFacts;
+
+    /// The row is assembled from whatever exists — and a file with nothing
+    /// resolves to no row rather than an empty separator.
+    #[test]
+    fn audio_format_line_joins_what_the_file_carries() {
+        assert_eq!(
+            audio_format_line(&AudioFacts {
+                sample_rate: Some(48000),
+                channels: Some(2),
+                bit_depth: None,
+                bitrate: Some(160),
+            })
+            .as_deref(),
+            Some("48 kHz · 2 ch · 160 kbps")
+        );
+        assert_eq!(
+            audio_format_line(&AudioFacts {
+                sample_rate: Some(44100),
+                ..Default::default()
+            })
+            .as_deref(),
+            Some("44.1 kHz")
+        );
+        assert_eq!(audio_format_line(&AudioFacts::default()), None);
+    }
 }

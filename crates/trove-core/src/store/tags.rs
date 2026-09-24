@@ -169,7 +169,11 @@ pub fn count_assets(conn: &Connection, tag_id: Uuid) -> Result<u64> {
         .join(",");
     Ok(rows::query_count(
         conn,
-        &format!("SELECT COUNT(DISTINCT asset_id) FROM asset_tag WHERE tag_id IN ({list})"),
+        &format!(
+            "SELECT COUNT(DISTINCT at.asset_id) FROM asset_tag at \
+             WHERE at.tag_id IN ({list}) AND {}",
+            super::sequences::hidden_beside("at.asset_id")
+        ),
         vec![],
     )? as u64)
 }
@@ -186,17 +190,26 @@ pub fn count_assets(conn: &Connection, tag_id: Uuid) -> Result<u64> {
 /// Same semantics as [`count_assets`], trashed assets included: a tag with no
 /// assets (or no subtree, i.e. one whose row is gone) is simply absent from the
 /// map, so callers should default missing ids to 0.
+///
+/// Both counts skip a sequence's hidden members, which is the one place they
+/// part with "everything tagged": the sidebar number has to be the count of the
+/// cards the tag's listing will actually show, or it disagrees with the view it
+/// is a label for.
 pub fn counts_by_tag(conn: &Connection) -> Result<std::collections::HashMap<Uuid, u64>> {
     let counts: Vec<(Uuid, u64)> = rows::query_map(
         conn,
-        "WITH RECURSIVE sub(root, id) AS ( \
+        &format!(
+            "WITH RECURSIVE sub(root, id) AS ( \
              SELECT id, id FROM tags \
              UNION ALL \
              SELECT s.root, t.id FROM tags t JOIN sub s ON t.parent_id = s.id \
-         ) \
-         SELECT sub.root, COUNT(DISTINCT at.asset_id) \
-         FROM sub JOIN asset_tag at ON at.tag_id = sub.id \
-         GROUP BY sub.root",
+             ) \
+             SELECT sub.root, COUNT(DISTINCT at.asset_id) \
+             FROM sub JOIN asset_tag at ON at.tag_id = sub.id \
+             WHERE {} \
+             GROUP BY sub.root",
+            super::sequences::hidden_beside("at.asset_id")
+        ),
         vec![],
         |row| Ok((req_uuid(row, 0)?, rows::int(row, 1)? as u64)),
     )?;

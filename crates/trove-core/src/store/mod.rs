@@ -3,12 +3,13 @@
 pub mod assets;
 pub mod batch;
 pub mod browse;
-pub use browse::BrowseContext;
+pub use browse::{BrowseContext, BrowseSession};
 pub mod collections;
 pub mod embeddings;
 pub mod model_look;
 pub(crate) mod rows;
 pub mod schema;
+pub mod sequences;
 pub mod smart;
 pub mod smart_collections;
 pub mod stats;
@@ -62,6 +63,7 @@ impl Store {
         };
         store.enable_foreign_keys()?;
         store.migrate()?;
+        store.ensure_statistics()?;
         Ok(store)
     }
 
@@ -79,6 +81,62 @@ impl Store {
     fn enable_foreign_keys(&self) -> Result<()> {
         let conn = self.conn();
         rows::execute(conn, "PRAGMA foreign_keys = ON", vec![])?;
+        Ok(())
+    }
+
+    /// Make sure the planner has statistics that describe this library.
+    ///
+    /// This is not a tuning nicety: without `sqlite_stat1`, SQLite prices an
+    /// index on a nullable column from a default guess, and the guess that
+    /// matters is `trashed_at IS NULL` — a term every live listing carries and
+    /// which matches every row in the library. Unpriced, it looks like a good
+    /// index to drive off, and a browse then sorts the whole live set into a
+    /// temp B-tree *per page* (100k assets, a 200-row page at offset 60k:
+    /// 188 ms with no statistics, 1.9 ms with them and the ordered index from
+    /// `schema::UPGRADE_17_TO_18`).
+    ///
+    /// `PRAGMA optimize` does not do this job: it samples, and a sample of 2000
+    /// rows reports `trashed_at` as ~2001 rows per value — still selective,
+    /// still the wrong plan. A full `ANALYZE` counts the column honestly, and
+    /// costs 136 ms at 100k rows.
+    ///
+    /// So: analyze when there are no statistics at all, or when the library has
+    /// grown a fifth past the size the statistics describe. The drift test
+    /// reads the row count `ANALYZE` saw out of `sqlite_stat1` itself, so
+    /// nothing new has to be tracked; the `COUNT(*)` it compares against is a
+    /// covering-index walk (~1.5 ms at 100k) and this runs once per open.
+    ///
+    /// A library that only ever *shrinks* keeps statistics that over-count,
+    /// which is the safe direction: an index priced as bigger than it is gets
+    /// avoided, and the ordered scans stay in play.
+    pub fn ensure_statistics(&self) -> Result<()> {
+        let conn = self.conn();
+        let analysed_at: Option<i64> = if rows::query_count(
+            conn,
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'sqlite_stat1'",
+            vec![],
+        )? > 0
+        {
+            // Each stat is `"<rows> <rows-per-value> …"` for the whole table;
+            // the first number is the row count `ANALYZE` saw.
+            rows::query_one(
+                conn,
+                "SELECT CAST(SUBSTR(stat, 1, INSTR(stat, ' ') - 1) AS INTEGER) \
+                 FROM sqlite_stat1 WHERE tbl = 'assets' LIMIT 1",
+                vec![],
+                |row| rows::int(row, 0),
+            )?
+        } else {
+            None
+        };
+        let now = rows::query_count(conn, "SELECT COUNT(*) FROM assets", vec![])?;
+        let stale = match analysed_at {
+            None => true,
+            Some(recorded) => now > recorded + recorded / 5,
+        };
+        if stale {
+            schema::analyze_statistics(conn)?;
+        }
         Ok(())
     }
 
@@ -534,6 +592,126 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// v17 → v18 is DDL plus statistics, and both halves are load-bearing: the
+    /// ordered indexes exist so a live page can be read in order, and
+    /// `ANALYZE` is what lets the planner *choose* them. This checks a library
+    /// that has neither walks into both, and that the step is replayable.
+    #[test]
+    fn a_v17_library_gains_the_ordered_indexes_and_their_statistics() {
+        let dir = std::env::temp_dir().join(format!("trove-schema-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("library.db");
+        let live = [
+            "idx_assets_live_created",
+            "idx_assets_live_name",
+            "idx_assets_live_size",
+            "idx_assets_live_rating",
+            "idx_assets_live_kind_created",
+        ];
+
+        {
+            let store = Store::open(&path).unwrap();
+            // Back the library up to the v17 shape: no ordered indexes, no
+            // statistics, version on record one behind.
+            let mut drop_sql = String::new();
+            for name in live {
+                drop_sql.push_str(&format!("DROP INDEX IF EXISTS {name};\n"));
+            }
+            drop_sql.push_str("DROP TABLE IF EXISTS sqlite_stat1;\nPRAGMA user_version = 17;");
+            store.conn().execute_batch(&drop_sql).unwrap();
+        }
+
+        let store = Store::open(&path).unwrap();
+        assert_eq!(store.user_version().unwrap(), schema::SCHEMA_VERSION);
+        for name in live {
+            let kept: String = store
+                .conn()
+                .query_row(
+                    "SELECT name FROM sqlite_master WHERE type = 'index' AND name = ?1",
+                    rusqlite::params![name],
+                    |row| row.get(0),
+                )
+                .unwrap_or_default();
+            assert_eq!(kept, name, "{name} was not created by the upgrade");
+        }
+        let stats: i64 = store
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'sqlite_stat1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(stats > 0, "the library opened without planner statistics");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The plan is the product here, so it is what gets asserted.
+    ///
+    /// A live listing sorted by import time must be read out of the ordered
+    /// index — no temp B-tree, because that is a sort of the whole live set for
+    /// every page the grid appends. Measured on a 100k library: 188 ms for a
+    /// 200-row page when the planner drives `idx_assets_trashed` and sorts,
+    /// 1.9 ms when it walks `idx_assets_live_created` and stops at the window.
+    ///
+    /// The statistics are part of the assertion, not setup: without them SQLite
+    /// prices `trashed_at IS NULL` off a default guess and picks the
+    /// whole-library index instead, which is the 188 ms plan.
+    #[test]
+    fn a_live_page_is_read_in_index_order() {
+        let store = Store::in_memory().unwrap();
+        for i in 0..2000 {
+            let asset = sample_asset(&format!("a{i:05}.png"), AssetKind::Image);
+            assets::insert(store.conn(), &asset).unwrap();
+        }
+        store.ensure_statistics().unwrap();
+
+        let plan_of = |sql: &str| -> String {
+            store
+                .conn()
+                .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                .and_then(|mut stmt| {
+                    let rows = stmt.query_map([], |r| r.get::<_, String>(3))?;
+                    Ok(rows.filter_map(|r| r.ok()).collect::<Vec<_>>().join("; "))
+                })
+                .unwrap()
+        };
+
+        for (sql, name) in [
+            (
+                "SELECT id FROM assets WHERE trashed_at IS NULL \
+                 ORDER BY created_at DESC, id ASC LIMIT 200 OFFSET 1000",
+                "idx_assets_live_created",
+            ),
+            (
+                "SELECT id FROM assets WHERE trashed_at IS NULL \
+                 ORDER BY file_name COLLATE NOCASE DESC, id ASC LIMIT 200 OFFSET 1000",
+                "idx_assets_live_name",
+            ),
+            (
+                "SELECT id FROM assets WHERE trashed_at IS NULL \
+                 ORDER BY size_bytes DESC, id ASC LIMIT 200 OFFSET 1000",
+                "idx_assets_live_size",
+            ),
+            (
+                "SELECT id FROM assets WHERE trashed_at IS NULL \
+                 ORDER BY rating DESC, id ASC LIMIT 200 OFFSET 1000",
+                "idx_assets_live_rating",
+            ),
+            (
+                "SELECT id FROM assets WHERE kind = 'image' AND trashed_at IS NULL \
+                 ORDER BY created_at DESC, id ASC LIMIT 200 OFFSET 1000",
+                "idx_assets_live_kind_created",
+            ),
+        ] {
+            let plan = plan_of(sql);
+            assert!(
+                plan.contains(name) && !plan.contains("TEMP B-TREE"),
+                "{name} should serve this listing, got {plan}"
+            );
+        }
+    }
+
     /// A folder's look is stored with the folder and read back with it, for
     /// both container kinds.
     #[test]
@@ -936,7 +1114,7 @@ mod tests {
     /// library, measured: 21 ms for 97 candidates and 36 ms for 2000, against
     /// 0.1 ms and 5 ms with the id list driving).
     #[test]
-    fn ranked_where_clause_leaves_the_id_list_driving() {
+    fn ranked_intersection_never_drives_off_a_filter_index() {
         let store = Store::in_memory().unwrap();
         let q = AssetQuery {
             kind: Some(AssetKind::Image),
@@ -950,22 +1128,30 @@ mod tests {
 
         // The modes differ only in the index-suppressing prefixes, so both
         // clauses select the same rows with the same arguments.
+        // The sequence clause rides on the live branch of both modes, with no
+        // prefix of its own: it is a probe against a UNIQUE index, not a table
+        // the planner could choose to drive from.
+        let hidden = " AND NOT EXISTS (SELECT 1 FROM asset_sequence_frames f \
+                      WHERE f.asset_id = assets.id AND f.position > 0)";
         assert_eq!(
             ranked,
-            "WHERE +kind = ?1 AND +is_favorite = ?2 AND +trashed_at IS NULL"
+            format!("WHERE +kind = ?1 AND +is_favorite = ?2 AND +trashed_at IS NULL{hidden}")
         );
         assert_eq!(
             listing,
-            "WHERE kind = ?1 AND is_favorite = ?2 AND trashed_at IS NULL"
+            format!("WHERE kind = ?1 AND is_favorite = ?2 AND trashed_at IS NULL{hidden}")
         );
         assert_eq!(args.len(), listing_args.len());
 
-        /// The plan for `SELECT id FROM assets <clause> AND id IN (?, …)`.
-        /// `params` is the statement's total placeholder count: the clause's
-        /// own arguments plus the ids.
-        fn plan(store: &Store, clause: &str, ids: usize, params: usize) -> String {
-            let marks = std::iter::repeat_n("?", ids).collect::<Vec<_>>().join(",");
-            let sql = format!("SELECT id FROM assets {clause} AND id IN ({marks})");
+        /// The plan for the statement `rank_intersect` runs: one clause, one
+        /// JSON parameter after the clause's own arguments. Note that the text
+        /// carries no candidate count — that is the property the shape exists
+        /// to get.
+        fn plan(store: &Store, clause: &str, params: usize) -> String {
+            let sql = format!(
+                "SELECT id FROM assets {clause} AND id IN (SELECT value FROM json_each(?{}))",
+                params + 1
+            );
             let rows: Vec<String> = store
                 .conn()
                 .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
@@ -973,7 +1159,7 @@ mod tests {
                     let rows = stmt.query_map(
                         rusqlite::params_from_iter(std::iter::repeat_n(
                             rusqlite::types::Value::Null,
-                            params,
+                            params + 1,
                         )),
                         |r| r.get::<_, String>(3),
                     )?;
@@ -997,23 +1183,45 @@ mod tests {
             .find(|idx| plan.contains(idx))
         }
 
-        // The listing clause is *supposed* to drive off a filter index, and on
-        // this schema it does — which is what makes the assertion below a real
-        // one rather than a coincidence. The candidate count has to be in the
-        // hundreds: SQLite prices an `id IN (…)` probe by the length of the
-        // list, so a two-entry list wins on price even when it loses on work.
-        let ids = 300;
-        let listing_plan = plan(&store, &listing, ids, listing_args.len() + ids);
-        assert!(
-            drives_a_filter_index(&listing_plan).is_some(),
-            "expected the listing clause to drive off a filter index, got {listing_plan}"
-        );
-
-        let ranked_plan = plan(&store, &ranked, ids, args.len() + ids);
+        // The intersection probes the primary key per candidate and never a
+        // filter index, in either mode. `Rejecting` is what makes that a
+        // guarantee rather than a coincidence of the statistics on the table
+        // right now: the prefixes take every filter index out of the running
+        // before the planner gets to price one, which is the difference between
+        // N index probes and a full scan of a library where `trashed_at IS NULL`
+        // matches everything.
+        let ranked_plan = plan(&store, &ranked, args.len());
         assert_eq!(
             drives_a_filter_index(&ranked_plan),
             None,
             "a filter index drives the ranked intersection: {ranked_plan}"
+        );
+        assert!(
+            ranked_plan.contains("sqlite_autoindex_assets_1"),
+            "the intersection should probe the primary key: {ranked_plan}"
+        );
+        // The listing clause is the one that *should* drive off a filter index
+        // — it is the listing, so `kind = 'image'` is what it is about. Stated
+        // as a plain `id IN (…)` (the shape the listing never uses, but the one
+        // the modes were built to distinguish) it does.
+        let marks = std::iter::repeat_n("?", 300).collect::<Vec<_>>().join(",");
+        let listing_plan = {
+            let sql = format!("SELECT id FROM assets {listing} AND id IN ({marks})");
+            let args = std::iter::repeat_n(rusqlite::types::Value::Null, listing_args.len() + 300);
+            store
+                .conn()
+                .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                .and_then(|mut stmt| {
+                    let rows = stmt
+                        .query_map(rusqlite::params_from_iter(args), |r| r.get::<_, String>(3))?;
+                    Ok::<Vec<String>, rusqlite::Error>(rows.filter_map(|r| r.ok()).collect())
+                })
+                .unwrap()
+                .join("; ")
+        };
+        assert!(
+            drives_a_filter_index(&listing_plan).is_some(),
+            "expected the listing clause to drive off a filter index, got {listing_plan}"
         );
 
         // Every condition kind in one clause: the indexable comparisons get
@@ -1046,11 +1254,62 @@ mod tests {
                 "missing {expected:?} in {clause:?}"
             );
         }
-        let mixed_plan = plan(&store, &clause, ids, mixed_args.len() + ids);
+        let mixed_plan = plan(&store, &clause, mixed_args.len());
         assert_eq!(
             drives_a_filter_index(&mixed_plan),
             None,
             "a filter index drives the mixed ranked intersection: {mixed_plan}"
+        );
+    }
+
+    /// What the intersection owes the search path: the survivors, in rank
+    /// order, with the ids that are no longer rows simply gone.
+    ///
+    /// Worth its own test because the statement shape changed (candidate ids
+    /// now arrive as one JSON array rather than one placeholder each) and the
+    /// order is the answer: the grid shows a search sorted by relevance, so a
+    /// shape that came back in table order would look right and rank nothing.
+    #[test]
+    fn the_ranked_intersection_keeps_rank_and_drops_gone_rows() {
+        let store = Store::in_memory().unwrap();
+        let conn = store.conn();
+        let live: Vec<Asset> = (0..500)
+            .map(|i| sample_asset(&format!("s{i:03}.png"), AssetKind::Image))
+            .collect();
+        for asset in &live {
+            assets::insert(conn, asset).unwrap();
+        }
+        let q = AssetQuery {
+            kind: Some(AssetKind::Image),
+            ..Default::default()
+        };
+
+        // A pool twice the size of the library, alternating a live id with one
+        // that has no row (deleted between the ranking and the narrowing).
+        let mut ranked: Vec<Uuid> = Vec::new();
+        for asset in &live {
+            ranked.push(asset.id);
+            ranked.push(Uuid::new_v4());
+        }
+        let (total, kept) = assets::rank_intersect(conn, &ranked, &q).unwrap();
+        assert_eq!(total as usize, live.len());
+        assert_eq!(
+            kept,
+            live.iter().map(|a| a.id).collect::<Vec<_>>(),
+            "the survivors came back out of rank order"
+        );
+
+        // An empty pool answers empty without touching the database, and a pool
+        // the filters reject entirely is a zero, not an error.
+        assert_eq!(assets::rank_intersect(conn, &[], &q).unwrap().0, 0);
+        let favorites = AssetQuery {
+            kind: Some(AssetKind::Image),
+            is_favorite: Some(true),
+            ..Default::default()
+        };
+        assert_eq!(
+            assets::rank_intersect(conn, &ranked, &favorites).unwrap().0,
+            0
         );
     }
 

@@ -230,8 +230,11 @@ pub fn remove_asset(conn: &Connection, collection_id: Uuid, asset_id: Uuid) -> R
 pub fn asset_ids(conn: &Connection, collection_id: Uuid) -> Result<Vec<Uuid>> {
     rows::query_map(
         conn,
-        "SELECT asset_id FROM asset_collection
-         WHERE collection_id = ?1 ORDER BY position ASC",
+        &format!(
+            "SELECT ac.asset_id FROM asset_collection ac \
+             WHERE ac.collection_id = ?1 AND {} ORDER BY ac.position ASC",
+            super::sequences::hidden_beside("ac.asset_id")
+        ),
         vec![rows::uuid(collection_id).into()],
         |row| req_uuid(row, 0),
     )
@@ -241,7 +244,11 @@ pub fn asset_ids(conn: &Connection, collection_id: Uuid) -> Result<Vec<Uuid>> {
 pub fn count_assets(conn: &Connection, collection_id: Uuid) -> Result<u64> {
     Ok(rows::query_count(
         conn,
-        "SELECT COUNT(*) FROM asset_collection WHERE collection_id = ?1",
+        &format!(
+            "SELECT COUNT(*) FROM asset_collection ac \
+             WHERE ac.collection_id = ?1 AND {}",
+            super::sequences::hidden_beside("ac.asset_id")
+        ),
         vec![rows::uuid(collection_id).into()],
     )? as u64)
 }

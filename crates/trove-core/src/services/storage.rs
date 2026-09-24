@@ -48,6 +48,11 @@ pub struct StorageReport {
     pub media: DirUsage,
     /// Thumbnails under the cache root — deletable, rebuildable.
     pub thumbs: DirUsage,
+    /// Waveform envelopes under the cache root — deletable, rebuildable (a
+    /// rebuild costs one ffmpeg pass per audio file that has no cover art).
+    pub waves: DirUsage,
+    /// Video contact sheets, built when a model is shown the clip.
+    pub sheets: DirUsage,
     /// The full-text index under the cache root — deletable, rebuildable.
     pub search_index: DirUsage,
     /// Log files under the state root.
@@ -66,9 +71,12 @@ impl StorageReport {
         self.library_db.plus(self.media)
     }
 
-    /// What can be deleted and regenerated: the cache root's two tenants.
+    /// What can be deleted and regenerated: the cache root's tenants.
     pub fn cache(&self) -> DirUsage {
-        self.thumbs.plus(self.search_index)
+        self.thumbs
+            .plus(self.search_index)
+            .plus(self.waves)
+            .plus(self.sheets)
     }
 }
 
@@ -84,6 +92,8 @@ pub fn report(library_data_root: &Path, library_cache_root: &Path) -> StorageRep
     let backups = dir_usage(&library_data_root.join("backups"));
     let media = dir_usage(&library_data_root.join("media"));
     let thumbs = dir_usage(&library_cache_root.join("thumbs"));
+    let waves = dir_usage(&library_cache_root.join("waveforms"));
+    let sheets = dir_usage(&library_cache_root.join("contact-sheet"));
     let search_index = dir_usage(&library_cache_root.join("search_index"));
     let logs = dir_usage(&paths::logs_dir());
     let incoming = dir_usage(&paths::incoming_dir());
@@ -93,6 +103,8 @@ pub fn report(library_data_root: &Path, library_cache_root: &Path) -> StorageRep
         .plus(backups)
         .plus(media)
         .plus(thumbs)
+        .plus(waves)
+        .plus(sheets)
         .plus(search_index)
         .plus(logs)
         .plus(incoming);
@@ -103,6 +115,8 @@ pub fn report(library_data_root: &Path, library_cache_root: &Path) -> StorageRep
         backups,
         media,
         thumbs,
+        waves,
+        sheets,
         search_index,
         logs,
         incoming,
@@ -198,7 +212,7 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
-    /// The parts add up to the whole, and the cache is exactly its two
+    /// The parts add up to the whole, and the cache is exactly its four
     /// tenants — the number the settings page offers to free.
     #[test]
     fn the_parts_add_up_to_the_total() {
@@ -211,6 +225,11 @@ mod tests {
                 bytes: 16,
                 files: 4,
             },
+            waves: DirUsage {
+                bytes: 20,
+                files: 5,
+            },
+            sheets: DirUsage { bytes: 9, files: 3 },
             search_index: DirUsage {
                 bytes: 32,
                 files: 5,
@@ -224,8 +243,8 @@ mod tests {
                 files: 7,
             },
             total: DirUsage {
-                bytes: 255,
-                files: 29,
+                bytes: 284,
+                files: 37,
             },
         };
         assert_eq!(
@@ -238,10 +257,10 @@ mod tests {
         assert_eq!(
             report.cache(),
             DirUsage {
-                bytes: 48,
-                files: 9
+                bytes: 77,
+                files: 17
             }
         );
-        assert_eq!(report.total.bytes, 255);
+        assert_eq!(report.total.bytes, 284);
     }
 }

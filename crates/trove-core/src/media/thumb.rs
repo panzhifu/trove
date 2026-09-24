@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 
 use image::GenericImageView;
 
+use crate::media::waveform;
 use crate::model::{Asset, AssetKind, Origin};
 
 /// Longest edge of generated thumbnails, in pixels.
@@ -38,27 +39,43 @@ pub fn ensure(root: &Path, sha: &str, kind: AssetKind, blob_path: &Path) -> Opti
         AssetKind::Video => write_video_thumb(blob_path, &out),
         AssetKind::Font => write_font_card(blob_path, &out),
         AssetKind::Model => write_model_card(blob_path, &out),
+        // An audio file carries no picture of its own, but a tagged one usually
+        // has one inside, and the rest can be recognised by their shape. Neither
+        // is built here — see `write_audio_cover`.
+        AssetKind::Audio => write_audio_cover(root, sha, blob_path, &out),
+        // Text is a family by extension rather than by kind: `.txt` is a
+        // `Document` and `.rs` is `Other`, and both have characters worth
+        // drawing. Everything else keeps its kind icon.
+        _ if crate::media::text::is_text_ext(&blob_ext(blob_path)) => {
+            write_text_card(blob_path, &out)
+        }
         _ => None,
     }
 }
 
+/// The blob a cache entry is derived from: a linked file lives where it was
+/// imported from, a stored one under the library's `media/`.
+pub fn blob_path(data_root: &Path, asset: &Asset) -> Option<PathBuf> {
+    match asset.origin {
+        Origin::Linked => Some(PathBuf::from(asset.facts.source_path.clone()?)),
+        Origin::Stored => Some(data_root.join(asset.rel_path.as_deref()?)),
+    }
+}
+
 /// The cached thumbnail for a whole asset, generated on demand.
-///
-/// The two blob-path rules are `Library::asset_file`'s — a linked file lives
-/// where it was imported from, a stored one under the library's `media/` —
-/// repeated here for the background jobs that hold no `Library`.
 pub fn ensure_for_asset(cache_root: &Path, data_root: &Path, asset: &Asset) -> Option<PathBuf> {
     let sha = asset.content_hash.as_deref()?;
-    let blob = match asset.origin {
-        Origin::Linked => PathBuf::from(asset.facts.source_path.clone()?),
-        Origin::Stored => data_root.join(asset.rel_path.as_deref()?),
-    };
+    let blob = blob_path(data_root, asset)?;
     ensure(cache_root, sha, asset.kind, &blob)
 }
 
 /// Regenerate a thumbnail unconditionally, overwriting any existing file.
 /// Returns the thumbnail path on success, or `None` when the blob is not a
 /// decodable image. Used by maintenance to rebuild a corrupt cache entry.
+///
+/// Unlike [`ensure`], this may pay for work the import path refuses to: an audio
+/// file with no embedded cover gets its envelope decoded to draw the card, which
+/// is one ffmpeg pass. That is what a user-initiated rebuild is for.
 pub fn regenerate(root: &Path, sha: &str, kind: AssetKind, blob_path: &Path) -> Option<PathBuf> {
     let out = abs_path(root, sha);
     match kind {
@@ -66,8 +83,20 @@ pub fn regenerate(root: &Path, sha: &str, kind: AssetKind, blob_path: &Path) -> 
         AssetKind::Video => write_video_thumb(blob_path, &out),
         AssetKind::Font => write_font_card(blob_path, &out),
         AssetKind::Model => write_model_card(blob_path, &out),
+        AssetKind::Audio => rebuild_audio_cover(root, sha, blob_path, &out),
+        _ if crate::media::text::is_text_ext(&blob_ext(blob_path)) => {
+            write_text_card(blob_path, &out)
+        }
         _ => None,
     }
+}
+
+/// Lower-case extension of a blob, without the dot.
+fn blob_ext(path: &Path) -> String {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .unwrap_or_default()
 }
 
 /// How a model thumbnail gets its geometry.
@@ -470,7 +499,11 @@ fn decode_raster(path: &Path) -> Option<image::DynamicImage> {
         .unwrap_or(image::metadata::Orientation::NoTransforms);
     let mut image = image::DynamicImage::from_decoder(decoder).ok()?;
     image.apply_orientation(orientation);
-    Some(image)
+    // Scene-linear buffers (EXR, Radiance HDR) come back as floats, and a float
+    // handed to a JPEG encoder is a near-black square: the display transform is
+    // what makes those files cards at all. Everything already encoded passes
+    // through untouched.
+    Some(crate::media::hdr::tonemap(image, 0.0))
 }
 
 /// Decode a JPEG-XL file through `jxl-oxide` (pure Rust; the `image`
@@ -481,16 +514,25 @@ fn render_jxl(path: &Path) -> Option<image::DynamicImage> {
     image::DynamicImage::from_decoder(decoder).ok()
 }
 
-/// Rasterize an SVG at its intrinsic size, capped at [`THUMB_MAX`].
+/// Rasterize an SVG file at its intrinsic size, capped at [`THUMB_MAX`].
 fn render_svg(path: &Path) -> Option<image::DynamicImage> {
-    let bytes = std::fs::read(path).ok()?;
+    render_svg_data(&std::fs::read(path).ok()?)
+}
+
+/// Rasterize SVG markup.
+///
+/// System fonts are loaded for the job, which is why the text card is drawn
+/// through here rather than with a hand-rolled layout: this is the one place in
+/// the crate that resolves a font family *with* a fallback, so a card of Chinese
+/// text shows characters instead of boxes.
+fn render_svg_data(bytes: &[u8]) -> Option<image::DynamicImage> {
     let mut options = resvg::usvg::Options::default();
     let mut fontdb = resvg::usvg::fontdb::Database::new();
     fontdb.load_system_fonts();
     options.fontdb = std::sync::Arc::new(fontdb);
-    let tree = resvg::usvg::Tree::from_data(&bytes, &options).ok()?;
+    let tree = resvg::usvg::Tree::from_data(bytes, &options).ok()?;
     let size = tree.size();
-    let (w, h) = (size.width().ceil() as f32, size.height().ceil() as f32);
+    let (w, h) = (size.width().ceil(), size.height().ceil());
     if w <= 0.0 || h <= 0.0 {
         return None;
     }
@@ -582,6 +624,172 @@ fn write_thumb(blob_path: &Path, out: &Path) -> Option<PathBuf> {
     write_downscaled(&downscale(&image), out)
 }
 
+/// Landscape size of a waveform card, in pixels.
+const AUDIO_CARD_SIZE: (u32, u32) = (512, 288);
+
+/// Size of a text card, in pixels — the same landscape box, so one family of
+/// derived cards never grows a grid row.
+const TEXT_CARD_SIZE: (u32, u32) = (512, 288);
+
+/// How many lines a text card shows and how wide each may be: enough of a file
+/// to recognise it by its opening, few enough that the type stays legible at
+/// card size.
+const TEXT_CARD_LINES: usize = 11;
+const TEXT_CARD_COLUMNS: usize = 72;
+
+/// How much of the file a card reads. One screenful of characters, not the
+/// megabyte the viewer is allowed.
+const TEXT_CARD_READ_BYTES: usize = 8 * 1024;
+
+/// The card for a text file: the file's own opening lines, set as a page on a
+/// light card.
+///
+/// Drawn through the SVG path rather than a hand-rolled layout because that path
+/// is the one place here that resolves a font family *with* a fallback, which is
+/// what lets a Chinese or Japanese file show characters instead of boxes. `None`
+/// — so the asset keeps its kind icon — for a binary file, or one whose content
+/// is nothing but whitespace.
+fn write_text_card(blob_path: &Path, out: &Path) -> Option<PathBuf> {
+    let content = crate::media::text::read(blob_path, TEXT_CARD_READ_BYTES)?;
+    if content.binary || content.text.chars().all(char::is_whitespace) {
+        return None;
+    }
+    let markup = text_card_svg(&content.text);
+    write_downscaled(&render_svg_data(markup.as_bytes())?, out)
+}
+
+/// The card's markup: a light page carrying the file's first lines in a
+/// monospace stack, so indentation is part of what makes the file recognisable.
+fn text_card_svg(text: &str) -> String {
+    let (w, h) = TEXT_CARD_SIZE;
+    let mut body = String::new();
+    for (i, line) in card_lines(text).iter().enumerate() {
+        let y = 34.0 + i as f32 * 24.0;
+        body.push_str(&format!(
+            "<text x=\"20\" y=\"{y:.0}\" font-family=\"monospace, DejaVu Sans Mono, \
+             Liberation Mono, sans-serif\" font-size=\"15\" fill=\"#202124\">{}</text>",
+            crate::services::xmp::xml_escape(line)
+        ));
+    }
+    format!(
+        "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{w}\" height=\"{h}\">\
+         <rect width=\"{w}\" height=\"{h}\" fill=\"#F7F6F3\"/>{body}</svg>"
+    )
+}
+
+/// The card's lines: CRLF folded, tabs widened into a real indent, each line cut
+/// to [`TEXT_CARD_COLUMNS`] and the whole thing capped at [`TEXT_CARD_LINES`].
+/// Blank lines are kept — the shape of a file is half its blank lines.
+fn card_lines(text: &str) -> Vec<String> {
+    let folded = text.replace("\r\n", "\n").replace('\r', "\n");
+    let mut lines = Vec::new();
+    for raw in folded.split(['\n', '\u{2028}', '\u{2029}']) {
+        lines.push(
+            raw.replace('\t', "    ")
+                .chars()
+                .filter(|c| !c.is_control())
+                .take(TEXT_CARD_COLUMNS)
+                .collect(),
+        );
+        if lines.len() == TEXT_CARD_LINES {
+            break;
+        }
+    }
+    lines
+}
+
+/// The audio card: cover art from the tags, else the file's waveform.
+///
+/// The waveform is only drawn from an envelope that is *already* cached.
+/// Building one costs an ffmpeg pass, and this runs on the import hot path, so
+/// a file with neither a picture nor a cached envelope keeps the kind icon it
+/// always had — until the envelope exists because the file was previewed, or
+/// until a thumbnail rebuild asks for it.
+fn write_audio_cover(root: &Path, sha: &str, blob_path: &Path, out: &Path) -> Option<PathBuf> {
+    if let Some(cover) = embedded_cover(blob_path) {
+        return write_cover(&cover, out);
+    }
+    write_wave_card(&waveform::cached(root, sha)?, out)
+}
+
+/// The same card for a rebuild that is allowed to decode the envelope first.
+fn rebuild_audio_cover(root: &Path, sha: &str, blob_path: &Path, out: &Path) -> Option<PathBuf> {
+    if let Some(cover) = embedded_cover(blob_path) {
+        return write_cover(&cover, out);
+    }
+    write_wave_card(&waveform::load_or_build(root, sha, blob_path)?, out)
+}
+
+/// Draw the envelope as a card.
+fn write_wave_card(peaks: &waveform::Peaks, out: &Path) -> Option<PathBuf> {
+    let (w, h) = AUDIO_CARD_SIZE;
+    let card = waveform::bitmap(peaks, w, h, &waveform::Style::CARD)?;
+    write_downscaled(&image::DynamicImage::ImageRgba8(card), out)
+}
+
+/// Write an embedded picture to the cache, downscaled to fit [`THUMB_MAX`].
+fn write_cover(cover: &image::DynamicImage, out: &Path) -> Option<PathBuf> {
+    let (w, h) = cover.dimensions();
+    if w == 0 || h == 0 {
+        return None;
+    }
+    write_downscaled(&downscale(cover), out)
+}
+
+/// The audio file's embedded picture, preferring a front cover and otherwise
+/// the largest one.
+///
+/// "Largest" rather than "first" because a tag commonly carries more than one
+/// image and the first is frequently the 32×32 file icon ID3 writes by
+/// convention; a card built from that would be a blur. The icon types are
+/// excluded outright.
+///
+/// The probe reads the container from the content before falling back to the
+/// extension, for the same reason `metadata::mine_audio` does: lofty will not
+/// identify an `.oga` by name, and a thumbnail that disagrees with the tag
+/// reader about which files are audio would be a puzzle.
+fn embedded_cover(path: &Path) -> Option<image::DynamicImage> {
+    use lofty::file::TaggedFileExt;
+    use lofty::picture::PictureType;
+    use lofty::probe::Probe;
+
+    let tagged = Probe::open(path)
+        .ok()?
+        .guess_file_type()
+        .ok()?
+        .read()
+        .ok()?;
+
+    let mut best: Option<(u64, usize, &[u8])> = None;
+    for tag in tagged.tags() {
+        for pic in tag.pictures() {
+            // ID3 APIC types 1 and 2: a 32×32 file icon and "other file icon".
+            // Neither is cover art, and both are smaller than a real one.
+            if matches!(pic.pic_type(), PictureType::Icon | PictureType::OtherIcon) {
+                continue;
+            }
+            let data = pic.data();
+            if data.is_empty() {
+                continue;
+            }
+            // A front cover always wins; among the rest the biggest bytes win,
+            // which stands in for resolution without decoding every picture.
+            let rank = u64::from(pic.pic_type() == PictureType::CoverFront);
+            let better = match best {
+                None => true,
+                Some((best_rank, best_len, _)) => {
+                    rank > best_rank || (rank == best_rank && data.len() > best_len)
+                }
+            };
+            if better {
+                best = Some((rank, data.len(), data));
+            }
+        }
+    }
+    let (_, _, data) = best?;
+    image::load_from_memory(data).ok()
+}
+
 /// Decode and develop a camera-RAW file with rawler: demosaic, white
 /// balance, color calibration and sRGB gamma in one pass, then clamp into
 /// an 8-bit RGB(A) image (EXIF orientation applied).
@@ -649,6 +857,298 @@ fn apply_orientation(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- audio cover-art fixtures ------------------------------------------
+    //
+    // Built from bytes so the test ships no binary asset. The ID3v2.3 frame IDs
+    // must be four characters (`TIT2`, not the v2.2 `TT2`): a three-character ID
+    // shifts every later byte by one, and lofty then reads a text frame's
+    // *content* as a header and reports "Found invalid encoding" — nothing about
+    // the real mistake. `APIC` is four characters in both versions, so a
+    // cover-only tag hides the problem entirely.
+
+    /// A solid-color PNG, DEFLATE'd with stored blocks (no compressor dep).
+    fn png_fixture(w: u32, h: u32, rgb: [u8; 3]) -> Vec<u8> {
+        fn chunk(t: &[u8], d: &[u8]) -> Vec<u8> {
+            let mut c = t.to_vec();
+            c.extend_from_slice(d);
+            let mut out = (d.len() as u32).to_be_bytes().to_vec();
+            out.extend_from_slice(&c);
+            out.extend_from_slice(&crc32(&c).to_be_bytes());
+            out
+        }
+        let mut raw = Vec::new();
+        for _ in 0..h {
+            raw.push(0u8);
+            raw.extend_from_slice(&vec![rgb; w as usize].concat());
+        }
+        let mut ihdr = Vec::new();
+        ihdr.extend_from_slice(&w.to_be_bytes());
+        ihdr.extend_from_slice(&h.to_be_bytes());
+        ihdr.extend_from_slice(&[8, 2, 0, 0, 0]);
+        let mut out = b"\x89PNG\r\n\x1a\n".to_vec();
+        out.extend_from_slice(&chunk(b"IHDR", &ihdr));
+        out.extend_from_slice(&chunk(b"IDAT", &stored_deflate(&raw)));
+        out.extend_from_slice(&chunk(b"IEND", &[]));
+        out
+    }
+
+    fn stored_deflate(data: &[u8]) -> Vec<u8> {
+        let mut out = vec![0x78, 0x01];
+        let mut chunks = data.chunks(0xffff).peekable();
+        while let Some(block) = chunks.next() {
+            out.push(if chunks.peek().is_none() { 1 } else { 0 });
+            out.extend_from_slice(&(block.len() as u16).to_le_bytes());
+            out.extend_from_slice(&(!(block.len() as u16)).to_le_bytes());
+            out.extend_from_slice(block);
+        }
+        out.extend_from_slice(&adler32(data).to_be_bytes());
+        out
+    }
+
+    fn adler32(data: &[u8]) -> u32 {
+        let (mut a, mut b) = (1u32, 0u32);
+        for byte in data {
+            a = (a + u32::from(*byte)) % 65521;
+            b = (b + a) % 65521;
+        }
+        (b << 16) | a
+    }
+
+    fn crc32(data: &[u8]) -> u32 {
+        let mut crc = !0u32;
+        for byte in data {
+            crc ^= u32::from(*byte);
+            for _ in 0..8 {
+                let mask = (!crc & 1).wrapping_sub(1) & 0xedb8_8320;
+                crc = (crc >> 1) ^ mask;
+            }
+        }
+        !crc
+    }
+
+    /// An MP3: an ID3v2.3 tag carrying `pictures` as `(pic_type, png bytes)`,
+    /// then twenty real MPEG-1 Layer III frames.
+    fn mp3_with_pictures(pictures: &[(u8, Vec<u8>)]) -> Vec<u8> {
+        fn frame(id: &[u8; 4], content: &[u8]) -> Vec<u8> {
+            let mut out = id.to_vec();
+            out.extend_from_slice(&(content.len() as u32).to_be_bytes());
+            out.extend_from_slice(&[0, 0]);
+            out.extend_from_slice(content);
+            out
+        }
+        fn synchsafe(n: u32) -> [u8; 4] {
+            [
+                ((n >> 21) & 0x7f) as u8,
+                ((n >> 14) & 0x7f) as u8,
+                ((n >> 7) & 0x7f) as u8,
+                (n & 0x7f) as u8,
+            ]
+        }
+        let mut body = Vec::new();
+        for (pic_type, png) in pictures {
+            let mut content = vec![0u8]; // ISO-8859-1
+            content.extend_from_slice(b"image/png\0");
+            content.push(*pic_type);
+            content.push(0); // empty description
+            content.extend_from_slice(png);
+            body.extend_from_slice(&frame(b"APIC", &content));
+        }
+        for (id, text) in [
+            (b"TIT2", "Test Song"),
+            (b"TPE1", "Test Artist"),
+            (b"TALB", "Test Album"),
+        ] {
+            let mut content = vec![0u8];
+            content.extend_from_slice(text.as_bytes());
+            body.extend_from_slice(&frame(id, &content));
+        }
+        let mut out = b"ID3".to_vec();
+        out.extend_from_slice(&[3, 0, 0]);
+        out.extend_from_slice(&synchsafe(body.len() as u32));
+        out.extend_from_slice(&body);
+        // 144 * 128000 / 44100 = 417 bytes per frame.
+        for _ in 0..20 {
+            out.extend_from_slice(&[0xff, 0xfb, 0x90, 0x64]);
+            out.resize(out.len() + 413, 0);
+        }
+        out
+    }
+
+    fn temp_dir_named(prefix: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "trove-{prefix}-{}",
+            crate::model::new_id().simple()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// The card comes from the front cover, not from the 32×32 file icon ID3
+    /// type 1 that a tag often carries alongside it — "first picture" would
+    /// pick the icon and blur the card.
+    #[test]
+    fn an_embedded_cover_becomes_the_audio_thumbnail() {
+        let dir = temp_dir_named("audiocover");
+        let src = dir.join("album.mp3");
+        std::fs::write(
+            &src,
+            mp3_with_pictures(&[
+                (1, png_fixture(4, 4, [255, 0, 0])), // file icon, must be skipped
+                (3, png_fixture(40, 40, [10, 200, 20])), // front cover
+            ]),
+        )
+        .unwrap();
+
+        let out = ensure(&dir.join("cache"), &"a".repeat(64), AssetKind::Audio, &src);
+        assert!(out.is_some(), "a tagged MP3 should produce a thumbnail");
+        let img = image::open(out.unwrap()).unwrap().to_rgb8();
+        let (w, h) = img.dimensions();
+        assert!((15..=40).contains(&w) && (15..=40).contains(&h), "{w}x{h}");
+        let px = *img.get_pixel(2, 2);
+        assert!(
+            px[0] < 60 && px[1] > 150 && px[2] < 60,
+            "expected the cover's green, got {px:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// No embedded picture is the common case, not an error: the caller keeps
+    /// the kind icon. Junk that merely ends in `.mp3` must not panic either.
+    ///
+    /// The second assertion is the load-bearing one: `ensure` runs on the import
+    /// path, and a waveform card may not cost it an ffmpeg pass.
+    #[test]
+    fn audio_without_a_picture_has_no_thumbnail() {
+        let dir = temp_dir_named("audiocover");
+        let cache = dir.join("cache");
+        let src = dir.join("plain.mp3");
+        std::fs::write(&src, mp3_with_pictures(&[])).unwrap();
+
+        let sha = "b".repeat(64);
+        assert!(ensure(&cache, &sha, AssetKind::Audio, &src).is_none());
+        assert!(
+            !waveform::abs_path(&cache, &sha).is_file(),
+            "the import path must not decode an envelope"
+        );
+
+        std::fs::write(&src, b"not an mp3 at all").unwrap();
+        assert!(ensure(&cache, &"c".repeat(64), AssetKind::Audio, &src).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A cover-less track whose envelope is already cached — because it was
+    /// previewed, or because a rebuild asked for it — is recognisable by its
+    /// shape instead of by a generic icon.
+    #[test]
+    fn a_cached_envelope_becomes_the_audio_card() {
+        let dir = temp_dir_named("audiowave");
+        let cache = dir.join("cache");
+        let src = dir.join("plain.mp3");
+        std::fs::write(&src, mp3_with_pictures(&[])).unwrap();
+
+        let sha = "e".repeat(64);
+        let mut peaks = vec![0u8; waveform::PEAK_COUNT];
+        peaks[200] = 255;
+        waveform::store(&cache, &sha, &peaks);
+
+        let out = ensure(&cache, &sha, AssetKind::Audio, &src).expect("a waveform card");
+        let card = image::open(&out).unwrap().to_rgb8();
+        let (w, h) = AUDIO_CARD_SIZE;
+        assert_eq!(card.dimensions(), AUDIO_CARD_SIZE);
+        // Bucket 200 of 400 covers the column at the centre of the card.
+        let bar = 200u32 * w / waveform::PEAK_COUNT as u32;
+        let ink = |p: &image::Rgb<u8>| p[0] < 100;
+        let paper = |p: &image::Rgb<u8>| p[0] > 150;
+        let loud = card.get_pixel(bar, h / 2);
+        assert!(ink(loud), "the loud bucket is a bar, got {loud:?}");
+        let quiet = card.get_pixel(w - 1, h / 2);
+        assert!(paper(quiet), "the silent tail is paper, got {quiet:?}");
+
+        // The rebuild reaches the same drawing without decoding anything.
+        let rebuilt = regenerate(&cache, &sha, AssetKind::Audio, &src).expect("a waveform card");
+        assert_eq!(rebuilt, out);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A picture beats a waveform: the art is the thing the label came with.
+    #[test]
+    fn a_cover_still_wins_over_a_cached_envelope() {
+        let dir = temp_dir_named("audiopriority");
+        let cache = dir.join("cache");
+        let src = dir.join("album.mp3");
+        std::fs::write(
+            &src,
+            mp3_with_pictures(&[(3, png_fixture(40, 40, [10, 200, 20]))]),
+        )
+        .unwrap();
+
+        let sha = "f".repeat(64);
+        let solid = vec![255u8; waveform::PEAK_COUNT];
+        waveform::store(&cache, &sha, &solid);
+        let out = ensure(&cache, &sha, AssetKind::Audio, &src).expect("the cover");
+        let card = image::open(out).unwrap().to_rgb8();
+        let px = *card.get_pixel(2, 2);
+        assert!(
+            px[0] < 60 && px[1] > 150 && px[2] < 60,
+            "expected the cover's green, got {px:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The claim behind a rebuilt thumbnail being a waveform card, end to end:
+    /// a real audio file with no picture and nothing cached. The import path
+    /// still refuses to pay for it; the rebuild does, and caches what it drew.
+    #[test]
+    fn a_rebuild_draws_a_card_from_a_real_audio_file() {
+        if !ffmpeg_available() {
+            eprintln!("skipping: ffmpeg not on PATH");
+            return;
+        }
+        let dir = temp_dir_named("audiorebuild");
+        let audio = dir.join("tone.wav");
+        let status = std::process::Command::new("ffmpeg")
+            .args([
+                "-y",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                // 50 Hz, not the 440 Hz a listener would ask for: the envelope
+                // is decoded at 300 Hz, so its resampler low-passes everything
+                // above 150 out of existence. A higher tone measures as silence
+                // here, which is the documented cost of the trick, not a bug.
+                "sine=frequency=50:duration=2",
+            ])
+            .arg(&audio)
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        let sha = "1".repeat(64);
+        let cache = dir.join("cache");
+        assert!(ensure(&cache, &sha, AssetKind::Audio, &audio).is_none());
+        assert!(
+            waveform::cached(&cache, &sha).is_none(),
+            "ensure must not have decoded anything"
+        );
+
+        let out = regenerate(&cache, &sha, AssetKind::Audio, &audio).expect("a decoded card");
+        let card = image::open(&out).unwrap().to_rgb8();
+        assert_eq!(card.dimensions(), AUDIO_CARD_SIZE);
+        // Measured across the card, not at one column: a 50 Hz tone sampled at
+        // 300 Hz has a near-zero bucket every sixth one, and a single pixel
+        // would be arguing with the phase of the fixture.
+        let ink = card.pixels().filter(|p| p[0] < 100).count();
+        let expected = (u64::from(AUDIO_CARD_SIZE.0) * u64::from(AUDIO_CARD_SIZE.1) / 20) as usize;
+        assert!(ink > expected, "the card is a waveform, {ink} ink pixels");
+        assert!(
+            waveform::cached(&cache, &sha).is_some(),
+            "the envelope it paid for stays cached for the preview"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     fn ffmpeg_available() -> bool {
         std::process::Command::new("ffmpeg")
@@ -960,6 +1460,90 @@ mod tests {
         assert!(ensure(&dir, "d".repeat(64).as_str(), AssetKind::Model, &junk).is_none());
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A text file is recognised by its own opening lines, not by a generic
+    /// icon — and a binary file that merely has a text extension still gets the
+    /// icon, because drawing its bytes would be a lie about what it is.
+    #[test]
+    fn a_text_file_is_carded_by_its_own_lines() {
+        let dir = temp_dir_named("textcard");
+        let cache = dir.join("cache");
+        let blob = dir.join("note.md");
+        std::fs::write(
+            &blob,
+            "# Verify\r\n\r\nfn main() {\r\n\tprintln!(\"hi\");\r\n}\r\n",
+        )
+        .unwrap();
+
+        let card = ensure(&cache, &"e".repeat(64), AssetKind::Document, &blob)
+            .expect("a text file gets a card");
+        let image = image::open(&card).unwrap().to_rgb8();
+        assert_eq!(
+            image.dimensions(),
+            TEXT_CARD_SIZE,
+            "the shared landscape box"
+        );
+        // The card is a page of ink on a light ground. Count the *bands* of ink
+        // rather than pixels: several separated rows is what "this file's lines
+        // were drawn" means, and it fails loudly if no font resolved at all.
+        let rows_with_ink: Vec<bool> = (0..image.height())
+            .map(|y| {
+                (0..image.width())
+                    .filter(|&x| {
+                        let p = image.get_pixel(x, y).0;
+                        (p[0] as u32) + (p[1] as u32) + (p[2] as u32) < 400
+                    })
+                    .count()
+                    >= 3
+            })
+            .collect();
+        let bands = rows_with_ink
+            .windows(2)
+            .filter(|pair| !pair[0] && pair[1])
+            .count()
+            + usize::from(rows_with_ink[0]);
+        assert!(
+            bands >= 4,
+            "expected the fixture's four text lines as separate bands, got {bands}"
+        );
+        // The margin is the page's own light ground, not an ink band or a black
+        // bar. Tolerant because the card is a JPEG: a flat field survives within
+        // a level or two, and demanding the exact byte would test the encoder.
+        let margin = image.get_pixel(4, 4).0;
+        assert!(
+            margin[0] > 230 && margin[1] > 230 && margin[2] > 225,
+            "expected the light page, got {margin:?}"
+        );
+
+        let binary = dir.join("pretender.txt");
+        std::fs::write(&binary, [b'a', b'b', 0, 0, b'c', 0, b'd', 0]).unwrap();
+        assert!(
+            ensure(&cache, &"f".repeat(64), AssetKind::Other, &binary).is_none(),
+            "NULs where characters should be is an icon, not a card"
+        );
+
+        let empty = dir.join("blank.md");
+        std::fs::write(&empty, "   \n\n  \n").unwrap();
+        assert!(ensure(&cache, &"0".repeat(64), AssetKind::Document, &empty).is_none());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The card's line budget is what keeps a one-thousand-line log and a four
+    /// line config file looking different at a glance, so the cut itself is
+    /// worth pinning: CRLF folded, tabs widened, columns and rows capped.
+    #[test]
+    fn card_lines_are_folded_widened_and_capped() {
+        let wide = "x".repeat(200);
+        let text = format!("a\r\n\tb\r\n{wide}\r\n\r\nc\n{}", "d\n".repeat(40));
+        let lines = card_lines(&text);
+        assert_eq!(lines.len(), TEXT_CARD_LINES, "capped at the card's rows");
+        assert_eq!(lines[0], "a");
+        assert_eq!(lines[1], "    b", "a tab is an indent, not a control code");
+        assert_eq!(lines[2].chars().count(), TEXT_CARD_COLUMNS, "cut to width");
+        assert_eq!(lines[3], "", "a blank line survives as a blank line");
+        assert_eq!(lines[4], "c");
     }
 
     fn walkdir_candidates(dir: &Path) -> Vec<PathBuf> {

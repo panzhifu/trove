@@ -65,14 +65,45 @@ pub fn is_video_ext(ext: &str) -> bool {
     )
 }
 
+/// Whether this extension is audio the library treats as a first-class
+/// `AssetKind::Audio`: classified, hashed, mined for tags and duration by
+/// lofty.
+///
+/// The same single-list rule as [`is_video_ext`], for the same reason: the
+/// app's "open with" gate listed `aiff` while this classifier did not, so an
+/// AIFF imported as `Other` — it got the external-player offer but never the
+/// audio kind, its duration or its tag mining.
+pub fn is_audio_ext(ext: &str) -> bool {
+    matches!(
+        ext,
+        "mp3"
+            | "wav"
+            | "flac"
+            | "m4a"
+            | "aac"
+            | "ogg"
+            | "oga"
+            | "opus"
+            | "wma"
+            | "aiff"
+            | "aif"
+            | "aifc"
+    )
+}
+
 /// Classify a file from its normalized extension.
 pub fn probe(ext: &str) -> Probe {
     let kind = match ext {
         "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "ico" | "tiff" | "tif" | "avif"
         | "jxl" | "heic" | "heif" | "svg" | "psd" => AssetKind::Image,
+        // High-dynamic-range and legacy raster stills. EXR and Radiance HDR
+        // carry scene-linear floats, so they only become *pictures* through
+        // `media::hdr`'s display transform — the decode alone would show a
+        // near-black square.
+        "exr" | "hdr" | "tga" => AssetKind::Image,
         ext if is_raw_ext(ext) => AssetKind::Image,
         ext if is_video_ext(ext) => AssetKind::Video,
-        "mp3" | "wav" | "flac" | "m4a" | "aac" | "ogg" | "opus" | "wma" => AssetKind::Audio,
+        ext if is_audio_ext(ext) => AssetKind::Audio,
         "pdf" | "doc" | "docx" | "xls" | "xlsx" | "ppt" | "pptx" | "txt" | "md" | "rtf" | "odt"
         | "ods" | "odp" | "csv" => AssetKind::Document,
         "zip" | "rar" | "7z" | "tar" | "gz" | "bz2" | "xz" | "iso" => AssetKind::Archive,
@@ -95,6 +126,12 @@ pub fn probe(ext: &str) -> Probe {
         "heic" | "heif" => "image/heic",
         "svg" => "image/svg+xml",
         "psd" => "image/vnd.adobe.photoshop",
+        // `image/aces` is the registered media type for OpenEXR; Radiance's own
+        // is `image/vnd.radiance`. TGA has no registration, so this is the name
+        // the IANA-adjacent lists and every desktop entry file use.
+        "exr" => "image/aces",
+        "hdr" => "image/vnd.radiance",
+        "tga" => "image/x-tga",
         "cr2" => "image/x-canon-cr2",
         "cr3" => "image/x-canon-cr3",
         "nef" => "image/x-nikon-nef",
@@ -120,7 +157,14 @@ pub fn probe(ext: &str) -> Probe {
         "m4a" => "audio/mp4",
         "aac" => "audio/aac",
         "ogg" => "audio/ogg",
+        "oga" => "audio/ogg",
         "opus" => "audio/opus",
+        // Both were classified as audio but fell through to
+        // `application/octet-stream`, which is what "Open with" and any export
+        // read the file as.
+        "wma" => "audio/x-ms-wma",
+        "aiff" | "aif" => "audio/aiff",
+        "aifc" => "audio/x-aifc",
         "pdf" => "application/pdf",
         "doc" => "application/msword",
         "docx" => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
@@ -224,6 +268,7 @@ pub fn image_dimensions(path: &std::path::Path) -> Option<Dimensions> {
         // whenever it was built with AV1 support; JPEG-XL needs its own crate.
         "avif" | "heic" | "heif" => return heif_dimensions(path),
         "jxl" => return jxl_dimensions(path),
+        "tga" => return tga_dimensions(path),
         _ if is_raw_ext(&ext) => return raw_dimensions(path),
         _ => {}
     }
@@ -304,6 +349,22 @@ fn jxl_dimensions(path: &std::path::Path) -> Option<Dimensions> {
     })
 }
 
+/// Size of a TGA, with the format named for the reader rather than guessed.
+///
+/// The pixel decode needs no such branch — `ImageReader::open` takes the format
+/// from the file name — but this function reads a header off a *content* guess,
+/// and TGA has no magic bytes for a guess to find. Without this arm a TGA
+/// imports with a thumbnail and no recorded size, which is enough to break every
+/// layout that trusts the size columns.
+fn tga_dimensions(path: &std::path::Path) -> Option<Dimensions> {
+    let file = std::fs::File::open(path).ok()?;
+    let mut reader = std::io::BufReader::new(file);
+    use image::ImageDecoder as _;
+    let decoder = image::codecs::tga::TgaDecoder::new(&mut reader).ok()?;
+    let (width, height) = decoder.dimensions();
+    Some(Dimensions { width, height })
+}
+
 /// Convert a HEIC/HEIF/AVIF blob to a raster image with the system `heif-dec`.
 ///
 /// AVIF rides along for free: it is the same ISOBMFF container with an AV1
@@ -340,6 +401,44 @@ mod tests {
     #[test]
     fn avif_and_jxl_are_first_class_images() {
         for (ext, mime) in [("avif", "image/avif"), ("jxl", "image/jxl")] {
+            let p = probe(&normalize_ext(ext));
+            assert_eq!(p.kind, AssetKind::Image, "{ext}");
+            assert_eq!(p.mime, mime, "{ext}");
+        }
+    }
+
+    /// Every audio extension, and no `Other` in the list: the "open with" gate
+    /// used to carry `aiff` while the classifier did not. Each one also needs a
+    /// real `audio/*` mime — `wma` was classified but typed as
+    /// `application/octet-stream`.
+    #[test]
+    fn audio_extensions_map_to_audio_kind_and_mime() {
+        for ext in [
+            "mp3", "wav", "flac", "m4a", "aac", "ogg", "oga", "opus", "wma", "aiff", "aif", "aifc",
+            "MP3", "Aiff",
+        ] {
+            let p = probe(&normalize_ext(ext));
+            assert_eq!(p.kind, AssetKind::Audio, "{ext}");
+            assert!(p.mime.starts_with("audio/"), "{ext} mime {}", p.mime);
+            assert!(is_audio_ext(&normalize_ext(ext)), "{ext}");
+        }
+        // The gate is not a prefix match on anything audio-ish.
+        assert!(!is_audio_ext("mp4"));
+        assert!(!is_audio_ext("mp4a"));
+    }
+
+    /// High-dynamic-range and legacy raster stills are first-class images: a
+    /// kind, so the grid, the filters and the card pipeline all take them, and a
+    /// real media type, so "open with" and an XMP export do not report them as
+    /// octet-stream.
+    #[test]
+    fn exr_hdr_and_tga_are_first_class_images() {
+        for (ext, mime) in [
+            ("exr", "image/aces"),
+            ("hdr", "image/vnd.radiance"),
+            ("tga", "image/x-tga"),
+            ("EXR", "image/aces"),
+        ] {
             let p = probe(&normalize_ext(ext));
             assert_eq!(p.kind, AssetKind::Image, "{ext}");
             assert_eq!(p.mime, mime, "{ext}");

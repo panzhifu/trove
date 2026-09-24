@@ -86,8 +86,26 @@ image = { version = "0.25", default-features = false, features = [
     "bmp",
     "tiff",
     "ico",
+    # High-dynamic-range stills. `exr` is the one crate here and it is already
+    # in the graph (another member enables `image`'s default features, which
+    # pull it in), so declaring it costs nothing but the wiring; `hdr` and
+    # `tga` are decoders inside `image` itself with no dependency at all.
+    # Scene-linear pixels need a display transform before they can be shown,
+    # which is `trove_core::media::hdr` — see the note there about why the
+    # plain decode path is not one.
+    "exr",
+    "hdr",
+    "tga",
 ] }
 smallvec = "1"
+
+# Text-file encoding detection, for the text viewer. `chardetng` is the Rust
+# port of ICU's charset detector — the same detector Serpent's JS `chardet` is a
+# binding of — and `encoding_rs` is the WHATWG encoding implementation it hands
+# back. Both pure Rust; `encoding_rs` is already in the graph as another
+# crate's dependency, so only `chardetng` is new work to compile.
+chardetng = "1"
+encoding_rs = "0.8"
 
 # Audio playback for the video preview (PCM out of the ffmpeg pipe).
 # `default-features = false` drops the symphonia/claxon decoders: every

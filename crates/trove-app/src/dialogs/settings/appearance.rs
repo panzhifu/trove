@@ -17,8 +17,24 @@ pub(super) fn appearance_page(controller: &Entity<LibraryController>, cx: &App) 
         .icon(IconName::Palette)
         .resettable(false)
         .group(mode_group())
+        .group(grid_group())
         .group(themes_group(cx))
         .group(custom_themes_group(controller))
+}
+
+/// The grid's own behavior: whether a card comes alive under the pointer.
+fn grid_group() -> SettingGroup {
+    SettingGroup::new()
+        .title(rust_i18n::t!("settings.grid").to_string())
+        .item(
+            SettingItem::new(
+                rust_i18n::t!("settings.hover_media").to_string(),
+                config_switch(AppConfig::hover_media, |config, on| {
+                    config.hover_media = Some(on);
+                }),
+            )
+            .description(rust_i18n::t!("settings.hover_media_desc").to_string()),
+        )
 }
 
 /// Basics: follow the system, or pin light / dark.

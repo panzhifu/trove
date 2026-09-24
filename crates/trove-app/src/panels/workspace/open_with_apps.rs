@@ -41,7 +41,10 @@ pub fn discover_apps(path: &Path) -> Vec<OpenWithApp> {
         other if trove_core::media::probe::is_video_ext(other) => video_apps(),
 
         // --- Audio -------------------------------------------------------
-        "mp3" | "wav" | "flac" | "aac" | "ogg" | "m4a" | "wma" | "aiff" | "opus" => audio_apps(),
+        // Same delegation as the video gate above: the classifier owns the
+        // list. This one carried `aiff` while the classifier did not, which is
+        // how an AIFF ended up as an `Other` asset with no duration.
+        other if trove_core::media::probe::is_audio_ext(other) => audio_apps(),
 
         // --- 3D models ---------------------------------------------------
         "obj" | "fbx" | "gltf" | "glb" | "stl" | "ply" | "dae" | "3ds" | "blend" | "usd"

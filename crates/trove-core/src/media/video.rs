@@ -7,7 +7,7 @@
 //! preview never decodes a whole clip into memory.
 
 use std::io::{BufReader, Read};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdout, Command, Stdio};
 
 /// Width cap for decoded frames: 720p BGRA is ~3.7 MB per frame and the
@@ -280,6 +280,113 @@ pub fn has_audio_track(path: &Path) -> bool {
         return false;
     };
     output.status.success() && !output.stdout.is_empty()
+}
+
+/// Write the frame at `at_ms` into `out` as a PNG, at the clip's own size.
+///
+/// Deliberately not the frame already on screen: [`FramePipe`] decodes through
+/// [`DEFAULT_MAX_WIDTH`]'s playback budget — one 720-wide frame alive at a time
+/// is what makes scrubbing smooth — and a still the user asked to keep should
+/// not inherit a budget made for smooth scrubbing. The seek is ffmpeg's
+/// input-side one, which rewinds to the preceding keyframe and decodes forward,
+/// so the file written is the playhead's own frame rather than whatever opened
+/// the GOP around it.
+///
+/// One subprocess, so it takes a slot like every other decoder here; `None`
+/// when ffmpeg is missing, refuses, or is timed out.
+pub fn write_frame_png(path: &Path, at_ms: u64, out: &Path) -> Option<PathBuf> {
+    let parent = out.parent()?;
+    std::fs::create_dir_all(parent).ok()?;
+    // ffmpeg picks the muxer from the extension, so the temporary file keeps
+    // `.png` and is renamed only once the child has succeeded.
+    let tmp = out.with_extension(format!("tmp-{}.png", crate::model::new_id().simple()));
+    let _slot = super::proc::slot();
+    let seek = format!("{:.3}", at_ms as f64 / 1000.0);
+    let mut command = Command::new("ffmpeg");
+    command
+        .args(["-y", "-loglevel", "error", "-ss", &seek, "-i"])
+        .arg(path)
+        .args(["-frames:v", "1"])
+        .arg(&tmp)
+        .stdin(Stdio::null())
+        .stderr(Stdio::null());
+    let output = super::proc::output_with_timeout(command).ok()?;
+    if !output.status.success() {
+        let _ = std::fs::remove_file(&tmp);
+        return None;
+    }
+    std::fs::rename(&tmp, out).ok()?;
+    Some(out.to_path_buf())
+}
+
+/// How many frames a contact sheet carries, as `cols × rows`. Sixteen is what a
+/// vision model can actually use in one image — more tiles and each one drops
+/// below the resolution where a person or an object is still recognisable.
+pub const SHEET_TILES: u32 = 16;
+/// Width of one tile, so a 4×4 sheet is 1024 across: the long edge a multimodal
+/// endpoint resamples to anyway.
+const SHEET_TILE_W: u32 = 256;
+
+/// The two filter chains worth trying, timed first.
+///
+/// `fps=<tiles>/<duration>` spreads exactly that many frames over the whole clip
+/// whatever its length. The timestamp needs the single quotes *and* the escaped
+/// colon: ffmpeg's filter parser splits options on `:`, so `%{pts:hms}` unquoted
+/// reads as a broken option name — and the failure is silent, because the retry
+/// below drops the stamp and still ships a sheet.
+fn sheet_filters(duration_ms: u64) -> [String; 2] {
+    let seconds = duration_ms as f64 / 1000.0;
+    let fps = format!("{:.6}", f64::from(SHEET_TILES) / seconds);
+    let grid = format!("{}", f64::from(SHEET_TILES).sqrt() as u32);
+    let geometry = format!("fps={fps},scale={SHEET_TILE_W}:-2,tile={grid}x{grid}");
+    let stamp =
+        r"drawtext=text='%{pts\:hms}':x=4:y=4:fontsize=20:fontcolor=white:box=1:boxcolor=black@0.5";
+    [format!("{geometry},{stamp}"), geometry]
+}
+
+/// Write a contact sheet of `path` into `out`: sixteen frames, evenly spaced
+/// across the whole clip, tiled 4×4 into one JPEG.
+///
+/// The timestamp burned into each tile is the point of the exercise — without it
+/// a model can say "a person walks in" but not *when*, and the answer cannot be
+/// filed against a playhead. It is also the fragile half of the filter chain:
+/// `drawtext` needs a font provider that a given ffmpeg build may not have, so a
+/// failure with it in the graph retries without it. An untimed sheet still beats
+/// no sheet.
+///
+/// One subprocess, so it takes a slot; `None` when ffmpeg is missing, refuses,
+/// or the clip is too short to be worth tiling.
+pub fn write_contact_sheet(path: &Path, out: &Path) -> Option<PathBuf> {
+    let facts = probe(path)?;
+    if facts.duration_ms < 2_000 {
+        // Two seconds of material is one frame with extra steps.
+        return None;
+    }
+    let parent = out.parent()?;
+    std::fs::create_dir_all(parent).ok()?;
+    let tmp = out.with_extension(format!("tmp-{}.jpg", crate::model::new_id().simple()));
+    let filters = sheet_filters(facts.duration_ms);
+    let _slot = super::proc::slot();
+    for filter in &filters {
+        let mut command = Command::new("ffmpeg");
+        command
+            .args(["-y", "-loglevel", "error", "-i"])
+            .arg(path)
+            .args(["-vf", filter, "-frames:v", "1"])
+            .arg(&tmp)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let Ok(output) = super::proc::output_with_timeout(command) else {
+            break; // no ffmpeg, or it hung: neither retry helps
+        };
+        if output.status.success() && tmp.is_file() {
+            std::fs::rename(&tmp, out).ok()?;
+            return Some(out.to_path_buf());
+        }
+        let _ = std::fs::remove_file(&tmp);
+    }
+    None
 }
 
 /// Lowest playback speed the player offers; the audio side chains
@@ -582,6 +689,198 @@ mod tests {
             }
         }
         assert!((5..=15).contains(&count), "decoded {count} frames");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// End-to-end: a frame grab comes out at the clip's own size rather than at
+    /// the player's width cap — the whole reason the grab re-decodes instead of
+    /// copying the frame that is on screen. The clip is deliberately wider than
+    /// [`DEFAULT_MAX_WIDTH`] so a resize would show up in the assertion.
+    #[test]
+    fn frame_grab_writes_a_full_size_png_when_ffmpeg_present() {
+        if !ffmpeg_available() {
+            eprintln!("skipping: ffmpeg not on PATH");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("trove-grab-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let clip = dir.join("clip.mp4");
+        let status = Command::new("ffmpeg")
+            .args([
+                "-v",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=size=800x600:rate=10:duration=1",
+                "-pix_fmt",
+                "yuv420p",
+            ])
+            .arg(&clip)
+            .status()
+            .expect("ffmpeg runs");
+        assert!(status.success(), "failed to generate the test clip");
+
+        // The nested directory and the space in the name are both things the
+        // app actually does: the still goes to `incoming/`, named after its
+        // clip and its moment.
+        let out = dir.join("frames").join("clip 0-00.png");
+        let written = write_frame_png(&clip, 500, &out).expect("a frame is written");
+        assert_eq!(written, out);
+        use image::GenericImageView as _;
+        let image = image::open(&out).expect("the still is a readable image");
+        assert_eq!(
+            image.dimensions(),
+            (800, 600),
+            "a grab keeps the clip's own size, past the player's {DEFAULT_MAX_WIDTH}-wide cap"
+        );
+        // The temporary file is renamed into place, so nothing is left behind.
+        assert_eq!(std::fs::read_dir(dir.join("frames")).unwrap().count(), 1);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The fragile half of the sheet is the burned-in timestamp, and its failure
+    /// mode is silent: a bad escape does not fail the run, it just costs every
+    /// answer its "when" while the retry ships an untimed sheet as if nothing
+    /// happened. So the timed chain is exercised on its own, here.
+    #[test]
+    fn the_timed_sheet_chain_parses_when_ffmpeg_present() {
+        if !ffmpeg_available() {
+            eprintln!("skipping: ffmpeg not on PATH");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("trove-timed-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let clip = dir.join("clip.mp4");
+        assert!(
+            Command::new("ffmpeg")
+                .args([
+                    "-v",
+                    "error",
+                    "-y",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "testsrc=size=160x120:rate=10:duration=2",
+                    "-pix_fmt",
+                    "yuv420p",
+                ])
+                .arg(&clip)
+                .status()
+                .expect("ffmpeg runs")
+                .success()
+        );
+
+        let [timed, plain] = sheet_filters(2000);
+        assert_ne!(timed, plain, "the fallback is a different chain");
+        let out = dir.join("timed.jpg");
+        let status = Command::new("ffmpeg")
+            .args(["-v", "error", "-y", "-i"])
+            .arg(&clip)
+            .args(["-vf", &timed, "-frames:v", "1"])
+            .arg(&out)
+            .status()
+            .expect("ffmpeg runs");
+        assert!(
+            status.success() && out.is_file(),
+            "ffmpeg rejected the timed chain: {timed}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A clip ffmpeg cannot read leaves no half-written still behind: the
+    /// caller reports "nothing grabbed", not a file that pretends to be one.
+    #[test]
+    fn frame_grab_refuses_a_clip_that_is_not_video() {
+        let dir = std::env::temp_dir().join(format!("trove-grab-bad-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let clip = dir.join("not-a-clip.mp4");
+        std::fs::write(&clip, b"mp4 in name only").unwrap();
+        let out = dir.join("frame.png");
+        assert!(write_frame_png(&clip, 0, &out).is_none());
+        assert!(!out.exists(), "a failed grab leaves no file");
+        assert_eq!(
+            std::fs::read_dir(&dir)
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .filter(|e| e.path().extension().is_some_and(|x| x == "png"))
+                .count(),
+            0,
+            "the temporary PNG is cleaned up too"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The sheet a video analysis sends: one JPEG of 4×4 tiles at the clip's own
+    /// aspect. The `drawtext` stamp is the point of it, and the retry that drops
+    /// the stamp rather than the sheet is the point of *that* — an ffmpeg build
+    /// without a font provider should degrade, not answer "no images at all".
+    #[test]
+    fn contact_sheet_is_one_tiled_image_when_ffmpeg_present() {
+        if !ffmpeg_available() || !ffprobe_available() {
+            eprintln!("skipping: ffmpeg/ffprobe not on PATH");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("trove-sheet-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let clip = dir.join("clip.mp4");
+        let status = Command::new("ffmpeg")
+            .args([
+                "-v",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=size=320x240:rate=10:duration=6",
+                "-pix_fmt",
+                "yuv420p",
+            ])
+            .arg(&clip)
+            .status()
+            .expect("ffmpeg runs");
+        assert!(status.success(), "failed to generate the test clip");
+
+        let out = dir.join("sheets").join("sheet.jpg");
+        let written = write_contact_sheet(&clip, &out).expect("a sheet is built");
+        use image::GenericImageView as _;
+        let image = image::open(&written).expect("the sheet is a readable image");
+        assert_eq!(image.dimensions().0, 1024, "four 256-wide tiles across");
+        assert!(
+            image.dimensions().1 > 700,
+            "and four rows of the clip's own aspect: {:?}",
+            image.dimensions()
+        );
+        // Nested directory created, temporary file renamed away.
+        assert_eq!(std::fs::read_dir(dir.join("sheets")).unwrap().count(), 1);
+
+        // Two seconds of material is one frame with extra steps, so it is
+        // refused rather than tiled into a lie.
+        let short = dir.join("short.mp4");
+        let status = Command::new("ffmpeg")
+            .args([
+                "-v",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=size=320x240:rate=10:duration=1",
+                "-pix_fmt",
+                "yuv420p",
+            ])
+            .arg(&short)
+            .status()
+            .expect("ffmpeg runs");
+        assert!(status.success());
+        assert!(
+            write_contact_sheet(&short, &dir.join("short.jpg")).is_none(),
+            "a one-second clip is not a contact sheet"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }

@@ -27,10 +27,11 @@ pub fn library_stats(conn: &rusqlite::Connection) -> Result<LibraryStats> {
 
     let mut counts: [u64; 8] = [0; 8];
     {
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare(&format!(
             "SELECT kind, COUNT(*) FROM assets \
-             WHERE trashed_at IS NULL GROUP BY kind",
-        )?;
+                 WHERE trashed_at IS NULL AND {} GROUP BY kind",
+            super::sequences::hidden_beside("assets.id")
+        ))?;
         let mut it = stmt.query([])?;
         while let Some(row) = it.next()? {
             let kind_raw: String = row.get(0)?;
@@ -57,13 +58,20 @@ pub fn library_stats(conn: &rusqlite::Connection) -> Result<LibraryStats> {
 
     stats.total_bytes = rows::query_count(
         conn,
-        "SELECT COALESCE(SUM(size_bytes), 0) FROM assets WHERE trashed_at IS NULL",
+        &format!(
+            "SELECT COALESCE(SUM(size_bytes), 0) FROM assets \
+             WHERE trashed_at IS NULL AND {}",
+            super::sequences::hidden_beside("assets.id")
+        ),
         vec![],
     )? as u64;
 
     stats.live = rows::query_count(
         conn,
-        "SELECT COUNT(*) FROM assets WHERE trashed_at IS NULL",
+        &format!(
+            "SELECT COUNT(*) FROM assets WHERE trashed_at IS NULL AND {}",
+            super::sequences::hidden_beside("assets.id")
+        ),
         vec![],
     )? as u64;
     stats.trashed = rows::query_count(

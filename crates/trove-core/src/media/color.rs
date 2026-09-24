@@ -18,7 +18,9 @@ pub const MAX_COLORS: usize = 12;
 /// as `#rrggbb` hex strings (quantized to 3 bits per channel). Empty when the
 /// file is not a decodable image.
 pub fn dominant_colors(path: &Path) -> Vec<String> {
-    match image::open(path) {
+    // Through the display decode, so a scene-linear file cannot contribute a
+    // palette of one near-black colour.
+    match crate::media::hdr::open_for_display(path) {
         Ok(image) => dominant_from_rgb(&image.to_rgb8()),
         Err(_) => Vec::new(),
     }

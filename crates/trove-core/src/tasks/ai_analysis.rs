@@ -281,7 +281,7 @@ pub fn run(
             .flatten();
         let contact_sheet = options
             .send_images
-            .then(|| contact_sheet_path(options, &asset))
+            .then(|| contact_sheet(options, &asset))
             .flatten();
         work.push(Prepared {
             asset,
@@ -840,8 +840,14 @@ fn thumbnail_path(options: &AiAnalysisOptions, asset: &Asset) -> Option<PathBuf>
     crate::media::thumb::ensure_for_asset(&options.cache_root, &options.data_root, asset)
 }
 
-/// Where this video's contact sheet is, if one was computed at import.
-fn contact_sheet_path(options: &AiAnalysisOptions, asset: &Asset) -> Option<PathBuf> {
+/// This video's contact sheet, built on first use.
+///
+/// The cost belongs here and not at import: it is one ffmpeg pass per video, and
+/// only the videos someone actually asks a model about should pay it. The result
+/// is cached by content hash beside the thumbnails, so a second run over the same
+/// library is free — and `clean_orphans` sweeps the directory with everything
+/// else derived.
+fn contact_sheet(options: &AiAnalysisOptions, asset: &Asset) -> Option<PathBuf> {
     if asset.kind != AssetKind::Video {
         return None;
     }
@@ -850,7 +856,12 @@ fn contact_sheet_path(options: &AiAnalysisOptions, asset: &Asset) -> Option<Path
         .cache_root
         .join("contact-sheet")
         .join(format!("{sha}.jpg"));
-    path.is_file().then_some(path)
+    if path.is_file() {
+        return Some(path);
+    }
+    let blob = crate::media::thumb::blob_path(&options.data_root, asset)?;
+    crate::media::video::write_contact_sheet(&blob, &path)?;
+    Some(path)
 }
 
 /// How many requests to have in flight: the caller's choice, then the

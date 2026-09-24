@@ -108,6 +108,30 @@ pub struct MediaTagsFacts {
     pub album: Option<String>,
 }
 
+/// Technical properties of an audio stream, as opposed to the tags above.
+///
+/// Keys are prefixed the way `font_glyphs` is: the `extra` column is one flat
+/// map, and a bare `channels` or `bitrate` would collide the day video facts
+/// get their own.
+///
+/// These are read from the file at import and never recomputed: there is no
+/// re-mine path, so an asset imported before this existed carries none of them
+/// and the inspector hides the rows rather than showing a dash.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct AudioFacts {
+    /// Hertz.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sample_rate: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channels: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bit_depth: Option<u8>,
+    /// Kilobits per second, not bits: lofty reports `audio_bitrate` in kbps,
+    /// and a label that multiplied it again would be off by a thousand.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bitrate: Option<u32>,
+}
+
 /// Everything stored in the asset's `extra` JSON column, typed.
 ///
 /// The sub-structs flatten onto one flat key map; `unknown` collects every
@@ -122,6 +146,8 @@ pub struct AssetFacts {
     pub font: FontFacts,
     #[serde(flatten)]
     pub media: MediaTagsFacts,
+    #[serde(flatten)]
+    pub audio: AudioFacts,
     /// Where a linked (`Origin::Linked`) file lives on disk. Recorded at
     /// import and updated by relinking; also filtered on by the folders
     /// panel (`json_extract(assets.extra, '$.source_path')`).

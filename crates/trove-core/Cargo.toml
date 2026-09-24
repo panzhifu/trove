@@ -11,6 +11,10 @@ image = { workspace = true }
 kamadak-exif = "0.5"
 lofty = "0.21"
 mp4 = { workspace = true }
+# Text viewer: legacy-encoding detection and decoding. See the note in the
+# workspace manifest for why these two and not a hand-rolled guess.
+chardetng = { workspace = true }
+encoding_rs = { workspace = true }
 ttf-parser = { workspace = true }
 fontdue = { workspace = true }
 rusqlite = { workspace = true }
@@ -53,6 +57,13 @@ jieba-rs = "0.7"
 # either (markup5ever pins it), so upgrading only adds phf_codegen 0.13 as a
 # second copy. Revisit once html5ever moves to phf 0.13.
 pinyin = "0.10"
+
+[dev-dependencies]
+# Only to *write* a fixture: the tests need a real OpenEXR file to prove the
+# decode path is wired, and `image` can read EXR but not produce one. Already in
+# the graph at this version (the `image/exr` feature pulls it in), so this costs
+# no download and no second copy.
+exr = "1"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # KWin's own capture interface (org.kde.KWin.ScreenShot2): KDE implements

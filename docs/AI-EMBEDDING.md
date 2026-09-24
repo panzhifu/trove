@@ -100,7 +100,7 @@ pub trait EmbeddingProvider: Send + Sync {
 ```
 
 - 截断至 `MAX_TEXT_CHARS` (4000 字符)
-- SHA-256 哈希作为 `source_hash`
+- BLAKE3 哈希作为 `source_hash`
 - 标题/描述/标签任一变更 → 标记过期 → 下次回填重新嵌入
 
 ---
@@ -116,7 +116,7 @@ CREATE TABLE asset_embeddings (
     space       TEXT NOT NULL,        -- "text" | "image"
     dim         INTEGER NOT NULL,
     vector      BLOB NOT NULL,        -- f32 数组
-    source_hash TEXT NOT NULL,        -- 输入文本的 SHA-256
+    source_hash TEXT NOT NULL,        -- 输入文本的 BLAKE3
     computed_at TIMESTAMP NOT NULL
 );
 ```

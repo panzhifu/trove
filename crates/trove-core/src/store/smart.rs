@@ -11,7 +11,7 @@ use super::rows;
 /// a smart rule (they become an `id IN (json_each)` narrowing).
 const TEXT_CANDIDATE_CAP: usize = 500;
 use crate::error::{Error, Result};
-use crate::model::{AssetKind, Page, SmartCompare, SmartField, SmartNode};
+use crate::model::{AssetKind, AssetQuery, Page, SmartCompare, SmartField, SmartNode};
 
 /// Deserialize a stored JSON condition tree into a [`SmartNode`].
 pub fn node_from_json(json: &Json) -> Result<SmartNode> {
@@ -236,13 +236,13 @@ fn compile_match(
     }
 }
 
-/// The narrowing applied on top of a rule tree: the grid filters (`kind` /
-/// `favorite`) plus the page window.
+/// The narrowing applied on top of a rule tree: the grid filters plus the page
+/// window.
 ///
-/// Bundled into one value because these four always travel together — through
-/// the `evaluate*` entry points and the store's `BrowseContext` — and because
-/// five positional arguments made every call site unreadable.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+/// Bundled into one value because these always travel together — through the
+/// `evaluate*` entry points and the store's `BrowseContext` — and because five
+/// positional arguments made every call site unreadable.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SmartPage {
     /// Restrict to one asset kind (the toolbar's type filter).
     pub kind: Option<AssetKind>,
@@ -252,6 +252,18 @@ pub struct SmartPage {
     pub limit: Option<u32>,
     /// Rows to skip; ignored when `limit` is `None`.
     pub offset: u64,
+    /// The remaining grid filters — orientation, aspect band, resolution band,
+    /// minimum rating, extension, and whatever the search box's qualifier
+    /// grammar stated.
+    ///
+    /// They belong *inside* the statement, not after it: applied to the rows a
+    /// page already returned, they shrink the page without shrinking the COUNT,
+    /// so the header reports a collection the list can never deliver and the
+    /// grid keeps re-running the query at the bottom of a scroll that no longer
+    /// advances. Only the predicates `build_where` can express are honoured;
+    /// a caller that sets a container field (collection, tag, folder) has to
+    /// mean it, because this does apply one.
+    pub filters: Option<AssetQuery>,
 }
 
 /// Evaluate a condition tree against the live library (trashed assets are
@@ -299,19 +311,17 @@ pub fn evaluate_filtered_without_count(
     evaluate_counted(conn, text, node, page, false)
 }
 
-fn evaluate_counted(
+/// The rule tree plus the narrowing on top of it, as a `WHERE` clause and its
+/// parameters. Shared by [`evaluate_counted`] and [`count`] so the page and the
+/// total are computed over one row set.
+fn rule_where(
     conn: &rusqlite::Connection,
     text: Option<&crate::search::TextIndex>,
     node: &SmartNode,
-    page: SmartPage,
-    count: bool,
-) -> Result<Page<Uuid>> {
-    let SmartPage {
-        kind,
-        favorite,
-        limit,
-        offset,
-    } = page;
+    kind: Option<AssetKind>,
+    favorite: Option<bool>,
+    filters: Option<&AssetQuery>,
+) -> Result<(String, Vec<Value>)> {
     let (tree, mut args) = compile(Some(conn), text, node)?;
     // Parenthesize the tree before appending: a compiled `or` group is a
     // bare `a OR b`, and `a OR b AND kind = ?` would let the AND bind to
@@ -325,7 +335,57 @@ fn evaluate_counted(
         expr.push_str(" AND assets.is_favorite = ?");
         args.push(Value::Integer(favorite as i64));
     }
-    let where_sql = format!("WHERE trashed_at IS NULL AND ({expr})");
+    // The remaining grid filters belong in here rather than after the page is
+    // materialized: applied to rows already fetched, they shrink the page but
+    // not the COUNT, so the header promises a set the list cannot deliver and
+    // paging never reaches its own end. `base` shifts this clause's
+    // hand-numbered placeholders past every parameter bound above it.
+    if let Some(filters) = filters {
+        let (fragment, mut fragment_args) = super::assets::where_fragment(
+            conn,
+            filters,
+            super::assets::WhereMode::Rejecting,
+            args.len(),
+        )?;
+        expr.push_str(&format!(" AND ({fragment})"));
+        args.append(&mut fragment_args);
+    }
+    Ok((format!("WHERE trashed_at IS NULL AND ({expr})"), args))
+}
+
+/// How many live assets a rule tree selects, without fetching them. The browse
+/// session asks this when the view opens, not on every page.
+pub fn count(
+    conn: &rusqlite::Connection,
+    text: Option<&crate::search::TextIndex>,
+    node: &SmartNode,
+    kind: Option<AssetKind>,
+    favorite: Option<bool>,
+    filters: Option<&AssetQuery>,
+) -> Result<u64> {
+    let (where_sql, args) = rule_where(conn, text, node, kind, favorite, filters)?;
+    Ok(rows::query_count(
+        conn,
+        &format!("SELECT COUNT(DISTINCT assets.id) FROM assets {where_sql}"),
+        args,
+    )? as u64)
+}
+
+fn evaluate_counted(
+    conn: &rusqlite::Connection,
+    text: Option<&crate::search::TextIndex>,
+    node: &SmartNode,
+    page: SmartPage,
+    count_rows: bool,
+) -> Result<Page<Uuid>> {
+    let SmartPage {
+        kind,
+        favorite,
+        limit,
+        offset,
+        filters,
+    } = page;
+    let (where_sql, mut args) = rule_where(conn, text, node, kind, favorite, filters.as_ref())?;
 
     // The COUNT never carries the page limit/offset, so snapshot the
     // where-clause args before they gain the paging ones.
@@ -334,15 +394,14 @@ fn evaluate_counted(
         "SELECT DISTINCT assets.id FROM assets {where_sql} \
          ORDER BY assets.created_at DESC, assets.id ASC"
     );
-    if let Some(limit) = limit {
-        let limit = limit.min(1_000);
+    if let Some(limit) = super::assets::checked_limit(limit)? {
         sql.push_str(" LIMIT ? OFFSET ?");
         args.push(Value::Integer(limit as i64));
         args.push(Value::Integer(offset as i64));
     }
     let ids = rows::query_map(conn, &sql, args, |row| rows::req_uuid(row, 0))?;
 
-    let total = if count {
+    let total = if count_rows {
         rows::query_count(
             conn,
             &format!("SELECT COUNT(DISTINCT assets.id) FROM assets {where_sql}"),
