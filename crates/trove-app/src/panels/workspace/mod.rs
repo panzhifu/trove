@@ -44,7 +44,8 @@ use uuid::Uuid;
 
 use crate::app::actions::{ClearSelection, MoveDown, MoveLeft, MoveRight, MoveUp, OpenPreview};
 use crate::components::preview::{
-    AssetPreviewEvent, AssetPreviewPanel, ModelViewport, ModelViewportEvent, VideoPlayer,
+    AssetPreviewEvent, AssetPreviewPanel, HoverCards, ModelViewport, ModelViewportEvent,
+    VideoPlayer,
 };
 use crate::library::{GRID_PAGE_SIZE, LibraryController, ViewMode};
 
@@ -70,11 +71,12 @@ use data::{
 // panel as its color column, fed by the same recently-used colours.
 pub(crate) use data::recent_picker_colors;
 use rows::{
-    materialize_rows, next_cell_row, prev_cell_row, refill_rows, timeline_header, timeline_rows,
+    appended_rows, list_rows, materialize_rows, next_cell_row, prev_cell_row, refill_rows,
+    timeline_header, timeline_rows,
 };
 use toolbar::{
     add_filter_button, color_filter, format_filter, kind_filter, kind_key, rating_filter,
-    selection_toolbar, shape_filter, tag_filter, title_controls,
+    resolution_filter, selection_toolbar, shape_filter, tag_filter, title_controls,
 };
 
 /// Fallback layout width before the container has been measured once
@@ -132,6 +134,10 @@ impl MainPreview {
 pub struct WorkspacePanel {
     focus_handle: FocusHandle,
     controller: Entity<LibraryController>,
+    /// The one live card: the tile the pointer rests on plays what it holds. Owned
+    /// here rather than by the controller because a hover repaint must not wake
+    /// every panel that observes the library.
+    hover: Entity<HoverCards>,
     /// Self-contained floating search (trigger + popover + input).
     search_box: Entity<SearchBox>,
     /// Framework colour picker state; the element owns its own popover, so
@@ -153,6 +159,9 @@ pub struct WorkspacePanel {
     /// Grid-zoom slider (title bar): pending scale before release; the
     /// committed value lives in [`LibraryController::row_height_scale`].
     zoom_slider: Entity<SliderState>,
+    /// The colour filter's similarity rail (0–100). Committed on release, like
+    /// the zoom slider: dragging it must not re-run the colour scan per frame.
+    colour_similarity_slider: Entity<SliderState>,
     /// The view the current [`Self::rows`] were laid out for.
     view_key: Option<ViewKey>,
     /// Cached data pass (query + cells) for the current [`DataKey`].
@@ -161,8 +170,16 @@ pub struct WorkspacePanel {
     /// How many cells the frozen rows cover (pagination / set-change cursor).
     covered: usize,
     /// Total asset count of the current view, captured by the last render and
-    /// displayed next to the title-bar buttons.
+    /// displayed next to the title-bar buttons. The paging trigger reads it
+    /// because it runs per visible row, where the fresh data pass does not.
     last_total: usize,
+    /// `last_total` is a floor: the query ran out of candidates before it had
+    /// seen everything matching, so the title bar says "at least".
+    last_truncated: bool,
+    /// The cursor has walked past the last row of the current listing. Paging
+    /// asks again from there would fetch nothing forever, so the trigger stops
+    /// until the view changes — which is what unfreezes it when rows arrive.
+    page_finished: bool,
     /// Set by the debounce timer: the next render should apply the newest
     /// width (layout recompute) even though only the width changed.
     relayout_pending: bool,
@@ -264,6 +281,41 @@ impl WorkspacePanel {
             let mut config = trove_core::config::AppConfig::load();
             config.grid_zoom = Some(scale);
             let _ = config.save();
+        }
+        cx.notify();
+    }
+
+    /// The similarity rail committed: store the box width, and re-run the
+    /// colour search it belongs to when one is on screen.
+    ///
+    /// Release rather than change, for the same reason the zoom slider commits
+    /// on release. And re-run rather than re-rank locally: the box is the
+    /// question, so a narrower one has a different answer set, not the same set
+    /// reordered.
+    fn on_colour_similarity_slider(
+        &mut self,
+        _: &Entity<SliderState>,
+        event: &SliderEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let SliderEvent::Release(value) = event else {
+            cx.notify();
+            return;
+        };
+        let similarity = value.start().clamp(0.0, 100.0);
+        let open_colour = {
+            let ctl = self.controller.read(cx);
+            ctl.visual_results
+                .as_ref()
+                .and_then(|results| results.colour.clone())
+        };
+        self.controller.update(cx, |ctl, cx| {
+            ctl.set_colour_similarity(similarity);
+            cx.notify();
+        });
+        if let Some(hex) = open_colour {
+            super::workspace_search::open_color_search(&hex, &self.controller, window, cx);
         }
         cx.notify();
     }
@@ -380,6 +432,7 @@ impl WorkspacePanel {
         let search_active = !in_trash && !in_recent && !ctl.search_text.trim().is_empty();
         let controller = self.controller.clone();
         let color_picker = self.color_picker.clone();
+        let colour_similarity = self.colour_similarity_slider.clone();
         // The extension list the format filter offers. Reading it means a full
         // scan of the live rows (32 ms on a 100k library) and this row is built
         // every frame, so it is refilled only when the generation moves.
@@ -406,7 +459,12 @@ impl WorkspacePanel {
             // the recent list included — because the query behind it honours
             // the filters there too. A filter bar that silently narrows
             // nothing is worse than no bar at all.
-            .child(color_filter(&color_picker, recent_picker_colors(cx), cx))
+            .child(color_filter(
+                &color_picker,
+                recent_picker_colors(cx),
+                &colour_similarity,
+                cx,
+            ))
             .when(tool_enabled("kind"), |row| {
                 row.child(kind_filter(&controller, cx))
             })
@@ -415,6 +473,9 @@ impl WorkspacePanel {
             })
             .when(tool_enabled("shape"), |row| {
                 row.child(shape_filter(&controller, cx))
+            })
+            .when(tool_enabled("resolution"), |row| {
+                row.child(resolution_filter(&controller, cx))
             })
             .when(tool_enabled("rating"), |row| {
                 row.child(rating_filter(&controller, cx))
@@ -574,6 +635,7 @@ impl Render for WorkspacePanel {
             filter_favorite,
             filter_orientation,
             filter_aspect,
+            filter_resolution,
             filter_min_rating,
             filter_ext,
             view_mode,
@@ -597,6 +659,7 @@ impl Render for WorkspacePanel {
                 ctl.filter_favorite,
                 ctl.filter_orientation,
                 ctl.filter_aspect,
+                ctl.filter_resolution,
                 ctl.filter_min_rating,
                 ctl.filter_ext.clone(),
                 ctl.view_mode,
@@ -629,17 +692,40 @@ impl Render for WorkspacePanel {
             filter_favorite,
             filter_orientation,
             filter_aspect,
+            filter_resolution,
             filter_min_rating,
             filter_ext,
             sort,
             sort_desc,
-            grid_loaded,
             library_root: library_root.clone(),
             cache_root: cache_root.clone(),
             generation: self.controller.read(cx).generation,
             visual: visual_ids.clone(),
         };
-        if self.data.as_ref().is_none_or(|d| d.key != data_key) {
+        // Where the user's scroll cursor is, and how many rows the cache
+        // already holds. A pass now fetches the window between the two and
+        // appends it — see [`next_window`].
+        let cached = self
+            .data
+            .as_ref()
+            .map(|d| (d.key == data_key, d.total, d.truncated, d.cells.len()));
+        let (extends, cached_total, cached_truncated, cached_cells) =
+            cached.unwrap_or((false, 0, false, 0));
+        // Whether this frame only *added* to the end of what was already
+        // listed. The layout below reads it: an appended page leaves every row
+        // on screen holding the cells it held, while any other pass replaced the
+        // listing under them.
+        let mut appended = false;
+        if let Some((offset, window)) =
+            next_window(extends, cached_total, cached_cells, grid_loaded)
+        {
+            // A fresh view starts at one page, so the cursor it inherits from
+            // the listing the user left has to be pulled back to match — or the
+            // next frame asks for everything in between.
+            if !extends && grid_loaded != window {
+                self.controller
+                    .update(cx, |ctl, _| ctl.grid_loaded = window);
+            }
             // Decide whether this refresh pays for the exact COUNT. Rapid
             // refreshes (import ticks, one-off edits) reuse the cached
             // total; the settle timer guarantees one exact pass once the
@@ -653,21 +739,52 @@ impl Render for WorkspacePanel {
             if need_count {
                 self.total_refresh = Some((now, identity));
             }
-            let (pass_total, cells) = self.run_data_pass(cx, &data_key, need_count);
-            let total = if need_count {
-                pass_total
-            } else {
-                self.arm_total_settle(cx);
-                self.data.as_ref().map(|d| d.total).unwrap_or(pass_total)
+            // Out of `self` before the pass runs, so the pass can borrow the
+            // panel mutably. A page says nothing about the total or its
+            // truncation — those belong to the listing as a whole, which is the
+            // pass that froze and counted it.
+            let previous = self.data.take();
+            let (total, cells, truncated, session) = match previous {
+                Some(previous) if extends => {
+                    let (added, nothing_new) = self.run_page_pass(
+                        cx,
+                        &data_key,
+                        previous.session.as_ref(),
+                        offset,
+                        window,
+                    );
+                    // A window with nothing in it is the end of the listing:
+                    // asking again from there returns nothing forever, so paging
+                    // stops until the view changes.
+                    self.page_finished |= nothing_new;
+                    let mut cells = Rc::unwrap_or_clone(previous.cells);
+                    cells.extend(added);
+                    appended = true;
+                    (previous.total, cells, previous.truncated, previous.session)
+                }
+                _ => {
+                    self.page_finished = false;
+                    let (pass_total, cells, pass_truncated, session) =
+                        self.run_data_pass(cx, &data_key, need_count, window);
+                    if need_count {
+                        (pass_total, cells, pass_truncated, session)
+                    } else {
+                        self.arm_total_settle(cx);
+                        (cached_total, cells, cached_truncated, session)
+                    }
+                }
             };
             self.data = Some(ViewData {
                 key: data_key,
                 total,
+                truncated,
                 cells: Rc::new(cells),
+                session,
             });
         }
         let data = self.data.as_ref().unwrap();
         let total = data.total;
+        let truncated = data.truncated;
         let cells = data.cells.clone();
         let cells_empty = cells.is_empty();
 
@@ -801,23 +918,14 @@ impl Render for WorkspacePanel {
             let old_rows = self.rows.len();
             self.relayout_pending = false;
             let rows = if view_mode == ViewMode::Timeline {
-                timeline_rows((*cells).clone(), content_width, target)
+                timeline_rows(&cells, content_width, target)
             } else if view_mode == ViewMode::List {
                 // List mode: one full-width info row per asset, no justification.
-                (*cells)
-                    .clone()
-                    .into_iter()
-                    .map(|c| Row {
-                        height: LIST_ROW_HEIGHT,
-                        widths: vec![content_width],
-                        cells: vec![c],
-                        header: None,
-                    })
-                    .collect()
+                list_rows(&cells, content_width)
             } else {
                 let aspects: Vec<f32> = cells.iter().map(|c| c.aspect()).collect();
                 let layouts = justify_layout_with_target(&aspects, content_width, target);
-                materialize_rows((*cells).clone(), &layouts)
+                materialize_rows(&cells, &layouts)
             };
             self.rows = Rc::new(rows);
             self.view_key = Some(key);
@@ -842,29 +950,34 @@ impl Render for WorkspacePanel {
                 self.list_state.reset(self.rows.len());
             }
         } else if !defer_layout && self.covered != cells.len() {
-            // Assets were added or removed: keep the frozen row *shapes*
-            // (cells per row) and refill them, so scrolling stays stable
-            // across unrelated mutations. List mode just rebuilds its
-            // trivial one-cell rows.
+            // Assets were added or removed. A page appended to the end of a
+            // listing the grid already has rows for leaves those rows holding
+            // the same cells in the same order, so they are kept as they are and
+            // only the new window is laid out. Anything else — an import, a
+            // rename, a delete — has moved the listing under the rows, and the
+            // frozen row *shapes* (cells per row) are refilled instead so
+            // scrolling stays stable across unrelated mutations.
             layout_changed = true;
+            let list_mode = view_mode == ViewMode::List;
+            let grew = appended && cells.len() > self.covered;
             let new_rows: Vec<Row> = if view_mode == ViewMode::Timeline {
                 // Sections move whenever the set does, so there is no frozen
-                // shape worth preserving here.
-                timeline_rows((*cells).clone(), content_width, target)
-            } else if view_mode == ViewMode::List {
-                (*cells)
-                    .clone()
-                    .into_iter()
-                    .map(|c| Row {
-                        height: LIST_ROW_HEIGHT,
-                        widths: vec![content_width],
-                        cells: vec![c],
-                        header: None,
-                    })
-                    .collect()
+                // head worth preserving here.
+                timeline_rows(&cells, content_width, target)
+            } else if grew {
+                appended_rows(
+                    &self.rows,
+                    self.covered,
+                    &cells,
+                    list_mode,
+                    content_width,
+                    target,
+                )
+            } else if list_mode {
+                list_rows(&cells, content_width)
             } else {
                 let counts: Vec<usize> = self.rows.iter().map(|r| r.cells.len()).collect();
-                refill_rows((*cells).clone(), &counts, content_width, target)
+                refill_rows(&cells, &counts, content_width, target)
             };
             let old_rows = self.rows.len();
             self.rows = Rc::new(new_rows);
@@ -885,6 +998,7 @@ impl Render for WorkspacePanel {
         }
         let rows = self.rows.clone();
         self.last_total = total;
+        self.last_truncated = truncated;
 
         // Publish the visible ids for Edit ▸ Select-all / Shift-range. Only
         // when the rows actually moved: flattening them is O(assets), and
@@ -902,6 +1016,9 @@ impl Render for WorkspacePanel {
         // --- virtualized list -----------------------------------------------------
         let list_state = self.list_state.clone();
         let controller = self.controller.clone();
+        // The live card is read per cell at paint time, so the closure that
+        // builds rows needs the entity rather than the panel.
+        let hover = self.hover.clone();
         let toolbar_controller = controller.clone();
         let focus_handle = self.focus_handle.clone();
         let rows_for_render = rows.clone();
@@ -918,12 +1035,15 @@ impl Render for WorkspacePanel {
         // page lands, which is the one moment another request is legitimate.
         let page_guard = self.page_guard.clone();
         let total_for_trigger = total;
+        // Copied for the closure: once the cursor has walked past the last row,
+        // the trigger stays down until the view changes.
+        let page_finished = self.page_finished;
 
         let grid = list_element(list_state, move |ix, _window, cx: &mut App| {
             // Infinite scroll: near the end, request the next page.
             if ix + PAGE_TRIGGER_ROWS >= rows_len {
                 let loaded = controller.read(cx).grid_loaded;
-                if loaded < total_for_trigger && page_guard.get() != loaded {
+                if !page_finished && loaded < total_for_trigger && page_guard.get() != loaded {
                     page_guard.set(loaded);
                     controller.update(cx, |ctl, cx| {
                         ctl.grid_loaded = (ctl.grid_loaded + GRID_PAGE_SIZE).min(total_for_trigger);
@@ -957,9 +1077,17 @@ impl Render for WorkspacePanel {
                 .children(
                     cells
                         .iter()
-                        .zip(widths)
+                        .zip(widths.iter())
                         .map(|(cell, w)| {
-                            build_cell_element(cx, &controller, &focus_handle, cell, w, height)
+                            build_cell_element(
+                                cx,
+                                &controller,
+                                &focus_handle,
+                                &hover,
+                                cell,
+                                *w,
+                                height,
+                            )
                         })
                         .collect::<Vec<_>>(),
                 )
@@ -1057,14 +1185,37 @@ impl Render for WorkspacePanel {
     }
 }
 
+/// The window the next data pass should fetch, as `(offset, rows)`, or `None`
+/// when the cache already holds everything the cursor asks for.
+///
+/// Kept out of the render path because this arithmetic is the whole paging fix:
+/// asking for "everything up to the cursor" is what made each page cost the
+/// query *and* the re-materialization of every row already on screen, and what
+/// turned the store's window bound into a ceiling on how many assets one could
+/// reach at all. Two rules hold it in check — a view opens on one page wherever
+/// the previous one got to, and a cursor left over from a longer listing cannot
+/// ask past the end of this one.
+fn next_window(
+    extends: bool,
+    cached_total: usize,
+    cached_cells: usize,
+    wanted: usize,
+) -> Option<(usize, usize)> {
+    if !extends {
+        return Some((0, wanted.clamp(1, GRID_PAGE_SIZE)));
+    }
+    let ask = wanted.min(cached_total);
+    (ask > cached_cells).then_some((cached_cells, ask - cached_cells))
+}
+
 #[cfg(test)]
 mod tests {
     // Explicit imports, not `use super::*`: the glob drags in a `test`
     // attribute macro from the gpui prelude, which makes expanding `#[test]`
     // below recurse.
     use super::{
-        Cell, Row, close_commits, color_change_commits, next_cell_row, picker_just_closed,
-        prev_cell_row, timeline_rows,
+        Cell, Row, close_commits, color_change_commits, next_cell_row, next_window,
+        picker_just_closed, prev_cell_row, timeline_rows,
     };
     use trove_core::layout::target_row_height_for_scale;
     use trove_core::model::AssetKind;
@@ -1080,12 +1231,77 @@ mod tests {
             height: Some(100),
             trashed: false,
             name: String::new(),
+            name_marks: Vec::new(),
+            score: None,
             size_bytes: 0,
             added: String::new(),
             day: day.to_string(),
             font_family: None,
             font_blob: None,
         }
+    }
+
+    /// Appending a page must leave the rows the user is looking at alone: they
+    /// are the same cells in the same order, so they are shared rather than
+    /// copied, and only the new window is laid out.
+    #[test]
+    fn an_appended_page_keeps_the_rows_it_already_had() {
+        use super::rows::{appended_rows, materialize_rows};
+        use std::rc::Rc;
+        use trove_core::layout::justify_layout_with_target;
+
+        let target = target_row_height_for_scale(1.0);
+        let cells: Vec<Cell> = (1..=12u8).map(|seed| cell(seed, "2026-09-10")).collect();
+        // The first five are the page that was on screen; the rest arrived.
+        let placed = 5;
+        let aspects: Vec<f32> = cells[..placed].iter().map(|c| c.aspect()).collect();
+        let head = materialize_rows(
+            &cells[..placed],
+            &justify_layout_with_target(&aspects, 800., target),
+        );
+        let rows = appended_rows(&head, placed, &cells, false, 800., target);
+
+        assert!(rows.len() > head.len(), "the surplus became rows");
+        for (kept, original) in rows.iter().zip(head.iter()) {
+            assert!(
+                Rc::ptr_eq(&kept.cells, &original.cells),
+                "a row that was already laid out is shared, not rebuilt"
+            );
+        }
+        let flat: Vec<Uuid> = rows
+            .iter()
+            .flat_map(|r| r.cells.iter().map(|c| c.id))
+            .collect();
+        assert_eq!(flat, cells.iter().map(|c| c.id).collect::<Vec<_>>());
+
+        // List mode: one row per asset, so the head is just as reusable.
+        let list_head = appended_rows(&[], 0, &cells[..placed], true, 800., target);
+        let list_rows = appended_rows(&list_head, placed, &cells, true, 800., target);
+        assert_eq!(list_rows.len(), cells.len());
+        assert!(
+            list_rows[..placed]
+                .iter()
+                .zip(list_head.iter())
+                .all(|(kept, original)| Rc::ptr_eq(&kept.cells, &original.cells))
+        );
+    }
+
+    /// The paging arithmetic, which is the whole fix: a pass fetches the window
+    /// that is missing, never everything up to the cursor.
+    #[test]
+    fn a_view_pages_the_window_it_is_missing() {
+        // A fresh listing opens on one page, however far the previous view got.
+        assert_eq!(next_window(false, 0, 0, 200), Some((0, 200)));
+        assert_eq!(next_window(false, 0, 0, 5_000), Some((0, 200)));
+        // Scrolling to the end asks for the next page, and only that.
+        assert_eq!(next_window(true, 3_751, 200, 400), Some((200, 200)));
+        // At the end of the listing there is nothing to fetch — which is what
+        // stops the old behaviour of re-running the query on every frame spent
+        // at the bottom of a scroll that could no longer advance.
+        assert_eq!(next_window(true, 3, 3, 200), None);
+        assert_eq!(next_window(true, 3, 2, 200), Some((2, 1)));
+        // A cursor inherited from a longer listing cannot ask past this one.
+        assert_eq!(next_window(true, 100, 100, 5_000), None);
     }
 
     #[test]
@@ -1095,7 +1311,7 @@ mod tests {
             cell(2, "2026-09-10"),
             cell(3, "2026-01-02"),
         ];
-        let rows = timeline_rows(cells, 800.0, target_row_height_for_scale(1.0));
+        let rows = timeline_rows(&cells, 800.0, target_row_height_for_scale(1.0));
 
         // Header, its rows, next header, its rows.
         assert!(rows[0].header.is_some(), "first row is a header");
@@ -1127,15 +1343,15 @@ mod tests {
             Row::section("newest".into()),
             Row {
                 height: 100.0,
-                widths: vec![100.0, 100.0],
-                cells: vec![cell(1, "2026-09-10"), cell(2, "2026-09-10")],
+                widths: vec![100.0, 100.0].into(),
+                cells: vec![cell(1, "2026-09-10"), cell(2, "2026-09-10")].into(),
                 header: None,
             },
             Row::section("older".into()),
             Row {
                 height: 100.0,
-                widths: vec![100.0],
-                cells: vec![cell(3, "2026-09-09")],
+                widths: vec![100.0].into(),
+                cells: vec![cell(3, "2026-09-09")].into(),
                 header: None,
             },
         ];

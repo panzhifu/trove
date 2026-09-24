@@ -70,7 +70,7 @@ impl ColorHistogram {
 
     /// Build a histogram from an image file.
     pub fn from_image(path: &Path) -> Self {
-        match image::open(path) {
+        match crate::media::hdr::open_for_display(path) {
             Ok(img) => Self::from_rgb(&img.to_rgb8()),
             _ => Self::default(),
         }
@@ -169,7 +169,7 @@ impl PHash {
 
     /// Compute pHash from an image file. Returns a zero hash for undecodable files.
     pub fn from_image(path: &Path) -> Self {
-        match image::open(path) {
+        match crate::media::hdr::open_for_display(path) {
             Ok(img) => {
                 let gray = image::imageops::grayscale(&img);
                 Self::from_gray(&gray)
@@ -263,7 +263,7 @@ impl VisualSignature {
 
     /// Compute the full visual signature from an image file.
     pub fn from_image(path: &Path) -> Self {
-        match image::open(path) {
+        match crate::media::hdr::open_for_display(path) {
             Ok(img) => Self::from_rgb(&img.to_rgb8()),
             _ => Self {
                 phash: PHash(0),
@@ -339,6 +339,137 @@ pub fn color_similarity(distance: f32) -> f32 {
     (1.0 - distance / 441.67).max(0.0)
 }
 
+// ---------------------------------------------------------------------------
+// Colour matching in the space the question is asked in
+// ---------------------------------------------------------------------------
+
+/// A colour where it sorts like the eye sorts it: hue in degrees (0–360),
+/// saturation and lightness in 0..=1.
+///
+/// RGB distance — what [`color_similarity`] measures — is the wrong space for a
+/// "find me the red ones" question: two reds of different brightness are far
+/// apart in RGB and adjacent in hue, and a grey has no hue at all but still
+/// scores as if it did.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Hsl {
+    pub h: f32,
+    pub s: f32,
+    pub l: f32,
+}
+
+/// Convert an 8-bit RGB to HSL. Pure black and pure white land at `s = 0` with
+/// an undefined hue, which is reported as 0 rather than as a noise value — the
+/// caller decides that a hueless colour matches on lightness alone.
+pub fn rgb_to_hsl(rgb: [u8; 3]) -> Hsl {
+    let r = rgb[0] as f32 / 255.0;
+    let g = rgb[1] as f32 / 255.0;
+    let b = rgb[2] as f32 / 255.0;
+    let max = r.max(g).max(b);
+    let min = r.min(g).min(b);
+    let lightness = (max + min) / 2.0;
+    let delta = max - min;
+    if delta == 0.0 {
+        return Hsl {
+            h: 0.0,
+            s: 0.0,
+            l: lightness,
+        };
+    }
+    // A dark colour's saturation is relative to how little light there is to
+    // carry it, a bright one's to how little room is left.
+    let denominator = 1.0 - (2.0 * lightness - 1.0).abs();
+    let saturation = if denominator > 0.0 {
+        delta / denominator
+    } else {
+        0.0
+    };
+    let hue = if max == r {
+        ((g - b) / delta) % 6.0
+    } else if max == g {
+        (b - r) / delta + 2.0
+    } else {
+        (r - g) / delta + 4.0
+    };
+    let mut hue = hue * 60.0;
+    if hue < 0.0 {
+        hue += 360.0;
+    }
+    Hsl {
+        h: hue,
+        s: saturation,
+        l: lightness,
+    }
+}
+
+/// Below this saturation a colour has no hue worth matching on. The rule is
+/// asymmetric, and both halves matter: a grey *ask* ("dark", "pale") is answered
+/// by lightness alone, while a grey *candidate* never answers a coloured ask —
+/// without the floor, a near-black pixel with 3 % red in it reads as "red" and a
+/// colour filter fills up with blacks.
+pub const CHROMA_FLOOR: f32 = 0.15;
+
+/// How wide a colour counts as a match.
+///
+/// Built from the 0–100 "similarity" the interface asks for: 0 is the loosest
+/// box (55° of hue, half the saturation and lightness range), 100 the tightest
+/// (10°, 0.1, 0.1). The endpoints and the linear interpolation between them are
+/// the shape a colour filter has to have — a slider that changed only a score
+/// threshold while the box stayed fixed would let the user widen *nothing*.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ColourMatch {
+    pub hue_span: f32,
+    pub sat_delta: f32,
+    pub light_delta: f32,
+    pub chroma_floor: f32,
+}
+
+impl ColourMatch {
+    /// The box for a 0–100 similarity ask. Values outside are clamped, so the
+    /// caller can pass a slider through unmodified.
+    pub fn from_similarity(similarity: f32) -> Self {
+        let t = similarity.clamp(0.0, 100.0) / 100.0;
+        Self {
+            hue_span: 55.0 + (10.0 - 55.0) * t,
+            sat_delta: 0.5 + (0.1 - 0.5) * t,
+            light_delta: 0.42 + (0.1 - 0.42) * t,
+            chroma_floor: CHROMA_FLOOR,
+        }
+    }
+
+    /// How well `candidate` answers a request for `query`, from 0.0 (outside the
+    /// box) to 1.0 (the same colour).
+    ///
+    /// The worst axis decides the score: a red with exactly the right hue but a
+    /// lightness at the box edge is not "a close match", it is a miss with one
+    /// axis saved. Averaging the axes would hide that and rank dark maroons
+    /// beside bright scarlet.
+    pub fn score(&self, query: Hsl, candidate: Hsl) -> f32 {
+        let lightness = self.axis(query.l - candidate.l, self.light_delta);
+        if query.s < self.chroma_floor {
+            // The ask has no hue at all — it is "dark", "pale", "grey" — so hue
+            // cannot answer it and lightness is the whole question.
+            return lightness;
+        }
+        if candidate.s < self.chroma_floor {
+            // And the converse, which is the one that reads as a bug if you get
+            // it wrong: a grey is not a shade of red however exactly its
+            // lightness lines up, so it never answers a coloured ask.
+            return 0.0;
+        }
+        let delta = (query.h - candidate.h).abs() % 360.0;
+        // Hue is a circle: 350° and 10° are 20° apart, not 340°.
+        let hue_delta = delta.min(360.0 - delta);
+        self.axis(hue_delta, self.hue_span)
+            .min(self.axis(query.s - candidate.s, self.sat_delta))
+            .min(lightness)
+    }
+
+    /// One axis's share of the score: how much of the half-width is left.
+    fn axis(&self, delta: f32, half_width: f32) -> f32 {
+        (1.0 - delta.abs() / half_width).max(0.0)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -393,5 +524,100 @@ mod tests {
         assert!(facts.visual.visual_color_hist.is_some());
         let loaded = VisualSignature::from_facts(&facts).unwrap();
         assert_eq!(loaded.phash, sig.phash);
+    }
+
+    #[test]
+    fn rgb_to_hsl_lands_where_the_eye_lands() {
+        let near = |a: f32, b: f32| (a - b).abs() < 0.01;
+        let red = rgb_to_hsl([255, 0, 0]);
+        assert!(
+            near(red.h, 0.0) && near(red.s, 1.0) && near(red.l, 0.5),
+            "{red:?}"
+        );
+        // Same hue, different brightness: RGB distance calls these far apart,
+        // the hue says they are the same colour, and that is the point.
+        let dark_red = rgb_to_hsl([128, 0, 0]);
+        assert!(
+            near(dark_red.h, 0.0) && near(dark_red.l, 0.25),
+            "{dark_red:?}"
+        );
+        let green = rgb_to_hsl([0, 255, 0]);
+        assert!(near(green.h, 120.0), "{green:?}");
+        let blue = rgb_to_hsl([0, 0, 255]);
+        assert!(near(blue.h, 240.0), "{blue:?}");
+        for grey in [[0u8, 0, 0], [128, 128, 128], [255, 255, 255]] {
+            let h = rgb_to_hsl(grey);
+            assert_eq!(h.s, 0.0, "{grey:?} has no saturation to speak of");
+        }
+    }
+
+    #[test]
+    fn a_tighter_similarity_narrows_the_box_on_every_axis() {
+        let loose = ColourMatch::from_similarity(0.0);
+        let tight = ColourMatch::from_similarity(100.0);
+        assert!((loose.hue_span - 55.0).abs() < 0.01, "{loose:?}");
+        assert!((tight.hue_span - 10.0).abs() < 0.01, "{tight:?}");
+        assert!((tight.sat_delta - 0.1).abs() < 0.01);
+        assert!((tight.light_delta - 0.1).abs() < 0.01);
+        assert!(tight.hue_span < loose.hue_span);
+        assert!(tight.sat_delta < loose.sat_delta);
+        assert!(tight.light_delta < loose.light_delta);
+        // The slider's ends are the contract; a value off the rail is clamped
+        // rather than becoming a negative box that matches nothing at all.
+        assert_eq!(
+            ColourMatch::from_similarity(-50.0),
+            ColourMatch::from_similarity(0.0)
+        );
+        assert_eq!(
+            ColourMatch::from_similarity(999.0),
+            ColourMatch::from_similarity(100.0)
+        );
+    }
+
+    #[test]
+    fn colour_scores_are_worst_axis_not_average_and_wrap_on_hue() {
+        let red = rgb_to_hsl([255, 0, 0]);
+        let match_loose = ColourMatch::from_similarity(0.0);
+        // Same colour, both ends of the rail.
+        assert!((match_loose.score(red, red) - 1.0).abs() < 1e-6);
+        assert!((ColourMatch::from_similarity(100.0).score(red, red) - 1.0).abs() < 1e-6);
+        // Hue is a circle: these two sit ~2.5° either side of 0°, so a naive
+        // |a - b| would call them 355° apart and reject them.
+        let wrap_a = rgb_to_hsl([255, 0, 10]);
+        let wrap_b = rgb_to_hsl([255, 10, 0]);
+        assert!(
+            match_loose.score(wrap_a, wrap_b) > 0.0,
+            "adjacent hues across 0° must match: {wrap_a:?} {wrap_b:?}"
+        );
+        // Green is 120° from red: outside even the loosest box.
+        assert_eq!(match_loose.score(red, rgb_to_hsl([0, 255, 0])), 0.0);
+        // Worst axis, not average: right hue and saturation, lightness past the
+        // edge, is a miss rather than a third of a match.
+        let box_tight = ColourMatch::from_similarity(100.0);
+        let dark_red = rgb_to_hsl([128, 0, 0]);
+        assert_eq!(
+            box_tight.score(red, dark_red),
+            0.0,
+            "{red:?} vs {dark_red:?}"
+        );
+        // A neutral is not a shade of anything: a grey never answers a coloured
+        // ask, however exactly its lightness lines up.
+        let grey = rgb_to_hsl([128, 128, 128]);
+        assert_eq!(
+            match_loose.score(red, grey),
+            0.0,
+            "a grey answered a red query: {grey:?}"
+        );
+        // The converse does hold: a *grey ask* is a question about lightness,
+        // and a saturated colour at that brightness is a plausible answer.
+        assert!(
+            match_loose.score(grey, red) > 0.0,
+            "nothing answered a mid-grey ask"
+        );
+        assert_eq!(
+            match_loose.score(red, rgb_to_hsl([255, 255, 255])),
+            0.0,
+            "white is too far from red's lightness even for the loosest box"
+        );
     }
 }

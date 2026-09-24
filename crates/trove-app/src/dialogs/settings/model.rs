@@ -45,26 +45,6 @@ pub(super) fn model_page() -> SettingPage {
 
 // ============================== look switches ================================
 
-/// A boolean setting, stored as `Some(value)` on one `AppConfig` field.
-///
-/// The framework's switch, the same control the About page uses for automatic
-/// updates: flipped, not labelled — the row's title already says what it is,
-/// so the control only has to say whether it is on.
-fn config_switch(
-    read: fn(&AppConfig) -> bool,
-    write: impl Fn(&mut AppConfig, bool) + 'static,
-) -> SettingField<bool> {
-    SettingField::switch(
-        move |_cx| read(&AppConfig::load()),
-        move |value, cx| {
-            let mut config = AppConfig::load();
-            write(&mut config, value);
-            let _ = config.save();
-            cx.refresh_windows();
-        },
-    )
-}
-
 // ========================= preview zoom limits ==============================
 
 /// Model ▸ Preview zoom: how far the viewport will zoom in and out.

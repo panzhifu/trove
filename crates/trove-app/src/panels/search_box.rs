@@ -42,6 +42,27 @@ impl SearchBox {
             match event {
                 InputEvent::PressEnter { .. } => {
                     let text = this.input.read(cx).value().trim().to_string();
+                    // Part of the box may not have parsed. The search still
+                    // runs with what did — a query that silently ignores a
+                    // fragment is a wrong answer with no visible cause — so
+                    // every complaint goes to the status bar, not just the
+                    // first: a box with two mistakes in it has two fragments
+                    // the user needs to see vanish.
+                    let errors = trove_core::search::expression::parse(&text).errors;
+                    if !errors.is_empty() {
+                        let listed = errors
+                            .iter()
+                            .map(|error| error.to_string())
+                            .collect::<Vec<_>>()
+                            .join("; ");
+                        let msg =
+                            rust_i18n::t!("workspace.search_syntax", error = listed).to_string();
+                        this.controller.update(cx, |ctl, cx| {
+                            if ctl.report_error(msg) {
+                                cx.notify();
+                            }
+                        });
+                    }
                     this.controller.update(cx, |ctl, _| ctl.set_search(text));
                     // Search tiers: fetch whatever the enabled tier needs in
                     // the background. The grid paints the text ranking now and

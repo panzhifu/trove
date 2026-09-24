@@ -9,7 +9,7 @@ use uuid::Uuid;
 use trove_core::config::AppConfig;
 use trove_core::library::Library;
 use trove_core::media::height_color::StoredLook;
-use trove_core::model::{AspectPreset, AssetKind, AssetSort, Orientation};
+use trove_core::model::{AspectPreset, AssetKind, AssetSort, Orientation, ResolutionBand};
 use trove_core::store::browse::SearchTiers;
 use trove_core::store::model_look;
 use trove_core::store::view_history;
@@ -157,6 +157,11 @@ impl AnalysisProbe {
 /// paged queries loads. Scrolling near the end loads the next page.
 pub const GRID_PAGE_SIZE: usize = 200;
 
+/// Where the colour filter's similarity rail sits for someone who has never
+/// touched it: the middle of the box, which is what "find me the red ones"
+/// means before the user says otherwise.
+pub const DEFAULT_COLOUR_SIMILARITY: f32 = 50.0;
+
 /// Ranked result set of a visual search (similar-image / by-colour): a
 /// display label plus `(asset id, similarity score)` pairs in rank order.
 /// The workspace grid shows exactly these assets while it is active.
@@ -170,13 +175,25 @@ pub struct VisualSearchResults {
     /// O(hits) — capped at [`CANDIDATE_CAP`](crate::search::CANDIDATE_CAP)
     /// — for a list that only changes when a new search lands.
     pub ids: Rc<Vec<Uuid>>,
+    /// The colour this result set was a question about, when it was one.
+    ///
+    /// The similarity slider re-runs *the same ask* at a different box width,
+    /// and the label it would otherwise have to be read back out of is
+    /// translated (`workspace.color_search` × nine locales), so the answer is
+    /// stored rather than parsed.
+    pub colour: Option<String>,
 }
 
 impl VisualSearchResults {
     /// Build the result set, deriving the rank-ordered id list once.
-    pub fn new(label: String, hits: Vec<(Uuid, f32)>) -> Self {
+    pub fn new(label: String, hits: Vec<(Uuid, f32)>, colour: Option<String>) -> Self {
         let ids = Rc::new(hits.iter().map(|(id, _)| *id).collect());
-        Self { label, hits, ids }
+        Self {
+            label,
+            hits,
+            ids,
+            colour,
+        }
     }
 }
 
@@ -259,6 +276,14 @@ pub struct LibraryController {
     /// this mutually exclusive with [`Self::filter_orientation`] — picking
     /// one clears the other — but both compose at the query layer.
     pub filter_aspect: Option<AspectPreset>,
+    /// Resolution band by longer edge. Independent of the two shape filters:
+    /// they compare proportions, this compares size, and a 4K frame is 4K at
+    /// any ratio.
+    pub filter_resolution: Option<ResolutionBand>,
+    /// How tight a colour search's match box is, on the interface's 0–100 rail
+    /// (0 loosest, 100 tightest). It is a *question width*, not a score
+    /// threshold: see `trove_core::media::search::ColourMatch`.
+    pub colour_similarity: f32,
     pub filter_min_rating: Option<u8>,
     pub filter_ext: Option<String>,
     /// Grid or list presentation of the asset area.
@@ -387,6 +412,8 @@ impl LibraryController {
             filter_favorite: false,
             filter_orientation: None,
             filter_aspect: None,
+            filter_resolution: None,
+            colour_similarity: DEFAULT_COLOUR_SIMILARITY,
             filter_min_rating: None,
             filter_ext: None,
             view_mode: ViewMode::default(),
@@ -724,6 +751,25 @@ impl LibraryController {
         }
     }
 
+    pub fn set_filter_resolution(&mut self, band: Option<ResolutionBand>) {
+        if self.filter_resolution != band {
+            self.filter_resolution = band;
+            self.reset_grid_page();
+            self.filter_generation += 1;
+        }
+    }
+
+    /// Set the colour search's match-box width (0–100). Deliberately does *not*
+    /// bump `generation`: it changes how a colour question is asked, not what
+    /// any browsed view lists. The colour search itself is re-run by the panel
+    /// that owns the slider.
+    pub fn set_colour_similarity(&mut self, similarity: f32) {
+        let similarity = similarity.clamp(0.0, 100.0);
+        if self.colour_similarity != similarity {
+            self.colour_similarity = similarity;
+        }
+    }
+
     pub fn set_filter_min_rating(&mut self, rating: Option<u8>) {
         if self.filter_min_rating != rating {
             self.filter_min_rating = rating;
@@ -745,12 +791,14 @@ impl LibraryController {
             || self.filter_favorite
             || self.filter_orientation.is_some()
             || self.filter_aspect.is_some()
+            || self.filter_resolution.is_some()
             || self.filter_min_rating.is_some()
             || self.filter_ext.is_some();
         self.filter_kind = None;
         self.filter_favorite = false;
         self.filter_orientation = None;
         self.filter_aspect = None;
+        self.filter_resolution = None;
         self.filter_min_rating = None;
         self.filter_ext = None;
         if changed {
@@ -849,6 +897,7 @@ impl LibraryController {
         self.filter_favorite = false;
         self.filter_orientation = None;
         self.filter_aspect = None;
+        self.filter_resolution = None;
         self.filter_min_rating = None;
         self.filter_ext = None;
         self.import_phase = ImportPhase::Idle;
@@ -1069,8 +1118,13 @@ impl LibraryController {
     /// Enter the visual-search results view: the grid shows the ranked
     /// hits in place of the browsed view. The selection resets because the
     /// content under it changes.
-    pub fn open_visual_search(&mut self, label: String, hits: Vec<(Uuid, f32)>) {
-        self.visual_results = Some(VisualSearchResults::new(label, hits));
+    pub fn open_visual_search(
+        &mut self,
+        label: String,
+        hits: Vec<(Uuid, f32)>,
+        colour: Option<String>,
+    ) {
+        self.visual_results = Some(VisualSearchResults::new(label, hits, colour));
         self.selected_assets = Rc::new(Vec::new());
         self.selection_anchor = None;
         self.selection_source = SelectionSource::None;

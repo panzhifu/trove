@@ -21,9 +21,9 @@
 源文件
   │
   ▼
-┌─────────────┐  产出: sha256, size, rel_path
+┌─────────────┐  产出: blake3, size, rel_path
 │  HashStage  │  成本: IO
-│   哈希阶段   │  读取源文件一次，计算 SHA-256
+│   哈希阶段   │  读取源文件一次，计算 BLAKE3
 └──────┬──────┘
        │
        ▼
@@ -51,7 +51,7 @@
 └──────┬──────┘
        │
        ▼
-┌─────────────┐  产出: pHash + color histogram
+┌─────────────┐  产出: dHash + color histogram
 │ VisualSig   │  成本: CPU
 │ 视觉签名阶段 │  感知哈希 + 颜色直方图 → 用于以图搜图
 └──────┬──────┘
@@ -72,7 +72,7 @@
 | 成本 | `Cost::Io` |
 | 输入 | 源文件路径 |
 
-- 计算源文件的 SHA-256 哈希
+- 计算源文件的 BLAKE3 哈希
 - 对于复制导入（`ImportStorage::Copy`），将文件暂存到 blob 目录
 - 对于链接导入（`ImportStorage::Link`），仅记录路径
 
@@ -140,9 +140,41 @@
 | 依赖 | `Need::Decode` |
 | 成本 | `Cost::Cpu` |
 
-- 计算感知哈希 (pHash) — 用于以图搜图
+- 计算差异哈希 (dHash) — 用于以图搜图
 - 计算颜色直方图 — 用于颜色相似度搜索
 - 仅对图片执行
+
+---
+
+## 每种类型实际经过哪些阶段
+
+阶段列表对所有人一致，**分支靠在阶段内自查 `io.kind`**（而不是维护多条管线）。下表是读代码时最想先知道
+的那件事：某个类型的文件到底做了什么、什么被跳过。✅ = 有实际工作，— = 立即返回 `Ok`。
+
+| 阶段 | 图片 | 视频 | **音频** | 字体 | 3D | 文档 / 压缩包 / 其他 |
+|------|------|------|---------|------|----|--------------------|
+| Hash | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Probe | ✅ kind·mime·头部尺寸 | ✅ kind·mime·moov / ffprobe 尺寸时长 | ✅ kind·mime | ✅ kind·mime | ✅ kind·mime | ✅ kind·mime |
+| Decode | ✅ 唯一一次解码 | — | **—** | — | — | — |
+| Thumb | ✅ 降采样 | ✅ ffmpeg 海报 | ⚠️ **仅当内嵌封面存在，或波形包络已在缓存**（否则 `None` → kind 图标） | ✅ 样张卡片 | ✅ 正交卡片 | — |
+| Mine | ✅ EXIF + 主色板 | —（时长由 Probe 带入） | ✅ **lofty：标题 / 艺术家 / 专辑 / 时长** | ✅ 族·样式·字重 | — | — |
+| VisualSig | ✅ | — | — | — | — | — |
+
+音频这一行值得单独说明三点：
+
+1. **它在管线里，且没有空转。** `DecodeStage` / `VisualSigStage` 各自开头就是 `if io.kind != AssetKind::Image { return Ok(()) }`，
+   `ThumbStage` 对音频只在**文件里真有内嵌封面**、或**波形包络已经被缓存**时产出缩略图，否则回到 `None` 让 kind 图标顶上：
+   跳过是显式契约，不是漏配，而且这条路径上音频**不会**为一张卡片起 ffmpeg。整条管线音频只付一次文件读 + 一次 lofty 解析。
+2. **`ProbeStage` 没有音频分支**，所以音频时长不是探出来的而是 `MineStage` 挖出来的，随后由它自己
+   把 `io.duration_ms` 与 `io.mined.duration_ms` 对齐（`pipeline.rs` 的 MineStage::run）。好处是音频永远不会为
+   探时长去抢一个 ffmpeg 进程槽。
+3. **波形不在管线里**，是首次播放时现算并单独缓存（`media/waveform.rs`）。刻意不挂进导入：它要读完整段音频，
+   而导入的正确性不该取决于一个纯展示用的派生物；而且管线失败会跳过整个文件，一个算不出包络的音频
+   不该因此进不了库。同一份包络后来还兼作无封面音频的**网格卡片**，付费的地方是
+   [BACKUP-MAINTENANCE.md](./BACKUP-MAINTENANCE.md) 里的缩略图重建，不是这里。
+4. **导入即完整**：时长写进 `assets.duration_ms` 列、标题写进资产 `title`、艺术家/专辑写进 `facts.media`。
+   这意味着后续补播放器或补缩略图**都不需要重新导入**——缩略图按内容哈希寻址且可懒生成，
+   检查器要读的字段早就在行里了。
 
 ---
 
@@ -165,7 +197,7 @@ stage_source()  ──────►  commit_staged()
 - 返回 `StagedFile` 结构（包含所有中间产物）
 
 **`commit_staged`**（主线程）：
-- 去重：检查 sha256 是否已存在
+- 去重：检查内容哈希（BLAKE3）是否已存在
 - 插入资产记录
 - 写入标签/集合关联
 - 入队搜索索引更新
@@ -176,8 +208,8 @@ stage_source()  ──────►  commit_staged()
 
 导入时自动去重：
 
-1. **内容去重**：SHA-256 相同 → 复用已有资产记录
-2. **视觉去重**：pHash 汉明距离 ≤ 阈值 → 标记为重复图片
+1. **内容去重**：BLAKE3 相同 → 复用已有资产记录
+2. **视觉去重**：dHash 汉明距离 ≤ 阈值 → 标记为重复图片
 3. **重复处理**：保留最新，其余入回收站
 
 ---
@@ -211,6 +243,6 @@ stage_source()  ──────►  commit_staged()
 | `trove-core/src/media/thumb.rs` | 缩略图缓存管理 |
 | `trove-core/src/media/metadata.rs` | 元数据提取 |
 | `trove-core/src/media/color.rs` | 色板计算 |
-| `trove-core/src/media/search.rs` | 视觉签名 (pHash + 直方图) |
+| `trove-core/src/media/search.rs` | 视觉签名（dHash + 直方图） |
 | `trove-core/src/media/probe.rs` | 文件类型探测 |
 | `trove-core/src/media/blob.rs` | Blob 暂存与哈希 |

@@ -88,6 +88,10 @@ pub fn paths(args: &Cli) -> Result<Rendered, CliError> {
             "metadata_json": data_root.join("library.json").display().to_string(),
             "search_index": cache_root.join("search_index").display().to_string(),
             "thumbnails": cache_root.join("thumbs").display().to_string(),
+            // The other two derived tenants, so a script asking "what is using
+            // my cache" gets an answer that names everything in it.
+            "waveforms": cache_root.join("waveforms").display().to_string(),
+            "contact_sheet": cache_root.join("contact-sheet").display().to_string(),
         },
         "data_dir": paths::data_dir().display().to_string(),
         "cache_dir": paths::cache_dir().display().to_string(),
@@ -226,6 +230,14 @@ fn build_query(env: &Env, filter: &FilterArgs) -> Result<AssetQuery, CliError> {
     if filter.limit == 0 {
         return Err(CliError::usage("--limit must be at least 1"));
     }
+    if filter.limit > trove_core::store::assets::MAX_PAGE {
+        // Said here rather than by the store so it reports as a bad ask about
+        // the flag, and so `--limit` never quietly fetches less than it names.
+        return Err(CliError::usage(format!(
+            "--limit takes at most {}",
+            trove_core::store::assets::MAX_PAGE
+        )));
+    }
 
     let mut query = AssetQuery {
         kind: filter.kind.map(Into::into),
@@ -237,6 +249,7 @@ fn build_query(env: &Env, filter: &FilterArgs) -> Result<AssetQuery, CliError> {
             .map(|ext| ext.trim().trim_start_matches('.').to_lowercase()),
         orientation: filter.orientation.map(Into::into),
         aspect: filter.aspect.map(Into::into),
+        resolution: filter.resolution.map(Into::into),
         source_path_prefix: filter.folder.clone(),
         usage_status: filter.usage.map(Into::into),
         is_trashed: filter.trashed,
@@ -266,6 +279,10 @@ fn page_rendered(env: &Env, page: Page<Asset>) -> Rendered {
 
     let mut object = Map::new();
     object.insert("total".into(), json!(page.total));
+    // `total` is a floor when the search ran out of candidates: the library
+    // holds at least this many matches, possibly more that were never seen.
+    // Omitting this would let `trove search` print a count it does not know.
+    object.insert("truncated".into(), json!(page.truncated));
     object.insert("returned".into(), json!(count));
     object.insert("assets".into(), Value::Array(items));
     let result = Value::Object(object);

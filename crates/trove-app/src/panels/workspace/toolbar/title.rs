@@ -78,7 +78,20 @@ impl DockPanel for WorkspacePanel {
         let slider_value = self.zoom_slider.read(cx).value().start();
         let zoom_label = format!("{:.0}%", (slider_value * 100.0).round());
         let count_label = if loaded < total {
-            rust_i18n::t!("workspace.scroll_hint", loaded = loaded, total = total).to_string()
+            if self.last_truncated {
+                // Every number here is a floor: the query ran out of candidates,
+                // and there is more of the library behind it than was seen.
+                rust_i18n::t!(
+                    "workspace.scroll_hint_at_least",
+                    loaded = loaded,
+                    total = total
+                )
+                .to_string()
+            } else {
+                rust_i18n::t!("workspace.scroll_hint", loaded = loaded, total = total).to_string()
+            }
+        } else if self.last_truncated {
+            rust_i18n::t!("workspace.items_at_least", count = total).to_string()
         } else if total == 1 {
             rust_i18n::t!("workspace.item_one").to_string()
         } else {
@@ -177,7 +190,7 @@ fn preview_toolbar(
     use gpui_kit::assets::IconName as ToolIcon;
     use gpui_kit::component::Disableable as _;
 
-    let (asset_id, is_image, blocker, write_back, original) = {
+    let (asset_id, is_image, blocker, write_back, original, has_video) = {
         let panel = preview.read(cx);
         (
             panel.asset_id(),
@@ -185,6 +198,7 @@ fn preview_toolbar(
             panel.edit_blocker(),
             panel.write_back(),
             panel.original_path().map(std::path::Path::to_path_buf),
+            panel.has_video(),
         )
     };
     // The panel entity, so a write-back confirmation can reopen the preview
@@ -287,6 +301,27 @@ fn preview_toolbar(
                 .tooltip(tooltip("viewport.edit_image"))
                 .on_click(move |_, window, cx| {
                     crate::dialogs::edit::EditDialog::open_for_asset(window, cx, ctl.clone(), id);
+                }),
+        );
+    }
+
+    // A video paused on a frame can hand that frame to the library as an asset
+    // of its own. The button belongs to the live player rather than to the
+    // asset: with no ffmpeg there is no player, and a still of the poster this
+    // panel already paints would only be a copy of what is on screen.
+    if has_video {
+        let ctl = controller.clone();
+        let preview_entity = preview.clone();
+        bar = bar.child(
+            Button::new("preview-grab-frame")
+                .ghost()
+                .xsmall()
+                .icon(ToolIcon::Camera)
+                .tooltip(rust_i18n::t!("viewport.grab_frame").to_string())
+                .on_click(move |_, window, cx| {
+                    preview_entity.update(cx, |this, cx| {
+                        this.grab_frame(&ctl, window, cx);
+                    });
                 }),
         );
     }

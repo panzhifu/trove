@@ -16,6 +16,8 @@
 //! Text is one leg of retrieval; the other is semantic — [`vector`] holds
 //! the in-memory embedding index over the `asset_embeddings` table.
 
+pub mod expression;
+pub mod highlight;
 pub mod vector;
 
 use std::cell::RefCell;
@@ -61,6 +63,21 @@ const WRITER_HEAP: usize = 32 * 1024 * 1024;
 /// matches far more documents than this, and the reported total stops climbing
 /// at the cap.
 pub const CANDIDATE_CAP: usize = 2000;
+/// The ceiling on a gather that has been widened to answer a filtered search.
+///
+/// The widening itself is not optional — see [`pool_for`](TextIndex::pool_for):
+/// filters run *after* ranking, so any pool that stops short of the term's
+/// whole result set can hide the one asset that matches both. This number is
+/// where "complete" gives way to "bounded": above it the search says so out
+/// loud (`Page::truncated`, which the title bar renders as "at least N" and
+/// `trove search` reports as a `truncated` field) rather than being quietly
+/// short.
+///
+/// The cost is linear in the pool and dominated by one stored-document read
+/// per hit — measured on a 100k-document index, a debug build: 2000 ids in
+/// 99 ms, 20000 in 297 ms, all 100000 in 1.02 s. It is paid once per frozen
+/// listing ([`crate::store::BrowseSession`]), not once per page.
+pub const MAX_RANKED_POOL: usize = 200_000;
 /// Registered tokenizer names.
 const TOK_JIEBA: &str = "jieba";
 const TOK_TRI: &str = "tri";
@@ -507,6 +524,24 @@ impl TextIndex {
         Self::collect_ids(&searcher, self.f.asset_id, top)
     }
 
+    /// Search a parsed [`expression::Expression`]: `|` groups OR, atoms inside
+    /// a group AND, a `-` atom excludes, and a field qualifier restricts which
+    /// surface a term may match.
+    pub fn search_expression(
+        &self,
+        expr: &expression::Expression,
+        cap: usize,
+    ) -> Result<Vec<Uuid>> {
+        let searcher = self.reader.searcher();
+        let top = searcher
+            .search(
+                &self.build_expression_query(expr),
+                &TopDocs::with_limit(cap).order_by_score(),
+            )
+            .map_err(|e| Error::Db(format!("search index: {e}")))?;
+        Self::collect_ids(&searcher, self.f.asset_id, top)
+    }
+
     /// Search using an AI-generated plan: keywords are ANDed (Must),
     /// synonyms are ORed (Should), and exclusions are negated (MustNot).
     /// Synonyms only boost ranking — a keyword-only match still returns.
@@ -521,6 +556,77 @@ impl TextIndex {
             .search(&query, &TopDocs::with_limit(cap).order_by_score())
             .map_err(|e| Error::Db(format!("search index: {e}")))?;
         Self::collect_ids(&searcher, self.f.asset_id, top)
+    }
+
+    /// The ranked pool for one search box, gathered wide enough to survive the
+    /// filters that are about to be applied to it.
+    ///
+    /// Returns the ids and whether the pool **ran out** — `true` means the
+    /// caller's total is a floor and more matches exist than were seen. Two
+    /// facts make this worth one extra gather instead of a permanent
+    /// compromise: a pool that comes back exactly full is the visible sign of
+    /// running out, and the filters are applied *after* ranking
+    /// ([`crate::store::assets::rank_intersect`]), so a saturated pool can hide
+    /// a match that satisfies both the term and the filter.
+    ///
+    /// `plan` replaces the expression's terms when the AI tier answered for a
+    /// plain box; `raw` is what an unremarkable box is looked up by, so the
+    /// pre-expression path stays byte-identical.
+    pub fn pool_for(
+        &self,
+        raw: &str,
+        expr: &expression::Expression,
+        plan: Option<&crate::ai::search_planner::AiSearchPlan>,
+        narrowed: bool,
+    ) -> Result<(Vec<Uuid>, bool)> {
+        let first = self.pool_at(raw, expr, plan, CANDIDATE_CAP)?;
+        if first.len() < CANDIDATE_CAP {
+            return Ok((first, false));
+        }
+        if !narrowed {
+            // Nothing is about to reject rows, so the cap bounds the *listing*,
+            // not the answer: every asset the term matches is in the ranking,
+            // the caller simply stops showing it at 2000. `truncated` says so.
+            return Ok((first, true));
+        }
+        // With filters in play, gathering to a fixed width can hide a match, so
+        // the width that is not a compromise is "everything the term has".
+        let (cap, ceiling) = Self::gather_cap(self.num_docs());
+        let wide = self.pool_at(raw, expr, plan, cap)?;
+        let ran_out = ceiling && wide.len() == cap;
+        Ok((wide, ran_out))
+    }
+
+    /// `(how wide to gather, whether that width can still hide something)`.
+    ///
+    /// A library with no more documents than [`MAX_RANKED_POOL`] is gathered in
+    /// full, which cannot hide anything — the pool is the whole index, so a
+    /// saturated length there only means the *term* matched everything and the
+    /// filters are free to reject it. Only past the ceiling does a gather return
+    /// less than exists, and only then is `truncated` the honest word.
+    fn gather_cap(docs: u64) -> (usize, bool) {
+        let docs = docs as usize;
+        if docs <= MAX_RANKED_POOL {
+            (docs.max(CANDIDATE_CAP), false)
+        } else {
+            (MAX_RANKED_POOL, true)
+        }
+    }
+
+    fn pool_at(
+        &self,
+        raw: &str,
+        expr: &expression::Expression,
+        plan: Option<&crate::ai::search_planner::AiSearchPlan>,
+        cap: usize,
+    ) -> Result<Vec<Uuid>> {
+        match plan {
+            Some(plan) => self.search_plan(plan, cap),
+            // A plain box keeps the path it has always used; the equivalence
+            // between the two is pinned by a test.
+            None if expr.is_plain() => self.search(raw, cap),
+            None => self.search_expression(expr, cap),
+        }
     }
 
     fn collect_ids(
@@ -547,13 +653,23 @@ impl TextIndex {
     /// well-ranked approximation of the substring). Returned as ONE query
     /// so it competes as a single `should` alternative next to the word /
     /// fuzzy / pinyin paths instead of constraining them.
-    fn gram_query(&self, term: &str) -> Box<dyn Query> {
-        let tris = [
-            self.f.name_tri,
-            self.f.title_tri,
-            self.f.desc_tri,
-            self.f.tags_tri,
-        ];
+    ///
+    /// The grams keep spaces (`NgramTokenizer` runs over characters), which is
+    /// what makes a quoted phrase a real substring match rather than a mere
+    /// AND of its words.
+    fn gram_query(&self, term: &str, target: expression::Target) -> Box<dyn Query> {
+        let tris: Vec<Field> = match target {
+            expression::Target::All => vec![
+                self.f.name_tri,
+                self.f.title_tri,
+                self.f.desc_tri,
+                self.f.tags_tri,
+            ],
+            expression::Target::Name => vec![self.f.name_tri],
+            expression::Target::Title => vec![self.f.title_tri],
+            expression::Target::Description => vec![self.f.desc_tri],
+            expression::Target::Tags => vec![self.f.tags_tri],
+        };
         let n = term.chars().count();
         let gram_shoulds = |gram: &str| {
             tris.iter()
@@ -595,12 +711,30 @@ impl TextIndex {
         }
     }
 
-    /// One user term → its ranked alternatives. Every alternative is a
-    /// `should` clause; the term itself becomes a `must` of that group.
+    /// One user term → its ranked alternatives, across every surface.
     fn term_query(&self, term: &str) -> Box<dyn Query> {
+        self.term_query_on(term, expression::Target::All)
+    }
+
+    /// One user term, restricted to `target`'s surfaces.
+    ///
+    /// A qualified term keeps the word, fuzzy, prefix and gram paths but loses
+    /// pinyin and abbreviation: those two are indexed over all four surfaces
+    /// concatenated, so answering `tag:mao` from them could hit a pinyin that
+    /// came from the file name — a wrong answer with no visible cause.
+    fn term_query_on(&self, term: &str, target: expression::Target) -> Box<dyn Query> {
         let lower = term.to_lowercase();
         let n = term.chars().count();
-        let words = [self.f.name_w, self.f.title_w, self.f.desc_w, self.f.tags_w];
+        let words: Vec<Field> = match target {
+            expression::Target::All => {
+                vec![self.f.name_w, self.f.title_w, self.f.desc_w, self.f.tags_w]
+            }
+            expression::Target::Name => vec![self.f.name_w],
+            expression::Target::Title => vec![self.f.title_w],
+            expression::Target::Description => vec![self.f.desc_w],
+            expression::Target::Tags => vec![self.f.tags_w],
+        };
+        let global = target == expression::Target::All;
 
         let mut shoulds: Vec<(Occur, Box<dyn Query>)> = Vec::new();
         let push_exact = |shoulds: &mut Vec<(Occur, Box<dyn Query>)>, f: Field, boost: f32| {
@@ -617,18 +751,18 @@ impl TextIndex {
         };
 
         if term.chars().all(|c| c.is_ascii_alphanumeric()) {
-            for f in words {
-                push_exact(&mut shoulds, f, 3.0);
+            for f in &words {
+                push_exact(&mut shoulds, *f, 3.0);
             }
             // Typo tolerance: short stems only get one edit to stay precise.
             if n >= 4 {
                 let distance = if n >= 8 { 2 } else { 1 };
-                for f in words {
+                for f in &words {
                     shoulds.push((
                         Occur::Should,
                         Box::new(tantivy::query::BoostQuery::new(
                             Box::new(FuzzyTermQuery::new(
-                                Term::from_field_text(f, &lower),
+                                Term::from_field_text(*f, &lower),
                                 distance,
                                 true,
                             )),
@@ -639,44 +773,46 @@ impl TextIndex {
             }
             // Word-start prefix ("sun" → "sunset") and pinyin lookups.
             if n >= 2 {
-                for f in words {
+                for f in &words {
                     shoulds.push((
                         Occur::Should,
                         Box::new(FuzzyTermQuery::new_prefix(
-                            Term::from_field_text(f, &lower),
+                            Term::from_field_text(*f, &lower),
                             0,
                             false,
                         )) as Box<dyn Query>,
                     ));
                 }
             }
-            shoulds.push((
-                Occur::Should,
-                Box::new(FuzzyTermQuery::new_prefix(
-                    Term::from_field_text(self.f.pinyin, &lower),
-                    0,
-                    false,
-                )) as Box<dyn Query>,
-            ));
-            shoulds.push((
-                Occur::Should,
-                Box::new(FuzzyTermQuery::new_prefix(
-                    Term::from_field_text(self.f.abbr, &lower),
-                    0,
-                    false,
-                )) as Box<dyn Query>,
-            ));
+            if global {
+                shoulds.push((
+                    Occur::Should,
+                    Box::new(FuzzyTermQuery::new_prefix(
+                        Term::from_field_text(self.f.pinyin, &lower),
+                        0,
+                        false,
+                    )) as Box<dyn Query>,
+                ));
+                shoulds.push((
+                    Occur::Should,
+                    Box::new(FuzzyTermQuery::new_prefix(
+                        Term::from_field_text(self.f.abbr, &lower),
+                        0,
+                        false,
+                    )) as Box<dyn Query>,
+                ));
+            }
             // Grams keep infix substrings findable (`ower` → `flower`).
             if n >= 2 {
-                shoulds.push((Occur::Should, self.gram_query(&lower)));
+                shoulds.push((Occur::Should, self.gram_query(&lower, target)));
             }
         } else {
             // CJK / mixed: whole-term word matches plus 2–3 gram
             // substrings; longer terms AND their 3-grams.
-            for f in words {
-                push_exact(&mut shoulds, f, 3.0);
+            for f in &words {
+                push_exact(&mut shoulds, *f, 3.0);
             }
-            shoulds.push((Occur::Should, self.gram_query(&lower)));
+            shoulds.push((Occur::Should, self.gram_query(&lower, target)));
         }
         Box::new(BooleanQuery::new(shoulds))
     }
@@ -689,15 +825,73 @@ impl TextIndex {
             .map(|term| (Occur::Must, self.term_query(term)))
             .collect();
         if must.is_empty() {
-            must.push((
-                Occur::Must,
-                Box::new(TermQuery::new(
-                    Term::from_field_text(self.f.abbr, "\u{0}no-match"),
-                    IndexRecordOption::Basic,
-                )),
-            ));
+            must.push((Occur::Must, self.no_match()));
         }
         Box::new(BooleanQuery::new(must))
+    }
+
+    /// Rank the documents an [`expression::Expression`] describes.
+    ///
+    /// Groups OR with each other; inside a group every positive atom is a
+    /// `must` and every `-` atom a `must_not`.
+    ///
+    /// A group holding only negations matches **nothing**. It could instead be
+    /// read as "everything but", and that reading is what a search engine with
+    /// a query language would do — but it would also mean a mistyped leading
+    /// dash widens a query into the whole library. Refusing to widen is the
+    /// contract the box has always had (`store::tests::
+    /// search_syntax_characters_stay_literal`), so exclusion needs something
+    /// positive to exclude from.
+    ///
+    /// One group of positive atoms builds the same object
+    /// [`build_query`](Self::build_query) does, which is what keeps an
+    /// unremarkable query behaving exactly as it always did.
+    fn build_expression_query(&self, expr: &expression::Expression) -> Box<dyn Query> {
+        let groups = expr
+            .groups
+            .iter()
+            .map(|group| self.build_group_query(group))
+            .collect::<Vec<_>>();
+        match groups.len() {
+            0 => self.no_match(),
+            // One disjunct needs no OR around it: the group query *is* the
+            // query, which is what makes a plain query byte-identical to the
+            // path it replaced.
+            1 => groups.into_iter().next().expect("one group"),
+            _ => Box::new(BooleanQuery::new(
+                groups
+                    .into_iter()
+                    .map(|group| (Occur::Should, group))
+                    .collect(),
+            )),
+        }
+    }
+
+    fn build_group_query(&self, group: &expression::Group) -> Box<dyn Query> {
+        if group.atoms.iter().all(|atom| atom.negate) {
+            return self.no_match();
+        }
+        let clauses = group
+            .atoms
+            .iter()
+            .map(|atom| {
+                let occur = if atom.negate {
+                    Occur::MustNot
+                } else {
+                    Occur::Must
+                };
+                (occur, self.term_query_on(&atom.text, atom.target))
+            })
+            .collect();
+        Box::new(BooleanQuery::new(clauses))
+    }
+
+    /// A term that can never have been indexed, standing in for "no results".
+    fn no_match(&self) -> Box<dyn Query> {
+        Box::new(TermQuery::new(
+            Term::from_field_text(self.f.abbr, "\u{0}no-match"),
+            IndexRecordOption::Basic,
+        ))
     }
 
     /// Build a Tantivy query from an AI search plan. Keywords are ANDed
@@ -885,6 +1079,7 @@ pub fn drain(conn: &Connection, index: &TextIndex) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::TextIndex;
+    use super::{CANDIDATE_CAP, MAX_RANKED_POOL, expression};
 
     /// A throwaway index directory, named so parallel tests never collide.
     fn temp_index_dir() -> std::path::PathBuf {
@@ -892,6 +1087,137 @@ mod tests {
             "trove-index-test-{}",
             crate::model::new_id().simple()
         ))
+    }
+
+    /// How much an uncapped ranked gather costs. Not a pass/fail test — it is
+    /// the measurement behind `pool_for`'s shape, kept so the next round can
+    /// re-take it instead of re-guessing it:
+    /// `cargo test -p trove-core bench_uncapped_gather -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn bench_uncapped_gather() {
+        use std::time::Instant;
+        let idx = TextIndex::in_ram().unwrap();
+        let writer = idx.writer().unwrap();
+        for i in 0..100_000usize {
+            idx.index_asset_text(
+                &writer,
+                &uuid::Uuid::new_v4().to_string(),
+                &format!("photo-{i:06}-cat.jpg"),
+                None,
+                None,
+                "",
+            );
+        }
+        drop(writer);
+        idx.commit().unwrap();
+        println!("docs {}", idx.num_docs());
+        for cap in [2_000usize, 20_000, 100_000] {
+            let t = Instant::now();
+            let hits = idx.search("cat", cap).unwrap();
+            println!("cap {cap:6} -> {} hits in {:?}", hits.len(), t.elapsed());
+        }
+    }
+
+    /// The ceiling decision, which is the only place `truncated` is decided for
+    /// a filtered search.
+    #[test]
+    fn a_filtered_gather_is_capped_only_above_the_ceiling() {
+        // Below the ceiling the pool is the whole index, so a saturated length
+        // is not a hidden match — it means the term matched everything.
+        assert_eq!(TextIndex::gather_cap(0), (CANDIDATE_CAP, false));
+        assert_eq!(TextIndex::gather_cap(12), (CANDIDATE_CAP, false));
+        assert_eq!(TextIndex::gather_cap(50_000), (50_000, false));
+        assert_eq!(
+            TextIndex::gather_cap(MAX_RANKED_POOL as u64),
+            (MAX_RANKED_POOL, false)
+        );
+        // Past it, the gather is narrower than what exists and says so.
+        assert_eq!(
+            TextIndex::gather_cap(MAX_RANKED_POOL as u64 + 1),
+            (MAX_RANKED_POOL, true)
+        );
+    }
+
+    /// The guarantee a filtered gather exists to keep: every asset that matches
+    /// the term *and* the filter is in the answer, including one the ranking
+    /// placed past the fast path's width.
+    ///
+    /// The weak match is the point — 2004 documents repeat the word and one
+    /// mentions it once, so the favourite ranks last and a pool that stopped at
+    /// [`CANDIDATE_CAP`] would return a confident zero for `fav:yes`.
+    #[test]
+    fn a_filtered_search_finds_the_match_that_ranked_past_the_fast_path() {
+        use crate::model::{AssetKind, AssetQuery};
+        use crate::store::assets;
+
+        let store = crate::store::Store::in_memory().unwrap();
+        let conn = store.conn();
+        let idx = TextIndex::in_ram().unwrap();
+        let writer = idx.writer().unwrap();
+
+        let mut strong = Vec::new();
+        for i in 0..2004 {
+            let mut a = crate::model::test_asset(
+                &format!("kittens-kittens-{i:04}-kittens.png"),
+                AssetKind::Image,
+                crate::model::new_id(),
+            );
+            a.description = Some("kittens kittens".into());
+            assets::insert(conn, &a).unwrap();
+            idx.index_asset_text(
+                &writer,
+                &a.id.to_string(),
+                &a.file_name,
+                None,
+                a.description.as_deref(),
+                "",
+            );
+            strong.push(a.id);
+        }
+        // The one asset that both matches the term (weakly, so it ranks last)
+        // and carries the filter.
+        let mut last =
+            crate::model::test_asset("photo-last.png", AssetKind::Image, crate::model::new_id());
+        last.description = Some("kittens".into());
+        last.is_favorite = true;
+        assets::insert(conn, &last).unwrap();
+        idx.index_asset_text(
+            &writer,
+            &last.id.to_string(),
+            &last.file_name,
+            None,
+            last.description.as_deref(),
+            "",
+        );
+        drop(writer);
+        idx.commit().unwrap();
+        assert!(!strong.is_empty());
+
+        let expr = expression::parse("kittens").into_expression();
+        let (pool, ran_out) = idx.pool_for("kittens", &expr, None, true).unwrap();
+        assert_eq!(
+            pool.len(),
+            2005,
+            "a filtered gather takes the term's whole result set, not a fixed width"
+        );
+        assert!(
+            !ran_out,
+            "nothing was left behind, so the total is a count and not a floor"
+        );
+        assert_eq!(
+            pool.last(),
+            Some(&last.id),
+            "the setup lost: the weak match no longer ranks last, so this test proves nothing"
+        );
+
+        let q = AssetQuery {
+            is_favorite: Some(true),
+            ..Default::default()
+        };
+        let (total, kept) = assets::rank_intersect(conn, &pool, &q).unwrap();
+        assert_eq!(kept, vec![last.id]);
+        assert_eq!(total, 1, "the asset past the fast path was not found");
     }
 
     /// The in-RAM index accepts documents and serves them after commit.
@@ -909,6 +1235,223 @@ mod tests {
         idx.commit().unwrap();
         assert_eq!(idx.num_docs(), 1);
         assert!(!idx.search("flower", 10).unwrap().is_empty());
+    }
+
+    /// One document to index: `(asset_id, file_name, title, description, tags)`.
+    type Case = (
+        &'static str,
+        &'static str,
+        Option<&'static str>,
+        Option<&'static str>,
+        &'static str,
+    );
+
+    /// A small library: one asset per surface that carries a word nothing else
+    /// in the set carries, so a field qualifier's answer is unambiguous.
+    fn sample_index() -> TextIndex {
+        let idx = TextIndex::in_ram().unwrap();
+        let cases: [Case; 4] = [
+            (
+                "aaaa0000-0000-0000-0000-000000000001",
+                "zong.png",
+                None,
+                None,
+                "",
+            ),
+            (
+                "aaaa0000-0000-0000-0000-000000000002",
+                "b.png",
+                Some("zong"),
+                None,
+                "",
+            ),
+            (
+                "aaaa0000-0000-0000-0000-000000000003",
+                "c.png",
+                None,
+                Some("zong"),
+                "",
+            ),
+            (
+                "aaaa0000-0000-0000-0000-000000000004",
+                "d.png",
+                None,
+                None,
+                "zong",
+            ),
+        ];
+        {
+            let writer = idx.writer().unwrap();
+            for (id, name, title, desc, tags) in cases {
+                idx.index_asset_text(&writer, id, name, title, desc, tags);
+            }
+            // The writer must be released before the reader may see the commit.
+            drop(writer);
+        }
+        idx.commit().unwrap();
+        idx
+    }
+
+    fn ids_of(idx: &TextIndex, query: &str) -> Vec<String> {
+        idx.search(query, 50)
+            .unwrap()
+            .into_iter()
+            .map(|u| u.to_string())
+            .collect()
+    }
+
+    fn ids_of_expr(idx: &TextIndex, query: &str) -> Vec<String> {
+        let expr = crate::search::expression::parse(query).into_expression();
+        idx.search_expression(&expr, 50)
+            .unwrap()
+            .into_iter()
+            .map(|u| u.to_string())
+            .collect()
+    }
+
+    /// The whole point of `is_plain`: a query with no new syntax in it must
+    /// rank exactly the way the splitter that predates this module did.
+    #[test]
+    fn a_plain_expression_answers_exactly_what_the_old_path_did() {
+        let idx = sample_index();
+        for query in ["zong", "b", "zong b", "png"] {
+            assert_eq!(
+                ids_of_expr(&idx, query),
+                ids_of(&idx, query),
+                "{query} diverged from the pre-expression path"
+            );
+        }
+    }
+
+    #[test]
+    fn a_field_qualifier_reaches_one_surface_only() {
+        let idx = sample_index();
+        // Unqualified, `zong` is found wherever it lives.
+        assert_eq!(ids_of(&idx, "zong").len(), 4);
+        // Qualified, it answers with the one asset that carries it there.
+        assert_eq!(
+            ids_of_expr(&idx, "name:zong"),
+            vec!["aaaa0000-0000-0000-0000-000000000001"]
+        );
+        assert_eq!(
+            ids_of_expr(&idx, "title:zong"),
+            vec!["aaaa0000-0000-0000-0000-000000000002"]
+        );
+        assert_eq!(
+            ids_of_expr(&idx, "tag:zong"),
+            vec!["aaaa0000-0000-0000-0000-000000000004"]
+        );
+    }
+
+    #[test]
+    fn a_bar_unions_two_groups_and_a_dash_subtracts() {
+        let idx = sample_index();
+        let union = ids_of_expr(&idx, "name:zong | tag:zong");
+        assert_eq!(union.len(), 2, "{union:?}");
+        assert!(union.contains(&"aaaa0000-0000-0000-0000-000000000001".to_string()));
+        assert!(union.contains(&"aaaa0000-0000-0000-0000-000000000004".to_string()));
+
+        // `png` is on all four; excluding the first-name asset leaves three.
+        let minus = ids_of_expr(&idx, "png -name:zong");
+        assert_eq!(minus.len(), 3, "{minus:?}");
+        assert!(!minus.contains(&"aaaa0000-0000-0000-0000-000000000001".to_string()));
+    }
+
+    /// A leading dash is a typo's worth of distance from "show me everything",
+    /// so an exclusion with nothing to exclude from answers with nothing. The
+    /// box has never widened a match on syntax characters, and this is where
+    /// that property could have been lost.
+    #[test]
+    fn an_exclusion_without_something_positive_matches_nothing() {
+        let idx = sample_index();
+        assert_eq!(ids_of(&idx, "png").len(), 4);
+        assert!(ids_of_expr(&idx, "-name:zong").is_empty());
+        // With a positive term to anchor it, the same exclusion subtracts.
+        let minus = ids_of_expr(&idx, "png -name:zong");
+        assert_eq!(minus.len(), 3, "{minus:?}");
+        assert!(!minus.contains(&"aaaa0000-0000-0000-0000-000000000001".to_string()));
+    }
+
+    #[test]
+    fn a_quoted_phrase_finds_the_substring_it_describes() {
+        let idx = TextIndex::in_ram().unwrap();
+        {
+            let writer = idx.writer().unwrap();
+            idx.index_asset_text(
+                &writer,
+                "bbbb0000-0000-0000-0000-000000000001",
+                "summer 2024 beach.png",
+                None,
+                None,
+                "",
+            );
+            idx.index_asset_text(
+                &writer,
+                "bbbb0000-0000-0000-0000-000000000002",
+                "summer beach.png",
+                None,
+                None,
+                "",
+            );
+            drop(writer);
+        }
+        idx.commit().unwrap();
+
+        // Quoted, the words stay one span, so the grams of the whole phrase
+        // have to be present: only the first file carries "summer 2024".
+        let hits = ids_of_expr(&idx, "\"summer 2024\"");
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert_eq!(hits[0], "bbbb0000-0000-0000-0000-000000000001");
+    }
+
+    /// A pool that comes back exactly full is gathered again, wider, when
+    /// structured filters are about to reject rows from it.
+    ///
+    /// The cap is applied *before* the SQL narrowing, so every asset past the
+    /// cap is invisible to a filtered search — including one that matches both
+    /// the term and the filter, which is the answer the caller came for. The
+    /// counts here are what that looks like from the outside: `CANDIDATE_CAP +
+    /// 5` matching documents, and the two asks that differ only in whether
+    /// something will reject rows afterwards.
+    #[test]
+    fn a_saturated_pool_is_gathered_wider_only_when_it_will_be_filtered() {
+        let count = CANDIDATE_CAP + 5;
+        let idx = TextIndex::in_ram().unwrap();
+        {
+            let writer = idx.writer().unwrap();
+            for _ in 0..count {
+                idx.index_asset_text(
+                    &writer,
+                    &crate::model::new_id().to_string(),
+                    "flood.png",
+                    None,
+                    None,
+                    "",
+                );
+            }
+            drop(writer);
+        }
+        idx.commit().unwrap();
+        assert_eq!(idx.num_docs() as usize, count);
+
+        let expr = expression::parse("flood").into_expression();
+        let (pooled, ran_out) = idx.pool_for("flood", &expr, None, true).unwrap();
+        assert!(
+            pooled.len() > CANDIDATE_CAP,
+            "a filtered ask reached past the cap and found {}",
+            pooled.len()
+        );
+        assert!(
+            !ran_out,
+            "the library holds {count} and the pool saw all of them"
+        );
+
+        // With nothing to reject rows, the wider gather would buy nothing: the
+        // caller shows a page out of this pool either way. What it must get is
+        // the honest flag, so the number beside the grid reads as a floor.
+        let (plain, ran_out) = idx.pool_for("flood", &expr, None, false).unwrap();
+        assert_eq!(plain.len(), CANDIDATE_CAP);
+        assert!(ran_out, "a saturated unfiltered pool says so");
     }
 
     /// A held writer lock is an error, not a panic — the desktop app and the

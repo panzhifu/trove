@@ -92,6 +92,43 @@ impl AspectPreset {
     }
 }
 
+/// Resolution band by an asset's **longer edge**, the coarse "is this 4K?"
+/// question the shape filter cannot ask: [`AspectPreset`] and
+/// [`Orientation`] are both about proportions, and a 1920×1080 frame and a
+/// 7680×4320 one are the same shape.
+///
+/// The bounds sit between the tiers rather than on a size anyone ships, so a
+/// canvas named for its width ("4K" = 3840, "2K" = 2560, and the 2240-ish DCI
+/// variants of each) lands in exactly one band without a tolerance rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ResolutionBand {
+    /// Under 2240 px: HD, 2K DCI and everything smaller.
+    #[serde(rename = "1k")]
+    OneK,
+    /// 2240–3199 px: QHD / 1440p and its neighbours.
+    #[serde(rename = "2k")]
+    TwoK,
+    /// 3200 px and up: UHD / 4K and larger.
+    #[serde(rename = "4k")]
+    FourK,
+}
+
+/// The longer-edge bounds of the three bands, in pixels.
+pub const RESOLUTION_BAND_BOUNDS: (i64, i64) = (2240, 3200);
+
+impl ResolutionBand {
+    /// The inclusive longer-edge range this band matches. The top band's
+    /// upper bound is `i64::MAX` rather than an `Option` so every band is one
+    /// SQL `BETWEEN`, and a file dimension cannot reach it.
+    pub fn px_range(self) -> (i64, i64) {
+        match self {
+            ResolutionBand::OneK => (0, RESOLUTION_BAND_BOUNDS.0 - 1),
+            ResolutionBand::TwoK => (RESOLUTION_BAND_BOUNDS.0, RESOLUTION_BAND_BOUNDS.1 - 1),
+            ResolutionBand::FourK => (RESOLUTION_BAND_BOUNDS.1, i64::MAX),
+        }
+    }
+}
+
 /// Where the asset stands in the user's workflow.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]

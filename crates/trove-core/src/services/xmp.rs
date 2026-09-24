@@ -101,7 +101,10 @@ fn alt_property(name: &str, value: &str) -> String {
 
 /// Escape text for XML element content. Applied to every user-controlled
 /// string (titles come from file names, tags from user input).
-fn xml_escape(s: &str) -> String {
+///
+/// Also what the text card uses: it draws a file's own characters through SVG,
+/// and a file that contains `<` is exactly the case that would break the markup.
+pub(crate) fn xml_escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for ch in s.chars() {
         match ch {

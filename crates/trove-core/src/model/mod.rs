@@ -23,12 +23,12 @@ mod tag;
 pub use appearance::{Accent, Appearance, Glyph};
 pub use asset::{
     ASPECT_TOLERANCE, AspectPreset, Asset, AssetKind, AssetPatch, NewAsset, Orientation, Origin,
-    UsageStatus,
+    RESOLUTION_BAND_BOUNDS, ResolutionBand, UsageStatus,
 };
 pub use collection::{Collection, NewCollection, NewSmartCollection, SmartCollection};
 pub use embedding::{EmbeddingSpace, MAX_DIM, NewEmbedding, VectorMatch, normalized};
-pub use facts::{AssetFacts, FontFacts, MediaTagsFacts, PhotoFacts, VisualFacts};
-pub use query::{AssetQuery, AssetSort, Page};
+pub use facts::{AssetFacts, AudioFacts, FontFacts, MediaTagsFacts, PhotoFacts, VisualFacts};
+pub use query::{AssetQuery, AssetSort, Page, QueryCondition};
 pub use smart_query::{SmartCompare, SmartField, SmartNode};
 pub use tag::{NewTag, Tag};
 

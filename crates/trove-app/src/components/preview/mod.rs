@@ -21,8 +21,12 @@ mod audio;
 mod fallback;
 mod font;
 mod gpu3d;
+mod hover;
 mod image;
 pub(crate) mod model;
+mod soundtrack;
+mod text;
+mod transport;
 mod video;
 
 // The model viewport is the model kind's preview surface, so it lives in
@@ -41,6 +45,7 @@ use uuid::Uuid;
 /// Zoom factor per wheel notch.
 const ZOOM_FACTOR: f32 = 1.15;
 
+pub(crate) use hover::HoverCards;
 pub(crate) use video::VideoPlayer;
 
 use crate::library::LibraryController;
@@ -180,6 +185,15 @@ pub(crate) struct AssetPreviewData {
     pub(crate) font_family: Option<String>,
     /// Media dimensions, for the inspector card's aspect-fit height.
     pub(crate) dimensions: Option<(u32, u32)>,
+    /// Cache root plus content hash, which is everything the waveform cache
+    /// needs to key itself. Only audio uses it today; it is not folded into
+    /// `thumb` because a thumbnail's path is a finished artifact while this is
+    /// an address to write one.
+    pub(crate) wave_cache: Option<(PathBuf, String)>,
+    /// Recorded media length, mined at import. The audio transport needs it to
+    /// bound its timeline; the video player gets its own duration from the
+    /// decode probe, so only audio reads this today.
+    pub(crate) duration_ms: Option<u64>,
 }
 
 impl AssetPreviewData {
@@ -227,6 +241,13 @@ impl AssetPreviewData {
             write_back: asset.origin == trove_core::model::Origin::Linked,
             edit_blocker: if asset.trashed_at.is_some() {
                 Some("edit.blocked_trashed")
+            } else if !trove_core::media::edit::is_editable_ext(&asset.ext) {
+                // Read-only here means *read-only in place*: a format the
+                // editor has no encoder for (EXR, HDR, TGA, RAW, HEIF, PSD,
+                // SVG, JXL) would come back as a refused edit, and for a
+                // linked asset a refusal is the good outcome — an 8-bit
+                // re-encode of a scene-linear file would destroy it.
+                Some("edit.blocked_format")
             } else {
                 None
             },
@@ -235,6 +256,11 @@ impl AssetPreviewData {
             animated,
             font_family: asset.facts.font.family.clone(),
             dimensions: asset.width.zip(asset.height),
+            duration_ms: asset.duration_ms,
+            wave_cache: asset
+                .content_hash
+                .clone()
+                .map(|sha| (cache_root.to_path_buf(), sha)),
         }
     }
 
@@ -311,6 +337,13 @@ pub(crate) struct AssetPreviewPanel {
     data: AssetPreviewData,
     /// Live player for videos; `None` renders the still variants instead.
     video: Option<Entity<VideoPlayer>>,
+    /// Live transport for audio assets. Its own entity because the soundtrack
+    /// engine it drives outlives any window, exactly as the video one does.
+    audio: Option<Entity<audio::AudioPlayer>>,
+    /// The text viewer, for an asset whose file has characters to read. Its own
+    /// entity because the editor state holds a line layout that outlives a
+    /// render, exactly as the two players do.
+    text: Option<Entity<text::TextViewer>>,
     /// Whether the font specimen actually registered (a font the text system
     /// refuses falls back to its thumbnail still, which only zooms when the
     /// asset carries dimensions).
@@ -346,6 +379,24 @@ impl AssetPreviewPanel {
         // The live player is spawned once, here — never per render. An
         // undecodable file (or no ffmpeg) keeps the poster still.
         let video = video::spawn_player(&data, cx);
+        // An audio file is a soundtrack with no picture beside it; the engine
+        // the video player uses is already file-agnostic, so this spawns the
+        // transport over it. `None` (no ffmpeg, no decodable stream) leaves the
+        // cover-art still, which is the whole picture either way.
+        let audio = if data.kind == trove_core::model::AssetKind::Audio {
+            audio::spawn_player(&data, cx)
+        } else {
+            None
+        };
+        // A text file is read off a background task and shown by the editor
+        // element. The gate is the extension rather than the kind, because the
+        // text family straddles `Document` and `Other` today. `None` (no file
+        // behind the asset) leaves the still, as every other live surface does.
+        let text = if text::is_text(&data) {
+            text::spawn_viewer(&data, cx)
+        } else {
+            None
+        };
         // A font whose specimen registers zooms the text itself; one that
         // falls back to its thumbnail still zooms only if that still has
         // recorded dimensions.
@@ -356,6 +407,8 @@ impl AssetPreviewPanel {
         cx.new(|_| Self {
             data,
             video,
+            audio,
+            text,
             font_live,
             pan: PanZoom::new(),
             viewport,
@@ -367,9 +420,10 @@ impl AssetPreviewPanel {
     /// Stills, font specimens and videos all move through [`PanZoom`]; the
     /// flag decides whether the stage carries the gestures at all.
     pub(crate) fn zoomable(&self) -> bool {
-        if self.video.is_some() {
-            // The video player stages its own picture; this panel's gestures
-            // would fight the transport controls.
+        if self.video.is_some() || self.audio.is_some() || self.text.is_some() {
+            // The video player stages its own picture and the text viewer owns
+            // its own scrolling; this panel's gestures would fight the controls
+            // inside them.
             return false;
         }
         self.data.dimensions.is_some() || self.font_live
@@ -409,6 +463,25 @@ impl AssetPreviewPanel {
     /// its own window (nothing is handed over: the same player keeps going).
     pub(crate) fn video_player(&self) -> Option<Entity<VideoPlayer>> {
         self.video.clone()
+    }
+
+    /// Whether a live player backs this preview — the precondition for
+    /// grabbing a frame, and the reason the toolbar button appears only then.
+    pub(crate) fn has_video(&self) -> bool {
+        self.video.is_some()
+    }
+
+    /// Save the frame under the video's playhead into the library. A no-op
+    /// without a live player — see [`Self::has_video`].
+    pub(crate) fn grab_frame(
+        &mut self,
+        controller: &Entity<LibraryController>,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        if let Some(video) = &self.video {
+            video::grab_frame(video, controller, window, cx);
+        }
     }
 
     /// Expose the asset name so the title bar can render it.
@@ -574,9 +647,15 @@ impl AssetPreviewPanel {
 
 impl Render for AssetPreviewPanel {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let content: AnyElement = match &self.video {
-            Some(player) => player.clone().into_any_element(),
-            None => {
+        let content: AnyElement = match (&self.video, &self.audio, &self.text) {
+            (Some(player), _, _) => player.clone().into_any_element(),
+            // The audio transport renders itself, so gpui passes the window to
+            // it rather than this panel forwarding one it does not own.
+            (None, Some(player), _) => player.clone().into_any_element(),
+            // So does the text viewer, for the same reason: its editor state
+            // needs a window the moment it first builds a line layout.
+            (None, None, Some(viewer)) => viewer.clone().into_any_element(),
+            (None, None, None) => {
                 if self.zoomable() && self.pan.zoom != 1.0 {
                     self.zoomed_still(cx)
                 } else {

@@ -17,13 +17,18 @@ pub fn execute(conn: &Connection, sql: &str, params: Vec<Value>) -> Result<u64> 
 }
 
 /// Run a `SELECT`, mapping every row to a value.
+///
+/// Both readers go through `prepare_cached`: the statement cache is keyed by
+/// the SQL text, so it only pays off where a statement's text does not depend
+/// on its data — which is why `store::assets::rank_intersect` passes its
+/// candidate ids as one JSON parameter instead of an `IN (?,?,…)`.
 pub fn query_map<T>(
     conn: &Connection,
     sql: &str,
     params: Vec<Value>,
     mut map: impl FnMut(&Row) -> Result<T>,
 ) -> Result<Vec<T>> {
-    let mut stmt = conn.prepare(sql).map_err(Error::from)?;
+    let mut stmt = conn.prepare_cached(sql).map_err(Error::from)?;
     let mut rows = stmt
         .query(rusqlite::params_from_iter(params))
         .map_err(Error::from)?;
@@ -41,7 +46,7 @@ pub fn query_one<T>(
     params: Vec<Value>,
     map: impl FnOnce(&Row) -> Result<T>,
 ) -> Result<Option<T>> {
-    let mut stmt = conn.prepare(sql).map_err(Error::from)?;
+    let mut stmt = conn.prepare_cached(sql).map_err(Error::from)?;
     let mut rows = stmt
         .query(rusqlite::params_from_iter(params))
         .map_err(Error::from)?;

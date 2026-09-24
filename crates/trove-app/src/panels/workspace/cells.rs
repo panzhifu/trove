@@ -14,12 +14,20 @@ pub(super) fn build_cell_element(
     cx: &mut App,
     controller: &Entity<LibraryController>,
     focus_handle: &FocusHandle,
+    hover: &Entity<HoverCards>,
     cell: &Cell,
     w: f32,
     h: f32,
 ) -> AnyElement {
     let (kind, thumb, id, trashed) = (cell.kind, cell.thumb.clone(), cell.id, cell.trashed);
     let is_sel = controller.read(cx).selected_assets.contains(&id);
+    // The live card, if this is the one. Reading it is a borrow of another
+    // entity on the paint path, which is exactly what selection already does —
+    // and it is the only way a hover can repaint a single tile without
+    // rebuilding the frozen row it sits in.
+    let is_live = hover.read(cx).is_live(id);
+    let picture = is_live.then(|| hover.read(cx).picture(id)).flatten();
+    let playhead = is_live.then(|| hover.read(cx).playhead(id)).flatten();
 
     // Fonts render live — the sample text set in the font itself, one row —
     // with the static specimen card as fallback (unparseable font / no
@@ -47,6 +55,12 @@ pub(super) fn build_cell_element(
     };
     let preview: AnyElement = if let Some(live) = live_font {
         live
+    } else if let Some(frame) = picture {
+        // The decoded frame, not the still: this is the tile the pointer chose.
+        img(ImageSource::Render(frame))
+            .size_full()
+            .object_fit(gpui_kit::ObjectFit::Contain)
+            .into_any_element()
     } else {
         match &thumb {
             Some(path) => img(path.clone())
@@ -61,12 +75,16 @@ pub(super) fn build_cell_element(
                 .into_any_element(),
         }
     };
+    // Where this card starts, so a window-relative pointer position becomes a
+    // 0..1 ratio across it. Only the live card measures itself: a static one
+    // never answers a move, so it never pays for the handler.
+    let left = Rc::new(std::cell::Cell::new(0f32));
     let base = div()
-        .id(format!("cell-{id}"))
         .cursor_pointer()
         .flex_none()
         .w(px(w))
         .h(px(h))
+        .relative()
         .rounded(cx.theme().radius)
         .border_1()
         .border_color(if is_sel {
@@ -75,7 +93,50 @@ pub(super) fn build_cell_element(
             cx.theme().border
         })
         .overflow_hidden()
-        .child(preview);
+        // `on_prepaint` belongs on the plain div, before the id (same contract
+        // as the preview stage).
+        .when(is_live, {
+            let left = left.clone();
+            move |cell| {
+                cell.on_prepaint(move |bounds: Bounds<Pixels>, _, _| {
+                    left.set(f32::from(bounds.origin.x));
+                })
+            }
+        })
+        .id(format!("cell-{id}"))
+        .child(preview)
+        .when_some(playhead, |cell, ratio| {
+            // The card's own progress bar: a hovering video has no transport,
+            // and this is the least intrusive thing that says where it is.
+            cell.child(
+                div()
+                    .absolute()
+                    .left_0()
+                    .bottom_0()
+                    .h(px(2.))
+                    .w(px(ratio.clamp(0., 1.) * w))
+                    .bg(cx.theme().primary),
+            )
+        })
+        .on_hover({
+            let hover = hover.clone();
+            let controller = controller.clone();
+            move |entered, _, cx| {
+                hover.update(cx, |cards, cx| {
+                    cards.hovered(entered.then_some(id), kind, &controller, cx);
+                });
+            }
+        })
+        .when(is_live, {
+            let hover = hover.clone();
+            let left = left.clone();
+            move |cell| {
+                cell.on_mouse_move(move |event: &MouseMoveEvent, _, cx| {
+                    let ratio = (f32::from(event.position.x) - left.get()) / w.max(1.);
+                    hover.update(cx, |cards, cx| cards.scrubbed(id, ratio, cx));
+                })
+            }
+        });
 
     let ctl_click = controller.clone();
     let id_click = id;
@@ -170,6 +231,34 @@ fn list_lead_fallback(cx: &App, kind: AssetKind, thumb: Option<&PathBuf>) -> Any
     }
 }
 
+/// The row's name as one text layout with the search hits coloured, or `None`
+/// when nothing is marked — a plain string is the cheaper element, and most
+/// rows in a library that is not being searched are unmarked.
+///
+/// One element rather than a flex row of spans: the name truncates with an
+/// ellipsis, and spans laid out side by side are each measured on their own, so
+/// the cut lands in the wrong place as soon as a marked word is the one that
+/// runs off.
+fn marked(name: &str, ranges: &[std::ops::Range<usize>], color: gpui::Hsla) -> Option<AnyElement> {
+    if ranges.is_empty() {
+        return None;
+    }
+    let highlights = ranges.iter().map(|range| {
+        (
+            range.clone(),
+            gpui::HighlightStyle {
+                color: Some(color),
+                ..Default::default()
+            },
+        )
+    });
+    Some(
+        gpui::StyledText::new(name)
+            .with_highlights(highlights)
+            .into_any_element(),
+    )
+}
+
 pub(super) fn build_list_row_element(
     cx: &mut App,
     controller: &Entity<LibraryController>,
@@ -179,6 +268,9 @@ pub(super) fn build_list_row_element(
 ) -> AnyElement {
     let (kind, thumb, id, trashed) = (cell.kind, cell.thumb.clone(), cell.id, cell.trashed);
     let (name, size, added) = (cell.name.clone(), cell.size_bytes, cell.added.clone());
+    // A visual search's rank, as a percentage. `None` for every other view,
+    // which is what keeps the column from being an empty gutter in a browse.
+    let score = cell.score.map(|value| format!("{:.0}%", value * 100.0));
     let is_sel = controller.read(cx).selected_assets.contains(&id);
 
     let lead: AnyElement = if kind == AssetKind::Font
@@ -222,7 +314,15 @@ pub(super) fn build_list_row_element(
                         .truncate()
                         .text_sm()
                         .text_color(cx.theme().foreground)
-                        .child(name),
+                        // A search hit marks the bytes the query actually named,
+                        // in the accent colour and nothing heavier: bold would
+                        // change the metrics of a row that truncates.
+                        .child(
+                            match marked(&cell.name, &cell.name_marks, cx.theme().primary) {
+                                Some(text) => text,
+                                None => name.into_any_element(),
+                            },
+                        ),
                 )
                 .child(
                     div()
@@ -231,6 +331,18 @@ pub(super) fn build_list_row_element(
                         .text_color(cx.theme().muted_foreground)
                         .child(rust_i18n::t!(kind_key(kind)).to_string()),
                 )
+                // The similarity column only exists in a visual search, where
+                // every row has a score; in a browse it is nothing at all, not
+                // an empty gutter.
+                .children(score.map(|value| {
+                    div()
+                        .w(px(48.))
+                        .text_right()
+                        .text_xs()
+                        .text_color(cx.theme().primary)
+                        .child(value)
+                        .into_any_element()
+                }))
                 .child(
                     div()
                         .w(px(80.))

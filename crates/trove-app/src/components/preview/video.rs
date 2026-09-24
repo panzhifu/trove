@@ -38,20 +38,23 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use gpui_kit::assets::IconName as MediaIcon;
-use gpui_kit::base::{ElementExt as _, POPUP_PRIORITY};
+use gpui_kit::base::ElementExt as _;
 use gpui_kit::base::{h_flex, v_flex};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
+use gpui_kit::component::notification::Notification;
 use gpui_kit::component::slider::{Slider, SliderEvent, SliderState};
-use gpui_kit::component::{ActiveTheme, Sizable};
+use gpui_kit::component::{ActiveTheme, Sizable, WindowExt as _};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use trove_core::media::video::{self, FramePipe, VideoStreamFacts};
 use trove_core::model::AssetKind;
 
-use super::audio::AudioEngine;
+use super::soundtrack::AudioEngine;
+use super::transport;
 use super::{AssetPreviewData, fallback};
 use crate::app::actions::{EnterVideoFullscreen, ExitVideoFullscreen};
+use crate::library::LibraryController;
+use crate::library::jobs;
 
 /// How long the decode loops sleep while paused before looking again.
 pub(super) const IDLE_POLL: Duration = Duration::from_millis(120);
@@ -80,11 +83,6 @@ const DROP_LATE_FRAMES: f64 = 1.5;
 /// an idle player does not repaint.
 const PRESENT_POLL: Duration = Duration::from_millis(4);
 
-/// The playback speeds offered in the menu. The range matches what
-/// [`video::atempo_filter`] can chain for the audio side, so the pitch
-/// holds at every preset.
-const SPEEDS: [f32; 9] = [0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 2.0, 3.0, 4.0];
-
 /// Spawn the live player for `data`, or `None` when the kind is not video,
 /// ffmpeg is unavailable, or the file cannot be probed.
 pub(super) fn spawn_player(data: &AssetPreviewData, cx: &mut App) -> Option<Entity<VideoPlayer>> {
@@ -111,6 +109,70 @@ pub(super) fn cover(data: &AssetPreviewData, cx: &App) -> AnyElement {
             .object_fit(ObjectFit::Contain)
             .into_any_element(),
         None => fallback::icon_card(data.kind, cx),
+    }
+}
+
+/// Save the frame under the playhead into the library as an asset of its own.
+///
+/// The route a screenshot already takes: the PNG goes to the incoming
+/// directory, because the import *links* what it is given and a still has to
+/// live somewhere the library does not own either. The grab is a full-size
+/// ffmpeg pass rather than a copy of the frame on screen (see
+/// [`trove_core::media::video::write_frame_png`]), so it runs on the background
+/// executor and hands the import back to this window when it lands.
+pub(crate) fn grab_frame(
+    player: &Entity<VideoPlayer>,
+    controller: &Entity<LibraryController>,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let (path, at_ms) = player.read(cx).grab_source();
+    let Some(stem) = path.file_stem().map(|s| s.to_string_lossy().into_owned()) else {
+        return;
+    };
+    // Two grabs of the same instant are two real stills, so the second one is
+    // not about to overwrite the first.
+    let stamp = frame_stamp(at_ms);
+    let dir = trove_core::paths::incoming_dir();
+    let mut dest = dir.join(format!("{stem} {stamp}.png"));
+    let mut taken = 2;
+    while dest.is_file() {
+        dest = dir.join(format!("{stem} {stamp} ({taken}).png"));
+        taken += 1;
+    }
+    let handle = window.window_handle();
+    let controller = controller.clone();
+    let write_to = dest.clone();
+    let clip = path.display().to_string();
+    cx.spawn(async move |cx| {
+        let written = cx
+            .background_executor()
+            .spawn(async move { video::write_frame_png(&path, at_ms, &write_to) })
+            .await;
+        let _ = handle.update(cx, |_, window, cx| match written {
+            Some(_) => jobs::import_paths_app(&controller, vec![dest], window, cx),
+            None => {
+                tracing::warn!(clip, at_ms, "frame grab produced nothing");
+                window.push_notification(
+                    Notification::warning(rust_i18n::t!("notice.frame_failed").to_string()),
+                    cx,
+                );
+            }
+        });
+    })
+    .detach();
+}
+
+/// The moment a grabbed still came from, in its file name: `mm-ss`, or
+/// `hh-mm-ss` past an hour. Padding every name to hours would bury the part
+/// that distinguishes one frame from the next.
+fn frame_stamp(ms: u64) -> String {
+    let total = ms / 1000;
+    let (hours, minutes, seconds) = (total / 3600, (total / 60) % 60, total % 60);
+    if hours > 0 {
+        format!("{hours}-{minutes:02}-{seconds:02}")
+    } else {
+        format!("{minutes}-{seconds:02}")
     }
 }
 
@@ -168,7 +230,7 @@ pub(crate) struct VideoPlayer {
     audio: Option<Entity<AudioEngine>>,
     /// The engine's clock, held as the shared slot so the decode loop can
     /// read it without borrowing the engine (or the app).
-    clock: Option<super::audio::Clock>,
+    clock: Option<super::soundtrack::Clock>,
     /// Playback speed; re-paces the frame loop and re-tempos the audio pipe.
     speed: f32,
     /// Output volume 0.0–1.0, applied on the rodio sink.
@@ -705,6 +767,14 @@ impl VideoPlayer {
         self.audio.is_some()
     }
 
+    /// What a frame grab needs: the clip on disk and where its playhead is.
+    /// The playhead, not the frame currently painted — the grab re-decodes at
+    /// full size, and it should land where the user stopped rather than on
+    /// whatever the last tick happened to present.
+    pub(crate) fn grab_source(&self) -> (PathBuf, u64) {
+        (self.path.clone(), self.position_ms.max(0.) as u64)
+    }
+
     /// The frame element: the current frame, or a dark placeholder until the
     /// first one arrives. Fills whatever container hosts the player.
     fn frame_element(&self) -> AnyElement {
@@ -923,8 +993,8 @@ impl VideoPlayer {
                     .text_color(cx.theme().muted_foreground)
                     .child(format!(
                         "{} / {}",
-                        time_label(self.position_ms),
-                        time_label(self.facts.duration_ms as f64)
+                        transport::time(self.position_ms),
+                        transport::time(self.facts.duration_ms as f64)
                     )),
             )
             .child(self.speed_control(speed, cx))
@@ -963,28 +1033,7 @@ impl VideoPlayer {
     /// The speed button: its label shows the current rate, its menu picks a
     /// new one.
     fn speed_control(&self, speed: f32, cx: &mut Context<Self>) -> impl IntoElement {
-        let options = SPEEDS.to_vec();
-        let d = cx.entity();
-        Button::new("video-speed")
-            .ghost()
-            .xsmall()
-            .label(format!("{speed:.2}×"))
-            .dropdown_menu_with_anchor(gpui::Anchor::TopRight, move |menu, _, _| {
-                // `Fn` closure: clone out of the capture each call.
-                let options = options.clone();
-                let mut menu = menu.min_w(px(110.));
-                for option in options {
-                    let d = d.clone();
-                    menu = menu.item(
-                        PopupMenuItem::new(format!("{option:.2}×"))
-                            .checked(option == speed)
-                            .on_click(move |_, _, cx| {
-                                d.update(cx, |this, cx| this.set_speed(option, cx));
-                            }),
-                    );
-                }
-                menu
-            })
+        transport::speed_button(speed, &cx.entity(), Self::set_speed)
     }
 
     /// The volume control: the state button toggles a vertical slider that
@@ -994,53 +1043,20 @@ impl VideoPlayer {
     /// `Popover` can't open upwards (its corner placement always extends
     /// down-right from the anchor), so the popup is positioned by hand.
     fn volume_control(&self, muted: bool, cx: &mut Context<Self>) -> impl IntoElement {
-        let volume_icon = if muted || self.volume == 0. {
-            MediaIcon::VolumeX
-        } else if self.volume < 0.5 {
-            MediaIcon::Volume1
-        } else {
-            MediaIcon::Volume2
-        };
-        let volume_slider = self.volume_slider.clone();
-        div()
-            .id("volume-anchor")
-            .relative()
-            .child(
-                Button::new("video-mute")
-                    .ghost()
-                    .xsmall()
-                    .icon(volume_icon)
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.volume_open = !this.volume_open;
-                        cx.notify();
-                    })),
-            )
-            .when(self.volume_open, |anchor| {
-                // Hangs off the button's top edge, centred on it; deferred
-                // so it paints above the click-away overlay.
-                anchor.child(
-                    deferred(
-                        div()
-                            .absolute()
-                            .bottom_full()
-                            .left(px(-4.))
-                            .p_1()
-                            .rounded(cx.theme().radius)
-                            .bg(cx.theme().popover)
-                            .border_1()
-                            .border_color(cx.theme().border)
-                            .shadow_lg()
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .child(Slider::new(&volume_slider).vertical().h(px(96.))),
-                            ),
-                    )
-                    .with_priority(POPUP_PRIORITY),
-                )
-            })
+        transport::volume_button(
+            self.volume,
+            muted,
+            self.volume_open,
+            &self.volume_slider,
+            &cx.entity(),
+            Self::toggle_volume_popup,
+            cx,
+        )
+    }
+
+    fn toggle_volume_popup(&mut self, cx: &mut Context<Self>) {
+        self.volume_open = !self.volume_open;
+        cx.notify();
     }
 
     /// Hand the decoded frames back to the window before the entity is
@@ -1207,8 +1223,20 @@ fn frame_image(width: u32, height: u32, bgra: Vec<u8>) -> Option<Arc<RenderImage
     Some(Arc::new(RenderImage::new(vec![image::Frame::new(buffer)])))
 }
 
-/// `m:ss` for the transport label.
-fn time_label(ms: f64) -> String {
-    let secs = (ms / 1000.0).max(0.0) as u64;
-    format!("{}:{:02}", secs / 60, secs % 60)
+#[cfg(test)]
+mod tests {
+    use super::frame_stamp;
+
+    /// The moment a still came from survives only in its file name, so the
+    /// point where hours start to matter is worth pinning: a short clip gets
+    /// `mm-ss`, and one that runs past an hour says so instead of padding every
+    /// name out to nine characters.
+    #[test]
+    fn a_grab_is_named_after_its_moment() {
+        assert_eq!(frame_stamp(0), "0-00");
+        assert_eq!(frame_stamp(12_400), "0-12");
+        assert_eq!(frame_stamp(59_900), "0-59");
+        assert_eq!(frame_stamp(7 * 60_000 + 3_000), "7-03");
+        assert_eq!(frame_stamp(3_661_000), "1-01-01");
+    }
 }

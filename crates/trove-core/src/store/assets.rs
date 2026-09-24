@@ -93,6 +93,19 @@ pub fn referenced_hashes(conn: &Connection) -> Result<Vec<String>> {
     )
 }
 
+/// Content hashes of *linked* assets, whose media file is the one they were
+/// imported from rather than a copy under `media/`. Cache sweeps need this to
+/// avoid judging a linked asset's derived files by that directory.
+pub fn linked_hashes(conn: &Connection) -> Result<Vec<String>> {
+    rows::query_map(
+        conn,
+        "SELECT DISTINCT content_hash FROM assets \
+         WHERE origin = 'linked' AND content_hash IS NOT NULL",
+        vec![],
+        |row| row.get::<_, String>(0).map_err(Error::from),
+    )
+}
+
 /// Find a live (not trashed) asset with the same content hash, if any.
 pub fn find_by_content_hash(conn: &Connection, content_hash: &str) -> Result<Option<Asset>> {
     rows::query_one(
@@ -133,9 +146,15 @@ pub fn by_ids(conn: &Connection, ids: &[Uuid]) -> Result<Vec<Asset>> {
 ///
 /// The candidate list drives the query and the filters only reject rows; see
 /// [`WhereMode`] for why that has to be forced rather than left to the planner.
-/// The query takes the candidate ids as an `IN (…)` list, whose entries are
-/// served straight from the primary-key index, and returns the ids that
-/// survived, in rank order.
+///
+/// The ids arrive as **one JSON array parameter**, not as an `IN (?,?,…)`. The
+/// statement text then does not depend on how many candidates there are, which
+/// is the whole point: a list-shaped statement is re-parsed for every pool
+/// width, and at the 20000-candidate pool a filtered search pays that parse
+/// (measured on a 100k library: 214 ms for the wide intersection, of which 137
+/// ms is SQLite parsing 20000 placeholders — the row work is the smaller half).
+/// The same query through `json_each` costs 54 ms, and its text is one string
+/// the statement cache can actually hit.
 pub(crate) fn rank_intersect(
     conn: &Connection,
     ranked: &[Uuid],
@@ -144,7 +163,7 @@ pub(crate) fn rank_intersect(
     if ranked.is_empty() {
         return Ok((0, Vec::new()));
     }
-    let (where_sql, args) = build_where(conn, q, WhereMode::Rejecting)?;
+    let (where_sql, mut args) = build_where(conn, q, WhereMode::Rejecting)?;
 
     let mut sql = String::from("SELECT id FROM assets");
     if !where_sql.is_empty() {
@@ -154,18 +173,13 @@ pub(crate) fn rank_intersect(
     } else {
         sql.push_str(" WHERE ");
     }
-    sql.push_str("id IN (");
-    let mut all_args = args;
-    for (i, id) in ranked.iter().enumerate() {
-        if i > 0 {
-            sql.push(',');
-        }
-        sql.push('?');
-        all_args.push(rows::uuid(*id).into());
-    }
-    sql.push(')');
+    sql.push_str(&format!(
+        "id IN (SELECT value FROM json_each(?{}))",
+        args.len() + 1
+    ));
+    args.push(Value::Text(id_json_array(ranked)));
 
-    let live: HashSet<Uuid> = rows::query_map(conn, &sql, all_args, |row| rows::req_uuid(row, 0))?
+    let live: HashSet<Uuid> = rows::query_map(conn, &sql, args, |row| rows::req_uuid(row, 0))?
         .into_iter()
         .collect();
 
@@ -176,6 +190,26 @@ pub(crate) fn rank_intersect(
         .collect();
     let total = filtered.len() as u64;
     Ok((total, filtered))
+}
+
+/// The candidate ids as a JSON array of strings.
+///
+/// Hand-built rather than serialized: the values come from [`rows::uuid`], so
+/// they are hex and dashes and nothing needs escaping, and a `serde_json` round
+/// trip over twenty thousand of them costs more than the query it feeds.
+fn id_json_array(ids: &[Uuid]) -> String {
+    let mut out = String::with_capacity(ids.len() * 39 + 2);
+    out.push('[');
+    for (i, id) in ids.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push('"');
+        out.push_str(&rows::uuid(*id));
+        out.push('"');
+    }
+    out.push(']');
+    out
 }
 
 /// Slice a full ranked id list per `q.limit`/`q.offset` and materialise.
@@ -204,17 +238,56 @@ pub(crate) fn tags_for_index(conn: &Connection, asset_id: Uuid) -> Result<String
     Ok(names.join(", "))
 }
 
+/// The largest window one listing fetches.
+///
+/// This used to be a silent clamp (`limit.min(1_000)`), and a silent clamp is
+/// a wrong answer with a visible number attached: the grid pages by widening
+/// its window, so past the clamp it re-ran the query at the bottom of every
+/// scroll and got back the same thousand rows while the header reported a
+/// larger total it could never reach. Asking for more than this is a caller
+/// bug, so it is refused by name instead. Public because `trove search` and
+/// `trove list` bound `--limit` with it, so the ask fails as a usage error
+/// rather than as a database error from here.
+pub const MAX_PAGE: u32 = 20_000;
+
+/// [`query`] and [`query_without_count`]'s bound on a requested window, run
+/// before a single statement so an over-large ask names itself instead of
+/// quietly fetching less.
+pub(crate) fn checked_limit(limit: Option<u32>) -> Result<Option<u32>> {
+    match limit {
+        Some(limit) if limit > MAX_PAGE => Err(Error::Validation(format!(
+            "a listing fetches at most {MAX_PAGE} rows per page, asked for {limit}"
+        ))),
+        limit => Ok(limit),
+    }
+}
+
+/// How many assets [`query`] would list for `q`, without listing them.
+///
+/// The browse session asks this once when a view opens, then serves every
+/// page from the window it fetches — a COUNT per page is what the total used to
+/// cost, and the answer cannot change between two pages of one session.
+pub fn count(conn: &Connection, q: &AssetQuery) -> Result<u64> {
+    let (where_sql, args) = build_where(conn, q, WhereMode::Driving)?;
+    Ok(rows::query_count(
+        conn,
+        &format!("SELECT COUNT(*) FROM assets {where_sql}"),
+        args,
+    )? as u64)
+}
+
 /// List assets matching the structured filters of `q`.
 ///
 /// Free text is not part of `q`; see [`AssetQuery`] and `build_where`.
 pub fn query(conn: &Connection, q: &AssetQuery) -> Result<Page<Asset>> {
+    let limit = checked_limit(q.limit)?;
     let (where_sql, args) = build_where(conn, q, WhereMode::Driving)?;
     let total = rows::query_count(
         conn,
         &format!("SELECT COUNT(*) FROM assets {where_sql}"),
         args.clone(),
     )? as u64;
-    let assets = query_items(conn, q, where_sql, args)?;
+    let assets = query_items(conn, q, limit, where_sql, args)?;
     Ok(Page::new(total, assets))
 }
 
@@ -222,16 +295,20 @@ pub fn query(conn: &Connection, q: &AssetQuery) -> Result<Page<Asset>> {
 /// bound (this page's item count). Rapid refreshes use it and overlay a
 /// cached exact total, keeping the COUNT off the hot path.
 pub fn query_without_count(conn: &Connection, q: &AssetQuery) -> Result<Page<Asset>> {
+    let limit = checked_limit(q.limit)?;
     let (where_sql, args) = build_where(conn, q, WhereMode::Driving)?;
-    let assets = query_items(conn, q, where_sql, args)?;
+    let assets = query_items(conn, q, limit, where_sql, args)?;
     Ok(Page::new(assets.len() as u64, assets))
 }
 
 /// The paged item fetch shared by [`query`] and [`query_without_count`]:
-/// order + limit are appended to `args`, so this must own them.
+/// order + limit are appended to `args`, so this must own them. `limit` is
+/// [`checked_limit`]'s output, never `q.limit` — a caller that reached this
+/// with a bound-breaking ask has already been refused.
 fn query_items(
     conn: &Connection,
     q: &AssetQuery,
+    limit: Option<u32>,
     where_sql: String,
     mut args: Vec<Value>,
 ) -> Result<Vec<Asset>> {
@@ -243,12 +320,15 @@ fn query_items(
         crate::model::AssetSort::SizeBytes => "size_bytes",
         crate::model::AssetSort::Rating => "rating",
         crate::model::AssetSort::Duration => "duration_ms",
-        crate::model::AssetSort::Color => "json_extract(extra, '$.visual.dominant_color')",
+        // The flat key, not the struct path: `AssetFacts` flattens its
+        // sub-structs onto one JSON map (`model/facts.rs`), so
+        // `$.visual.dominant_color` would read NULL for every row and this sort
+        // would silently degrade to the `id ASC` tiebreaker.
+        crate::model::AssetSort::Color => "json_extract(extra, '$.dominant_color')",
     };
     let dir = if q.sort_desc { "DESC" } else { "ASC" };
     sql.push_str(&format!(" ORDER BY {order_col} {dir}, id ASC"));
-    if let Some(limit) = q.limit {
-        let limit = limit.min(1_000);
+    if let Some(limit) = limit {
         sql.push_str(" LIMIT ? OFFSET ?");
         args.push(Value::Integer(limit as i64));
         args.push(Value::Integer(q.offset as i64));
@@ -584,7 +664,7 @@ fn asset_values(a: &Asset) -> Vec<Value> {
 /// a 100k library: 21 ms for 97 candidates and 36 ms for 2000, against 0.1 ms
 /// and 5 ms once the id list drives.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum WhereMode {
+pub(crate) enum WhereMode {
     /// Plain comparisons; the planner may pick any index, including one built
     /// for a filter column.
     Driving,
@@ -617,6 +697,30 @@ impl WhereMode {
 /// correlated on `assets.id`, `json_extract`, the orientation and aspect-ratio
 /// `CASE`s, the `LOWER(ext)` comparison) are never index sources, so they need
 /// no prefix.
+/// Escape a value destined for a `LIKE ... ESCAPE '\'` comparison, so path
+/// separators and underscores in real file names match literally.
+fn escape_like(text: &str) -> String {
+    text.replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
+}
+
+/// Bind `values` as an `IN (...)` list, appending them to `args` and returning
+/// the parenthesised placeholder SQL.
+///
+/// Takes the values already mapped because the two callers fold differently:
+/// extensions arrive lower-cased to meet `LOWER(ext)`, kinds arrive as the text
+/// the `kind` column stores.
+fn in_list(values: Vec<Value>, args: &mut Vec<Value>) -> String {
+    let first = args.len() + 1;
+    let placeholders = (0..values.len())
+        .map(|ix| format!("?{}", first + ix))
+        .collect::<Vec<_>>()
+        .join(", ");
+    args.extend(values);
+    format!("({placeholders})")
+}
+
 pub(super) fn build_where(
     conn: &Connection,
     q: &AssetQuery,
@@ -659,13 +763,7 @@ pub(super) fn build_where(
             "json_extract(assets.extra, '$.source_path') LIKE ?{} ESCAPE '\\'",
             args.len() + 1
         ));
-        // Escape LIKE metacharacters so path separators and underscores in
-        // real file names match literally.
-        let escaped = prefix
-            .replace('\\', "\\\\")
-            .replace('%', "\\%")
-            .replace('_', "\\_");
-        args.push(Value::Text(format!("{escaped}%")));
+        args.push(Value::Text(format!("{}%", escape_like(prefix))));
     }
     if let Some(status) = q.usage_status {
         conds.push(format!("{ni}usage_status = ?{}", args.len() + 1));
@@ -716,15 +814,94 @@ pub(super) fn build_where(
         args.push(Value::Real(lo as f64));
         args.push(Value::Real(hi as f64));
     }
+    if let Some(band) = q.resolution {
+        // The longer edge, so the band says something the two shape filters
+        // cannot: proportions are the same at any size. `MAX(a, b)` is SQLite's
+        // scalar maximum, and rows without usable dimensions get -1, which is
+        // outside every band — the same contract the orientation and aspect
+        // `CASE`s above keep.
+        let (lo, hi) = band.px_range();
+        conds.push(format!(
+            "CASE WHEN width IS NULL OR height IS NULL THEN -1 \
+             ELSE MAX(width, height) END BETWEEN ?{} AND ?{}",
+            args.len() + 1,
+            args.len() + 2
+        ));
+        args.push(Value::Integer(lo));
+        args.push(Value::Integer(hi));
+    }
     if let Some(ext) = &q.ext {
         conds.push(format!("LOWER(ext) = LOWER(?{})", args.len() + 1));
         args.push(Value::Text(ext.clone()));
+    }
+    // Conditions the search box's field-qualifier grammar states (`ext:png`,
+    // `-kind:video`, `path:/data`, `rating:3`, `fav:no`). They join the same
+    // conjunction as the toolbar filters above, so a qualified query and a
+    // clicked filter narrow the library by one rule, not two.
+    for condition in &q.conditions {
+        use crate::model::QueryCondition as C;
+        match condition {
+            C::Ext { values, negate } => {
+                // The column is folded by the comparison itself, so only the
+                // bound values need lowering.
+                let list = in_list(
+                    values
+                        .iter()
+                        .map(|v| Value::Text(v.to_lowercase()))
+                        .collect(),
+                    &mut args,
+                );
+                conds.push(format!(
+                    "{ni}LOWER(ext) {} {list}",
+                    if *negate { "NOT IN" } else { "IN" }
+                ));
+            }
+            C::Kind { kinds, negate } => {
+                let list = in_list(
+                    kinds
+                        .iter()
+                        .map(|k| kind_str(*k).to_string().into())
+                        .collect(),
+                    &mut args,
+                );
+                conds.push(format!(
+                    "{ni}kind {} {list}",
+                    if *negate { "NOT IN" } else { "IN" }
+                ));
+            }
+            C::Path { prefix, negate } => {
+                conds.push(format!(
+                    "{ni}json_extract(assets.extra, '$.source_path') {} ?{} ESCAPE '\\'",
+                    if *negate { "NOT LIKE" } else { "LIKE" },
+                    args.len() + 1
+                ));
+                args.push(Value::Text(format!("{}%", escape_like(prefix))));
+            }
+            C::MinRating(rating) => {
+                // Unrated assets (NULL) fail the comparison naturally.
+                conds.push(format!("{ni}rating >= ?{}", args.len() + 1));
+                args.push(Value::Integer(*rating as i64));
+            }
+            C::Favorite(want) => {
+                conds.push(format!("{ni}is_favorite = ?{}", args.len() + 1));
+                args.push(Value::Integer(*want as i64));
+            }
+        }
     }
     // Unconditional, so `where_sql` is never empty.
     if q.is_trashed {
         conds.push(format!("{ni}trashed_at IS NOT NULL"));
     } else {
         conds.push(format!("{ni}trashed_at IS NULL"));
+        // A sequence shows one card, not one per frame: the members past the
+        // first are hidden here, which is the single place every browse,
+        // search, recent and smart path comes through.
+        //
+        // Deliberately *not* applied to the trash branch. A trashed frame has to
+        // be listed and restorable on its own, and `empty_trash` enumerates
+        // through here — a filter on that branch would leave 149 members' files
+        // on disk forever.
+        conds.push(super::sequences::HIDDEN_FRAMES.to_string());
     }
 
     // The placeholders are hand-numbered, so the clause has to end up using
@@ -745,6 +922,55 @@ pub(super) fn build_where(
     Ok((where_sql, args))
 }
 
+/// [`build_where`]'s clause without its `WHERE`, for a caller that already has
+/// a clause of its own to join it to. Every hand-numbered placeholder is
+/// shifted past the `base` parameters that caller has bound so far, so the two
+/// halves share one positional argument list.
+///
+/// `smart::evaluate_counted` is the reason this exists: the grid filters have
+/// to sit inside the statement that pages, or the page window and the COUNT
+/// answer for different row sets.
+pub(crate) fn where_fragment(
+    conn: &Connection,
+    q: &AssetQuery,
+    mode: WhereMode,
+    base: usize,
+) -> Result<(String, Vec<Value>)> {
+    let (where_sql, args) = build_where(conn, q, mode)?;
+    let body = where_sql
+        .strip_prefix("WHERE ")
+        .ok_or_else(|| Error::Db("build_where produced no WHERE clause".into()))?;
+    Ok((shift_placeholders(body, base)?, args))
+}
+
+/// Move every `?N` in a clause to `?(N + shift)`, leaving the rest of the text
+/// byte-for-byte alone.
+fn shift_placeholders(sql: &str, shift: usize) -> Result<String> {
+    if shift == 0 {
+        return Ok(sql.to_string());
+    }
+    let mut out = String::with_capacity(sql.len() + 8);
+    let mut rest = sql;
+    while let Some(at) = rest.find('?') {
+        out.push_str(&rest[..at]);
+        let after = &rest[at + 1..];
+        let digits = after
+            .chars()
+            .take_while(char::is_ascii_digit)
+            .collect::<String>();
+        let Ok(n) = digits.parse::<usize>() else {
+            return Err(Error::Db(
+                "a filter clause used an unnumbered placeholder".into(),
+            ));
+        };
+        out.push('?');
+        out.push_str(&(n + shift).to_string());
+        rest = &after[digits.len()..];
+    }
+    out.push_str(rest);
+    Ok(out)
+}
+
 /// Distinct *direct* parent folders that live assets were imported from,
 /// each with its live-asset count, sorted by path. No ancestor walk: the
 /// panel shows one flat row per folder a file was actually dropped into,
@@ -752,8 +978,12 @@ pub(super) fn build_where(
 pub fn source_folders(conn: &Connection) -> Result<Vec<(String, u64)>> {
     let paths: Vec<String> = rows::query_map(
         conn,
-        "SELECT json_extract(extra, '$.source_path') FROM assets \
-         WHERE trashed_at IS NULL AND json_extract(extra, '$.source_path') IS NOT NULL",
+        &format!(
+            "SELECT json_extract(extra, '$.source_path') FROM assets \
+             WHERE trashed_at IS NULL AND json_extract(extra, '$.source_path') IS NOT NULL \
+             AND {}",
+            super::sequences::hidden_beside("assets.id")
+        ),
         vec![],
         |row| row.get::<_, String>(0).map_err(Error::from),
     )?;

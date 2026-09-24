@@ -19,10 +19,11 @@
 //! come back — with the rule that a step must be applicable from a shape that
 //! matches the version on record.
 //!
-//! That is where this file stands now: [`UPGRADES`] holds two steps, because
-//! both landed while the version before them was already in the field —
-//! v14 → v15 for the `ai_analysis` cache, v15 → v16 for a container's
-//! appearance. Everything not on the list is still refused by name.
+//! That is where this file stands now: [`UPGRADES`] holds four steps, because
+//! every one of them landed while the version before it was already in the
+//! field — v14 → v15 for the `ai_analysis` cache, v15 → v16 for a container's
+//! appearance, v16 → v17 for the 3D viewport's look, v17 → v18 for the ordered
+//! live-listing indexes. Everything not on the list is still refused by name.
 
 /// The schema this build creates, and the only shape it opens. A library at
 /// any other version is refused by name rather than guessed at.
@@ -31,7 +32,7 @@
 /// existence was written by a build whose chain ended there, and that shape
 /// is the pre-`asset_embeddings` subset of the one below — which is the only
 /// sense in which a version number means anything.
-pub const SCHEMA_VERSION: i64 = 17;
+pub const SCHEMA_VERSION: i64 = 19;
 
 /// One upgrade step: the DDL that takes a library from `from` to `to`, and the
 /// data that DDL cannot move.
@@ -75,7 +76,117 @@ pub const UPGRADES: &[Upgrade] = &[
         sql: UPGRADE_16_TO_17,
         data: None,
     },
+    Upgrade {
+        from: 17,
+        to: 18,
+        sql: UPGRADE_17_TO_18,
+        data: Some(analyze_statistics),
+    },
+    Upgrade {
+        from: 18,
+        to: 19,
+        sql: UPGRADE_18_TO_19,
+        data: None,
+    },
 ];
+
+/// v18 → v19: image sequences, as a group over the frames that already exist.
+///
+/// A sequence is *not* an asset. The frames stay ordinary rows — linked, hashed,
+/// searchable, individually restorable — and these two tables only say which of
+/// them form a run and in what order. That shape is what makes the feature
+/// reversible: dissolving a sequence deletes rows here and changes nothing about
+/// the files.
+///
+/// A side table rather than columns on `assets` for the reason `model_looks`
+/// gives: a column would have to be threaded through the row struct, the insert
+/// list, the positional reader and every `Asset` literal in the app, for
+/// something only the listing's "hide the non-representative frames" predicate
+/// joins on.
+const UPGRADE_18_TO_19: &str = r#"
+    CREATE TABLE IF NOT EXISTS asset_sequences (
+        id               TEXT PRIMARY KEY,
+        -- The frame the grid shows, which is `position` 0 below. Kept here as
+        -- well because every listing needs it and one row read should be enough.
+        primary_asset_id TEXT NOT NULL UNIQUE REFERENCES assets(id) ON DELETE CASCADE,
+        fps              REAL NOT NULL DEFAULT 30 CHECK (fps >= 1 AND fps <= 240),
+        created_at       TEXT NOT NULL,
+        updated_at       TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS asset_sequence_frames (
+        sequence_id  TEXT NOT NULL REFERENCES asset_sequences(id) ON DELETE CASCADE,
+        -- UNIQUE, so a frame belongs to at most one run: a file cannot be a
+        -- frame of two sequences, and a listing that hides it would otherwise
+        -- have to choose which one it belongs to.
+        asset_id     TEXT NOT NULL UNIQUE REFERENCES assets(id) ON DELETE CASCADE,
+        -- Display order within the run. 0 is the visible card, anything above
+        -- is a hidden member, which is what the listing filter keys on.
+        -- (No semicolons anywhere in this DDL's comments: `apply_upgrade`
+        -- splits the step on them.)
+        position     INTEGER NOT NULL CHECK (position >= 0),
+        -- The number written in the file name, which may start anywhere
+        -- (`shot0001.exr` → 1) and so is not the same thing as `position`.
+        frame_number INTEGER NOT NULL CHECK (frame_number >= 0),
+        PRIMARY KEY (sequence_id, position)
+    );
+"#;
+
+/// v17 → v18: the "filter + sort" partial indexes, and the statistics that
+/// make the planner use them.
+///
+/// Both halves are load-bearing, which is what the measurements say (100k
+/// assets, a 200-row page at offset 40k, the live browse):
+///
+/// | | no statistics | statistics, v17 shape | statistics + these indexes |
+/// |---|---|---|---|
+/// | newest | 188 ms | 57 ms | **1.9 ms** |
+/// | name | 93 ms | 92 ms | **0.36 ms** |
+/// | size | 32 ms | 17 ms | **0.40 ms** |
+/// | rating | 44 ms | 87 ms | **0.48 ms** |
+/// | type=newest | 34 ms | 18 ms | **0.39 ms** |
+///
+/// Without the indexes the sort is a temp B-tree over the whole live set, per
+/// page. Without the statistics the indexes are *there and unused*: `ANALYZE`
+/// is what tells SQLite that `idx_assets_trashed` matches every row in the
+/// library, so the ordered scan wins on price instead of losing to a guess.
+/// (`PRAGMA optimize` is not enough — it samples, and a sample calls
+/// `trashed_at` selective at 2001 rows per value when the column is NULL in all
+/// 100000 of them. Same wrong plan, 189 ms.)
+///
+/// Partial (`WHERE trashed_at IS NULL`) because every listing that sorts is a
+/// live listing, and the trash is small enough to sort. Each carries `id`
+/// second: a listing orders `…, id ASC` so two pages of one browse cannot
+/// disagree about which of two same-stamped assets comes first, and an index
+/// that cannot supply that tiebreaker buys a temp B-tree anyway.
+///
+/// Five, not seven: these are the sorts the sort menu and `trove --sort` can
+/// ask for. `updated_at`, `duration_ms` and the dominant colour are in the
+/// `AssetSort` enum but reachable from neither interface, so an index for them
+/// would be 5–7 MB per 100k assets of pure write amplification.
+const UPGRADE_17_TO_18: &str = r#"
+    CREATE INDEX IF NOT EXISTS idx_assets_live_created
+        ON assets(created_at DESC, id ASC) WHERE trashed_at IS NULL;
+    CREATE INDEX IF NOT EXISTS idx_assets_live_name
+        ON assets(file_name COLLATE NOCASE DESC, id ASC) WHERE trashed_at IS NULL;
+    CREATE INDEX IF NOT EXISTS idx_assets_live_size
+        ON assets(size_bytes DESC, id ASC) WHERE trashed_at IS NULL;
+    CREATE INDEX IF NOT EXISTS idx_assets_live_rating
+        ON assets(rating DESC, id ASC) WHERE trashed_at IS NULL;
+    CREATE INDEX IF NOT EXISTS idx_assets_live_kind_created
+        ON assets(kind, created_at DESC, id ASC) WHERE trashed_at IS NULL;
+"#;
+
+/// Gather planner statistics for the whole library.
+///
+/// Runs as an upgrade step and from [`Store::ensure_statistics`](super::Store::ensure_statistics);
+/// re-running is harmless, which is the rule every step obeys. 136 ms at 100k
+/// assets — once, on a background open, in exchange for the difference between
+/// a 188 ms page and a 2 ms one.
+pub fn analyze_statistics(conn: &rusqlite::Connection) -> crate::error::Result<()> {
+    conn.execute_batch("ANALYZE;")?;
+    Ok(())
+}
 
 /// v16 → v17: the 3D viewport's look, per asset.
 ///
@@ -233,6 +344,21 @@ pub const SCHEMA: &str = r#"
     CREATE INDEX idx_assets_favorite ON assets(is_favorite);
     CREATE INDEX idx_assets_size     ON assets(size_bytes);
 
+    -- The ordered live listings, and the reason a page of a big library costs
+    -- 2 ms rather than 188. Same five shapes [`UPGRADE_17_TO_18`] creates; see
+    -- that comment for why each carries `id` second and `trashed_at` as a
+    -- partial-index predicate.
+    CREATE INDEX idx_assets_live_created ON assets(created_at DESC, id ASC)
+        WHERE trashed_at IS NULL;
+    CREATE INDEX idx_assets_live_name ON assets(file_name COLLATE NOCASE DESC, id ASC)
+        WHERE trashed_at IS NULL;
+    CREATE INDEX idx_assets_live_size ON assets(size_bytes DESC, id ASC)
+        WHERE trashed_at IS NULL;
+    CREATE INDEX idx_assets_live_rating ON assets(rating DESC, id ASC)
+        WHERE trashed_at IS NULL;
+    CREATE INDEX idx_assets_live_kind_created ON assets(kind, created_at DESC, id ASC)
+        WHERE trashed_at IS NULL;
+
     CREATE TABLE collections (
         id         TEXT PRIMARY KEY,
         parent_id  TEXT REFERENCES collections(id) ON DELETE CASCADE,
@@ -313,6 +439,25 @@ pub const SCHEMA: &str = r#"
     CREATE TABLE IF NOT EXISTS model_looks (
         asset_id TEXT PRIMARY KEY REFERENCES assets(id) ON DELETE CASCADE,
         look     TEXT NOT NULL
+    );
+
+    -- Image sequences: a group over frames that are ordinary assets, and the
+    -- order within it. See [`UPGRADE_18_TO_19`] for why this is a side table and
+    -- why dissolving a sequence never touches a file.
+    CREATE TABLE IF NOT EXISTS asset_sequences (
+        id               TEXT PRIMARY KEY,
+        primary_asset_id TEXT NOT NULL UNIQUE REFERENCES assets(id) ON DELETE CASCADE,
+        fps              REAL NOT NULL DEFAULT 30 CHECK (fps >= 1 AND fps <= 240),
+        created_at       TEXT NOT NULL,
+        updated_at       TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS asset_sequence_frames (
+        sequence_id  TEXT NOT NULL REFERENCES asset_sequences(id) ON DELETE CASCADE,
+        asset_id     TEXT NOT NULL UNIQUE REFERENCES assets(id) ON DELETE CASCADE,
+        position     INTEGER NOT NULL CHECK (position >= 0),
+        frame_number INTEGER NOT NULL CHECK (frame_number >= 0),
+        PRIMARY KEY (sequence_id, position)
     );
 
     -- The Tantivy outbox: filled by the triggers below on every asset and tag

@@ -38,16 +38,28 @@ pub(super) fn files_page(
                 ),
         )
         .group(
-            SettingGroup::new().title(t("settings.thumbnails")).item(
-                SettingItem::new(
-                    t("settings.rebuild_thumbs"),
-                    SettingField::render({
-                        let controller = controller.clone();
-                        move |_, _, cx| thumbs_row(&controller, cx)
-                    }),
+            SettingGroup::new()
+                .title(t("settings.thumbnails"))
+                .item(
+                    SettingItem::new(
+                        t("settings.rebuild_thumbs"),
+                        SettingField::render({
+                            let controller = controller.clone();
+                            move |_, _, cx| thumbs_row(&controller, cx)
+                        }),
+                    )
+                    .description(t("settings.rebuild_thumbs_desc")),
                 )
-                .description(t("settings.rebuild_thumbs_desc")),
-            ),
+                .item(
+                    SettingItem::new(
+                        t("settings.remine"),
+                        SettingField::render({
+                            let controller = controller.clone();
+                            move |_, _, cx| remine_row(&controller, cx)
+                        }),
+                    )
+                    .description(t("settings.remine_desc")),
+                ),
         )
         .group(backups_group(controller))
         .group(
@@ -588,6 +600,68 @@ fn rebuild_thumbs(controller: &Entity<LibraryController>, force: bool, cx: &mut 
     );
 }
 
+/// Re-mine row: re-read embedded metadata on assets already in the library.
+///
+/// Same shape as the thumbnails row because it has the same constraint — the
+/// library handle is not `Send`, so the work list is collected on the main
+/// thread and only the read/write crosses to the background executor.
+fn remine_row(controller: &Entity<LibraryController>, cx: &mut App) -> Div {
+    let busy = controller.read(cx).busy;
+    let controller2 = controller.clone();
+    h_flex()
+        .flex_1()
+        .justify_end()
+        .gap_2()
+        .child(
+            Button::new("remine")
+                .outline()
+                .small()
+                .disabled(busy)
+                .label(rust_i18n::t!("settings.remine").to_string())
+                .on_click({
+                    let controller = controller.clone();
+                    move |_, _, cx| remine_metadata_job(&controller, false, cx)
+                }),
+        )
+        .child(
+            Button::new("remine-force")
+                .outline()
+                .small()
+                .disabled(busy)
+                .label(rust_i18n::t!("settings.remine_force").to_string())
+                .on_click(move |_, _, cx| remine_metadata_job(&controller2, true, cx)),
+        )
+}
+
+fn remine_metadata_job(controller: &Entity<LibraryController>, force: bool, cx: &mut App) {
+    spawn_maintenance_job(
+        controller,
+        "metadata re-mine",
+        |library| {
+            // The database path rides along in the payload for the same reason
+            // the cache path does for thumbnails: the job thread opens its own
+            // connection rather than borrowing a handle it cannot hold.
+            let db = library.root().join("library.db");
+            trove_core::services::maintenance::plan_remine(library, force).map(|plan| (db, plan))
+        },
+        |(db, plan)| {
+            // Header reads only: no decoders, no subprocesses.
+            trove_core::services::maintenance::run_remine_plan(&db, plan)
+        },
+        |ctl, report: trove_core::services::maintenance::RemineReport| {
+            ctl.notice = Some(
+                rust_i18n::t!(
+                    "settings.remine_done",
+                    count = report.updated,
+                    scanned = report.scanned
+                )
+                .to_string(),
+            );
+        },
+        cx,
+    );
+}
+
 /// Orphan-sweep row: synchronous (one filesystem walk over `media/` +
 /// `thumbs/`).
 fn orphans_row(controller: &Entity<LibraryController>, cx: &mut App) -> Div {
@@ -613,6 +687,7 @@ fn orphans_row(controller: &Entity<LibraryController>, cx: &mut App) -> Div {
                             "settings.clean_orphans_done",
                             blobs = report.blobs_removed,
                             thumbs = report.thumbs_removed,
+                            waves = report.waves_removed,
                             trashed = report.files_trashed,
                             dirs = report.empty_dirs_removed,
                         )

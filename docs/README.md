@@ -22,6 +22,7 @@
 | [MEDIA-FORMATS.md](./MEDIA-FORMATS.md) | 媒体格式支持 — 图片/视频/音频/3D/字体/动效格式一览 |
 | [CONFIGURATION.md](./CONFIGURATION.md) | 配置管理 — 应用配置、库配置、快捷键、多语言 |
 | [INTERACTION-SYSTEM.md](./INTERACTION-SYSTEM.md) | 交互系统 — 三视图布局、工作区、检查器、对话框 |
+| [GAP-TO-SERPENT.md](./GAP-TO-SERPENT.md) | 与 Serpent 的差距清单 — 逐项对照、量级估算、以及明确不追的部分 |
 
 ---
 

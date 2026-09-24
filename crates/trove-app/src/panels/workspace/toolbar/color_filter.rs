@@ -38,9 +38,15 @@ const PALETTE_TAB: usize = 0;
 const SHADES: usize = 10;
 
 /// The colour filter, sized and styled like the filters beside it.
+///
+/// `similarity` is the match-box rail under the picker. It belongs to the
+/// filter, not to the picker: the same `color_panel` is embedded by the
+/// smart-collection editor, where a colour is a rule value and there is no
+/// search to widen.
 pub(crate) fn color_filter(
     state: &Entity<ColorPickerState>,
     featured: Vec<Hsla>,
+    similarity: &Entity<SliderState>,
     cx: &App,
 ) -> impl IntoElement {
     let (open, selected) = {
@@ -73,8 +79,30 @@ pub(crate) fn color_filter(
                         .label(rust_i18n::t!("workspace.color_filter").to_string())
                         .selected(selected),
                 )
-                .child(color_panel(state, featured, cx)),
+                .child(color_panel(state, featured, cx))
+                .child(similarity_row(similarity, cx)),
         )
+}
+
+/// The 0–100 similarity rail: how wide a colour counts as a match.
+///
+/// The track runs muted at the loose end and into the accent at the tight one,
+/// because the axis is "how exactly did I mean this colour", not a quantity.
+fn similarity_row(similarity: &Entity<SliderState>, cx: &App) -> impl IntoElement {
+    let value = similarity.read(cx).value().start();
+    v_flex()
+        .px_3()
+        .pb_2()
+        .gap_1()
+        .child(Separator::horizontal())
+        .child(slider_row(
+            "color-similarity",
+            rust_i18n::t!("workspace.colour_similarity"),
+            similarity,
+            gradient_track(cx.theme().muted_foreground, cx.theme().primary),
+            format!("{value:.0}"),
+            cx,
+        ))
 }
 
 /// The popover body: the two panels, over a preview of whatever colour the

@@ -313,7 +313,17 @@ fn mine_audio(path: &Path) -> Option<MinedMetadata> {
     use lofty::probe::Probe;
     use lofty::tag::Accessor;
 
-    let tagged = Probe::open(path).ok()?.read().ok()?;
+    // `guess_file_type` reads the container from the bytes and only falls back
+    // to the extension hint when it cannot, which matters for `.oga`: an
+    // ordinary Ogg stream that lofty refuses to identify by name, so every
+    // tagged file with that extension would otherwise lose its duration and
+    // tags to an extension that is real but unmapped.
+    let tagged = Probe::open(path)
+        .ok()?
+        .guess_file_type()
+        .ok()?
+        .read()
+        .ok()?;
     let mut m = MinedMetadata::default();
     let media = &mut m.facts.media;
 
@@ -341,10 +351,20 @@ fn mine_audio(path: &Path) -> Option<MinedMetadata> {
         media.album = Some(album);
     }
 
-    let duration = tagged.properties().duration();
+    let props = tagged.properties();
+    let duration = props.duration();
     if !duration.is_zero() {
         m.duration_ms = Some(duration.as_millis() as u64);
     }
+
+    // Technical properties sit beside the tags rather than inside them: a tag
+    // is something the encoder was told, a property is something the stream
+    // is, and the inspector reads them apart.
+    let audio = &mut m.facts.audio;
+    audio.sample_rate = props.sample_rate();
+    audio.channels = props.channels();
+    audio.bit_depth = props.bit_depth();
+    audio.bitrate = props.audio_bitrate();
 
     Some(m)
 }

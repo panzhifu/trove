@@ -9,7 +9,9 @@
 use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use trove_core::model::{AspectPreset, AssetKind, AssetSort, Orientation, UsageStatus};
+use trove_core::model::{
+    AspectPreset, AssetKind, AssetSort, Orientation, ResolutionBand, UsageStatus,
+};
 
 /// Query and edit a Trove library from the command line.
 ///
@@ -183,6 +185,10 @@ pub struct FilterArgs {
     #[arg(long, value_enum, value_name = "PRESET")]
     pub aspect: Option<AspectArg>,
 
+    /// Only assets whose longer edge falls in this resolution band.
+    #[arg(long, value_enum, value_name = "BAND")]
+    pub resolution: Option<ResolutionArg>,
+
     /// Only assets whose recorded source path starts with this prefix.
     #[arg(long, value_name = "PREFIX")]
     pub folder: Option<String>,
@@ -203,7 +209,8 @@ pub struct FilterArgs {
     #[arg(long)]
     pub asc: bool,
 
-    /// Maximum number of records to return (the store caps this at 1000).
+    /// Maximum number of records to return (the store refuses a window wider
+    /// than 20000).
     #[arg(long, short = 'n', default_value_t = 50, value_name = "N")]
     pub limit: u32,
 
@@ -550,6 +557,29 @@ impl From<AspectArg> for AspectPreset {
             AspectArg::PhotoLandscape => AspectPreset::PhotoLandscape,
             AspectArg::PhotoPortrait => AspectPreset::PhotoPortrait,
             AspectArg::Square => AspectPreset::Square,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum ResolutionArg {
+    /// Longer edge under 2240 px.
+    #[value(name = "1k")]
+    OneK,
+    /// 2240–3199 px.
+    #[value(name = "2k")]
+    TwoK,
+    /// 3200 px and up.
+    #[value(name = "4k")]
+    FourK,
+}
+
+impl From<ResolutionArg> for ResolutionBand {
+    fn from(value: ResolutionArg) -> Self {
+        match value {
+            ResolutionArg::OneK => ResolutionBand::OneK,
+            ResolutionArg::TwoK => ResolutionBand::TwoK,
+            ResolutionArg::FourK => ResolutionBand::FourK,
         }
     }
 }

@@ -64,7 +64,7 @@ pub(crate) fn open_image_search(
             .await;
         let _ = handle.update(cx, |_, _, cx| {
             controller.update(cx, |ctl, cx| {
-                ctl.open_visual_search(format!("{mode_label} · {title}"), results);
+                ctl.open_visual_search(format!("{mode_label} · {title}"), results, None);
                 cx.notify();
             });
         });
@@ -81,9 +81,9 @@ pub(crate) fn open_color_search(
     window: &mut Window,
     cx: &mut App,
 ) {
-    let db_path = {
+    let (db_path, similarity) = {
         let ctl = controller.read(cx);
-        ctl.library.root().join("library.db")
+        (ctl.library.root().join("library.db"), ctl.colour_similarity)
     };
     let handle = window.window_handle();
     let mode_label = rust_i18n::t!("workspace.color_search").to_string();
@@ -93,11 +93,15 @@ pub(crate) fn open_color_search(
         let hex_for_search = hex_owned.clone();
         let results = cx
             .background_executor()
-            .spawn(async move { color_search(&db_path, &hex_for_search) })
+            .spawn(async move { color_search(&db_path, &hex_for_search, similarity) })
             .await;
         let _ = handle.update(cx, |_, _, cx| {
             controller.update(cx, |ctl, cx| {
-                ctl.open_visual_search(format!("{mode_label} · {hex_owned}"), results);
+                ctl.open_visual_search(
+                    format!("{mode_label} · {hex_owned}"),
+                    results,
+                    Some(hex_owned.clone()),
+                );
                 cx.notify();
             });
         });
@@ -120,11 +124,11 @@ fn visual_search(db_path: &Path, query_path: &Path) -> Vec<(Uuid, f32)> {
 }
 
 /// Search images whose palette contains a colour close to `hex`.
-fn color_search(db_path: &Path, hex: &str) -> Vec<(Uuid, f32)> {
+fn color_search(db_path: &Path, hex: &str, similarity: f32) -> Vec<(Uuid, f32)> {
     let Ok(store) = trove_core::store::Store::open(db_path) else {
         return Vec::new();
     };
-    trove_core::store::visual_search::search_by_color(store.conn(), hex, Some(50))
+    trove_core::store::visual_search::search_by_color(store.conn(), hex, similarity, Some(50))
         .unwrap_or_default()
         .into_iter()
         .map(|r| (r.asset.id, r.score))
