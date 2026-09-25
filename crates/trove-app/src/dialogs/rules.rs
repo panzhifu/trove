@@ -25,11 +25,11 @@
 //! conditions on the left, the appearance column on the right.
 
 use gpui_kit::base::{h_flex, v_flex};
-use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::WindowExt as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
+use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::{ActiveTheme, IconName, Sizable};
 use gpui_kit::*;
 
