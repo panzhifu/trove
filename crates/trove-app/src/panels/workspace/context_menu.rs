@@ -87,8 +87,17 @@ pub(crate) fn asset_context_menu(
         assets::get(ctl.library.store().conn(), asset_id)
             .ok()
             .flatten()
-            .and_then(|a| a.rel_path)
-            .map(|rel| ctl.library.root().join(rel))
+            .and_then(|a| {
+                // Linked files keep their original path in `source_path`;
+                // stored ones live under the library's `rel_path`.
+                if a.origin == trove_core::model::Origin::Linked {
+                    a.facts.source_path.as_ref().map(PathBuf::from)
+                } else {
+                    a.rel_path
+                        .as_ref()
+                        .map(|rel| ctl.library.root().join(rel))
+                }
+            })
     };
 
     let mut menu = menu

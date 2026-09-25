@@ -25,6 +25,7 @@
 //! conditions on the left, the appearance column on the right.
 
 use gpui_kit::base::{h_flex, v_flex};
+use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::WindowExt as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputState};
@@ -491,7 +492,7 @@ pub fn open_rule_editor(
                 })
                 .to_string(),
             )
-            .width(px(760.))
+            .width(px(608.))
             .child(render_body(&draft, status, cx))
             .on_ok({
                 let draft = draft.clone();
@@ -670,7 +671,14 @@ fn render_body(
         h_flex()
             .items_start()
             .gap_4()
-            .child(conditions)
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .max_h(px(400.))
+                    .overflow_y_scrollbar()
+                    .child(conditions),
+            )
             .child(appearance::column(&draft.read(cx).chooser, cx)),
     )
 }

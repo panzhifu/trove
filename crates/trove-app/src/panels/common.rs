@@ -140,7 +140,7 @@ pub(crate) fn color_swatch(
     div()
         .id(id)
         .cursor_pointer()
-        .size_6()
+        .size(px(19.2))
         .flex_shrink_0()
         .rounded(cx.theme().radius)
         .p(ring)
