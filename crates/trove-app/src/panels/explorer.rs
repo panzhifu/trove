@@ -634,7 +634,24 @@ impl Render for ExplorerPanel {
                         let dragged = payload.0;
                         if dragged != sid {
                             drop_ctl.update(cx, move |ctl, cx| {
-                                reparent_smart(ctl, dragged, Some(sid), cx);
+                                let conn = ctl.library.store().conn();
+                                let target_parent = smart_collections::get(conn, sid)
+                                    .ok()
+                                    .flatten()
+                                    .and_then(|s| s.parent_id);
+                                let target_pos = smart_collections::list(conn)
+                                    .map(|all| {
+                                        all.iter()
+                                            .filter(|sc| sc.parent_id == target_parent)
+                                            .position(|sc| sc.id == sid)
+                                            .unwrap_or(0) as i64
+                                    })
+                                    .unwrap_or(0);
+                                if let Err(e) = ctl.library.reorder_smart_collection(dragged, target_pos) {
+                                    ctl.notice = Some(rust_i18n::t!("explorer.move_failed", error = e.to_string()).to_string());
+                                }
+                                ctl.generation += 1;
+                                cx.notify();
                             });
                         }
                     })

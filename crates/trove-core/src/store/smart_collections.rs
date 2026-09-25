@@ -183,6 +183,58 @@ pub fn move_to(conn: &Connection, id: Uuid, new_parent: Option<Uuid>, position: 
     Ok(())
 }
 
+/// Move `id` to `position` among its siblings, shifting others to make room.
+///
+/// Unlike [`move_to`], which simply sets the position (and is best for
+/// reparenting), this reindexes siblings so the order is deterministic:
+/// the dragged item lands exactly at `position`, and every other sibling
+/// keeps its relative sequence.
+pub fn reorder_to(conn: &Connection, id: Uuid, position: i64) -> Result<()> {
+    let parent_id: Option<String> = rows::query_one(
+        conn,
+        "SELECT parent_id FROM smart_collections WHERE id = ?1",
+        vec![rows::uuid(id).into()],
+        |row| Ok(rows::opt_str(row, 0)?),
+    )?.flatten();
+    let siblings: Vec<Uuid> = rows::query_map(
+        conn,
+        "SELECT id FROM smart_collections \
+         WHERE parent_id IS ?1 AND id != ?2 \
+         ORDER BY position ASC, created_at ASC",
+        vec![
+            parent_id.clone().map(Value::Text).unwrap_or(Value::Null),
+            rows::uuid(id).into(),
+        ],
+        |row| Ok(rows::req_uuid(row, 0)?),
+    )?;
+    let pos = (position as usize).min(siblings.len());
+    let now = Utc::now();
+    for (new_pos, sib_id) in siblings.iter().enumerate().skip(pos) {
+        rows::execute(
+            conn,
+            "UPDATE smart_collections SET position = ?1, updated_at = ?2 WHERE id = ?3",
+            vec![
+                Value::Integer(new_pos as i64 + 1),
+                rows::ts(now).into(),
+                rows::uuid(*sib_id).into(),
+            ],
+        )?;
+    }
+    let changed = rows::execute(
+        conn,
+        "UPDATE smart_collections SET position = ?1, updated_at = ?2 WHERE id = ?3",
+        vec![
+            Value::Integer(position),
+            rows::ts(now).into(),
+            rows::uuid(id).into(),
+        ],
+    )?;
+    if changed == 0 {
+        return Err(Error::NotFound("smart_collection"));
+    }
+    Ok(())
+}
+
 /// Delete a smart collection together with its smart descendants (the saved
 /// searches only; assets are untouched).
 pub fn delete(conn: &Connection, id: Uuid) -> Result<()> {
