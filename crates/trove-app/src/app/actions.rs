@@ -46,6 +46,7 @@ gpui_kit::actions!(
         MoveUp,
         MoveDown,
         OpenPreview,
+        QuickLook,
         // -- Inline editor (ExplorerPanel only) ------------------------------
         CancelEditor,
         // -- Fullscreen video stage -----------------------------------------

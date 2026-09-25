@@ -50,6 +50,14 @@ pub fn default_keybindings() -> Vec<KeyBindingConfig> {
             key: "enter",
             context: Some("Workspace"),
         },
+        // The grid's own context, not `Workspace`: the search input sits inside
+        // `Workspace` as well, and a binding for a bare character there would
+        // take that character away from typing.
+        KeyBindingConfig {
+            action: "QuickLook",
+            key: "space",
+            context: Some("AssetGrid"),
+        },
         KeyBindingConfig {
             action: "TrashSelected",
             key: "delete",
@@ -182,6 +190,20 @@ mod tests {
     }
 
     #[test]
+    fn quick_look_is_scoped_to_the_grid_not_the_workspace() {
+        // The same reason `f` is scoped to `VideoPreview`: `Workspace` wraps the
+        // search input too, and a bare `space` bound there would take the space
+        // character away from typing a two-word query.
+        let defaults = default_keybindings();
+        let binding = defaults
+            .iter()
+            .find(|b| b.action == "QuickLook")
+            .expect("QuickLook must stay configurable");
+        assert_eq!(binding.key, "space");
+        assert_eq!(binding.context, Some("AssetGrid"));
+    }
+
+    #[test]
     fn the_fullscreen_keys_mirror_each_other() {
         // `f` toggles: the same letter enters the stage and leaves it, so a
         // rebind of one without the other breaks the pairing.
@@ -201,13 +223,16 @@ mod tests {
     fn no_bare_letter_in_the_workspace_context() {
         // The search box shares the `Workspace` context, so a single-letter
         // binding there would eat that letter while typing. The fullscreen
-        // key is scoped to `VideoPreview` for exactly this reason.
+        // key is scoped to `VideoPreview` for exactly this reason — and so is
+        // the space bar, scoped to `AssetGrid`, because a grid that swallows
+        // spaces is a grid you cannot search for two words at once.
         let offenders: Vec<&str> = default_keybindings()
             .iter()
             .filter(|b| b.context == Some("Workspace"))
             .filter(|b| {
                 let mut chars = b.key.chars();
-                matches!(chars.next(), Some(c) if c.is_ascii_alphabetic()) && chars.next().is_none()
+                matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == ' ')
+                    && chars.next().is_none()
             })
             .map(|b| b.action)
             .collect();

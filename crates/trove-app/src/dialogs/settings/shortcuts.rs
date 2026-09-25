@@ -435,6 +435,7 @@ fn action_label(action: &str) -> String {
         "MoveUp" => rust_i18n::t!("shortcuts.actions.MoveUp").to_string(),
         "MoveDown" => rust_i18n::t!("shortcuts.actions.MoveDown").to_string(),
         "OpenPreview" => rust_i18n::t!("shortcuts.actions.OpenPreview").to_string(),
+        "QuickLook" => rust_i18n::t!("shortcuts.actions.QuickLook").to_string(),
         "TrashSelected" => rust_i18n::t!("shortcuts.actions.TrashSelected").to_string(),
         "SelectAll" => rust_i18n::t!("shortcuts.actions.SelectAll").to_string(),
         "ClearSelection" => rust_i18n::t!("shortcuts.actions.ClearSelection").to_string(),
@@ -472,6 +473,7 @@ fn action_label(action: &str) -> String {
 fn context_label(context: &str) -> String {
     match context {
         "Workspace" => rust_i18n::t!("shortcuts.context.Workspace").to_string(),
+        "AssetGrid" => rust_i18n::t!("shortcuts.context.AssetGrid").to_string(),
         "VideoPreview" => rust_i18n::t!("shortcuts.context.VideoPreview").to_string(),
         _ => rust_i18n::t!("shortcuts.context.global").to_string(),
     }

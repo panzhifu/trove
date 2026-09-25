@@ -1,16 +1,23 @@
-//! One live card at a time: the tile the pointer rests on plays what it holds.
+//! One live card at a time: the tile the user asked for shows what it holds.
 //!
 //! The grid is static everywhere else by design — a hundred thumbnails do not
 //! move, and the row layout is frozen so a repaint never re-measures. This is the
 //! one place a card is allowed to be alive, and the budget that keeps it honest:
-//! **exactly one** tile, and only after the pointer has settled on it for
-//! [`SETTLE`]. Sweeping the mouse across a library therefore starts nothing,
-//! which is what makes the feature safe to leave on by default.
+//! **exactly one** tile, and only one the user named with the space bar. Nothing
+//! comes alive on its own, which is what makes it safe to leave in without a
+//! switch — and what makes a sweeping mouse irrelevant here.
+//!
+//! A live card is alive in one of two ways. A video or a soundtrack **plays**: a
+//! decoder starts, frames arrive, and the tile itself becomes the picture. A
+//! still or a specimen has nothing to play, so it is only **looked at** — nothing
+//! is spawned for it at all, and what the key buys is a larger view of the very
+//! picture the tile was already painting, which the workspace cell code draws
+//! beside it.
 //!
 //! It lives here rather than in `panels::workspace` because the two things it
 //! drives — the frame pipe and the soundtrack — belong to the preview module, and
 //! a grid cell should not have to widen their APIs to borrow them. The workspace
-//! owns the entity, tells it which tile the pointer is on, and asks it what to
+//! owns the entity, tells it which tile to bring to life, and asks it what to
 //! paint.
 
 use std::path::PathBuf;
@@ -27,16 +34,11 @@ use uuid::Uuid;
 use super::soundtrack::AudioEngine;
 use crate::library::LibraryController;
 
-/// How long the pointer must rest on a tile before it comes alive. Half a second
-/// is the difference between "I meant that one" and a jukebox that plays every
-/// tile the mouse crosses.
-const SETTLE: Duration = Duration::from_millis(500);
-
-/// Width a hover decode is capped to. A card is never wider than this on screen
-/// at any zoom the grid offers, and one 320-wide BGRA frame is ~400 KB rather
-/// than the ~3.7 MB a 720-wide one costs — this loop must not be able to make
-/// the grid slower than the grid itself.
-const HOVER_MAX_WIDTH: u32 = 320;
+/// Width a live card's decode is capped to. A card is never wider than this on
+/// screen at any zoom the grid offers, and one 320-wide BGRA frame is ~400 KB
+/// rather than the ~3.7 MB a 720-wide one costs — this loop must not be able to
+/// make the grid slower than the grid itself.
+const CARD_MAX_WIDTH: u32 = 320;
 
 /// How far the pointer must travel across a live card, as a fraction of its
 /// width, before it counts as a seek rather than a jitter.
@@ -69,7 +71,7 @@ struct Live {
     /// Milliseconds of clip: the asset's own figure at first, then the probe's,
     /// which is what turns a pointer ratio into a seek target.
     duration_ms: u64,
-    /// Both kinds carry sound: a video that hovers silently reads as broken, and
+    /// Both kinds carry sound: a video that plays silently reads as broken, and
     /// an audio tile has nothing else to announce itself with.
     audio: Option<Entity<AudioEngine>>,
     /// `None` for an audio tile: no picture to advance.
@@ -77,67 +79,103 @@ struct Live {
     /// Cleared when this card stops, which is how the loop learns to end without
     /// the entity having to reach it.
     alive: Option<Arc<AtomicBool>>,
+    /// The card holds something to look at rather than something to play, which
+    /// is the one difference between it and a dead decoder: no frame pipe, no
+    /// soundtrack, and a tile that keeps painting its own still. Every field
+    /// above is `None` here, and this is what says that was the plan.
+    looked: bool,
 }
 
 /// The grid's one live card.
-pub(crate) struct HoverCards {
-    /// The tile under the pointer, settled or not.
-    over: Option<Uuid>,
+pub(crate) struct LiveCard {
     live: Option<Live>,
-    /// Bumped by every hover change. A settle timer that wakes to a stale
-    /// generation does nothing — cheaper and less racy than cancelling the task
-    /// it was waiting for.
-    generation: u64,
+    /// Where the tile last painted, keyed by the asset it belongs to. The larger
+    /// view has to be positioned while it is being *built*, which is before this
+    /// frame's measurement, so the box cannot live in the frame — it lives here,
+    /// written by the tile's own `on_prepaint`. Nothing notifies on it: a repaint
+    /// already scheduled for another reason carries a fresh box, and a tile that
+    /// has not repainted has not moved.
+    anchor: Option<(Uuid, Bounds<Pixels>)>,
 }
 
-impl HoverCards {
+impl LiveCard {
     pub(crate) fn new() -> Self {
         Self {
-            over: None,
             live: None,
-            generation: 0,
+            anchor: None,
         }
     }
 
-    /// The pointer entered a tile (`Some`) or left the cards (`None`).
-    ///
-    /// The caller hands over the kind it already has on the paint path: reading
-    /// the asset's record here would cost a database lookup for every tile the
-    /// mouse crosses.
-    pub(crate) fn hovered(
+    /// Bring the tile `id` to life — or put it away if it is the one already
+    /// live, which is what makes the same key open and close a card.
+    pub(crate) fn toggle(
         &mut self,
-        id: Option<Uuid>,
+        id: Uuid,
         kind: AssetKind,
         controller: &Entity<LibraryController>,
         cx: &mut Context<Self>,
     ) {
-        if id == self.over {
-            return;
+        if self.live.as_ref().is_some_and(|live| live.id == id) {
+            self.off(cx);
+        } else {
+            self.point_to(id, kind, controller, cx);
         }
-        self.over = id;
-        self.generation += 1;
-        // Whatever was playing ends the moment the pointer moves off it —
-        // including when it moves onto another card, which is the common case.
+    }
+
+    /// Make `id` the live card, whatever was live before. The workspace calls
+    /// this from the space bar and then again to follow the selection, so
+    /// arrowing through a run of clips plays them one after another.
+    ///
+    /// The caller hands over the kind it already has for the row it is looking
+    /// at: resolving it here would cost a database lookup for every arrow step.
+    pub(crate) fn point_to(
+        &mut self,
+        id: Uuid,
+        kind: AssetKind,
+        controller: &Entity<LibraryController>,
+        cx: &mut Context<Self>,
+    ) {
         self.stop();
-        let (Some(id), true) = (id, matches!(kind, AssetKind::Video | AssetKind::Audio)) else {
+        match kind {
+            AssetKind::Video | AssetKind::Audio => self.start(id, kind, controller.clone(), cx),
+            AssetKind::Image | AssetKind::Font => self.look(id, cx),
+            // A model has a viewport and a text file an editor, and `enter` opens
+            // both properly. A live tile would only be a worse version of them.
+            _ => cx.notify(),
+        }
+    }
+
+    /// Whether any card is live, which is what the escape key answers to first.
+    pub(crate) fn is_on(&self) -> bool {
+        self.live.is_some()
+    }
+
+    /// Put the live card away, reporting whether there was one to put away.
+    pub(crate) fn off(&mut self, cx: &mut Context<Self>) -> bool {
+        let was = self.live.is_some();
+        self.stop();
+        if was {
             cx.notify();
-            return;
-        };
-        let generation = self.generation;
-        let entity = cx.entity();
-        let controller = controller.clone();
-        cx.spawn(async move |_, cx| {
-            cx.background_executor().timer(SETTLE).await;
-            entity.update(cx, move |this, cx| {
-                // The pointer may have moved on, or landed somewhere else,
-                // while this was waiting.
-                if this.generation == generation && this.over == Some(id) {
-                    this.start(id, kind, controller, cx);
-                }
-            });
-        })
-        .detach();
-        cx.notify();
+        }
+        was
+    }
+
+    /// Record where the tile `id` sits, from its own prepaint, answering whether
+    /// this is the first box for that tile. Deliberately silent either way — see
+    /// the field — and the caller asks for one more frame when the answer is yes,
+    /// because a larger view is built *from* the box and cannot be built in the
+    /// frame that discovers it.
+    pub(crate) fn set_anchor(&mut self, id: Uuid, bounds: Bounds<Pixels>) -> bool {
+        let first = self.anchor.is_none_or(|(anchor, _)| anchor != id);
+        self.anchor = Some((id, bounds));
+        first
+    }
+
+    /// The box `id` last painted in, or `None` if it never reported one.
+    pub(crate) fn anchor(&self, id: Uuid) -> Option<Bounds<Pixels>> {
+        self.anchor
+            .filter(|(anchor, _)| *anchor == id)
+            .map(|(_, bounds)| bounds)
     }
 
     /// The pointer moved to a 0..1 position across the live card: a seek, for
@@ -189,13 +227,41 @@ impl HoverCards {
         live.mailbox.is_some().then_some(live.ratio)
     }
 
-    /// Whether `id` is the live tile, which is what decides if a card gets the
-    /// pointer handlers at all: a static card must not pay for a move listener.
+    /// Whether `id` is the live tile, which is what decides which card pays for
+    /// the measurement and the move listener: a static tile has neither.
     pub(crate) fn is_live(&self, id: Uuid) -> bool {
         self.live.as_ref().is_some_and(|live| live.id == id)
     }
 
-    /// Start the tile the settle delay picked.
+    /// Whether `id` is the live tile **and** holds a still or a specimen, which
+    /// is what decides whether the card grows a larger view beside it. A played
+    /// card answers `false`: its payload is the tile itself, so there is nothing
+    /// left to show at a distance.
+    pub(crate) fn looked(&self, id: Uuid) -> bool {
+        self.live
+            .as_ref()
+            .is_some_and(|live| live.id == id && live.looked)
+    }
+
+    /// Make a still or a specimen the live card. Nothing is spawned — no
+    /// decoder, no soundtrack, not even a file read: the tile keeps painting what
+    /// it painted a moment ago, and [`Self::looked`] is the whole answer the host
+    /// needs in order to draw the larger view beside it.
+    fn look(&mut self, id: Uuid, cx: &mut Context<Self>) {
+        self.live = Some(Live {
+            id,
+            frame: None,
+            ratio: 0.,
+            duration_ms: 0,
+            audio: None,
+            mailbox: None,
+            alive: None,
+            looked: true,
+        });
+        cx.notify();
+    }
+
+    /// Start the tile the space bar named.
     fn start(
         &mut self,
         id: Uuid,
@@ -204,10 +270,8 @@ impl HoverCards {
         cx: &mut Context<Self>,
     ) {
         // Read here rather than on the paint path: this runs once per deliberate
-        // dwell, while a hover change fires for every tile the mouse crosses.
-        if !trove_core::config::AppConfig::load().hover_media() {
-            return;
-        }
+        // key press, and the file the asset's bytes live in is not something a
+        // cell should have to resolve.
         let (path, duration_ms) = {
             let controller = controller.read(cx);
             let record = trove_core::store::assets::get(controller.library.store().conn(), id)
@@ -239,6 +303,7 @@ impl HoverCards {
                 audio: Some(audio),
                 mailbox: None,
                 alive: None,
+                looked: false,
             });
             cx.notify();
             return;
@@ -260,6 +325,7 @@ impl HoverCards {
             audio,
             mailbox: Some(mailbox.clone()),
             alive: Some(alive.clone()),
+            looked: false,
         });
         self.decode(mailbox, alive, path, cx);
         self.present(id, cx);
@@ -314,7 +380,7 @@ impl HoverCards {
                     let at = playhead;
                     let fresh = cx
                         .background_executor()
-                        .spawn(async move { FramePipe::open(&open_path, at, HOVER_MAX_WIDTH) })
+                        .spawn(async move { FramePipe::open(&open_path, at, CARD_MAX_WIDTH) })
                         .await;
                     match fresh {
                         Some(fresh) => pipe = Some(fresh),

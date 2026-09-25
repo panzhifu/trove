@@ -61,13 +61,6 @@ pub struct AppConfig {
     /// Collect service port. Defaults to [`crate::services::collect::DEFAULT_PORT`].
     #[serde(default)]
     pub collect_port: Option<u16>,
-    /// Whether a grid card comes alive under the pointer: a video plays from a
-    /// keyframe-near seek, an audio file plays, both after the pointer has
-    /// settled. On by default — it is the fastest way to find a clip in a wall
-    /// of posters — and the one media feature here that makes noise, so it is
-    /// the one worth a switch.
-    #[serde(default)]
-    pub hover_media: Option<bool>,
     /// Eye-dome lighting and gap filling on a point-cloud preview. On by
     /// default: without it a scan reads as dust rather than a surface. Turn it
     /// off for a flatter, marginally cheaper picture.
@@ -798,11 +791,6 @@ impl AppConfig {
     /// Whether the local collect service should listen (on by default).
     pub fn collect_enabled(&self) -> bool {
         self.collect_enabled.unwrap_or(true)
-    }
-
-    /// Whether hovering a grid card plays it (on by default).
-    pub fn hover_media(&self) -> bool {
-        self.hover_media.unwrap_or(true)
     }
 
     /// Effective collect-service port.

@@ -40,6 +40,12 @@ use app::actions::*;
 /// search input or elsewhere never triggers grid navigation.
 const WORKSPACE_CONTEXT: &str = "Workspace";
 
+/// Key context of the asset grid itself — the scrolling tiles, not the toolbar
+/// above them. It exists for the one binding a wider context could not carry:
+/// the space bar for quick look. `Workspace` covers the search input too, and a
+/// binding for a bare character there is that character, gone from typing.
+const GRID_CONTEXT: &str = "AssetGrid";
+
 /// Key context of the `ExplorerPanel` (collections tree). Its only binding
 /// is Escape: the inline add/rename editor's input lets the key propagate,
 /// so the panel can dismiss the editor.
@@ -94,10 +100,13 @@ pub(crate) fn register_keys(cx: &mut App) {
 
     macro_rules! bind {
         ($action:ident, $action_name:literal) => {
+            bind!($action, $action_name, Some(WORKSPACE_CONTEXT));
+        };
+        ($action:ident, $action_name:literal, $context:expr) => {
             if let Some(k) = default_key($action_name) {
                 let k = key_for($action_name, &k);
                 if !k.is_empty() {
-                    bindings.push(KeyBinding::new(&k, $action, Some(WORKSPACE_CONTEXT)));
+                    bindings.push(KeyBinding::new(&k, $action, $context));
                 }
             }
         };
@@ -108,6 +117,7 @@ pub(crate) fn register_keys(cx: &mut App) {
     bind!(MoveUp, "MoveUp");
     bind!(MoveDown, "MoveDown");
     bind!(OpenPreview, "OpenPreview");
+    bind!(QuickLook, "QuickLook", Some(GRID_CONTEXT));
     // Backspace stays a fixed alias for TrashSelected.
     let trash_key = key_for("TrashSelected", "delete");
     if !trash_key.is_empty() {

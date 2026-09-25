@@ -3,18 +3,34 @@
 //! wiring, plus the list-view row variant.
 
 use super::*;
+use gpui_kit::base::{Align, Placement, Positioner};
+
+/// Longest edge of the larger view a live still or specimen gets. The
+/// thumbnail it shows is capped at [`trove_core::media::thumb::THUMB_MAX`], and
+/// that is the ceiling this is measured against: past it the view would be
+/// upscaling the cached picture rather than revealing it. 480 still clears the
+/// tallest tile the zoom slider offers, so it is a genuine enlargement at every
+/// zoom the grid can reach.
+const LOUPE_MAX: f32 = 480.;
+
+/// Gap kept between a tile and its larger view.
+const LOUPE_GAP: f32 = 10.;
+
+/// Deferred paint priority. Below Base's dialogs (`10 + layer`) and popups
+/// (`100`), so a menu or a sheet always covers the view rather than fighting it.
+const LOUPE_PRIORITY: usize = 5;
 
 // ============================ cell rendering =================================
 
 /// One cell thumbnail with click / drag / context-menu behavior, rendered at
 /// the exact pixel size the row layout assigned to it. Selection is read live
-/// from the controller. Clicking focuses the panel so grid keyboard
-/// navigation (arrows / Delete / Enter) applies.
+/// from the controller. Clicking focuses the tiles so the grid keyboard
+/// navigation (arrows / Delete / Enter) and the space bar apply.
 pub(super) fn build_cell_element(
     cx: &mut App,
     controller: &Entity<LibraryController>,
     focus_handle: &FocusHandle,
-    hover: &Entity<HoverCards>,
+    quick_look: &Entity<LiveCard>,
     cell: &Cell,
     w: f32,
     h: f32,
@@ -23,11 +39,12 @@ pub(super) fn build_cell_element(
     let is_sel = controller.read(cx).selected_assets.contains(&id);
     // The live card, if this is the one. Reading it is a borrow of another
     // entity on the paint path, which is exactly what selection already does —
-    // and it is the only way a hover can repaint a single tile without
-    // rebuilding the frozen row it sits in.
-    let is_live = hover.read(cx).is_live(id);
-    let picture = is_live.then(|| hover.read(cx).picture(id)).flatten();
-    let playhead = is_live.then(|| hover.read(cx).playhead(id)).flatten();
+    // and it is the only way a card can repaint on its own without rebuilding
+    // the frozen row it sits in.
+    let is_live = quick_look.read(cx).is_live(id);
+    let picture = is_live.then(|| quick_look.read(cx).picture(id)).flatten();
+    let playhead = is_live.then(|| quick_look.read(cx).playhead(id)).flatten();
+    let looked = quick_look.read(cx).looked(id);
 
     // Fonts render live — the sample text set in the font itself, one row —
     // with the static specimen card as fallback (unparseable font / no
@@ -38,15 +55,9 @@ pub(super) fn build_cell_element(
                 .then(|| {
                     // Subtitled specimen card (fontmatrix style): three
                     // stacked rows (Latin / CJK / digits) under the label.
-                    // The font size derives from the height actually left
-                    // for the rows — card height minus the label strip,
-                    // over the three-line line-height factor — so the zoom
-                    // slider keeps steering it across its whole travel;
-                    // only the very top of the range clamps out.
-                    let size = ((h - 24.0) / 3.6).clamp(12.0, 72.0);
                     crate::panels::common::font_specimen_card(family, cx)
                         .size_full()
-                        .text_size(px(size))
+                        .text_size(px(font_specimen_size(h)))
                         .into_any_element()
                 })
         })
@@ -75,10 +86,15 @@ pub(super) fn build_cell_element(
                 .into_any_element(),
         }
     };
-    // Where this card starts, so a window-relative pointer position becomes a
-    // 0..1 ratio across it. Only the live card measures itself: a static one
-    // never answers a move, so it never pays for the handler.
-    let left = Rc::new(std::cell::Cell::new(0f32));
+    // The larger view, and only for the one card that earned it. Its anchor is
+    // the tile's box *from the last paint*, because a deferred surface is placed
+    // while it is being built — before this frame has measured anything. And
+    // deciding a font's view asks whether the face registered, which is a probe
+    // the other hundred tiles must not pay for.
+    let loupe = looked
+        .then(|| quick_look.read(cx).anchor(id))
+        .flatten()
+        .and_then(|anchor| loupe_for(cell, anchor, cx));
     let base = div()
         .cursor_pointer()
         .flex_none()
@@ -94,19 +110,24 @@ pub(super) fn build_cell_element(
         })
         .overflow_hidden()
         // `on_prepaint` belongs on the plain div, before the id (same contract
-        // as the preview stage).
+        // as the preview stage). The live tile measures itself so the larger view
+        // has a box to hang off, and the first measurement of a tile asks for one
+        // more frame — the view is built *from* the box, so the frame that finds
+        // it cannot be the frame that draws it.
         .when(is_live, {
-            let left = left.clone();
+            let quick_look = quick_look.clone();
             move |cell| {
-                cell.on_prepaint(move |bounds: Bounds<Pixels>, _, _| {
-                    left.set(f32::from(bounds.origin.x));
+                cell.on_prepaint(move |measured: Bounds<Pixels>, window, cx| {
+                    if quick_look.update(cx, |cards, _| cards.set_anchor(id, measured)) {
+                        window.request_animation_frame();
+                    }
                 })
             }
         })
         .id(format!("cell-{id}"))
         .child(preview)
         .when_some(playhead, |cell, ratio| {
-            // The card's own progress bar: a hovering video has no transport,
+            // The card's own progress bar: a live video has no transport,
             // and this is the least intrusive thing that says where it is.
             cell.child(
                 div()
@@ -118,22 +139,19 @@ pub(super) fn build_cell_element(
                     .bg(cx.theme().primary),
             )
         })
-        .on_hover({
-            let hover = hover.clone();
-            let controller = controller.clone();
-            move |entered, _, cx| {
-                hover.update(cx, |cards, cx| {
-                    cards.hovered(entered.then_some(id), kind, &controller, cx);
-                });
-            }
-        })
-        .when(is_live, {
-            let hover = hover.clone();
-            let left = left.clone();
+        .when_some(loupe, |cell, loupe| cell.child(loupe))
+        // Not a looked-at card: a still and a specimen have no timeline for the
+        // pointer to be a shuttle across, so that tile gets no move listener.
+        .when(is_live && !looked, {
+            let quick_look = quick_look.clone();
             move |cell| {
                 cell.on_mouse_move(move |event: &MouseMoveEvent, _, cx| {
-                    let ratio = (f32::from(event.position.x) - left.get()) / w.max(1.);
-                    hover.update(cx, |cards, cx| cards.scrubbed(id, ratio, cx));
+                    let Some(anchor) = quick_look.read(cx).anchor(id) else {
+                        return;
+                    };
+                    let ratio =
+                        (f32::from(event.position.x) - f32::from(anchor.origin.x)) / w.max(1.);
+                    quick_look.update(cx, |cards, cx| cards.scrubbed(id, ratio, cx));
                 })
             }
         });
@@ -204,6 +222,87 @@ pub(super) fn build_cell_element(
         asset_context_menu(menu, window, cx, &ctl_menu, id, trashed)
     })
     .into_any_element()
+}
+
+/// Font size for a specimen card of the given height: the height actually left
+/// for the rows — card height minus the label strip, over the three-line
+/// line-height factor. Derived from height rather than width so the zoom slider
+/// keeps steering it across its whole travel and only the very top of the range
+/// clamps out. Shared by the tile and by its larger view, which is what makes
+/// the two differ in nothing but size.
+fn font_specimen_size(height: f32) -> f32 {
+    ((height - 24.) / 3.6).clamp(12., 72.)
+}
+
+/// The larger view of a live tile: the very picture the card is already painting,
+/// at a size a face or a picture can be judged by.
+///
+/// It shows the library **thumbnail**, never the original, and that is the same
+/// bargain the main-area preview strikes: a 50-megapixel original would decode
+/// into hundreds of megabytes of pixels for one glance. The cached 512px JPEG is
+/// at least as sharp as this box and costs nothing to get, which is why adding a
+/// view here needed no decoder at all — unlike a played card, where the whole
+/// mechanism is the decoding.
+fn loupe_for(cell: &Cell, anchor: Bounds<Pixels>, cx: &mut App) -> Option<AnyElement> {
+    // A font whose file registers shows live text; one that does not, like any
+    // other kind, shows the rasterized card — which is exactly what its tile is
+    // already painting, so the view enlarges the tile rather than replacing it.
+    let family = cell.font_family.as_ref().filter(|family| {
+        crate::panels::common::ensure_font_registered(family, cell.font_blob.as_deref(), cx)
+    });
+    // A font card is 512×256 in both of its forms, live and rasterized, so its
+    // proportions come from the card rather than from a face with no dimensions
+    // of its own; and the height is the one that puts the rows at the largest
+    // size this element reaches at all (`font_specimen_size` clamps at 72), so
+    // the view differs from the tile by having room for the whole sample rather
+    // than by glyphs no tile could show.
+    let (width, height) = if cell.kind == AssetKind::Font {
+        (LOUPE_MAX, 300.)
+    } else {
+        let aspect = cell.aspect();
+        if aspect >= 1. {
+            (LOUPE_MAX, LOUPE_MAX / aspect)
+        } else {
+            (LOUPE_MAX * aspect, LOUPE_MAX)
+        }
+    };
+    let content: AnyElement = if let Some(family) = family {
+        crate::panels::common::font_specimen_card(family, cx)
+            .size_full()
+            .text_size(px(font_specimen_size(height)))
+            .into_any_element()
+    } else {
+        let thumb = cell.thumb.clone()?;
+        img(thumb)
+            .size_full()
+            .object_fit(gpui_kit::ObjectFit::Contain)
+            .into_any_element()
+    };
+    let surface = div()
+        .w(px(width))
+        .h(px(height))
+        .overflow_hidden()
+        .rounded(cx.theme().radius)
+        .border_1()
+        .border_color(cx.theme().border)
+        .bg(cx.theme().background)
+        .shadow_lg()
+        .child(content);
+    // Deferred, so the view escapes every clip its tile sits under: the cell's
+    // own `overflow_hidden`, the grid area's, and the virtualized list's.
+    // `Positioner` owns the rest — the preferred side, the flip to the other one
+    // when it will not fit, and the clamp inside the window.
+    Some(
+        deferred(
+            Positioner::side(anchor)
+                .placement(Placement::Right)
+                .align(Align::Center)
+                .offset(px(LOUPE_GAP))
+                .child(surface),
+        )
+        .with_priority(LOUPE_PRIORITY)
+        .into_any_element(),
+    )
 }
 
 /// One full-width info row for list view: small thumbnail (or kind icon),
