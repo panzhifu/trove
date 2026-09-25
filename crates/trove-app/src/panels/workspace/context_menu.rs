@@ -93,9 +93,7 @@ pub(crate) fn asset_context_menu(
                 if a.origin == trove_core::model::Origin::Linked {
                     a.facts.source_path.as_ref().map(PathBuf::from)
                 } else {
-                    a.rel_path
-                        .as_ref()
-                        .map(|rel| ctl.library.root().join(rel))
+                    a.rel_path.as_ref().map(|rel| ctl.library.root().join(rel))
                 }
             })
     };

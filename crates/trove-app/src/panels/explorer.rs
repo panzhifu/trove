@@ -644,11 +644,20 @@ impl Render for ExplorerPanel {
                                         all.iter()
                                             .filter(|sc| sc.parent_id == target_parent)
                                             .position(|sc| sc.id == sid)
-                                            .unwrap_or(0) as i64
+                                            .unwrap_or(0)
+                                            as i64
                                     })
                                     .unwrap_or(0);
-                                if let Err(e) = ctl.library.reorder_smart_collection(dragged, target_pos) {
-                                    ctl.notice = Some(rust_i18n::t!("explorer.move_failed", error = e.to_string()).to_string());
+                                if let Err(e) =
+                                    ctl.library.reorder_smart_collection(dragged, target_pos)
+                                {
+                                    ctl.notice = Some(
+                                        rust_i18n::t!(
+                                            "explorer.move_failed",
+                                            error = e.to_string()
+                                        )
+                                        .to_string(),
+                                    );
                                 }
                                 ctl.generation += 1;
                                 cx.notify();

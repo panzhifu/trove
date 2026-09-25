@@ -194,8 +194,9 @@ pub fn reorder_to(conn: &Connection, id: Uuid, position: i64) -> Result<()> {
         conn,
         "SELECT parent_id FROM smart_collections WHERE id = ?1",
         vec![rows::uuid(id).into()],
-        |row| Ok(rows::opt_str(row, 0)?),
-    )?.flatten();
+        |row| rows::opt_str(row, 0),
+    )?
+    .flatten();
     let siblings: Vec<Uuid> = rows::query_map(
         conn,
         "SELECT id FROM smart_collections \
@@ -205,7 +206,7 @@ pub fn reorder_to(conn: &Connection, id: Uuid, position: i64) -> Result<()> {
             parent_id.clone().map(Value::Text).unwrap_or(Value::Null),
             rows::uuid(id).into(),
         ],
-        |row| Ok(rows::req_uuid(row, 0)?),
+        |row| rows::req_uuid(row, 0),
     )?;
     let pos = (position as usize).min(siblings.len());
     let now = Utc::now();
