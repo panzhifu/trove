@@ -275,7 +275,7 @@ fn preview_toolbar(
                                     cx,
                                 ) {
                                     panel.update(cx, |this, cx| {
-                                        this.open_asset_preview(id, window, cx);
+                                        this.open_asset_preview(id, &[], window, cx);
                                     });
                                 }
                             }

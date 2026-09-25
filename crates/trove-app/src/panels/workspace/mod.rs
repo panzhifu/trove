@@ -191,6 +191,11 @@ pub struct WorkspacePanel {
     preview: Option<MainPreview>,
     /// Kept so the preview's close event stops arriving when it is dropped.
     preview_subscription: Option<Subscription>,
+    /// Flat asset ID list for preview navigation (left/right arrow keys).
+    /// Captured when the preview opens; cleared when it closes.
+    preview_asset_ids: Vec<Uuid>,
+    /// Current position within `preview_asset_ids`.
+    preview_index: usize,
     /// Which renderer is painting an open model viewport, as the status bar
     /// shows it. `None` when no model preview is open. Carried here — rather
     /// than read on demand by the app view, which cannot reach through the
@@ -583,17 +588,33 @@ impl Render for WorkspacePanel {
                 shell.key_context(crate::VIDEO_PREVIEW_CONTEXT)
             })
             .track_focus(&self.focus_handle)
-            .on_action(cx.listener(|this, _: &MoveLeft, _, cx| {
-                this.move_selection(Direction::Left, cx);
+            .on_action(cx.listener(|this, _: &MoveLeft, window, cx| {
+                if this.preview.is_some() {
+                    this.navigate_preview(false, window, cx);
+                } else {
+                    this.move_selection(Direction::Left, cx);
+                }
             }))
-            .on_action(cx.listener(|this, _: &MoveRight, _, cx| {
-                this.move_selection(Direction::Right, cx);
+            .on_action(cx.listener(|this, _: &MoveRight, window, cx| {
+                if this.preview.is_some() {
+                    this.navigate_preview(true, window, cx);
+                } else {
+                    this.move_selection(Direction::Right, cx);
+                }
             }))
-            .on_action(cx.listener(|this, _: &MoveUp, _, cx| {
-                this.move_selection(Direction::Up, cx);
+            .on_action(cx.listener(|this, _: &MoveUp, window, cx| {
+                if this.preview.is_some() {
+                    this.navigate_preview(false, window, cx);
+                } else {
+                    this.move_selection(Direction::Up, cx);
+                }
             }))
-            .on_action(cx.listener(|this, _: &MoveDown, _, cx| {
-                this.move_selection(Direction::Down, cx);
+            .on_action(cx.listener(|this, _: &MoveDown, window, cx| {
+                if this.preview.is_some() {
+                    this.navigate_preview(true, window, cx);
+                } else {
+                    this.move_selection(Direction::Down, cx);
+                }
             }))
             .on_action(cx.listener(|this, _: &OpenPreview, window, cx| {
                 this.open_preview(window, cx);
