@@ -277,7 +277,14 @@ impl WorkspacePanel {
             self.open_model_preview(name, path, id, window, cx);
             return;
         }
-        self.open_asset_preview(id, window, cx);
+        // Flatten the row layout into a plain ID list so left/right arrows
+        // can step through the grid order while the preview is open.
+        let asset_ids: Vec<Uuid> = self
+            .rows
+            .iter()
+            .flat_map(|row| row.cells.iter().map(|cell| cell.id))
+            .collect();
+        self.open_asset_preview(id, &asset_ids, window, cx);
     }
 
     /// Show a 3D model in the main-area viewport, replacing whatever was
@@ -327,9 +334,12 @@ impl WorkspacePanel {
     /// whatever was there. No-op when the asset no longer exists.
     /// `pub(super)`: the preview toolbar re-opens the same asset after a
     /// quick edit, so the edited result replaces the picture on screen.
+    /// `asset_ids` is the flat ordered list of assets for left/right navigation;
+    /// pass an empty vec to keep the existing list (e.g. after an edit refresh).
     pub(super) fn open_asset_preview(
         &mut self,
         id: Uuid,
+        asset_ids: &[Uuid],
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -347,7 +357,35 @@ impl WorkspacePanel {
         self.viewport_backend = None;
         self.viewport_observer = None;
         self.preview_subscription = Some(subscription);
+        if !asset_ids.is_empty() {
+            self.preview_asset_ids = asset_ids.to_vec();
+            self.preview_index = asset_ids.iter().position(|&x| x == id).unwrap_or(0);
+        }
         cx.notify();
+    }
+
+    /// Step the preview to the next or previous asset in the frozen row
+    /// order. `forward` = true moves right/down, false moves left/up.
+    pub(super) fn navigate_preview(
+        &mut self,
+        forward: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.preview_asset_ids.is_empty() {
+            return;
+        }
+        let new_index = if forward {
+            self.preview_index.saturating_add(1).min(self.preview_asset_ids.len() - 1)
+        } else {
+            self.preview_index.saturating_sub(1)
+        };
+        if new_index == self.preview_index {
+            return;
+        }
+        let id = self.preview_asset_ids[new_index];
+        self.preview_index = new_index;
+        self.open_asset_preview(id, &[], window, cx);
     }
 
     /// Leave the preview, giving its frame back to the window first.
@@ -355,6 +393,8 @@ impl WorkspacePanel {
         if let Some(preview) = self.preview.take() {
             preview.release(window, cx);
             self.preview_subscription = None;
+            self.preview_asset_ids.clear();
+            self.preview_index = 0;
             self.viewport_backend = None;
             self.viewport_observer = None;
             cx.notify();
@@ -367,6 +407,8 @@ impl WorkspacePanel {
     fn forget_preview(&mut self, cx: &mut Context<Self>) {
         if self.preview.take().is_some() {
             self.preview_subscription = None;
+            self.preview_asset_ids.clear();
+            self.preview_index = 0;
             self.viewport_backend = None;
             self.viewport_observer = None;
             cx.notify();

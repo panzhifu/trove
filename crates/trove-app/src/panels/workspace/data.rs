@@ -272,6 +272,8 @@ impl WorkspacePanel {
             debounce_timer: None,
             preview: None,
             preview_subscription: None,
+            preview_asset_ids: Vec::new(),
+            preview_index: 0,
             viewport_backend: None,
             viewport_observer: None,
             total_refresh: None,
