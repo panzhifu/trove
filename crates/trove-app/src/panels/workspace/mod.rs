@@ -42,10 +42,11 @@ use trove_core::model::{AssetKind, AssetSort, NewSmartCollection, Orientation};
 use trove_core::store::{assets, collections, smart_collections};
 use uuid::Uuid;
 
-use crate::app::actions::{ClearSelection, MoveDown, MoveLeft, MoveRight, MoveUp, OpenPreview};
+use crate::app::actions::{
+    ClearSelection, MoveDown, MoveLeft, MoveRight, MoveUp, OpenPreview, QuickLook,
+};
 use crate::components::preview::{
-    AssetPreviewEvent, AssetPreviewPanel, HoverCards, ModelViewport, ModelViewportEvent,
-    VideoPlayer,
+    AssetPreviewEvent, AssetPreviewPanel, LiveCard, ModelViewport, ModelViewportEvent, VideoPlayer,
 };
 use crate::library::{GRID_PAGE_SIZE, LibraryController, ViewMode};
 
@@ -133,11 +134,16 @@ impl MainPreview {
 
 pub struct WorkspacePanel {
     focus_handle: FocusHandle,
+    /// Focus of the tiles themselves, as distinct from the panel. The space bar
+    /// belongs to the grid and to nothing else, and the search input shares the
+    /// panel's `Workspace` context — a binding for a bare character there is
+    /// that character, gone from typing.
+    grid_focus: FocusHandle,
     controller: Entity<LibraryController>,
-    /// The one live card: the tile the pointer rests on plays what it holds. Owned
-    /// here rather than by the controller because a hover repaint must not wake
-    /// every panel that observes the library.
-    hover: Entity<HoverCards>,
+    /// The one live card: the tile the space bar named. Owned here rather than by
+    /// the controller because a card's repaint must not wake every panel that
+    /// observes the library.
+    quick_look: Entity<LiveCard>,
     /// Self-contained floating search (trigger + popover + input).
     search_box: Entity<SearchBox>,
     /// Framework colour picker state; the element owns its own popover, so
@@ -619,13 +625,22 @@ impl Render for WorkspacePanel {
             .on_action(cx.listener(|this, _: &OpenPreview, window, cx| {
                 this.open_preview(window, cx);
             }))
+            .on_action(cx.listener(|this, _: &QuickLook, _, cx| {
+                this.toggle_quick_look(cx);
+            }))
             .on_action(cx.listener(|this, _: &ClearSelection, window, cx| {
                 // Escape backs out of the innermost thing: out of the
-                // main-area preview when one is open, otherwise it falls
-                // through to the app root, which clears the grid selection
-                // as before.
+                // main-area preview when one is open, then out of a live
+                // card, and only then to the app root, which clears the
+                // grid selection as before.
                 if this.preview.is_some() {
                     this.dismiss_preview(window, cx);
+                    cx.stop_propagation();
+                } else if this.quick_look.read(cx).is_on() {
+                    let quick_look = this.quick_look.clone();
+                    quick_look.update(cx, |cards, cx| {
+                        cards.off(cx);
+                    });
                     cx.stop_propagation();
                 }
             }));
@@ -1039,9 +1054,11 @@ impl Render for WorkspacePanel {
         let controller = self.controller.clone();
         // The live card is read per cell at paint time, so the closure that
         // builds rows needs the entity rather than the panel.
-        let hover = self.hover.clone();
+        let quick_look = self.quick_look.clone();
         let toolbar_controller = controller.clone();
-        let focus_handle = self.focus_handle.clone();
+        // Clicking a tile focuses the tiles, not the panel: that is what puts
+        // the keypress inside the grid's own context.
+        let grid_focus = self.grid_focus.clone();
         let rows_for_render = rows.clone();
         let rows_len = rows.len();
         let list_mode = view_mode == ViewMode::List;
@@ -1084,13 +1101,7 @@ impl Render for WorkspacePanel {
             let cells = row.cells.clone();
             if list_mode {
                 // One full-width info row per asset.
-                return build_list_row_element(
-                    cx,
-                    &controller,
-                    &focus_handle,
-                    &cells[0],
-                    widths[0],
-                );
+                return build_list_row_element(cx, &controller, &grid_focus, &cells[0], widths[0]);
             }
             h_flex()
                 .w_full()
@@ -1103,8 +1114,8 @@ impl Render for WorkspacePanel {
                             build_cell_element(
                                 cx,
                                 &controller,
-                                &focus_handle,
-                                &hover,
+                                &grid_focus,
+                                &quick_look,
                                 cell,
                                 *w,
                                 height,
@@ -1148,6 +1159,12 @@ impl Render for WorkspacePanel {
             .child(
                 div()
                     .id("assets-grid-area")
+                    // The tiles' own key context, inside `Workspace`: focus lands
+                    // here when a tile is clicked, and it is what scopes the space
+                    // bar to the grid. `Workspace` wraps the search input too, and
+                    // a binding for a bare character there eats that character.
+                    .key_context(crate::GRID_CONTEXT)
+                    .track_focus(&self.grid_focus)
                     .relative()
                     .flex_1()
                     .min_h_0()

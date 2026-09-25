@@ -271,6 +271,10 @@ impl WorkspacePanel {
         let Some(id) = self.controller.read(cx).primary() else {
             return;
         };
+        // A live card is a tile, and every tile is about to be gone: put the card
+        // out rather than leave a clip playing behind a full-size preview.
+        let quick_look = self.quick_look.clone();
+        quick_look.update(cx, |cards, cx| cards.off(cx));
         // A mesh is worth more than a picture of a mesh: the viewport lets it
         // be turned and zoomed, and a static picture is no way to look at one.
         if let Some((name, path)) = model_source(self.controller.read(cx), id) {
@@ -285,6 +289,43 @@ impl WorkspacePanel {
             .flat_map(|row| row.cells.iter().map(|cell| cell.id))
             .collect();
         self.open_asset_preview(id, &asset_ids, window, cx);
+    }
+
+    /// The kind of the loaded cell `id`, or `None` when the grid holds no tile
+    /// for it. Quick look is about a tile — it lights one up, or enlarges the
+    /// picture it was already painting — so an asset outside the loaded window
+    /// has nothing here to bring to life.
+    pub(super) fn cell_kind(&self, id: Uuid) -> Option<AssetKind> {
+        self.rows
+            .iter()
+            .find_map(|row| row.cells.iter().find(|cell| cell.id == id))
+            .map(|cell| cell.kind)
+    }
+
+    /// Space: make the selected card live, or put it away if it already is.
+    ///
+    /// This is the whole trigger now. Nothing comes alive because the pointer
+    /// happens to cross it, so there is no debounce to wait out, no switch to
+    /// turn the surprise off, and no sound nobody asked for.
+    pub(super) fn toggle_quick_look(&mut self, cx: &mut Context<Self>) {
+        let Some(id) = self.controller.read(cx).primary() else {
+            return;
+        };
+        let Some(kind) = self.cell_kind(id) else {
+            return;
+        };
+        let (quick_look, controller) = (self.quick_look.clone(), self.controller.clone());
+        quick_look.update(cx, |cards, cx| {
+            cards.toggle(id, kind, &controller, cx);
+        });
+    }
+
+    /// The main area is a different keyboard surface: while it holds one asset
+    /// whole, the arrows belong to stepping through the preview, not to the
+    /// grid. Focus goes back to the panel, which is the node that always exists
+    /// — the grid area is not rendered at all while a preview is up.
+    fn focus_preview_keys(&self, window: &mut Window, cx: &mut App) {
+        window.focus(&self.focus_handle, cx);
     }
 
     /// Show a 3D model in the main-area viewport, replacing whatever was
@@ -327,6 +368,7 @@ impl WorkspacePanel {
         }
         self.preview_subscription = Some(subscription);
         self.viewport_observer = Some(observer);
+        self.focus_preview_keys(window, cx);
         cx.notify();
     }
 
@@ -361,6 +403,7 @@ impl WorkspacePanel {
             self.preview_asset_ids = asset_ids.to_vec();
             self.preview_index = asset_ids.iter().position(|&x| x == id).unwrap_or(0);
         }
+        self.focus_preview_keys(window, cx);
         cx.notify();
     }
 
@@ -376,7 +419,9 @@ impl WorkspacePanel {
             return;
         }
         let new_index = if forward {
-            self.preview_index.saturating_add(1).min(self.preview_asset_ids.len() - 1)
+            self.preview_index
+                .saturating_add(1)
+                .min(self.preview_asset_ids.len() - 1)
         } else {
             self.preview_index.saturating_sub(1)
         };
@@ -397,6 +442,10 @@ impl WorkspacePanel {
             self.preview_index = 0;
             self.viewport_backend = None;
             self.viewport_observer = None;
+            // Back to the tiles: the grid is about to be rendered again, and the
+            // keys that belong to it — the space bar among them — should work
+            // without the user having to click a card first.
+            window.focus(&self.grid_focus, cx);
             cx.notify();
         }
     }

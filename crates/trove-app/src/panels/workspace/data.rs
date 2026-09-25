@@ -197,8 +197,8 @@ impl WorkspacePanel {
         // The one live card. A frame arriving from its decode loop is a
         // `notify` on that entity, and `observe` is what turns it into a
         // repaint of the grid.
-        let hover = cx.new(|_| HoverCards::new());
-        cx.observe(&hover, |_, _, cx| cx.notify()).detach();
+        let quick_look = cx.new(|_| LiveCard::new());
+        cx.observe(&quick_look, |_, _, cx| cx.notify()).detach();
         let search_box = cx.new(|cx| SearchBox::new(window, cx, controller.clone()));
         let available_width = cx.new(|_| px(0.));
         let list_state = ListState::new(0, ListAlignment::Top, px(LIST_OVERDRAW_PX));
@@ -251,8 +251,9 @@ impl WorkspacePanel {
         .detach();
         let this = Self {
             focus_handle: cx.focus_handle(),
+            grid_focus: cx.focus_handle(),
             controller,
-            hover,
+            quick_look,
             search_box,
             color_picker,
             pending_color_search: None,
@@ -284,6 +285,34 @@ impl WorkspacePanel {
             page_guard: Rc::new(CellFlag::new(usize::MAX)),
         };
         observe_controller(cx, &this.controller);
+        // Quick look follows the card. Once the space bar has lit one, moving the
+        // selection — an arrow key or a click, both of which arrive here as a
+        // controller notification — moves the light with it, so a run of clips
+        // plays through without a key press per tile. The alternative is a card
+        // still playing two rows up while the selection has long since moved on.
+        cx.observe(&this.controller, |this, _, cx| {
+            if !this.quick_look.read(cx).is_on() {
+                return;
+            }
+            let quick_look = this.quick_look.clone();
+            let controller = this.controller.clone();
+            // Nothing selected is nothing to look at, and the card goes out.
+            let Some(id) = this.controller.read(cx).primary() else {
+                quick_look.update(cx, |cards, cx| {
+                    cards.off(cx);
+                });
+                return;
+            };
+            let Some(kind) = this.cell_kind(id) else {
+                return;
+            };
+            quick_look.update(cx, |cards, cx| {
+                if !cards.is_live(id) {
+                    cards.point_to(id, kind, &controller, cx);
+                }
+            });
+        })
+        .detach();
         this
     }
 

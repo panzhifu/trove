@@ -21,9 +21,9 @@ mod audio;
 mod fallback;
 mod font;
 mod gpu3d;
-mod hover;
 mod image;
 pub(crate) mod model;
+mod quick_look;
 mod soundtrack;
 mod text;
 mod transport;
@@ -45,7 +45,7 @@ use uuid::Uuid;
 /// Zoom factor per wheel notch.
 const ZOOM_FACTOR: f32 = 1.15;
 
-pub(crate) use hover::HoverCards;
+pub(crate) use quick_look::LiveCard;
 pub(crate) use video::VideoPlayer;
 
 use crate::library::LibraryController;
