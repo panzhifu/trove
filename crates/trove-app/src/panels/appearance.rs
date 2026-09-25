@@ -397,9 +397,6 @@ pub(crate) struct Picker {
     /// What the preview row calls the folder.
     name: SharedString,
     commit: Commit,
-    /// The catalogue's scroll position, held here so it survives a frame: gpui
-    /// keeps the offset on the tracked element and the scrollbar reads it back.
-    scroll: ScrollHandle,
 }
 
 impl Picker {
@@ -416,7 +413,6 @@ impl Picker {
             appearance,
             name: preview_label(name),
             commit: Commit::Live { controller, target },
-            scroll: ScrollHandle::default(),
         })
     }
 
@@ -426,7 +422,6 @@ impl Picker {
             appearance,
             name: preview_label(name),
             commit: Commit::Draft,
-            scroll: ScrollHandle::default(),
         })
     }
 
@@ -500,7 +495,6 @@ impl Render for Picker {
         let picker = cx.entity();
         let appearance = self.appearance.clone();
         let name = self.name.clone();
-        let scroll = self.scroll.clone();
 
         v_flex()
             .id("appearance-picker")
@@ -509,18 +503,11 @@ impl Render for Picker {
             .gap_2()
             .child(accent_row(&picker, &appearance, cx))
             .child(
-                // The height clamp sits on the scroller itself rather than on
-                // `ScrollableElement::overflow_y_scrollbar`, which moves it to a
-                // wrapper and lets the scroller resolve to its content's height —
-                // inside a menu item, whose height is the content's own, that
-                // leaves a clipped list with nothing to scroll.
                 v_flex()
                     .id("appearance-catalogue")
                     .gap_2()
-                    .max_h(px(280.))
-                    .overflow_y_scroll()
-                    .track_scroll(&scroll)
-                    .vertical_scrollbar(&scroll)
+                    .h(px(224.))
+                    .overflow_y_scrollbar()
                     .child(glyph_run(
                         &picker,
                         &appearance,
@@ -669,7 +656,7 @@ fn cell_view(
     let picked = current.glyph == Some(cell.glyph());
     div()
         .id(format!("appearance-{}-{ix}", cell.key()))
-        .size_7()
+        .size(px(22.4))
         .flex_none()
         .flex()
         .items_center()
@@ -767,7 +754,7 @@ pub(crate) fn submenu_item(
     let current = target.stored(controller.read(cx)).unwrap_or_default();
     let chooser = Picker::live(controller, target, name, current, cx);
     let menu = PopupMenu::build(window, cx, move |menu, _, _| {
-        menu.min_w(px(300.))
+        menu.min_w(px(160.))
             .item(PopupMenuItem::element(move |_, cx| {
                 div()
                     .mx_neg_2()
@@ -785,7 +772,7 @@ pub(crate) fn submenu_item(
 /// persists its appearance with the new row.
 pub(crate) fn column(chooser: &Entity<Picker>, cx: &App) -> AnyElement {
     v_flex()
-        .w(px(300.))
+        .w(px(160.))
         .flex_shrink_0()
         .gap_2()
         .border_l_1()
