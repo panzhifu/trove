@@ -874,11 +874,10 @@ impl InspectorPanel {
         let mut section = v_flex().gap_1();
         if let (Some(family), true) = (&family, registered) {
             section = section.child(
-                div()
-                    .font_family(family.clone())
-                    .text_xl()
-                    .text_color(cx.theme().foreground)
-                    .child("AaBbYyZz 允 123"),
+                crate::panels::common::font_live_preview(family, cx)
+                    .h(px(48.))
+                    .text_size(px(20.))
+                    .rounded(cx.theme().radius),
             );
         }
         if let Some(family) = &family {
