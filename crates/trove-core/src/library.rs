@@ -837,6 +837,13 @@ impl Library {
         smart_collections::move_to(conn, id, new_parent, position)
     }
 
+    /// Reorder a smart collection to `position` among its siblings, shifting
+    /// others to make room. The parent is unchanged.
+    pub fn reorder_smart_collection(&self, id: Uuid, position: i64) -> Result<()> {
+        let conn = self.store.conn();
+        smart_collections::reorder_to(conn, id, position)
+    }
+
     /// Evaluate a stored smart collection live, materialising the matching
     /// assets as a paged list. `kind` / `favorite` are extra grid filters
     /// AND-ed onto the tree (the toolbar filters compose with smart
