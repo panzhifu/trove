@@ -744,8 +744,9 @@ pub enum HeightMode {
 }
 
 impl HeightMode {
-    /// The number the shader compares against, which is also the order the
-    /// panel's three choices are listed in.
+    /// The number the shader compares against, and the config's stored order.
+    /// The panel lists only `Ramp` and `Bands` — `Off` is the × beside the
+    /// palette button, not one of the ways of painting.
     pub fn index(self) -> u8 {
         match self {
             Self::Off => 0,
