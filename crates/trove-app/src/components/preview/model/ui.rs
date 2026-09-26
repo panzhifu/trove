@@ -447,24 +447,51 @@ impl ModelViewport {
     /// A popover, not a settings row, because the choice is made while looking
     /// at the model: CloudCompare asks the same four questions in its
     /// `ccColorGradientDlg` (direction, ramp, banding, frequency) and so does
-    /// this panel, with the ramp previewed where its name would be.
+    /// this panel, with the ramp previewed where its name would be. The panel
+    /// itself only ever offers ways of painting; switching off is the × beside
+    /// the button, which appears while the colouring is on — the same split as
+    /// a chip that carries its own untag.
     ///
     /// On the canvas rather than in the toolbar because it changes what is
     /// drawn, not the panel's chrome. Every choice persists as it is made, so
     /// the next model opened looks the same way.
     fn height_control(&self, cx: &mut Context<Self>) -> AnyElement {
         let on = self.height.mode != HeightMode::Off;
-        Popover::new("height-color-popover")
-            .trigger(
-                Button::new("height-color")
-                    .xsmall()
-                    .when(on, |button| button.primary())
-                    .when(!on, |button| button.ghost())
-                    .icon(IconName::Palette)
-                    .label(rust_i18n::t!("viewport.height_color").to_string())
-                    .tooltip(rust_i18n::t!("viewport.height_color_tip").to_string()),
+        h_flex()
+            .gap_1()
+            .items_center()
+            .child(
+                Popover::new("height-color-popover")
+                    .trigger(
+                        Button::new("height-color")
+                            .xsmall()
+                            .when(on, |button| button.primary())
+                            .when(!on, |button| button.ghost())
+                            .icon(IconName::Palette)
+                            .label(rust_i18n::t!("viewport.height_color").to_string())
+                            .tooltip(rust_i18n::t!("viewport.height_color_tip").to_string()),
+                    )
+                    .child(height_panel(self, cx.entity(), cx)),
             )
-            .child(height_panel(self, cx.entity(), cx))
+            .when(on, |row| {
+                row.child(
+                    Button::new("height-color-off")
+                        .ghost()
+                        .xsmall()
+                        .icon(IconName::Close)
+                        .tooltip(rust_i18n::t!("viewport.height_color_off").to_string())
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.apply_height(
+                                HeightLook {
+                                    mode: HeightMode::Off,
+                                    ..this.height.clone()
+                                },
+                                true,
+                                cx,
+                            );
+                        })),
+                )
+            })
             .into_any_element()
     }
 
@@ -1272,22 +1299,29 @@ fn change_height(
     });
 }
 
-/// 关闭 / 渐变 / 分带: whether the model is painted by height at all, and
-/// whether that is one continuous scale or discrete bands. CloudCompare asks the
-/// same question with three radio buttons in `ccColorGradientDlg`.
+/// 渐变 / 分带: how the scale is laid over the field.
+///
+/// CloudCompare asks the same question with radio buttons in
+/// `ccColorGradientDlg`. Its fourth button — off — is not a way of painting,
+/// so it is not offered here either: turning the colouring off is the × beside
+/// the palette button, and while the model is uncoloured the panel opens on
+/// the two real choices with neither one lit.
 fn mode_row(look: &HeightLook, entity: Entity<ModelViewport>) -> AnyElement {
-    TabBar::new("height-mode")
+    // Panel indices, not [`HeightMode::index`] — that one puts `Off` first,
+    // and `Off` is no longer a choice the panel lists.
+    let panel_index = |mode: HeightMode| match mode {
+        HeightMode::Bands => 1,
+        _ => 0,
+    };
+    let bar = TabBar::new("height-mode")
         .segmented()
-        .selected_index(look.mode.index() as usize)
         .on_click(move |index: &usize, _, cx| {
-            let mode = HeightMode::from_index(*index as u8);
+            let mode = match *index {
+                1 => HeightMode::Bands,
+                _ => HeightMode::Ramp,
+            };
             change_height(&entity, move |look| HeightLook { mode, ..look }, cx);
         })
-        .child(
-            Tab::new()
-                .flex_1()
-                .label(rust_i18n::t!("viewport.height_off")),
-        )
         .child(
             Tab::new()
                 .flex_1()
@@ -1297,8 +1331,12 @@ fn mode_row(look: &HeightLook, entity: Entity<ModelViewport>) -> AnyElement {
             Tab::new()
                 .flex_1()
                 .label(rust_i18n::t!("viewport.height_bands")),
-        )
-        .into_any_element()
+        );
+    let mut bar = bar;
+    if look.mode != HeightMode::Off {
+        bar = bar.selected_index(panel_index(look.mode));
+    }
+    bar.into_any_element()
 }
 
 /// The scale list: every built-in strip, then the custom pair. Each row is the
