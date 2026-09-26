@@ -242,9 +242,10 @@ impl Scratch {
 
 /// Optional work the rasteriser can do on top of a raw frame.
 ///
-/// Both default to off, so [`render`] — and every caller that did not ask —
-/// keeps producing exactly the frame it always did.
-#[derive(Debug, Clone, Copy, Default, PartialEq)]
+/// Everything defaults to off except `material_colors` — so [`render`] — and
+/// every caller that did not ask keeps producing exactly the frame it always
+/// did, with the file's own materials showing.
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct RenderOptions {
     /// Skip the back faces of a closed, outward-wound mesh.
     ///
@@ -260,6 +261,13 @@ pub struct RenderOptions {
     /// camera, which is what makes the form legible; gap filling closes the
     /// single-pixel holes between neighbouring discs.
     pub enhance_points: bool,
+    /// Whether a mesh is painted with the per-vertex colours its file
+    /// declared — its materials. The one option whose default is on: the file
+    /// meant those colours, and thumbnails render through
+    /// [`RenderOptions::default`], where a card should say what the file
+    /// looks like. Point clouds keep their own colours either way; those are
+    /// scan data, not materials.
+    pub material_colors: bool,
     /// How the surface is painted by height, rather than by the material.
     ///
     /// How the surface is painted by its field values, already measured against
@@ -267,6 +275,17 @@ pub struct RenderOptions {
     /// — the default — keeps the flat material for a mesh and the file's own
     /// colours for a cloud, so nothing that did not ask gets a look change.
     pub height: HeightField,
+}
+
+impl Default for RenderOptions {
+    fn default() -> Self {
+        Self {
+            cull_backfaces: false,
+            enhance_points: false,
+            material_colors: true,
+            height: HeightField::default(),
+        }
+    }
 }
 
 /// [`render`], reusing the caller's buffers. The interactive path goes through
@@ -866,11 +885,16 @@ fn paint(
                 // lands on the geometry rather than on a pixel; the shader does
                 // the same from the same model-space position and normal. With
                 // no field active the vertex keeps the colour the file gave it
-                // — its material — or the flat one when the file had none.
+                // — its material — or the flat one when the file had none or
+                // the material switch is off.
                 let c = options
                     .height
                     .tint_at(&Sample::of(mesh, index, geometric))
-                    .unwrap_or_else(|| base_color(mesh, index));
+                    .unwrap_or(if options.material_colors {
+                        base_color(mesh, index)
+                    } else {
+                        MATERIAL
+                    });
                 corners[slot] = Vertex {
                     p: view[index],
                     i: AMBIENT + DIFFUSE * dot(normal, light).max(0.0),
@@ -1532,6 +1556,7 @@ mod tests {
             RenderOptions {
                 cull_backfaces: false,
                 enhance_points: true,
+                material_colors: true,
                 height: HeightField::default(),
             },
             &mut Scratch::default(),
@@ -1648,6 +1673,7 @@ mod tests {
             RenderOptions {
                 cull_backfaces: true,
                 enhance_points: false,
+                material_colors: true,
                 height: HeightField::default(),
             },
             &mut Scratch::default(),
@@ -1686,6 +1712,7 @@ mod tests {
             RenderOptions {
                 cull_backfaces: true,
                 enhance_points: false,
+                material_colors: true,
                 height: HeightField::default(),
             },
             &mut Scratch::default(),

@@ -327,6 +327,9 @@ pub struct ModelViewport {
     /// Cached `AppConfig::point_enhance`, so the frame path does not read the
     /// config file every time it draws.
     enhance_points: bool,
+    /// Cached `AppConfig::material_render`, refreshed by the same poll: the
+    /// file's own colours show while it is on, the flat material while off.
+    material_render: bool,
     /// How the model is painted by its field values, cached from the same
     /// config read as `enhance_points`. Resolved per frame by
     /// [`ModelViewport::height_field`], against the scene's bounds and the
@@ -463,6 +466,7 @@ impl ModelViewport {
                 last_camera_move: None,
                 gesture_armed: false,
                 enhance_points: true,
+                material_render: cfg.material_render(),
                 height,
                 channel_intensities: None,
                 channel_classes: None,

@@ -1017,7 +1017,7 @@ impl GpuRenderer {
         framing: &Framing,
         size: (u32, u32),
         interactive: bool,
-        enhance_points: bool,
+        options: &render3d::RenderOptions,
         look: HeightUniforms,
     ) -> Option<Vec<u8>> {
         let (width, height) = (size.0.max(1), size.1.max(1));
@@ -1092,9 +1092,9 @@ impl GpuRenderer {
                 pass.draw(0..6, 0..mesh.point_count);
             } else {
                 // A mesh with its own colours is drawn by the pipelines that
-                // read the colour buffer; a plain one takes the flat material
-                // from the uniform block.
-                let colored = mesh.colors.is_some();
+                // read the colour buffer — while the material switch is on;
+                // off, the flat material from the uniform block stands in.
+                let colored = mesh.colors.is_some() && options.material_colors;
                 pass.set_pipeline(match (colored, mesh.cull_backfaces) {
                     (true, true) => &pipelines.model_colored_culled,
                     (true, false) => &pipelines.model_colored_two_sided,
@@ -1133,7 +1133,7 @@ impl GpuRenderer {
         // and the pixels to spare; the rest read back what the rasterizer
         // wrote directly.
         let mut enhanced = None;
-        if enhance_points
+        if options.enhance_points
             && mesh.point_count > 0
             && let (Some((texture, view)), Some(bind_group)) =
                 (edl_color.as_ref(), edl_bind_group.as_ref())
@@ -1460,7 +1460,7 @@ mod tests {
                 &framing,
                 size,
                 false,
-                false,
+                &render3d::RenderOptions::default(),
                 HeightUniforms::default(),
             )
             .expect("a plain frame comes back");
@@ -1470,7 +1470,10 @@ mod tests {
                 &framing,
                 size,
                 false,
-                true,
+                &render3d::RenderOptions {
+                    enhance_points: true,
+                    ..Default::default()
+                },
                 HeightUniforms::default(),
             )
             .expect("an enhanced frame comes back");
@@ -1509,6 +1512,115 @@ mod tests {
             }
         }
         Mesh::from_parts(positions, normals, Vec::new(), triangles).expect("grid builds")
+    }
+
+    /// Render one real model file through the GPU and dump the frame, to see
+    /// exactly what the viewport sees. Runs only when `TROVE_DEBUG_GLB` names
+    /// a file; the frame lands at `/tmp/trove-gpu-render.png`.
+    #[test]
+    fn a_real_file_renders_on_the_gpu() {
+        let Ok(path) = std::env::var("TROVE_DEBUG_GLB") else {
+            return;
+        };
+        let Ok(renderer) = GpuRenderer::new() else {
+            eprintln!("no graphics device: skipping the real-file GPU test");
+            return;
+        };
+        let mesh = trove_core::media::formats::load(std::path::Path::new(&path))
+            .expect("the debug file parses");
+        eprintln!(
+            "mesh: {} vertices, {} triangles, winding={:?}, colors={}",
+            mesh.positions.len(),
+            mesh.triangle_count(),
+            mesh.winding(),
+            mesh.colors.len()
+        );
+        let uploaded = renderer.upload(&mesh);
+        eprintln!(
+            "gpu mesh: meshlets={} colors={}",
+            uploaded.meshlets.len(),
+            uploaded.colors.is_some()
+        );
+        let framing = render3d::Camera::default().framing(mesh.bounds, 1.0);
+        let frame = renderer
+            .render(
+                &uploaded,
+                &framing,
+                (800, 600),
+                false,
+                &render3d::RenderOptions::default(),
+                HeightUniforms::default(),
+            )
+            .expect("a frame comes back");
+        dump_png("/tmp/trove-gpu-render.png", &frame);
+    }
+
+    /// Write a BGRA frame out as an 8-bit RGB PNG (stored deflate, no deps).
+    fn dump_png(path: &str, frame: &[u8]) {
+        use std::io::Write;
+        let (width, height) = (800u32, 600u32);
+        let mut raw = Vec::with_capacity(frame.len());
+        for y in 0..height {
+            raw.push(0); // filter: none
+            for x in 0..width {
+                let i = ((y * width + x) as usize) * 4;
+                raw.extend_from_slice(&[frame[i + 2], frame[i + 1], frame[i]]);
+            }
+        }
+        let mut png = Vec::new();
+        png.extend_from_slice(b"\x89PNG\r\n\x1a\n");
+        let mut ihdr = Vec::new();
+        ihdr.extend_from_slice(&width.to_be_bytes());
+        ihdr.extend_from_slice(&height.to_be_bytes());
+        ihdr.extend_from_slice(&[8, 2, 0, 0, 0]);
+        push_png_chunk(&mut png, b"IHDR", &ihdr);
+        push_png_chunk(&mut png, b"IDAT", &zlib_stored(&raw));
+        push_png_chunk(&mut png, b"IEND", &[]);
+        std::fs::File::create(path)
+            .unwrap()
+            .write_all(&png)
+            .unwrap();
+        eprintln!("wrote {path}");
+    }
+
+    fn push_png_chunk(out: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) {
+        out.extend_from_slice(&(data.len() as u32).to_be_bytes());
+        out.extend_from_slice(kind);
+        out.extend_from_slice(data);
+        let mut crc = 0xFFFF_FFFFu32;
+        for byte in kind.iter().chain(data) {
+            crc ^= *byte as u32;
+            for _ in 0..8 {
+                crc = if crc & 1 != 0 {
+                    (crc >> 1) ^ 0xEDB8_8320
+                } else {
+                    crc >> 1
+                };
+            }
+        }
+        out.extend_from_slice(&(crc ^ 0xFFFF_FFFF).to_be_bytes());
+    }
+
+    fn zlib_stored(data: &[u8]) -> Vec<u8> {
+        let mut out = vec![0x78, 0x01];
+        let mut chunks = data.chunks(65535).peekable();
+        if data.is_empty() {
+            out.extend_from_slice(&[0x01, 0x00, 0x00, 0xFF, 0xFF]);
+        }
+        while let Some(chunk) = chunks.next() {
+            out.push(if chunks.peek().is_none() { 1 } else { 0 });
+            let len = chunk.len() as u16;
+            out.extend_from_slice(&len.to_le_bytes());
+            out.extend_from_slice(&(!len).to_le_bytes());
+            out.extend_from_slice(chunk);
+        }
+        let (mut a, mut b) = (1u32, 0u32);
+        for &byte in data {
+            a = (a + byte as u32) % 65521;
+            b = (b + a) % 65521;
+        }
+        out.extend_from_slice(&((b << 16) | a).to_be_bytes());
+        out
     }
 
     /// A mesh large enough to be partitioned is cut into clusters, culled
@@ -1553,7 +1665,7 @@ mod tests {
                 &close,
                 (160, 120),
                 false,
-                false,
+                &render3d::RenderOptions::default(),
                 HeightUniforms::default(),
             )
             .expect("a frame comes back");
@@ -1604,7 +1716,7 @@ mod tests {
                     &render3d::Camera::default().framing(bounds, 1.0),
                     (160, 120),
                     false,
-                    false,
+                    &render3d::RenderOptions::default(),
                     look.resolve(&FieldData::geometry(&bounds)).uniforms(),
                 )
                 .expect("a frame comes back")

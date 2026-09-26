@@ -40,6 +40,19 @@ pub(super) fn model_page() -> SettingPage {
                     .description(t("settings.height_color_desc")),
                 ),
         )
+        .group(
+            SettingGroup::new()
+                .title(t("settings.model_material"))
+                .item(
+                    SettingItem::new(
+                        t("settings.material_render"),
+                        config_switch(AppConfig::material_render, |config, on| {
+                            config.material_render = Some(on);
+                        }),
+                    )
+                    .description(t("settings.material_render_desc")),
+                ),
+        )
         .group(zoom_group())
 }
 

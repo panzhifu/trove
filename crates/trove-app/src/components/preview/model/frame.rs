@@ -144,6 +144,7 @@ impl ModelViewport {
         {
             let cfg = trove_core::config::AppConfig::load();
             self.enhance_points = cfg.point_enhance();
+            self.material_render = cfg.material_render();
             // The look only follows the config while the model has no look of
             // its own, and never in the middle of a drag whose value has not
             // been written yet — that would flick the colour back to where the
@@ -184,6 +185,9 @@ impl ModelViewport {
             // they are worth it on a settled frame and wasted on a draft the
             // user is dragging past.
             enhance_points: !interactive && self.enhance_points,
+            // The file's own materials show while the switch is on; off, the
+            // flat material stands in for them.
+            material_colors: self.material_render,
             height,
         };
 
@@ -447,7 +451,7 @@ fn draw(shot: Shot<'_>) -> Rendered {
             &framing,
             size,
             interactive,
-            options.enhance_points,
+            &options,
             options.height.uniforms(),
         ) && let Some(frame) = frame_image(size, bytes)
         {

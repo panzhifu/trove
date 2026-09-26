@@ -20,14 +20,72 @@ use super::types::Mesh;
 
 /// Load a glTF or GLB file. Buffers are resolved relative to the file.
 pub fn load_gltf(path: &Path) -> Result<Mesh, String> {
-    let (document, buffers, _images) =
-        gltf::import(path).map_err(|e| format!("failed to load glTF: {e}"))?;
+    let (document, buffers, images) = match gltf::import(path) {
+        Ok(imported) => (imported.0, imported.1, imported.2),
+        Err(error) => fallback_import(path, error)?,
+    };
+    // Texture handle -> image index, resolved once: a material's texture info
+    // carries only its position in this table.
+    let texture_images: Vec<usize> = document
+        .textures()
+        .map(|texture| texture.source().index())
+        .collect();
 
     let mut builder = Builder::default();
     for node in root_nodes(&document) {
-        builder.add_node(&node, &buffers);
+        builder.add_node(&node, IDENTITY, &buffers, &images, &texture_images);
     }
     builder.finish()
+}
+
+/// Import without the validator, for the files it refuses on sight.
+///
+/// `import` fails outright when a document's `extensionsRequired` names an
+/// extension this build of the crate was not compiled with — a Sketchfab
+/// export asking for `KHR_materials_pbrSpecularGlossiness`, say — and the
+/// refusal covers the whole file, geometry included. The geometry is still
+/// perfectly readable, so the parse is retried without validation: the
+/// extension's own material block is read where the crate knows it (the
+/// feature is enabled), and ignored where it does not. A file that fails this
+/// way too was never going to open, and the original error — which names the
+/// extension — is the more useful one to report.
+fn fallback_import(
+    path: &Path,
+    original: gltf::Error,
+) -> Result<
+    (
+        gltf::Document,
+        Vec<gltf::buffer::Data>,
+        Vec<gltf::image::Data>,
+    ),
+    String,
+> {
+    let parsed = std::fs::read(path)
+        .map_err(|e| format!("failed to load glTF: {e}"))
+        .and_then(|bytes| {
+            gltf::Gltf::from_slice_without_validation(&bytes)
+                .map_err(|e| format!("failed to load glTF: {e}"))
+        });
+    match parsed {
+        Ok(gltf) => {
+            let buffers = gltf::import_buffers(&gltf.document, Some(path), gltf.blob)
+                .map_err(|e| format!("failed to load glTF: {e}"))?;
+            // Best-effort: the images only ever feed a textured primitive's
+            // average colour, and a decode failure costs that colour, not the
+            // model the first attempt could not open at all.
+            let images =
+                gltf::import_images(&gltf.document, Some(path), &buffers).unwrap_or_default();
+            tracing::info!(
+                path = %path.display(),
+                %original,
+                "glTF imported without validation"
+            );
+            Ok((gltf.document, buffers, images))
+        }
+        // The fallback got no further than the first attempt did; the error
+        // that named the unsupported extension is the one worth keeping.
+        Err(_) => Err(format!("failed to load glTF: {original}")),
+    }
 }
 
 /// The nodes the default scene draws — or, for a document that names no
@@ -77,30 +135,44 @@ struct Builder {
 }
 
 impl Builder {
-    fn add_node(&mut self, node: &gltf::Node<'_>, buffers: &[gltf::buffer::Data]) {
+    fn add_node(
+        &mut self,
+        node: &gltf::Node<'_>,
+        parent: [[f32; 4]; 4],
+        buffers: &[gltf::buffer::Data],
+        images: &[gltf::image::Data],
+        texture_images: &[usize],
+    ) {
+        // A node's placement is its own transform ON TOP OF every ancestor's:
+        // the walk composes them, so a part nested under a rotated, scaled
+        // root — the shape every Sketchfab or Blender export has — lands
+        // where the scene puts it, not where its local transform alone would
+        // leave it.
+        let combined = mul4(parent, node.transform().matrix());
         if let Some(mesh) = node.mesh() {
             for primitive in mesh.primitives() {
-                self.add_primitive(&primitive, node.transform(), buffers);
+                self.add_primitive(&primitive, combined, buffers, images, texture_images);
             }
         }
         for child in node.children() {
-            self.add_node(&child, buffers);
+            self.add_node(&child, combined, buffers, images, texture_images);
         }
     }
 
     fn add_primitive(
         &mut self,
         primitive: &gltf::Primitive<'_>,
-        transform: gltf::scene::Transform,
+        transform: [[f32; 4]; 4],
         buffers: &[gltf::buffer::Data],
+        images: &[gltf::image::Data],
+        texture_images: &[usize],
     ) {
-        let (translation, rotation, scale) = transform.decomposed();
         let reader = primitive.reader(|buffer| buffers.get(buffer.index()).map(|data| &data[..]));
         let Some(positions) = reader.read_positions() else {
             return; // A primitive with no positions is not drawable.
         };
         let local: Vec<[f32; 3]> = positions
-            .map(|position| transform_point(translation, rotation, scale, position))
+            .map(|position| transform_point(transform, position))
             .collect();
         if local.is_empty() {
             return;
@@ -115,7 +187,7 @@ impl Builder {
         let count = local.len();
         let normals: Option<Vec<[f32; 3]>> = reader.read_normals().map(|normals| {
             normals
-                .map(|normal| transform_normal(rotation, scale, normal))
+                .map(|normal| transform_normal(transform, normal))
                 .collect()
         });
         match normals {
@@ -138,10 +210,37 @@ impl Builder {
         // spec — the factor multiplies everything the material draws. A
         // primitive with neither attribute nor a non-default factor opts out,
         // which is what drops the whole set when the model mixes the two.
-        let factor = primitive
-            .material()
+        // What the primitive is painted with. A specular-glossiness material
+        // has no metallic-roughness block — the crate hands back the default
+        // for it — so its diffuse is the colour to read when the extension is
+        // there. And a base-colour *texture* paints from its image: the flat
+        // renderer cannot show the texture, but its average colour is a fair
+        // stand-in, and without it the one textured part of an otherwise
+        // material-coloured model would drag the whole set of colours down as
+        // incomplete.
+        let material = primitive.material();
+        let base_texture = material
             .pbr_metallic_roughness()
-            .base_color_factor();
+            .base_color_texture()
+            .or_else(|| {
+                material
+                    .pbr_specular_glossiness()
+                    .and_then(|sg| sg.diffuse_texture())
+            });
+        let factor = match base_texture {
+            Some(info) => texture_images
+                .get(info.texture().index())
+                .and_then(|image| images.get(*image))
+                .map(|rgb| {
+                    let [r, g, b] = average_rgb(rgb);
+                    [r, g, b, 1.0]
+                })
+                .unwrap_or([1.0, 1.0, 1.0, 1.0]),
+            None => material
+                .pbr_specular_glossiness()
+                .map(|sg| sg.diffuse_factor())
+                .unwrap_or_else(|| material.pbr_metallic_roughness().base_color_factor()),
+        };
         match reader.read_colors(0) {
             Some(colors) => {
                 for color in colors.into_rgb_f32() {
@@ -236,63 +335,115 @@ fn triangles_of(mode: gltf::mesh::Mode, indices: &[u32]) -> Vec<[u32; 3]> {
     triangles
 }
 
-/// Apply a node's translation, rotation and scale to a point. The pieces
-/// arrive decomposed because `Transform` is not `Copy` and the readers need
-/// them inside their closures.
-fn transform_point(
-    translation: [f32; 3],
-    rotation: [f32; 4],
-    scale: [f32; 3],
-    point: [f32; 3],
-) -> [f32; 3] {
-    let scaled = [
-        point[0] * scale[0],
-        point[1] * scale[1],
-        point[2] * scale[2],
-    ];
-    let rotated = rotate(rotation, scaled);
+/// The average colour of a decoded image, sampled on a coarse grid so a
+/// 2048-pixel texture costs a few thousand reads. The renderer paints flat
+/// colours, and this is the one honest flat colour a texture has.
+fn average_rgb(image: &gltf::image::Data) -> [f32; 3] {
+    let channels = match image.format {
+        gltf::image::Format::R8G8B8 => 3,
+        _ => 4,
+    };
+    let (width, height) = (image.width.max(1), image.height.max(1));
+    // Cap the sample grid at 64×64 however large the image is.
+    let (step_x, step_y) = ((width / 64).max(1), (height / 64).max(1));
+    let mut sum = [0.0f64; 3];
+    let mut count = 0u64;
+    let mut y = 0;
+    while y < height {
+        let mut x = 0;
+        while x < width {
+            let at = ((y * width + x) as usize) * channels;
+            let px = &image.pixels[at..at + 3];
+            sum[0] += px[0] as f64;
+            sum[1] += px[1] as f64;
+            sum[2] += px[2] as f64;
+            count += 1;
+            x += step_x;
+        }
+        y += step_y;
+    }
+    if count == 0 {
+        return [1.0, 1.0, 1.0];
+    }
+    let (r, g, b) = (
+        sum[0] / count as f64,
+        sum[1] / count as f64,
+        sum[2] / count as f64,
+    );
+    // Into the 0..=1 range the vertex colours live in; sRGB bytes into linear
+    // would be more correct, but the flat renderer shades in this same space
+    // either way.
+    [(r / 255.0) as f32, (g / 255.0) as f32, (b / 255.0) as f32]
+}
+
+/// Apply a composed node transform to a point. The matrix is glTF's own
+/// column-major layout: `m[column][row]`, translation in the last column.
+fn transform_point(m: [[f32; 4]; 4], point: [f32; 3]) -> [f32; 3] {
     [
-        rotated[0] + translation[0],
-        rotated[1] + translation[1],
-        rotated[2] + translation[2],
+        m[0][0] * point[0] + m[1][0] * point[1] + m[2][0] * point[2] + m[3][0],
+        m[0][1] * point[0] + m[1][1] * point[1] + m[2][1] * point[2] + m[3][1],
+        m[0][2] * point[0] + m[1][2] * point[1] + m[2][2] * point[2] + m[3][2],
     ]
 }
 
-/// Apply a node's rotation to a normal, undoing its scale first — a normal
-/// transforms by the inverse transpose, and for an axis-aligned scale that is
-/// the reciprocal. The length is not restored here: both renderers normalise.
-fn transform_normal(rotation: [f32; 4], scale: [f32; 3], normal: [f32; 3]) -> [f32; 3] {
-    let unscaled = [
-        if scale[0] != 0.0 {
-            normal[0] / scale[0]
-        } else {
-            0.0
-        },
-        if scale[1] != 0.0 {
-            normal[1] / scale[1]
-        } else {
-            0.0
-        },
-        if scale[2] != 0.0 {
-            normal[2] / scale[2]
-        } else {
-            0.0
-        },
-    ];
-    rotate(rotation, unscaled)
+/// Apply a composed node transform to a normal: the inverse transpose of the
+/// rotation-and-scale part, which is what keeps a normal perpendicular under a
+/// non-uniform scale. The length is not restored here: both renderers
+/// normalise. A degenerate scale has no inverse — the raw matrix is applied
+/// instead, and the normalised result is whatever it comes out as.
+fn transform_normal(m: [[f32; 4]; 4], normal: [f32; 3]) -> [f32; 3] {
+    // The three columns of the rotation-and-scale block.
+    let c0 = [m[0][0], m[0][1], m[0][2]];
+    let c1 = [m[1][0], m[1][1], m[1][2]];
+    let c2 = [m[2][0], m[2][1], m[2][2]];
+    let det = dot(c0, cross(c1, c2));
+    if det.abs() < 1e-12 {
+        return [
+            m[0][0] * normal[0] + m[1][0] * normal[1] + m[2][0] * normal[2],
+            m[0][1] * normal[0] + m[1][1] * normal[1] + m[2][1] * normal[2],
+            m[0][2] * normal[0] + m[1][2] * normal[1] + m[2][2] * normal[2],
+        ];
+    }
+    // The inverse's columns are the cross products of the other two, scaled
+    // by one determinant; the transpose then mixes equal components across
+    // them.
+    let one = 1.0 / det;
+    let i0 = scale3(cross(c1, c2), one);
+    let i1 = scale3(cross(c2, c0), one);
+    let i2 = scale3(cross(c0, c1), one);
+    [
+        i0[0] * normal[0] + i1[0] * normal[1] + i2[0] * normal[2],
+        i0[1] * normal[0] + i1[1] * normal[1] + i2[1] * normal[2],
+        i0[2] * normal[0] + i1[2] * normal[1] + i2[2] * normal[2],
+    ]
 }
 
-/// Rotate `v` by a `[x, y, z, w]` quaternion.
-fn rotate(quaternion: [f32; 4], v: [f32; 3]) -> [f32; 3] {
-    let q = [quaternion[0], quaternion[1], quaternion[2]];
-    let w = quaternion[3];
-    let uv = cross(q, v);
-    let uuv = cross(q, uv);
-    [
-        v[0] + 2.0 * (w * uv[0] + uuv[0]),
-        v[1] + 2.0 * (w * uv[1] + uuv[1]),
-        v[2] + 2.0 * (w * uv[2] + uuv[2]),
-    ]
+/// Compose two column-major transforms: `mul4(parent, local)` places a node
+/// inside its parent, the parent's frame applied after the node's own.
+fn mul4(a: [[f32; 4]; 4], b: [[f32; 4]; 4]) -> [[f32; 4]; 4] {
+    let mut out = [[0.0f32; 4]; 4];
+    for column in 0..4 {
+        for row in 0..4 {
+            out[column][row] = (0..4).map(|k| a[k][row] * b[column][k]).sum();
+        }
+    }
+    out
+}
+
+/// The walk's starting frame: the first node's transform composes against it.
+pub(crate) const IDENTITY: [[f32; 4]; 4] = [
+    [1.0, 0.0, 0.0, 0.0],
+    [0.0, 1.0, 0.0, 0.0],
+    [0.0, 0.0, 1.0, 0.0],
+    [0.0, 0.0, 0.0, 1.0],
+];
+
+fn scale3(v: [f32; 3], k: f32) -> [f32; 3] {
+    [v[0] * k, v[1] * k, v[2] * k]
+}
+
+fn dot(a: [f32; 3], b: [f32; 3]) -> f32 {
+    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
 }
 
 fn cross(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
@@ -440,6 +591,41 @@ mod tests {
         assert!(mesh.colors.is_empty());
     }
 
+    /// A node's placement is its own transform on top of every ancestor's.
+    /// The walk used to apply only the local transform, which dropped a part
+    /// nested under a rotated or scaled root out of the scene entirely — the
+    /// shape every Sketchfab export has.
+    #[test]
+    fn an_ancestors_transform_is_applied_to_a_nested_mesh() {
+        let json = r#"{{
+            "asset": {{"version": "2.0"}},
+            "scenes": [{{"nodes": [0]}}],
+            "scene": 0,
+            "nodes": [
+                {{"children": [1], "scale": [2.0, 2.0, 2.0], "translation": [10.0, 0.0, 0.0]}},
+                {{"mesh": 0, "translation": [0.0, 1.0, 0.0]}}
+            ],
+            "meshes": [{{"primitives": [{{"attributes": {{"POSITION": 0}}, "indices": 1}}]}}],
+            "buffers": [{{"byteLength": 48}}],
+            "bufferViews": [
+                {{"buffer": 0, "byteOffset": 0, "byteLength": 36, "target": 34962}},
+                {{"buffer": 0, "byteOffset": 36, "byteLength": 12, "target": 34963}}
+            ],
+            "accessors": [
+                {{"bufferView": 0, "componentType": 5126, "count": 3, "type": "VEC3", "max": [1,1,0], "min": [0,0,0]}},
+                {{"bufferView": 1, "componentType": 5125, "count": 3, "type": "SCALAR"}}
+            ]
+        }}"#;
+        let path = glb(json.replace("{{", "{").replace("}}", "}"));
+        let mesh = load_gltf(&path).expect("glb triangle parses");
+        std::fs::remove_file(&path).ok();
+        // The child moves its triangle to (0,1,0); the parent scales that by
+        // two and moves it to x=10: (10,2,0)..(12,4,0). Applied in the other
+        // order, or not at all, the bounds say so.
+        assert_eq!(mesh.bounds.min, [10.0, 2.0, 0.0]);
+        assert_eq!(mesh.bounds.max, [12.0, 4.0, 0.0]);
+    }
+
     /// The node's transform is what places the geometry. Ignoring it — the
     /// old behaviour, which read `document.meshes()` directly — puts every
     /// scaled, rotated or moved model in the wrong place at the wrong size.
@@ -497,17 +683,5 @@ mod tests {
         // Lines and points are not surfaces.
         assert!(triangles_of(gltf::mesh::Mode::Points, &[0, 1, 2]).is_empty());
         assert!(triangles_of(gltf::mesh::Mode::LineStrip, &[0, 1, 2]).is_empty());
-    }
-
-    /// A quaternion's rotation is its own inverse at the opposite angle, and
-    /// the identity leaves a vector alone.
-    #[test]
-    fn rotate_matches_the_quaternion_axes() {
-        let identity = rotate([0.0, 0.0, 0.0, 1.0], [1.0, 2.0, 3.0]);
-        assert_eq!(identity, [1.0, 2.0, 3.0]);
-        let half = std::f32::consts::FRAC_1_SQRT_2;
-        // 90° about Z: x -> y, y -> -x.
-        let turned = rotate([0.0, 0.0, half, half], [1.0, 0.0, 0.0]);
-        assert!(turned[0].abs() < 1e-5 && (turned[1] - 1.0).abs() < 1e-5);
     }
 }
