@@ -15,6 +15,7 @@ use std::sync::Arc;
 use gpui_kit::*;
 
 use trove_core::media::chunked::{self, LodConfig};
+use trove_core::media::formats::meshlet;
 use trove_core::media::formats::simplify::{select_lod, simplify_mesh};
 use trove_core::media::formats::streaming_point_cloud::StreamingPointCloud;
 use trove_core::media::formats::types::{Bounds as MeshBounds, Mesh, Winding};
@@ -182,8 +183,11 @@ impl ModelViewport {
         self.channel_classes = None;
         self.swap_mesh(mesh);
 
-        // Spawn QEM simplification in the background for large meshes.
-        if self.mesh.triangle_count() > 1000 {
+        // Spawn QEM simplification in the background for large meshes — the
+        // same threshold at which the partitioner bothers, because below it a
+        // full-resolution mesh is already cheap to draw and every visible
+        // level switch is pure loss.
+        if self.mesh.triangle_count() >= meshlet::MIN_MESHLET_TRIANGLES {
             let mesh_for_lod = self.mesh.clone();
             let serial = self.mesh_serial;
             cx.spawn(async move |weak, cx| {

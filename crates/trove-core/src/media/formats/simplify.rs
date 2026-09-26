@@ -10,7 +10,7 @@
 //! Error Metrics" (1997).
 
 use crate::media::formats::types::{Bounds, Mesh};
-use std::collections::BinaryHeap;
+use std::collections::{BinaryHeap, HashMap};
 
 /// Target triangle counts for each LOD level, as a fraction of the original.
 /// Levels cascade — each is produced by collapsing the previous one further —
@@ -22,6 +22,12 @@ const LOD_LEVELS: [f64; 4] = [1.0, 0.5, 0.25, 0.125];
 /// worst deviation projects to less than this is indistinguishable from the
 /// original at the size it is drawn.
 pub const PIXEL_ERROR_THRESHOLD: f64 = 2.0;
+
+/// How much a collapse that would move a vertex off its open border costs,
+/// relative to the plain surface error — Blender's own
+/// `BOUNDARY_PRESERVE_WEIGHT`, and for the same reason: without it, an open
+/// shell's border vertices slide and fold the surface into slivers.
+const BOUNDARY_PRESERVE_WEIGHT: f64 = 100.0;
 
 /// One level of detail: the vertices, the triangles that connect them, and
 /// how far the level has moved from the original surface.
@@ -125,7 +131,8 @@ pub fn simplify_mesh(mesh: &Mesh) -> SimplifiedMesh {
         })
         .collect();
 
-    for tri in &mesh.triangles {
+    let mut edge_face: HashMap<(u32, u32), usize> = HashMap::new();
+    for (ti, tri) in mesh.triangles.iter().enumerate() {
         let v0 = vertices[tri[0] as usize].position;
         let v1 = vertices[tri[1] as usize].position;
         let v2 = vertices[tri[2] as usize].position;
@@ -142,6 +149,64 @@ pub fn simplify_mesh(mesh: &Mesh) -> SimplifiedMesh {
         for &vi in tri {
             add_quadric(&mut vertices[vi as usize].quadric, &q);
         }
+
+        // Remember which triangle used each edge, so the boundary pass below
+        // can find the face a boundary edge belongs to. `usize::MAX` marks an
+        // edge with two or more users — interior (or non-manifold) — which is
+        // exactly what this pass is not for.
+        for (a, b) in [(tri[0], tri[1]), (tri[1], tri[2]), (tri[2], tri[0])] {
+            let key = if a < b { (a, b) } else { (b, a) };
+            edge_face
+                .entry(key)
+                .and_modify(|face| *face = usize::MAX)
+                .or_insert(ti);
+        }
+    }
+
+    // Open borders are pinned, after Blender's decimate
+    // (`BOUNDARY_PRESERVE_WEIGHT` in `bmesh_decimate_collapse.cc`): a quadric
+    // for the wall plane through each boundary edge, weighted a hundredfold,
+    // goes onto the edge's two vertices. The base quadrics only know the
+    // surface planes, so on an open shell — and most real models are open
+    // somewhere — a boundary vertex could slide along it and fold the surface
+    // over itself, tearing the shape into slivers as the level coarsens. The
+    // wall makes that collapse cost a hundred times more; the border stays a
+    // border.
+    for ((a, b), face) in edge_face {
+        let Some(face) = mesh.triangles.get(face) else {
+            continue; // An interior or non-manifold edge: not this pass's.
+        };
+        let ev = [
+            vertices[b as usize].position[0] - vertices[a as usize].position[0],
+            vertices[b as usize].position[1] - vertices[a as usize].position[1],
+            vertices[b as usize].position[2] - vertices[a as usize].position[2],
+        ];
+        let v0 = vertices[face[0] as usize].position;
+        let v1 = vertices[face[1] as usize].position;
+        let v2 = vertices[face[2] as usize].position;
+        let n = cross(
+            [v1[0] - v0[0], v1[1] - v0[1], v1[2] - v0[2]],
+            [v2[0] - v0[0], v2[1] - v0[1], v2[2] - v0[2]],
+        );
+        // The wall through the edge, standing on its face.
+        let mut wall = cross(ev, n);
+        let len = (wall[0] * wall[0] + wall[1] * wall[1] + wall[2] * wall[2]).sqrt();
+        if len <= 1e-9 {
+            continue; // A zero-area face contributes nothing to pin with.
+        }
+        wall = [wall[0] / len, wall[1] / len, wall[2] / len];
+        let center = [
+            (vertices[a as usize].position[0] + vertices[b as usize].position[0]) * 0.5,
+            (vertices[a as usize].position[1] + vertices[b as usize].position[1]) * 0.5,
+            (vertices[a as usize].position[2] + vertices[b as usize].position[2]) * 0.5,
+        ];
+        let d = -(wall[0] * center[0] + wall[1] * center[1] + wall[2] * center[2]);
+        let mut q = outer_product([wall[0] as f64, wall[1] as f64, wall[2] as f64, d as f64]);
+        for entry in &mut q {
+            *entry *= BOUNDARY_PRESERVE_WEIGHT;
+        }
+        add_quadric(&mut vertices[a as usize].quadric, &q);
+        add_quadric(&mut vertices[b as usize].quadric, &q);
     }
 
     let original_count = mesh.triangles.len();
@@ -225,6 +290,31 @@ fn collapse_edges(
     let mut live_triangles = tris.len();
     let mut error = 0.0f64;
 
+    // The most one collapse may cost before the level gives up collapsing. A
+    // quadric error is a squared distance, so a ceiling of "a quarter of the
+    // model's diagonal, squared" is generous for any fair simplification —
+    // and the sign of a quadric gone flat, where a vertex sits between two
+    // nearly parallel planes and can slide away along them for a price the
+    // rest of the heap cannot match. Collapsing past it sent vertices to
+    // astronomical distances, blew the level's bounds up, and left the coarser
+    // levels a dot on screen; stopping keeps them merely coarser than the
+    // ratio asked for.
+    let mut lo = [f64::MAX; 3];
+    let mut hi = [f64::MIN; 3];
+    for tri in &tris {
+        for &v in tri {
+            let p = verts[v as usize].position;
+            for axis in 0..3 {
+                lo[axis] = lo[axis].min(p[axis] as f64);
+                hi[axis] = hi[axis].max(p[axis] as f64);
+            }
+        }
+    }
+    let diagonal = ((hi[0] - lo[0]).powi(2) + (hi[1] - lo[1]).powi(2) + (hi[2] - lo[2]).powi(2))
+        .sqrt()
+        .max(1e-9);
+    let cost_ceiling = (0.25 * diagonal).powi(2);
+
     while live_triangles > target_triangles {
         let Some(candidate) = heap.pop() else {
             break; // Nothing left worth collapsing.
@@ -242,6 +332,9 @@ fn collapse_edges(
         }
 
         let (cost, position) = collapse_cost(&verts[target], &verts[remove]);
+        if cost > cost_ceiling {
+            break; // Every collapse left is worse; the level is as far as it goes.
+        }
         if !collapse_is_valid(&verts, &tris, &incident, remove, target, position) {
             continue; // Would fold the surface over itself; drop the pair.
         }
