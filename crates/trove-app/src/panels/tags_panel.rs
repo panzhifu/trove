@@ -7,7 +7,6 @@ use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::dock::{BasePanel, Panel as DockPanel, PanelControl, PanelEvent};
 use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::component::menu::{ContextMenuExt as _, PopupMenu, PopupMenuItem};
-use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::{ActiveTheme, Icon, IconName, Sizable as _};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -15,6 +14,7 @@ use gpui_kit::*;
 use trove_core::store::tags;
 use uuid::Uuid;
 
+use crate::components::scrollbar;
 use crate::library::LibraryController;
 
 use super::common::{AssetsDrag, hex_to_rgb, observe_controller};
@@ -213,7 +213,7 @@ impl Render for TagsPanel {
             .size_full()
             .p_2()
             .gap_1()
-            .child(div().flex_1().min_h_0().overflow_y_scrollbar().child(list))
+            .child(scrollbar::vertical(div().flex_1().min_h_0()).child(list))
     }
 }
 

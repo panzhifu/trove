@@ -6,7 +6,6 @@
 
 use gpui_kit::base::{h_flex, v_flex};
 use gpui_kit::component::dock::{BasePanel, Panel as DockPanel, PanelEvent};
-use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{ActiveTheme, Icon, IconName};
 use gpui_kit::prelude::FluentBuilder as _;
@@ -14,6 +13,7 @@ use gpui_kit::*;
 
 use trove_core::store::assets::source_folders;
 
+use crate::components::scrollbar;
 use crate::library::LibraryController;
 
 // =========================== Folders panel ===================================
@@ -142,7 +142,7 @@ impl Render for FoldersPanel {
             .size_full()
             .p_2()
             .gap_1()
-            .child(div().flex_1().min_h_0().overflow_y_scrollbar().child(rows))
+            .child(scrollbar::vertical(div().flex_1().min_h_0()).child(rows))
             .into_any_element()
     }
 }

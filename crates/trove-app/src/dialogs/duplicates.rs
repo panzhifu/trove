@@ -12,7 +12,6 @@
 use gpui_kit::base::{h_flex, v_flex};
 use gpui_kit::component::button::Button;
 use gpui_kit::component::dialog::DialogButtonProps;
-use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::{ActiveTheme, Sizable, WindowExt as _};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -20,6 +19,7 @@ use gpui_kit::*;
 use trove_core::store::assets::DuplicateGroup;
 use uuid::Uuid;
 
+use crate::components::scrollbar;
 use crate::library::LibraryController;
 use crate::panels::common::{display_name, human_bytes};
 
@@ -82,10 +82,7 @@ impl DuplicateDialog {
                     for group in groups.iter() {
                         list = list.child(group_row(controller.clone(), group, cx));
                     }
-                    div()
-                        .max_h(px(420.))
-                        .flex_1()
-                        .overflow_y_scrollbar()
+                    scrollbar::vertical(div().max_h(px(420.)).flex_1())
                         .child(list)
                         .into_any_element()
                 }

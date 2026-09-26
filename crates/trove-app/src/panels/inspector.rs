@@ -11,7 +11,6 @@ use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::dock::{BasePanel, Panel as DockPanel, PanelControl, PanelEvent};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::menu::{ContextMenuExt as _, PopupMenuItem};
-use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::{ActiveTheme, Icon, IconName, Sizable};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -21,6 +20,7 @@ use trove_core::store::{assets, tags};
 use uuid::Uuid;
 
 use crate::components::preview::{AssetPreviewData, PreviewContext};
+use crate::components::scrollbar;
 use crate::library::LibraryController;
 
 use super::common::{color_swatch, hex_to_rgb, human_bytes, observe_controller};
@@ -734,12 +734,10 @@ impl Render for InspectorPanel {
             .gap_0() // ← 子元素之间无间距，内容紧贴
             .bg(cx.theme().background) // ← 设置背景色，填满整个面板
             .child(
-                div()
-                    .flex_1()
-                    .min_h_0()
-                    .size_full() // ← 水平方向也填满
-                    .overflow_y_scrollbar()
-                    .child(content),
+                scrollbar::vertical(
+                    div().flex_1().min_h_0().size_full(), // ← 水平方向也填满
+                )
+                .child(content),
             )
             .into_any_element()
     }

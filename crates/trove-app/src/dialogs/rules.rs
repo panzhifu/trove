@@ -29,7 +29,6 @@ use gpui_kit::component::WindowExt as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
-use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::{ActiveTheme, IconName, Sizable};
 use gpui_kit::*;
 
@@ -37,6 +36,7 @@ use trove_core::model::{AssetKind, SmartCollection, SmartCompare, SmartField, Sm
 use trove_core::store::{smart, smart_collections, tags};
 use uuid::Uuid;
 
+use crate::components::scrollbar;
 use crate::library::LibraryController;
 use crate::panels::appearance;
 
@@ -671,14 +671,9 @@ fn render_body(
         h_flex()
             .items_start()
             .gap_4()
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .max_h(px(400.))
-                    .overflow_y_scrollbar()
-                    .child(conditions),
-            )
+            .child(scrollbar::vertical(
+                div().flex_1().min_w_0().max_h(px(400.)).child(conditions),
+            ))
             .child(appearance::column(&draft.read(cx).chooser, cx)),
     )
 }

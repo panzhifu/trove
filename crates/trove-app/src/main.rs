@@ -239,26 +239,6 @@ pub(crate) fn register_keys(cx: &mut App) {
     cx.bind_keys(bindings);
 }
 
-/// Slim the global scrollbar theme: a hairline thumb that widens slightly on
-/// hover, over a narrow track. Applies to every scrollable surface at once.
-fn slim_scrollbars(cx: &mut App) {
-    use gpui_kit::base::{ScrollbarStyles, Theme};
-    use gpui_kit::component::ActiveTheme as _;
-
-    let mut thumb = cx.theme().muted_foreground;
-    thumb.a = 0.35;
-    let mut thumb_hover = thumb;
-    thumb_hover.a = 0.6;
-    let theme = Theme::global_mut(cx);
-    theme.scrollbar = theme.scrollbar.clone().with_styles(
-        ScrollbarStyles::default()
-            .track(|t| t.width(px(8.)))
-            .thumb(|s| s.width(px(4.)).inset(px(2.)).radius(px(2.)).bg(thumb))
-            .thumb_hover(|s| s.width(px(6.)).inset(px(1.)).radius(px(3.)).bg(thumb_hover))
-            .thumb_active(|s| s.width(px(6.)).inset(px(1.)).radius(px(3.)).bg(thumb_hover)),
-    );
-}
-
 fn main() {
     // Logging first: everything after this point can emit events.
     logging::init();
@@ -273,7 +253,7 @@ fn main() {
             // User themes last: they may redefine a bundled name.
             crate::app::theme::register_user_themes(cx);
             crate::app::theme::apply_from_settings(None, cx);
-            slim_scrollbars(cx);
+            crate::components::scrollbar::init(cx);
 
             // Menus are owned by the title bar module — it renders them, so it
             // also defines and registers them.

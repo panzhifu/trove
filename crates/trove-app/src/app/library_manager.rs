@@ -22,13 +22,13 @@ use gpui_kit::component::dialog::DialogButtonProps;
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::notification::Notification;
-use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::{ActiveTheme, IconName, Root, Sizable as _, TitleBar};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use super::AppView;
 use crate::app::actions::RunPluginCommand;
+use crate::components::scrollbar;
 use trove_core::config::{AppConfig, LibraryEntry};
 use trove_core::paths;
 
@@ -348,10 +348,7 @@ impl LibraryManagerView {
         view: Entity<Self>,
         cx: &mut Context<Self>,
     ) -> Div {
-        let mut list = v_flex()
-            .flex_1()
-            .min_h_0()
-            .overflow_y_scrollbar()
+        let mut list = scrollbar::vertical(v_flex().flex_1().min_h_0())
             .px_2()
             .pt_3()
             .pb_3()
@@ -394,11 +391,7 @@ impl LibraryManagerView {
 
     /// The right pane: the hero (logo, name, version) above the action card.
     fn main_pane(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
-        v_flex()
-            .flex_1()
-            .h_full()
-            .min_w_0()
-            .overflow_y_scrollbar()
+        scrollbar::vertical(v_flex().flex_1().h_full().min_w_0())
             .items_center()
             .px_8()
             .pt_12()

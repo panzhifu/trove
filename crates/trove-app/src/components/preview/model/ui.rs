@@ -12,9 +12,9 @@ use gpui_kit::component::{ActiveTheme, IconName, Sizable};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
+use crate::components::scrollbar;
 use gpui_kit::base::{ColorPickerEvent, ColorPickerState};
 use gpui_kit::component::color_picker::ColorPicker;
-use gpui_kit::component::scroll::ScrollableElement as _;
 use trove_core::media::height_color::{
     COLOR_SCALES, ColorScale, ColorStop, CustomScale, Field, HeightField, HeightLook, HeightMode,
     MAX_PERIOD, MIN_PERIOD, RAMP_STOPS, Ramp, Scale, nice_ticks, scale_by_id,
@@ -1364,10 +1364,7 @@ fn scale_list(
         .gap_1()
         .child(section_label(rust_i18n::t!("viewport.height_scale"), cx))
         .child(
-            v_flex()
-                .gap_1()
-                .max_h(px(220.))
-                .overflow_y_scrollbar()
+            scrollbar::vertical(v_flex().gap_1().max_h(px(220.)))
                 .pr_1()
                 .children(rows),
         )

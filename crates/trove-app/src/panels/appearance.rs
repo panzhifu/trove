@@ -27,7 +27,6 @@
 use gpui_kit::assets::IconName;
 use gpui_kit::base::{h_flex, v_flex};
 use gpui_kit::component::menu::{PopupMenu, PopupMenuItem};
-use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::separator::Separator;
 use gpui_kit::component::{ActiveTheme, Colorize as _, Icon};
 use gpui_kit::prelude::FluentBuilder as _;
@@ -35,6 +34,7 @@ use gpui_kit::*;
 use trove_core::model::{Accent, Appearance, Glyph};
 use uuid::Uuid;
 
+use crate::components::scrollbar;
 use crate::library::LibraryController;
 use crate::panels::common::color_swatch;
 
@@ -502,12 +502,11 @@ impl Render for Picker {
             .w_full()
             .gap_2()
             .child(accent_row(&picker, &appearance, cx))
-            .child(
+            .child(scrollbar::vertical(
                 v_flex()
                     .id("appearance-catalogue")
                     .gap_2()
                     .h(px(224.))
-                    .overflow_y_scrollbar()
                     .child(glyph_run(
                         &picker,
                         &appearance,
@@ -524,7 +523,7 @@ impl Render for Picker {
                         None,
                         cx,
                     )),
-            )
+            ))
             .child(footer(&picker, &appearance, &name, cx))
     }
 }

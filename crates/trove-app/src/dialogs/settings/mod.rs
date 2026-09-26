@@ -34,10 +34,10 @@ mod shortcuts;
 
 pub(super) use std::path::PathBuf;
 
+pub(super) use crate::components::scrollbar;
 pub(super) use gpui_kit::base::{h_flex, v_flex};
 pub(super) use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::group_box::GroupBoxVariant;
-pub(super) use gpui_kit::component::scroll::ScrollableElement as _;
 pub(super) use gpui_kit::component::setting::{
     SelectIndex, SettingField, SettingGroup, SettingItem, SettingPage, Settings,
 };

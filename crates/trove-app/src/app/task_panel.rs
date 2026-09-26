@@ -13,13 +13,13 @@ use gpui_kit::component::IconName;
 use gpui_kit::component::Sizable as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::popover::Popover;
-use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::prelude::FluentBuilder as _;
 
 // Re-export gpui's styled-building names (div, ElementId, AnyElement, Entity,
 // App, SharedString, px, …) plus gpui-kit's extensions.
 use gpui_kit::*;
 
+use crate::components::scrollbar;
 use crate::library::{LibraryController, TaskCard, jobs};
 use trove_core::tasks::{TaskId, TaskKind, TaskStatus};
 
@@ -174,12 +174,9 @@ fn task_panel_body(
             )
             .into_any_element();
     }
-    body.child(
-        v_flex()
-            .max_h(px(280.))
-            .overflow_y_scrollbar()
-            .children(rows.iter().rev().map(|row| task_row(&controller, row, cx))),
-    )
+    body.child(scrollbar::vertical(v_flex().max_h(px(280.)).children(
+        rows.iter().rev().map(|row| task_row(&controller, row, cx)),
+    )))
     .into_any_element()
 }
 

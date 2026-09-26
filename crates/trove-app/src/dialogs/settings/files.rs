@@ -781,13 +781,7 @@ fn integrity_row(controller: &Entity<LibraryController>, cx: &mut App) -> Div {
         for entry in &report.entries {
             list = list.child(integrity_entry_row(controller.clone(), entry.clone(), cx));
         }
-        col = col.child(
-            div()
-                .w_full()
-                .max_h(px(220.))
-                .overflow_y_scrollbar()
-                .child(list),
-        );
+        col = col.child(scrollbar::vertical(div().w_full().max_h(px(220.))).child(list));
     }
     col
 }
