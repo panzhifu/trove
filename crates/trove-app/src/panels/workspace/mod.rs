@@ -589,9 +589,9 @@ impl Render for WorkspacePanel {
         let shell = v_flex()
             .size_full()
             .gap_1()
-            .key_context("Workspace")
+            .key_context(crate::app::keybindings::WORKSPACE_CONTEXT)
             .when(video_preview, |shell| {
-                shell.key_context(crate::VIDEO_PREVIEW_CONTEXT)
+                shell.key_context(crate::app::keybindings::VIDEO_PREVIEW_CONTEXT)
             })
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(|this, _: &MoveLeft, window, cx| {
@@ -1163,7 +1163,7 @@ impl Render for WorkspacePanel {
                     // here when a tile is clicked, and it is what scopes the space
                     // bar to the grid. `Workspace` wraps the search input too, and
                     // a binding for a bare character there eats that character.
-                    .key_context(crate::GRID_CONTEXT)
+                    .key_context(crate::app::keybindings::GRID_CONTEXT)
                     .track_focus(&self.grid_focus)
                     .relative()
                     .flex_1()

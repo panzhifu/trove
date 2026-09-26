@@ -471,10 +471,11 @@ fn action_label(action: &str) -> String {
 
 /// Localized context label.
 fn context_label(context: &str) -> String {
+    use crate::app::keybindings::{GRID_CONTEXT, VIDEO_PREVIEW_CONTEXT, WORKSPACE_CONTEXT};
     match context {
-        "Workspace" => rust_i18n::t!("shortcuts.context.Workspace").to_string(),
-        "AssetGrid" => rust_i18n::t!("shortcuts.context.AssetGrid").to_string(),
-        "VideoPreview" => rust_i18n::t!("shortcuts.context.VideoPreview").to_string(),
+        WORKSPACE_CONTEXT => rust_i18n::t!("shortcuts.context.Workspace").to_string(),
+        GRID_CONTEXT => rust_i18n::t!("shortcuts.context.AssetGrid").to_string(),
+        VIDEO_PREVIEW_CONTEXT => rust_i18n::t!("shortcuts.context.VideoPreview").to_string(),
         _ => rust_i18n::t!("shortcuts.context.global").to_string(),
     }
 }
@@ -484,6 +485,6 @@ fn reset_keybindings(cx: &mut App) {
     let mut config = AppConfig::load();
     config.keybindings.clear();
     let _ = config.save();
-    crate::register_keys(cx);
+    crate::app::keybindings::register(cx, &config);
     cx.refresh_windows();
 }

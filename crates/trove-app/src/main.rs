@@ -14,7 +14,7 @@
 // and panics still surface there while developing.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-// Embeds `locales/*.toml` into the binary (compile-time parse; `en.toml` is
+// Embeds `locales/*.toml` into the binary (compile-time parse; `zh-CN.toml` is
 // the fallback catalog). After this, `rust_i18n::t!` resolves keys and
 // `rust_i18n::set_locale` switches the process-global language — see `i18n`.
 rust_i18n::i18n!("locales", fallback = "zh-CN");
@@ -33,211 +33,6 @@ mod panels;
 mod plugins;
 
 use app::AppView;
-use app::actions::*;
-
-/// Keyboard map for the asset grid. The `Workspace` key context is active
-/// only while the grid (or one of its cells) holds focus, so typing in the
-/// search input or elsewhere never triggers grid navigation.
-const WORKSPACE_CONTEXT: &str = "Workspace";
-
-/// Key context of the asset grid itself — the scrolling tiles, not the toolbar
-/// above them. It exists for the one binding a wider context could not carry:
-/// the space bar for quick look. `Workspace` covers the search input too, and a
-/// binding for a bare character there is that character, gone from typing.
-const GRID_CONTEXT: &str = "AssetGrid";
-
-/// Key context of the `ExplorerPanel` (collections tree). Its only binding
-/// is Escape: the inline add/rename editor's input lets the key propagate,
-/// so the panel can dismiss the editor.
-const EXPLORER_CONTEXT: &str = "Explorer";
-
-/// Key context of the library-manager window. Its only binding is Escape,
-/// dismissing the sidebar's inline rename editor the same way the explorer
-/// panel's is dismissed.
-const LIBRARY_MANAGER_CONTEXT: &str = "LibraryManager";
-
-/// Key context of the video preview (a video is open in the main area). It
-/// exists only while a video is previewed, so a bare letter bound here — the
-/// fullscreen key — never shadows typing in the search box, which sits in the
-/// `Workspace` context.
-const VIDEO_PREVIEW_CONTEXT: &str = "VideoPreview";
-
-/// Key context of the fullscreen video window. Its only binding is Escape:
-/// leaving hands playback back to the main window. The context lives only
-/// on that window's root, so the main window's Escape handlers are
-/// untouched.
-const VIDEO_FULLSCREEN_CONTEXT: &str = "VideoFullscreen";
-
-/// Key context of the screenshot picker overlay. Its only binding is
-/// Escape: it cancels the pick. The context lives only on the overlay's
-/// root, so nothing else sees it.
-const CAPTURE_PICK_CONTEXT: &str = "CapturePick";
-
-pub(crate) fn register_keys(cx: &mut App) {
-    use trove_core::config::AppConfig;
-    use trove_core::keybindings::default_keybindings;
-
-    let config = AppConfig::load();
-    let defaults = default_keybindings();
-
-    // Resolve effective key for an action (custom override > default).
-    let key_for = |action: &str, fallback: &str| -> String {
-        config
-            .keybindings
-            .get(action)
-            .cloned()
-            .unwrap_or_else(|| fallback.to_string())
-    };
-
-    let mut bindings = vec![];
-    // Look up the default key for an action from `defaults` (primary source).
-    let default_key = |action: &str| -> Option<String> {
-        defaults
-            .iter()
-            .find(|d| d.action == action)
-            .map(|d| d.key.to_string())
-    };
-
-    macro_rules! bind {
-        ($action:ident, $action_name:literal) => {
-            bind!($action, $action_name, Some(WORKSPACE_CONTEXT));
-        };
-        ($action:ident, $action_name:literal, $context:expr) => {
-            if let Some(k) = default_key($action_name) {
-                let k = key_for($action_name, &k);
-                if !k.is_empty() {
-                    bindings.push(KeyBinding::new(&k, $action, $context));
-                }
-            }
-        };
-    }
-
-    bind!(MoveLeft, "MoveLeft");
-    bind!(MoveRight, "MoveRight");
-    bind!(MoveUp, "MoveUp");
-    bind!(MoveDown, "MoveDown");
-    bind!(OpenPreview, "OpenPreview");
-    bind!(QuickLook, "QuickLook", Some(GRID_CONTEXT));
-    // Backspace stays a fixed alias for TrashSelected.
-    let trash_key = key_for("TrashSelected", "delete");
-    if !trash_key.is_empty() {
-        bindings.push(KeyBinding::new(
-            &trash_key,
-            TrashSelected,
-            Some(WORKSPACE_CONTEXT),
-        ));
-    }
-    bindings.push(KeyBinding::new(
-        "backspace",
-        TrashSelected,
-        Some(WORKSPACE_CONTEXT),
-    ));
-    bind!(SelectAll, "SelectAll");
-    bind!(ClearSelection, "ClearSelection");
-    bind!(Undo, "Undo");
-    bind!(Redo, "Redo");
-    // Menu-only until the user binds a key in Settings ▸ Shortcuts.
-    bind!(BatchRename, "BatchRename");
-    bind!(BatchConvert, "BatchConvert");
-    bind!(AutoTag, "AutoTag");
-    bind!(CopyImage, "CopyImage");
-    // Paste import is global (works wherever focus is).
-    bindings.push(KeyBinding::new("ctrl-shift-v", PasteImport, None));
-    // Esc dismisses the explorer's inline add/rename editor. The input's own
-    // Escape handler propagates the key, so this fires only while the editor
-    // input holds focus inside the explorer panel.
-    bindings.push(KeyBinding::new(
-        "escape",
-        CancelEditor,
-        Some(EXPLORER_CONTEXT),
-    ));
-    // Esc dismisses the library manager's inline rename editor, on the same
-    // terms as the explorer panel's.
-    bindings.push(KeyBinding::new(
-        "escape",
-        CancelEditor,
-        Some(LIBRARY_MANAGER_CONTEXT),
-    ));
-    // Esc leaves the fullscreen video window. Only that window's root
-    // carries the VideoFullscreen context.
-    bindings.push(KeyBinding::new(
-        "escape",
-        ExitVideoFullscreen,
-        Some(VIDEO_FULLSCREEN_CONTEXT),
-    ));
-    // `f` leaves it too, mirroring the enter key: the stage replaces the
-    // preview, so the enter binding is out of the dispatch path there and
-    // the toggle needs its own binding.
-    if let Some(k) = default_key("ExitVideoFullscreen") {
-        let k = key_for("ExitVideoFullscreen", &k);
-        if !k.is_empty() {
-            bindings.push(KeyBinding::new(
-                &k,
-                ExitVideoFullscreen,
-                Some(VIDEO_FULLSCREEN_CONTEXT),
-            ));
-        }
-    }
-    // Esc cancels the screenshot picker overlay; only the overlay's root
-    // carries that context.
-    bindings.push(KeyBinding::new(
-        "escape",
-        CancelCapturePick,
-        Some(CAPTURE_PICK_CONTEXT),
-    ));
-
-    // Plugin commands: declared by registered plugins, bound with each
-    // command's default key or the user's override (an empty effective key
-    // means "not on the keyboard yet" — the command still dispatches from
-    // wherever a menu shows it). Rebinding goes through Settings ▸ Shortcuts,
-    // where these rows sit beside the built-in ones.
-    for plugin in trove_core::plugins::all() {
-        for command in plugin.commands() {
-            let key = key_for(command.action, command.key);
-            if key.is_empty() {
-                continue;
-            }
-            bindings.push(KeyBinding::new(
-                &key,
-                RunPluginCommand {
-                    command: command.action.into(),
-                },
-                (!command.global).then_some(WORKSPACE_CONTEXT),
-            ));
-        }
-    }
-
-    // `f` puts the video preview into the fullscreen stage. Its context is
-    // the preview's, not `Workspace`, so the letter is only live while a
-    // video is on screen — the search box shares the `Workspace` context and
-    // would lose the letter otherwise. Configurable: the key comes from
-    // `default_keybindings` (Settings ▸ Shortcuts).
-    if let Some(k) = default_key("EnterVideoFullscreen") {
-        let k = key_for("EnterVideoFullscreen", &k);
-        if !k.is_empty() {
-            bindings.push(KeyBinding::new(
-                &k,
-                EnterVideoFullscreen,
-                Some(VIDEO_PREVIEW_CONTEXT),
-            ));
-        }
-    }
-
-    // Screenshots are global (like paste import), not grid-scoped.
-    macro_rules! bind_global {
-        ($action:ident, $action_name:literal) => {
-            if let Some(k) = default_key($action_name) {
-                let k = key_for($action_name, &k);
-                if !k.is_empty() {
-                    bindings.push(KeyBinding::new(&k, $action, None));
-                }
-            }
-        };
-    }
-    bind_global!(Screenshot, "Screenshot");
-
-    cx.bind_keys(bindings);
-}
 
 fn main() {
     // Logging first: everything after this point can emit events.
@@ -263,19 +58,25 @@ fn main() {
             // be complete before the first import builds it.
             crate::plugins::init(cx);
 
-            register_keys(cx);
+            // One read serves the whole boot: the keybindings the actions
+            // register with, and whether a library exists at all — decided
+            // here, so the spawned closure moves a bool rather than the
+            // config.
+            let config = trove_core::config::AppConfig::load();
+            app::keybindings::register(cx, &config);
+            let has_library = !config.libraries.is_empty();
 
             cx.spawn(async move |cx| {
                 let options = cx.update(|cx| gpui_kit::WindowOptions {
                     window_bounds: Some(WindowBounds::centered(size(px(1024.), px(720.)), cx)),
                     ..crate::app::title_bar::window_options()
                 });
-                cx.open_window(options, |window, cx| {
+                if let Err(error) = cx.open_window(options, |window, cx| {
                     // With no library there is nothing to open, so the asset
                     // manager is the whole application until one exists.
                     // Both branches return the same `Root` type, so the
                     // window's root is decided here and nowhere else.
-                    if trove_core::config::AppConfig::load().libraries.is_empty() {
+                    if !has_library {
                         let view = cx.new(|cx| app::LibraryManagerView::new(window, cx));
                         cx.new(|cx| Root::new(view, window, cx))
                     } else {
@@ -283,7 +84,12 @@ fn main() {
                         cx.new(|cx| Root::new(view, window, cx))
                     }
                 })
-                .expect("failed to open window");
+                // A window that will not open is logged, not fatal: the
+                // process (and its tray) stay up, and the log line names the
+                // cause instead of a backtrace naming a panic.
+                {
+                    tracing::error!(%error, "failed to open the main window");
+                }
             })
             .detach();
         });

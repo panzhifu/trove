@@ -315,7 +315,7 @@ impl Render for LibraryManagerView {
             // panel.
             .key_context("LibraryManager")
             .on_action(
-                cx.listener(|this, _: &crate::app::actions::CancelEditor, window, cx| {
+                cx.listener(|this, _: &crate::app::actions::Cancel, window, cx| {
                     this.cancel_rename(window, cx);
                 }),
             )

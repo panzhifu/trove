@@ -384,7 +384,7 @@ impl SettingsView {
             // Bindings are matched latest-first, so the override wins over
             // the default it replaces without a restart. This only registers;
             // it never reads the view, so it is safe mid-update.
-            crate::register_keys(cx);
+            crate::app::keybindings::register(cx, &config);
         }
     }
 

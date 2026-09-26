@@ -47,13 +47,14 @@ gpui_kit::actions!(
         MoveDown,
         OpenPreview,
         QuickLook,
-        // -- Inline editor (ExplorerPanel only) ------------------------------
-        CancelEditor,
         // -- Fullscreen video stage -----------------------------------------
         EnterVideoFullscreen,
         ExitVideoFullscreen,
-        // -- Capture picker overlay ------------------------------------------
-        CancelCapturePick,
+        // -- Cancel ----------------------------------------------------------
+        // Escape, globally: an inline editor closes, a fullscreen stage
+        // steps down, an overlay dismisses. Handled by whichever view on the
+        // focus path has a cancellation to perform; nothing where none does.
+        Cancel,
     ]
 );
 

@@ -30,7 +30,7 @@ use gpui_kit::component::Root;
 use gpui_kit::component::{ActiveTheme as _, ThemeStyled as _};
 use gpui_kit::*;
 
-use crate::app::actions::CancelCapturePick;
+use crate::app::actions::Cancel;
 use crate::library::LibraryController;
 use crate::library::jobs;
 
@@ -345,7 +345,7 @@ impl CapturePick {
         window.remove_window();
     }
 
-    fn cancel(&mut self, _: &CancelCapturePick, window: &mut Window, _: &mut Context<Self>) {
+    fn cancel(&mut self, _: &Cancel, window: &mut Window, _: &mut Context<Self>) {
         tracing::info!("capture pick: cancelled");
         window.remove_window();
     }
@@ -387,7 +387,7 @@ impl Render for CapturePick {
             .size_full()
             .bg(black())
             .cursor(CursorStyle::Crosshair)
-            .key_context(crate::CAPTURE_PICK_CONTEXT)
+            .key_context(crate::app::keybindings::CAPTURE_PICK_CONTEXT)
             .track_focus(&self.focus)
             .on_action(cx.listener(Self::cancel))
             .on_mouse_down(

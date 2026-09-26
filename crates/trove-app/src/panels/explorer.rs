@@ -722,7 +722,7 @@ impl Render for ExplorerPanel {
             .p_1()
             .key_context("Explorer")
             .on_action(
-                cx.listener(|this, _: &crate::app::actions::CancelEditor, window, cx| {
+                cx.listener(|this, _: &crate::app::actions::Cancel, window, cx| {
                     this.cancel_editor(window, cx);
                 }),
             )

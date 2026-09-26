@@ -5,6 +5,7 @@
 pub mod actions;
 pub mod dock_skin;
 pub mod i18n;
+pub mod keybindings;
 pub mod theme;
 pub mod title_bar;
 

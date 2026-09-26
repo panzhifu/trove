@@ -957,7 +957,7 @@ impl Render for AppView {
                 .size_full()
                 .bg(black())
                 .track_focus(&self.video_stage_focus)
-                .key_context(crate::VIDEO_FULLSCREEN_CONTEXT)
+                .key_context(crate::app::keybindings::VIDEO_FULLSCREEN_CONTEXT)
                 .on_action(cx.listener(|this, _: &ExitVideoFullscreen, window, cx| {
                     this.leave_video_fullscreen(window, cx);
                 }))

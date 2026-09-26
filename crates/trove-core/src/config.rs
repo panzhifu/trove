@@ -26,7 +26,10 @@ use crate::media::height_color::{
 use crate::paths;
 
 /// Application configuration, persisted as JSON in [`paths::config_file`].
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+///
+/// Not `Clone`: every reader loads its own (`AppConfig::load` is a cheap
+/// small-JSON read), and an owned copy invites stale reads.
+#[derive(Debug, Serialize, Deserialize, Default)]
 pub struct AppConfig {
     /// Every library the user has, in creation order. A fresh install starts
     /// with one ([`paths::DEFAULT_LIBRARY_SLUG`]).
@@ -66,6 +69,12 @@ pub struct AppConfig {
     /// off for a flatter, marginally cheaper picture.
     #[serde(default)]
     pub point_enhance: Option<bool>,
+    /// Paint a model with the materials its file declares — the per-vertex
+    /// colours a glTF or OBJ carries — rather than the one flat material. On
+    /// by default: the file meant those colours. A height look, when on,
+    /// wins over them either way.
+    #[serde(default)]
+    pub material_render: Option<bool>,
     /// Light/dark appearance. `System` follows the OS and is the default.
     #[serde(default)]
     pub appearance: Appearance,
@@ -842,6 +851,12 @@ impl AppConfig {
     /// [`Self::height_look`] reads them all together.
     pub fn height_color(&self) -> bool {
         self.height_color.unwrap_or(false)
+    }
+
+    /// Whether a model shows the materials its file declares (on by default).
+    /// The flat material is what off looks like; a height look overrides both.
+    pub fn material_render(&self) -> bool {
+        self.material_render.unwrap_or(true)
     }
 
     /// The height look as configured.
