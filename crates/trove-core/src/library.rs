@@ -177,6 +177,10 @@ pub struct PurgeReport {
     pub thumbs_removed: u64,
     /// Files Trove removed from its own inbox along with their records.
     pub sources_removed: u64,
+    /// Linked files outside the inbox deleted along with their records —
+    /// only ever at the user's request, via the library's
+    /// `purge_delete_sources` setting.
+    pub source_files_removed: u64,
 }
 
 /// Outcome of a batch image edit. `skipped` counts assets the batch had no
@@ -1854,6 +1858,11 @@ impl Library {
     /// record. The inbox is a permanent import source and the dedupe key lives
     /// in the very row being deleted, so a file left behind there is imported
     /// again on the next scan: "delete" would undo itself on every restart.
+    ///
+    /// The other exception is opt-in: when the library's
+    /// `purge_delete_sources` setting is on
+    /// ([`crate::config::LibraryConfig::purge_delete_sources`]), linked files
+    /// outside the inbox are deleted with their records too.
     pub fn purge_assets(&self, ids: &[Uuid]) -> Result<PurgeReport> {
         self.purge_assets_against(ids, &collect::inbox_dir())
     }
@@ -1861,6 +1870,9 @@ impl Library {
     /// [`purge_assets`] with the inbox spelled out, so the rule can be
     /// exercised without relocating the data root.
     pub(crate) fn purge_assets_against(&self, ids: &[Uuid], inbox: &Path) -> Result<PurgeReport> {
+        // The setting is read per purge, so a flip in the settings window
+        // applies to the very next delete with no restart.
+        let delete_sources = crate::config::LibraryConfig::load(&self.root).purge_delete_sources();
         // Track (rel, hash) for every content hash left unreferenced by this
         // purge, so the file is deleted exactly once even when several deleted
         // assets shared it. Linked sources are collected the same way, then
@@ -1904,13 +1916,34 @@ impl Library {
             report.thumbs_removed += 1;
             self.remove_blob_files(&rel, &hash);
         }
-        for source in collect::inbox_files(inbox, sources) {
-            if collect::remove_inbox_file(&source) {
-                report.sources_removed += 1;
-                tracing::info!(
-                    path = %source.display(),
-                    "purge: removed the inbox file along with its asset"
-                );
+        // Inbox files always go with their record (see [`Self::purge_assets`]);
+        // linked files everywhere else only when the setting asks for it.
+        for source in sources {
+            if collect::is_in_inbox(inbox, &source) {
+                if collect::remove_inbox_file(&source) {
+                    report.sources_removed += 1;
+                    tracing::info!(
+                        path = %source.display(),
+                        "purge: removed the inbox file along with its asset"
+                    );
+                }
+            } else if delete_sources {
+                match std::fs::remove_file(&source) {
+                    Ok(()) => {
+                        report.source_files_removed += 1;
+                        tracing::info!(
+                            path = %source.display(),
+                            "purge: removed the linked source at the user's request"
+                        );
+                    }
+                    // A second purged asset sharing this source got there first.
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => tracing::warn!(
+                        path = %source.display(),
+                        %error,
+                        "purge: could not remove a linked source"
+                    ),
+                }
             }
         }
         Ok(report)
@@ -2242,6 +2275,63 @@ mod tests {
         assert_eq!(report.purged, 1);
         assert_eq!(report.sources_removed, 0);
         assert!(photo.is_file(), "a user's own file is never deleted");
+    }
+
+    /// The opt-in exception: with the library's `purge_delete_sources`
+    /// setting on, the linked file outside the inbox goes with the record.
+    #[test]
+    fn purging_a_linked_file_deletes_it_when_the_setting_asks() {
+        let (lib, root) = temp_library("purge-delete-source");
+        let inbox = root.join("incoming");
+        let pictures = root.join("pictures");
+        std::fs::create_dir_all(&inbox).unwrap();
+        std::fs::create_dir_all(&pictures).unwrap();
+        let photo = write_source(&pictures, "holiday.png", PNG_1X1);
+
+        crate::config::LibraryConfig {
+            purge_delete_sources: Some(true),
+            ..Default::default()
+        }
+        .save(&root)
+        .unwrap();
+
+        let id = import_linked(&lib, &root, &photo);
+        let report = lib.purge_assets_against(&[id], &inbox).unwrap();
+
+        assert_eq!(report.purged, 1);
+        assert_eq!(report.source_files_removed, 1);
+        assert!(
+            !photo.exists(),
+            "the setting turns the user's own file deletable"
+        );
+        assert!(assets::get(lib.store().conn(), id).unwrap().is_none());
+    }
+
+    /// The setting never reroutes inbox files onto the plain-delete path:
+    /// they follow their own rule (record plus sidecars) whatever it says.
+    #[test]
+    fn purging_an_inbox_file_ignores_the_source_deletion_setting() {
+        let (lib, root) = temp_library("purge-inbox-setting");
+        let inbox = root.join("incoming");
+        std::fs::create_dir_all(&inbox).unwrap();
+        let shot = write_source(&inbox, "screenshot-3.png", PNG_1X1);
+        let sidecar = inbox.join("screenshot-3.png.meta.json");
+        std::fs::write(&sidecar, b"{}").unwrap();
+
+        crate::config::LibraryConfig {
+            purge_delete_sources: Some(true),
+            ..Default::default()
+        }
+        .save(&root)
+        .unwrap();
+
+        let id = import_linked(&lib, &root, &shot);
+        let report = lib.purge_assets_against(&[id], &inbox).unwrap();
+
+        assert_eq!(report.sources_removed, 1);
+        assert_eq!(report.source_files_removed, 0);
+        assert!(!shot.exists());
+        assert!(!sidecar.exists(), "the sidecar goes with its file");
     }
 
     /// Soft delete stays reversible, so it must not touch the file at all —

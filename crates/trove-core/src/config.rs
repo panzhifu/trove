@@ -439,6 +439,11 @@ pub struct LibraryConfig {
     /// configured; `false` pauses the watcher without losing the list.
     #[serde(default)]
     pub watch_folders_enabled: Option<bool>,
+    /// Whether purging an asset also deletes the linked file it references
+    /// outside the library. Defaults to off: the file is the user's, wherever
+    /// they keep it.
+    #[serde(default)]
+    pub purge_delete_sources: Option<bool>,
 }
 
 impl LibraryConfig {
@@ -478,6 +483,12 @@ impl LibraryConfig {
     /// Whether the folder watcher should run (on by default).
     pub fn watch_folders_enabled(&self) -> bool {
         self.watch_folders_enabled.unwrap_or(true)
+    }
+
+    /// Whether a purge should also delete linked source files (off by
+    /// default — see [`Self::purge_delete_sources`]).
+    pub fn purge_delete_sources(&self) -> bool {
+        self.purge_delete_sources.unwrap_or(false)
     }
 
     /// Add a watched folder (deduplicated) and persist.
