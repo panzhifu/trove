@@ -59,7 +59,7 @@ pub fn load(path: &Path) -> Result<Mesh, String> {
         "obj" => {
             let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
             let text = String::from_utf8_lossy(&bytes);
-            obj::load_obj(&text)
+            obj::load_obj_at(path, &text)
         }
         "stl" => {
             let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
@@ -76,7 +76,7 @@ pub fn load(path: &Path) -> Result<Mesh, String> {
 }
 
 // Re-export the format-specific loaders for direct use.
-pub use obj::load_obj;
+pub use obj::{load_obj, load_obj_at};
 pub use ply::load_ply;
 pub use stl::load_stl;
 

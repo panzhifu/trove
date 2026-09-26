@@ -198,6 +198,24 @@ fn vs_model(
     return out;
 }
 
+// The same vertex stage for a mesh that carries its own colours — a glTF
+// primitive's base colour factor, an OBJ material's diffuse. One extra vertex
+// buffer of RGB, and otherwise the identical path: the flat material the plain
+// pipeline takes from the uniform block is per-vertex here.
+@vertex
+fn vs_model_colored(
+    @location(0) position: vec3<f32>,
+    @location(1) normal: vec3<f32>,
+    @location(2) color: vec3<f32>,
+) -> ModelOut {
+    var out: ModelOut;
+    out.clip = u.view_proj * vec4<f32>(position, 1.0);
+    out.model_pos = position;
+    out.normal = normal;
+    out.tint = surface_color(position, normal, 0.0, 0.0, color);
+    return out;
+}
+
 @fragment
 fn fs_model(in: ModelOut) -> @location(0) vec4<f32> {
     let geometric = normalize(in.normal);

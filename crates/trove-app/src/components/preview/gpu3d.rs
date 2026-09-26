@@ -16,8 +16,7 @@
 //! wgpu's handles are `Send + Sync` on native targets, so a frame can be
 //! rendered from a background task without blocking the UI thread.
 
-use std::sync::{Arc, mpsc, OnceLock};
-
+use std::sync::{Arc, OnceLock, mpsc};
 use trove_core::media::formats::meshlet::{self, Meshlet};
 use trove_core::media::formats::types::{Mesh, Winding};
 use trove_core::media::gpu::{self, UNIFORM_SIZE, Uniforms};
@@ -113,6 +112,11 @@ pub struct GpuMesh {
     /// partitioned. Each is one draw call the frustum can skip; empty means
     /// "draw the whole index buffer in one call".
     meshlets: Vec<Meshlet>,
+    /// Per-vertex RGB, present only when the file carried its own colours —
+    /// a glTF base colour factor or an OBJ material's diffuse. `Some` puts the
+    /// mesh on the coloured pipelines, which read this as a second vertex
+    /// buffer; `None` takes the flat material from the uniform block instead.
+    colors: Option<wgpu::Buffer>,
 }
 
 impl GpuMesh {
@@ -168,14 +172,19 @@ struct Targets {
 
 /// The draw pipelines for one multisample count.
 ///
-/// Two model pipelines, because back-face culling is a per-mesh decision: a
-/// closed surface is drawn with its back faces culled, an open shell with
-/// both. The point and backdrop pipelines are unaffected.
+/// Model pipelines come in four shapes, because two decisions are per-mesh:
+/// back-face culling (a closed surface hides its own back faces, an open
+/// shell does not) and colour (a mesh carrying its own per-vertex materials
+/// reads a second vertex buffer; a plain one takes the flat material from the
+/// uniform block). The point and backdrop pipelines are unaffected.
 struct Pipelines {
     /// Model pipeline for a closed, outward-wound mesh.
     model_culled: wgpu::RenderPipeline,
     /// Model pipeline that draws both faces.
     model_two_sided: wgpu::RenderPipeline,
+    /// Same two for a mesh whose vertices carry their own colours.
+    model_colored_culled: wgpu::RenderPipeline,
+    model_colored_two_sided: wgpu::RenderPipeline,
     point: wgpu::RenderPipeline,
     backdrop: wgpu::RenderPipeline,
 }
@@ -527,23 +536,48 @@ impl GpuRenderer {
             };
 
             let attributes = wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3];
-            let model = |cull: bool| {
+            let color_attributes = wgpu::vertex_attr_array![2 => Float32x3];
+            let model = |cull: bool, colored: bool| {
+                // A coloured mesh reads its RGB from a second vertex buffer, so
+                // the interleaved position+normal stride the plain pipelines
+                // use stays untouched.
+                let buffers = if colored {
+                    &[
+                        wgpu::VertexBufferLayout {
+                            array_stride: render3d::VertexData::STRIDE,
+                            step_mode: wgpu::VertexStepMode::Vertex,
+                            attributes: &attributes,
+                        },
+                        wgpu::VertexBufferLayout {
+                            array_stride: 3 * 4,
+                            step_mode: wgpu::VertexStepMode::Vertex,
+                            attributes: &color_attributes,
+                        },
+                    ][..]
+                } else {
+                    &[wgpu::VertexBufferLayout {
+                        array_stride: render3d::VertexData::STRIDE,
+                        step_mode: wgpu::VertexStepMode::Vertex,
+                        attributes: &attributes,
+                    }][..]
+                };
                 device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                    label: Some(if cull {
-                        "trove-3d-model-culled"
-                    } else {
-                        "trove-3d-model"
+                    label: Some(match (colored, cull) {
+                        (true, true) => "trove-3d-model-colored-culled",
+                        (true, false) => "trove-3d-model-colored",
+                        (false, true) => "trove-3d-model-culled",
+                        (false, false) => "trove-3d-model",
                     }),
                     layout: Some(&pipeline_layout),
                     vertex: wgpu::VertexState {
                         module: &shader,
-                        entry_point: Some("vs_model"),
+                        entry_point: Some(if colored {
+                            "vs_model_colored"
+                        } else {
+                            "vs_model"
+                        }),
                         compilation_options: wgpu::PipelineCompilationOptions::default(),
-                        buffers: &[wgpu::VertexBufferLayout {
-                            array_stride: render3d::VertexData::STRIDE,
-                            step_mode: wgpu::VertexStepMode::Vertex,
-                            attributes: &attributes,
-                        }],
+                        buffers,
                     },
                     primitive: wgpu::PrimitiveState {
                         topology: wgpu::PrimitiveTopology::TriangleList,
@@ -572,8 +606,10 @@ impl GpuRenderer {
                     cache: None,
                 })
             };
-            let model_culled = model(true);
-            let model = model(false);
+            let model_culled = model(true, false);
+            let model_two_sided = model(false, false);
+            let model_colored_culled = model(true, true);
+            let model_colored_two_sided = model(false, true);
 
             // Points: the sprite corners come from the shader's
             // `vertex_index`, so the only vertex buffer holds one instance per
@@ -647,7 +683,9 @@ impl GpuRenderer {
 
             Pipelines {
                 model_culled,
-                model_two_sided: model,
+                model_two_sided,
+                model_colored_culled,
+                model_colored_two_sided,
                 point,
                 backdrop,
             }
@@ -880,6 +918,9 @@ impl GpuRenderer {
                 // A sprite is always facing the camera, whatever its winding.
                 cull_backfaces: false,
                 meshlets: Vec::new(),
+                // Points already carry their colour inside the instance
+                // buffer; there is no separate colour pass to make.
+                colors: None,
             };
         }
 
@@ -926,6 +967,20 @@ impl GpuRenderer {
             buffer
         });
 
+        // The file's own colours go in a buffer of their own: only a mesh that
+        // has them pays for one, and the coloured pipelines read it as a second
+        // vertex buffer beside the interleaved positions and normals.
+        let colors = (!data.colors.is_empty()).then(|| {
+            let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("trove-3d-colors"),
+                size: (data.color_bytes().len() as u64).max(4),
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            self.queue.write_buffer(&buffer, 0, &data.color_bytes());
+            buffer
+        });
+
         GpuMesh {
             vertices,
             indices,
@@ -934,6 +989,7 @@ impl GpuRenderer {
             point_count: 0,
             cull_backfaces: winding != Winding::TwoSided,
             meshlets,
+            colors,
         }
     }
 
@@ -1035,13 +1091,21 @@ impl GpuRenderer {
                 pass.set_vertex_buffer(0, mesh.vertices.slice(..));
                 pass.draw(0..6, 0..mesh.point_count);
             } else {
-                pass.set_pipeline(if mesh.cull_backfaces {
-                    &pipelines.model_culled
-                } else {
-                    &pipelines.model_two_sided
+                // A mesh with its own colours is drawn by the pipelines that
+                // read the colour buffer; a plain one takes the flat material
+                // from the uniform block.
+                let colored = mesh.colors.is_some();
+                pass.set_pipeline(match (colored, mesh.cull_backfaces) {
+                    (true, true) => &pipelines.model_colored_culled,
+                    (true, false) => &pipelines.model_colored_two_sided,
+                    (false, true) => &pipelines.model_culled,
+                    (false, false) => &pipelines.model_two_sided,
                 });
                 pass.set_bind_group(0, &self.bind_group, &[]);
                 pass.set_vertex_buffer(0, mesh.vertices.slice(..));
+                if let Some(colors) = &mesh.colors {
+                    pass.set_vertex_buffer(1, colors.slice(..));
+                }
                 match &mesh.indices {
                     Some(indices) => {
                         pass.set_index_buffer(indices.slice(..), wgpu::IndexFormat::Uint32);
@@ -1231,6 +1295,7 @@ mod tests {
                 ("fs_point", naga::ShaderStage::Fragment),
                 ("vs_backdrop", naga::ShaderStage::Vertex),
                 ("vs_model", naga::ShaderStage::Vertex),
+                ("vs_model_colored", naga::ShaderStage::Vertex),
                 ("vs_point", naga::ShaderStage::Vertex),
             ]
         );
@@ -1252,6 +1317,13 @@ mod tests {
                 "vs_model",
                 vec![float(0, 3), float(1, 3)],
                 render3d::VertexData::STRIDE / 4,
+            ),
+            // The coloured entry reads the interleaved buffer and the colour
+            // buffer both: six floats plus three.
+            (
+                "vs_model_colored",
+                vec![float(0, 3), float(1, 3), float(2, 3)],
+                render3d::VertexData::STRIDE / 4 + render3d::VertexData::COLOR_STRIDE / 4,
             ),
             (
                 "vs_point",
