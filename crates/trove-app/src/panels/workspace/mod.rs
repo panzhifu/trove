@@ -1243,7 +1243,10 @@ fn next_window(
         return Some((0, wanted.clamp(1, GRID_PAGE_SIZE)));
     }
     let ask = wanted.min(cached_total);
-    (ask > cached_cells).then_some((cached_cells, ask - cached_cells))
+    // `then`, not `then_some`: the closure keeps `ask - cached_cells` from
+    // being evaluated (and underflowing) whenever the cursor already fits
+    // inside the cache — then_some would subtract before checking.
+    (ask > cached_cells).then(|| (cached_cells, ask - cached_cells))
 }
 
 #[cfg(test)]
@@ -1340,6 +1343,11 @@ mod tests {
         assert_eq!(next_window(true, 3, 2, 200), Some((2, 1)));
         // A cursor inherited from a longer listing cannot ask past this one.
         assert_eq!(next_window(true, 100, 100, 5_000), None);
+        // Nor past what the cache already holds — the case that underflowed
+        // before the fetch went through a closure: the listing shrank under
+        // the cursor (a delete landed between passes) and the difference
+        // went negative on an unsigned type.
+        assert_eq!(next_window(true, 3, 5, 200), None);
     }
 
     #[test]
