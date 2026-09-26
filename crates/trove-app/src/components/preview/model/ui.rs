@@ -464,7 +464,7 @@ impl ModelViewport {
                     .label(rust_i18n::t!("viewport.height_color").to_string())
                     .tooltip(rust_i18n::t!("viewport.height_color_tip").to_string()),
             )
-            .child(height_panel(&self.height, cx.entity(), cx))
+            .child(height_panel(self, cx.entity(), cx))
             .into_any_element()
     }
 
@@ -1145,23 +1145,27 @@ fn axis_tint(color: [f32; 3], alpha: f32) -> gpui::Rgba {
 ///
 /// Free functions rather than methods, because the elements they build must not
 /// hold a borrow of the render context: the viewport is captured by handle and
-/// updated when a choice is clicked.
-fn height_panel(look: &HeightLook, entity: Entity<ModelViewport>, cx: &App) -> AnyElement {
+/// updated when a choice is clicked. Reads run the other way — they come from
+/// the `&ModelViewport` the caller already holds, never through the handle,
+/// because render itself runs inside the entity's update lease and one
+/// `entity.read(cx)` here double-leases the viewport and panics.
+fn height_panel(viewport: &ModelViewport, entity: Entity<ModelViewport>, cx: &App) -> AnyElement {
+    let look = &viewport.height;
     v_flex()
         .w(px(280.))
         .gap_3()
         .child(mode_row(look, entity.clone()))
         .when(look.mode != HeightMode::Off, |panel| {
             panel
-                .child(field_row(look, entity.clone(), cx))
+                .child(field_row(look, viewport, entity.clone(), cx))
                 .child(match look.mode {
-                    HeightMode::Ramp => scale_list(look, entity.clone(), cx),
+                    HeightMode::Ramp => scale_list(look, viewport, entity.clone(), cx),
                     HeightMode::Bands => band_period_row(look, entity.clone(), cx),
                     HeightMode::Off => div().into_any_element(),
                 })
                 .when(
                     look.mode == HeightMode::Ramp && look.scale.custom_id().is_some(),
-                    |panel| panel.child(anchor_editor(look, entity.clone(), cx)),
+                    |panel| panel.child(anchor_editor(look, viewport, entity.clone(), cx)),
                 )
                 .child(Separator::horizontal())
                 .child(axis_row(look, entity.clone(), cx))
@@ -1177,10 +1181,15 @@ fn height_panel(look: &HeightLook, entity: Entity<ModelViewport>, cx: &App) -> A
 /// file carried or did not, and a missing one is shown disabled rather than
 /// hidden — a control that comes and going reads as a bug, and the reason is
 /// worth the one line of copy.
-fn field_row(look: &HeightLook, entity: Entity<ModelViewport>, cx: &App) -> AnyElement {
+fn field_row(
+    look: &HeightLook,
+    viewport: &ModelViewport,
+    entity: Entity<ModelViewport>,
+    cx: &App,
+) -> AnyElement {
     // No caption for the row itself: the five names are the whole question, and
     // the segmented control already reads as a choice between them.
-    let available = |field: Field| entity.read(cx).field_available(field);
+    let available = |field: Field| viewport.field_available(field);
     // In `Field::index` order, which is how the click reads the position back.
     let fields = [
         Field::Height,
@@ -1299,12 +1308,17 @@ fn mode_row(look: &HeightLook, entity: Entity<ModelViewport>) -> AnyElement {
 /// fit above a preview the height of a laptop window, and a scale whose colours
 /// you cannot see is not a choice. CloudCompare answers this with a dropdown
 /// selector; here the strips are the point, so they stay on screen.
-fn scale_list(look: &HeightLook, entity: Entity<ModelViewport>, cx: &App) -> AnyElement {
+fn scale_list(
+    look: &HeightLook,
+    viewport: &ModelViewport,
+    entity: Entity<ModelViewport>,
+    cx: &App,
+) -> AnyElement {
     let mut rows = COLOR_SCALES
         .iter()
         .map(|scale| scale_row(scale, scale.id == look.scale.key(), entity.clone(), cx))
         .collect::<Vec<_>>();
-    for (number, custom) in entity.read(cx).height_scales().iter().enumerate() {
+    for (number, custom) in viewport.height_scales().iter().enumerate() {
         rows.push(custom_row(custom, number + 1, look, entity.clone(), cx));
     }
     rows.push(new_scale_button(entity.clone(), cx));
@@ -1432,9 +1446,14 @@ fn new_scale_button(entity: Entity<ModelViewport>, cx: &App) -> AnyElement {
 /// drop an anchor there, click a marked one to select it, and step it along with
 /// the arrows. CloudCompare drags its anchors; this picks them, at a resolution
 /// finer than anyone reads off a 96-pixel bar.
-fn anchor_editor(look: &HeightLook, entity: Entity<ModelViewport>, cx: &App) -> AnyElement {
+fn anchor_editor(
+    look: &HeightLook,
+    viewport: &ModelViewport,
+    entity: Entity<ModelViewport>,
+    cx: &App,
+) -> AnyElement {
     let stops = look.scale.stops();
-    let selected = entity.read(cx).height_anchor_index();
+    let selected = viewport.height_anchor_index();
     let anchor = selected.min(stops.len().saturating_sub(1));
     let cell = stops
         .get(anchor)
@@ -1487,7 +1506,7 @@ fn anchor_editor(look: &HeightLook, entity: Entity<ModelViewport>, cx: &App) -> 
                 .gap_1()
                 .items_center()
                 .child(
-                    ColorPicker::new(&entity.read(cx).height_colour_picker())
+                    ColorPicker::new(&viewport.height_colour_picker())
                         .xsmall()
                         .label(rust_i18n::t!("viewport.height_anchor_colour")),
                 )
