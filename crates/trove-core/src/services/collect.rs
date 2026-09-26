@@ -149,25 +149,28 @@ fn is_inbox_sidecar(name: Option<&std::ffi::OsStr>) -> bool {
         .unwrap_or(true)
 }
 
-/// The paths in `sources` that live in `inbox` — the files Trove put there
-/// itself.
-///
-/// The inbox is the one directory whose files are Trove's to remove: a
-/// screenshot or a collected page lands here and the library links it where it
-/// stands, so deleting the record can only mean deleting the file. Everywhere
-/// else a linked file belongs to the user and outlives its record, which is
-/// why a purge has to ask this question first.
+/// Why a purge has to ask this question first: the inbox is the one
+/// directory whose files are Trove's to remove — a screenshot or a collected
+/// page lands here and the library links it where it stands, so deleting the
+/// record can only mean deleting the file. Everywhere else a linked file
+/// belongs to the user and outlives its record.
+pub fn inbox_files(inbox: &Path, sources: Vec<PathBuf>) -> Vec<PathBuf> {
+    sources
+        .into_iter()
+        .filter(|source| is_in_inbox(inbox, source))
+        .collect()
+}
+
+/// Whether `path` sits inside the inbox — the question behind
+/// [`inbox_files`], asked one path at a time when a purge must treat the two
+/// kinds differently.
 ///
 /// Both sides are canonicalized, so a relocated data root or a symlinked
 /// `/tmp` still compares equal; a path that no longer resolves is compared as
 /// written. `starts_with` is component-wise, so a sibling `incoming-old/`
 /// never matches.
-pub fn inbox_files(inbox: &Path, sources: Vec<PathBuf>) -> Vec<PathBuf> {
-    let inbox = resolved(inbox);
-    sources
-        .into_iter()
-        .filter(|source| resolved(source).starts_with(&inbox))
-        .collect()
+pub fn is_in_inbox(inbox: &Path, path: &Path) -> bool {
+    resolved(path).starts_with(resolved(inbox))
 }
 
 /// Canonical form of `path`, or the path itself when it cannot be resolved.

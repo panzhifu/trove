@@ -86,6 +86,7 @@ pub(super) fn files_page(
                     .description(t("settings.verify_integrity_desc")),
                 ),
         )
+        .group(deletion_group())
         .group(SettingGroup::new().item(SettingItem::new(
             t("settings.status"),
             SettingField::render(move |_, _, cx| status_row(&status, cx)),
@@ -362,6 +363,33 @@ fn format_bytes(bytes: u64) -> String {
     } else {
         format!("{value:.1} {}", UNITS[unit])
     }
+}
+
+// =============================== deletion ====================================
+
+/// Files ▸ Deletion: how far a purge may reach. The getter re-reads the
+/// library config on every render, and the purge itself reads the same file
+/// per delete — so a flip here governs the very next emptying of the trash,
+/// no restart in between.
+fn deletion_group() -> SettingGroup {
+    SettingGroup::new()
+        .title(rust_i18n::t!("settings.deletion").to_string())
+        .item(
+            SettingItem::new(
+                rust_i18n::t!("settings.purge_delete_sources").to_string(),
+                SettingField::switch(
+                    |_cx| LibraryConfig::load(&library_dir()).purge_delete_sources(),
+                    |enabled, cx| {
+                        let dir = library_dir();
+                        let mut config = LibraryConfig::load(&dir);
+                        config.purge_delete_sources = Some(enabled);
+                        let _ = config.save(&dir);
+                        cx.refresh_windows();
+                    },
+                ),
+            )
+            .description(rust_i18n::t!("settings.purge_delete_sources_desc").to_string()),
+        )
 }
 
 // =============================== backups =====================================

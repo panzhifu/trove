@@ -407,6 +407,7 @@ pub fn purge(env: &Env, args: &PurgeArgs) -> Result<Rendered, CliError> {
             "blobs_removed": report.blobs_removed,
             "thumbnails_removed": report.thumbs_removed,
             "inbox_files_removed": report.sources_removed,
+            "source_files_removed": report.source_files_removed,
             "requested": ids.len(),
         }),
         format!(
