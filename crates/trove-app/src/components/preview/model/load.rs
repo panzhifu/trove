@@ -498,9 +498,13 @@ impl ModelViewport {
             let built = cx
                 .background_executor()
                 .spawn(async move {
+                    // A device already up (this viewport's, or the process's
+                    // shared one from an earlier preview) serves this mesh
+                    // with an upload and nothing else — which is most of what
+                    // a small model's whole load amounts to.
                     let renderer = match existing {
                         Some(renderer) => renderer,
-                        None => Arc::new(GpuRenderer::new()?),
+                        None => super::super::gpu3d::shared_renderer()?,
                     };
                     let wanted = GpuRenderer::estimate_gpu_bytes(&mesh);
                     if wanted >= LARGE_UPLOAD_LOG_BYTES {

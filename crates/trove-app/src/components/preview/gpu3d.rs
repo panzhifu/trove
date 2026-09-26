@@ -16,7 +16,7 @@
 //! wgpu's handles are `Send + Sync` on native targets, so a frame can be
 //! rendered from a background task without blocking the UI thread.
 
-use std::sync::mpsc;
+use std::sync::{Arc, mpsc, OnceLock};
 
 use trove_core::media::formats::meshlet::{self, Meshlet};
 use trove_core::media::formats::types::{Mesh, Winding};
@@ -259,6 +259,26 @@ impl DeviceCaps {
             if self.int64_atomics { "yes" } else { "no" },
         )
     }
+}
+
+/// The one GPU renderer for the whole process, brought up on first use and
+/// shared by every model viewport after that.
+///
+/// Bringing a device up — instance, adapter enumeration, pipelines — costs
+/// hundreds of milliseconds, and a small model spends nearly all of its load
+/// time there: its geometry parses in milliseconds and uploads in fewer.
+/// Sharing one device turns "every preview pays for the GPU" into "the first
+/// one does", which is most of what makes a small model feel instant.
+///
+/// Safe to share because the renderer is stateless between frames — the
+/// off-screen targets follow whoever renders next — and only one model
+/// viewport is open at a time. A failure is cached too: an adapter probe that
+/// found nothing will find nothing next time, so the search is paid for once.
+pub(crate) fn shared_renderer() -> Result<Arc<GpuRenderer>, GpuUnavailable> {
+    static SHARED: OnceLock<Result<Arc<GpuRenderer>, GpuUnavailable>> = OnceLock::new();
+    SHARED
+        .get_or_init(|| GpuRenderer::new().map(Arc::new))
+        .clone()
 }
 
 impl GpuRenderer {
