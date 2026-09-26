@@ -57,10 +57,19 @@ fn root_nodes(document: &gltf::Document) -> Vec<gltf::Node<'_>> {
 struct Builder {
     positions: Vec<[f32; 3]>,
     /// Parallel to `positions`; placeholder zeros where a primitive carried
-    /// none, dropped as a set by `finish` when `normals_complete` is false.
+    /// none, dropped as a set by `finish` when `normals_incomplete` is set.
     normals: Vec<[f32; 3]>,
-    /// Whether every vertex so far came with a normal.
-    normals_complete: bool,
+    /// Some vertex so far came without a normal.
+    normals_incomplete: bool,
+    /// Parallel to `positions`; the material colour each vertex is painted
+    /// with — the primitive's base colour factor times its `COLOR_0`, when
+    /// either is present. Placeholder zeros where a primitive carried neither,
+    /// dropped as a set by `finish` when `colors_incomplete` is set: shading
+    /// half a model by its materials and half by the flat default reads as a
+    /// bug, so the set stands or falls together.
+    colors: Vec<[f32; 3]>,
+    /// Some vertex so far came without a material colour.
+    colors_incomplete: bool,
     /// Vertices of `POINTS` primitives. Used only when the document has no
     /// triangles at all: a mesh is either a surface or a cloud.
     points: Vec<[f32; 3]>,
@@ -103,6 +112,7 @@ impl Builder {
         }
 
         let base = self.positions.len() as u32;
+        let count = local.len();
         let normals: Option<Vec<[f32; 3]>> = reader.read_normals().map(|normals| {
             normals
                 .map(|normal| transform_normal(rotation, scale, normal))
@@ -116,12 +126,45 @@ impl Builder {
                 // One primitive without normals drops the whole set: shading
                 // half a model smooth and half flat looks broken, and a
                 // half-length array would index out of bounds.
-                self.normals_complete = false;
+                self.normals_incomplete = true;
                 self.normals
                     .extend(std::iter::repeat_n([0.0, 0.0, 0.0], local.len()));
             }
         }
         self.positions.extend(local);
+
+        // The material colour each corner is painted with: the `COLOR_0`
+        // attribute times the primitive's base colour factor, per the glTF
+        // spec — the factor multiplies everything the material draws. A
+        // primitive with neither attribute nor a non-default factor opts out,
+        // which is what drops the whole set when the model mixes the two.
+        let factor = primitive
+            .material()
+            .pbr_metallic_roughness()
+            .base_color_factor();
+        match reader.read_colors(0) {
+            Some(colors) => {
+                for color in colors.into_rgb_f32() {
+                    self.colors.push([
+                        color[0] * factor[0],
+                        color[1] * factor[1],
+                        color[2] * factor[2],
+                    ]);
+                }
+                debug_assert_eq!(self.colors.len() - base as usize, count);
+            }
+            None if factor[..3] != [1.0, 1.0, 1.0] => {
+                self.colors.extend(std::iter::repeat_n(
+                    [factor[0], factor[1], factor[2]],
+                    count,
+                ));
+            }
+            None => {
+                self.colors_incomplete = true;
+                self.colors
+                    .extend(std::iter::repeat_n([0.0, 0.0, 0.0], count));
+            }
+        }
 
         let indices: Vec<u32> = match reader.read_indices() {
             Some(indices) => indices.into_u32().collect(),
@@ -135,12 +178,18 @@ impl Builder {
 
     fn finish(self) -> Result<Mesh, String> {
         if !self.triangles.is_empty() {
-            let normals = if self.normals_complete && self.normals.len() == self.positions.len() {
+            let normals = if !self.normals_incomplete && self.normals.len() == self.positions.len()
+            {
                 self.normals
             } else {
                 Vec::new()
             };
-            return Mesh::finish(self.positions, normals, Vec::new(), self.triangles)
+            let colors = if !self.colors_incomplete && self.colors.len() == self.positions.len() {
+                self.colors
+            } else {
+                Vec::new()
+            };
+            return Mesh::finish(self.positions, normals, colors, self.triangles)
                 .ok_or_else(|| "the glTF file contains no drawable geometry".to_string());
         }
         // No triangles: a `POINTS` document is a cloud, and the renderers
@@ -259,9 +308,9 @@ mod tests {
     use super::*;
     use std::io::Write;
 
-    /// Build a minimal valid GLB (binary glTF) containing one triangle, with
-    /// `node` spliced into the JSON for the scene's single node.
-    fn triangle_glb(node: &str) -> std::path::PathBuf {
+    /// Build a minimal valid GLB (binary glTF) wrapping the given JSON,
+    /// against a binary chunk of one triangle.
+    fn glb(json: String) -> std::path::PathBuf {
         let bin: Vec<u8> = {
             let mut v = Vec::new();
             // 3 vertices: (0,0,0), (1,0,0), (0,1,0)
@@ -276,27 +325,6 @@ mod tests {
             }
             v
         };
-
-        let json = format!(
-            r#"{{
-            "asset": {{"version": "2.0"}},
-            "scenes": [{{"nodes": [0]}}],
-            "scene": 0,
-            "nodes": [{}],
-            "meshes": [{{"primitives": [{{"attributes": {{"POSITION": 0}}, "indices": 1}}]}}],
-            "buffers": [{{"byteLength": {}}}],
-            "bufferViews": [
-                {{"buffer": 0, "byteOffset": 0, "byteLength": 36, "target": 34962}},
-                {{"buffer": 0, "byteOffset": 36, "byteLength": 12, "target": 34963}}
-            ],
-            "accessors": [
-                {{"bufferView": 0, "componentType": 5126, "count": 3, "type": "VEC3", "max": [1,1,0], "min": [0,0,0]}},
-                {{"bufferView": 1, "componentType": 5125, "count": 3, "type": "SCALAR"}}
-            ]
-        }}"#,
-            node,
-            bin.len()
-        );
 
         let json_bytes = json.into_bytes();
         let json_pad = (4 - (json_bytes.len() % 4)) % 4;
@@ -330,6 +358,31 @@ mod tests {
         path
     }
 
+    /// Build a minimal valid GLB containing one triangle, with `node` spliced
+    /// into the JSON for the scene's single node.
+    fn triangle_glb(node: &str) -> std::path::PathBuf {
+        let json = format!(
+            r#"{{
+            "asset": {{"version": "2.0"}},
+            "scenes": [{{"nodes": [0]}}],
+            "scene": 0,
+            "nodes": [{}],
+            "meshes": [{{"primitives": [{{"attributes": {{"POSITION": 0}}, "indices": 1}}]}}],
+            "buffers": [{{"byteLength": {}}}],
+            "bufferViews": [
+                {{"buffer": 0, "byteOffset": 0, "byteLength": 36, "target": 34962}},
+                {{"buffer": 0, "byteOffset": 36, "byteLength": 12, "target": 34963}}
+            ],
+            "accessors": [
+                {{"bufferView": 0, "componentType": 5126, "count": 3, "type": "VEC3", "max": [1,1,0], "min": [0,0,0]}},
+                {{"bufferView": 1, "componentType": 5125, "count": 3, "type": "SCALAR"}}
+            ]
+        }}"#,
+            node, 48
+        );
+        glb(json)
+    }
+
     #[test]
     fn triangle_parses_from_glb() {
         let path = triangle_glb(r#"{"mesh": 0}"#);
@@ -339,6 +392,52 @@ mod tests {
         assert_eq!(mesh.triangle_count(), 1);
         assert_eq!(mesh.triangles[0], [0, 1, 2]);
         assert_eq!(mesh.bounds.max, [1.0, 1.0, 0.0]);
+    }
+
+    /// The primitive's base colour factor is what its vertices are painted
+    /// with — the one material property this flat-colour renderer can show.
+    #[test]
+    fn a_materials_base_colour_becomes_vertex_colours() {
+        let json = format!(
+            r#"{{
+            "asset": {{"version": "2.0"}},
+            "scenes": [{{"nodes": [0]}}],
+            "scene": 0,
+            "nodes": [{{"mesh": 0}}],
+            "meshes": [{{"primitives": [{{"attributes": {{"POSITION": 0}}, "indices": 1, "material": 0}}]}}],
+            "materials": [{{"pbrMetallicRoughness": {{"baseColorFactor": [1.0, 0.5, 0.0, 1.0]}}}}],
+            "buffers": [{{"byteLength": 48}}],
+            "bufferViews": [
+                {{"buffer": 0, "byteOffset": 0, "byteLength": 36, "target": 34962}},
+                {{"buffer": 0, "byteOffset": 36, "byteLength": 12, "target": 34963}}
+            ],
+            "accessors": [
+                {{"bufferView": 0, "componentType": 5126, "count": 3, "type": "VEC3", "max": [1,1,0], "min": [0,0,0]}},
+                {{"bufferView": 1, "componentType": 5125, "count": 3, "type": "SCALAR"}}
+            ]
+        }}"#
+        );
+        let path = glb(json);
+        let mesh = load_gltf(&path).expect("glb triangle parses");
+        std::fs::remove_file(&path).ok();
+        assert!(
+            mesh.has_vertex_colors(),
+            "the material colour comes through"
+        );
+        assert_eq!(mesh.colors[0], [1.0, 0.5, 0.0]);
+        assert_eq!(mesh.colors[2], [1.0, 0.5, 0.0]);
+    }
+
+    /// A primitive with neither `COLOR_0` nor a non-default base colour
+    /// factor has no material to preview, so the mesh keeps the flat default
+    /// it always had.
+    #[test]
+    fn a_gltf_without_materials_keeps_no_colours() {
+        let path = triangle_glb(r#"{"mesh": 0}"#);
+        let mesh = load_gltf(&path).expect("glb triangle parses");
+        std::fs::remove_file(&path).ok();
+        assert!(!mesh.has_vertex_colors());
+        assert!(mesh.colors.is_empty());
     }
 
     /// The node's transform is what places the geometry. Ignoring it — the

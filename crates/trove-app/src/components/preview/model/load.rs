@@ -265,6 +265,12 @@ impl ModelViewport {
         if lod == self.current_lod || lod >= simplified.levels.len() {
             return;
         }
+        // Levels are painted flat: QEM's vertices are new points with no
+        // provenance to the source colours, and carrying them through would
+        // mean re-deriving a colour per collapsed vertex. A level swapped in
+        // at a distance therefore loses the file's materials until the camera
+        // returns to the full-resolution level — a trade against re-colouring
+        // geometry nobody can see at that distance anyway.
         self.current_lod = lod;
         let level = &simplified.levels[lod];
         let has_normals = simplified.has_normals;

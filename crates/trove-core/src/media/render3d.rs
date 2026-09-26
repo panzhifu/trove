@@ -516,6 +516,10 @@ impl Camera {
 pub struct VertexData {
     /// Interleaved `[x, y, z, nx, ny, nz]` per vertex.
     pub vertices: Vec<f32>,
+    /// Per-vertex `[r, g, b]`, only when the mesh carries its own colours —
+    /// the file's material or vertex-colour attributes. Empty otherwise, which
+    /// puts the mesh on the plain pipeline and its flat material.
+    pub colors: Vec<f32>,
     /// Triangle indices, or `None` when the mesh had to be expanded per face.
     pub indices: Option<Vec<u32>>,
     /// Vertices in the buffer, i.e. `vertices.len() / 6`.
@@ -525,6 +529,9 @@ pub struct VertexData {
 impl VertexData {
     /// Bytes of one interleaved vertex: two `vec3<f32>`.
     pub const STRIDE: u64 = 24;
+
+    /// Bytes of one colour vertex: a `vec3<f32>`.
+    pub const COLOR_STRIDE: u64 = 12;
 
     /// Triangles that will be drawn.
     pub fn triangle_count(&self) -> usize {
@@ -537,6 +544,11 @@ impl VertexData {
     /// The vertex array as bytes, ready for `Queue::write_buffer`.
     pub fn vertex_bytes(&self) -> Vec<u8> {
         f32_bytes(&self.vertices)
+    }
+
+    /// The colour array as bytes, ready for `Queue::write_buffer`.
+    pub fn color_bytes(&self) -> Vec<u8> {
+        f32_bytes(&self.colors)
     }
 
     /// The index list as bytes, when the mesh is indexed.
@@ -586,14 +598,25 @@ pub fn vertex_data(mesh: &Mesh) -> VertexData {
 /// spelled it.
 pub fn vertex_data_with(mesh: &Mesh, flip_winding: bool) -> VertexData {
     let mut vertices = Vec::new();
+    // The file's own colours ride along only when it has them: an empty array
+    // is what puts the mesh on the plain pipeline and its flat material.
+    let mut colors = Vec::new();
+    let colored = mesh.has_vertex_colors();
+    if colored {
+        colors.reserve(mesh.positions.len() * 3);
+    }
     if mesh.has_vertex_normals() {
         vertices.reserve(mesh.positions.len() * 6);
-        for (p, n) in mesh.positions.iter().zip(mesh.normals.iter()) {
+        for (index, (p, n)) in mesh.positions.iter().zip(mesh.normals.iter()).enumerate() {
             // A flipped winding means the file's normals point the other way
             // too, or the shading would disagree with the culling.
             let n = if flip_winding { neg(*n) } else { *n };
             let n = normalize(n);
             vertices.extend_from_slice(&[p[0], p[1], p[2], n[0], n[1], n[2]]);
+            if colored {
+                let c = base_color(mesh, index);
+                colors.extend_from_slice(&[c[0], c[1], c[2]]);
+            }
         }
         let mut indices = Vec::with_capacity(mesh.triangles.len() * 3);
         for triangle in &mesh.triangles {
@@ -605,36 +628,41 @@ pub fn vertex_data_with(mesh: &Mesh, flip_winding: bool) -> VertexData {
         }
         VertexData {
             vertices,
+            colors,
             indices: Some(indices),
             vertex_count: mesh.positions.len() as u32,
         }
     } else {
         vertices.reserve(mesh.triangles.len() * 18);
         for triangle in &mesh.triangles {
-            let corners = if flip_winding {
-                [
-                    mesh.positions[triangle[0] as usize],
-                    mesh.positions[triangle[2] as usize],
-                    mesh.positions[triangle[1] as usize],
-                ]
+            // The expanded corners follow the winding, and so do their colours:
+            // the same slot indexes the same vertex of the source triangle.
+            let source = if flip_winding {
+                [triangle[0], triangle[2], triangle[1]]
             } else {
-                [
-                    mesh.positions[triangle[0] as usize],
-                    mesh.positions[triangle[1] as usize],
-                    mesh.positions[triangle[2] as usize],
-                ]
+                *triangle
             };
+            let corners = [
+                mesh.positions[source[0] as usize],
+                mesh.positions[source[1] as usize],
+                mesh.positions[source[2] as usize],
+            ];
             let n = normalize(cross(
                 sub(corners[1], corners[0]),
                 sub(corners[2], corners[0]),
             ));
-            for p in corners {
+            for (slot, p) in corners.iter().enumerate() {
                 vertices.extend_from_slice(&[p[0], p[1], p[2], n[0], n[1], n[2]]);
+                if colored {
+                    let c = base_color(mesh, source[slot] as usize);
+                    colors.extend_from_slice(&[c[0], c[1], c[2]]);
+                }
             }
         }
         VertexData {
             vertex_count: (mesh.triangles.len() * 3) as u32,
             vertices,
+            colors,
             indices: None,
         }
     }
@@ -836,11 +864,13 @@ fn paint(
                 };
                 // Field colouring is decided per vertex, so a band boundary
                 // lands on the geometry rather than on a pixel; the shader does
-                // the same from the same model-space position and normal.
+                // the same from the same model-space position and normal. With
+                // no field active the vertex keeps the colour the file gave it
+                // — its material — or the flat one when the file had none.
                 let c = options
                     .height
                     .tint_at(&Sample::of(mesh, index, geometric))
-                    .unwrap_or(MATERIAL);
+                    .unwrap_or_else(|| base_color(mesh, index));
                 corners[slot] = Vertex {
                     p: view[index],
                     i: AMBIENT + DIFFUSE * dot(normal, light).max(0.0),
@@ -1464,6 +1494,26 @@ mod tests {
             .iter()
             .filter(|p| p[1] < 220)
             .count()
+    }
+
+    /// A mesh that carries colours hands them to the vertex buffer — one RGB
+    /// per buffered vertex, expanded per face exactly when the geometry is —
+    /// and a mesh without colours leaves the array empty, which is what puts
+    /// it on the plain pipeline and its flat material.
+    #[test]
+    fn vertex_data_carries_colours_exactly_when_the_mesh_has_them() {
+        let mut colored = cube();
+        colored.colors = vec![[0.2, 0.4, 0.8]; colored.positions.len()];
+        for flip in [false, true] {
+            let data = vertex_data_with(&colored, flip);
+            assert_eq!(data.colors.len(), data.vertex_count as usize * 3);
+            assert_eq!(data.colors[0], 0.2);
+            assert_eq!(data.colors[1], 0.4);
+        }
+        let plain = cube();
+        for flip in [false, true] {
+            assert!(vertex_data_with(&plain, flip).colors.is_empty());
+        }
     }
 
     fn brightness(p: [u8; 4]) -> u32 {
