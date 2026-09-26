@@ -790,10 +790,13 @@ impl InspectorPanel {
                     .text_color(cx.theme().muted_foreground)
                     .rotate(gpui::percentage(if open { 0. } else { 0.75 })),
             );
+        // Body shares the header's px_1, so the section title and every row
+        // under it sit on one leading spine — the padding belongs to the
+        // hover pill, the content aligns with the title text, not the pill.
         div()
             .w_full()
             .child(header)
-            .when(open, |this| this.child(content))
+            .when(open, |this| this.child(content.px_1()))
     }
 
     /// One small button per [`AssetKind`]; the active kind is highlighted.
