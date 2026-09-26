@@ -24,6 +24,14 @@ pub fn abs_path(root: &Path, sha: &str) -> PathBuf {
     root.join(rel_path(sha))
 }
 
+/// Remove the thumbnail and its kindred derived files for `sha`. Deleting an
+/// asset takes its derived data with it — the cache regenerates whatever a
+/// remaining record still needs.
+pub fn remove_derived(root: &Path, sha: &str) {
+    let _ = std::fs::remove_file(abs_path(root, sha));
+    let _ = std::fs::remove_file(crate::media::waveform::abs_path(root, sha));
+}
+
 /// Ensure a thumbnail exists for the image blob at `blob_path` and return its
 /// absolute path, or `None` when the file is not a decodable image.
 ///

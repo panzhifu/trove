@@ -1326,7 +1326,7 @@ impl Library {
         // from the file where it lives.
         if !old_hash.is_empty() && assets::count_by_content_hash(self.store.conn(), &old_hash)? == 0
         {
-            let _ = std::fs::remove_file(media::thumb::abs_path(self.cache(), &old_hash));
+            media::thumb::remove_derived(self.cache(), &old_hash);
         }
         media::thumb::regenerate(self.cache(), &hash, asset.kind, &source);
         Ok(true)
@@ -1363,11 +1363,14 @@ impl Library {
             Some(height),
         )?;
 
-        // Free the old content when this was the last reference to it.
+        // Free the old content when this was the last reference to it. Its
+        // derived files describe the old pixels and go with it; the new
+        // content's card is regenerated below.
         if assets::count_by_content_hash(self.store.conn(), &old_hash)? == 0
             && let Some(rel) = &old_rel
         {
-            self.remove_blob_files(rel, &old_hash);
+            self.remove_blob_file(rel);
+            media::thumb::remove_derived(self.cache(), &old_hash);
         }
 
         // Thumbnail and visual fingerprint describe the old pixels; both
@@ -1876,12 +1879,15 @@ impl Library {
         // Track (rel, hash) for every content hash left unreferenced by this
         // purge, so the file is deleted exactly once even when several deleted
         // assets shared it. Linked sources are collected the same way, then
-        // tried against the inbox once the records are gone.
+        // tried against the inbox once the records are gone. Every purged
+        // hash — referenced or not — has its derived files taken with it.
         let mut freed: Vec<(String, String)> = Vec::new();
         let mut sources: Vec<PathBuf> = Vec::new();
+        let mut derived: Vec<String> = Vec::new();
         let purged = self.store.transaction(|tx| {
             let mut freed_tx: Vec<(String, String)> = Vec::new();
             let mut sources_tx: Vec<PathBuf> = Vec::new();
+            let mut derived_tx: Vec<String> = Vec::new();
             for id in ids {
                 let Some(asset) = assets::get(tx, *id)? else {
                     continue;
@@ -1894,6 +1900,11 @@ impl Library {
                 let hash = asset.content_hash.clone();
                 let rel = asset.rel_path.clone();
                 assets::delete(tx, *id)?;
+                if let Some(hash) = &hash
+                    && !derived_tx.contains(hash)
+                {
+                    derived_tx.push(hash.clone());
+                }
                 if let (Some(hash), Some(rel)) = (hash, rel)
                     && assets::count_by_content_hash(tx, &hash)? == 0
                 {
@@ -1902,6 +1913,7 @@ impl Library {
             }
             freed = freed_tx;
             sources = sources_tx;
+            derived = derived_tx;
             Ok(ids.len() as u64)
         })?;
 
@@ -1909,12 +1921,18 @@ impl Library {
             purged,
             ..Default::default()
         };
-        for (rel, hash) in freed {
+        // Derived files go with every deleted record, whatever else shares
+        // the content: the cache exists to serve the records, and whatever a
+        // surviving twin still needs regenerates on its next view.
+        for hash in &derived {
+            media::thumb::remove_derived(&self.cache, hash);
+            report.thumbs_removed += 1;
+        }
+        for (rel, _hash) in freed {
             if rel.starts_with("media/") {
                 report.blobs_removed += 1;
+                self.remove_blob_file(&rel);
             }
-            report.thumbs_removed += 1;
-            self.remove_blob_files(&rel, &hash);
         }
         // Inbox files always go with their record (see [`Self::purge_assets`]);
         // linked files everywhere else only when the setting asks for it.
@@ -1949,14 +1967,13 @@ impl Library {
         Ok(report)
     }
 
-    /// Best-effort removal of a content-addressed blob and its thumbnail.
-    /// Only called once the content is unreferenced.
-    fn remove_blob_files(&self, rel: &str, hash: &str) {
+    /// Best-effort removal of a content-addressed blob, once no record
+    /// references the content any more. The derived files went already —
+    /// see the purge loop.
+    fn remove_blob_file(&self, rel: &str) {
         if rel.starts_with("media/") {
             let _ = std::fs::remove_file(self.root.join(rel));
         }
-        let thumb = media::thumb::abs_path(&self.cache, hash);
-        let _ = std::fs::remove_file(thumb);
     }
 }
 
