@@ -1134,7 +1134,15 @@ fn paint(
             }) {
                 Some((map, factors, uv)) => {
                     let (_r, g, b) = map.sample(uv[0], uv[1]);
-                    (g * factors[1], b * factors[0])
+                    // The metallic-roughness channels are LINEAR data, not
+                    // colour — `sample` decoded them as sRGB on the way out,
+                    // so they are re-encoded back to the stored value before
+                    // use. A stored 0.5 must read as 0.5, or the finish the
+                    // author picked quietly turns to gloss.
+                    (
+                        encode_channel(g) * factors[1],
+                        encode_channel(b) * factors[0],
+                    )
                 }
                 None => (MATERIAL_ROUGHNESS, 0.0),
             };

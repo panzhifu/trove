@@ -371,8 +371,13 @@ fn fs_model_textured(in: ModelOut) -> @location(0) vec4<f32> {
         mr_layer,
         0.0,
     );
-    let metallic = mr_texel.b * in.mr_factors.x;
-    let roughness = mr_texel.g * in.mr_factors.y;
+    // The metallic-roughness channels are LINEAR data, not colour: the
+    // sRGB format decodes them on sample, so they are re-encoded back to the
+    // stored value before use. A stored 0.5 must read as 0.5, or the finish
+    // the author picked quietly turns to gloss.
+    let mr_raw = encode(mr_texel.rgb);
+    let metallic = mr_raw.b * in.mr_factors.x;
+    let roughness = mr_raw.g * in.mr_factors.y;
 
     // A metal's diffuse is zero — its colour travels in the specular — and
     // its specular colour starts at the base colour instead of the
