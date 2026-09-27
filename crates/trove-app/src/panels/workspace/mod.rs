@@ -70,6 +70,7 @@ use data::{
 };
 // Re-exported for the smart-collection editor: it embeds the colour-filter
 // panel as its color column, fed by the same recently-used colours.
+use crate::components::controls::{centered_note, muted_label};
 pub(crate) use data::recent_picker_colors;
 use rows::{
     appended_rows, list_rows, materialize_rows, next_cell_row, prev_cell_row, refill_rows,
@@ -418,12 +419,10 @@ impl WorkspacePanel {
                                 + &visual.label,
                         ),
                 )
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(cx.theme().muted_foreground)
-                        .child(rust_i18n::t!("workspace.visual_count", count = count).to_string()),
-                )
+                .child(muted_label(
+                    rust_i18n::t!("workspace.visual_count", count = count).to_string(),
+                    cx,
+                ))
                 .child(
                     Button::new("exit-visual-search")
                         .ghost()
@@ -1196,20 +1195,7 @@ impl Render for WorkspacePanel {
                     // Empty-state hint sits UNDER the grid so the grid keeps
                     // all mouse handling (deselect on click, etc.).
                     .when(!empty_message.is_empty(), |area| {
-                        area.child(
-                            div()
-                                .absolute()
-                                .inset_0()
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .child(
-                                    div()
-                                        .text_sm()
-                                        .text_color(cx.theme().muted_foreground)
-                                        .child(empty_message),
-                                ),
-                        )
+                        area.child(centered_note(empty_message, cx))
                     })
                     // The toolbar must come AFTER the grid: later siblings
                     // paint on top, and the bar has to float over the cells.

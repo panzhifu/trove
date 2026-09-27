@@ -14,6 +14,7 @@ use gpui_kit::component::slider::Slider;
 use gpui_kit::component::{IconName, Sizable as _, WindowExt as _};
 use gpui_kit::*;
 
+use crate::components::controls::{icon_button, muted_label};
 use crate::components::preview::{AssetPreviewPanel, ModelViewport};
 use crate::library::LibraryController;
 use crate::panels::WorkspacePanel;
@@ -100,12 +101,7 @@ impl DockPanel for WorkspacePanel {
         let mut row = h_flex()
             .items_center()
             .gap_1()
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(count_label),
-            )
+            .child(muted_label(count_label, cx))
             .child(
                 div()
                     .id("grid-zoom")
@@ -140,19 +136,19 @@ impl DockPanel for WorkspacePanel {
             // neither a trash nor an eraser.
             use gpui_kit::assets::IconName as CatalogIcon;
             let action = if in_trash {
-                Button::new("empty-trash")
-                    .ghost()
-                    .xsmall()
-                    .icon(CatalogIcon::Trash)
-                    .tooltip(rust_i18n::t!("workspace.empty_all_tooltip").to_string())
-                    .on_click(cx.listener(|this, _, _, cx| this.empty_trash(cx)))
+                icon_button(
+                    "empty-trash",
+                    CatalogIcon::Trash,
+                    rust_i18n::t!("workspace.empty_all_tooltip").to_string(),
+                )
+                .on_click(cx.listener(|this, _, _, cx| this.empty_trash(cx)))
             } else {
-                Button::new("clear-history")
-                    .ghost()
-                    .xsmall()
-                    .icon(CatalogIcon::Eraser)
-                    .tooltip(rust_i18n::t!("workspace.clear_history_tooltip").to_string())
-                    .on_click(cx.listener(|this, _, _, cx| this.clear_view_history(cx)))
+                icon_button(
+                    "clear-history",
+                    CatalogIcon::Eraser,
+                    rust_i18n::t!("workspace.clear_history_tooltip").to_string(),
+                )
+                .on_click(cx.listener(|this, _, _, cx| this.clear_view_history(cx)))
             };
             row = row.child(action);
         }
@@ -313,28 +309,28 @@ fn preview_toolbar(
         let ctl = controller.clone();
         let preview_entity = preview.clone();
         bar = bar.child(
-            Button::new("preview-grab-frame")
-                .ghost()
-                .xsmall()
-                .icon(ToolIcon::Camera)
-                .tooltip(rust_i18n::t!("viewport.grab_frame").to_string())
-                .on_click(move |_, window, cx| {
-                    preview_entity.update(cx, |this, cx| {
-                        this.grab_frame(&ctl, window, cx);
-                    });
-                }),
+            icon_button(
+                "preview-grab-frame",
+                ToolIcon::Camera,
+                rust_i18n::t!("viewport.grab_frame").to_string(),
+            )
+            .on_click(move |_, window, cx| {
+                preview_entity.update(cx, |this, cx| {
+                    this.grab_frame(&ctl, window, cx);
+                });
+            }),
         );
     }
 
     bar.child(
-        Button::new("preview-close")
-            .ghost()
-            .xsmall()
-            .icon(IconName::Close)
-            .tooltip(rust_i18n::t!("viewport.close").to_string())
-            .on_click(cx.listener(|this, _, window, cx| {
-                this.dismiss_preview(window, cx);
-            })),
+        icon_button(
+            "preview-close",
+            IconName::Close,
+            rust_i18n::t!("viewport.close").to_string(),
+        )
+        .on_click(cx.listener(|this, _, window, cx| {
+            this.dismiss_preview(window, cx);
+        })),
     )
 }
 

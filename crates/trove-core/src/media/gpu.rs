@@ -15,8 +15,8 @@
 
 use super::height_color::{HeightUniforms, RAMP_STOPS};
 use super::render3d::{
-    BG_BOTTOM, BG_TOP, EDL_STRENGTH, Framing, MATERIAL, MATERIAL_ROUGHNESS, POINT_RADIUS,
-    VIGNETTE, model_space_lights,
+    BG_BOTTOM, BG_TOP, EDL_STRENGTH, Framing, MATERIAL, MATERIAL_ROUGHNESS, POINT_RADIUS, VIGNETTE,
+    model_space_lights,
 };
 
 /// Bytes of [`Uniforms`]: one `mat4x4<f32>`, twenty-one `vec4<f32>`s (two
@@ -92,7 +92,12 @@ impl Uniforms {
             material: [MATERIAL[0], MATERIAL[1], MATERIAL[2], 0.0],
             params: [MATERIAL_ROUGHNESS, 0.0, VIGNETTE, 0.0],
             lights: model_space_lights(framing).map(|light| LightUniform {
-                direction_wrap: [light.direction[0], light.direction[1], light.direction[2], light.wrap],
+                direction_wrap: [
+                    light.direction[0],
+                    light.direction[1],
+                    light.direction[2],
+                    light.wrap,
+                ],
                 diffuse: [light.diffuse[0], light.diffuse[1], light.diffuse[2], 0.0],
                 specular: [light.specular[0], light.specular[1], light.specular[2], 0.0],
             }),
@@ -342,10 +347,7 @@ mod tests {
             .sqrt();
             assert!((length - 1.0).abs() < 1e-5, "light must be a unit vector");
         }
-        assert_eq!(
-            uniforms.params,
-            [MATERIAL_ROUGHNESS, 0.0, VIGNETTE, 0.0]
-        );
+        assert_eq!(uniforms.params, [MATERIAL_ROUGHNESS, 0.0, VIGNETTE, 0.0]);
         assert_eq!(uniforms.params2[0], POINT_RADIUS);
         assert_eq!(uniforms.params2[1], EDL_STRENGTH);
         // The GPU post pass rebuilds view depth from the depth buffer with

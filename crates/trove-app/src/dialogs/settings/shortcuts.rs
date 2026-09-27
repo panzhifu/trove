@@ -4,10 +4,8 @@
 
 use std::collections::HashMap;
 
-use gpui::Keystroke;
-use gpui_kit::component::kbd::Kbd;
-
 use super::*;
+use crate::components::controls::{kbd_or_raw, muted_label};
 
 // ============================ shortcuts page ================================
 
@@ -150,12 +148,10 @@ fn shortcut_row(view: &Entity<SettingsView>, row: &ShortcutRow, capturing: bool,
     let name = if capturing {
         // The line is listening: say so under the name, where the eye
         // already is.
-        v_flex().flex_1().min_w_0().child(label).child(
-            div()
-                .text_xs()
-                .text_color(cx.theme().muted_foreground)
-                .child(rust_i18n::t!("shortcuts.capture_hint").to_string()),
-        )
+        v_flex().flex_1().min_w_0().child(label).child(muted_label(
+            rust_i18n::t!("shortcuts.capture_hint").to_string(),
+            cx,
+        ))
     } else {
         let mut line = h_flex().min_w_0().items_baseline().gap_2().child(label);
         if let Some(context) = row.context {
@@ -208,26 +204,11 @@ fn key_pill(
             pill.border_color(cx.theme().border)
         })
         .child(if capturing {
-            div()
-                .text_xs()
-                .text_color(cx.theme().muted_foreground)
-                .child(rust_i18n::t!("shortcuts.press_keys").to_string())
-                .into_any_element()
+            muted_label(rust_i18n::t!("shortcuts.press_keys").to_string(), cx).into_any_element()
         } else if row.key.is_empty() {
-            div()
-                .text_xs()
-                .text_color(cx.theme().muted_foreground)
-                .child(rust_i18n::t!("shortcuts.unset").to_string())
-                .into_any_element()
+            muted_label(rust_i18n::t!("shortcuts.unset").to_string(), cx).into_any_element()
         } else {
-            match Keystroke::parse(&row.key) {
-                Ok(stroke) => Kbd::new(stroke).into_any_element(),
-                Err(_) => div()
-                    .text_xs()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(row.key.clone())
-                    .into_any_element(),
-            }
+            kbd_or_raw(&row.key, cx)
         })
         .on_click(move |_, _, cx| {
             view.update(cx, |this, cx| this.start_capture(action, cx));

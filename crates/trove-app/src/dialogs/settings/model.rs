@@ -20,17 +20,15 @@ pub(super) fn model_page() -> SettingPage {
         .icon(IconName::Frame)
         .resettable(false)
         .group(
-            SettingGroup::new()
-                .title(t("settings.model_points"))
-                .item(
-                    SettingItem::new(
-                        t("settings.point_enhance"),
-                        config_switch(AppConfig::point_enhance, |config, on| {
-                            config.point_enhance = Some(on);
-                        }),
-                    )
-                    .description(t("settings.point_enhance_desc")),
-                ),
+            SettingGroup::new().title(t("settings.model_points")).item(
+                SettingItem::new(
+                    t("settings.point_enhance"),
+                    config_switch(AppConfig::point_enhance, |config, on| {
+                        config.point_enhance = Some(on);
+                    }),
+                )
+                .description(t("settings.point_enhance_desc")),
+            ),
         )
         .group(zoom_group())
 }

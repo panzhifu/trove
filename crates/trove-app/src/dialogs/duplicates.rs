@@ -19,6 +19,7 @@ use gpui_kit::*;
 use trove_core::store::assets::DuplicateGroup;
 use uuid::Uuid;
 
+use crate::components::controls::muted_label;
 use crate::components::scrollbar;
 use crate::library::LibraryController;
 use crate::panels::common::{display_name, human_bytes};
@@ -175,12 +176,10 @@ fn group_row(controller: Entity<LibraryController>, group: &DuplicateGroup, cx: 
                         .text_color(cx.theme().foreground)
                         .child(display_name(asset)),
                 )
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(cx.theme().muted_foreground)
-                        .child(format!("{} · {}", human_bytes(asset.size_bytes), added)),
-                ),
+                .child(muted_label(
+                    format!("{} · {}", human_bytes(asset.size_bytes), added),
+                    cx,
+                )),
         );
     }
     card

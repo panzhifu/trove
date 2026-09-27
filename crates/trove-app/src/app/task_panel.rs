@@ -19,6 +19,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 // App, SharedString, px, …) plus gpui-kit's extensions.
 use gpui_kit::*;
 
+use crate::components::controls::empty_note;
 use crate::components::scrollbar;
 use crate::library::{LibraryController, TaskCard, jobs};
 use trove_core::tasks::{TaskId, TaskKind, TaskStatus};
@@ -164,14 +165,7 @@ fn task_panel_body(
     let body = v_flex().w_full().child(header);
     if rows.is_empty() {
         return body
-            .child(
-                div()
-                    .px_3()
-                    .py_4()
-                    .text_sm()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(rust_i18n::t!("task.empty").to_string()),
-            )
+            .child(empty_note(rust_i18n::t!("task.empty").to_string(), cx))
             .into_any_element();
     }
     body.child(scrollbar::vertical(v_flex().max_h(px(280.)).children(

@@ -3,12 +3,12 @@
 
 use std::sync::Arc;
 
+use gpui_kit::assets::IconName as AssetIcon;
 use gpui_kit::base::{Disableable as _, ElementExt as _, h_flex, v_flex};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::popover::Popover;
 use gpui_kit::component::separator::Separator;
 use gpui_kit::component::tab::{Tab, TabBar};
-use gpui_kit::assets::IconName as AssetIcon;
 use gpui_kit::component::{ActiveTheme, IconName, Sizable};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -22,6 +22,7 @@ use trove_core::media::height_color::{
 };
 
 use super::{Backend, Drag, ModelViewport, ModelViewportEvent, drag_for};
+use crate::components::controls::{centered_note, icon_button, muted_label};
 
 /// The camera's distance bounds for the configured magnification limits.
 ///
@@ -52,14 +53,6 @@ const LEGEND_LINE: f32 = 14.0;
 /// bar this short, coarse enough that a scale's anchors land on positions the
 /// strip can actually show.
 const ANCHOR_CELLS: usize = 24;
-
-/// The caption above a row of the height panel.
-fn section_label(text: impl Into<SharedString>, cx: &App) -> impl IntoElement {
-    div()
-        .text_xs()
-        .text_color(cx.theme().muted_foreground)
-        .child(text.into())
-}
 
 /// A colour scale drawn as a horizontal strip, so the thing being chosen is the
 /// thing being seen rather than a name that has to be imagined in colour.
@@ -202,12 +195,7 @@ fn legend_labels(field: &HeightField, label: &dyn Fn(f32) -> String, cx: &App) -
                 .gap_1()
                 // The tick itself, so the number points at something.
                 .child(div().w_1().h(px(7.)).flex_shrink_0().bg(cx.theme().border))
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(cx.theme().muted_foreground)
-                        .child(label(value)),
-                ),
+                .child(muted_label(label(value), cx)),
         );
     }
     column.into_any_element()
@@ -521,21 +509,21 @@ impl ModelViewport {
             )
             .when(on, |row| {
                 row.child(
-                    Button::new("height-color-off")
-                        .ghost()
-                        .xsmall()
-                        .icon(IconName::Close)
-                        .tooltip(rust_i18n::t!("viewport.height_color_off").to_string())
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.apply_height(
-                                HeightLook {
-                                    mode: HeightMode::Off,
-                                    ..this.height.clone()
-                                },
-                                true,
-                                cx,
-                            );
-                        })),
+                    icon_button(
+                        "height-color-off",
+                        IconName::Close,
+                        rust_i18n::t!("viewport.height_color_off").to_string(),
+                    )
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.apply_height(
+                            HeightLook {
+                                mode: HeightMode::Off,
+                                ..this.height.clone()
+                            },
+                            true,
+                            cx,
+                        );
+                    })),
                 )
             })
             .into_any_element()
@@ -832,12 +820,7 @@ impl ModelViewport {
                     // Which field is being painted, and along which axis when
                     // that is what the field asks: with the panel closed, this
                     // is the only place either is visible.
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(cx.theme().muted_foreground)
-                            .child(legend_caption(&field)),
-                    )
+                    .child(muted_label(legend_caption(&field), cx))
                     .child(
                         h_flex()
                             .gap_1()
@@ -929,12 +912,7 @@ impl ModelViewport {
     /// corner is the free one.
     fn shortcuts_hint(&self, cx: &mut Context<Self>) -> impl IntoElement {
         use gpui_kit::base::v_flex;
-        let line = |text: String| {
-            div()
-                .text_xs()
-                .text_color(cx.theme().muted_foreground)
-                .child(text)
-        };
+        let line = |text: String| muted_label(text, cx);
         v_flex()
             .absolute()
             .top_2()
@@ -969,16 +947,7 @@ impl ModelViewport {
                 None => rust_i18n::t!("viewport.rendering").to_string(),
             },
         };
-        div()
-            .absolute()
-            .inset_0()
-            .flex()
-            .items_center()
-            .justify_center()
-            .text_sm()
-            .text_color(cx.theme().muted_foreground)
-            .child(message)
-            .into_any_element()
+        centered_note(message, cx).into_any_element()
     }
 
     /// The viewport's title-bar controls: the reset / close buttons.
@@ -1001,24 +970,24 @@ impl ModelViewport {
             .gap_2()
             .items_center()
             .child(
-                Button::new("model-reset")
-                    .ghost()
-                    .xsmall()
-                    .icon(IconName::RotateCw)
-                    .tooltip(rust_i18n::t!("viewport.reset").to_string())
-                    .on_click(cx.listener(|this, _, _, cx| this.reset_camera(cx))),
+                icon_button(
+                    "model-reset",
+                    IconName::RotateCw,
+                    rust_i18n::t!("viewport.reset").to_string(),
+                )
+                .on_click(cx.listener(|this, _, _, cx| this.reset_camera(cx))),
             )
             .child(
-                Button::new("model-close")
-                    .ghost()
-                    .xsmall()
-                    .icon(IconName::Close)
-                    .tooltip(rust_i18n::t!("viewport.close").to_string())
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        // Free the frame before the panel drops us.
-                        this.release(window);
-                        this.close(cx);
-                    })),
+                icon_button(
+                    "model-close",
+                    IconName::Close,
+                    rust_i18n::t!("viewport.close").to_string(),
+                )
+                .on_click(cx.listener(|this, _, window, cx| {
+                    // Free the frame before the panel drops us.
+                    this.release(window);
+                    this.close(cx);
+                })),
             )
     }
 }
@@ -1317,18 +1286,14 @@ fn field_row(
         .gap_1()
         .child(row.selected_index(look.field.index() as usize))
         .when(!available(look.field), |row| {
-            row.child(
-                div()
-                    .text_xs()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(
-                        rust_i18n::t!(
-                            "viewport.height_field_unavailable",
-                            field = field_name(look.field)
-                        )
-                        .to_string(),
-                    ),
-            )
+            row.child(muted_label(
+                rust_i18n::t!(
+                    "viewport.height_field_unavailable",
+                    field = field_name(look.field)
+                )
+                .to_string(),
+                cx,
+            ))
         })
         .into_any_element()
 }
@@ -1408,7 +1373,7 @@ fn scale_list(
     rows.push(new_scale_button(entity.clone(), cx));
     v_flex()
         .gap_1()
-        .child(section_label(rust_i18n::t!("viewport.height_scale"), cx))
+        .child(muted_label(rust_i18n::t!("viewport.height_scale"), cx))
         .child(
             scrollbar::vertical(v_flex().gap_1().max_h(px(220.)))
                 .pr_1()
@@ -1542,7 +1507,7 @@ fn anchor_editor(
         .unwrap_or(0);
     v_flex()
         .gap_1()
-        .child(section_label(rust_i18n::t!("viewport.height_anchors"), cx))
+        .child(muted_label(rust_i18n::t!("viewport.height_anchors"), cx))
         .child(h_flex().w_full().children((0..ANCHOR_CELLS).map(|index| {
             let here = anchor_at(&stops, index);
             let rgb = ramp_rgb(&stops, cell_position(index));
@@ -1702,7 +1667,7 @@ fn axis_row(look: &HeightLook, entity: Entity<ModelViewport>, cx: &App) -> AnyEl
         .items_center()
         // The same control answers a different question per field: where the
         // elevations sit, versus what counts as up.
-        .child(section_label(
+        .child(muted_label(
             rust_i18n::t!(if look.field == Field::Height {
                 "viewport.height_axis"
             } else {
@@ -1751,7 +1716,7 @@ fn band_period_row(look: &HeightLook, entity: Entity<ModelViewport>, cx: &App) -
     let period = look.period;
     v_flex()
         .gap_1()
-        .child(section_label(
+        .child(muted_label(
             rust_i18n::t!("viewport.height_band_period"),
             cx,
         ))

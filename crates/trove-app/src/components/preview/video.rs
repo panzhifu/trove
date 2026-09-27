@@ -53,6 +53,7 @@ use super::soundtrack::AudioEngine;
 use super::transport;
 use super::{AssetPreviewData, fallback};
 use crate::app::actions::{EnterVideoFullscreen, ExitVideoFullscreen};
+use crate::components::controls::muted_label;
 use crate::library::LibraryController;
 use crate::library::jobs;
 
@@ -987,16 +988,14 @@ impl VideoPlayer {
                     })),
             )
             .child(div().flex_1().child(Slider::new(&self.slider).horizontal()))
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(format!(
-                        "{} / {}",
-                        transport::time(self.position_ms),
-                        transport::time(self.facts.duration_ms as f64)
-                    )),
-            )
+            .child(muted_label(
+                format!(
+                    "{} / {}",
+                    transport::time(self.position_ms),
+                    transport::time(self.facts.duration_ms as f64)
+                ),
+                cx,
+            ))
             .child(self.speed_control(speed, cx))
             .when(self.has_audio(), |row| {
                 row.child(self.volume_control(muted, cx))

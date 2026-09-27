@@ -24,6 +24,7 @@ use crate::components::scrollbar;
 use crate::library::LibraryController;
 
 use super::common::{color_swatch, hex_to_rgb, human_bytes, observe_controller};
+use crate::components::controls::{icon_button, muted_label};
 
 // ==================== Inspector: details + tags ==============================
 
@@ -430,12 +431,7 @@ impl Render for InspectorPanel {
                     .child(asset.ext.to_uppercase()),
             );
 
-        let edit_label = |key: &'static str| {
-            div()
-                .text_xs()
-                .text_color(cx.theme().muted_foreground)
-                .child(rust_i18n::t!(key).to_string())
-        };
+        let edit_label = |key: &'static str| muted_label(rust_i18n::t!(key).to_string(), cx);
 
         // The edit section made the panel taller than its dock slot: the
         // whole content scrolls inside a bounded container (same pattern as
@@ -500,14 +496,14 @@ impl Render for InspectorPanel {
             .items_center()
             .child(Input::new(&self.tag_input).small().flex_1())
             .child(
-                Button::new("replace-tags")
-                    .xsmall()
-                    .ghost()
-                    .icon(IconName::Replace)
-                    .tooltip(rust_i18n::t!("inspector.replace_tags_hint").to_string())
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.replace_tags_from_input(window, cx);
-                    })),
+                icon_button(
+                    "replace-tags",
+                    IconName::Replace,
+                    rust_i18n::t!("inspector.replace_tags_hint").to_string(),
+                )
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.replace_tags_from_input(window, cx);
+                })),
             );
 
         let tags_content = v_flex().gap_2().child(tag_chips).child(tag_input_row);
@@ -553,12 +549,10 @@ impl Render for InspectorPanel {
                         .child(
                             h_flex()
                                 .gap_1()
-                                .child(
-                                    div()
-                                        .text_xs()
-                                        .text_color(cx.theme().muted_foreground)
-                                        .child(rust_i18n::t!("inspector.location").to_string()),
-                                )
+                                .child(muted_label(
+                                    rust_i18n::t!("inspector.location").to_string(),
+                                    cx,
+                                ))
                                 .when(linked, |row| {
                                     row.child(
                                         div()
@@ -904,12 +898,7 @@ impl InspectorPanel {
             meta.push(format!("{glyphs} glyphs"));
         }
         if !meta.is_empty() {
-            section = section.child(
-                div()
-                    .text_xs()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(meta.join(" · ")),
-            );
+            section = section.child(muted_label(meta.join(" · "), cx));
         }
 
         // System install: user-level fonts directory, hash-named copy. The
@@ -924,12 +913,10 @@ impl InspectorPanel {
                     .gap_2()
                     .items_center()
                     .when(installed, |row| {
-                        row.child(
-                            div()
-                                .text_xs()
-                                .text_color(cx.theme().muted_foreground)
-                                .child(rust_i18n::t!("inspector.font_installed").to_string()),
-                        )
+                        row.child(muted_label(
+                            rust_i18n::t!("inspector.font_installed").to_string(),
+                            cx,
+                        ))
                     })
                     .child(if installed {
                         Button::new("font-uninstall")
@@ -1086,12 +1073,7 @@ fn property_row(cx: &Context<impl Render>, key: &'static str, value: String) -> 
         .w_full()
         .justify_between()
         .gap_2()
-        .child(
-            div()
-                .text_xs()
-                .text_color(cx.theme().muted_foreground)
-                .child(rust_i18n::t!(key).to_string()),
-        )
+        .child(muted_label(rust_i18n::t!(key).to_string(), cx))
         .child(
             div()
                 .flex_1()

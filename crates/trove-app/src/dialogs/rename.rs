@@ -15,6 +15,7 @@ use std::rc::Rc;
 
 use trove_core::store::assets;
 
+use crate::components::controls::muted_label;
 use crate::library::LibraryController;
 
 pub struct RenameDialog;
@@ -56,23 +57,13 @@ impl RenameDialog {
                     v_flex()
                         .gap_2()
                         .p_1()
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(cx.theme().muted_foreground)
-                                .child(rust_i18n::t!("rename.pattern").to_string()),
-                        )
+                        .child(muted_label(rust_i18n::t!("rename.pattern").to_string(), cx))
                         .child(Input::new(&pattern).small().appearance(true))
                         .child(
                             h_flex()
                                 .gap_2()
                                 .items_center()
-                                .child(
-                                    div()
-                                        .text_xs()
-                                        .text_color(cx.theme().muted_foreground)
-                                        .child(rust_i18n::t!("rename.start").to_string()),
-                                )
+                                .child(muted_label(rust_i18n::t!("rename.start").to_string(), cx))
                                 .child(Input::new(&start).small().appearance(true).w(px(90.))),
                         )
                         .child(preview_block(&draft_ok, cx)),
@@ -175,12 +166,7 @@ fn preview_block(draft: &Entity<RenameDraft>, cx: &mut App) -> Div {
 
     v_flex()
         .gap_0p5()
-        .child(
-            div()
-                .text_xs()
-                .text_color(cx.theme().muted_foreground)
-                .child(rust_i18n::t!("rename.preview").to_string()),
-        )
+        .child(muted_label(rust_i18n::t!("rename.preview").to_string(), cx))
         .child(
             div()
                 .text_sm()

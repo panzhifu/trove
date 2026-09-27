@@ -875,7 +875,11 @@ fn studio_diffuse(normal: [f32; 3], lights: &[ModelLight; 4]) -> [f32; 3] {
 /// wrap squared, then coloured by the Fresnel-lifted dielectric. Returns the
 /// specular light and the energy it takes out of the diffuse — Blender's
 /// single-knob conservation between the two halves of one answer.
-fn studio_specular(normal: [f32; 3], to_eye: [f32; 3], lights: &[ModelLight; 4]) -> ([f32; 3], f32) {
+fn studio_specular(
+    normal: [f32; 3],
+    to_eye: [f32; 3],
+    lights: &[ModelLight; 4],
+) -> ([f32; 3], f32) {
     // The mirror direction the environment term reads: where a perfect
     // reflector would send the view ray.
     let mirror = sub(scale(normal, 2.0 * dot(normal, to_eye)), to_eye);
@@ -1158,11 +1162,7 @@ pub fn point_normal(mesh: &Mesh, index: usize) -> [f32; 3] {
     const FALLBACK: [f32; 3] = [0.0, 0.0, 1.0];
     if mesh.has_vertex_normals() {
         let n = normalize(mesh.normals[index]);
-        return if n == [0.0; 3] {
-            FALLBACK
-        } else {
-            n
-        };
+        return if n == [0.0; 3] { FALLBACK } else { n };
     }
     let Some(position) = mesh.positions.get(index) else {
         return FALLBACK;

@@ -13,6 +13,7 @@ use std::rc::Rc;
 
 use trove_core::store::{assets, collections};
 
+use crate::components::controls::icon_button;
 use crate::library::LibraryController;
 use uuid::Uuid;
 
@@ -61,86 +62,82 @@ pub(crate) fn selection_toolbar(
     if in_trash {
         bar = bar
             .child(
-                Button::new("sel-restore")
-                    .xsmall()
-                    .ghost()
-                    .icon(IconName::Undo)
-                    .tooltip(rust_i18n::t!("workspace.restore").to_string())
-                    .on_click(move |_, _, cx| {
-                        ctl_restore.update(cx, |ctl, cx| {
-                            let ids = std::mem::take(Rc::make_mut(&mut ctl.selected_assets));
-                            let _ = ctl.library.restore_assets(&ids);
-                            ctl.selection_anchor = None;
-                            ctl.generation += 1;
-                            cx.notify();
-                        });
-                    }),
+                icon_button(
+                    "sel-restore",
+                    IconName::Undo,
+                    rust_i18n::t!("workspace.restore").to_string(),
+                )
+                .on_click(move |_, _, cx| {
+                    ctl_restore.update(cx, |ctl, cx| {
+                        let ids = std::mem::take(Rc::make_mut(&mut ctl.selected_assets));
+                        let _ = ctl.library.restore_assets(&ids);
+                        ctl.selection_anchor = None;
+                        ctl.generation += 1;
+                        cx.notify();
+                    });
+                }),
             )
             .child(
-                Button::new("sel-purge")
-                    .xsmall()
-                    .ghost()
-                    .icon(IconName::Delete)
-                    .tooltip(rust_i18n::t!("workspace.delete_forever").to_string())
-                    .on_click(move |_, _, cx| {
-                        ctl_purge.update(cx, |ctl, cx| {
-                            let ids = std::mem::take(Rc::make_mut(&mut ctl.selected_assets));
-                            if let Err(e) = ctl.library.purge_assets(&ids) {
-                                ctl.notice = Some(
-                                    rust_i18n::t!("workspace.purge_failed", error = e.to_string())
-                                        .to_string(),
-                                );
-                            }
-                            ctl.selection_anchor = None;
-                            ctl.generation += 1;
-                            cx.notify();
-                        });
-                    }),
+                icon_button(
+                    "sel-purge",
+                    IconName::Delete,
+                    rust_i18n::t!("workspace.delete_forever").to_string(),
+                )
+                .on_click(move |_, _, cx| {
+                    ctl_purge.update(cx, |ctl, cx| {
+                        let ids = std::mem::take(Rc::make_mut(&mut ctl.selected_assets));
+                        if let Err(e) = ctl.library.purge_assets(&ids) {
+                            ctl.notice = Some(
+                                rust_i18n::t!("workspace.purge_failed", error = e.to_string())
+                                    .to_string(),
+                            );
+                        }
+                        ctl.selection_anchor = None;
+                        ctl.generation += 1;
+                        cx.notify();
+                    });
+                }),
             );
     } else {
         bar = bar
             .child(
-                Button::new("sel-rename")
-                    .xsmall()
-                    .ghost()
-                    .icon(IconName::CaseSensitive)
-                    .tooltip(rust_i18n::t!("workspace.batch_rename").to_string())
-                    .on_click({
-                        let controller = controller.clone();
-                        move |_, window, cx| {
-                            crate::dialogs::rename::RenameDialog::open(
-                                window,
-                                cx,
-                                controller.clone(),
-                            );
-                        }
-                    }),
+                icon_button(
+                    "sel-rename",
+                    IconName::CaseSensitive,
+                    rust_i18n::t!("workspace.batch_rename").to_string(),
+                )
+                .on_click({
+                    let controller = controller.clone();
+                    move |_, window, cx| {
+                        crate::dialogs::rename::RenameDialog::open(window, cx, controller.clone());
+                    }
+                }),
             )
             .child(
-                Button::new("sel-edit")
-                    .xsmall()
-                    .ghost()
-                    .icon(IconName::RotateCw)
-                    .tooltip(rust_i18n::t!("edit.menu").to_string())
-                    .on_click({
-                        let controller = controller.clone();
-                        move |_, window, cx| {
-                            crate::dialogs::edit::EditDialog::open(window, cx, controller.clone());
-                        }
-                    }),
+                icon_button(
+                    "sel-edit",
+                    IconName::RotateCw,
+                    rust_i18n::t!("edit.menu").to_string(),
+                )
+                .on_click({
+                    let controller = controller.clone();
+                    move |_, window, cx| {
+                        crate::dialogs::edit::EditDialog::open(window, cx, controller.clone());
+                    }
+                }),
             )
             .child(
-                Button::new("sel-xmp")
-                    .xsmall()
-                    .ghost()
-                    .icon(IconName::FileText)
-                    .tooltip(rust_i18n::t!("xmp.menu").to_string())
-                    .on_click({
-                        let controller = controller.clone();
-                        move |_, window, cx| {
-                            crate::library::jobs::export_xmp_app(&controller, window, cx);
-                        }
-                    }),
+                icon_button(
+                    "sel-xmp",
+                    IconName::FileText,
+                    rust_i18n::t!("xmp.menu").to_string(),
+                )
+                .on_click({
+                    let controller = controller.clone();
+                    move |_, window, cx| {
+                        crate::library::jobs::export_xmp_app(&controller, window, cx);
+                    }
+                }),
             )
             .child(
                 Button::new("sel-autotag")
@@ -164,85 +161,81 @@ pub(crate) fn selection_toolbar(
                     }),
             )
             .child(
-                Button::new("sel-fav")
-                    .xsmall()
-                    .ghost()
-                    .icon(if all_favorite {
+                icon_button(
+                    "sel-fav",
+                    if all_favorite {
                         IconName::HeartOff
                     } else {
                         IconName::Heart
+                    },
+                    rust_i18n::t!(if all_favorite {
+                        "workspace.remove_from_favorites"
+                    } else {
+                        "workspace.add_to_favorites"
                     })
-                    .tooltip(
-                        rust_i18n::t!(if all_favorite {
-                            "workspace.remove_from_favorites"
-                        } else {
-                            "workspace.add_to_favorites"
-                        })
-                        .to_string(),
-                    )
-                    .on_click(move |_, _, cx| {
-                        ctl_fav.update(cx, |ctl, cx| {
-                            let ids = ctl.selected_assets.clone();
-                            let _ = ctl.library.set_assets_favorite(&ids, !all_favorite);
-                            ctl.generation += 1;
-                            cx.notify();
-                        });
-                    }),
+                    .to_string(),
+                )
+                .on_click(move |_, _, cx| {
+                    ctl_fav.update(cx, |ctl, cx| {
+                        let ids = ctl.selected_assets.clone();
+                        let _ = ctl.library.set_assets_favorite(&ids, !all_favorite);
+                        ctl.generation += 1;
+                        cx.notify();
+                    });
+                }),
             )
             .child(
-                Button::new("sel-add")
-                    .xsmall()
-                    .ghost()
-                    .icon(IconName::Plus)
-                    .tooltip(rust_i18n::t!("workspace.add_to_collection").to_string())
-                    .dropdown_menu_with_anchor(Anchor::TopLeft, move |menu, _, cx| {
-                        let conn = ctl_add.read(cx).library.store().conn();
-                        let mut items: Vec<(Uuid, String)> = Vec::new();
-                        if let Ok(roots) = collections::roots(conn) {
-                            for root in roots {
-                                items.push((root.id, root.name.clone()));
-                                if let Ok(children) = collections::children_of(conn, Some(root.id))
-                                {
-                                    for child in children {
-                                        items.push((child.id, child.name.clone()));
-                                    }
+                icon_button(
+                    "sel-add",
+                    IconName::Plus,
+                    rust_i18n::t!("workspace.add_to_collection").to_string(),
+                )
+                .dropdown_menu_with_anchor(Anchor::TopLeft, move |menu, _, cx| {
+                    let conn = ctl_add.read(cx).library.store().conn();
+                    let mut items: Vec<(Uuid, String)> = Vec::new();
+                    if let Ok(roots) = collections::roots(conn) {
+                        for root in roots {
+                            items.push((root.id, root.name.clone()));
+                            if let Ok(children) = collections::children_of(conn, Some(root.id)) {
+                                for child in children {
+                                    items.push((child.id, child.name.clone()));
                                 }
                             }
                         }
-                        let mut menu = menu.min_w(px(180.));
-                        if items.is_empty() {
-                            menu = menu.item(PopupMenuItem::label(
-                                rust_i18n::t!("workspace.no_collections").to_string(),
-                            ));
-                        }
-                        for (cid, cname) in items {
-                            let ctl = ctl_add.clone();
-                            menu =
-                                menu.item(PopupMenuItem::new(cname).on_click(move |_, _, cx| {
-                                    ctl.update(cx, |ctl, cx| {
-                                        let ids = ctl.selected_assets.clone();
-                                        let _ = ctl.library.add_assets_to_collection(cid, &ids);
-                                        ctl.generation += 1;
-                                        cx.notify();
-                                    });
-                                }));
-                        }
-                        menu
-                    }),
+                    }
+                    let mut menu = menu.min_w(px(180.));
+                    if items.is_empty() {
+                        menu = menu.item(PopupMenuItem::label(
+                            rust_i18n::t!("workspace.no_collections").to_string(),
+                        ));
+                    }
+                    for (cid, cname) in items {
+                        let ctl = ctl_add.clone();
+                        menu = menu.item(PopupMenuItem::new(cname).on_click(move |_, _, cx| {
+                            ctl.update(cx, |ctl, cx| {
+                                let ids = ctl.selected_assets.clone();
+                                let _ = ctl.library.add_assets_to_collection(cid, &ids);
+                                ctl.generation += 1;
+                                cx.notify();
+                            });
+                        }));
+                    }
+                    menu
+                }),
             )
             .child(
-                Button::new("sel-trash")
-                    .xsmall()
-                    .ghost()
-                    .icon(IconName::Delete)
-                    .tooltip(rust_i18n::t!("app.move_to_trash").to_string())
-                    .on_click(move |_, _, cx| {
-                        ctl_trash.update(cx, |ctl, cx| {
-                            ctl.trash_or_purge_selection();
-                            ctl.selection_anchor = None;
-                            cx.notify();
-                        });
-                    }),
+                icon_button(
+                    "sel-trash",
+                    IconName::Delete,
+                    rust_i18n::t!("app.move_to_trash").to_string(),
+                )
+                .on_click(move |_, _, cx| {
+                    ctl_trash.update(cx, |ctl, cx| {
+                        ctl.trash_or_purge_selection();
+                        ctl.selection_anchor = None;
+                        cx.notify();
+                    });
+                }),
             );
     }
 

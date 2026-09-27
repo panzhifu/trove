@@ -34,6 +34,7 @@ use gpui_kit::*;
 use trove_core::model::{Accent, Appearance, Glyph};
 use uuid::Uuid;
 
+use crate::components::controls::muted_label;
 use crate::components::scrollbar;
 use crate::library::LibraryController;
 use crate::panels::common::color_swatch;
@@ -606,7 +607,10 @@ fn accent_row(picker: &Entity<Picker>, current: &Appearance, cx: &App) -> AnyEle
     v_flex()
         .gap_1p5()
         .child(h_flex().flex_wrap().gap_1().children(chips))
-        .child(hint("appearance.accent_hint", cx))
+        .child(muted_label(
+            rust_i18n::t!("appearance.accent_hint").to_string(),
+            cx,
+        ))
         .into_any_element()
 }
 
@@ -635,11 +639,11 @@ fn glyph_run(
             .enumerate()
             .map(|(ix, cell)| cell_view(picker, cell, ix, current, cx));
         run = run
-            .child(hint(group.label_key, cx))
+            .child(muted_label(rust_i18n::t!(group.label_key).to_string(), cx))
             .child(h_flex().flex_wrap().gap_1().children(cells))
             .when(!last, |this| this.child(Separator::horizontal()));
     }
-    run.children(note.map(|key| hint(key, cx)))
+    run.children(note.map(|key| muted_label(rust_i18n::t!(key).to_string(), cx)))
         .into_any_element()
 }
 
@@ -678,14 +682,6 @@ fn section(key: &'static str) -> AnyElement {
     div()
         .text_sm()
         .font_weight(FontWeight::BOLD)
-        .child(rust_i18n::t!(key).to_string())
-        .into_any_element()
-}
-
-fn hint(key: &str, cx: &App) -> AnyElement {
-    div()
-        .text_xs()
-        .text_color(cx.theme().muted_foreground)
         .child(rust_i18n::t!(key).to_string())
         .into_any_element()
 }

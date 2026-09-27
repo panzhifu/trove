@@ -5,5 +5,6 @@
 // picker is the whole interaction (see `app::root::take_screenshot`).
 #[cfg(target_os = "linux")]
 pub(crate) mod capture_pick;
+pub(crate) mod controls;
 pub(crate) mod preview;
 pub(crate) mod scrollbar;

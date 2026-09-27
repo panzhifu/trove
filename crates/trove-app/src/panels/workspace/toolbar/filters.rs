@@ -13,6 +13,7 @@ use trove_core::config::{AppConfig, FILTER_TOOLS};
 use trove_core::model::{AspectPreset, AssetKind, AssetSort, Orientation, ResolutionBand};
 use trove_core::store::tags;
 
+use crate::components::controls::icon_button;
 use crate::library::{LibraryController, ViewMode};
 use uuid::Uuid;
 
@@ -58,20 +59,15 @@ pub(crate) fn title_controls(controller: &Entity<LibraryController>, cx: &App) -
         ),
     };
     bar = bar.child(
-        Button::new("view-toggle")
-            .xsmall()
-            .ghost()
-            .icon(toggle_icon)
-            .tooltip(t(toggle_tip))
-            .on_click({
-                let controller = controller.clone();
-                move |_, _, cx| {
-                    controller.update(cx, |ctl, cx| {
-                        ctl.set_view_mode(next_mode);
-                        cx.notify();
-                    });
-                }
-            }),
+        icon_button("view-toggle", toggle_icon, t(toggle_tip)).on_click({
+            let controller = controller.clone();
+            move |_, _, cx| {
+                controller.update(cx, |ctl, cx| {
+                    ctl.set_view_mode(next_mode);
+                    cx.notify();
+                });
+            }
+        }),
     );
 
     // Sort dropdown: key + direction pairs.
@@ -85,36 +81,35 @@ pub(crate) fn title_controls(controller: &Entity<LibraryController>, cx: &App) -
         (AssetSort::Rating, true, t("workspace.sort_rating_desc")),
     ];
     bar = bar.child(
-        Button::new("sort-menu")
-            .xsmall()
-            .ghost()
-            .icon(if sort_desc {
+        icon_button(
+            "sort-menu",
+            if sort_desc {
                 IconName::SortDescending
             } else {
                 IconName::SortAscending
-            })
-            .tooltip(t("workspace.sort"))
-            .dropdown_menu_with_anchor(Anchor::TopLeft, {
-                let controller = controller.clone();
-                move |menu, _, _| {
-                    let mut menu = menu.min_w(px(170.));
-                    for (value, desc, label) in &sort_options {
-                        let checked = *value == sort && *desc == sort_desc;
-                        let (value, desc) = (*value, *desc);
-                        let controller = controller.clone();
-                        menu =
-                            menu.item(PopupMenuItem::new(label.clone()).checked(checked).on_click(
-                                move |_, _, cx| {
-                                    controller.update(cx, |ctl, cx| {
-                                        ctl.set_sort(value, desc);
-                                        cx.notify();
-                                    });
-                                },
-                            ));
-                    }
-                    menu
+            },
+            t("workspace.sort"),
+        )
+        .dropdown_menu_with_anchor(Anchor::TopLeft, {
+            let controller = controller.clone();
+            move |menu, _, _| {
+                let mut menu = menu.min_w(px(170.));
+                for (value, desc, label) in &sort_options {
+                    let checked = *value == sort && *desc == sort_desc;
+                    let (value, desc) = (*value, *desc);
+                    let controller = controller.clone();
+                    menu = menu.item(PopupMenuItem::new(label.clone()).checked(checked).on_click(
+                        move |_, _, cx| {
+                            controller.update(cx, |ctl, cx| {
+                                ctl.set_sort(value, desc);
+                                cx.notify();
+                            });
+                        },
+                    ));
                 }
-            }),
+                menu
+            }
+        }),
     );
 
     // Favorites toggle: the primary (filled) state marks the active filter.
@@ -525,28 +520,28 @@ pub(crate) fn add_filter_button(controller: &Entity<LibraryController>) -> impl 
     let t = |k: &str| rust_i18n::t!(k).to_string();
 
     let controller = controller.clone();
-    Button::new("add-filter")
-        .ghost()
-        .xsmall()
-        .icon(IconName::Plus)
-        .tooltip(t("workspace.add_filter_tooltip"))
-        .dropdown_menu_with_anchor(Anchor::TopLeft, move |menu, _, _| {
-            let mut menu = menu.min_w(px(170.));
-            for tool in FILTER_TOOLS {
-                let tool = tool.to_string();
-                let checked = enabled.iter().any(|e| e == &tool);
-                let label_key = format!("workspace.filter_tool_{tool}");
-                let controller = controller.clone();
-                let tool_click = tool.clone();
-                menu = menu.item(PopupMenuItem::new(t(&label_key)).checked(checked).on_click(
-                    move |_, _, cx| {
-                        let mut config = AppConfig::load();
-                        let _ = config.toggle_filter_tool(&tool_click);
-                        // The toolbar row reads the config every render.
-                        controller.update(cx, |_, cx| cx.notify());
-                    },
-                ));
-            }
-            menu
-        })
+    icon_button(
+        "add-filter",
+        IconName::Plus,
+        t("workspace.add_filter_tooltip"),
+    )
+    .dropdown_menu_with_anchor(Anchor::TopLeft, move |menu, _, _| {
+        let mut menu = menu.min_w(px(170.));
+        for tool in FILTER_TOOLS {
+            let tool = tool.to_string();
+            let checked = enabled.iter().any(|e| e == &tool);
+            let label_key = format!("workspace.filter_tool_{tool}");
+            let controller = controller.clone();
+            let tool_click = tool.clone();
+            menu = menu.item(PopupMenuItem::new(t(&label_key)).checked(checked).on_click(
+                move |_, _, cx| {
+                    let mut config = AppConfig::load();
+                    let _ = config.toggle_filter_tool(&tool_click);
+                    // The toolbar row reads the config every render.
+                    controller.update(cx, |_, cx| cx.notify());
+                },
+            ));
+        }
+        menu
+    })
 }

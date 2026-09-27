@@ -13,6 +13,7 @@ use gpui_kit::*;
 
 use trove_core::store::assets::source_folders;
 
+use crate::components::controls::muted_label;
 use crate::components::scrollbar;
 use crate::library::LibraryController;
 
@@ -94,12 +95,7 @@ impl FoldersPanel {
                                 .text_color(cx.theme().foreground)
                                 .child(folder_name(path)),
                         )
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(cx.theme().muted_foreground)
-                                .child(count.to_string()),
-                        ),
+                        .child(muted_label(count.to_string(), cx)),
                 );
             list = list.child(row);
         }

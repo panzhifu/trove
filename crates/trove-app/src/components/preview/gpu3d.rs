@@ -1756,16 +1756,23 @@ mod tests {
         // toward grey — but the unclassified frame stays on the cool side, and
         // the two never meet.
         let buildings = frame([2, 6]);
-        assert!(warm(&buildings) > 10, "the palette's warm end never appeared");
-        // Class 0 is "not classified", which the palette paints white: the same
-        // two points, the same look, and nothing warm in the frame.
+        assert!(
+            warm(&buildings) > 10,
+            "the palette's warm end never appeared"
+        );
         // Class 0 is "not classified", which the palette paints white: the
         // same two points, the same look. The near-neutral studio lights tint
         // every class toward grey, so warmth is a matter of degree — the
         // yellow end stays measurably warmer than the white.
         let unclassified = frame([0, 0]);
-        assert!(warm(&buildings) >= 15, "the palette's warm end never appeared");
-        assert!(warm(&unclassified) <= 10, "a white class came out of the palette warm");
+        assert!(
+            warm(&buildings) >= 15,
+            "the palette's warm end never appeared"
+        );
+        assert!(
+            warm(&unclassified) <= 10,
+            "a white class came out of the palette warm"
+        );
         assert_ne!(buildings, unclassified, "the classes were ignored");
     }
 

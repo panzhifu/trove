@@ -5,6 +5,7 @@
 //! keep the derived files honest — thumbnails, backups, orphans, integrity.
 
 use super::*;
+use crate::components::controls::muted_label;
 use gpui_kit::component::chart::PieChart;
 use trove_core::config::LibraryConfig;
 use trove_core::services::storage::{DirUsage, StorageReport};
@@ -240,12 +241,7 @@ fn ring(slices: Vec<Slice>, center: String, cx: &App) -> Div {
                         .flex()
                         .items_center()
                         .justify_center()
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(cx.theme().muted_foreground)
-                                .child(center),
-                        ),
+                        .child(muted_label(center, cx)),
                 ),
         )
         .child(
@@ -418,19 +414,15 @@ fn backup_row(controller: &Entity<LibraryController>, cx: &mut App) -> Div {
         .w_full()
         .justify_end()
         .gap_2()
-        .child(
-            div()
-                .text_xs()
-                .text_color(cx.theme().muted_foreground)
-                .child(
-                    rust_i18n::t!(
-                        "settings.backup_count",
-                        count = count,
-                        max = trove_core::services::backup::MAX_BACKUPS
-                    )
-                    .to_string(),
-                ),
-        )
+        .child(muted_label(
+            rust_i18n::t!(
+                "settings.backup_count",
+                count = count,
+                max = trove_core::services::backup::MAX_BACKUPS
+            )
+            .to_string(),
+            cx,
+        ))
         .child(
             Button::new("open-backups-dir")
                 .ghost()
@@ -907,12 +899,10 @@ fn status_row(controller: &Entity<LibraryController>, cx: &mut App) -> Div {
                 .child(notice.unwrap_or_else(|| "—".into())),
         )
         .when(busy, |row| {
-            row.child(
-                div()
-                    .text_xs()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(rust_i18n::t!("settings.maintenance_running").to_string()),
-            )
+            row.child(muted_label(
+                rust_i18n::t!("settings.maintenance_running").to_string(),
+                cx,
+            ))
         })
 }
 

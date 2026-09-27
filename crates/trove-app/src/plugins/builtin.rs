@@ -33,6 +33,7 @@ use trove_core::config::AppConfig;
 
 use crate::plugins::i18n::pt;
 
+use crate::components::controls::muted_label;
 use trove_core::media::pipeline::{Cost, Stage, StageIo};
 use trove_core::plugins::{Plugin, PluginCommand};
 
@@ -261,15 +262,9 @@ fn self_set_mode(state: &Arc<RwLock<Mode>>, mode: Mode) {
 /// The command's shortcut line on the settings page: the chord it answers to
 /// right now, and where to change it.
 fn shortcut_row(cx: &App, key: &str, mode_label: String) -> gpui_kit::Div {
-    use gpui_kit::component::ActiveTheme as _;
-
     let chord = match Keystroke::parse(key) {
         Ok(stroke) => Kbd::new(stroke).into_any_element(),
-        Err(_) => div()
-            .text_xs()
-            .text_color(cx.theme().muted_foreground)
-            .child(key.to_string())
-            .into_any_element(),
+        Err(_) => muted_label(key.to_string(), cx).into_any_element(),
     };
     h_flex()
         .w_full()
@@ -280,15 +275,10 @@ fn shortcut_row(cx: &App, key: &str, mode_label: String) -> gpui_kit::Div {
                 .flex_1()
                 .min_w_0()
                 .child(div().text_sm().child(pt!("plugins.sidecar_notes_toggle")))
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(cx.theme().muted_foreground)
-                        .child(pt!(
-                            "plugins.sidecar_notes_shortcut_hint",
-                            mode = mode_label
-                        )),
-                ),
+                .child(muted_label(
+                    pt!("plugins.sidecar_notes_shortcut_hint", mode = mode_label),
+                    cx,
+                )),
         )
         .child(chord)
 }

@@ -33,6 +33,7 @@ use super::common::{
     AssetsDrag, CollectionDrag, SmartDrag, live_count, observe_controller, separator_label,
     trash_count,
 };
+use crate::components::controls::muted_label;
 
 // ============================================================================
 // Layout metrics
@@ -705,12 +706,7 @@ impl Render for ExplorerPanel {
                                     .text_color(appearance::label_color(&row.appearance, cx))
                                     .child(row.name.clone()),
                             )
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child(row.count.to_string()),
-                            ),
+                            .child(muted_label(row.count.to_string(), cx)),
                     )
                     .into_any_element(),
             );
@@ -788,12 +784,7 @@ fn pseudo_row(
                         .text_color(cx.theme().foreground)
                         .child(label),
                 )
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(cx.theme().muted_foreground)
-                        .child(count.to_string()),
-                ),
+                .child(muted_label(count.to_string(), cx)),
         )
 }
 
@@ -962,12 +953,7 @@ fn collection_row(
                         .text_color(appearance::label_color(&folder, cx))
                         .child(name),
                 )
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(cx.theme().muted_foreground)
-                        .child(count.to_string()),
-                ),
+                .child(muted_label(count.to_string(), cx)),
         );
 
     if selected {

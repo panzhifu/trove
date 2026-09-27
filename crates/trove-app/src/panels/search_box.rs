@@ -17,6 +17,7 @@ use gpui_kit::component::{ActiveTheme, IconName};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
+use crate::components::controls::icon_button;
 use crate::library::LibraryController;
 
 /// Floating asset search, rendered in the workspace title bar.
@@ -147,25 +148,23 @@ impl Render for SearchBox {
                         .child(
                             // Always visible: with text it clears + closes,
                             // when empty it just dismisses the popover.
-                            Button::new("clear-search")
-                                .ghost()
-                                .xsmall()
-                                .icon(IconName::Close)
-                                .tooltip(rust_i18n::t!("workspace.clear_search").to_string())
-                                .on_click({
-                                    let input = input.clone();
-                                    let ctl = ctl.clone();
-                                    let open = open.clone();
-                                    let this = this.clone();
-                                    move |_, window, cx| {
-                                        input.update(cx, |state, cx| {
-                                            state.set_value("", window, cx)
-                                        });
-                                        ctl.update(cx, |ctl, _| ctl.set_search(String::new()));
-                                        open.set(false);
-                                        this.update(cx, |_, cx| cx.notify());
-                                    }
-                                }),
+                            icon_button(
+                                "clear-search",
+                                IconName::Close,
+                                rust_i18n::t!("workspace.clear_search").to_string(),
+                            )
+                            .on_click({
+                                let input = input.clone();
+                                let ctl = ctl.clone();
+                                let open = open.clone();
+                                let this = this.clone();
+                                move |_, window, cx| {
+                                    input.update(cx, |state, cx| state.set_value("", window, cx));
+                                    ctl.update(cx, |ctl, _| ctl.set_search(String::new()));
+                                    open.set(false);
+                                    this.update(cx, |_, cx| cx.notify());
+                                }
+                            }),
                         )
                         .into_any_element()
                 }

@@ -28,7 +28,6 @@ use gpui_kit::base::{h_flex, v_flex};
 use gpui_kit::component::WindowExt as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputState};
-use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::{ActiveTheme, IconName, Sizable};
 use gpui_kit::*;
 
@@ -36,6 +35,7 @@ use trove_core::model::{AssetKind, SmartCollection, SmartCompare, SmartField, Sm
 use trove_core::store::{smart, smart_collections, tags};
 use uuid::Uuid;
 
+use crate::components::controls::{self, muted_label};
 use crate::components::scrollbar;
 use crate::library::LibraryController;
 use crate::panels::appearance;
@@ -612,7 +612,7 @@ fn render_body(
         .child(
             v_flex()
                 .gap_1()
-                .child(field_label(cx, "rules.name"))
+                .child(muted_label(rust_i18n::t!("rules.name").to_string(), cx))
                 .child(Input::new(&name_input).small().appearance(true)),
         )
         .child(
@@ -620,7 +620,10 @@ fn render_body(
                 .items_center()
                 .justify_between()
                 .gap_2()
-                .child(field_label(cx, "rules.conditions"))
+                .child(muted_label(
+                    rust_i18n::t!("rules.conditions").to_string(),
+                    cx,
+                ))
                 // The single combination operator over all rows.
                 .child({
                     let d = draft.clone();
@@ -655,16 +658,14 @@ fn render_body(
                 }),
         )
     };
-    let conditions = conditions.child(
-        footer.child(match status {
-            (Some(total), None) => div()
-                .text_xs()
-                .text_color(cx.theme().muted_foreground)
-                .child(rust_i18n::t!("rules.match_count", count = total).to_string()),
-            (_, Some(err)) => div().text_xs().text_color(cx.theme().danger).child(err),
-            (None, None) => div(),
-        }),
-    );
+    let conditions = conditions.child(footer.child(match status {
+        (Some(total), None) => muted_label(
+            rust_i18n::t!("rules.match_count", count = total).to_string(),
+            cx,
+        ),
+        (_, Some(err)) => div().text_xs().text_color(cx.theme().danger).child(err),
+        (None, None) => div(),
+    }));
 
     // Two columns: conditions on the left, the color column on the right.
     v_flex().w_full().child(
@@ -858,9 +859,8 @@ fn render_row(
 
 // ---- small widget helpers ---------------------------------------------------
 
-/// A button whose dropdown lets the user pick one of `options`
-/// (`(value, label)`); the current value is check-marked, `on_pick` fires
-/// with the picked value.
+/// The rules dialog's pickers, at the shared implementation's width and
+/// anchor.
 fn dropdown_button<T: PartialEq + Clone + 'static>(
     id: impl Into<ElementId>,
     label: String,
@@ -868,31 +868,7 @@ fn dropdown_button<T: PartialEq + Clone + 'static>(
     current: T,
     on_pick: impl Fn(T, &mut App) + Clone + 'static,
 ) -> impl IntoElement {
-    Button::new(id)
-        .xsmall()
-        .outline()
-        .label(label)
-        .dropdown_menu_with_anchor(Anchor::TopLeft, move |menu, _, _| {
-            let mut menu = menu.min_w(px(150.));
-            for (value, option_label) in &options {
-                let value = value.clone();
-                let checked = value == current;
-                let on_pick = on_pick.clone();
-                menu = menu.item(
-                    PopupMenuItem::new(option_label.clone())
-                        .checked(checked)
-                        .on_click(move |_, _, cx| on_pick(value.clone(), cx)),
-                );
-            }
-            menu
-        })
-}
-
-fn field_label(cx: &App, key: &'static str) -> Div {
-    div()
-        .text_xs()
-        .text_color(cx.theme().muted_foreground)
-        .child(rust_i18n::t!(key).to_string())
+    controls::dropdown_button(id, label, options, current, on_pick, 150.0, Anchor::TopLeft)
 }
 
 fn field_key(field: SmartField) -> &'static str {

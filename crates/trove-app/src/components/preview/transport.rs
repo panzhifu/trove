@@ -19,6 +19,7 @@ use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::slider::{Slider, SliderState};
 
+use crate::components::controls::muted_label;
 /// Re-exported so a host wires its sliders without importing from two places.
 pub(super) use gpui_kit::component::slider::SliderEvent;
 use gpui_kit::component::{ActiveTheme, IconName, Sizable as _};
@@ -257,16 +258,10 @@ pub(super) fn row(
         .w_full()
         .child(play_pause)
         .child(div().flex_1().child(Slider::new(&slider).horizontal()))
-        .child(
-            div()
-                .text_xs()
-                .text_color(cx.theme().muted_foreground)
-                .child(format!(
-                    "{} / {}",
-                    time(position_ms),
-                    time(duration_ms as f64)
-                )),
-        )
+        .child(muted_label(
+            format!("{} / {}", time(position_ms), time(duration_ms as f64)),
+            cx,
+        ))
         .child(speed)
         .children(volume)
         .into_any_element()

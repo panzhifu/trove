@@ -15,19 +15,18 @@
 //! percent is the only unit that means the same thing for all of them.
 
 use gpui_kit::base::{h_flex, v_flex};
-use gpui_kit::component::button::Button;
 use gpui_kit::component::dialog::DialogButtonProps;
 use gpui_kit::component::input::{Input, InputState};
-use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::notification::Notification;
 use gpui_kit::component::switch::Switch;
-use gpui_kit::component::{ActiveTheme, Sizable, WindowExt as _};
+use gpui_kit::component::{Sizable, WindowExt as _};
 use gpui_kit::*;
 
 use trove_core::media::edit::ImageEdit;
 use trove_core::model::{Asset, AssetKind, Origin};
 use trove_core::store::assets;
 
+use crate::components::controls::{self, muted_label};
 use crate::library::LibraryController;
 
 /// Marker for the keyed edit progress toast (pushing with the same id replaces
@@ -388,55 +387,48 @@ fn content(draft: &Entity<EditDraft>, cx: &mut App) -> Div {
         let d = draft.read(cx);
         (d.rotation, d.flip_h, d.flip_v, d.linked)
     };
-    let label = |cx: &App, key: &'static str| {
-        div()
-            .text_xs()
-            .text_color(cx.theme().muted_foreground)
-            .child(rust_i18n::t!(key).to_string())
-    };
 
     let mut rotate_row = h_flex()
         .gap_2()
         .items_center()
-        .child(label(cx, "edit.rotate"));
+        .child(muted_label(rust_i18n::t!("edit.rotate").to_string(), cx));
     {
         let d = draft.clone();
-        rotate_row = rotate_row.child(
-            Button::new("edit-rotate")
-                .xsmall()
-                .outline()
-                .label(rust_i18n::t!(rotation.label_key()).to_string())
-                .dropdown_menu_with_anchor(Anchor::TopLeft, move |menu, _, _| {
-                    let mut menu = menu.min_w(px(160.));
-                    for picked in [Rotation::None, Rotation::Cw, Rotation::Half, Rotation::Ccw] {
-                        let d = d.clone();
-                        menu = menu.item(
-                            PopupMenuItem::new(rust_i18n::t!(picked.label_key()).to_string())
-                                .checked(picked == rotation)
-                                .on_click(move |_, _, cx| {
-                                    d.update(cx, |d, cx| {
-                                        d.rotation = picked;
-                                        cx.notify();
-                                    })
-                                }),
-                        );
-                    }
-                    menu
-                }),
-        );
+        rotate_row = rotate_row.child({
+            let d = d.clone();
+            let options: Vec<(Rotation, String)> =
+                [Rotation::None, Rotation::Cw, Rotation::Half, Rotation::Ccw]
+                    .into_iter()
+                    .map(|picked| (picked, rust_i18n::t!(picked.label_key()).to_string()))
+                    .collect();
+            controls::dropdown_button(
+                "edit-rotate",
+                rust_i18n::t!(rotation.label_key()).to_string(),
+                options,
+                rotation,
+                move |picked: Rotation, cx: &mut App| {
+                    d.update(cx, |d, cx| {
+                        d.rotation = picked;
+                        cx.notify();
+                    })
+                },
+                160.0,
+                Anchor::TopLeft,
+            )
+        });
     }
 
     let mut flip_row = h_flex()
         .gap_2()
         .items_center()
-        .child(label(cx, "edit.flip"));
+        .child(muted_label(rust_i18n::t!("edit.flip").to_string(), cx));
     for (id, key, current, is_horizontal) in [
         ("edit-flip-h", "edit.flip_h", flip_h, true),
         ("edit-flip-v", "edit.flip_v", flip_v, false),
     ] {
         let d = draft.clone();
         flip_row = flip_row
-            .child(label(cx, key))
+            .child(muted_label(rust_i18n::t!(key).to_string(), cx))
             .child(
                 Switch::new(id)
                     .checked(current)
@@ -456,7 +448,7 @@ fn content(draft: &Entity<EditDraft>, cx: &mut App) -> Div {
     let crop_row = h_flex()
         .gap_2()
         .items_center()
-        .child(label(cx, "edit.crop"))
+        .child(muted_label(rust_i18n::t!("edit.crop").to_string(), cx))
         .child(
             Input::new(&draft.read(cx).crop_left)
                 .small()
@@ -485,7 +477,7 @@ fn content(draft: &Entity<EditDraft>, cx: &mut App) -> Div {
     let quality_row = h_flex()
         .gap_2()
         .items_center()
-        .child(label(cx, "edit.quality"))
+        .child(muted_label(rust_i18n::t!("edit.quality").to_string(), cx))
         .child(
             Input::new(&draft.read(cx).quality)
                 .small()
@@ -498,26 +490,14 @@ fn content(draft: &Entity<EditDraft>, cx: &mut App) -> Div {
         .child(rotate_row)
         .child(flip_row)
         .child(crop_row)
-        .child(
-            div()
-                .text_xs()
-                .text_color(cx.theme().muted_foreground)
-                .child(rust_i18n::t!("edit.crop_hint").to_string()),
-        )
+        .child(muted_label(rust_i18n::t!("edit.crop_hint").to_string(), cx))
         .child(quality_row)
-        .child(
-            div()
-                .text_xs()
-                .text_color(cx.theme().muted_foreground)
-                .child(rust_i18n::t!("edit.note").to_string()),
-        );
+        .child(muted_label(rust_i18n::t!("edit.note").to_string(), cx));
     if linked > 0 {
-        body = body.child(
-            div()
-                .text_xs()
-                .text_color(cx.theme().muted_foreground)
-                .child(rust_i18n::t!("edit.linked_note", count = linked).to_string()),
-        );
+        body = body.child(muted_label(
+            rust_i18n::t!("edit.linked_note", count = linked).to_string(),
+            cx,
+        ));
     }
     body
 }

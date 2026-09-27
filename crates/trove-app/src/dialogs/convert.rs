@@ -10,16 +10,16 @@ use gpui_kit::base::{h_flex, v_flex};
 use gpui_kit::component::button::Button;
 use gpui_kit::component::dialog::DialogButtonProps;
 use gpui_kit::component::input::{Input, InputState};
-use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::notification::Notification;
 use gpui_kit::component::switch::Switch;
-use gpui_kit::component::{ActiveTheme, Sizable, WindowExt as _};
+use gpui_kit::component::{Sizable, WindowExt as _};
 use gpui_kit::*;
 
 use trove_core::media::convert::{self, CONVERT_FORMATS, ConvertFormat, ConvertItem};
 use trove_core::model::{Asset, AssetKind};
 use trove_core::store::assets;
 
+use crate::components::controls::{self, muted_label};
 use crate::library::LibraryController;
 
 /// Marker for the keyed conversion progress toast (pushing with the same id
@@ -174,65 +174,63 @@ fn content(draft: &Entity<ConvertDraft>, window: &mut Window, cx: &mut App) -> D
     let quality_input = draft.read(cx).quality.clone();
     let max_dim_input = draft.read(cx).max_dim.clone();
 
-    let label = |cx: &App, key: &'static str| {
-        div()
-            .text_xs()
-            .text_color(cx.theme().muted_foreground)
-            .child(rust_i18n::t!(key).to_string())
-    };
-
     // Format picker (quality applies to JPEG only).
     let mut format_row = h_flex()
         .gap_2()
         .items_center()
-        .child(label(cx, "convert.format"));
+        .child(muted_label(rust_i18n::t!("convert.format").to_string(), cx));
     {
         let d = draft.clone();
         let current = format;
-        format_row = format_row.child(
-            Button::new("convert-format")
-                .xsmall()
-                .outline()
-                .label(format_label(current))
-                .dropdown_menu_with_anchor(Anchor::TopLeft, move |menu, _, _| {
-                    let mut menu = menu.min_w(px(140.));
-                    for picked in CONVERT_FORMATS {
-                        let d = d.clone();
-                        menu = menu.item(
-                            PopupMenuItem::new(format_label(picked))
-                                .checked(picked == current)
-                                .on_click(move |_, _, cx| {
-                                    d.update(cx, |d, cx| {
-                                        d.format = picked;
-                                        cx.notify();
-                                    })
-                                }),
-                        );
-                    }
-                    menu
-                }),
-        );
+        let options: Vec<(ConvertFormat, String)> = CONVERT_FORMATS
+            .into_iter()
+            .map(|picked| (picked, format_label(picked)))
+            .collect();
+        format_row = format_row.child(controls::dropdown_button(
+            "convert-format",
+            format_label(current),
+            options,
+            current,
+            move |picked: ConvertFormat, cx: &mut App| {
+                d.update(cx, |d, cx| {
+                    d.format = picked;
+                    cx.notify();
+                })
+            },
+            140.0,
+            Anchor::TopLeft,
+        ));
     }
     if format.supports_quality() {
-        format_row = format_row.child(label(cx, "convert.quality")).child(
-            Input::new(&quality_input)
+        format_row = format_row
+            .child(muted_label(
+                rust_i18n::t!("convert.quality").to_string(),
+                cx,
+            ))
+            .child(
+                Input::new(&quality_input)
+                    .small()
+                    .appearance(true)
+                    .w(px(70.)),
+            );
+    }
+    format_row = format_row
+        .child(muted_label(
+            rust_i18n::t!("convert.max_dim").to_string(),
+            cx,
+        ))
+        .child(
+            Input::new(&max_dim_input)
                 .small()
                 .appearance(true)
-                .w(px(70.)),
+                .w(px(90.)),
         );
-    }
-    format_row = format_row.child(label(cx, "convert.max_dim")).child(
-        Input::new(&max_dim_input)
-            .small()
-            .appearance(true)
-            .w(px(90.)),
-    );
 
     // Destination picker.
     let mut dest_row = h_flex()
         .gap_2()
         .items_center()
-        .child(label(cx, "convert.dest"));
+        .child(muted_label(rust_i18n::t!("convert.dest").to_string(), cx));
     {
         let d = draft.clone();
         let handle = window.window_handle();
@@ -270,10 +268,10 @@ fn content(draft: &Entity<ConvertDraft>, window: &mut Window, cx: &mut App) -> D
     }
 
     // Re-import switch.
-    let mut import_row = h_flex()
-        .gap_2()
-        .items_center()
-        .child(label(cx, "convert.import_after"));
+    let mut import_row = h_flex().gap_2().items_center().child(muted_label(
+        rust_i18n::t!("convert.import_after").to_string(),
+        cx,
+    ));
     {
         let d = draft.clone();
         import_row = import_row.child(
@@ -299,12 +297,7 @@ fn content(draft: &Entity<ConvertDraft>, window: &mut Window, cx: &mut App) -> D
         .child(format_row)
         .child(dest_row)
         .child(import_row)
-        .child(
-            div()
-                .text_xs()
-                .text_color(cx.theme().muted_foreground)
-                .child(rust_i18n::t!(note_key).to_string()),
-        )
+        .child(muted_label(rust_i18n::t!(note_key).to_string(), cx))
 }
 
 /// Localized label for a format, e.g. "JPEG".
