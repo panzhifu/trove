@@ -512,7 +512,10 @@ impl Framing {
         )
     }
 
-    /// Near and far planes in unit-sphere space.
+    /// The near plane in unit-sphere space, and the far distance the CPU
+    /// rasteriser's scratch math used to clip against. The projection itself
+    /// has an infinite far plane (see [`Self::view_projection`]); the far
+    /// value stays for the CPU paths and the eye-dome constants.
     pub fn depth_range(&self) -> (f32, f32) {
         ((self.distance * 0.01).max(1e-5), self.distance + 2.0)
     }
@@ -529,15 +532,26 @@ impl Framing {
     }
 
     /// Model space → clip space, **column-major**, ready to upload as a WGSL
-    /// `mat4x4<f32>`. Depth maps to `0..1` (wgpu's convention).
+    /// `mat4x4<f32>`. Depth is *reversed* with an infinite far plane — the
+    /// stored value is `near / vz`, `1` at the near plane falling towards `0`
+    /// — the projection Blender's `projection::perspective_infinite` builds
+    /// (Lengyel, "Projection Matrix Tricks", GDC 2007).
+    ///
+    /// Reversed-Z exists for the depth buffer's precision: a fixed-point
+    /// depth distributed hyperbolically loses ~50 model units of resolution
+    /// at this scene's scale, which lets a box sitting *behind* the screen
+    /// quad of a model poke through it as a black patch. Storing `near / vz`
+    /// in a float32 buffer keeps the precision relative to the distance
+    /// instead — sub-millimetre here — and the compare flips to
+    /// GreaterEqual with a clear of 0 to match.
     pub fn view_projection(&self) -> [[f32; 4]; 4] {
-        let (near, far) = self.depth_range();
-        // x_clip = a * vx, y_clip = b * vy, w_clip = vz, and z_clip is affine
-        // in vz so that `near..far` lands on `0..1`.
+        let near = self.depth_range().0;
+        // x_clip = a * vx, y_clip = b * vy, w_clip = vz, and z_clip is the
+        // constant near: the perspective divide lands the depth on
+        // `near / vz`, exactly the reversed curve above. A constant row is
+        // as interpolable as any affine row — w_clip carries the division.
         let a = 1.0 / (self.tan_half * self.aspect);
         let b = 1.0 / self.tan_half;
-        let z_scale = far / (far - near);
-        let z_bias = -far * near / (far - near);
 
         let row = |axis: [f32; 3], gain: f32| -> [f32; 4] {
             // m = (p - center) * inv_radius, then dot with `axis` and offset
@@ -554,9 +568,7 @@ impl Framing {
         let x = row(self.right, a);
         let y = row(self.up, b);
         let w = row(self.forward, 1.0);
-        let zk = row(self.forward, z_scale);
-        // z is the same linear form as w, rescaled, plus the constant bias.
-        let z = [zk[0], zk[1], zk[2], zk[3] + z_bias];
+        let z = [0.0, 0.0, 0.0, near];
 
         // `[[f32; 4]; 4]` is indexed [row][column]; WGSL reads mat4x4 as four
         // consecutive column vectors, so transpose on the way out. The column
@@ -2363,11 +2375,14 @@ mod tests {
     }
 
     #[test]
-    fn the_depth_range_lands_on_zero_and_one() {
+    fn the_depth_range_lands_on_one_and_falls_towards_zero() {
         let framing = Camera::default().framing(cube().bounds, 1.0);
         let matrix = framing.view_projection();
         let (near, far) = framing.depth_range();
-        for (depth, expected) in [(near, 0.0f32), (far, 1.0f32)] {
+        // The reversed projection: `near` maps to exactly one, and depth
+        // falls towards zero as the distance grows — halving every time the
+        // distance doubles, since the stored value is `near / vz`.
+        for (depth, expected) in [(near, 1.0f32), (far, near / far)] {
             let unit = add(framing.eye, scale(framing.forward, depth));
             let p = from_unit(&framing, unit);
             let clip = mat_vec(&matrix, [p[0], p[1], p[2], 1.0]);
@@ -2376,6 +2391,19 @@ mod tests {
                 (ndc_z - expected).abs() < 1e-3,
                 "depth {depth} mapped to {ndc_z}, expected {expected}"
             );
+        }
+        // And it falls off monotonically: everything nearer the camera
+        // stores a larger depth, which is what the GreaterEqual compare
+        // relies on.
+        let mut previous = 1.1f32;
+        for step in [1, 2, 4, 8, 16, 32] {
+            let depth = near * step as f32;
+            let unit = add(framing.eye, scale(framing.forward, depth));
+            let p = from_unit(&framing, unit);
+            let clip = mat_vec(&matrix, [p[0], p[1], p[2], 1.0]);
+            let ndc_z = clip[2] / clip[3];
+            assert!(ndc_z < previous, "depth must fall with distance");
+            previous = ndc_z;
         }
     }
 

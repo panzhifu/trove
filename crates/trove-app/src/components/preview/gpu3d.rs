@@ -626,7 +626,12 @@ impl GpuRenderer {
                     // assets — then resolve by draw order, the same tie-break the
                     // CPU rasteriser's `<=` test gives, instead of per-pixel
                     // speckle.
-                    depth_compare: write.then_some(wgpu::CompareFunction::Always),
+                    // Reversed-Z: the depth grows towards the camera
+                    // (`near / vz`, `1` at the near plane), so nearer
+                    // fragments carry larger values and the compare flips
+                    // with them. Coplanar surfaces resolve by draw order —
+                    // the CPU rasteriser's own `<=` tie-break, mirrored.
+                    depth_compare: write.then_some(wgpu::CompareFunction::GreaterEqual),
                     stencil: wgpu::StencilState::default(),
                     bias: wgpu::DepthBiasState::default(),
                 })
@@ -1293,7 +1298,9 @@ impl GpuRenderer {
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                     view: depth_view,
                     depth_ops: Some(wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(1.0),
+                        // Reversed-Z clears to zero: "nothing drawn yet" is
+                        // the far end of the reversed range.
+                        load: wgpu::LoadOp::Clear(0.0),
                         store: wgpu::StoreOp::Store,
                     }),
                     stencil_ops: None,
@@ -1781,8 +1788,17 @@ mod tests {
             uploaded.cull_backfaces
         );
 
-        for zoom in [1.0, 0.5, 0.25, 0.12] {
+        for (yaw, pitch, zoom) in [
+            (0.62f32, 0.34f32, 1.0),
+            (0.0f32, 0.08f32, 0.35),
+            (3.14159, 0.08, 0.35),
+            (3.14159, 0.08, 0.2),
+            (0.0, 0.5, 0.3),
+            (0.35, 0.1, 0.18),
+        ] {
             let camera = render3d::Camera {
+                yaw,
+                pitch,
                 zoom,
                 ..render3d::Camera::default()
             };
@@ -1805,7 +1821,10 @@ mod tests {
                     HeightUniforms::default(),
                 )
                 .expect("a frame comes back");
-            dump_png(&format!("/tmp/trove-gpu-zoom-{zoom}.png"), &frame);
+            dump_png(
+                &format!("/tmp/trove-gpu-view-{yaw}-{pitch}-{zoom}.png"),
+                &frame,
+            );
         }
     }
 

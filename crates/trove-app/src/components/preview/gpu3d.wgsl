@@ -506,21 +506,23 @@ fn fs_backdrop(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32>
 @group(1) @binding(0) var edl_depth: texture_depth_multisampled_2d;
 @group(1) @binding(1) var edl_source: texture_2d<f32>;
 
+// Reversed-Z: drawn pixels store a depth above zero, the clear value is the
+// far end of the range.
 fn drew(coord: vec2<i32>) -> bool {
-    return textureLoad(edl_depth, coord, 0) < 1.0;
+    return textureLoad(edl_depth, coord, 0) > 0.0;
 }
 
-// The CPU keeps `-log2(1/z)`, which is `log2(w)` for view depth `w`. Depth is
-// affine in `1/w` (`ndc = z_scale + z_bias / w`), so the same value comes back
-// from the depth buffer with the two constants the host packs into `params2`.
-// Subtracting two of them gives the log of the ratio of their distances, in
-// the right order.
+// The CPU keeps `-log2(1/z)`, which is `log2(w)` for view depth `w`. The
+// reversed buffer stores `near / w`, so its own `-log2` is the CPU's value
+// shifted by the constant `log2(near)` — and the eye-dome lighting only ever
+// compares two of these, so the constant cancels and the raw `-log2` of the
+// stored depth lands on the same values the CPU works from.
 fn log_depth_at(coord: vec2<i32>) -> f32 {
-    let ndc = textureLoad(edl_depth, coord, 0);
-    if ndc >= 1.0 {
+    let depth = textureLoad(edl_depth, coord, 0);
+    if depth <= 0.0 {
         return 0.0;
     }
-    return log2(max(u.params2.w / (ndc - u.params2.z), 1e-6));
+    return -log2(depth);
 }
 
 // Whether the 3×3 neighbour at an offset drew something. Off the edge counts

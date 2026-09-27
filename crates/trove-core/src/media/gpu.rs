@@ -14,6 +14,7 @@
 //!   BGRA order the UI expects.
 
 use super::height_color::{HeightUniforms, RAMP_STOPS};
+use super::render3d;
 use super::render3d::{
     BG_BOTTOM, BG_TOP, EDL_STRENGTH, Framing, MATERIAL, MATERIAL_ROUGHNESS, POINT_RADIUS, VIGNETTE,
     model_space_lights,
@@ -53,10 +54,9 @@ pub struct Uniforms {
     /// host rides it through the basis once instead of the shader doing it
     /// per pixel.
     pub lights: [LightUniform; 4],
-    /// `x` = point sprite radius in pixels, `y` = eye-dome lighting strength.
-    /// `z` and `w` are the depth-to-log-depth constants (`z_scale`, `z_bias`)
-    /// the point-cloud post pass uses to rebuild view depth from the depth
-    /// buffer, so it can light the creases the CPU rasteriser lights.
+    /// `x` = point sprite radius in pixels, `y` = eye-dome lighting strength,
+    /// `z` = the near plane (the reversed depth is `near / vz`, which the
+    /// point-cloud post pass inverts with one division).
     pub params2: [f32; 4],
     /// Camera position in model space, so shading can work where the normals
     /// live; `w` unused.
@@ -81,12 +81,10 @@ impl Uniforms {
     /// Build the block for one frame.
     pub fn new(framing: &Framing, viewport: (u32, u32)) -> Self {
         let eye = framing.eye_in_model_space();
-        // Same constants `render3d`'s projection is built from: depth is affine
-        // in `1/w`, so these turn a depth-buffer value back into a view
-        // distance for the eye-dome lighting pass.
-        let (near, far) = framing.depth_range();
-        let z_scale = far / (far - near);
-        let z_bias = -far * near / (far - near);
+        // The reversed depth is `near / vz`, so a depth-buffer value turns
+        // back into a view distance with one division by the near plane —
+        // the constant the eye-dome pass reads out of `params2`.
+        let near = framing.depth_range().0;
         Self {
             view_proj: framing.view_projection(),
             material: [MATERIAL[0], MATERIAL[1], MATERIAL[2], 0.0],
@@ -101,7 +99,7 @@ impl Uniforms {
                 diffuse: [light.diffuse[0], light.diffuse[1], light.diffuse[2], 0.0],
                 specular: [light.specular[0], light.specular[1], light.specular[2], 0.0],
             }),
-            params2: [POINT_RADIUS, EDL_STRENGTH, z_scale, z_bias],
+            params2: [POINT_RADIUS, EDL_STRENGTH, near, 0.0],
             eye: [eye[0], eye[1], eye[2], 0.0],
             viewport: [viewport.0.max(1) as f32, viewport.1.max(1) as f32, 0.0, 0.0],
             background: [
@@ -350,14 +348,14 @@ mod tests {
         assert_eq!(uniforms.params, [MATERIAL_ROUGHNESS, 0.0, VIGNETTE, 0.0]);
         assert_eq!(uniforms.params2[0], POINT_RADIUS);
         assert_eq!(uniforms.params2[1], EDL_STRENGTH);
-        // The GPU post pass rebuilds view depth from the depth buffer with
-        // these two, so they have to invert the projection's own map
-        // `ndc = z_scale + z_bias / w`.
+        // The reversed depth stores `near / vz`, so the post pass rebuilds
+        // the view distance with one division by the near plane it finds in
+        // `params2.z`.
         let (near, far) = framing().depth_range();
         for distance in [near, (near + far) * 0.5, far] {
-            let ndc = uniforms.params2[2] + uniforms.params2[3] / distance;
-            let back = uniforms.params2[3] / (ndc - uniforms.params2[2]);
-            assert!((back - distance).abs() < 1e-4, "{distance} -> {back}");
+            let stored = near / distance;
+            let back = uniforms.params2[2] / stored;
+            assert!((back - distance).abs() < 1e-2, "{distance} -> {back}");
         }
         assert_eq!(uniforms.material[..3], MATERIAL);
         assert_eq!(uniforms.viewport[0], 320.0);
