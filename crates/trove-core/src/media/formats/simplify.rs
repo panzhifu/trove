@@ -643,6 +643,8 @@ fn optimal_position(q: &[f64; 10], p1: [f32; 3], p2: [f32; 3]) -> [f64; 4] {
 mod tests {
     use super::*;
 
+    /// A quad with two triangles, with normals: the smallest mesh a collapse
+    /// can be tested on.
     fn quad_mesh() -> Mesh {
         let positions = vec![
             [0.0, 0.0, 0.0],

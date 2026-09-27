@@ -55,6 +55,12 @@ struct Uniforms {
 };
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
+// The model's base-colour textures as one array, layer 0 white: a vertex
+// whose primitive has no texture points here, and "multiply by white" is
+// "do nothing". sRGB format, so the sample arrives linear like everything
+// else the shading multiplies.
+@group(0) @binding(1) var model_textures: texture_2d_array<f32>;
+@group(0) @binding(2) var model_sampler: sampler;
 
 // How far behind the red channel the green and blue ones start, matching
 // `height_color::BAND_PHASE_2` and `_3`.
@@ -193,6 +199,8 @@ struct ModelOut {
     // here, from the model-space position, so toggling the look costs a uniform
     // write rather than a vertex-buffer re-upload.
     @location(2) tint: vec3<f32>,
+    // u, v, and the texture layer the vertex samples; -1 when none.
+    @location(3) uv_layer: vec3<f32>,
 };
 
 @vertex
@@ -219,12 +227,14 @@ fn vs_model_colored(
     @location(0) position: vec3<f32>,
     @location(1) normal: vec3<f32>,
     @location(2) color: vec3<f32>,
+    @location(3) uv_layer: vec3<f32>,
 ) -> ModelOut {
     var out: ModelOut;
     out.clip = u.view_proj * vec4<f32>(position, 1.0);
     out.model_pos = position;
     out.normal = normal;
     out.tint = surface_color(position, normal, 0.0, 0.0, color);
+    out.uv_layer = uv_layer;
     return out;
 }
 
@@ -313,6 +323,36 @@ fn fs_model(in: ModelOut) -> @location(0) vec4<f32> {
     let energy = dot(spec_color, vec3<f32>(1.0 / 3.0));
 
     return vec4<f32>(encode(in.tint * diffuse * (1.0 - energy) + specular), 1.0);
+}
+
+// The coloured pipeline's fragment: the file's own colours — factor, vertex
+// attributes and now the base-colour texture, sampled sRGB and decoded by
+// the hardware like Blender's image textures — multiply together before the
+// lighting does. Layer -1 is the untextured vertex; it clamps to layer 0,
+// the white stand-in, and the multiply is inert.
+@fragment
+fn fs_model_textured(in: ModelOut) -> @location(0) vec4<f32> {
+    let geometric = normalize(in.normal);
+    let to_eye = normalize(u.eye.xyz - in.model_pos);
+    let n = select(-geometric, geometric, dot(geometric, to_eye) >= 0.0);
+
+    let diffuse = studio_diffuse(n);
+    let spec_color = fresnel_specular_color(n, to_eye);
+    let specular = studio_specular(n, to_eye) * spec_color;
+    let energy = dot(spec_color, vec3<f32>(1.0 / 3.0));
+
+    // Round, never truncate: the perspective interpolation of an exact 1.0
+    // can land at 0.9999, and a truncation would fall to the white layer.
+    let layer = i32(round(clamp(in.uv_layer.z, 0.0, 255.0)));
+    let texel = textureSampleLevel(
+        model_textures,
+        model_sampler,
+        in.uv_layer.xy,
+        layer,
+        0.0,
+    ).rgb;
+
+    return vec4<f32>(encode(in.tint * texel * diffuse * (1.0 - energy) + specular), 1.0);
 }
 
 // A point cloud is drawn one sprite per point, each a camera-facing square

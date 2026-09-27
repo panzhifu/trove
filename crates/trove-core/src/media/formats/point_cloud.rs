@@ -500,6 +500,7 @@ impl Octree {
             colors: gather(&self.colors, total, &indices),
             triangles: Vec::new(),
             bounds,
+            texture: None,
         }
     }
 
@@ -871,6 +872,7 @@ impl StreamingOctree {
             colors: gather(&self.colors, total, &indices),
             triangles: Vec::new(),
             bounds,
+            texture: None,
         }
     }
 
@@ -1039,7 +1041,6 @@ mod tests {
             let t = i as f32 * 0.0001;
             positions.push([t.fract(), (t * 7.0).fract(), (t * 13.0).fract()]);
         }
-
         let mesh = Mesh {
             positions: positions.clone(),
             normals: Vec::new(),
@@ -1047,6 +1048,7 @@ mod tests {
             triangles: Vec::new(),
             bounds: Bounds::empty(),
             fields: None,
+            texture: None,
         };
 
         let octree = Octree::from_point_cloud(&mesh).expect("octree builds");
@@ -1103,7 +1105,6 @@ mod tests {
             let t = i as f32 * 0.001;
             positions.push([t.fract() * 2.0 - 1.0, (t * 7.0).fract() * 2.0 - 1.0, -10.0]);
         }
-
         let mesh = Mesh {
             positions,
             normals: Vec::new(),
@@ -1111,6 +1112,7 @@ mod tests {
             triangles: Vec::new(),
             bounds: Bounds::empty(),
             fields: None,
+            texture: None,
         };
 
         let octree = Octree::from_point_cloud(&mesh).expect("octree builds");
@@ -1161,6 +1163,7 @@ mod tests {
             triangles: Vec::new(),
             bounds: Bounds::empty(),
             fields: None,
+            texture: None,
         };
         let behind_octree = Octree::from_point_cloud(&behind_mesh).expect("builds");
         let visible = behind_octree.query_frustum(&front_frustum, [0.0, 0.0, 0.0], usize::MAX);
@@ -1191,6 +1194,7 @@ mod tests {
             triangles: Vec::new(),
             bounds: Bounds::empty(),
             fields: None,
+            texture: None,
         };
         let octree = Octree::from_point_cloud(&mesh).expect("octree builds");
 

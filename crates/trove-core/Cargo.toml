@@ -45,7 +45,14 @@ resvg = { workspace = true }
 psd = { workspace = true }
 rawler = { workspace = true }
 jxl-oxide = { workspace = true }
-gltf = { workspace = true, features = ["KHR_materials_pbrSpecularGlossiness"] }
+# allow_empty_texture: `Texture::source` returns `Option` instead of
+# unwrapping — the validator is skipped on the fallback import path, so a
+# texture whose source index points past the image table must not panic.
+gltf = { workspace = true, features = [
+    "KHR_materials_pbrSpecularGlossiness",
+    "allow_empty_texture",
+    "extensions",
+] }
 # 0.26 pulls fs4 0.13 (rustix 0.38 -> 1.x), collapsing rustix/linux-raw-sys
 # and itertools 0.12 onto the versions the rest of the graph already uses.
 # Two API fixes were needed: `TopDocs::with_limit(..).order_by_score()` and

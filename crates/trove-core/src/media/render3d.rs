@@ -25,7 +25,7 @@
 //! while the three dim fills keep the form reading from every angle.
 
 use super::formats::point_cloud::Frustum;
-use super::formats::types::{Bounds, Mesh};
+use super::formats::types::{Bounds, Mesh, NO_TEXTURE, TextureData};
 use super::height_color::{HeightField, Sample};
 
 /// Vertical field of view used to frame a model, in degrees.
@@ -636,6 +636,11 @@ pub struct VertexData {
     /// the file's material or vertex-colour attributes. Empty otherwise, which
     /// puts the mesh on the plain pipeline and its flat material.
     pub colors: Vec<f32>,
+    /// Per-vertex `[u, v, layer]`, only when the mesh carries base-colour
+    /// textures: the UV to sample and which texture of the model's set to
+    /// sample. Empty otherwise. Layer `-1.0` marks a vertex with no texture,
+    /// which the shader answers with white.
+    pub tex: Vec<f32>,
     /// Triangle indices, or `None` when the mesh had to be expanded per face.
     pub indices: Option<Vec<u32>>,
     /// Vertices in the buffer, i.e. `vertices.len() / 6`.
@@ -648,6 +653,13 @@ impl VertexData {
 
     /// Bytes of one colour vertex: a `vec3<f32>`.
     pub const COLOR_STRIDE: u64 = 12;
+    /// Bytes of one `[u, v, layer]` texel-coordinate triple.
+    pub const TEX_STRIDE: u64 = 12;
+
+    /// The texture coordinates as bytes, ready for `Queue::write_buffer`.
+    pub fn tex_bytes(&self) -> Vec<u8> {
+        f32_bytes(&self.tex)
+    }
 
     /// Triangles that will be drawn.
     pub fn triangle_count(&self) -> usize {
@@ -721,6 +733,27 @@ pub fn vertex_data_with(mesh: &Mesh, flip_winding: bool) -> VertexData {
     if colored {
         colors.reserve(mesh.positions.len() * 3);
     }
+    // The same for the texture coordinates, with the slot flipped to the
+    // shader's "no texture means sample white" encoding.
+    let mut tex = Vec::new();
+    let textured = mesh.has_textures();
+    if textured {
+        tex.reserve(mesh.positions.len() * 3);
+    }
+    let tex_at = |index: usize| -> [f32; 3] {
+        let data = mesh.texture.as_ref().expect("textured");
+        let slot = data.slot.get(index).copied().unwrap_or(NO_TEXTURE);
+        let uv = data.uv.get(index).copied().unwrap_or([0.0, 0.0]);
+        [
+            uv[0],
+            uv[1],
+            if slot == NO_TEXTURE {
+                -1.0
+            } else {
+                slot as f32
+            },
+        ]
+    };
     if mesh.has_vertex_normals() {
         vertices.reserve(mesh.positions.len() * 6);
         for (index, (p, n)) in mesh.positions.iter().zip(mesh.normals.iter()).enumerate() {
@@ -732,6 +765,10 @@ pub fn vertex_data_with(mesh: &Mesh, flip_winding: bool) -> VertexData {
             if colored {
                 let c = base_color(mesh, index);
                 colors.extend_from_slice(&[c[0], c[1], c[2]]);
+            }
+            if textured {
+                let t = tex_at(index);
+                tex.extend_from_slice(&t);
             }
         }
         let mut indices = Vec::with_capacity(mesh.triangles.len() * 3);
@@ -745,6 +782,7 @@ pub fn vertex_data_with(mesh: &Mesh, flip_winding: bool) -> VertexData {
         VertexData {
             vertices,
             colors,
+            tex,
             indices: Some(indices),
             vertex_count: mesh.positions.len() as u32,
         }
@@ -773,12 +811,17 @@ pub fn vertex_data_with(mesh: &Mesh, flip_winding: bool) -> VertexData {
                     let c = base_color(mesh, source[slot] as usize);
                     colors.extend_from_slice(&[c[0], c[1], c[2]]);
                 }
+                if textured {
+                    let t = tex_at(source[slot] as usize);
+                    tex.extend_from_slice(&t);
+                }
             }
         }
         VertexData {
             vertex_count: (mesh.triangles.len() * 3) as u32,
             vertices,
             colors,
+            tex,
             indices: None,
         }
     }
@@ -965,6 +1008,7 @@ fn paint(
             width: w,
             height: h,
             framing,
+            texture: None,
         };
         paint_points(&mut target, mesh, point_radius, quality, options.height);
         return;
@@ -987,6 +1031,12 @@ fn paint(
     let lights = model_space_lights(&framing);
     let eye = framing.eye;
     let (near, _) = framing.depth_range();
+    // Textures paint only while the material switch is on and no field look
+    // owns the surface colour: the height look wins over the file's own
+    // materials, exactly as it wins over their colours.
+    let texture = (options.material_colors && mesh.has_textures())
+        .then(|| mesh.texture.as_deref())
+        .flatten();
     let vertex_count = mesh.positions.len();
     let gouraud = mesh.has_vertex_normals();
 
@@ -997,6 +1047,7 @@ fn paint(
             width: w,
             height: h,
             framing,
+            texture,
         };
 
         // Quality subsampling: render every `step`th triangle.  At
@@ -1037,6 +1088,12 @@ fn paint(
             // the whole triangle and lose the very tightness a highlight is.
             let (spec, spec_energy) = studio_specular(shaded_face, to_camera, &lights);
 
+            // One texture per face: a triangle belongs to one primitive, and
+            // a primitive carries one material. `NO_TEXTURE` falls out of the
+            // slot lookup naturally — no map answers at that index.
+            let face_slot = texture
+                .and_then(|t| t.slot.get(i0).copied())
+                .unwrap_or(NO_TEXTURE);
             let mut corners = [Vertex::default(); 3];
             for (slot, index) in [i0, i1, i2].into_iter().enumerate() {
                 let geometric = if gouraud {
@@ -1073,17 +1130,22 @@ fn paint(
                 for channel in &mut i {
                     *channel *= 1.0 - spec_energy;
                 }
+                let uv = texture
+                    .filter(|_| face_slot != NO_TEXTURE)
+                    .and_then(|t| t.uv.get(index).copied())
+                    .unwrap_or([0.0, 0.0]);
                 corners[slot] = Vertex {
                     p: view[index],
                     i,
                     c,
+                    uv,
                 };
             }
 
             let mut polygon = [Vertex::default(); 4];
             let count = clip_near(corners, near, &mut polygon);
             for k in 1..count.saturating_sub(1) {
-                target.triangle(polygon[0], polygon[k], polygon[k + 1], spec);
+                target.triangle(polygon[0], polygon[k], polygon[k + 1], spec, face_slot);
             }
         }
     }
@@ -1183,6 +1245,8 @@ struct Target<'a> {
     width: usize,
     height: usize,
     framing: Framing,
+    /// The mesh's texture set, when the material switch serves it.
+    texture: Option<&'a TextureData>,
 }
 
 impl Target<'_> {
@@ -1197,6 +1261,7 @@ impl Target<'_> {
             inv_z,
             i: v.i,
             c: v.c,
+            uv: v.uv,
         }
     }
 
@@ -1246,7 +1311,14 @@ impl Target<'_> {
     }
 
     /// Rasterise one projected triangle with an edge-function test.
-    fn triangle(&mut self, a: Vertex, b: Vertex, c: Vertex, spec: [f32; 3]) {
+    fn triangle(&mut self, a: Vertex, b: Vertex, c: Vertex, spec: [f32; 3], slot: u16) {
+        // The face's texture, if the model carries one at this slot. The
+        // no-texture marker is `u16::MAX`, which no map answers — the lookup
+        // falls out of range and the vertex colour stands alone.
+        let slot_texture = self
+            .texture
+            .as_ref()
+            .and_then(|t| t.maps.get(slot as usize));
         let (a, b, c) = (self.project(a), self.project(b), self.project(c));
         let area = edge(a.x, a.y, b.x, b.y, c.x, c.y);
         if area.abs() < 1e-9 {
@@ -1291,19 +1363,35 @@ impl Target<'_> {
                     w0 * a.i[1] + w1 * b.i[1] + w2 * c.i[1],
                     w0 * a.i[2] + w1 * b.i[2] + w2 * c.i[2],
                 ];
-                // The shading is scene-linear — the studio lights and the
-                // file's colours both are — so the display transform lands
-                // here, on the assembled pixel, where Blender's does.
+                // The texture coordinate is perspective-correct: a plain
+                // screen-space average of the corners' UVs would swim across
+                // the surface as the triangle leans away from the eye.
+                let (mut sr, mut sg, mut sb) = (
+                    w0 * a.c[0] + w1 * b.c[0] + w2 * c.c[0],
+                    w0 * a.c[1] + w1 * b.c[1] + w2 * c.c[1],
+                    w0 * a.c[2] + w1 * b.c[2] + w2 * c.c[2],
+                );
+                if let Some(map) = slot_texture {
+                    // Perspective-correct UV, then nearest-neighbour sample.
+                    let u =
+                        (w0 * a.uv[0] * a.inv_z + w1 * b.uv[0] * b.inv_z + w2 * c.uv[0] * c.inv_z)
+                            / inv_z;
+                    let v =
+                        (w0 * a.uv[1] * a.inv_z + w1 * b.uv[1] * b.inv_z + w2 * c.uv[1] * c.inv_z)
+                            / inv_z;
+                    let (tr, tg, tb) = map.sample(u, v);
+                    sr *= tr;
+                    sg *= tg;
+                    sb *= tb;
+                }
+                // The shading is scene-linear — the studio lights, the file's
+                // colours and the decoded texture all are — so the display
+                // transform lands here, on the assembled pixel, where
+                // Blender's does.
                 self.colors[index] = [
-                    encode_channel(
-                        (w0 * a.c[0] + w1 * b.c[0] + w2 * c.c[0]) * intensity[0] + spec[0],
-                    ),
-                    encode_channel(
-                        (w0 * a.c[1] + w1 * b.c[1] + w2 * c.c[1]) * intensity[1] + spec[1],
-                    ),
-                    encode_channel(
-                        (w0 * a.c[2] + w1 * b.c[2] + w2 * c.c[2]) * intensity[2] + spec[2],
-                    ),
+                    encode_channel(sr * intensity[0] + spec[0]),
+                    encode_channel(sg * intensity[1] + spec[1]),
+                    encode_channel(sb * intensity[2] + spec[2]),
                 ];
             }
         }
@@ -1322,6 +1410,8 @@ struct Vertex {
     i: [f32; 3],
     /// Base surface colour: the material or a height band.
     c: [f32; 3],
+    /// Texture coordinate, carried for the textured path.
+    uv: [f32; 2],
 }
 
 /// A projected vertex.
@@ -1333,6 +1423,7 @@ struct ScreenVertex {
     inv_z: f32,
     i: [f32; 3],
     c: [f32; 3],
+    uv: [f32; 2],
 }
 
 /// Twice the signed area of the triangle `(a, b, p)`; the sign says which side
@@ -1358,6 +1449,10 @@ fn clip_near(triangle: [Vertex; 3], near: f32, out: &mut [Vertex; 4]) -> usize {
             let t = (near - current.p[2]) / (next.p[2] - current.p[2]);
             out[count] = Vertex {
                 p: lerp3(current.p, next.p, t),
+                uv: [
+                    current.uv[0] + (next.uv[0] - current.uv[0]) * t,
+                    current.uv[1] + (next.uv[1] - current.uv[1]) * t,
+                ],
                 i: [
                     current.i[0] + (next.i[0] - current.i[0]) * t,
                     current.i[1] + (next.i[1] - current.i[1]) * t,

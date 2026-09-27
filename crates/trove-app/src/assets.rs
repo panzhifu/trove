@@ -27,6 +27,8 @@ use gpui_kit::{AssetSource, Result, SharedString};
 icon_assets!(
     pub(crate) ExtraIcons,
     [
+        // The model viewport's material switch: the file's own colours.
+        Paintbrush,
         // The video player, the preview toolbar and the title bar.
         Volume1,
         Volume2,

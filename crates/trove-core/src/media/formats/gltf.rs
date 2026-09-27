@@ -16,24 +16,43 @@
 use std::collections::HashSet;
 use std::path::Path;
 
-use super::types::Mesh;
+use image::GenericImageView as _;
+
+use super::types::{Mesh, NO_TEXTURE, TextureData, TextureMap, resize_rgba};
 
 /// Load a glTF or GLB file. Buffers are resolved relative to the file.
+///
+/// Images are decoded here rather than by the gltf crate's own import, whose
+/// decoder only carries png and jpeg — a Sketchfab model's webp textures
+/// would fail the whole import and leave the model flat.
 pub fn load_gltf(path: &Path) -> Result<Mesh, String> {
-    let (document, buffers, images) = match gltf::import(path) {
-        Ok(imported) => (imported.0, imported.1, imported.2),
+    let (document, buffers) = match gltf::import(path) {
+        Ok(imported) => (imported.0, imported.1),
         Err(error) => fallback_import(path, error)?,
     };
-    // Texture handle -> image index, resolved once: a material's texture info
-    // carries only its position in this table.
-    let texture_images: Vec<usize> = document
+    // Every image the document's textures reference becomes one texture slot,
+    // decoded once and shared (two materials on one image share the slot).
+    // The per-texture slot table comes out alongside: a texture whose source
+    // points past the image table — possible on the validation-free fallback
+    // path — maps to no slot rather than stopping the parse.
+    // Slots are the document image order — `decode_images` walks exactly
+    // that — so a texture names its image index, capped at the table.
+    let maps = decode_images(&document, &buffers, path);
+    let slot_of_texture: Vec<u16> = document
         .textures()
-        .map(|texture| texture.source().index())
+        .map(|texture| {
+            texture_source_index(&texture)
+                .and_then(|index| {
+                    (index < maps.len()).then(|| index.min(NO_TEXTURE as usize - 1) as u16)
+                })
+                .unwrap_or(NO_TEXTURE)
+        })
         .collect();
 
     let mut builder = Builder::default();
+    builder.textures = maps;
     for node in root_nodes(&document) {
-        builder.add_node(&node, IDENTITY, &buffers, &images, &texture_images);
+        builder.add_node(&node, IDENTITY, &buffers, &slot_of_texture);
     }
     builder.finish()
 }
@@ -52,14 +71,7 @@ pub fn load_gltf(path: &Path) -> Result<Mesh, String> {
 fn fallback_import(
     path: &Path,
     original: gltf::Error,
-) -> Result<
-    (
-        gltf::Document,
-        Vec<gltf::buffer::Data>,
-        Vec<gltf::image::Data>,
-    ),
-    String,
-> {
+) -> Result<(gltf::Document, Vec<gltf::buffer::Data>), String> {
     let parsed = std::fs::read(path)
         .map_err(|e| format!("failed to load glTF: {e}"))
         .and_then(|bytes| {
@@ -70,22 +82,45 @@ fn fallback_import(
         Ok(gltf) => {
             let buffers = gltf::import_buffers(&gltf.document, Some(path), gltf.blob)
                 .map_err(|e| format!("failed to load glTF: {e}"))?;
-            // Best-effort: the images only ever feed a textured primitive's
-            // average colour, and a decode failure costs that colour, not the
-            // model the first attempt could not open at all.
-            let images =
-                gltf::import_images(&gltf.document, Some(path), &buffers).unwrap_or_default();
             tracing::info!(
                 path = %path.display(),
                 %original,
                 "glTF imported without validation"
             );
-            Ok((gltf.document, buffers, images))
+            Ok((gltf.document, buffers))
         }
         // The fallback got no further than the first attempt did; the error
         // that named the unsupported extension is the one worth keeping.
         Err(_) => Err(format!("failed to load glTF: {original}")),
     }
+}
+
+/// Decode every image the document declares into a texture slot, in document
+/// order. A decode failure costs that image its slot, never the model.
+fn decode_images(
+    document: &gltf::Document,
+    buffers: &[gltf::buffer::Data],
+    path: &Path,
+) -> Vec<TextureMap> {
+    document
+        .images()
+        .filter_map(|image| {
+            let bytes = match image.source() {
+                gltf::image::Source::View { view, .. } => {
+                    let buffer = buffers.get(view.buffer().index())?;
+                    let start = view.offset();
+                    Some(buffer[start..start + view.length()].to_vec())
+                }
+                gltf::image::Source::Uri { uri, .. } => {
+                    std::fs::read(path.parent()?.join(uri)).ok()
+                }
+            }?;
+            let decoded = image::load_from_memory(&bytes).ok()?;
+            let (width, height) = decoded.dimensions();
+            let rgba = decoded.to_rgba8().into_raw();
+            Some(finish_texture(rgba, width, height))
+        })
+        .collect()
 }
 
 /// The nodes the default scene draws — or, for a document that names no
@@ -128,6 +163,13 @@ struct Builder {
     colors: Vec<[f32; 3]>,
     /// Some vertex so far came without a material colour.
     colors_incomplete: bool,
+    /// The decoded base-colour textures, in slot order; empty when the
+    /// document carries none.
+    textures: Vec<TextureMap>,
+    /// Per-vertex UV, parallel to `positions`.
+    uv: Vec<[f32; 2]>,
+    /// Per-vertex texture slot, parallel to `positions`.
+    slots: Vec<u16>,
     /// Vertices of `POINTS` primitives. Used only when the document has no
     /// triangles at all: a mesh is either a surface or a cloud.
     points: Vec<[f32; 3]>,
@@ -140,8 +182,7 @@ impl Builder {
         node: &gltf::Node<'_>,
         parent: [[f32; 4]; 4],
         buffers: &[gltf::buffer::Data],
-        images: &[gltf::image::Data],
-        texture_images: &[usize],
+        slot_of_texture: &[u16],
     ) {
         // A node's placement is its own transform ON TOP OF every ancestor's:
         // the walk composes them, so a part nested under a rotated, scaled
@@ -151,11 +192,11 @@ impl Builder {
         let combined = mul4(parent, node.transform().matrix());
         if let Some(mesh) = node.mesh() {
             for primitive in mesh.primitives() {
-                self.add_primitive(&primitive, combined, buffers, images, texture_images);
+                self.add_primitive(&primitive, combined, buffers, slot_of_texture);
             }
         }
         for child in node.children() {
-            self.add_node(&child, combined, buffers, images, texture_images);
+            self.add_node(&child, combined, buffers, slot_of_texture);
         }
     }
 
@@ -164,8 +205,7 @@ impl Builder {
         primitive: &gltf::Primitive<'_>,
         transform: [[f32; 4]; 4],
         buffers: &[gltf::buffer::Data],
-        images: &[gltf::image::Data],
-        texture_images: &[usize],
+        slot_of_texture: &[u16],
     ) {
         let reader = primitive.reader(|buffer| buffers.get(buffer.index()).map(|data| &data[..]));
         let Some(positions) = reader.read_positions() else {
@@ -207,17 +247,10 @@ impl Builder {
 
         // The material colour each corner is painted with: the `COLOR_0`
         // attribute times the primitive's base colour factor, per the glTF
-        // spec — the factor multiplies everything the material draws. A
-        // primitive with neither attribute nor a non-default factor opts out,
-        // which is what drops the whole set when the model mixes the two.
-        // What the primitive is painted with. A specular-glossiness material
-        // has no metallic-roughness block — the crate hands back the default
-        // for it — so its diffuse is the colour to read when the extension is
-        // there. And a base-colour *texture* paints from its image: the flat
-        // renderer cannot show the texture, but its average colour is a fair
-        // stand-in, and without it the one textured part of an otherwise
-        // material-coloured model would drag the whole set of colours down as
-        // incomplete.
+        // spec — the factor multiplies everything the material draws, the
+        // texture included. A specular-glossiness material has no
+        // metallic-roughness block — the crate hands back the default for it —
+        // so its diffuse is the colour to read when the extension is there.
         let material = primitive.material();
         let base_texture = material
             .pbr_metallic_roughness()
@@ -227,20 +260,10 @@ impl Builder {
                     .pbr_specular_glossiness()
                     .and_then(|sg| sg.diffuse_texture())
             });
-        let factor = match base_texture {
-            Some(info) => texture_images
-                .get(info.texture().index())
-                .and_then(|image| images.get(*image))
-                .map(|rgb| {
-                    let [r, g, b] = average_rgb(rgb);
-                    [r, g, b, 1.0]
-                })
-                .unwrap_or([1.0, 1.0, 1.0, 1.0]),
-            None => material
-                .pbr_specular_glossiness()
-                .map(|sg| sg.diffuse_factor())
-                .unwrap_or_else(|| material.pbr_metallic_roughness().base_color_factor()),
-        };
+        let factor = material
+            .pbr_specular_glossiness()
+            .map(|sg| sg.diffuse_factor())
+            .unwrap_or_else(|| material.pbr_metallic_roughness().base_color_factor());
         match reader.read_colors(0) {
             Some(colors) => {
                 for color in colors.into_rgb_f32() {
@@ -252,7 +275,11 @@ impl Builder {
                 }
                 debug_assert_eq!(self.colors.len() - base as usize, count);
             }
-            None if factor[..3] != [1.0, 1.0, 1.0] => {
+            // A textured primitive's texture carries its colour, so white is
+            // the multiply that leaves it alone — the colour set may not break
+            // here, or the model's one textured part would drag every colour
+            // down as incomplete and the texture would never be sampled.
+            None if base_texture.is_some() || factor[..3] != [1.0, 1.0, 1.0] => {
                 self.colors.extend(std::iter::repeat_n(
                     [factor[0], factor[1], factor[2]],
                     count,
@@ -265,6 +292,33 @@ impl Builder {
             }
         }
 
+        // The texture this primitive samples, and the UV it samples with. A
+        // primitive with neither carries the no-texture marker — the arrays
+        // stay parallel to the positions either way.
+        let slot = base_texture
+            .map(|info| {
+                slot_of_texture
+                    .get(info.texture().index())
+                    .copied()
+                    .unwrap_or(NO_TEXTURE)
+            })
+            .unwrap_or(NO_TEXTURE);
+        match reader.read_tex_coords(0) {
+            Some(uv) => {
+                for uv in uv.into_f32() {
+                    self.uv.push(uv);
+                    self.slots.push(slot);
+                }
+            }
+            None => {
+                self.uv.extend(std::iter::repeat_n([0.0, 0.0], count));
+                self.slots.extend(std::iter::repeat_n(NO_TEXTURE, count));
+            }
+        }
+
+        if std::env::var_os("TROVE_DEBUG_SLOTS").is_some() {
+            eprintln!("prim base={base} count={count} slot={slot}");
+        }
         let indices: Vec<u32> = match reader.read_indices() {
             Some(indices) => indices.into_u32().collect(),
             None => (0..(self.positions.len() - base as usize) as u32).collect(),
@@ -288,8 +342,16 @@ impl Builder {
             } else {
                 Vec::new()
             };
-            return Mesh::finish(self.positions, normals, colors, self.triangles)
-                .ok_or_else(|| "the glTF file contains no drawable geometry".to_string());
+            let mut mesh = Mesh::finish(self.positions, normals, colors, self.triangles)
+                .ok_or_else(|| "the glTF file contains no drawable geometry".to_string())?;
+            if !self.textures.is_empty() && self.uv.len() == mesh.positions.len() {
+                mesh.texture = Some(Box::new(TextureData {
+                    uv: self.uv,
+                    slot: self.slots,
+                    maps: self.textures,
+                }));
+            }
+            return Ok(mesh);
         }
         // No triangles: a `POINTS` document is a cloud, and the renderers
         // already know how to draw one.
@@ -335,48 +397,45 @@ fn triangles_of(mode: gltf::mesh::Mode, indices: &[u32]) -> Vec<[u32; 3]> {
     triangles
 }
 
-/// The average colour of a decoded image, sampled on a coarse grid so a
-/// 2048-pixel texture costs a few thousand reads. The renderer paints flat
-/// colours, and this is the one honest flat colour a texture has.
-fn average_rgb(image: &gltf::image::Data) -> [f32; 3] {
-    let channels = match image.format {
-        gltf::image::Format::R8G8B8 => 3,
-        _ => 4,
-    };
-    let (width, height) = (image.width.max(1), image.height.max(1));
-    // Cap the sample grid at 64×64 however large the image is.
-    let (step_x, step_y) = ((width / 64).max(1), (height / 64).max(1));
-    let mut sum = [0.0f64; 3];
-    let mut count = 0u64;
-    let mut y = 0;
-    while y < height {
-        let mut x = 0;
-        while x < width {
-            let at = ((y * width + x) as usize) * channels;
-            let px = &image.pixels[at..at + 3];
-            sum[0] += px[0] as f64;
-            sum[1] += px[1] as f64;
-            sum[2] += px[2] as f64;
-            count += 1;
-            x += step_x;
-        }
-        y += step_y;
-    }
-    if count == 0 {
-        return [1.0, 1.0, 1.0];
-    }
-    let (r, g, b) = (
-        sum[0] / count as f64,
-        sum[1] / count as f64,
-        sum[2] / count as f64,
-    );
-    // Into the 0..=1 range the vertex colours live in; sRGB bytes into linear
-    // would be more correct, but the flat renderer shades in this same space
-    // either way.
-    [(r / 255.0) as f32, (g / 255.0) as f32, (b / 255.0) as f32]
+/// The longest edge a decoded texture may keep: a preview does not need the
+/// 4K original, and the CPU renderer holds the decoded pixels in memory.
+const TEXTURE_MAX_EDGE: u32 = 1024;
+
+/// The document image a texture names: the standard `source` field, falling
+/// back to `EXT_texture_webp`, whose source lives in the extension block the
+/// gltf crate lists but does not resolve. Sketchfab exports lean on it.
+fn texture_source_index(texture: &gltf::Texture<'_>) -> Option<usize> {
+    texture.source().map(|image| image.index()).or_else(|| {
+        let value = texture
+            .extensions()?
+            .get("EXT_texture_webp")?
+            .get("source")?;
+        value.as_u64().map(|index| index as usize)
+    })
 }
 
-/// Apply a composed node transform to a point. The matrix is glTF's own
+/// Cap a decoded image at the texture edge limit: a preview does not need
+/// the 4K original, and the CPU renderer holds the decoded pixels in memory.
+fn finish_texture(rgba: Vec<u8>, width: u32, height: u32) -> TextureMap {
+    let longest = width.max(height);
+    if longest <= TEXTURE_MAX_EDGE {
+        return TextureMap {
+            rgba,
+            width,
+            height,
+        };
+    }
+    let scale = TEXTURE_MAX_EDGE as f32 / longest as f32;
+    let tw = ((width as f32 * scale).round() as u32).max(1);
+    let th = ((height as f32 * scale).round() as u32).max(1);
+    TextureMap {
+        rgba: resize_rgba(&rgba, width, height, tw, th),
+        width: tw,
+        height: th,
+    }
+}
+
+/// Apply a composed node transform/// Apply a composed node transform to a point. The matrix is glTF's own
 /// column-major layout: `m[column][row]`, translation in the last column.
 fn transform_point(m: [[f32; 4]; 4], point: [f32; 3]) -> [f32; 3] {
     [

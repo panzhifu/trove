@@ -137,6 +137,113 @@ impl CloudFields {
 
 /// Usable geometry in model space: a triangle mesh, or a point cloud when the
 /// file carries no faces.
+/// One decoded base-colour texture: RGBA8 bytes, sRGB-encoded, the layout
+/// image decoders hand over and texture samplers expect.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct TextureMap {
+    pub rgba: Vec<u8>,
+    pub width: u32,
+    pub height: u32,
+}
+
+/// The texture side of a mesh's materials, when the file carries any: the
+/// decoded base-colour textures, the per-vertex UV that reads them, and the
+/// slot each vertex samples. Boxed because a mesh without textures — most
+/// files — should not pay for three empty `Vec`s inside every geometry the
+/// renderers hand around.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct TextureData {
+    /// Per-vertex UV, parallel to `positions`.
+    pub uv: Vec<[f32; 2]>,
+    /// Per-vertex texture slot, parallel to `positions`. [`NO_TEXTURE`]
+    /// marks a vertex whose primitive carries no base-colour texture.
+    pub slot: Vec<u16>,
+    /// The decoded textures, in slot order.
+    pub maps: Vec<TextureMap>,
+}
+
+/// The slot value a vertex with no base-colour texture carries.
+pub const NO_TEXTURE: u16 = u16::MAX;
+
+/// Box-filter an RGBA8 image to new dimensions: each target pixel averages
+/// the source pixels its cell covers, so shrinking keeps the average colour
+/// rather than sampling a stray one. Same dimensions in and out is a copy.
+pub fn resize_rgba(rgba: &[u8], width: u32, height: u32, tw: u32, th: u32) -> Vec<u8> {
+    if (width, height) == (tw, th) || width == 0 || height == 0 || tw == 0 || th == 0 {
+        return rgba.to_vec();
+    }
+    let (w, h) = (width as usize, height as usize);
+    let (tw, th) = (tw as usize, th as usize);
+    let mut out = vec![0u8; tw * th * 4];
+    for ty in 0..th {
+        let sy0 = ty * h / th;
+        let sy1 = ((ty + 1) * h / th).max(sy0 + 1).min(h);
+        for tx in 0..tw {
+            let sx0 = tx * w / tw;
+            let sx1 = ((tx + 1) * w / tw).max(sx0 + 1).min(w);
+            let (mut r, mut g, mut b, mut a) = (0u32, 0u32, 0u32, 0u32);
+            let mut count = 0u32;
+            for sy in sy0..sy1 {
+                for sx in sx0..sx1 {
+                    let at = (sy * w + sx) * 4;
+                    r += rgba[at] as u32;
+                    g += rgba[at + 1] as u32;
+                    b += rgba[at + 2] as u32;
+                    a += rgba[at + 3] as u32;
+                    count += 1;
+                }
+            }
+            let at = (ty * tw + tx) * 4;
+            out[at] = (r / count) as u8;
+            out[at + 1] = (g / count) as u8;
+            out[at + 2] = (b / count) as u8;
+            out[at + 3] = (a / count) as u8;
+        }
+    }
+    out
+}
+
+impl TextureMap {
+    /// Sample the texture at UV `(u, v)` and decode to scene-linear.
+    ///
+    /// glTF's defaults all round: the wrapping repeats (`fract`), the origin
+    /// is the image's top-left, and the lookup is nearest-neighbour — the
+    /// preview's software path pays per pixel, and at thumbnail sizes the
+    /// difference from bilinear is a rounding error.
+    pub fn sample(&self, u: f32, v: f32) -> (f32, f32, f32) {
+        let (w, h) = (self.width.max(1) as usize, self.height.max(1) as usize);
+        let x = (u.rem_euclid(1.0) * w as f32) as usize % w;
+        let y = (v.rem_euclid(1.0) * h as f32) as usize % h;
+        let at = (y * w + x) * 4;
+        let px = &self.rgba[at..at + 3];
+        let lut = decode_lut();
+        (
+            lut[px[0] as usize],
+            lut[px[1] as usize],
+            lut[px[2] as usize],
+        )
+    }
+}
+
+/// sRGB byte → scene-linear, as a 256-entry table: the texture bytes are
+/// display-encoded, the shading is linear, and the conversion sits between —
+/// the same transform the display step runs in reverse.
+fn decode_lut() -> &'static [f32; 256] {
+    static LUT: std::sync::OnceLock<[f32; 256]> = std::sync::OnceLock::new();
+    LUT.get_or_init(|| {
+        let mut table = [0f32; 256];
+        for (entry, value) in table.iter_mut().enumerate() {
+            let x = entry as f32 / 255.0;
+            *value = if x <= 0.04045 {
+                x / 12.92
+            } else {
+                ((x + 0.055) / 1.055).powf(2.4)
+            };
+        }
+        table
+    })
+}
+
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Mesh {
     pub positions: Vec<[f32; 3]>,
@@ -153,6 +260,8 @@ pub struct Mesh {
     /// without them — which is most files — should not pay for two empty `Vec`s
     /// inside every geometry the renderers hand around.
     pub fields: Option<Box<CloudFields>>,
+    /// Base-colour texture mapping, when the file carries one.
+    pub texture: Option<Box<TextureData>>,
 }
 
 impl Mesh {
@@ -170,6 +279,13 @@ impl Mesh {
     /// rasterise, so the renderers draw one sprite per vertex.
     pub fn is_point_cloud(&self) -> bool {
         self.triangles.is_empty() && !self.positions.is_empty()
+    }
+
+    /// Whether the mesh carries usable base-colour textures: a texture table
+    /// plus a UV per vertex, lining up with `positions`.
+    pub fn has_textures(&self) -> bool {
+        matches!(&self.texture, Some(t)
+            if !t.maps.is_empty() && t.uv.len() == self.positions.len())
     }
 
     /// What the frame-size heuristics count: triangles for a mesh, points for
@@ -399,6 +515,7 @@ impl Mesh {
             triangles,
             bounds,
             fields: (!fields.is_empty()).then(|| Box::new(fields)),
+            texture: None,
         })
     }
 }

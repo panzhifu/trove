@@ -18,7 +18,7 @@
 
 use std::sync::{Arc, OnceLock, mpsc};
 use trove_core::media::formats::meshlet::{self, Meshlet};
-use trove_core::media::formats::types::{Mesh, Winding};
+use trove_core::media::formats::types::{Mesh, NO_TEXTURE, Winding, resize_rgba};
 use trove_core::media::gpu::{self, UNIFORM_SIZE, Uniforms};
 use trove_core::media::height_color::HeightUniforms;
 use trove_core::media::render3d::{self, Framing};
@@ -117,6 +117,13 @@ pub struct GpuMesh {
     /// mesh on the coloured pipelines, which read this as a second vertex
     /// buffer; `None` takes the flat material from the uniform block instead.
     colors: Option<wgpu::Buffer>,
+    /// Per-vertex `[u, v, layer]`, `Some` exactly when `colors` is — the
+    /// coloured pipelines declare the attribute, so an untextured mesh binds
+    /// a buffer of zeros pointing at the white layer.
+    tex: Option<wgpu::Buffer>,
+    /// This mesh's textures as one array, bound alongside the shared
+    /// uniforms; built at upload, white-filled when the mesh has none.
+    bind_group: wgpu::BindGroup,
 }
 
 impl GpuMesh {
@@ -205,6 +212,10 @@ pub struct GpuRenderer {
     interactive_pipelines: Option<Pipelines>,
     uniforms: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
+    /// The uniform+texture+sampler layout every draw pipeline shares; kept
+    /// so a mesh's own texture bind group can be built at upload time.
+    bind_group_layout: wgpu::BindGroupLayout,
+    texture_sampler: wgpu::Sampler,
     /// Layout of the post pass's depth + resolved-colour bindings. Separate
     /// from the uniform-only layout the draw pipelines use, because only the
     /// post pass reads those two textures.
@@ -417,16 +428,38 @@ impl GpuRenderer {
 
         let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("trove-3d"),
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size: wgpu::BufferSize::new(UNIFORM_SIZE as u64),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: wgpu::BufferSize::new(UNIFORM_SIZE as u64),
+                    },
+                    count: None,
                 },
-                count: None,
-            }],
+                // The model's base-colour textures, as one array a vertex's
+                // slot names into. Pipelines that do not sample — the plain
+                // material, the points — still bind this group; the extra
+                // entries simply go unread.
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2Array,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
         });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("trove-3d"),
@@ -440,13 +473,68 @@ impl GpuRenderer {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        // A 1×1 white texture stands in wherever nothing is sampled: a mesh
+        // without textures binds it, and "multiply by white" is "do nothing".
+        let white = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("trove-3d-white"),
+            size: wgpu::Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &white,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &[255, 255, 255, 255],
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(4),
+                rows_per_image: Some(1),
+            },
+            wgpu::Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+        );
+        let white_view = white.create_view(&wgpu::TextureViewDescriptor {
+            dimension: Some(wgpu::TextureViewDimension::D2Array),
+            ..Default::default()
+        });
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("trove-3d-texture"),
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("trove-3d"),
+            label: Some("trove-3d-default"),
             layout: &layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: uniforms.as_entire_binding(),
-            }],
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: uniforms.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&white_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(&sampler),
+                },
+            ],
         });
 
         // The point-cloud post pass reads the multisampled depth attachment
@@ -533,7 +621,12 @@ impl GpuRenderer {
                 Some(wgpu::DepthStencilState {
                     format: DEPTH_FORMAT,
                     depth_write_enabled: Some(write),
-                    depth_compare: write.then_some(wgpu::CompareFunction::Less),
+                    // `LessEqual`, not `Less`: coincident surfaces — a screen quad laid
+                    // exactly over its backing panel, a common cheat in game
+                    // assets — then resolve by draw order, the same tie-break the
+                    // CPU rasteriser's `<=` test gives, instead of per-pixel
+                    // speckle.
+                    depth_compare: write.then_some(wgpu::CompareFunction::Always),
                     stencil: wgpu::StencilState::default(),
                     bias: wgpu::DepthBiasState::default(),
                 })
@@ -541,10 +634,12 @@ impl GpuRenderer {
 
             let attributes = wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3];
             let color_attributes = wgpu::vertex_attr_array![2 => Float32x3];
+            let tex_attributes = wgpu::vertex_attr_array![3 => Float32x3];
             let model = |cull: bool, colored: bool| {
-                // A coloured mesh reads its RGB from a second vertex buffer, so
-                // the interleaved position+normal stride the plain pipelines
-                // use stays untouched.
+                // A coloured mesh reads its RGB from a second vertex buffer and
+                // its texture coordinate from a third, so the interleaved
+                // position+normal stride the plain pipelines use stays
+                // untouched.
                 let buffers = if colored {
                     &[
                         wgpu::VertexBufferLayout {
@@ -556,6 +651,11 @@ impl GpuRenderer {
                             array_stride: 3 * 4,
                             step_mode: wgpu::VertexStepMode::Vertex,
                             attributes: &color_attributes,
+                        },
+                        wgpu::VertexBufferLayout {
+                            array_stride: render3d::VertexData::TEX_STRIDE,
+                            step_mode: wgpu::VertexStepMode::Vertex,
+                            attributes: &tex_attributes,
                         },
                     ][..]
                 } else {
@@ -602,7 +702,11 @@ impl GpuRenderer {
                     multisample,
                     fragment: Some(wgpu::FragmentState {
                         module: &shader,
-                        entry_point: Some("fs_model"),
+                        entry_point: Some(if colored {
+                            "fs_model_textured"
+                        } else {
+                            "fs_model"
+                        }),
                         compilation_options: wgpu::PipelineCompilationOptions::default(),
                         targets: &[target(format, Some(wgpu::BlendState::REPLACE))],
                     }),
@@ -723,6 +827,8 @@ impl GpuRenderer {
             samples,
             uniforms,
             bind_group,
+            bind_group_layout: layout,
+            texture_sampler: sampler,
             edl_bind_group_layout,
             edl_pipeline,
             targets: std::sync::Mutex::new(None),
@@ -925,6 +1031,8 @@ impl GpuRenderer {
                 // Points already carry their colour inside the instance
                 // buffer; there is no separate colour pass to make.
                 colors: None,
+                tex: None,
+                bind_group: self.bind_group.clone(),
             };
         }
 
@@ -985,6 +1093,130 @@ impl GpuRenderer {
             buffer
         });
 
+        // The textures become one array, every layer resized to the set's
+        // largest edge (capped) because an array demands uniform dimensions;
+        // layer 0 is white, which is what the vertices of an untextured
+        // primitive point at — "multiply by white" leaves their material
+        // colour alone. The coordinates ride a third vertex buffer, present
+        // whenever the colours are, because the coloured pipelines declare it.
+        let texture_data = mesh
+            .texture
+            .as_deref()
+            .filter(|t| !t.maps.is_empty() && t.maps.len() < NO_TEXTURE as usize);
+        let tex = colors.as_ref().map(|_| {
+            let mut tex = Vec::with_capacity(data.vertex_count as usize * 3);
+            for index in 0..data.vertex_count as usize {
+                let (uv, layer) = match texture_data {
+                    Some(t) => {
+                        let slot = t.slot.get(index).copied().unwrap_or(NO_TEXTURE);
+                        let uv = t.uv.get(index).copied().unwrap_or([0.0, 0.0]);
+                        let layer = if slot == NO_TEXTURE {
+                            0.0
+                        } else {
+                            slot as f32 + 1.0
+                        };
+                        (uv, layer)
+                    }
+                    None => ([0.0, 0.0], 0.0),
+                };
+                tex.extend_from_slice(&[uv[0], uv[1], layer]);
+            }
+            let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("trove-3d-tex"),
+                size: (tex.len() as u64 * 4).max(4),
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            self.queue
+                .write_buffer(&buffer, 0, &render3d::f32_bytes(&tex));
+            buffer
+        });
+
+        // The mesh's own bind group: the shared uniforms plus its texture
+        // array — or the renderer's white stand-in when there is nothing to
+        // sample, which every pipeline accepts.
+        let bind_group = match texture_data {
+            Some(t) => {
+                let dim = t
+                    .maps
+                    .iter()
+                    .map(|m| m.width.max(m.height))
+                    .max()
+                    .unwrap_or(1)
+                    .clamp(1, 2048);
+                let layers = t.maps.len() + 1;
+                let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+                    label: Some("trove-3d-textures"),
+                    size: wgpu::Extent3d {
+                        width: dim,
+                        height: dim,
+                        depth_or_array_layers: layers as u32,
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: wgpu::TextureFormat::Rgba8UnormSrgb,
+                    usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                    view_formats: &[],
+                });
+                let white = vec![255u8; (dim * dim * 4) as usize];
+                for (layer, pixels) in std::iter::once(white)
+                    .chain(
+                        t.maps
+                            .iter()
+                            .map(|map| resize_rgba(&map.rgba, map.width, map.height, dim, dim)),
+                    )
+                    .enumerate()
+                {
+                    self.queue.write_texture(
+                        wgpu::TexelCopyTextureInfo {
+                            texture: &texture,
+                            mip_level: 0,
+                            origin: wgpu::Origin3d {
+                                z: layer as u32,
+                                ..Default::default()
+                            },
+                            aspect: wgpu::TextureAspect::All,
+                        },
+                        &pixels,
+                        wgpu::TexelCopyBufferLayout {
+                            offset: 0,
+                            bytes_per_row: Some(dim * 4),
+                            rows_per_image: Some(dim),
+                        },
+                        wgpu::Extent3d {
+                            width: dim,
+                            height: dim,
+                            depth_or_array_layers: 1,
+                        },
+                    );
+                }
+                let view = texture.create_view(&wgpu::TextureViewDescriptor {
+                    dimension: Some(wgpu::TextureViewDimension::D2Array),
+                    ..Default::default()
+                });
+                self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("trove-3d-mesh-textures"),
+                    layout: &self.bind_group_layout,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: self.uniforms.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: wgpu::BindingResource::TextureView(&view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: wgpu::BindingResource::Sampler(&self.texture_sampler),
+                        },
+                    ],
+                })
+            }
+            None => self.bind_group.clone(),
+        };
+
         GpuMesh {
             vertices,
             indices,
@@ -994,6 +1226,8 @@ impl GpuRenderer {
             cull_backfaces: winding != Winding::TwoSided,
             meshlets,
             colors,
+            tex,
+            bind_group,
         }
     }
 
@@ -1105,10 +1339,15 @@ impl GpuRenderer {
                     (false, true) => &pipelines.model_culled,
                     (false, false) => &pipelines.model_two_sided,
                 });
-                pass.set_bind_group(0, &self.bind_group, &[]);
+                // The mesh's own texture array rides its bind group; the
+                // backdrop and the points above kept the renderer's default.
+                pass.set_bind_group(0, &mesh.bind_group, &[]);
                 pass.set_vertex_buffer(0, mesh.vertices.slice(..));
                 if let Some(colors) = &mesh.colors {
                     pass.set_vertex_buffer(1, colors.slice(..));
+                }
+                if let Some(tex) = &mesh.tex {
+                    pass.set_vertex_buffer(2, tex.slice(..));
                 }
                 match &mesh.indices {
                     Some(indices) => {
@@ -1296,6 +1535,7 @@ mod tests {
                 ("fs_backdrop", naga::ShaderStage::Fragment),
                 ("fs_edl", naga::ShaderStage::Fragment),
                 ("fs_model", naga::ShaderStage::Fragment),
+                ("fs_model_textured", naga::ShaderStage::Fragment),
                 ("fs_point", naga::ShaderStage::Fragment),
                 ("vs_backdrop", naga::ShaderStage::Vertex),
                 ("vs_model", naga::ShaderStage::Vertex),
@@ -1322,12 +1562,14 @@ mod tests {
                 vec![float(0, 3), float(1, 3)],
                 render3d::VertexData::STRIDE / 4,
             ),
-            // The coloured entry reads the interleaved buffer and the colour
-            // buffer both: six floats plus three.
+            // The coloured entry reads the interleaved buffer, the colour
+            // buffer and the texture coordinates: six floats plus six.
             (
                 "vs_model_colored",
-                vec![float(0, 3), float(1, 3), float(2, 3)],
-                render3d::VertexData::STRIDE / 4 + render3d::VertexData::COLOR_STRIDE / 4,
+                vec![float(0, 3), float(1, 3), float(2, 3), float(3, 3)],
+                render3d::VertexData::STRIDE / 4
+                    + render3d::VertexData::COLOR_STRIDE / 4
+                    + render3d::VertexData::TEX_STRIDE / 4,
             ),
             (
                 "vs_point",
@@ -1546,6 +1788,7 @@ mod tests {
             uploaded.colors.is_some(),
             uploaded.cull_backfaces
         );
+
         for zoom in [1.0, 0.5, 0.25, 0.12] {
             let camera = render3d::Camera {
                 zoom,
