@@ -48,6 +48,10 @@ pub(crate) const VIDEO_FULLSCREEN_CONTEXT: &str = "VideoFullscreen";
 /// Key context of the screenshot picker overlay. Its only binding is
 /// Escape: it cancels the pick. The context lives only on the overlay's
 /// root, so nothing else sees it.
+///
+/// Gated with the picker itself: the overlay is Linux-only, so on the other
+/// two platforms this name would have no reader at all.
+#[cfg(target_os = "linux")]
 pub(crate) const CAPTURE_PICK_CONTEXT: &str = "CapturePick";
 
 pub(crate) fn register(cx: &mut App, config: &trove_core::config::AppConfig) {
