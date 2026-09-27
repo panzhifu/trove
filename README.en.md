@@ -58,6 +58,7 @@ This README summarizes what ships. The **[Chinese README](./README.md)** is the 
 ### Browse & inspect
 
 - **Three views** — grid (justified layout) / list / timeline, with density slider, multi-select and a floating toolbar.
+- **Quick look with the space bar** — press space on the selected card and it comes alive where it stands: video and audio start playing, and moving across the card shuttles through them; images and font specimens float out an enlarged view beside the card, enlarging the very thumbnail or specimen the card was already painting instead of decoding the original. Press it again to put the card away, or Escape to back out one layer at a time (live card → full preview → clear selection). Nothing follows the pointer, so nothing makes noise on its own — and there is no switch to reach for.
 - **Shape & aspect filters** — the toolbar shape filter (landscape / portrait / square) carries media aspect presets — WeChat cover 2.35:1, video 16:9, vertical video 9:16, photo 4:3 / 3:4, square 1:1 — matched with 3% tolerance so rounded dimensions still hit.
 - **Inspector** — thumbnail + tags + color palette + inline editing (title / description / source URL / rating); properties page shows MIME / size / dimensions / content hash (BLAKE3); one-click reveal of the underlying file.
 - **Animated images** — GIF / animated WebP / APNG play frame-by-frame in the preview dialog and Inspector; grid thumbnails stay static for performance.

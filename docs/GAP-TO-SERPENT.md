@@ -2,6 +2,7 @@
 
 > 对照物：`reference/Serpent`（上游 [dolag233/Serpent](https://github.com/dolag233/Serpent)）**v0.2.6**，Electron 43 + React 19。
 > 本文：**v0.4.8** 的 Trove 与它在功能面上的逐项差距，以及明确决定**不追**的部分。
+> **v0.4.9 已于 2026-09-27 发布**，而下面逐项审的是 v0.4.8 那个点。之后落的主要是三块：模型材质与共享 GPU 渲染器那一轮、智能集合同级拖拽重排 + 预览里方向键换素材、以及**卡片"活过来"的触发从指针定住改成按空格**（见 §C 的活卡片行与 [PREVIEW-SYSTEM.md](./PREVIEW-SYSTEM.md)）。所以下文的文件数、行数与测试数都比现在的新（测试现为 **771 core + 67 app = 838** 全绿 3 ignored）。
 > 核验日期 **2026-09-25**（上一轮 09-24，再上一轮 09-23）。两边的数字都取自源码而非各自文档：Serpent `src/` **773 文件 / 249,024 行** `.ts`+`.tsx`（与 09-23/24 逐字相同——vendored 副本未动，`reference/Serpent` 的 HEAD 仍是 `4661e17e`），schema **v56**、56 段迁移（`src/worker/library-service.ts:3454` 起的 `MIGRATIONS`，末条 `version: 56` 在 `:3642`，`SUPPORTED_SCHEMA_VERSION = MIGRATIONS.at(-1)!.version` 在 `:3647`）——**它自己的 `docs/developer/architecture.md:63` 还写着 "currently v33"**，又是一处文档落后于代码。Trove `crates/` **217 文件 / 105,694 行** `.rs`（schema **v19**、包版本 0.4.8、测试 **762 core + 66 app = 828** 全绿 3 ignored；本轮较上轮 +7 文件 / +5,263 行，增量是文本查看器与编码探测、EXR/HDR/TGA、悬停卡片、序列帧数据层、点云按字段着色）。上一轮那行写的 "schema v17" 是它自己同日就过期的数：同一份文档的下文里 v18 与 v19 都已经落了。
 >
 > **本轮把上轮三处"确认缺失"推翻了两处**，都是同一个失败模式——按 Serpent 的实现符号去 grep（`CF_HDROP`、`xdnd`、`file_drop`），命中零就记成"没有"，而没有按**能力**去问（"能不能把文件拖出窗口"）：
