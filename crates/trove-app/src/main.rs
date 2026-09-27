@@ -37,10 +37,14 @@ use app::AppView;
 fn main() {
     // Logging first: everything after this point can emit events.
     logging::init();
-    app::i18n::init_from_config();
+    // One read serves the whole boot: the language the interface opens in,
+    // the keybindings the actions register with, and whether a library
+    // exists at all — decided here, before anything can have changed it.
+    let config = trove_core::config::AppConfig::load();
+    app::i18n::init_from_config(&config);
     gpui_kit::application()
         .with_assets(assets::TroveAssets)
-        .run(|cx| {
+        .run(move |cx| {
             gpui_kit::init(cx);
             // Themes before the first paint: the registry has to know every
             // theme before `apply_from_settings` picks one per mode.
@@ -58,11 +62,8 @@ fn main() {
             // be complete before the first import builds it.
             crate::plugins::init(cx);
 
-            // One read serves the whole boot: the keybindings the actions
-            // register with, and whether a library exists at all — decided
-            // here, so the spawned closure moves a bool rather than the
-            // config.
-            let config = trove_core::config::AppConfig::load();
+            // The boot's single config read, from before the event loop
+            // opened, still serves here.
             app::keybindings::register(cx, &config);
             let has_library = !config.libraries.is_empty();
 

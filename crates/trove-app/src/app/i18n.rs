@@ -47,9 +47,10 @@ fn effective(language: Option<&str>) -> &'static str {
 }
 
 /// Apply the configured language at startup, before any window opens. The
-/// locale is a plain process global, so this is safe pre-GPUI.
-pub fn init_from_config() {
-    let config = AppConfig::load();
+/// locale is a plain process global, so this is safe pre-GPUI. The config
+/// comes in from the caller: the boot reads it once, and every consumer
+/// afterwards works from that same read.
+pub fn init_from_config(config: &AppConfig) {
     rust_i18n::set_locale(effective(config.language.as_deref()));
 }
 
