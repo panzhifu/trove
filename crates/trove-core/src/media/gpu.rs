@@ -14,7 +14,6 @@
 //!   BGRA order the UI expects.
 
 use super::height_color::{HeightUniforms, RAMP_STOPS};
-use super::render3d;
 use super::render3d::{
     BG_BOTTOM, BG_TOP, EDL_STRENGTH, Framing, MATERIAL, MATERIAL_ROUGHNESS, POINT_RADIUS, VIGNETTE,
     model_space_lights,
