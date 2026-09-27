@@ -28,7 +28,6 @@ mod components;
 mod dialogs;
 mod fonts;
 mod library;
-mod logging;
 mod panels;
 mod plugins;
 
@@ -36,7 +35,7 @@ use app::AppView;
 
 fn main() {
     // Logging first: everything after this point can emit events.
-    logging::init();
+    trove_core::logging::init(trove_core::logging::LoggingOptions::app());
     // One read serves the whole boot: the language the interface opens in,
     // the keybindings the actions register with, and whether a library
     // exists at all — decided here, before anything can have changed it.

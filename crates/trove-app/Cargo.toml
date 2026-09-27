@@ -20,8 +20,6 @@ rust-i18n = { workspace = true }
 toml = "0.8"
 sys-locale = { workspace = true }
 tracing = { workspace = true }
-tracing-subscriber = { workspace = true }
-bytemuck = { version = "1", features = ["derive"] }
 rodio = { workspace = true }
 # System tray, one API for all three platforms. The default features must stay
 # off: they pull in GTK, libappindicator and libxdo, none of which the tray

@@ -8809,7 +8809,6 @@ name = "trove-app"
 version = "0.4.8"
 dependencies = [
  "arboard",
- "bytemuck",
  "dirs 5.0.1",
  "gpui-kit",
  "image",
@@ -8821,7 +8820,6 @@ dependencies = [
  "sys-locale",
  "toml 0.8.23",
  "tracing",
- "tracing-subscriber",
  "tray-icon",
  "trove-core",
  "uuid",
@@ -8832,12 +8830,9 @@ dependencies = [
 name = "trove-cli"
 version = "0.4.8"
 dependencies = [
- "chrono",
  "clap",
  "serde",
  "serde_json",
- "tracing",
- "tracing-subscriber",
  "trove-core",
  "uuid",
 ]
@@ -8876,6 +8871,7 @@ dependencies = [
  "tantivy",
  "thiserror 2.0.20",
  "tracing",
+ "tracing-subscriber",
  "ttf-parser",
  "ureq",
  "uuid",

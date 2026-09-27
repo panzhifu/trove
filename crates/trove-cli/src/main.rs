@@ -25,7 +25,15 @@ use ctx::{CliError, Env, Style};
 
 fn main() {
     let args = Cli::parse();
-    init_logging(&args);
+    // Log to stderr, quietly by default: the library is chatty at `info`
+    // (drains, thumbnails, watches) and none of that belongs in a script's
+    // output, so the default is `warn` and `RUST_LOG` is there when something
+    // needs chasing. `--quiet` drops to errors only.
+    trove_core::logging::init(trove_core::logging::LoggingOptions::cli(if args.quiet {
+        "error"
+    } else {
+        "warn"
+    }));
     let code = match dispatch(&args) {
         Ok(()) => 0,
         Err(error) => {
@@ -75,24 +83,4 @@ fn dispatch(args: &Cli) -> Result<(), CliError> {
     };
 
     style.emit(&rendered)
-}
-
-/// Log to stderr, quietly by default.
-///
-/// The library is chatty at `info` (drains, thumbnails, watches) and none of
-/// that belongs in a script's output, so the default is `warn` and `RUST_LOG`
-/// is there when something needs chasing. `--quiet` drops to errors only.
-fn init_logging(args: &Cli) {
-    use tracing_subscriber::EnvFilter;
-
-    let default = if args.quiet { "error" } else { "warn" };
-    let filter = match std::env::var("RUST_LOG") {
-        Ok(spec) if !spec.trim().is_empty() => EnvFilter::new(spec),
-        _ => EnvFilter::new(default),
-    };
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_target(false)
-        .with_writer(std::io::stderr)
-        .try_init();
 }
