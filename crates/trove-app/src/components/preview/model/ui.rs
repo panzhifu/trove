@@ -8,6 +8,7 @@ use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::popover::Popover;
 use gpui_kit::component::separator::Separator;
 use gpui_kit::component::tab::{Tab, TabBar};
+use gpui_kit::assets::IconName as AssetIcon;
 use gpui_kit::component::{ActiveTheme, IconName, Sizable};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -435,26 +436,71 @@ impl ModelViewport {
                     .absolute()
                     .top_2()
                     .left_2()
-                    .child(self.height_control(cx)),
+                    .child(self.look_controls(cx)),
             )
             .child(self.height_legend(cx))
             .child(self.shortcuts_hint(cx))
     }
 
-    /// The one look switch, in the canvas's top-left corner: how — or whether
-    /// — the model is painted by height.
-    ///
-    /// A popover, not a settings row, because the choice is made while looking
-    /// at the model: CloudCompare asks the same four questions in its
+    /// The look switches, in the canvas's top-left corner: how — or whether —
+    /// the model is painted. The material switch is a plain toggle; the height
+    /// switch opens the panel, because its choice is made while looking at the
+    /// model: CloudCompare asks the same four questions in its
     /// `ccColorGradientDlg` (direction, ramp, banding, frequency) and so does
-    /// this panel, with the ramp previewed where its name would be. The panel
+    /// this panel, with the ramp previewed where its name would be. That panel
     /// itself only ever offers ways of painting; switching off is the × beside
     /// the button, which appears while the colouring is on — the same split as
     /// a chip that carries its own untag.
     ///
-    /// On the canvas rather than in the toolbar because it changes what is
-    /// drawn, not the panel's chrome. Every choice persists as it is made, so
-    /// the next model opened looks the same way.
+    /// On the canvas rather than in the toolbar because the switches change
+    /// what is drawn, not the panel's chrome. Every choice persists as it is
+    /// made, so the next model opened looks the same way.
+    fn look_controls(&self, cx: &mut Context<Self>) -> AnyElement {
+        h_flex()
+            .gap_1()
+            .items_center()
+            // A cloud's points keep their own colours — scan data, not
+            // materials — so the switch has nothing to flip there.
+            .when(!self.mesh.is_point_cloud(), |row| {
+                row.child(self.material_control(cx))
+            })
+            .child(self.height_control(cx))
+            .into_any_element()
+    }
+
+    /// Whether the model wears the colours its file declares, as one button.
+    ///
+    /// A toggle rather than a popover: the choice is on or off, and what it
+    /// changes is visible the moment it flips — the file's own colours, or the
+    /// one flat material standing in for them. A height look, when on, paints
+    /// over either.
+    fn material_control(&self, cx: &mut Context<Self>) -> AnyElement {
+        Button::new("material-render")
+            .xsmall()
+            .when(self.material_render, |button| button.primary())
+            .when(!self.material_render, |button| button.ghost())
+            .icon(AssetIcon::Paintbrush)
+            .label(rust_i18n::t!("viewport.material_render").to_string())
+            .tooltip(rust_i18n::t!("viewport.material_render_tip").to_string())
+            .on_click(cx.listener(|this, _, _, cx| this.toggle_material_render(cx)))
+            .into_any_element()
+    }
+
+    /// Flip the material switch and write it down. The look is app-wide — the
+    /// same file the settings page used to write — and the poll that re-reads
+    /// the config is stamped here, so the frame after the click cannot re-read
+    /// the file as it was before it.
+    pub(super) fn toggle_material_render(&mut self, cx: &mut Context<Self>) {
+        self.material_render = !self.material_render;
+        let mut config = trove_core::config::AppConfig::load();
+        config.material_render = Some(self.material_render);
+        let _ = config.save();
+        self.enhance_checked = Some(std::time::Instant::now());
+        self.redraw(cx);
+    }
+
+    /// The height switch: a popover over the canvas, with the × beside it
+    /// while the colouring is on.
     fn height_control(&self, cx: &mut Context<Self>) -> AnyElement {
         let on = self.height.mode != HeightMode::Off;
         h_flex()

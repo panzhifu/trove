@@ -1,10 +1,11 @@
 //! Model page: how the 3D preview draws a model.
 //!
-//! These decide what a point cloud or a mesh looks like *before* a file is
-//! opened, and how far the viewport will zoom. The same look switches sit on
-//! the viewport's own toolbar, where they are one click away while a model is
-//! on screen; both write the same config, and the viewport re-reads it every
-//! frame, so flipping a switch here reaches a preview that is already open.
+//! These decide what a point cloud looks like *before* a file is opened, and
+//! how far the viewport will zoom. The look switches — height colouring, the
+//! file's own materials — are not here: they sit on the viewport's canvas,
+//! where they are one click away while a model is on screen and their effect
+//! is visible the moment they flip. They write the same config the viewport
+//! starts from, so what one viewport writes is what the next opens with.
 
 use super::*;
 use gpui_kit::component::setting::NumberFieldOptions;
@@ -29,28 +30,6 @@ pub(super) fn model_page() -> SettingPage {
                         }),
                     )
                     .description(t("settings.point_enhance_desc")),
-                )
-                .item(
-                    SettingItem::new(
-                        t("settings.height_color"),
-                        config_switch(AppConfig::height_color, |config, on| {
-                            config.height_color = Some(on);
-                        }),
-                    )
-                    .description(t("settings.height_color_desc")),
-                ),
-        )
-        .group(
-            SettingGroup::new()
-                .title(t("settings.model_material"))
-                .item(
-                    SettingItem::new(
-                        t("settings.material_render"),
-                        config_switch(AppConfig::material_render, |config, on| {
-                            config.material_render = Some(on);
-                        }),
-                    )
-                    .description(t("settings.material_render_desc")),
                 ),
         )
         .group(zoom_group())
