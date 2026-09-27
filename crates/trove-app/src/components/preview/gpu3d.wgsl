@@ -199,8 +199,11 @@ struct ModelOut {
     // here, from the model-space position, so toggling the look costs a uniform
     // write rather than a vertex-buffer re-upload.
     @location(2) tint: vec3<f32>,
-    // u, v, and the texture layer the vertex samples; -1 when none.
-    @location(3) uv_layer: vec3<f32>,
+    // u, v, the base-colour layer and the metallic-roughness layer the
+    // vertex samples; layers 0 is the white stand-in.
+    @location(3) tex_meta: vec4<f32>,
+    // x = metallic factor, y = roughness factor.
+    @location(4) mr_factors: vec2<f32>,
 };
 
 @vertex
@@ -227,14 +230,16 @@ fn vs_model_colored(
     @location(0) position: vec3<f32>,
     @location(1) normal: vec3<f32>,
     @location(2) color: vec3<f32>,
-    @location(3) uv_layer: vec3<f32>,
+    @location(3) tex_meta: vec4<f32>,
+    @location(4) mr_factors: vec2<f32>,
 ) -> ModelOut {
     var out: ModelOut;
     out.clip = u.view_proj * vec4<f32>(position, 1.0);
     out.model_pos = position;
     out.normal = normal;
     out.tint = surface_color(position, normal, 0.0, 0.0, color);
-    out.uv_layer = uv_layer;
+    out.tex_meta = tex_meta;
+    out.mr_factors = mr_factors;
     return out;
 }
 
@@ -263,7 +268,7 @@ fn studio_diffuse(n: vec3<f32>) -> vec3<f32> {
 // blended toward a wrapped "environment" term by the light's wrap squared,
 // then coloured by the Fresnel-lifted dielectric. Mirrors the CPU's
 // `studio_specular` in `render3d`.
-fn studio_specular(n: vec3<f32>, to_eye: vec3<f32>) -> vec3<f32> {
+fn studio_specular(n: vec3<f32>, to_eye: vec3<f32>, roughness: f32) -> vec3<f32> {
     var sum = vec3<f32>(0.0);
     // The mirror direction the environment term reads: where a perfect
     // reflector would send the view ray.
@@ -275,7 +280,7 @@ fn studio_specular(n: vec3<f32>, to_eye: vec3<f32>) -> vec3<f32> {
         let nl = clamp(dot(light.dir_wrap.xyz, n), 0.0, 1.0);
         // A wrapped light is a bigger, softer light: its gloss shrinks and
         // its highlight widens accordingly.
-        let gloss = (1.0 - u.params.x) * (1.0 - light.dir_wrap.w);
+        let gloss = (1.0 - roughness) * (1.0 - light.dir_wrap.w);
         let shininess = exp2(10.0 * gloss + 1.0);
         var s = pow(spec_angle, shininess) * nl * (shininess * 0.125 + 1.0);
         // The environment stand-in, mixed in by the wrap squared — Blender's
@@ -293,11 +298,18 @@ fn studio_specular(n: vec3<f32>, to_eye: vec3<f32>) -> vec3<f32> {
 // lifts toward white at grazing angles, the less the rougher the surface.
 // Its luminance is also what the diffuse gives back — the one-knob energy
 // conservation between the two halves of one answer.
-fn fresnel_specular_color(n: vec3<f32>, to_eye: vec3<f32>) -> vec3<f32> {
+fn fresnel_specular_color(
+    n: vec3<f32>,
+    to_eye: vec3<f32>,
+    roughness: f32,
+    metallic: f32,
+    albedo: vec3<f32>,
+) -> vec3<f32> {
     let dielectric = 0.05;
     let nv = clamp(dot(n, to_eye), 0.0, 1.0);
-    let fresnel = exp2(-8.35 * nv) * (1.0 - u.params.x);
-    return vec3<f32>(dielectric + fresnel * (1.0 - dielectric));
+    let fresnel = exp2(-8.35 * nv) * (1.0 - roughness);
+    let spec_color = mix(vec3<f32>(dielectric), albedo, vec3<f32>(metallic));
+    return mix(spec_color, vec3<f32>(1.0), vec3<f32>(fresnel));
 }
 
 // The scene-linear → sRGB display transform. Blender shades in scene-linear
@@ -318,8 +330,9 @@ fn fs_model(in: ModelOut) -> @location(0) vec4<f32> {
     let n = select(-geometric, geometric, dot(geometric, to_eye) >= 0.0);
 
     let diffuse = studio_diffuse(n);
-    let spec_color = fresnel_specular_color(n, to_eye);
-    let specular = studio_specular(n, to_eye) * spec_color;
+    let spec_color =
+        fresnel_specular_color(n, to_eye, u.params.x, 0.0, in.tint);
+    let specular = studio_specular(n, to_eye, u.params.x) * spec_color;
     let energy = dot(spec_color, vec3<f32>(1.0 / 3.0));
 
     return vec4<f32>(encode(in.tint * diffuse * (1.0 - energy) + specular), 1.0);
@@ -337,22 +350,44 @@ fn fs_model_textured(in: ModelOut) -> @location(0) vec4<f32> {
     let n = select(-geometric, geometric, dot(geometric, to_eye) >= 0.0);
 
     let diffuse = studio_diffuse(n);
-    let spec_color = fresnel_specular_color(n, to_eye);
-    let specular = studio_specular(n, to_eye) * spec_color;
-    let energy = dot(spec_color, vec3<f32>(1.0 / 3.0));
 
     // Round, never truncate: the perspective interpolation of an exact 1.0
     // can land at 0.9999, and a truncation would fall to the white layer.
-    let layer = i32(round(clamp(in.uv_layer.z, 0.0, 255.0)));
-    let texel = textureSampleLevel(
+    // The base-colour texel, then the metallic-roughness texel: G carries
+    // roughness, B carries metallic, both scaled by the material's factors.
+    let base_layer = i32(round(clamp(in.tex_meta.z, 0.0, 255.0)));
+    let mr_layer = i32(round(clamp(in.tex_meta.w, 0.0, 255.0)));
+    let base_texel = textureSampleLevel(
         model_textures,
         model_sampler,
-        in.uv_layer.xy,
-        layer,
+        in.tex_meta.xy,
+        base_layer,
         0.0,
     ).rgb;
+    let mr_texel = textureSampleLevel(
+        model_textures,
+        model_sampler,
+        in.tex_meta.xy,
+        mr_layer,
+        0.0,
+    );
+    let metallic = mr_texel.b * in.mr_factors.x;
+    let roughness = mr_texel.g * in.mr_factors.y;
 
-    return vec4<f32>(encode(in.tint * texel * diffuse * (1.0 - energy) + specular), 1.0);
+    // A metal's diffuse is zero — its colour travels in the specular — and
+    // its specular colour starts at the base colour instead of the
+    // dielectric constant, both per the workbench material mix.
+    // The metallic mix reads the MATERIAL's colour, not the texel: the
+    // texture varies per pixel, and Blender's mix uses the base colour the
+    // material declares.
+    let spec_color = fresnel_specular_color(n, to_eye, roughness, metallic, in.tint);
+    let specular = studio_specular(n, to_eye, roughness) * spec_color;
+    let energy = dot(spec_color, vec3<f32>(1.0 / 3.0));
+
+    return vec4<f32>(
+        encode(in.tint * base_texel * (1.0 - metallic) * diffuse * (1.0 - energy) + specular),
+        1.0,
+    );
 }
 
 // A point cloud is drawn one sprite per point, each a camera-facing square

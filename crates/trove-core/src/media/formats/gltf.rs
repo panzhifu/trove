@@ -170,6 +170,11 @@ struct Builder {
     uv: Vec<[f32; 2]>,
     /// Per-vertex texture slot, parallel to `positions`.
     slots: Vec<u16>,
+    /// Per-vertex metallic-roughness texture slot, parallel to `positions`.
+    mr_slots: Vec<u16>,
+    /// Per-vertex `(metallic factor, roughness factor)`, parallel to
+    /// `positions`.
+    factors: Vec<[f32; 2]>,
     /// Vertices of `POINTS` primitives. Used only when the document has no
     /// triangles at all: a mesh is either a surface or a cloud.
     points: Vec<[f32; 3]>,
@@ -303,16 +308,37 @@ impl Builder {
                     .unwrap_or(NO_TEXTURE)
             })
             .unwrap_or(NO_TEXTURE);
+        // The metallic-roughness texture: its G channel carries roughness and
+        // its B channel metallic, both scaled by the material's factors. The
+        // factors default to the spec's (1.0, 1.0) — with the texture present
+        // that is the real data; without one they name a full metal at full
+        // roughness, which is what Blender's importer reads too.
+        let mr_slot = material
+            .pbr_metallic_roughness()
+            .metallic_roughness_texture()
+            .map(|info| {
+                slot_of_texture
+                    .get(info.texture().index())
+                    .copied()
+                    .unwrap_or(NO_TEXTURE)
+            })
+            .unwrap_or(NO_TEXTURE);
+        let pbr = material.pbr_metallic_roughness();
+        let factors = [pbr.metallic_factor(), pbr.roughness_factor()];
         match reader.read_tex_coords(0) {
             Some(uv) => {
                 for uv in uv.into_f32() {
                     self.uv.push(uv);
                     self.slots.push(slot);
+                    self.mr_slots.push(mr_slot);
+                    self.factors.push(factors);
                 }
             }
             None => {
                 self.uv.extend(std::iter::repeat_n([0.0, 0.0], count));
-                self.slots.extend(std::iter::repeat_n(NO_TEXTURE, count));
+                self.slots.extend(std::iter::repeat_n(slot, count));
+                self.mr_slots.extend(std::iter::repeat_n(mr_slot, count));
+                self.factors.extend(std::iter::repeat_n(factors, count));
             }
         }
 
@@ -348,6 +374,8 @@ impl Builder {
                 mesh.texture = Some(Box::new(TextureData {
                     uv: self.uv,
                     slot: self.slots,
+                    mr_slot: self.mr_slots,
+                    factors: self.factors,
                     maps: self.textures,
                 }));
             }

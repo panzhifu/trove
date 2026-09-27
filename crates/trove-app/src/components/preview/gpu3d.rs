@@ -634,7 +634,7 @@ impl GpuRenderer {
 
             let attributes = wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3];
             let color_attributes = wgpu::vertex_attr_array![2 => Float32x3];
-            let tex_attributes = wgpu::vertex_attr_array![3 => Float32x3];
+            let tex_attributes = wgpu::vertex_attr_array![3 => Float32x4, 4 => Float32x2];
             let model = |cull: bool, colored: bool| {
                 // A coloured mesh reads its RGB from a second vertex buffer and
                 // its texture coordinate from a third, so the interleaved
@@ -1103,32 +1103,18 @@ impl GpuRenderer {
             .texture
             .as_deref()
             .filter(|t| !t.maps.is_empty() && t.maps.len() < NO_TEXTURE as usize);
+        // The coordinates and PBR factors come out of the vertex data — which
+        // followed the same per-face expansion the positions did — as a third
+        // vertex buffer, present whenever the colours are, because the
+        // coloured pipelines declare it.
         let tex = colors.as_ref().map(|_| {
-            let mut tex = Vec::with_capacity(data.vertex_count as usize * 3);
-            for index in 0..data.vertex_count as usize {
-                let (uv, layer) = match texture_data {
-                    Some(t) => {
-                        let slot = t.slot.get(index).copied().unwrap_or(NO_TEXTURE);
-                        let uv = t.uv.get(index).copied().unwrap_or([0.0, 0.0]);
-                        let layer = if slot == NO_TEXTURE {
-                            0.0
-                        } else {
-                            slot as f32 + 1.0
-                        };
-                        (uv, layer)
-                    }
-                    None => ([0.0, 0.0], 0.0),
-                };
-                tex.extend_from_slice(&[uv[0], uv[1], layer]);
-            }
             let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("trove-3d-tex"),
-                size: (tex.len() as u64 * 4).max(4),
+                size: (data.tex.len() as u64 * 4).max(4),
                 usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             });
-            self.queue
-                .write_buffer(&buffer, 0, &render3d::f32_bytes(&tex));
+            self.queue.write_buffer(&buffer, 0, &data.tex_bytes());
             buffer
         });
 
@@ -1566,7 +1552,13 @@ mod tests {
             // buffer and the texture coordinates: six floats plus six.
             (
                 "vs_model_colored",
-                vec![float(0, 3), float(1, 3), float(2, 3), float(3, 3)],
+                vec![
+                    float(0, 3),
+                    float(1, 3),
+                    float(2, 3),
+                    float(3, 4),
+                    float(4, 2),
+                ],
                 render3d::VertexData::STRIDE / 4
                     + render3d::VertexData::COLOR_STRIDE / 4
                     + render3d::VertexData::TEX_STRIDE / 4,

@@ -158,6 +158,13 @@ pub struct TextureData {
     /// Per-vertex texture slot, parallel to `positions`. [`NO_TEXTURE`]
     /// marks a vertex whose primitive carries no base-colour texture.
     pub slot: Vec<u16>,
+    /// Per-vertex metallic-roughness texture slot, parallel to `positions`
+    /// (glTF's G channel is roughness, B is metallic). [`NO_TEXTURE`] when
+    /// the primitive has none and the factors stand alone.
+    pub mr_slot: Vec<u16>,
+    /// Per-vertex `(metallic factor, roughness factor)`, the multipliers the
+    /// glTF spec pairs with the two channels above.
+    pub factors: Vec<[f32; 2]>,
     /// The decoded textures, in slot order.
     pub maps: Vec<TextureMap>,
 }

@@ -653,8 +653,9 @@ impl VertexData {
 
     /// Bytes of one colour vertex: a `vec3<f32>`.
     pub const COLOR_STRIDE: u64 = 12;
-    /// Bytes of one `[u, v, layer]` texel-coordinate triple.
-    pub const TEX_STRIDE: u64 = 12;
+    /// Bytes of one `[u, v, base layer, mr layer, metallic f, roughness f]`
+    /// record.
+    pub const TEX_STRIDE: u64 = 24;
 
     /// The texture coordinates as bytes, ready for `Queue::write_buffer`.
     pub fn tex_bytes(&self) -> Vec<u8> {
@@ -733,25 +734,38 @@ pub fn vertex_data_with(mesh: &Mesh, flip_winding: bool) -> VertexData {
     if colored {
         colors.reserve(mesh.positions.len() * 3);
     }
-    // The same for the texture coordinates, with the slot flipped to the
-    // shader's "no texture means sample white" encoding.
+    // The same for the texture coordinates and the material's PBR factors,
+    // packed as `[u, v, base layer, mr layer, metallic f, roughness f]` per
+    // vertex. Layer `0` is the white stand-in the shader answers when the
+    // primitive carries no such texture; the real slots shift up by one. The
+    // factors default to the glTF spec's (1.0, 1.0), so the white layer's
+    // `g = b = 1` samples leave the spec defaults standing.
     let mut tex = Vec::new();
     let textured = mesh.has_textures();
     if textured {
-        tex.reserve(mesh.positions.len() * 3);
+        tex.reserve(mesh.positions.len() * 6);
     }
-    let tex_at = |index: usize| -> [f32; 3] {
+    let tex_at = |index: usize| -> [f32; 6] {
         let data = mesh.texture.as_ref().expect("textured");
         let slot = data.slot.get(index).copied().unwrap_or(NO_TEXTURE);
+        let mr_slot = data.mr_slot.get(index).copied().unwrap_or(NO_TEXTURE);
         let uv = data.uv.get(index).copied().unwrap_or([0.0, 0.0]);
+        let factors = data.factors.get(index).copied().unwrap_or([0.0, 0.0]);
         [
             uv[0],
             uv[1],
             if slot == NO_TEXTURE {
-                -1.0
+                0.0
             } else {
-                slot as f32
+                slot as f32 + 1.0
             },
+            if mr_slot == NO_TEXTURE {
+                0.0
+            } else {
+                mr_slot as f32 + 1.0
+            },
+            factors[0],
+            factors[1],
         ]
     };
     if mesh.has_vertex_normals() {
@@ -899,6 +913,14 @@ fn wrapped_light(nl: f32, wrap: f32) -> f32 {
     ((nl + wrap) / denom).max(0.0).min(1.0)
 }
 
+/// The specular colour a channel starts from: the dielectric constant for a
+/// non-metal, the base colour for a metal, blended by the material's
+/// metallic — `mix(vec3(0.05), base_color, metallic)` in the workbench
+/// shader.
+fn mix_dielectric(albedo: f32, metallic: f32) -> f32 {
+    DIELECTRIC_F0 * (1.0 - metallic) + albedo * metallic
+}
+
 /// The diffuse half of the studio lighting, summed over the four lights: a
 /// colour-free light sum a surface colour multiplies. Mirrors
 /// `get_world_lighting`'s diffuse loop in Blender's workbench.
@@ -915,13 +937,17 @@ fn studio_diffuse(normal: [f32; 3], lights: &[ModelLight; 4]) -> [f32; 3] {
 
 /// The specular half, per surface point: the normalized-Blinn term each light
 /// contributes, blended toward a wrapped "environment" term by the light's
-/// wrap squared, then coloured by the Fresnel-lifted dielectric. Returns the
-/// specular light and the energy it takes out of the diffuse — Blender's
-/// single-knob conservation between the two halves of one answer.
+/// wrap squared, then coloured by the metallic-mixed, Fresnel-lifted
+/// specular colour. Returns the specular light and the energy it takes out
+/// of the diffuse — Blender's single-knob conservation between the two
+/// halves of one answer.
 fn studio_specular(
     normal: [f32; 3],
     to_eye: [f32; 3],
     lights: &[ModelLight; 4],
+    roughness: f32,
+    metallic: f32,
+    albedo: [f32; 3],
 ) -> ([f32; 3], f32) {
     // The mirror direction the environment term reads: where a perfect
     // reflector would send the view ray.
@@ -933,13 +959,13 @@ fn studio_specular(
         let nl = dot(light.direction, normal).max(0.0).min(1.0);
         // A wrapped light is a bigger, softer light: its gloss shrinks and its
         // highlight widens accordingly.
-        let gloss = (1.0 - MATERIAL_ROUGHNESS) * (1.0 - light.wrap);
+        let gloss = (1.0 - roughness) * (1.0 - light.wrap);
         let shininess = (10.0 * gloss + 1.0).exp2();
         let mut s = spec_angle.powf(shininess) * nl * (shininess * 0.125 + 1.0);
         // The environment stand-in: a wrapped term on the mirror direction,
         // mixed in by the wrap squared — Blender's cheap stand-in for the IBL
         // a rougher surface would blur the highlight into.
-        let env_wrap = light.wrap + (1.0 - light.wrap) * MATERIAL_ROUGHNESS;
+        let env_wrap = light.wrap + (1.0 - light.wrap) * roughness;
         let env = wrapped_light(dot(light.direction, mirror), env_wrap);
         let blend = light.wrap * light.wrap;
         s = s * (1.0 - blend) + env * blend;
@@ -950,8 +976,12 @@ fn studio_specular(
     // The Fresnel approximation Blender's fast path uses: the specular colour
     // lifts toward white at grazing angles, the less the rougher the surface.
     let nv = dot(normal, to_eye).max(0.0).min(1.0);
-    let fresnel = (-8.35 * nv).exp2() * (1.0 - MATERIAL_ROUGHNESS);
-    let spec_color = [DIELECTRIC_F0 + fresnel * (1.0 - DIELECTRIC_F0); 3];
+    let fresnel = (-8.35 * nv).exp2() * (1.0 - roughness);
+    let spec_color = [
+        mix_dielectric(albedo[0], metallic) * (1.0 - fresnel) + fresnel,
+        mix_dielectric(albedo[1], metallic) * (1.0 - fresnel) + fresnel,
+        mix_dielectric(albedo[2], metallic) * (1.0 - fresnel) + fresnel,
+    ];
     let energy = (spec_color[0] + spec_color[1] + spec_color[2]) / 3.0;
     (
         [
@@ -1083,10 +1113,6 @@ fn paint(
                 continue;
             }
             let shaded_face = if facing_away { neg(face) } else { face };
-            // The specular is per face — the same granularity the highlight had
-            // before — because interpolating it per vertex would smear it over
-            // the whole triangle and lose the very tightness a highlight is.
-            let (spec, spec_energy) = studio_specular(shaded_face, to_camera, &lights);
 
             // One texture per face: a triangle belongs to one primitive, and
             // a primitive carries one material. `NO_TEXTURE` falls out of the
@@ -1094,6 +1120,37 @@ fn paint(
             let face_slot = texture
                 .and_then(|t| t.slot.get(i0).copied())
                 .unwrap_or(NO_TEXTURE);
+            // The material's roughness and metallic: sampled from the
+            // metallic-roughness texture when the primitive carries one (G =
+            // roughness, B = metallic, times the factors), else the
+            // fresh-Principled defaults the studio rig assumes. A height look
+            // owns the colour but not the finish, so these stand regardless.
+            let (roughness, metallic) = match texture.and_then(|t| {
+                Some((
+                    t.maps.get(*t.mr_slot.get(i0)? as usize)?,
+                    *t.factors.get(i0)?,
+                    *t.uv.get(i0)?,
+                ))
+            }) {
+                Some((map, factors, uv)) => {
+                    let (_r, g, b) = map.sample(uv[0], uv[1]);
+                    (g * factors[1], b * factors[0])
+                }
+                None => (MATERIAL_ROUGHNESS, 0.0),
+            };
+            let face_albedo = base_color(mesh, i0);
+            // The specular is per face — the same granularity the highlight
+            // had before — because interpolating it per vertex would smear it
+            // over the whole triangle and lose the very tightness a highlight
+            // is.
+            let (spec, spec_energy) = studio_specular(
+                shaded_face,
+                to_camera,
+                &lights,
+                roughness,
+                metallic,
+                face_albedo,
+            );
             let mut corners = [Vertex::default(); 3];
             for (slot, index) in [i0, i1, i2].into_iter().enumerate() {
                 let geometric = if gouraud {
@@ -1128,7 +1185,9 @@ fn paint(
                 // a per-face constant, so it scales the corners for free.
                 let mut i = studio_diffuse(normal, &lights);
                 for channel in &mut i {
-                    *channel *= 1.0 - spec_energy;
+                    // The specular takes its energy from the diffuse, and a
+                    // metal's diffuse is zero: both fold into the corners.
+                    *channel *= (1.0 - spec_energy) * (1.0 - metallic);
                 }
                 let uv = texture
                     .filter(|_| face_slot != NO_TEXTURE)
