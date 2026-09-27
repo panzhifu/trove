@@ -10,15 +10,27 @@
 // catches a drift; 32 is what CloudCompare's 23-anchor ASPRS palette needs.
 const RAMP_STOPS: u32 = 32u;
 
+// One studio light, as the host packs it: direction plus wrap, then the
+// light's diffuse and specular colours.
+struct LightUniform {
+    // xyz = direction toward the light, in model space (unit); w = wrap.
+    dir_wrap: vec4<f32>,
+    // rgb = the light's diffuse colour.
+    diffuse: vec4<f32>,
+    // rgb = the light's specular colour.
+    specular: vec4<f32>,
+};
+
 struct Uniforms {
     // Model space -> clip space, column-major.
     view_proj: mat4x4<f32>,
-    // xyz = key light direction (unit), w unused.
-    light: vec4<f32>,
-    // rgb = base colour, w = ambient.
+    // rgb = the flat material colour; w unused.
     material: vec4<f32>,
-    // x = diffuse, y = specular, z = shininess, w = vignette.
+    // x = material roughness, z = vignette strength; y/w unused.
     params: vec4<f32>,
+    // The four studio lights, already turned into model space for this
+    // frame's camera.
+    lights: array<LightUniform, 4>,
     // x = point sprite radius in pixels, y = eye-dome lighting strength,
     // z/w = the depth-to-log-depth constants the point-cloud post pass reads.
     params2: vec4<f32>,
@@ -216,6 +228,78 @@ fn vs_model_colored(
     return out;
 }
 
+// Blender workbench's `wrapped_lighting`: a diffuse term whose terminator the
+// light's wrap softens. The dot is deliberately unclamped — the wrap is what
+// folds light around past the horizon.
+fn wrapped_light(nl: f32, wrap: f32) -> f32 {
+    let denom = (wrap + 1.0) * (wrap + 1.0);
+    return clamp((nl + wrap) / denom, 0.0, 1.0);
+}
+
+// The diffuse half of the studio lighting, summed over the four lights: a
+// colour-free light sum a surface colour multiplies. Mirrors
+// `get_world_lighting`'s diffuse loop in Blender's workbench.
+fn studio_diffuse(n: vec3<f32>) -> vec3<f32> {
+    var sum = vec3<f32>(0.0);
+    for (var i = 0; i < 4; i++) {
+        let light = u.lights[i];
+        let lit = wrapped_light(dot(light.dir_wrap.xyz, n), light.dir_wrap.w);
+        sum += lit * light.diffuse.xyz;
+    }
+    return sum;
+}
+
+// The specular half: the normalized-Blinn term each light contributes,
+// blended toward a wrapped "environment" term by the light's wrap squared,
+// then coloured by the Fresnel-lifted dielectric. Mirrors the CPU's
+// `studio_specular` in `render3d`.
+fn studio_specular(n: vec3<f32>, to_eye: vec3<f32>) -> vec3<f32> {
+    var sum = vec3<f32>(0.0);
+    // The mirror direction the environment term reads: where a perfect
+    // reflector would send the view ray.
+    let mirror = 2.0 * dot(n, to_eye) * n - to_eye;
+    for (var i = 0; i < 4; i++) {
+        let light = u.lights[i];
+        let half = normalize(light.dir_wrap.xyz + to_eye);
+        let spec_angle = clamp(dot(half, n), 0.0, 1.0);
+        let nl = clamp(dot(light.dir_wrap.xyz, n), 0.0, 1.0);
+        // A wrapped light is a bigger, softer light: its gloss shrinks and
+        // its highlight widens accordingly.
+        let gloss = (1.0 - u.params.x) * (1.0 - light.dir_wrap.w);
+        let shininess = exp2(10.0 * gloss + 1.0);
+        var s = pow(spec_angle, shininess) * nl * (shininess * 0.125 + 1.0);
+        // The environment stand-in, mixed in by the wrap squared — Blender's
+        // cheap stand-in for the IBL a rougher surface would blur into.
+        let env_wrap = mix(light.dir_wrap.w, 1.0, u.params.x);
+        let env = wrapped_light(dot(light.dir_wrap.xyz, mirror), env_wrap);
+        let blend = light.dir_wrap.w * light.dir_wrap.w;
+        s = mix(s, env, blend);
+        sum += s * light.specular.xyz;
+    }
+    return sum;
+}
+
+// The Fresnel approximation Blender's fast path uses: the specular colour
+// lifts toward white at grazing angles, the less the rougher the surface.
+// Its luminance is also what the diffuse gives back — the one-knob energy
+// conservation between the two halves of one answer.
+fn fresnel_specular_color(n: vec3<f32>, to_eye: vec3<f32>) -> vec3<f32> {
+    let dielectric = 0.05;
+    let nv = clamp(dot(n, to_eye), 0.0, 1.0);
+    let fresnel = exp2(-8.35 * nv) * (1.0 - u.params.x);
+    return vec3<f32>(dielectric + fresnel * (1.0 - dielectric));
+}
+
+// The scene-linear → sRGB display transform. Blender shades in scene-linear
+// and converts on the way to the screen — its studio-light numbers are linear
+// intensities, and so are a glTF file's colours — so the shading result is
+// encoded where the shading is written. Mirrors the CPU's `encode_channel`.
+fn encode(c: vec3<f32>) -> vec3<f32> {
+    let low = c * 12.92;
+    let high = 1.055 * pow(max(c, vec3<f32>(0.0)), vec3<f32>(1.0 / 2.4)) - 0.055;
+    return select(high, low, c <= vec3<f32>(0.0031308));
+}
+
 @fragment
 fn fs_model(in: ModelOut) -> @location(0) vec4<f32> {
     let geometric = normalize(in.normal);
@@ -223,12 +307,12 @@ fn fs_model(in: ModelOut) -> @location(0) vec4<f32> {
     // Two-sided, so an open shell never shows black back faces.
     let n = select(-geometric, geometric, dot(geometric, to_eye) >= 0.0);
 
-    let diffuse = max(dot(n, u.light.xyz), 0.0);
-    let shading = u.material.w + u.params.x * diffuse;
-    let half = normalize(u.light.xyz + to_eye);
-    let spec = u.params.y * pow(max(dot(n, half), 0.0), u.params.z);
+    let diffuse = studio_diffuse(n);
+    let spec_color = fresnel_specular_color(n, to_eye);
+    let specular = studio_specular(n, to_eye) * spec_color;
+    let energy = dot(spec_color, vec3<f32>(1.0 / 3.0));
 
-    return vec4<f32>(in.tint * shading + vec3<f32>(spec), 1.0);
+    return vec4<f32>(encode(in.tint * diffuse * (1.0 - energy) + specular), 1.0);
 }
 
 // A point cloud is drawn one sprite per point, each a camera-facing square
@@ -291,17 +375,15 @@ fn fs_point(in: PointOut) -> @location(0) vec4<f32> {
         discard;
     }
 
-    // Same lighting as a triangle, using the normal the host supplied: the
-    // file's own when it has one, otherwise the direction the point sits in
-    // relative to the model centre.
+    // The same studio rig a triangle shades with, diffuse only: a disc a few
+    // pixels across has no room for a highlight to live in. The normal is the
+    // one the host supplied: the file's own when it has one, otherwise the
+    // direction the point sits in relative to the model centre.
     let geometric = normalize(in.normal);
     let to_eye = normalize(u.eye.xyz - in.model_pos);
     let n = select(-geometric, geometric, dot(geometric, to_eye) >= 0.0);
 
-    let diffuse = max(dot(n, u.light.xyz), 0.0);
-    let shading = u.material.w + u.params.x * diffuse;
-
-    return vec4<f32>(in.color * shading, 1.0);
+    return vec4<f32>(encode(in.color * studio_diffuse(n)), 1.0);
 }
 
 // A single oversized triangle covering the viewport, so the backdrop gets the
@@ -323,7 +405,7 @@ fn fs_backdrop(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32>
     var color = mix(u.bg_top.rgb, u.bg_bottom.rgb, position.y / size.y);
 
     let centered = vec2<f32>(position.x / size.x, position.y / size.y) * 2.0 - vec2<f32>(1.0, 1.0);
-    let vignette = min(dot(centered, centered) * 0.5, 1.0) * u.params.w;
+    let vignette = min(dot(centered, centered) * 0.5, 1.0) * u.params.z;
     color = mix(color, u.bg_bottom.rgb, vignette);
 
     return vec4<f32>(color, 1.0);

@@ -15,12 +15,14 @@
 //! 3. triangles are near-plane clipped, then rasterised with an edge-function
 //!    test against a `1/z` depth buffer (`1/z` is linear in screen space, so
 //!    plain barycentric interpolation of it is exact);
-//! 4. shading is two-sided Lambert plus a Blinn-Phong highlight — flat when the
-//!    file carried no normals, Gouraud when it did.
+//! 4. shading is Blender's: the Solid viewport's studio lighting — four
+//!    camera-anchored lights with soft terminators, a dielectric specular and
+//!    a Fresnel lift at grazing angles — flat when the file carried no
+//!    normals, Gouraud when it did.
 //!
-//! The key light is fixed in model space, so orbiting the camera changes the
-//! shading across the surface: the model reads as a solid object turning,
-//! rather than a silhouette under a headlight.
+//! The lights are fixed to the camera, as Blender's are with world
+//! orientation off: orbiting keeps the same key from the viewer's upper left
+//! while the three dim fills keep the form reading from every angle.
 
 use super::formats::point_cloud::Frustum;
 use super::formats::types::{Bounds, Mesh};
@@ -47,18 +49,113 @@ const AUTO_SIZE_FLOOR: u32 = 320;
 /// Supersampling beyond 2× costs more than it is worth here.
 pub const MAX_SUPERSAMPLE: u32 = 2;
 
-/// Key light direction in model space (normalised on use): up and to the left,
-/// so the default camera — up and to the right — sees a lit face.
-pub const KEY_LIGHT: [f32; 3] = [-0.45, 0.78, 0.52];
+/// The studio rig Blender's Solid viewport defaults to — `BKE_studiolight_default`
+/// in Blender's `studiolight.c`, the internal "Default" preset, copied
+/// verbatim: one key light from the viewer's upper left carrying almost all
+/// the diffuse, and three dim fills (a rim behind, a fill above, a kick below)
+/// whose job is specular and keeping the form legible from any orbit angle.
+/// The directions are view space — x right, y up, z into the screen — with the
+/// key light's z sign turned from Blender's toward-viewer convention to ours.
+pub const STUDIO_LIGHTS: [StudioLight; 4] = [
+    // The rim: behind the object, half-wrapped so edges keep a sliver of light.
+    StudioLight {
+        direction: [-0.352546, 0.170931, 0.920051],
+        wrap: 0.526620,
+        diffuse: [0.033103; 3],
+        specular: [0.266761; 3],
+    },
+    // The key: the only strong light, from the viewer's upper left.
+    StudioLight {
+        direction: [-0.408163, 0.346939, -0.844415],
+        wrap: 0.0,
+        diffuse: [0.521083, 0.538226, 0.538226],
+        specular: [0.599030; 3],
+    },
+    // The fill: above and to the right, behind the object plane.
+    StudioLight {
+        direction: [0.521739, 0.826087, -0.212999],
+        wrap: 0.478261,
+        diffuse: [0.038403, 0.034357, 0.049530],
+        specular: [0.106102, 0.125981, 0.158523],
+    },
+    // The kick: below and to the right, behind.
+    StudioLight {
+        direction: [0.624519, -0.562067, 0.542269],
+        wrap: 0.200000,
+        diffuse: [0.090838, 0.082080, 0.072255],
+        specular: [0.106535, 0.084771, 0.066080],
+    },
+];
+
+/// One studio light, in view space: `direction` points toward the light,
+/// `wrap` is the terminator softness Blender calls "smooth", and the two
+/// colours are the light's diffuse and specular strengths.
+#[derive(Debug, Clone, Copy)]
+pub struct StudioLight {
+    pub direction: [f32; 3],
+    pub wrap: f32,
+    pub diffuse: [f32; 3],
+    pub specular: [f32; 3],
+}
+
+/// One studio light turned into model space — the shading math's space, where
+/// the normals live.
+#[derive(Debug, Clone, Copy)]
+pub struct ModelLight {
+    pub direction: [f32; 3],
+    pub wrap: f32,
+    pub diffuse: [f32; 3],
+    pub specular: [f32; 3],
+}
+
+/// The rig for one camera: the view-space lights ride the camera's basis into
+/// model space. The basis is orthonormal, so the inverse is its transpose and
+/// the light directions stay unit.
+///
+/// Anchoring the rig to the camera is Blender's own behaviour with world
+/// orientation off: orbiting keeps the key light on the viewer's upper left
+/// instead of swinging the model through a fixed beam.
+pub fn model_space_lights(framing: &Framing) -> [ModelLight; 4] {
+    let mut lights = [ModelLight {
+        direction: [0.0; 3],
+        wrap: 0.0,
+        diffuse: [0.0; 3],
+        specular: [0.0; 3],
+    }; 4];
+    for (slot, light) in STUDIO_LIGHTS.into_iter().enumerate() {
+        let direction = add(
+            add(
+                scale(framing.right, light.direction[0]),
+                scale(framing.up, light.direction[1]),
+            ),
+            scale(framing.forward, light.direction[2]),
+        );
+        lights[slot] = ModelLight {
+            direction: normalize(direction),
+            wrap: light.wrap,
+            diffuse: light.diffuse,
+            specular: light.specular,
+        };
+    }
+    lights
+}
+
+/// How rough the studio lighting shades the surface: Blender's fresh Principled
+/// BSDF, a medium-rough dielectric. A file's glTF factors are already flattened
+/// into its vertex colours, and without its textures the per-material roughness
+/// is usually the default anyway, so the lighting reads this until materials
+/// carry their own roughness. Metals are out with it: a metal's specular is
+/// its base colour, which the flattened vertices do not keep separate.
+pub const MATERIAL_ROUGHNESS: f32 = 0.5;
+/// Dielectric reflectance at normal incidence — where a non-metal's specular
+/// colour starts.
+pub const DIELECTRIC_F0: f32 = 0.05;
+
 /// Background gradient: brighter at the top, with a soft corner vignette.
 pub const BG_TOP: [f32; 3] = [0.965, 0.969, 0.976];
 pub const BG_BOTTOM: [f32; 3] = [0.869, 0.882, 0.898];
 /// Neutral cool-grey surface.
 pub const MATERIAL: [f32; 3] = [0.600, 0.645, 0.710];
-pub const AMBIENT: f32 = 0.30;
-pub const DIFFUSE: f32 = 0.70;
-pub const SPECULAR: f32 = 0.20;
-pub const SHININESS: f32 = 40.0;
 /// Fraction of the image the corner vignette darkens by.
 pub const VIGNETTE: f32 = 0.35;
 /// Radius of one point sprite, in pixels of the final image. Both renderers
@@ -751,6 +848,74 @@ fn fit_distance() -> f32 {
     FIT_MARGIN / (FOV_DEG.to_radians() * 0.5).sin()
 }
 
+/// Blender workbench's `wrapped_lighting`: a diffuse term whose terminator the
+/// light's `wrap` softens. The dot is deliberately unclamped — the wrap is
+/// what folds light around past the horizon.
+fn wrapped_light(nl: f32, wrap: f32) -> f32 {
+    let denom = (wrap + 1.0) * (wrap + 1.0);
+    ((nl + wrap) / denom).max(0.0).min(1.0)
+}
+
+/// The diffuse half of the studio lighting, summed over the four lights: a
+/// colour-free light sum a surface colour multiplies. Mirrors
+/// `get_world_lighting`'s diffuse loop in Blender's workbench.
+fn studio_diffuse(normal: [f32; 3], lights: &[ModelLight; 4]) -> [f32; 3] {
+    let mut sum = [0.0f32; 3];
+    for light in lights {
+        let lit = wrapped_light(dot(light.direction, normal), light.wrap);
+        for (channel, value) in sum.iter_mut().zip(light.diffuse) {
+            *channel += lit * value;
+        }
+    }
+    sum
+}
+
+/// The specular half, per surface point: the normalized-Blinn term each light
+/// contributes, blended toward a wrapped "environment" term by the light's
+/// wrap squared, then coloured by the Fresnel-lifted dielectric. Returns the
+/// specular light and the energy it takes out of the diffuse — Blender's
+/// single-knob conservation between the two halves of one answer.
+fn studio_specular(normal: [f32; 3], to_eye: [f32; 3], lights: &[ModelLight; 4]) -> ([f32; 3], f32) {
+    // The mirror direction the environment term reads: where a perfect
+    // reflector would send the view ray.
+    let mirror = sub(scale(normal, 2.0 * dot(normal, to_eye)), to_eye);
+    let mut sum = [0.0f32; 3];
+    for light in lights {
+        let half = normalize(add(light.direction, to_eye));
+        let spec_angle = dot(half, normal).max(0.0).min(1.0);
+        let nl = dot(light.direction, normal).max(0.0).min(1.0);
+        // A wrapped light is a bigger, softer light: its gloss shrinks and its
+        // highlight widens accordingly.
+        let gloss = (1.0 - MATERIAL_ROUGHNESS) * (1.0 - light.wrap);
+        let shininess = (10.0 * gloss + 1.0).exp2();
+        let mut s = spec_angle.powf(shininess) * nl * (shininess * 0.125 + 1.0);
+        // The environment stand-in: a wrapped term on the mirror direction,
+        // mixed in by the wrap squared — Blender's cheap stand-in for the IBL
+        // a rougher surface would blur the highlight into.
+        let env_wrap = light.wrap + (1.0 - light.wrap) * MATERIAL_ROUGHNESS;
+        let env = wrapped_light(dot(light.direction, mirror), env_wrap);
+        let blend = light.wrap * light.wrap;
+        s = s * (1.0 - blend) + env * blend;
+        for (channel, value) in sum.iter_mut().zip(light.specular) {
+            *channel += s * value;
+        }
+    }
+    // The Fresnel approximation Blender's fast path uses: the specular colour
+    // lifts toward white at grazing angles, the less the rougher the surface.
+    let nv = dot(normal, to_eye).max(0.0).min(1.0);
+    let fresnel = (-8.35 * nv).exp2() * (1.0 - MATERIAL_ROUGHNESS);
+    let spec_color = [DIELECTRIC_F0 + fresnel * (1.0 - DIELECTRIC_F0); 3];
+    let energy = (spec_color[0] + spec_color[1] + spec_color[2]) / 3.0;
+    (
+        [
+            sum[0] * spec_color[0],
+            sum[1] * spec_color[1],
+            sum[2] * spec_color[2],
+        ],
+        energy,
+    )
+}
+
 /// Rasterise into the scratch buffers, background included.
 ///
 /// The buffers are resized in place: a frame that matches the last one pays
@@ -815,7 +980,7 @@ fn paint(
         view.push(framing.to_view(*p));
     }
 
-    let light = normalize(KEY_LIGHT);
+    let lights = model_space_lights(&framing);
     let eye = framing.eye;
     let (near, _) = framing.depth_range();
     let vertex_count = mesh.positions.len();
@@ -863,8 +1028,10 @@ fn paint(
                 continue;
             }
             let shaded_face = if facing_away { neg(face) } else { face };
-            let half = normalize(add(light, to_camera));
-            let spec = SPECULAR * dot(shaded_face, half).max(0.0).powf(SHININESS);
+            // The specular is per face — the same granularity the highlight had
+            // before — because interpolating it per vertex would smear it over
+            // the whole triangle and lose the very tightness a highlight is.
+            let (spec, spec_energy) = studio_specular(shaded_face, to_camera, &lights);
 
             let mut corners = [Vertex::default(); 3];
             for (slot, index) in [i0, i1, i2].into_iter().enumerate() {
@@ -895,9 +1062,16 @@ fn paint(
                     } else {
                         MATERIAL
                     });
+                // The light sum rides the vertices (Gouraud), and hands the
+                // specular's share of the energy back to the diffuse here —
+                // a per-face constant, so it scales the corners for free.
+                let mut i = studio_diffuse(normal, &lights);
+                for channel in &mut i {
+                    *channel *= 1.0 - spec_energy;
+                }
                 corners[slot] = Vertex {
                     p: view[index],
-                    i: AMBIENT + DIFFUSE * dot(normal, light).max(0.0),
+                    i,
                     c,
                 };
             }
@@ -934,8 +1108,8 @@ fn paint_points(
     height: HeightField,
 ) {
     let (near, _) = target.framing.depth_range();
+    let lights = model_space_lights(&target.framing);
     let eye = target.framing.eye_in_model_space();
-    let light = normalize(KEY_LIGHT);
     let step = (1.0f32 / quality).round().max(1.0) as usize;
 
     for (index, position) in mesh.positions.iter().enumerate() {
@@ -957,16 +1131,18 @@ fn paint_points(
         } else {
             geometric
         };
-        let intensity = AMBIENT + DIFFUSE * dot(normal, light).max(0.0);
+        // The same studio rig the triangles shade with, diffuse only: a disc
+        // a few pixels across has no room for a highlight to live in.
+        let light_sum = studio_diffuse(normal, &lights);
         // Field colouring wins over the file's own colours; that is the whole
         // point of switching it on.
         let base = height
             .tint_at(&Sample::of(mesh, index, geometric))
             .unwrap_or_else(|| base_color(mesh, index));
         let rgb = [
-            base[0] * intensity,
-            base[1] * intensity,
-            base[2] * intensity,
+            base[0] * light_sum[0],
+            base[1] * light_sum[1],
+            base[2] * light_sum[2],
         ];
         target.point(view, radius, rgb);
     }
@@ -979,20 +1155,21 @@ fn paint_points(
 /// a lit volume instead of a flat silhouette. A point exactly at the centre
 /// has no such direction, so it is lit head-on.
 pub fn point_normal(mesh: &Mesh, index: usize) -> [f32; 3] {
+    const FALLBACK: [f32; 3] = [0.0, 0.0, 1.0];
     if mesh.has_vertex_normals() {
         let n = normalize(mesh.normals[index]);
         return if n == [0.0; 3] {
-            normalize(KEY_LIGHT)
+            FALLBACK
         } else {
             n
         };
     }
     let Some(position) = mesh.positions.get(index) else {
-        return normalize(KEY_LIGHT);
+        return FALLBACK;
     };
     let direction = normalize(sub(*position, mesh.bounds.center()));
     if direction == [0.0; 3] {
-        normalize(KEY_LIGHT)
+        FALLBACK
     } else {
         direction
     }
@@ -1057,13 +1234,19 @@ impl Target<'_> {
                     continue; // Hidden behind whatever is already there.
                 }
                 self.depth[index] = inv_z;
-                self.colors[index] = rgb;
+                // The sprite's shading is scene-linear, like a triangle's: the
+                // display transform lands on the written pixel here too.
+                self.colors[index] = [
+                    encode_channel(rgb[0]),
+                    encode_channel(rgb[1]),
+                    encode_channel(rgb[2]),
+                ];
             }
         }
     }
 
     /// Rasterise one projected triangle with an edge-function test.
-    fn triangle(&mut self, a: Vertex, b: Vertex, c: Vertex, spec: f32) {
+    fn triangle(&mut self, a: Vertex, b: Vertex, c: Vertex, spec: [f32; 3]) {
         let (a, b, c) = (self.project(a), self.project(b), self.project(c));
         let area = edge(a.x, a.y, b.x, b.y, c.x, c.y);
         if area.abs() < 1e-9 {
@@ -1103,24 +1286,40 @@ impl Target<'_> {
                     continue; // Hidden behind whatever is already there.
                 }
                 self.depth[index] = inv_z;
-                let intensity = w0 * a.i + w1 * b.i + w2 * c.i;
+                let intensity = [
+                    w0 * a.i[0] + w1 * b.i[0] + w2 * c.i[0],
+                    w0 * a.i[1] + w1 * b.i[1] + w2 * c.i[1],
+                    w0 * a.i[2] + w1 * b.i[2] + w2 * c.i[2],
+                ];
+                // The shading is scene-linear — the studio lights and the
+                // file's colours both are — so the display transform lands
+                // here, on the assembled pixel, where Blender's does.
                 self.colors[index] = [
-                    (w0 * a.c[0] + w1 * b.c[0] + w2 * c.c[0]) * intensity + spec,
-                    (w0 * a.c[1] + w1 * b.c[1] + w2 * c.c[1]) * intensity + spec,
-                    (w0 * a.c[2] + w1 * b.c[2] + w2 * c.c[2]) * intensity + spec,
+                    encode_channel(
+                        (w0 * a.c[0] + w1 * b.c[0] + w2 * c.c[0]) * intensity[0] + spec[0],
+                    ),
+                    encode_channel(
+                        (w0 * a.c[1] + w1 * b.c[1] + w2 * c.c[1]) * intensity[1] + spec[1],
+                    ),
+                    encode_channel(
+                        (w0 * a.c[2] + w1 * b.c[2] + w2 * c.c[2]) * intensity[2] + spec[2],
+                    ),
                 ];
             }
         }
     }
 }
 
-/// A view-space vertex; `i` is the shading intensity and `c` the base colour,
-/// both carried through clipping and interpolated per pixel.
+/// A view-space vertex; `i` is the lighting's colour-free light sum and `c`
+/// the base colour, both carried through clipping and interpolated per pixel.
 #[derive(Clone, Copy, Default)]
 struct Vertex {
     /// x right, y up, z forward.
     p: [f32; 3],
-    i: f32,
+    /// The studio lights' diffuse sum, with the specular's energy share
+    /// already taken out. Three channels because the rig's lights are
+    /// coloured, if only slightly.
+    i: [f32; 3],
     /// Base surface colour: the material or a height band.
     c: [f32; 3],
 }
@@ -1132,7 +1331,7 @@ struct ScreenVertex {
     y: f32,
     /// `1/z`, linear in screen space and larger when nearer.
     inv_z: f32,
-    i: f32,
+    i: [f32; 3],
     c: [f32; 3],
 }
 
@@ -1159,7 +1358,11 @@ fn clip_near(triangle: [Vertex; 3], near: f32, out: &mut [Vertex; 4]) -> usize {
             let t = (near - current.p[2]) / (next.p[2] - current.p[2]);
             out[count] = Vertex {
                 p: lerp3(current.p, next.p, t),
-                i: current.i + (next.i - current.i) * t,
+                i: [
+                    current.i[0] + (next.i[0] - current.i[0]) * t,
+                    current.i[1] + (next.i[1] - current.i[1]) * t,
+                    current.i[2] + (next.i[2] - current.i[2]) * t,
+                ],
                 c: [
                     current.c[0] + (next.c[0] - current.c[0]) * t,
                     current.c[1] + (next.c[1] - current.c[1]) * t,
@@ -1387,7 +1590,7 @@ fn downsample(src: &[[f32; 3]], sw: usize, sh: usize, dw: usize, dh: usize) -> V
     out
 }
 
-/// Quantise the linear buffer into BGRA bytes, fully opaque.
+/// Quantise the display-space buffer into BGRA bytes, fully opaque.
 fn to_bgra(colors: &[[f32; 3]]) -> Vec<u8> {
     let mut out = Vec::with_capacity(colors.len() * 4);
     for c in colors {
@@ -1399,9 +1602,43 @@ fn to_bgra(colors: &[[f32; 3]]) -> Vec<u8> {
     out
 }
 
-/// Clamp and scale one linear channel to a byte.
+/// Clamp and scale one display-space channel to a byte.
 fn to_byte(value: f32) -> u8 {
     (value.clamp(0.0, 1.0) * 255.0 + 0.5) as u8
+}
+
+/// The scene-linear → sRGB display transform, precomputed: entry `i` is the
+/// encoded channel value for linear input `i / 4095`.
+///
+/// Blender shades in scene-linear and converts on the way to the screen — its
+/// studio-light numbers are linear intensities, and so are a glTF file's
+/// colours. The shading result is therefore encoded where the shading is
+/// written, exactly where Blender's display transform sits, which keeps the
+/// depth buffer, the eye-dome pass and the box filter working on the same
+/// display-space values they always did. 4096 bins hold the quantised output
+/// within one LSB of the exact curve, and a table beats a `powf` per channel
+/// per pixel in the rasteriser's hot loop.
+fn encode_lut() -> &'static [f32; 4096] {
+    static LUT: std::sync::OnceLock<[f32; 4096]> = std::sync::OnceLock::new();
+    LUT.get_or_init(|| {
+        let mut table = [0f32; 4096];
+        for (entry, value) in table.iter_mut().enumerate() {
+            let x = entry as f32 / 4095.0;
+            *value = if x <= 0.0031308 {
+                12.92 * x
+            } else {
+                1.055 * x.powf(1.0 / 2.4) - 0.055
+            };
+        }
+        table
+    })
+}
+
+/// Encode one scene-linear channel for the display-space buffer.
+fn encode_channel(value: f32) -> f32 {
+    let lut = encode_lut();
+    let index = (value.clamp(0.0, 1.0) * 4095.0).round() as usize;
+    lut[index]
 }
 
 /// Fold an angle into `-π..π` so repeated orbiting cannot drift.
@@ -2423,10 +2660,10 @@ mod tests {
         );
     }
 
-    /// Two points on the same sight line, seen head-on. The nearer one is lit
-    /// by its outward normal, the far one faces away from the key light and
-    /// shades at ambient only, so the pixel between them tells which one won
-    /// the depth test.
+    /// Two points on the same sight line, distinguishable by colour alone —
+    /// the studio rig shades both with the same camera-facing normal, so the
+    /// centre pixel's colour, not its brightness, says which one won the
+    /// depth test.
     #[test]
     fn points_are_depth_tested() {
         let axis_on = Camera {
@@ -2435,16 +2672,16 @@ mod tests {
             zoom: 1.0,
             pan: [0.0, 0.0],
         };
-        let mesh = cloud(&[[0.0, 0.0, 1.0], [0.0, 0.0, -1.0]]);
+        let mesh = colored_cloud(
+            &[[0.0, 0.0, 1.0], [0.0, 0.0, -1.0]],
+            &[[255, 0, 0], [0, 0, 255]],
+        );
         let frame = render(&mesh, &axis_on, 64, 64, 1, 1.0);
         let centre = frame.pixel(32, 32);
-
-        let near = MATERIAL[1] * (AMBIENT + DIFFUSE * dot(normalize(KEY_LIGHT), [0.0, 0.0, 1.0]));
-        let far = MATERIAL[1] * AMBIENT;
-        let blue = centre[0] as f32 / 255.0;
+        // BGRA: the nearer point is the red one.
         assert!(
-            (blue - near).abs() < (blue - far).abs(),
-            "the nearer point must win: pixel {blue} vs near {near} / far {far}"
+            centre[2] > centre[0] + centre[1],
+            "the nearer point must win the depth test: pixel {centre:?}"
         );
     }
 
@@ -2454,8 +2691,9 @@ mod tests {
         assert!(!mesh.has_vertex_normals());
         assert_eq!(point_normal(&mesh, 0), [1.0, 0.0, 0.0]);
         assert_eq!(point_normal(&mesh, 2), [-1.0, 0.0, 0.0]);
-        // The centre point has no direction of its own: lit head-on.
-        assert_eq!(point_normal(&mesh, 1), normalize(KEY_LIGHT));
+        // The centre point has no direction of its own: any unit direction
+        // would do, and it falls to the fixed one.
+        assert_eq!(point_normal(&mesh, 1), [0.0, 0.0, 1.0]);
     }
 
     #[test]
@@ -2551,10 +2789,11 @@ mod tests {
 
         let frame = render(&mesh, &Camera::default(), 64, 64, 1, 1.0);
         // BGRA: a red point leaves the green and blue channels dark, where a
-        // material-shaded one would be a grey-blue.
+        // material-shaded one would be a grey-blue. The exact red depends on
+        // the lighting; dominance is the part that must not drift.
         let centre = frame.pixel(32, 32);
         assert!(
-            centre[2] > 200 && centre[0] < 40 && centre[1] < 40,
+            centre[2] > 80 && centre[2] > centre[0] && centre[2] > centre[1],
             "expected a red point, got {centre:?}"
         );
 

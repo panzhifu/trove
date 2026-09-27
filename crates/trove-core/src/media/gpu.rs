@@ -15,13 +15,26 @@
 
 use super::height_color::{HeightUniforms, RAMP_STOPS};
 use super::render3d::{
-    AMBIENT, BG_BOTTOM, BG_TOP, DIFFUSE, EDL_STRENGTH, Framing, KEY_LIGHT, MATERIAL, POINT_RADIUS,
-    SHININESS, SPECULAR, VIGNETTE,
+    BG_BOTTOM, BG_TOP, EDL_STRENGTH, Framing, MATERIAL, MATERIAL_ROUGHNESS, POINT_RADIUS,
+    VIGNETTE, model_space_lights,
 };
 
-/// Bytes of [`Uniforms`]: one `mat4x4<f32>`, ten `vec4<f32>` and the colour
-/// scale's stop table.
-pub const UNIFORM_SIZE: usize = 64 + 10 * 16 + RAMP_STOPS * 16;
+/// Bytes of [`Uniforms`]: one `mat4x4<f32>`, twenty-one `vec4<f32>`s (two
+/// scalars' worth, four lights of three each, six more) and the colour scale's
+/// stop table.
+pub const UNIFORM_SIZE: usize = 64 + 21 * 16 + RAMP_STOPS * 16;
+
+/// One studio light as the shader reads it: direction plus wrap, then the
+/// light's diffuse and specular colours.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LightUniform {
+    /// xyz = direction toward the light, in model space (unit); w = wrap.
+    pub direction_wrap: [f32; 4],
+    /// rgb = the light's diffuse colour.
+    pub diffuse: [f32; 4],
+    /// rgb = the light's specular colour.
+    pub specular: [f32; 4],
+}
 
 /// The uniform block read by the model and backdrop shaders.
 ///
@@ -31,12 +44,15 @@ pub const UNIFORM_SIZE: usize = 64 + 10 * 16 + RAMP_STOPS * 16;
 pub struct Uniforms {
     /// Model space → clip space, column-major.
     pub view_proj: [[f32; 4]; 4],
-    /// Key light direction (normalised), `w` unused.
-    pub light: [f32; 4],
-    /// Base surface colour, `w` = ambient.
+    /// rgb = the flat material colour; `w` unused.
     pub material: [f32; 4],
-    /// `x` = diffuse amount, `y` = specular amount, `z` = shininess.
+    /// x = material roughness, z = vignette strength; `y`/`w` unused.
     pub params: [f32; 4],
+    /// The four studio lights, turned into model space for this frame's
+    /// camera — the rig is anchored to the viewer, as Blender's is, so the
+    /// host rides it through the basis once instead of the shader doing it
+    /// per pixel.
+    pub lights: [LightUniform; 4],
     /// `x` = point sprite radius in pixels, `y` = eye-dome lighting strength.
     /// `z` and `w` are the depth-to-log-depth constants (`z_scale`, `z_bias`)
     /// the point-cloud post pass uses to rebuild view depth from the depth
@@ -64,7 +80,6 @@ pub struct Uniforms {
 impl Uniforms {
     /// Build the block for one frame.
     pub fn new(framing: &Framing, viewport: (u32, u32)) -> Self {
-        let light = normalize3(KEY_LIGHT);
         let eye = framing.eye_in_model_space();
         // Same constants `render3d`'s projection is built from: depth is affine
         // in `1/w`, so these turn a depth-buffer value back into a view
@@ -74,9 +89,13 @@ impl Uniforms {
         let z_bias = -far * near / (far - near);
         Self {
             view_proj: framing.view_projection(),
-            light: [light[0], light[1], light[2], 0.0],
-            material: [MATERIAL[0], MATERIAL[1], MATERIAL[2], AMBIENT],
-            params: [DIFFUSE, SPECULAR, SHININESS, VIGNETTE],
+            material: [MATERIAL[0], MATERIAL[1], MATERIAL[2], 0.0],
+            params: [MATERIAL_ROUGHNESS, 0.0, VIGNETTE, 0.0],
+            lights: model_space_lights(framing).map(|light| LightUniform {
+                direction_wrap: [light.direction[0], light.direction[1], light.direction[2], light.wrap],
+                diffuse: [light.diffuse[0], light.diffuse[1], light.diffuse[2], 0.0],
+                specular: [light.specular[0], light.specular[1], light.specular[2], 0.0],
+            }),
             params2: [POINT_RADIUS, EDL_STRENGTH, z_scale, z_bias],
             eye: [eye[0], eye[1], eye[2], 0.0],
             viewport: [viewport.0.max(1) as f32, viewport.1.max(1) as f32, 0.0, 0.0],
@@ -112,10 +131,14 @@ impl Uniforms {
         for column in &self.view_proj {
             push(column, &mut at);
         }
+        push(&self.material, &mut at);
+        push(&self.params, &mut at);
+        for light in &self.lights {
+            push(&light.direction_wrap, &mut at);
+            push(&light.diffuse, &mut at);
+            push(&light.specular, &mut at);
+        }
         for vector in [
-            self.light,
-            self.material,
-            self.params,
             self.params2,
             self.eye,
             self.viewport,
@@ -207,16 +230,6 @@ pub fn unpack_bgra(padded: &[u8], width: u32, height: u32, order: PixelOrder) ->
     out
 }
 
-/// `[f32; 3]` normalise, mirroring the renderer's own helper.
-fn normalize3(v: [f32; 3]) -> [f32; 3] {
-    let length = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
-    if length > 1e-12 {
-        [v[0] / length, v[1] / length, v[2] / length]
-    } else {
-        [0.0; 3]
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -235,11 +248,12 @@ mod tests {
 
     #[test]
     fn the_uniform_block_is_the_size_the_shader_expects() {
-        // 64 bytes of matrix + ten vec4 + a 32-stop colour scale = 736, a
-        // multiple of 16.
-        assert_eq!(UNIFORM_SIZE, 736);
+        // 64 bytes of matrix + twenty-one vec4 (two scalars' worth, four
+        // lights of three each, and six more) + a 32-stop colour scale = 912,
+        // a multiple of 16.
+        assert_eq!(UNIFORM_SIZE, 912);
         assert_eq!(UNIFORM_SIZE % 16, 0);
-        assert_eq!(Uniforms::new(&framing(), (800, 600)).to_bytes().len(), 736);
+        assert_eq!(Uniforms::new(&framing(), (800, 600)).to_bytes().len(), 912);
     }
 
     /// The height look is the payload the viewport's panel changes, so its
@@ -266,8 +280,8 @@ mod tests {
         let float_at =
             |offset: usize| f32::from_ne_bytes(bytes[offset..offset + 4].try_into().unwrap());
 
-        // Eight vec4s follow the matrix, and the look is the ninth and tenth.
-        let coloring = 64 + 8 * 16;
+        // Nineteen vec4s follow the matrix, and the look is the twentieth.
+        let coloring = 64 + 19 * 16;
         assert_eq!(float_at(coloring), HeightMode::Ramp.index() as f32, "mode");
         assert_eq!(float_at(coloring + 4), 1.0, "axis");
         assert_eq!(float_at(coloring + 8), 0.0, "the range floor");
@@ -301,27 +315,37 @@ mod tests {
                 assert_eq!(stored, *value, "matrix [{column}][{row}]");
             }
         }
-        // Followed immediately by the light, then the material's rgb + ambient.
-        let light_at = 64;
+        // Followed immediately by the material's rgb, then the lighting
+        // parameters.
+        let material_at = 64;
         assert_eq!(
-            f32::from_ne_bytes(bytes[light_at..light_at + 4].try_into().unwrap()),
-            uniforms.light[0]
+            f32::from_ne_bytes(bytes[material_at..material_at + 4].try_into().unwrap()),
+            uniforms.material[0]
         );
-        let ambient_at = 64 + 16 + 12;
+        let roughness_at = 64 + 16;
         assert_eq!(
-            f32::from_ne_bytes(bytes[ambient_at..ambient_at + 4].try_into().unwrap()),
-            AMBIENT
+            f32::from_ne_bytes(bytes[roughness_at..roughness_at + 4].try_into().unwrap()),
+            MATERIAL_ROUGHNESS
         );
     }
 
     #[test]
     fn shading_values_are_normalised_and_shared_with_the_cpu_path() {
         let uniforms = Uniforms::new(&framing(), (320, 240));
-        let length =
-            (uniforms.light[0].powi(2) + uniforms.light[1].powi(2) + uniforms.light[2].powi(2))
-                .sqrt();
-        assert!((length - 1.0).abs() < 1e-5, "light must be a unit vector");
-        assert_eq!(uniforms.params, [DIFFUSE, SPECULAR, SHININESS, VIGNETTE]);
+        // The rig arrives in model space, one light per slot, every direction
+        // still unit after riding the camera's basis.
+        assert_eq!(uniforms.lights.len(), 4);
+        for light in &uniforms.lights {
+            let length = (light.direction_wrap[0].powi(2)
+                + light.direction_wrap[1].powi(2)
+                + light.direction_wrap[2].powi(2))
+            .sqrt();
+            assert!((length - 1.0).abs() < 1e-5, "light must be a unit vector");
+        }
+        assert_eq!(
+            uniforms.params,
+            [MATERIAL_ROUGHNESS, 0.0, VIGNETTE, 0.0]
+        );
         assert_eq!(uniforms.params2[0], POINT_RADIUS);
         assert_eq!(uniforms.params2[1], EDL_STRENGTH);
         // The GPU post pass rebuilds view depth from the depth buffer with
@@ -333,7 +357,7 @@ mod tests {
             let back = uniforms.params2[3] / (ndc - uniforms.params2[2]);
             assert!((back - distance).abs() < 1e-4, "{distance} -> {back}");
         }
-        assert_eq!(uniforms.material[3], AMBIENT);
+        assert_eq!(uniforms.material[..3], MATERIAL);
         assert_eq!(uniforms.viewport[0], 320.0);
         assert_eq!(uniforms.viewport[1], 240.0);
         assert_eq!(uniforms.background[0][..3], BG_TOP);
