@@ -268,12 +268,52 @@ pub(crate) fn checked_limit(limit: Option<u32>) -> Result<Option<u32>> {
 /// page from the window it fetches — a COUNT per page is what the total used to
 /// cost, and the answer cannot change between two pages of one session.
 pub fn count(conn: &Connection, q: &AssetQuery) -> Result<u64> {
+    let (sql, args) = count_statement(conn, q)?;
+    Ok(rows::query_count(conn, &sql, args)? as u64)
+}
+
+/// The statement [`count`] runs, and its arguments.
+///
+/// Split out for the reason `build_where` is: which side of a junction drives a
+/// count is the whole difference between 0.9 ms and 23.9 ms, and a plan is only
+/// worth having if something fails when it changes.
+///
+/// A collection is a small set of membership rows inside a large table, and a
+/// COUNT has to account for every row the clause matches — so counting from
+/// `assets` scans the whole live library and asks each row whether it is a
+/// member, while counting from the junction probes one asset per member. On a
+/// 100 000-asset library holding a 1 184-member collection that is 0.86 ms
+/// against 23.9 ms, and the gap tracks the *library's* size rather than the
+/// collection's, which is why a 5× larger library cost ×11.
+///
+/// Only the count flips. The listing keeps the `EXISTS` shape because it stops
+/// at its page: an ordered scan of `idx_assets_live_created` reaches a sparse
+/// collection's first 50 rows in 0.76 ms, where the junction-driven plan has to
+/// materialise every member and sort it (1.49 ms — and 55 ms on a tag dense
+/// enough to match 41 % of the library). Count and page are already two
+/// statements, and they want opposite plans.
+///
+/// The assets side is built `Rejecting` because the membership side has to be
+/// the one that drives: a plain `trashed_at IS NULL` matches every live row and
+/// would otherwise be priced as a scan source again.
+pub(super) fn count_statement(conn: &Connection, q: &AssetQuery) -> Result<(String, Vec<Value>)> {
+    if let Some(collection_id) = q.collection_id {
+        let mut members = q.clone();
+        members.collection_id = None;
+        let (rest, args) = where_fragment(conn, &members, WhereMode::Rejecting, 1)?;
+        let mut params = vec![Value::Text(rows::uuid(collection_id))];
+        params.extend(args);
+        return Ok((
+            format!(
+                "SELECT COUNT(*) FROM asset_collection ac \
+                 JOIN assets ON assets.id = ac.asset_id \
+                 WHERE ac.collection_id = ?1 AND {rest}"
+            ),
+            params,
+        ));
+    }
     let (where_sql, args) = build_where(conn, q, WhereMode::Driving)?;
-    Ok(rows::query_count(
-        conn,
-        &format!("SELECT COUNT(*) FROM assets {where_sql}"),
-        args,
-    )? as u64)
+    Ok((format!("SELECT COUNT(*) FROM assets {where_sql}"), args))
 }
 
 /// List assets matching the structured filters of `q`.
@@ -281,12 +321,8 @@ pub fn count(conn: &Connection, q: &AssetQuery) -> Result<u64> {
 /// Free text is not part of `q`; see [`AssetQuery`] and `build_where`.
 pub fn query(conn: &Connection, q: &AssetQuery) -> Result<Page<Asset>> {
     let limit = checked_limit(q.limit)?;
+    let total = count(conn, q)?;
     let (where_sql, args) = build_where(conn, q, WhereMode::Driving)?;
-    let total = rows::query_count(
-        conn,
-        &format!("SELECT COUNT(*) FROM assets {where_sql}"),
-        args.clone(),
-    )? as u64;
     let assets = query_items(conn, q, limit, where_sql, args)?;
     Ok(Page::new(total, assets))
 }
@@ -694,9 +730,11 @@ impl WhereMode {
 /// through an index — see [`WhereMode`].
 ///
 /// Conditions that are not plain column comparisons (`EXISTS (…)` subqueries
-/// correlated on `assets.id`, `json_extract`, the orientation and aspect-ratio
-/// `CASE`s, the `LOWER(ext)` comparison) are never index sources, so they need
-/// no prefix.
+/// correlated on `assets.id`, the orientation and aspect-ratio `CASE`s, the
+/// `LOWER(ext)` comparison) are never index sources, so they need no prefix.
+/// `assets.source_path` is the exception that proves the rule: it reads like a
+/// function call's argument but is a generated column with an index behind it,
+/// so it takes the prefix like any other indexed comparison.
 /// Escape a value destined for a `LIKE ... ESCAPE '\'` comparison, so path
 /// separators and underscores in real file names match literally.
 fn escape_like(text: &str) -> String {
@@ -759,8 +797,16 @@ pub(super) fn build_where(
         args.push(Value::Integer(fav as i64));
     }
     if let Some(prefix) = &q.source_path_prefix {
+        // The generated column, not the `json_extract` it is defined as: only
+        // the column has an index behind it (`idx_assets_source_path`), and a
+        // folder switch on a 100 000-asset library is 0.014 ms through it
+        // against 142 ms through the JSON.
+        //
+        // Which makes it an index source, so it takes `mode`'s prefix like every
+        // other one: a ranked intersection that let a folder prefix drive would
+        // scan the whole index instead of probing its candidate ids.
         conds.push(format!(
-            "json_extract(assets.extra, '$.source_path') LIKE ?{} ESCAPE '\\'",
+            "{ni}assets.source_path LIKE ?{} ESCAPE '\\'",
             args.len() + 1
         ));
         args.push(Value::Text(format!("{}%", escape_like(prefix))));
@@ -870,8 +916,12 @@ pub(super) fn build_where(
                 ));
             }
             C::Path { prefix, negate } => {
+                // The generated column, for the index behind it — see the
+                // `source_path_prefix` branch above, including why the prefix
+                // this one already carried is now load-bearing rather than a
+                // no-op on an unindexable expression.
                 conds.push(format!(
-                    "{ni}json_extract(assets.extra, '$.source_path') {} ?{} ESCAPE '\\'",
+                    "{ni}assets.source_path {} ?{} ESCAPE '\\'",
                     if *negate { "NOT LIKE" } else { "LIKE" },
                     args.len() + 1
                 ));
@@ -901,7 +951,13 @@ pub(super) fn build_where(
         // be listed and restorable on its own, and `empty_trash` enumerates
         // through here — a filter on that branch would leave 149 members' files
         // on disk forever.
-        conds.push(super::sequences::HIDDEN_FRAMES.to_string());
+        //
+        // Asked, not assumed: the clause is one index probe per row scanned, so
+        // a library that has never grouped a frame was paying it on every count
+        // and every page for nothing. See `sequences::any_hidden_frames`.
+        if super::sequences::any_hidden_frames(conn)? {
+            conds.push(super::sequences::HIDDEN_FRAMES.to_string());
+        }
     }
 
     // The placeholders are hand-numbered, so the clause has to end up using
@@ -976,13 +1032,20 @@ fn shift_placeholders(sql: &str, shift: usize) -> Result<String> {
 /// panel shows one flat row per folder a file was actually dropped into,
 /// nothing else.
 pub fn source_folders(conn: &Connection) -> Result<Vec<(String, u64)>> {
+    // The hint is not decoration. This statement visits every live row either
+    // way, so the planner prices the narrow index scan against the table scan
+    // and picks the table — 71.7 ms on a 100 000-asset library against 29.8 ms
+    // forced onto `idx_assets_source_path`, which carries the path and nothing
+    // else. `INDEXED BY` still tolerates the hidden-frame term below even though
+    // that predicate reads a column the index does not hold (10.7 ms against
+    // 15.8 ms unhinted), so the hint is safe on a library that has sequences.
     let paths: Vec<String> = rows::query_map(
         conn,
         &format!(
-            "SELECT json_extract(extra, '$.source_path') FROM assets \
-             WHERE trashed_at IS NULL AND json_extract(extra, '$.source_path') IS NOT NULL \
+            "SELECT source_path FROM assets INDEXED BY idx_assets_source_path \
+             WHERE trashed_at IS NULL AND source_path IS NOT NULL \
              AND {}",
-            super::sequences::hidden_beside("assets.id")
+            super::sequences::hidden_beside_guarded(conn, "assets.id")?
         ),
         vec![],
         |row| row.get::<_, String>(0).map_err(Error::from),

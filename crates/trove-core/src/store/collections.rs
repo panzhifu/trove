@@ -233,7 +233,7 @@ pub fn asset_ids(conn: &Connection, collection_id: Uuid) -> Result<Vec<Uuid>> {
         &format!(
             "SELECT ac.asset_id FROM asset_collection ac \
              WHERE ac.collection_id = ?1 AND {} ORDER BY ac.position ASC",
-            super::sequences::hidden_beside("ac.asset_id")
+            super::sequences::hidden_beside_guarded(conn, "ac.asset_id")?
         ),
         vec![rows::uuid(collection_id).into()],
         |row| req_uuid(row, 0),
@@ -247,7 +247,7 @@ pub fn count_assets(conn: &Connection, collection_id: Uuid) -> Result<u64> {
         &format!(
             "SELECT COUNT(*) FROM asset_collection ac \
              WHERE ac.collection_id = ?1 AND {}",
-            super::sequences::hidden_beside("ac.asset_id")
+            super::sequences::hidden_beside_guarded(conn, "ac.asset_id")?
         ),
         vec![rows::uuid(collection_id).into()],
     )? as u64)

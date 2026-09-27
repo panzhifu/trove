@@ -274,7 +274,7 @@ mod tests {
         Asset, AssetKind, AssetPatch, AssetQuery, NewCollection, NewTag, Origin, Page, UsageStatus,
         now,
     };
-    use crate::store::{assets, collections, smart_collections, tags};
+    use crate::store::{assets, collections, sequences, smart_collections, tags};
     use uuid::Uuid;
 
     fn sample_asset(name: &str, kind: AssetKind) -> Asset {
@@ -644,6 +644,319 @@ mod tests {
             .unwrap();
         assert!(stats > 0, "the library opened without planner statistics");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// v19 → v20: the folder queries gain a column they can index.
+    ///
+    /// Two halves, because a store at the current version cannot be walked
+    /// backwards far enough to test the first one on itself. The step's own DDL
+    /// is run against a table that genuinely lacks the column; then a real store
+    /// is checked for what the step leaves behind — the index, the statistics
+    /// without which the planner ignores it, and a generated column that reads
+    /// `extra` rather than copying it.
+    ///
+    /// That last point is the one the assertions are about. A second copy of the
+    /// path that could drift from the JSON it came from would be worse than the
+    /// `json_extract` this replaces: the folder panel and the inspector would
+    /// disagree about where a file lives.
+    #[test]
+    fn a_v19_library_gains_the_indexed_source_path() {
+        // The step's DDL against a v19-shaped table, split on `;` the way
+        // `apply_upgrade` splits it. This is the half that has to work on a real
+        // library coming forward, and the only way to reach it: a store created
+        // by this build already has the column, so its `ALTER` can only ever
+        // answer "duplicate column name".
+        let step = schema::UPGRADES
+            .iter()
+            .find(|step| step.from == 19)
+            .expect("a v19 → v20 step");
+        let scratch = rusqlite::Connection::open_in_memory().unwrap();
+        scratch
+            .execute_batch(
+                "CREATE TABLE assets (id TEXT PRIMARY KEY, \
+                 extra TEXT NOT NULL DEFAULT '{}', trashed_at TEXT);
+                 INSERT INTO assets (id, extra) \
+                 VALUES ('a', '{\"source_path\":\"/photos/roll one/a.png\"}');",
+            )
+            .unwrap();
+        for statement in step.sql.split(';') {
+            let statement = statement.trim();
+            if !statement.is_empty() {
+                scratch.execute_batch(statement).unwrap();
+            }
+        }
+        (step.data.unwrap())(&scratch).unwrap();
+        let lifted: String = scratch
+            .query_row("SELECT source_path FROM assets WHERE id = 'a'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            lifted, "/photos/roll one/a.png",
+            "the added column has to read the JSON already on disk"
+        );
+
+        let dir = std::env::temp_dir().join(format!("trove-schema-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("library.db");
+
+        let before = {
+            let mut asset = sample_asset("before.png", AssetKind::Image);
+            asset.origin = Origin::Linked;
+            asset.rel_path = None;
+            asset.facts.source_path = Some("/photos/2025/old roll/before.png".into());
+            asset
+        };
+        {
+            let store = Store::open(&path).unwrap();
+            assets::insert(store.conn(), &before).unwrap();
+            // Back the library up one step: no index, version on record behind.
+            store
+                .conn()
+                .execute_batch(
+                    "DROP INDEX IF EXISTS idx_assets_source_path;
+                     PRAGMA user_version = 19;",
+                )
+                .unwrap();
+        }
+
+        let store = Store::open(&path).unwrap();
+        assert_eq!(store.user_version().unwrap(), schema::SCHEMA_VERSION);
+        let indexed: String = store
+            .conn()
+            .query_row(
+                "SELECT name FROM sqlite_master WHERE type = 'index' AND name = ?1",
+                rusqlite::params!["idx_assets_source_path"],
+                |row| row.get(0),
+            )
+            .unwrap_or_default();
+        assert_eq!(
+            indexed, "idx_assets_source_path",
+            "the upgrade did not create the folder index"
+        );
+        let stats: i64 = store
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'sqlite_stat1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            stats > 0,
+            "the upgrade created an index the planner has no statistics for"
+        );
+
+        // A row written before the step ran is reachable through the column.
+        let found = store
+            .conn()
+            .query_row(
+                "SELECT source_path FROM assets WHERE id = ?1",
+                rusqlite::params![before.id.to_string()],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap();
+        assert_eq!(found, "/photos/2025/old roll/before.png");
+
+        // And it keeps tracking `extra`: rewriting the JSON moves the column
+        // with it, because there is nothing stored to go stale.
+        let mut facts = before.facts.clone();
+        facts.source_path = Some("/photos/2026/new roll/before.png".into());
+        assets::update_facts(store.conn(), before.id, &facts).unwrap();
+        let moved = store
+            .conn()
+            .query_row(
+                "SELECT source_path FROM assets WHERE id = ?1",
+                rusqlite::params![before.id.to_string()],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap();
+        assert_eq!(moved, "/photos/2026/new roll/before.png");
+
+        // Replaying the step is harmless: the `ALTER` answers "duplicate column
+        // name", which `apply_upgrade` takes as the redo it is, and the index
+        // carries `IF NOT EXISTS`.
+        store
+            .conn()
+            .execute_batch("PRAGMA user_version = 19;")
+            .unwrap();
+        drop(store);
+        let replayed = Store::open(&path).unwrap();
+        assert_eq!(replayed.user_version().unwrap(), schema::SCHEMA_VERSION);
+        assert_eq!(
+            replayed
+                .conn()
+                .query_row(
+                    "SELECT source_path FROM assets WHERE id = ?1",
+                    rusqlite::params![before.id.to_string()],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "/photos/2026/new roll/before.png"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The plan is the product of the generated column, so it is what gets
+    /// asserted: a column no index can serve is the `json_extract` it replaced.
+    ///
+    /// Measured on a 100 000-asset library, one folder's prefix: 142 ms for
+    /// `json_extract(extra, '$.source_path') LIKE`, which scans every live row,
+    /// against 0.014 ms for the same predicate on the column, which SQLite
+    /// rewrites into a range `SEARCH`. The `COLLATE NOCASE` on the index is what
+    /// buys the rewrite — `LIKE` is case-insensitive unless
+    /// `PRAGMA case_sensitive_like` is switched on, and SQLite only turns a
+    /// `LIKE 'prefix%'` into a range scan when the index collation matches.
+    #[test]
+    fn a_folder_filter_is_served_by_the_source_path_index() {
+        let store = Store::in_memory().unwrap();
+        for i in 0..2000 {
+            let mut asset = sample_asset(&format!("a{i:05}.png"), AssetKind::Image);
+            asset.origin = Origin::Linked;
+            asset.rel_path = None;
+            asset.facts.source_path =
+                Some(format!("/photos/2026/roll-{:04}/a{i:05}.png", i % 160));
+            assets::insert(store.conn(), &asset).unwrap();
+        }
+        store.ensure_statistics().unwrap();
+
+        let plan_of = |sql: &str, arg: &str| -> String {
+            store
+                .conn()
+                .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                .and_then(|mut stmt| {
+                    let rows = stmt.query_map(rusqlite::params![arg], |r| r.get::<_, String>(3))?;
+                    Ok(rows.filter_map(|r| r.ok()).collect::<Vec<_>>().join("; "))
+                })
+                .unwrap()
+        };
+        let filter = "SELECT COUNT(*) FROM assets WHERE trashed_at IS NULL \
+                      AND assets.source_path LIKE ?1 ESCAPE '\\'";
+        let plan = plan_of(filter, "/photos/2026/roll-0042%");
+        assert!(
+            plan.contains("idx_assets_source_path"),
+            "the folder filter should be a range search, got {plan}"
+        );
+
+        // The rewrite is a range scan, so it has to answer the same rows the
+        // JSON predicate does — including that it stays case-insensitive, which
+        // is what `LIKE` always meant here and what `COLLATE NOCASE` preserves.
+        let via_column: i64 = store
+            .conn()
+            .query_row(filter, rusqlite::params!["/PHOTOS/2026/roll-0042%"], |r| r.get(0))
+            .unwrap();
+        let via_json: i64 = store
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM assets WHERE trashed_at IS NULL \
+                 AND json_extract(extra, '$.source_path') LIKE ?1 ESCAPE '\\'",
+                rusqlite::params!["/PHOTOS/2026/roll-0042%"],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(via_column, via_json);
+        assert_eq!(
+            via_column,
+            (0..2000).filter(|i| i % 160 == 42).count() as i64,
+            "one roll of the 160 the library was built with"
+        );
+
+        // The panel that lists every folder reads the column too, and it visits
+        // every live row either way — so the index has to be forced, because the
+        // planner prices a narrow index scan against a table scan and picks the
+        // table. 71.7 ms unhinted against 29.8 ms hinted, on 100 000 assets.
+        let folders = assets::source_folders(store.conn()).unwrap();
+        assert_eq!(folders.len(), 160);
+        assert!(folders.iter().all(|(_, count)| *count > 0));
+    }
+
+    /// A collection's total is read from its membership rows, never from the
+    /// library.
+    ///
+    /// `COUNT` accounts for every row the clause matches, so counting from
+    /// `assets` scans the whole live library and asks each row whether it is a
+    /// member. That is what made the number grow with the library rather than
+    /// with the collection — a 1 184-member collection cost 15.3 ms in a
+    /// 20 000-asset library and 172 ms in a 100 000-asset one, against 0.4 ms
+    /// and 0.9 ms driven from the junction.
+    ///
+    /// The listing keeps the opposite shape on purpose, so this pins the count
+    /// only: a page stops at its window, and an ordered scan of the live index
+    /// finds a sparse collection's first rows faster than materialising every
+    /// member and sorting them.
+    #[test]
+    fn a_collection_count_is_driven_by_its_memberships() {
+        let store = Store::in_memory().unwrap();
+        let collection = collections::create(
+            store.conn(),
+            &NewCollection {
+                parent_id: None,
+                name: "Roll".into(),
+                position: 0,
+            },
+        )
+        .unwrap();
+
+        let mut members = Vec::new();
+        for i in 0..600 {
+            let asset = sample_asset(&format!("m{i:04}.png"), AssetKind::Image);
+            assets::insert(store.conn(), &asset).unwrap();
+            collections::add_asset(store.conn(), collection.id, asset.id).unwrap();
+            members.push(asset);
+        }
+        // A library around the collection, so a count that scanned `assets`
+        // would have something to scan: the plan is the assertion here, and in
+        // an empty library either shape looks cheap.
+        for i in 0..1400 {
+            let asset = sample_asset(&format!("x{i:04}.png"), AssetKind::Image);
+            assets::insert(store.conn(), &asset).unwrap();
+        }
+        store.ensure_statistics().unwrap();
+
+        let q = AssetQuery {
+            collection_id: Some(collection.id),
+            ..Default::default()
+        };
+        let (sql, args) = assets::count_statement(store.conn(), &q).unwrap();
+        let plan = {
+            let mut stmt = store
+                .conn()
+                .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                .unwrap();
+            let rows = stmt
+                .query_map(rusqlite::params_from_iter(args.iter()), |r| {
+                    r.get::<_, String>(3)
+                })
+                .unwrap();
+            rows.filter_map(|r| r.ok()).collect::<Vec<_>>()
+        };
+        assert!(
+            !plan.iter().any(|step| step.contains("SCAN assets")),
+            "the count walked the library instead of the memberships: {plan:?}"
+        );
+        assert_eq!(assets::count(store.conn(), &q).unwrap(), 600);
+
+        // A trashed member leaves the count exactly as it leaves the listing —
+        // the junction drives, but the live predicate still rejects.
+        assets::set_trashed(store.conn(), members[0].id, true).unwrap();
+        assert_eq!(assets::count(store.conn(), &q).unwrap(), 599);
+
+        // And a toolbar filter on top still narrows from the membership side.
+        assets::update(
+            store.conn(),
+            members[1].id,
+            &AssetPatch {
+                rating: Some(Some(4)),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let rated = AssetQuery {
+            collection_id: Some(collection.id),
+            min_rating: Some(3),
+            ..Default::default()
+        };
+        assert_eq!(assets::count(store.conn(), &rated).unwrap(), 1);
     }
 
     /// The plan is the product here, so it is what gets asserted.
@@ -1128,18 +1441,26 @@ mod tests {
 
         // The modes differ only in the index-suppressing prefixes, so both
         // clauses select the same rows with the same arguments.
-        // The sequence clause rides on the live branch of both modes, with no
-        // prefix of its own: it is a probe against a UNIQUE index, not a table
-        // the planner could choose to drive from.
-        let hidden = " AND NOT EXISTS (SELECT 1 FROM asset_sequence_frames f \
-                      WHERE f.asset_id = assets.id AND f.position > 0)";
+        //
+        // The sequence clause is *absent* here, and that is the point of the
+        // assertion rather than an accident of an empty store: this library has
+        // never grouped a frame, so `any_hidden_frames` said no and neither mode
+        // carries a probe that cannot exclude anything. When a library does hold
+        // one the clause rides on the live branch of both modes, with no prefix
+        // of its own — it is a probe against a UNIQUE index, not a table the
+        // planner could choose to drive from. `sequences::tests` pins that half,
+        // where a listing and a count both have to lose the hidden members.
+        assert!(
+            !sequences::any_hidden_frames(store.conn()).unwrap(),
+            "a fresh store holds no sequence, so the clause must not be emitted"
+        );
         assert_eq!(
             ranked,
-            format!("WHERE +kind = ?1 AND +is_favorite = ?2 AND +trashed_at IS NULL{hidden}")
+            "WHERE +kind = ?1 AND +is_favorite = ?2 AND +trashed_at IS NULL"
         );
         assert_eq!(
             listing,
-            format!("WHERE kind = ?1 AND is_favorite = ?2 AND trashed_at IS NULL{hidden}")
+            "WHERE kind = ?1 AND is_favorite = ?2 AND trashed_at IS NULL"
         );
         assert_eq!(args.len(), listing_args.len());
 
@@ -1226,8 +1547,10 @@ mod tests {
 
         // Every condition kind in one clause: the indexable comparisons get
         // suppressed, while the terms that were never index sources — an
-        // `EXISTS` on a join table, `json_extract`, `LOWER(ext)`, the
-        // orientation `CASE` — keep their plain rendering.
+        // `EXISTS` on a join table, `LOWER(ext)`, the orientation `CASE` — keep
+        // their plain rendering. The folder term is the one to watch: it reads
+        // like a function call but is a generated column with an index behind
+        // it, so it has to come out prefixed like the others.
         let mixed = AssetQuery {
             kind: Some(AssetKind::Image),
             collection_id: Some(Uuid::new_v4()),
@@ -1243,7 +1566,7 @@ mod tests {
         assert!(clause.starts_with("WHERE +kind = ?1 AND EXISTS (SELECT 1 FROM asset_collection"));
         for expected in [
             "+is_favorite = ?3",
-            "json_extract(assets.extra, '$.source_path') LIKE ?4",
+            "+assets.source_path LIKE ?4",
             "CASE WHEN width IS NULL",
             "+rating >= ?6",
             "LOWER(ext) = LOWER(?7)",

@@ -25,12 +25,16 @@ pub struct LibraryStats {
 pub fn library_stats(conn: &rusqlite::Connection) -> Result<LibraryStats> {
     let mut stats = LibraryStats::default();
 
+    // Asked once for the three live-set counts below, which all key on the same
+    // column: a library that has never grouped a frame leaves it out of all
+    // three statements instead of paying a probe per row in each.
+    let hidden = super::sequences::hidden_beside_guarded(conn, "assets.id")?;
+
     let mut counts: [u64; 8] = [0; 8];
     {
         let mut stmt = conn.prepare(&format!(
             "SELECT kind, COUNT(*) FROM assets \
-                 WHERE trashed_at IS NULL AND {} GROUP BY kind",
-            super::sequences::hidden_beside("assets.id")
+                 WHERE trashed_at IS NULL AND {hidden} GROUP BY kind"
         ))?;
         let mut it = stmt.query([])?;
         while let Some(row) = it.next()? {
@@ -60,18 +64,14 @@ pub fn library_stats(conn: &rusqlite::Connection) -> Result<LibraryStats> {
         conn,
         &format!(
             "SELECT COALESCE(SUM(size_bytes), 0) FROM assets \
-             WHERE trashed_at IS NULL AND {}",
-            super::sequences::hidden_beside("assets.id")
+             WHERE trashed_at IS NULL AND {hidden}"
         ),
         vec![],
     )? as u64;
 
     stats.live = rows::query_count(
         conn,
-        &format!(
-            "SELECT COUNT(*) FROM assets WHERE trashed_at IS NULL AND {}",
-            super::sequences::hidden_beside("assets.id")
-        ),
+        &format!("SELECT COUNT(*) FROM assets WHERE trashed_at IS NULL AND {hidden}"),
         vec![],
     )? as u64;
     stats.trashed = rows::query_count(

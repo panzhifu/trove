@@ -172,7 +172,7 @@ pub fn count_assets(conn: &Connection, tag_id: Uuid) -> Result<u64> {
         &format!(
             "SELECT COUNT(DISTINCT at.asset_id) FROM asset_tag at \
              WHERE at.tag_id IN ({list}) AND {}",
-            super::sequences::hidden_beside("at.asset_id")
+            super::sequences::hidden_beside_guarded(conn, "at.asset_id")?
         ),
         vec![],
     )? as u64)
@@ -208,7 +208,7 @@ pub fn counts_by_tag(conn: &Connection) -> Result<std::collections::HashMap<Uuid
              FROM sub JOIN asset_tag at ON at.tag_id = sub.id \
              WHERE {} \
              GROUP BY sub.root",
-            super::sequences::hidden_beside("at.asset_id")
+            super::sequences::hidden_beside_guarded(conn, "at.asset_id")?
         ),
         vec![],
         |row| Ok((req_uuid(row, 0)?, rows::int(row, 1)? as u64)),

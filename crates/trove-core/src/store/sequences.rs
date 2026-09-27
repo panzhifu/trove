@@ -25,8 +25,44 @@ use crate::media::sequence;
 /// Applied on the live branch only. A trashed frame must list and restore on its
 /// own, and `empty_trash` enumerates through the same builder — filtering there
 /// would strand a hundred and forty-nine members' files on disk forever.
+///
+/// Every caller asks [`any_hidden_frames`] first and pushes this only when the
+/// answer is yes; that function's comment carries the measurements.
 pub const HIDDEN_FRAMES: &str = "NOT EXISTS (SELECT 1 FROM asset_sequence_frames f \
                                  WHERE f.asset_id = assets.id AND f.position > 0)";
+
+/// Whether this library holds a single hidden frame.
+///
+/// [`HIDDEN_FRAMES`] is correlated on the outer row, so it costs one index probe
+/// for every row the statement scans — and a `COUNT(*)` scans all of them. A
+/// 100 000-asset library with no sequences in it pays 10.7 ms for a clause that
+/// cannot exclude anything, against a 3.6 ms floor without it (20 000 assets:
+/// 1.5 ms against 0.37). Asking first is one statement over a table that is
+/// empty in every library that has never grouped a frame, so it costs about a
+/// microsecond and takes the whole clause off the query.
+///
+/// A guard inside the SQL — `(no hidden frames) OR NOT EXISTS (…)` — was
+/// measured too, and it is worse at both ends: an `OR` arm the planner cannot
+/// fold is re-tested per row, which leaves 4.3 ms on the empty library and
+/// costs 17 % *more* than the bare clause once half the library is hidden
+/// frames. One extra statement beats one extra branch per row.
+///
+/// The probe is not part of the statement it guards, so a sequence created
+/// between the two is missed by that one query and caught by the next. The
+/// listings already run their COUNT and their page as two statements, so this
+/// does not widen a window that was open.
+pub fn any_hidden_frames(conn: &Connection) -> Result<bool> {
+    // `LIMIT 1` on the primary key `(sequence_id, position)`: a run's second
+    // frame is a hidden one, so a library that has any sequence answers on its
+    // second row rather than after a scan.
+    let found: Option<i64> = rows::query_one(
+        conn,
+        "SELECT 1 FROM asset_sequence_frames WHERE position > 0 LIMIT 1",
+        vec![],
+        |row| rows::int(row, 0),
+    )?;
+    Ok(found.is_some())
+}
 
 /// The same rule as [`HIDDEN_FRAMES`], written against an arbitrary id column.
 ///
@@ -39,6 +75,20 @@ pub fn hidden_beside(id_column: &str) -> String {
         "NOT EXISTS (SELECT 1 FROM asset_sequence_frames f \
          WHERE f.asset_id = {id_column} AND f.position > 0)"
     )
+}
+
+/// [`hidden_beside`] behind an [`any_hidden_frames`] check, as a term that is
+/// ready to drop into a conjunction either way.
+///
+/// The counting surfaces splice this into a `format!`'d `AND {…}`, so the
+/// nothing-to-hide case has to render as SQL rather than disappear: `1` keeps
+/// the conjunction well-formed and costs the planner nothing.
+pub fn hidden_beside_guarded(conn: &Connection, id_column: &str) -> Result<String> {
+    Ok(if any_hidden_frames(conn)? {
+        hidden_beside(id_column)
+    } else {
+        "1".to_string()
+    })
 }
 
 /// What a frame belongs to, as the surfaces that show it need it.
@@ -84,7 +134,7 @@ pub fn create(conn: &Connection, ids: &[Uuid], fps: f64) -> Result<Uuid> {
     for &id in ids {
         let found: Option<(String, Option<u32>, Option<u32>)> = rows::query_one(
             conn,
-            "SELECT COALESCE(json_extract(extra, '$.source_path'), ''), width, height
+            "SELECT COALESCE(source_path, ''), width, height
              FROM assets WHERE id = ?1 AND trashed_at IS NULL",
             vec![rows::uuid(id).into()],
             |row| {
@@ -271,9 +321,9 @@ pub fn membership(conn: &Connection, asset_id: Uuid) -> Result<Option<Membership
 /// Every asset that is a member of a sequence, with its own id. Used by the
 /// import path to skip work for frames the grid will never show on its own.
 pub fn hidden_members(conn: &Connection) -> Result<Vec<Uuid>> {
-    let mut statement = conn.prepare(&format!(
-        "SELECT f.asset_id FROM asset_sequence_frames f WHERE f.position > 0 AND {HIDDEN_FRAMES}"
-    ))?;
+    let mut statement = conn.prepare(
+        "SELECT f.asset_id FROM asset_sequence_frames f WHERE f.position > 0",
+    )?;
     let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
     let mut out = Vec::new();
     for row in rows {
@@ -357,7 +407,24 @@ mod tests {
         }
         let query = crate::model::AssetQuery::default();
         assert_eq!(assets::count(conn, &query).unwrap(), 6, "before");
+        assert!(
+            !any_hidden_frames(conn).unwrap(),
+            "a library that has never grouped a frame must not be asked to filter for one"
+        );
         create(conn, &ids, 30.0).unwrap();
+        assert!(
+            any_hidden_frames(conn).unwrap(),
+            "grouping a run makes its members hidden"
+        );
+        // The guard is what decides whether the clause is emitted at all, so
+        // both halves are pinned: absent while there is nothing to hide,
+        // present the moment there is.
+        let (clause, _) =
+            assets::build_where(conn, &query, assets::WhereMode::Driving).unwrap();
+        assert!(
+            clause.contains("asset_sequence_frames"),
+            "a library with a run has to filter its hidden members: {clause}"
+        );
 
         let listed = assets::query(conn, &query).unwrap();
         assert_eq!(listed.total, 1, "one card for the run");
@@ -389,6 +456,10 @@ mod tests {
             dissolve(conn, &[sequence_id]).unwrap();
         }
         assert_eq!(assets::count(conn, &query).unwrap(), 6, "after dissolving");
+        assert!(
+            !any_hidden_frames(conn).unwrap(),
+            "dissolving leaves nothing hidden, so the clause goes back out of every listing"
+        );
         assert!(
             std::fs::read_dir(&dir).unwrap().count() >= 6,
             "dissolving never touches a file"

@@ -150,7 +150,8 @@ pub struct AssetFacts {
     pub audio: AudioFacts,
     /// Where a linked (`Origin::Linked`) file lives on disk. Recorded at
     /// import and updated by relinking; also filtered on by the folders
-    /// panel (`json_extract(assets.extra, '$.source_path')`).
+    /// panel, which reads it through the schema's generated `source_path`
+    /// column so the query has an index behind it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_path: Option<String>,
     /// Keys not claimed by any typed field, preserved verbatim.
