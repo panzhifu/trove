@@ -138,41 +138,41 @@ Trove 的配置分为两个层级：
 
 ### 默认快捷键
 
-| 操作 | 快捷键 | 说明 |
-|------|--------|------|
-| 打开资产 | `Enter` | 预览选中资产 |
-| 全选 | `Ctrl+A` | 选中所有资产 |
-| 删除 | `Delete` | 移入回收站 |
-| 永久删除 | `Shift+Delete` | 跳过回收站 |
-| 收藏 | `F` | 切换收藏状态 |
-| 评分 1-5 | `1-5` | 设置评分 |
-| 标签面板 | `T` | 打开标签面板 |
-| 搜索 | `Ctrl+F` | 聚焦搜索框 |
-| 设置 | `Ctrl+,` | 打开设置 |
-| 撤销 | `Ctrl+Z` | 撤销操作 |
-| 重做 | `Ctrl+Shift+Z` | 重做操作 |
-| 复制 | `Ctrl+C` | 复制到剪贴板 |
-| 粘贴导入 | `Ctrl+Shift+V` | 剪贴板图片入库 |
-| 刷新 | `F5` | 刷新视图 |
-| 全屏 | `F11` | 切换全屏 |
-| 放大 | `Ctrl+=` | 放大预览 |
-| 缩小 | `Ctrl+-` | 缩小预览 |
-| 实际大小 | `Ctrl+0` | 重置缩放 |
-| 密度+ | `Ctrl+]` | 增大网格密度 |
-| 密度- | `Ctrl+[` | 减小网格密度 |
+唯一的真值是 `crates/trove-core/src/keybindings.rs` 里那 21 条，下表逐条照抄（**上一版这张表编造了十几个不存在的绑定** —— `Shift+Delete` 永久删除、`F` 收藏、`1-5` 评分、`T` 标签面板、`Ctrl+F` 搜索、`Ctrl+C` 复制、`F11` 全屏、`Ctrl+=` / `Ctrl+-` / `Ctrl+0` 缩放、`Ctrl+]` / `Ctrl+[` 密度，全都没有注册过）。
+
+| 操作 | 默认键 | 生效上下文 |
+|------|--------|-----------|
+| `MoveLeft` / `MoveRight` / `MoveUp` / `MoveDown` | `←` `→` `↑` `↓` | Workspace |
+| `OpenPreview` | `Enter` | Workspace |
+| `QuickLook` | `空格` | **AssetGrid** |
+| `TrashSelected` | `Delete`（`Backspace` 是固定别名，不可改） | Workspace |
+| `SelectAll` | `Ctrl+A` | Workspace |
+| `ClearSelection` | `Esc` | Workspace |
+| `Undo` / `Redo` | `Ctrl+Z` / `Ctrl+Shift+Z` | Workspace |
+| `CopyImage` | `Ctrl+Shift+C` | Workspace |
+| `ImportFiles` | `Ctrl+O` | 全局 |
+| `OpenSettings` | `Ctrl+,` | 全局 |
+| `RefreshLibrary` | `F5` | 全局 |
+| `PasteImport` | `Ctrl+Shift+V` | 全局（写死在 `main.rs`，不在可配表里） |
+| `EnterVideoFullscreen` / `ExitVideoFullscreen` | `F` / `F` | VideoPreview / VideoFullscreen |
+| `BatchRename` / `BatchConvert` / `AutoTag` | **默认无键** | Workspace（菜单里，可在本页自行绑） |
+| `Screenshot` | **默认无键** | 全局（同上） |
+
+`QuickLook` 是唯一一个绑在 **AssetGrid** 而不是 Workspace 的：搜索框也在 `Workspace` 上下文里，而 gpui 只在按键事件仍向上传播时才把字符交给聚焦的输入框，所以绑在那边的裸字符键会让搜索框打不出那个字符——空格尤其致命。
 
 ### 自定义快捷键
 
-在"设置 → 快捷键"中修改：
+在"设置 → 快捷键"里改，或直接写 `config.json` 的 `keybindings`：**键是动作名本身**（不是 `workspace/open` 这种路径式 id），值是键串；空串表示解绑。
 
 ```json
 {
-  "workspace/open": "enter",
-  "workspace/select-all": "ctrl-a",
-  "workspace/delete": "delete",
-  "asset/favorite": "f",
-  "asset/rate-1": "1",
-  "search/focus": "ctrl-f"
+  "keybindings": {
+    "OpenPreview": "enter",
+    "QuickLook": "space",
+    "SelectAll": "ctrl-a",
+    "TrashSelected": "delete",
+    "BatchRename": "f2"
+  }
 }
 ```
 

@@ -1,9 +1,9 @@
 # Trove ← Serpent 差距清单
 
-> 对照物：`reference/Serpent`（上游 [dolag233/Serpent](https://github.com/dolag233/Serpent)）**v0.2.6**，Electron 43 + React 19。
+> 对照物：`reference/Serpent`（上游 [dolag233/Serpent](https://github.com/dolag233/Serpent)）**v0.2.9**，Electron 43 + React 19。
 > 本文：**v0.4.8** 的 Trove 与它在功能面上的逐项差距，以及明确决定**不追**的部分。
-> **v0.4.9 已于 2026-09-27 发布**，而下面逐项审的是 v0.4.8 那个点。之后落的主要是三块：模型材质与共享 GPU 渲染器那一轮、智能集合同级拖拽重排 + 预览里方向键换素材、以及**卡片"活过来"的触发从指针定住改成按空格**（见 §C 的活卡片行与 [PREVIEW-SYSTEM.md](./PREVIEW-SYSTEM.md)）。所以下文的文件数、行数与测试数都比现在的新（测试现为 **771 core + 67 app = 838** 全绿 3 ignored）。
-> 核验日期 **2026-09-25**（上一轮 09-24，再上一轮 09-23）。两边的数字都取自源码而非各自文档：Serpent `src/` **773 文件 / 249,024 行** `.ts`+`.tsx`（与 09-23/24 逐字相同——vendored 副本未动，`reference/Serpent` 的 HEAD 仍是 `4661e17e`），schema **v56**、56 段迁移（`src/worker/library-service.ts:3454` 起的 `MIGRATIONS`，末条 `version: 56` 在 `:3642`，`SUPPORTED_SCHEMA_VERSION = MIGRATIONS.at(-1)!.version` 在 `:3647`）——**它自己的 `docs/developer/architecture.md:63` 还写着 "currently v33"**，又是一处文档落后于代码。Trove `crates/` **217 文件 / 105,694 行** `.rs`（schema **v19**、包版本 0.4.8、测试 **762 core + 66 app = 828** 全绿 3 ignored；本轮较上轮 +7 文件 / +5,263 行，增量是文本查看器与编码探测、EXR/HDR/TGA、悬停卡片、序列帧数据层、点云按字段着色）。上一轮那行写的 "schema v17" 是它自己同日就过期的数：同一份文档的下文里 v18 与 v19 都已经落了。
+> **本轮（09-27）两边都动了**：Trove 发了 **v0.4.9**（模型材质与共享 GPU 渲染器那一轮、智能集合同级拖拽重排、预览里方向键换素材、以及**卡片"活过来"的触发从指针定住改成按空格**——见 §C 的活卡片行与 [PREVIEW-SYSTEM.md](./PREVIEW-SYSTEM.md)），Serpent 从 v0.2.6 走到 v0.2.9。后者的增量单独成节，见 **§2026-09-27 复核**；下面 A–I 各行仍是 09-25 那一版按 v0.2.6 审的，只有被那 79 个提交碰到的行需要读新节。
+> 核验日期 **2026-09-27**（上一轮 09-25，再上一轮 09-24 / 09-23）。两边的数字都取自源码而非各自文档：Serpent `src/` **849 文件 / 258,255 行** `.ts`+`.tsx`（上轮 773 / 249,024，这两轮 +76 文件 / +9,231 行），**schema 仍是 v56 一格没加**——`MIGRATIONS` 32 段、末条 `version: 56`，`SUPPORTED_SCHEMA_VERSION = MIGRATIONS.at(-1)!.version`，全部增量都在 `handleLibraryRequest` 的 handler 拆分与 UI 上。顺带修正上一版这里写的"56 段迁移"：是 **32 段迁移到达 v56**，不是 56 段。Trove `crates/` **223 文件 / 108,427 行** `.rs`（schema **v19** 未动、`INDEX_VERSION` 仍是 2、包版本 **0.4.9**、测试 **771 core + 67 app = 838** 全绿 3 ignored）。
 >
 > **本轮把上轮三处"确认缺失"推翻了两处**，都是同一个失败模式——按 Serpent 的实现符号去 grep（`CF_HDROP`、`xdnd`、`file_drop`），命中零就记成"没有"，而没有按**能力**去问（"能不能把文件拖出窗口"）：
 > ① **原生文件拖出早就有**（`2026-09-12` 的 `ce6a29d` 起，`panels/workspace/cells.rs:192`、`:406`，见 §A）；
@@ -21,12 +21,56 @@
 |---|---|---|---|---|
 | A | 自动化与扩展（§A） | 无 MCP / 无脚本 / 插件编译期 | XL | **最值得追**：Trove 已有 CLI 和 core/app 分层，缺的是把命令面形式化 |
 | B | 同步与外部库（§B） | 无 WebDAV、无 Eagle/Billfish 迁移、归档只入不解、备份**能导不能还** | L | 追平即"能换过来"，是用户迁移成本的主要来源 |
-| C | 内容类型 + 预览交互（§C） | 09-24 一轮收掉七块：文本查看器与编码探测、EXR/HDR/TGA、截当前帧入库、波形带拖拽、文本卡片、接触表生产者、悬停即播与 seek。**09-25 复核，剩的全在原地**：序列帧**只有数据层**（用户能碰的那一半一行都没有，**L**）/ 色彩管理的 ICC 那一半（`qcms` 仍未进依赖图，**M**）/ 文档真缩略图（**已定路线，决定不加依赖**）/ 文本内容入索引（等 `INDEX_VERSION`）。**EXR 曝光那一格降级**：`hdr.rs` 的曲线本来就吃 `stops` 参数、±10 的范围也写好了，缺的只是没有任何调用方传非零值——**现在补的是 UI，不是核**（见 §C）。补齐顺序见 §内容类型计划 | T7 的 UI 半 / T8 未动 | 每一项独立、都不大，但合起来是"能不能当日常素材库"的分水岭。AI 分析三类的"已打平"于 09-24 打折、同日 T6 补齐后又重新成立 |
+| C | 内容类型 + 预览交互（§C） | 09-24 一轮收掉七块：文本查看器与编码探测、EXR/HDR/TGA、截当前帧入库、波形带拖拽、文本卡片、接触表生产者、活卡片即播与 seek（**09-25 触发从指针改成空格**）。**09-25 复核，剩的全在原地**：序列帧**只有数据层**（用户能碰的那一半一行都没有，**L**）/ 色彩管理的 ICC 那一半（`qcms` 仍未进依赖图，**M**）/ 文档真缩略图（**已定路线，决定不加依赖**）/ 文本内容入索引（等 `INDEX_VERSION`）。**EXR 曝光那一格降级**：`hdr.rs` 的曲线本来就吃 `stops` 参数、±10 的范围也写好了，缺的只是没有任何调用方传非零值——**现在补的是 UI，不是核**（见 §C）。**09-27 又拉开三格**（见 §2026-09-27 复核）：动画 GIF 走播放条（**L**，传输带被 `video.rs:90` 的 `kind != Video` 挡死）、PDF 兼容的 `.ai` 当图片看（**L**，顺带需要 Trove 一直缺的 PDF 光栅化）、RAW 头 0×0 被记成 1×1（**S**，`probe.rs:326`）。FLV / 0.25×–4× 倍速 / 旋转写回 Serpent 这轮才做，Trove 早就有 | T7 的 UI 半 / T8 未动 / GIF+.ai 新增 | 每一项独立、都不大，但合起来是"能不能当日常素材库"的分水岭。AI 分析三类的"已打平"于 09-24 打折、同日 T6 补齐后又重新成立 |
 | D | 检索纵深（§D） | ~~结果上限 2000~~ 与 ~~分页会话~~ 均已收敛；剩 **R2 索引内过滤**（要 `INDEX_VERSION` 批准）、R3 复合索引、R6 颜色相似度为 M，R4 snippet 高亮、R5 分辨率档、R7 追加页克隆为 S | M×3 + S×3 | 大库可用性的地基，09-23/24 两轮已拆掉三处硬顶并把页窗冻成快照 |
-| E | 组织与元数据（§E） | 无持久化撤销(L)、批量改名不碰磁盘名(M)、忽略项不可还原(M)、无托管文件夹(未估，与"只链接"哲学冲突)、无标签合并(S)、无合集封面(S) | L + M×2 + S×2 | 「持久化撤销」是唯一的架构级改动，而它的**逆向配方其实已经有了**，缺的是落库 |
+| E | 组织与元数据（§E） | 无持久化撤销(L)、批量改名不碰磁盘名(M)、忽略项不可还原(M)、无托管文件夹(未估，与"只链接"哲学冲突)、无标签合并(S)、无合集封面(S)。**09-27 这三格合流成一格了**：Serpent 这轮新做的文件夹检查器、链接文件夹树、侧栏文件夹快捷键全长在同一棵**磁盘文件夹树**上，而 Trove 侧栏只有合集树（`explorer.rs:902/804/826`）——要么一起立项(L+)，要么在 §H 明确写清"只链接"放弃了什么 | L + M×2 + S×2 | 「持久化撤销」是唯一的架构级改动，而它的**逆向配方其实已经有了**，缺的是落库 |
 | F | 编辑与维护（§F） | 回收站无保留期(S) + 文件夹不能作容器入回收站(M)、单件缺图不自动补(**S–M**：便宜的是排一次任务，贵在渲染线程上不能同步解码)、zip 无预检(S)、备份不能还原(S)、更新只查不装(M)、无安装器(M)、库打不开无救援(M)、介质不自适应(M)、无障碍(L，且一半要推给上游 gpui) | S×4 + M×4 + L | 都是收口工作，不是新能力；「还原快照」这条尤其便宜——**校验和快照两样都已经在跑**（内容级 `plan_integrity` + 开库 `VACUUM INTO`），差的只是"从快照写回原位"那一个函数 |
 | G | 平台与集成（§G） | 无单实例锁(S)、macOS 应用菜单细节(S)、7 份 locale 各缺 63–64 键(补文案 M，要过一遍全部语言) | S×2 + M | 截图与 Linux 发行这两项 Trove 反而领先，见 §H |
 | H | 3D / 点云 | 只有 glTF / OBJ 的贴图与材质这一项（`Mesh` 无 UV） | M | Trove 全面领先，明细见 §H 表 |
+
+---
+
+## 2026-09-27 复核：Serpent v0.2.6 → v0.2.9 的增量
+
+Serpent 在这两轮之间走了 **88 个提交**（其中 79 个非发布提交），版本号 0.2.6 → 0.2.9，`src/` 从 773 文件 / 249,024 行涨到 **849 文件 / 258,255 行**。有一点值得先说：**它的 schema 一步没动**——`MIGRATIONS` 仍是 32 段、末条 `version: 56`，和 v0.2.6 逐字相同（顺带修正上一版本文写的"56 段迁移"：是 32 段迁移**到达** v56，不是 56 段）。这 79 个提交里绝大多数是 `refactor(main/worker/preload): extract …`——把 `handleLibraryRequest` 那个巨型 switch 拆成 command handler，纯内部结构，不构成能力差。
+
+按能力（不按 Serpent 的符号名——这是本文已经犯过两次的错）逐条对照，结果分三堆。
+
+### 已经追平：Serpent 新做的，Trove 早就有
+
+| Serpent 这轮做的 | Trove 的对应物 |
+|---|---|
+| 查看器左右旋转**写回图片文件** | 更强：Trove 无条件写回。`media/edit.rs:56 apply()` 按输入自身格式重编码，`library.rs:1201 batch_edit_images` 落盘并换入；不支持的编码器在 `edit.rs:146 is_editable_ext` 就被挡下。差别只在 Trove 没有那个设置开关 |
+| 查看器支持**逆时针 90°** | `toolbar/title.rs:229` `preview-rotate-ccw` → `ImageEdit::Rotate270`，图标与文案齐 |
+| 视频倍速改成 **0.25×–4× 可慢可快下拉** | `preview/transport.rs:33 SPEEDS: [f32; 9] = [0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 2.0, 3.0, 4.0]`，视频与音频共用，`atempo` 保音调 |
+| 支持 **FLV** | `media/probe.rs:64` 的 `is_video_ext` 含 `flv`，`:152` 给 `video/x-flv`，并有测试钉着（`:484`） |
+| 导入时不再把已有缩略图整批丢掉 | 结构上不可能：缩略图按内容哈希寻址且先查命中（`thumb.rs:40-42`），`remove_derived` 只按被清除的 sha 逐个走（`library.rs:1929`） |
+| 库内拖拽不再弹导入提示、且能拖走整页选中 | 每个应用内落点都是**有类型**的 `drag_over::<AssetsDrag>`（`explorer.rs:793`），外部导入的壳根本不在这条路上；拖拽负载是选中集（`cells.rs:191-197`） |
+
+### 新差距：这轮真正拉开的
+
+| 能力 | Serpent | Trove | 量级 |
+|---|---|---|---|
+| **动画 GIF 用播放条控制** | 新增 `GifViewerPlayer` + `gif-playback-timeline`，GIF 与视频共用一条传输带，可拖可定位 | **无**。GIF 交给 gpui 自行循环播放（`panels/common.rs:344` → `preview/image.rs:17`），而传输带压根到不了它：`preview/video.rs:90` 第一句就是 `if data.kind != AssetKind::Video { return None; }`。全仓也没有 GIF 帧索引 | **L**（帧解码 + 每帧延时 + 把 transport 接进图片舞台；APNG 顺带能白拿，WebP 不能） |
+| **PDF 兼容的 `.ai` 当图片看** | 嗅前 1024 字节的 `%PDF-`，命中就按图片显示 | **无**。`.ai` 只出现在"用外部程序打开"的分派里（`open_with_apps.rs:35`），`probe.rs:96-108` 的图片臂与文档臂都不含它 → 落 `AssetKind::Other`，无缩略图无预览。更根本的是 **Trove 没有任何 PDF 光栅化路径**（无 pdfium，PDF 只有文本视图） | **L**（先要一个 PDF→位图的依赖，这条同时是"文档真缩略图"那块欠的） |
+| **文件夹检查器**（对齐资产检查器的字段 + 封面 / 数量 / 大小） | 新增 `folder-inspector`：封面拼贴、名称、路径、资产数、子文件夹数、总大小 | **无**。检查器只认资产：`inspector.rs:303` 的入口是 `ctl.primary()`，而它读的是选中集里最后一个**资产 id**（`library/controller.rs:981`）；浏览合集时没有任何右侧详情。合集的字节数与封面在 `store/` 里也没有查询面（唯一的 `SUM(size_bytes)` 是全库的，`store/stats.rs:62`） | **L** |
+| **忽略规则面板**（内嵌草稿预览，点保存才写入） | `.serpentignore` 编辑器 + 预览 | **无**。Trove 只**读** Git 的忽略文件（`tasks/ignore.rs:46 OWN_IGNORE_FILES = [".gitignore", ".ignore"]`），从不写，也没有编辑面板。但**草稿-修订-保存这个形状已经有了**：`dialogs/rules.rs:12` 的 `RuleDraft` 就是"这里什么都不写" | **L**（新存储 + 写路径 + 对真实扫描的预览；UI 骨架可复用 rules） |
+| **拖文件夹到库根 = 建一个链接文件夹** | 链接树里出现该文件夹节点，规则/扫描都挂在它身上 | **部分**。拖入确实**不复制**（`library/jobs/import.rs:104` 注释即"用户导入是链接"），但落下去是**逐个文件的 `Origin::Linked`**，文件夹身份只剩 `facts.source_path`，靠 `panels/folders.rs` 事后归组 | **L** |
+| **侧栏文件夹快捷键** | 新增 | **无**。`Explorer` 上下文只绑了一个 `Cancel`（`explorer.rs:719-720`） | **M** |
+| **搜索历史**（回呼以前输入过的查询） | 新增 | **无**。`search_box.rs:22-31` 的 `SearchBox` 只有 controller/input/open 三个字段，没有存储也没有回呼列表（`en.toml:163` 的 `clear_history_tooltip` 是**浏览**历史，不是查询历史） | **S** |
+| **乱序 / 随机排序** | 修好虚拟画布上的乱序生效 | **无**。`AssetSort` 只有 CreatedAt / UpdatedAt / Name / SizeBytes / Rating / Duration / Color（`model/query.rs:12-28`），全仓无 random/shuffle 排序码 | **M**（难点不是 SQL，是"追加一页不能重新洗"这条不变量，`store/browse.rs:1086`） |
+| **内嵌元数据显示** | 新增 `embedded-metadata.ts`，归一 15+ 字段成行显示 | **部分，而且差得很便宜**。抽取是真的（`media/metadata.rs:163` exif-rs 已挖出 Make/Model/ISO/FNumber/FocalLength/ExposureTime/GPS），但**挖出来的 `facts.photo` 在 `crates/trove-app/src` 里零引用**——一块已经躺在库里的数据没上界面。没抽的：视频/文档/归档（`metadata.rs:67` `_ => MinedMetadata::default()`）；没有 XMP/IPTC **读**（`library/jobs/xmp.rs` 是 sidecar **导出**） | **S**（先把已挖的显示出来）/ L（全打平） |
+| **检查器逗号一次输入多个标签** | 输入即拆成待提交 chip，Enter 全给 | **部分**。拆分逻辑在，但挂在另一个按钮上且是**替换**不是追加：`inspector.rs:136 replace_tags_from_input` 按 `,，;；` 拆 → `set_asset_tags`；Enter 走的 `add_tag_from_input`（`:111`）把整串当一个名字 | **S** |
+| **音频卡片可选封面或波形，切换重建缩略图** | 新增设置项 | **部分**。策略硬编码在 `thumb.rs:716`（有内嵌封面就用封面，否则画波形卡），`AppConfig`/`LibraryConfig` 里没这个键；而**重建机器早就在**（`settings/files.rs:586` "rebuild-thumbs-force" → `plan_thumbnail_rebuild`） | **S** |
+| **从硬盘删除走当前主题的确认框** | 新增 | **无，而且这条是数据安全的**。`context_menu.rs:304-312` 的「永久删除」直接 `purge_assets(&ids)`，**没有任何确认**，而 `en.toml:459 purge_delete_sources` 说明它确实会删源文件。 themed 确认框的现成样式在 `app/library_manager.rs:704` | **S** |
+| **RAW 头 0×0 不要记成假尺寸** | 新增 `usablePixelDimension` 判掉占位 0 | **部分**。光栅这条路结构上免疫（Trove 根本不读 EXIF 维度标签，尺寸取解码器自己的帧头 `probe.rs:286`），但 RAW 那条 `probe.rs:326` 写的是 `raw.width.max(1)`——**把 0 变成 1×1 记进库**，正是 Serpent 刚关掉的那类撒谎 | **S** |
+| **多文件原生拖出** | 整页可拖 | **部分**。应用内拖的是选中集，但拖出窗口时只解析被点那一个文件（`cells.rs:215` 单条 `FileDragPaths`） | **S** |
+
+### 一个结构性观察
+
+上面 **文件夹检查器 / 链接文件夹树 / 侧栏文件夹快捷键** 三行其实是**同一个洞的三面**：Trove 的侧栏只有合集树（`explorer.rs:902 collection_row`、`:804 recent_row`、`:826 trash_row`），**没有磁盘文件夹树**。Serpent 这轮在文件夹上叠加的所有能力都长在那棵树上是自然的；Trove 要单独补其中任何一格都会别扭。所以这三条不该分开排期——要么按"给 Trove 加一棵链接文件夹树"一起立项（L+），要么明确决定不做（那 §H 里"只链接、不托管"的哲学就得写清楚它放弃了什么）。
+
+另外**「从硬盘删除无确认」这一条我建议不按差距排期，按缺陷排期**：它不是能力缺失，是少了一道本该有的门，而代价是不可恢复地删掉用户的源文件。
 
 ---
 
@@ -273,7 +317,7 @@ README 与 README.en 里的 8 处已在 09-23 那轮修正，`docs/` 下的 SHA-
 | `MEDIA-FORMATS.md:31` | AVIF 由 image crate 解码 | 走外部 `heif-dec`：`media/probe.rs:320`（尺寸路径的注释）与 `:345` `heif_to_image`，**一处覆盖 `.heic .heif .avif` 三种后缀**。`:31` 那句仍未改 |
 | `AI-TAGGING.md` | `ai/chat.rs` / `ai/tagging.rs` / `tasks/autotag.rs` / `trove autotag` | 已被 `4515046` 重构删除，现为 `tasks/ai_analysis.rs` + `trove analyze`。**2026-09-24 再确认这些名字还在文档里**：`:27`、`:74`、`:120`、`:166`，以及 `:199-204` 整段 `trove autotag …` 示例。`ai/` 目录实际内容是 `analysis.rs · embedding_openai.rs · http.rs · mock.rs · mod.rs · search_planner.rs · vendor/`；`tasks/` 是 `ai_analysis.rs · embed.rs · ignore.rs · import.rs · mod.rs · watch.rs` |
 | `TAG-COLLECTION.md` | `:70` 标签合并、`:118` 封面设置、`:173-182` 规则字段表（`is/is_not/contains/not_contains/starts_with/before/after/between` + `width`/`height`）、`:271` 声称 `collections.rs` 管封面 | 合并与封面无（见 §E 两行）；规则真实形状是 `{"op":"and\|or","children"}` / `{"op":"match","field"…}`，比较符只有 `eq/ne/gt/gte/lt/lte`，文档里的 `is/is_not/contains/before/between` 与 `width`/`height` 字段都不存在（`model/query.rs:117-129`：条件仅 `Ext\|Kind\|Path\|MinRating\|Favorite`） |
-| `CONFIGURATION.md` | 键位表（`:22`、`:41` 的 `~/Documents/Trove` 目录树同理） | 与 `crates/trove-core/src/keybindings.rs:26-140` 的 **20 个可配动作**（MoveLeft/Right/Up/Down · OpenPreview · TrashSelected · SelectAll · ClearSelection · Undo · Redo · CopyImage · ImportFiles · OpenSettings · Screenshot · RefreshLibrary · BatchRename · BatchConvert · AutoTag · EnterVideoFullscreen · ExitVideoFullscreen；其中 **5 个默认值是空串**，即"未绑定但可绑"，`:105-107`）、**八个**内置设置页 + 插件贡献页（About / Appearance / Files / Model / Search / AI / Shortcuts / Plugins，注册在 `dialogs/settings/mod.rs:398-412`；**深链枚举只覆盖前 7 个**，不含 Plugins，`:85-120`）、XDG 四根目录均不一致 |
+| `CONFIGURATION.md` | ~~键位表~~ **已于 2026-09-27 整段重写**：旧表 20 行里只有 7 行是真注册过的绑定，其余（`Shift+Delete` 永久删除、`F` 收藏、`1-5` 评分、`T` 标签、`Ctrl+F`、`Ctrl+C`、`F11`、`Ctrl+=`/`-`/`0`、`Ctrl+]`/`[`）全是编造的，且 JSON 示例用的 `workspace/open` 式键名根本不是真实格式（`keybindings` 的键是动作名本身）。新表逐条照抄 `keybindings.rs` 的 21 条并标出上下文。`:22`、`:41` 的 `~/Documents/Trove` 目录树**仍未核** | 与 `crates/trove-core/src/keybindings.rs:26-140` 的 **21 个可配动作**（09-27 起多一个 `QuickLook`）（MoveLeft/Right/Up/Down · OpenPreview · TrashSelected · SelectAll · ClearSelection · Undo · Redo · CopyImage · ImportFiles · OpenSettings · Screenshot · RefreshLibrary · BatchRename · BatchConvert · AutoTag · EnterVideoFullscreen · ExitVideoFullscreen；其中 **5 个默认值是空串**，即"未绑定但可绑"，`:105-107`）、**八个**内置设置页 + 插件贡献页（About / Appearance / Files / Model / Search / AI / Shortcuts / Plugins，注册在 `dialogs/settings/mod.rs:398-412`；**深链枚举只覆盖前 7 个**，不含 Plugins，`:85-120`）、XDG 四根目录均不一致 |
 | ~~`PREVIEW-SYSTEM.md:91`、`MEDIA-FORMATS.md:94`~~ | ~~视频截帧入库~~ | **不再是失真**：2026-09-24 的 T1 把它实现了（`media/video.rs::write_frame_png` + 预览工具栏的相机按钮），两行文档也顺手改成说得准确——按源尺寸重解一帧，不是抓屏幕上那块 720 宽的缓冲 |
 | ~~`PREVIEW-SYSTEM.md:88`、`MEDIA-FORMATS.md:92`~~ | ~~倍速播放 0.5× – 2×~~ | **已于 2026-09-24 改为实际值**：9 档、上限 4×，`preview/transport.rs:32` `SPEEDS: [f32; 9] = [0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 2.0, 3.0, 4.0]`，视频与音频共用（两处都写明了是这 9 档） |
 | `MEDIA-FORMATS.md:291-292`、`PREVIEW-SYSTEM.md:18,49` | 动图"逐帧播放 / 帧控制：暂停/逐帧/速度" | 播放为真、**控制为无**：GIF 与动态 WebP 由 gpui 原生解，APNG 走 `panels::common` 的多帧解码缓存，`preview/image.rs` 只有"有 animated 源就播，否则退回缩略图"两个分支，没有任何逐帧/暂停/倍速入口（09-25 再确认：`next_frame` / `FrameStep` 这类符号在 `preview/image.rs` 里零命中）。**这一行上轮引的 `:276-277` 已经漂到 `:291-292`**——同一个文件在同一轮里被改过 146 行，行号是这份文档里最短命的引用 |
