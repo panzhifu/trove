@@ -165,21 +165,26 @@ impl Frustum {
         let min = bounds.min;
         let max = bounds.max;
         for plane in &self.planes {
-            // Find the corner of the box that is most opposite to the plane normal.
+            // The corner sticking out furthest along the plane's inward
+            // normal. If even that corner is on the negative side, no part of
+            // the box is inside this half-space and nothing of it can be
+            // visible. (The corner nearest the plane would only say the box
+            // is not fully inside — a box straddling a plane is half visible,
+            // and rejecting it takes the visible half with it.)
             let nx = if plane.normal[0] > 0.0 {
-                min[0]
-            } else {
                 max[0]
+            } else {
+                min[0]
             };
             let ny = if plane.normal[1] > 0.0 {
-                min[1]
-            } else {
                 max[1]
+            } else {
+                min[1]
             };
             let nz = if plane.normal[2] > 0.0 {
-                min[2]
-            } else {
                 max[2]
+            } else {
+                min[2]
             };
             if plane.signed_distance([nx, ny, nz]) < 0.0 {
                 return false; // entirely outside this plane
@@ -1006,8 +1011,24 @@ mod tests {
         // In front of the near plane and beyond the far plane: both culled.
         // A frustum built with the OpenGL `-1..=1` extraction gets these two
         // the wrong way round, which is what pins the depth convention here.
-        assert!(!frustum.intersects_bounds(&box_at(-0.5, 0.1)));
+        // Strictly in front: a box merely touching the near plane counts as
+        // visible, the same tolerance a straddling box gets.
+        assert!(!frustum.intersects_bounds(&box_at(-0.45, 0.1)));
         assert!(!frustum.intersects_bounds(&box_at(-20.0, 1.0)));
+        // Straddling the right plane at depth 5, where the view spans
+        // x ∈ [-5, 5]: half the box is on screen, so the box is visible.
+        // Culling it was the zoomed-in viewport's missing chunks.
+        let straddling = Bounds {
+            min: [4.5, -1.0, -5.5],
+            max: [5.5, 1.0, -4.5],
+        };
+        assert!(frustum.intersects_bounds(&straddling));
+        // …while a box wholly beyond the same plane is still culled.
+        let beyond = Bounds {
+            min: [6.0, -1.0, -5.5],
+            max: [7.0, 1.0, -4.5],
+        };
+        assert!(!frustum.intersects_bounds(&beyond));
     }
 
     #[test]

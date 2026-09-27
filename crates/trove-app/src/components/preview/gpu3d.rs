@@ -130,6 +130,10 @@ impl GpuMesh {
         if self.meshlets.is_empty() {
             return None;
         }
+        // Debug escape hatch: draw every cluster, cull nothing.
+        if std::env::var_os("TROVE_DEBUG_NO_CULL").is_some() {
+            return None;
+        }
         let frustum = framing.frustum();
         let ranges: Vec<std::ops::Range<u32>> = self
             .meshlets
@@ -1537,22 +1541,37 @@ mod tests {
         );
         let uploaded = renderer.upload(&mesh);
         eprintln!(
-            "gpu mesh: meshlets={} colors={}",
+            "gpu mesh: meshlets={} colors={} cull={}",
             uploaded.meshlets.len(),
-            uploaded.colors.is_some()
+            uploaded.colors.is_some(),
+            uploaded.cull_backfaces
         );
-        let framing = render3d::Camera::default().framing(mesh.bounds, 1.0);
-        let frame = renderer
-            .render(
-                &uploaded,
-                &framing,
-                (800, 600),
-                false,
-                &render3d::RenderOptions::default(),
-                HeightUniforms::default(),
-            )
-            .expect("a frame comes back");
-        dump_png("/tmp/trove-gpu-render.png", &frame);
+        for zoom in [1.0, 0.5, 0.25, 0.12] {
+            let camera = render3d::Camera {
+                zoom,
+                ..render3d::Camera::default()
+            };
+            let framing = camera.framing(mesh.bounds, 1.0);
+            let culled = uploaded.visible_meshlets(&framing);
+            eprintln!(
+                "zoom {zoom}: meshlets drawn = {}",
+                match &culled {
+                    None => uploaded.meshlets.len(),
+                    Some(ranges) => ranges.len(),
+                }
+            );
+            let frame = renderer
+                .render(
+                    &uploaded,
+                    &framing,
+                    (800, 600),
+                    false,
+                    &render3d::RenderOptions::default(),
+                    HeightUniforms::default(),
+                )
+                .expect("a frame comes back");
+            dump_png(&format!("/tmp/trove-gpu-zoom-{zoom}.png"), &frame);
+        }
     }
 
     /// Write a BGRA frame out as an 8-bit RGB PNG (stored deflate, no deps).
