@@ -535,6 +535,28 @@ impl Render for InspectorPanel {
                 this.child(property_row(cx, "inspector.audio_format", line))
             })
             .child(property_row(cx, "inspector.dimensions", dims))
+            // The EXIF the import stage already mined into the asset row. Each
+            // of these is optional on its own, so a screenshot or a re-saved
+            // JPEG shows none of them — and a camera file shows the whole set
+            // without a single empty label.
+            .when_some(camera_line(&asset.facts.photo), |this, line| {
+                this.child(property_row(cx, "inspector.camera", line))
+            })
+            .when_some(exposure_line(&asset.facts.photo), |this, line| {
+                this.child(property_row(cx, "inspector.exposure", line))
+            })
+            // When the photo was taken, not when it arrived: the two differ for
+            // anything imported long after it was shot, which is most libraries.
+            .when_some(asset.captured_at, |this, at| {
+                this.child(property_row(
+                    cx,
+                    "inspector.captured",
+                    at.format("%Y-%m-%d %H:%M").to_string(),
+                ))
+            })
+            .when_some(gps_line(&asset.facts.photo), |this, line| {
+                this.child(property_row(cx, "inspector.gps", line))
+            })
             .child(property_row(cx, "inspector.added", added))
             .child(property_row(cx, "inspector.content_hash", hash))
             .when_some(disk_path, |row, path| {
@@ -1068,6 +1090,60 @@ fn audio_format_line(audio: &trove_core::model::AudioFacts) -> Option<String> {
     (!parts.is_empty()).then(|| parts.join(" · "))
 }
 
+/// The camera a photo names, as one label: `Canon EOS R5`.
+///
+/// The make is dropped when the model already begins with it, because that is
+/// what manufacturers write: a Canon file carries Make `Canon` and Model
+/// `Canon EOS R5`, and joining the two reads `Canon Canon EOS R5`.
+fn camera_line(photo: &trove_core::model::PhotoFacts) -> Option<String> {
+    let make = photo.make.as_deref().unwrap_or("").trim();
+    let model = photo.model.as_deref().unwrap_or("").trim();
+    let line = match (make.is_empty(), model.is_empty()) {
+        // Only one of the two names exists — show the one that does.
+        (true, false) => model.to_string(),
+        (false, true) => make.to_string(),
+        (true, true) => return None,
+        // Both exist: keep the make only where the model does not repeat it.
+        (false, false) if model.to_lowercase().starts_with(&make.to_lowercase()) => {
+            model.to_string()
+        }
+        (false, false) => format!("{make} {model}"),
+    };
+    Some(line)
+}
+
+/// The exposure a photo names, on one line: `f/2.8 · 1/60s · ISO 100 · 35 mm`.
+///
+/// Assembled for the same reason `audio_format_line` is — a file carries some
+/// subset of these, and four rows of labels with three dashes in them says
+/// nothing, while one line says everything there is. The pieces arrive from the
+/// miner already in photographic form (`f/2.8`, `1/60s`); only the unit that
+/// EXIF omits is added here.
+fn exposure_line(photo: &trove_core::model::PhotoFacts) -> Option<String> {
+    let mut parts: Vec<String> = Vec::with_capacity(4);
+    if let Some(aperture) = photo.aperture_f.as_deref() {
+        parts.push(aperture.to_string());
+    }
+    if let Some(exposure) = photo.exposure_time.as_deref() {
+        parts.push(exposure.to_string());
+    }
+    if let Some(iso) = photo.iso {
+        parts.push(format!("ISO {iso}"));
+    }
+    if let Some(mm) = photo.focal_length_mm.as_deref() {
+        parts.push(format!("{mm} mm"));
+    }
+    (!parts.is_empty()).then(|| parts.join(" · "))
+}
+
+/// Where the photo was taken, to four decimals — about eleven metres, which is
+/// as precise as a camera GPS read is, and a coordinate is only ever going to
+/// be copied out of here into a map.
+fn gps_line(photo: &trove_core::model::PhotoFacts) -> Option<String> {
+    let (lat, lng) = (photo.gps_lat?, photo.gps_lng?);
+    Some(format!("{lat:.4}, {lng:.4}"))
+}
+
 fn property_row(cx: &Context<impl Render>, key: &'static str, value: String) -> Div {
     h_flex()
         .w_full()
@@ -1125,8 +1201,8 @@ fn prompt_relink(controller: &Entity<LibraryController>, asset_id: Uuid, cx: &mu
 
 #[cfg(test)]
 mod tests {
-    use super::audio_format_line;
-    use trove_core::model::AudioFacts;
+    use super::{audio_format_line, camera_line, exposure_line, gps_line};
+    use trove_core::model::{AudioFacts, PhotoFacts};
 
     /// The row is assembled from whatever exists — and a file with nothing
     /// resolves to no row rather than an empty separator.
@@ -1151,5 +1227,81 @@ mod tests {
             Some("44.1 kHz")
         );
         assert_eq!(audio_format_line(&AudioFacts::default()), None);
+    }
+
+    /// The make is not repeated when the model already carries it, which is
+    /// what a camera file actually looks like — and a file with only one of the
+    /// two names still gets a row.
+    #[test]
+    fn camera_line_does_not_double_the_make() {
+        let photo = PhotoFacts {
+            make: Some("Canon".into()),
+            model: Some("Canon EOS R5".into()),
+            ..Default::default()
+        };
+        assert_eq!(camera_line(&photo).as_deref(), Some("Canon EOS R5"));
+
+        let photo = PhotoFacts {
+            make: Some("NIKON CORPORATION".into()),
+            model: Some("Nikon Z6".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            camera_line(&photo).as_deref(),
+            Some("NIKON CORPORATION Nikon Z6")
+        );
+
+        let only_make = PhotoFacts {
+            make: Some("Apple".into()),
+            ..Default::default()
+        };
+        assert_eq!(camera_line(&only_make).as_deref(), Some("Apple"));
+        assert_eq!(camera_line(&PhotoFacts::default()), None);
+    }
+
+    /// Same contract as the audio line: whatever the file carries, in the
+    /// photographer's own order, and no row at all for a file that carries
+    /// nothing.
+    #[test]
+    fn exposure_line_joins_what_the_file_carries() {
+        assert_eq!(
+            exposure_line(&PhotoFacts {
+                aperture_f: Some("f/2.8".into()),
+                exposure_time: Some("1/60s".into()),
+                iso: Some(100),
+                focal_length_mm: Some("35".into()),
+                ..Default::default()
+            })
+            .as_deref(),
+            Some("f/2.8 · 1/60s · ISO 100 · 35 mm")
+        );
+        assert_eq!(
+            exposure_line(&PhotoFacts {
+                iso: Some(400),
+                ..Default::default()
+            })
+            .as_deref(),
+            Some("ISO 400")
+        );
+        assert_eq!(exposure_line(&PhotoFacts::default()), None);
+    }
+
+    /// A position needs both halves; a lone latitude is not a place.
+    #[test]
+    fn gps_line_needs_a_pair() {
+        assert_eq!(
+            gps_line(&PhotoFacts {
+                gps_lat: Some(31.230416),
+                gps_lng: Some(121.473701),
+                ..Default::default()
+            })
+            .as_deref(),
+            Some("31.2304, 121.4737")
+        );
+        let half = PhotoFacts {
+            gps_lat: Some(31.2304),
+            ..Default::default()
+        };
+        assert_eq!(gps_line(&half), None);
     }
 }
