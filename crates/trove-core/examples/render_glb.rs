@@ -53,10 +53,6 @@ fn push_chunk(out: &mut Vec<u8>, kind: &[u8; 4], data: Vec<u8>) {
     out.extend_from_slice(&crc32_parts(kind, &data).to_be_bytes());
 }
 
-fn crc32(data: &[u8]) -> u32 {
-    crc32_update(0xFFFF_FFFF, data) ^ 0xFFFF_FFFF
-}
-
 /// The CRC over two byte runs, as a PNG chunk needs (its kind, then its body).
 fn crc32_parts(first: &[u8], second: &[u8]) -> u32 {
     crc32_update(crc32_update(0xFFFF_FFFF, first), second) ^ 0xFFFF_FFFF

@@ -49,8 +49,10 @@ pub fn load_gltf(path: &Path) -> Result<Mesh, String> {
         })
         .collect();
 
-    let mut builder = Builder::default();
-    builder.textures = maps;
+    let mut builder = Builder {
+        textures: maps,
+        ..Default::default()
+    };
     for node in root_nodes(&document) {
         builder.add_node(&node, IDENTITY, &buffers, &slot_of_texture);
     }
@@ -636,25 +638,24 @@ mod tests {
     /// with — the one material property this flat-colour renderer can show.
     #[test]
     fn a_materials_base_colour_becomes_vertex_colours() {
-        let json = format!(
-            r#"{{
-            "asset": {{"version": "2.0"}},
-            "scenes": [{{"nodes": [0]}}],
+        let json =
+            r#"{
+            "asset": {"version": "2.0"},
+            "scenes": [{"nodes": [0]}],
             "scene": 0,
-            "nodes": [{{"mesh": 0}}],
-            "meshes": [{{"primitives": [{{"attributes": {{"POSITION": 0}}, "indices": 1, "material": 0}}]}}],
-            "materials": [{{"pbrMetallicRoughness": {{"baseColorFactor": [1.0, 0.5, 0.0, 1.0]}}}}],
-            "buffers": [{{"byteLength": 48}}],
+            "nodes": [{"mesh": 0}],
+            "meshes": [{"primitives": [{"attributes": {"POSITION": 0}, "indices": 1, "material": 0}]}],
+            "materials": [{"pbrMetallicRoughness": {"baseColorFactor": [1.0, 0.5, 0.0, 1.0]}}],
+            "buffers": [{"byteLength": 48}],
             "bufferViews": [
-                {{"buffer": 0, "byteOffset": 0, "byteLength": 36, "target": 34962}},
-                {{"buffer": 0, "byteOffset": 36, "byteLength": 12, "target": 34963}}
+                {"buffer": 0, "byteOffset": 0, "byteLength": 36, "target": 34962},
+                {"buffer": 0, "byteOffset": 36, "byteLength": 12, "target": 34963}
             ],
             "accessors": [
-                {{"bufferView": 0, "componentType": 5126, "count": 3, "type": "VEC3", "max": [1,1,0], "min": [0,0,0]}},
-                {{"bufferView": 1, "componentType": 5125, "count": 3, "type": "SCALAR"}}
+                {"bufferView": 0, "componentType": 5126, "count": 3, "type": "VEC3", "max": [1,1,0], "min": [0,0,0]},
+                {"bufferView": 1, "componentType": 5125, "count": 3, "type": "SCALAR"}
             ]
-        }}"#
-        );
+        }"#.to_string();
         let path = glb(json);
         let mesh = load_gltf(&path).expect("glb triangle parses");
         std::fs::remove_file(&path).ok();

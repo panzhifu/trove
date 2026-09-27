@@ -922,7 +922,7 @@ fn fit_distance() -> f32 {
 /// what folds light around past the horizon.
 fn wrapped_light(nl: f32, wrap: f32) -> f32 {
     let denom = (wrap + 1.0) * (wrap + 1.0);
-    ((nl + wrap) / denom).max(0.0).min(1.0)
+    ((nl + wrap) / denom).clamp(0.0, 1.0)
 }
 
 /// The specular colour a channel starts from: the dielectric constant for a
@@ -967,8 +967,8 @@ fn studio_specular(
     let mut sum = [0.0f32; 3];
     for light in lights {
         let half = normalize(add(light.direction, to_eye));
-        let spec_angle = dot(half, normal).max(0.0).min(1.0);
-        let nl = dot(light.direction, normal).max(0.0).min(1.0);
+        let spec_angle = dot(half, normal).clamp(0.0, 1.0);
+        let nl = dot(light.direction, normal).clamp(0.0, 1.0);
         // A wrapped light is a bigger, softer light: its gloss shrinks and its
         // highlight widens accordingly.
         let gloss = (1.0 - roughness) * (1.0 - light.wrap);
@@ -987,7 +987,7 @@ fn studio_specular(
     }
     // The Fresnel approximation Blender's fast path uses: the specular colour
     // lifts toward white at grazing angles, the less the rougher the surface.
-    let nv = dot(normal, to_eye).max(0.0).min(1.0);
+    let nv = dot(normal, to_eye).clamp(0.0, 1.0);
     let fresnel = (-8.35 * nv).exp2() * (1.0 - roughness);
     let spec_color = [
         mix_dielectric(albedo[0], metallic) * (1.0 - fresnel) + fresnel,
@@ -1077,7 +1077,7 @@ fn paint(
     // owns the surface colour: the height look wins over the file's own
     // materials, exactly as it wins over their colours.
     let texture = (options.material_colors && mesh.has_textures())
-        .then(|| mesh.texture.as_deref())
+        .then_some(mesh.texture.as_deref())
         .flatten();
     let vertex_count = mesh.positions.len();
     let gouraud = mesh.has_vertex_normals();
