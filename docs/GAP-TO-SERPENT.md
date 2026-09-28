@@ -323,7 +323,7 @@ Serpent 侧依旧一格没动。这一轮收 §2026-09-27 复核 里那条 S 级
 
 **门**：**812 core + 74 app = 886** 全绿 3 ignored；`fmt`、`clippy -D warnings` 同轮过。`crates/` **228 文件 / 116,283 行**，schema 仍 v22，`en.toml` 仍 **798** 键（本轮没加文案）。
 
-**没做的**：`store/assets.rs` 里三处**注释**仍写 `trashed_at IS NULL` 字面量——那是解释文字不是谓词，改它只会让解释更难读；P4（`Rating` / `ContentHash` 两个 newtype + SQL `CHECK` + 坏行降级而不失败整份列表）、P5（智能集规则的裸 `Json` → `SmartNode`，并决定 `Library::evaluate_smart_collection` 那颗零调用方去留）未动；app 侧约 40 处 `let _ =` 静默写失败也仍是原样。
+**没做的**：`store/assets.rs` 里三处**注释**仍写 `trashed_at IS NULL` 字面量——那是解释文字不是谓词，改它只会让解释更难读；P4（`Rating` / `ContentHash` 两个 newtype + SQL `CHECK` + 坏行降级而不失败整份列表）、P5（智能集规则的裸 `Json` → `SmartNode`，并决定 `Library::evaluate_smart_collection` 那颗零调用方去留）未动；静默丢弃返回值的 `let _ =` 也仍是原样。口径别混：第七轮数的是**守着一次写**的那些（51 处，P0 处理了 11 处，剩 ~40，其中 17 处是 `config.save()`）；本轮重新数的是**全部** `let _ =`——`grep` 实跑 **app 114 处 / core 121 处**，这里面有多少吞掉的是一次真会失败的写，要逐条读才能定，本轮没有逐条读。
 
 ---
 
