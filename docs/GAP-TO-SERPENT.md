@@ -313,7 +313,7 @@ Serpent 侧依旧一格没动。这一轮收 §2026-09-27 复核 里那条 S 级
 
 ③ **`Flip<T> { id, before, after }`** 取代 undo 里三个批量操作（`SetTrashed` / `SetFavorite` / `SetTitles`）的 `before: Vec<(Uuid, T)>` + `after: Vec<(Uuid, T)>`。两个平行向量拦不住的是同一件事：往一个 push、忘了另一个，撤销于是去改一条正向从没碰过的行，而且**不报错**——错的 id 集、错的长度、错的方向都不会被类型发现。现在一个资产的两个面绑在同一条记录上，`inverse` 对整批只做一件事：逐条交换两面。
 
-**谓词收成两个常量，并且和索引钉在一起**。`LIVE_ROWS` / `TRASHED_ROWS` 替掉 20 处手写的 `trashed_at IS NULL`（stats / view_history / embeddings / sequences / smart 规则 / visual_search / assets 七处文件）。真正的理由是：**库里那 6 条 partial index 的定义文本就是这个字符串**，而 SQLite 只会为"能证明蕴含索引谓词"的 `WHERE` 使用 partial index——同义改写（`COALESCE(trashed_at,'')=''`、小写 `is null`、`+trashed_at IS NULL`）答案一样、索引全丢，表现出来是"库变慢了"，不是报错。
+**谓词收成两个常量，并且和索引钉在一起**。`LIVE_ROWS` / `TRASHED_ROWS` 替掉 **22 处**生产代码里手写的 `trashed_at IS NULL` / `IS NOT NULL`（assets 7、visual_search 5、stats 4、view_history 2、embeddings 2、smart 规则 1、sequences 1 = 22，`grep` 数出来的，不是估的），外加 plan 测试里那 5 处也改成同一个常量，一共 27 处。真正的理由是：**库里那 6 条 partial index 的定义文本就是这个字符串**，而 SQLite 只会为"能证明蕴含索引谓词"的 `WHERE` 使用 partial index——同义改写（`COALESCE(trashed_at,'')=''`、小写 `is null`、`+trashed_at IS NULL`）答案一样、索引全丢，表现出来是"库变慢了"，不是报错。
 
 两条钉测试，一条看行为一条看文本：**plan 测试的查询现在用常量拼**，把常量改成 `+trashed_at IS NULL` 之后它给出的就是 planner 的原话 `SCAN assets USING INDEX idx_assets_created; USE TEMP B-TREE FOR LAST TERM OF ORDER BY`——正是那 188 ms 的计划；另一条 `the_live_predicate_matches_the_index_it_needs` 从 `sqlite_master` 读出每条 partial index 的存储 SQL，逐条比对常量，并按名字和条数核对那 6 条，所以改 DDL 或漏一条索引同样是红的。**迁移脚本里的字面量故意不动**：一段 step 必须描述它真实产出的形状，v17→v18 那五条索引当年写成什么样就得是什么样。
 
