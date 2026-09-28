@@ -288,15 +288,16 @@ pub(super) fn start_import_job(
     // One import at a time across both kinds: the controller's phase is
     // shared, and two writer threads would race the progress reporting.
     // `is_active` (not `is_running`) so a *paused* import still holds the slot.
-    if manager.is_active(TaskKind::Import) || manager.is_active(TaskKind::CollectInbox) {
+    if manager.is_active(&TaskKind::Import) || manager.is_active(&TaskKind::CollectInbox) {
         return false;
     }
     // Keep a copy of the inputs so a failed/cancelled run can be retried from
     // the status-bar panel; the job closure consumes the other half.
     let retry_options = options.clone();
     let label = kind.name().to_string();
-    let Ok((task_id, rx)) = manager.start(kind, kind.name(), move |ctx| import::run(&options, ctx))
-    else {
+    let Ok((task_id, rx)) = manager.start(kind.clone(), label.clone(), move |ctx| {
+        import::run(&options, ctx)
+    }) else {
         return false;
     };
 
@@ -307,7 +308,7 @@ pub(super) fn start_import_job(
             task_id,
         });
         ctl.record_retry(Retryable::Import {
-            kind,
+            kind: kind.clone(),
             options: retry_options,
             total,
         });

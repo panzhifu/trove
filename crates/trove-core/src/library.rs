@@ -316,12 +316,22 @@ impl Library {
         store: Store,
         text_index: crate::search::TextIndex,
     ) -> Self {
+        // Open a separate SQLite connection for the task journal. The main
+        // Store connection is thread-confined (Rc<RefCell<…>), so the journal
+        // needs its own. WAL mode lets both coexist on the same database file.
+        let mut tasks = crate::tasks::TaskManager::new();
+        if let Ok(journal_conn) = rusqlite::Connection::open(root.join("library.db")) {
+            journal_conn
+                .execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=2000;")
+                .ok();
+            tasks.set_journal(journal_conn);
+        }
         let lib = Self {
             store,
             root,
             cache,
             undo: SharedUndoStack::with_cap(crate::config::AppConfig::load().undo_cap()),
-            tasks: std::sync::Arc::new(crate::tasks::TaskManager::new()),
+            tasks: std::sync::Arc::new(tasks),
             text_index,
             vector_index: std::cell::RefCell::new(None),
         };

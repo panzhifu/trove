@@ -6,6 +6,7 @@ pub mod browse;
 pub use browse::{BrowseContext, BrowseSession};
 pub mod collections;
 pub mod embeddings;
+pub mod facets;
 pub mod model_look;
 pub(crate) mod rows;
 pub mod schema;
@@ -14,6 +15,7 @@ pub mod smart;
 pub mod smart_collections;
 pub mod stats;
 pub mod tags;
+pub mod task_journal;
 pub mod view_history;
 pub mod visual_search;
 
@@ -814,8 +816,7 @@ mod tests {
             let mut asset = sample_asset(&format!("a{i:05}.png"), AssetKind::Image);
             asset.origin = Origin::Linked;
             asset.rel_path = None;
-            asset.facts.source_path =
-                Some(format!("/photos/2026/roll-{:04}/a{i:05}.png", i % 160));
+            asset.facts.source_path = Some(format!("/photos/2026/roll-{:04}/a{i:05}.png", i % 160));
             assets::insert(store.conn(), &asset).unwrap();
         }
         store.ensure_statistics().unwrap();
@@ -843,7 +844,9 @@ mod tests {
         // is what `LIKE` always meant here and what `COLLATE NOCASE` preserves.
         let via_column: i64 = store
             .conn()
-            .query_row(filter, rusqlite::params!["/PHOTOS/2026/roll-0042%"], |r| r.get(0))
+            .query_row(filter, rusqlite::params!["/PHOTOS/2026/roll-0042%"], |r| {
+                r.get(0)
+            })
             .unwrap();
         let via_json: i64 = store
             .conn()

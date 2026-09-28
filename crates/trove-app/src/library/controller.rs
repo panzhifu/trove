@@ -78,7 +78,7 @@ pub enum Retryable {
 pub fn retryable_kind(retryable: &Retryable) -> trove_core::tasks::TaskKind {
     use trove_core::tasks::TaskKind;
     match retryable {
-        Retryable::Import { kind, .. } => *kind,
+        Retryable::Import { kind, .. } => kind.clone(),
         Retryable::Embedding => TaskKind::EmbeddingBackfill,
         Retryable::Analysis { .. } => TaskKind::AiAnalysis,
     }
@@ -567,8 +567,8 @@ impl LibraryController {
     }
 
     /// The stored re-run inputs for `kind`, if any.
-    pub fn retry_inputs(&self, kind: trove_core::tasks::TaskKind) -> Option<&Retryable> {
-        self.retryable.get(&kind)
+    pub fn retry_inputs(&self, kind: &trove_core::tasks::TaskKind) -> Option<&Retryable> {
+        self.retryable.get(kind)
     }
 
     pub fn pause_task(&mut self, id: trove_core::tasks::TaskId) {

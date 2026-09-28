@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 
 use image::GenericImageView;
 
+use crate::config::{AppConfig, AudioCardStyle};
 use crate::media::waveform;
 use crate::model::{Asset, AssetKind, Origin};
 
@@ -713,19 +714,43 @@ fn card_lines(text: &str) -> Vec<String> {
 /// a file with neither a picture nor a cached envelope keeps the kind icon it
 /// always had — until the envelope exists because the file was previewed, or
 /// until a thumbnail rebuild asks for it.
+///
+/// The order is controlled by [`crate::config::AudioCardStyle`]: the default
+/// `cover` tries the tagged picture first and falls back to the waveform;
+/// `waveform` reverses the preference.
 fn write_audio_cover(root: &Path, sha: &str, blob_path: &Path, out: &Path) -> Option<PathBuf> {
-    if let Some(cover) = embedded_cover(blob_path) {
-        return write_cover(&cover, out);
+    match AppConfig::load().audio_card_style() {
+        AudioCardStyle::Cover => {
+            if let Some(cover) = embedded_cover(blob_path) {
+                return write_cover(&cover, out);
+            }
+            write_wave_card(&waveform::cached(root, sha)?, out)
+        }
+        AudioCardStyle::Waveform => {
+            if let Some(peaks) = waveform::cached(root, sha) {
+                return write_wave_card(&peaks, out);
+            }
+            embedded_cover(blob_path).and_then(|c| write_cover(&c, out))
+        }
     }
-    write_wave_card(&waveform::cached(root, sha)?, out)
 }
 
 /// The same card for a rebuild that is allowed to decode the envelope first.
 fn rebuild_audio_cover(root: &Path, sha: &str, blob_path: &Path, out: &Path) -> Option<PathBuf> {
-    if let Some(cover) = embedded_cover(blob_path) {
-        return write_cover(&cover, out);
+    match AppConfig::load().audio_card_style() {
+        AudioCardStyle::Cover => {
+            if let Some(cover) = embedded_cover(blob_path) {
+                return write_cover(&cover, out);
+            }
+            write_wave_card(&waveform::load_or_build(root, sha, blob_path)?, out)
+        }
+        AudioCardStyle::Waveform => {
+            if let Some(peaks) = waveform::load_or_build(root, sha, blob_path) {
+                return write_wave_card(&peaks, out);
+            }
+            embedded_cover(blob_path).and_then(|c| write_cover(&c, out))
+        }
     }
-    write_wave_card(&waveform::load_or_build(root, sha, blob_path)?, out)
 }
 
 /// Draw the envelope as a card.

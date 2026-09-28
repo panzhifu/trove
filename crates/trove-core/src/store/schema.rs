@@ -19,12 +19,13 @@
 //! come back — with the rule that a step must be applicable from a shape that
 //! matches the version on record.
 //!
-//! That is where this file stands now: [`UPGRADES`] holds six steps, because
+//! That is where this file stands now: [`UPGRADES`] holds seven steps, because
 //! every one of them landed while the version before it was already in the
 //! field — v14 → v15 for the `ai_analysis` cache, v15 → v16 for a container's
 //! appearance, v16 → v17 for the 3D viewport's look, v17 → v18 for the ordered
 //! live-listing indexes, v18 → v19 for image sequences, v19 → v20 for the
-//! indexed source path. Everything not on the list is still refused by name.
+//! indexed source path, v20 → v21 for the task journal. Everything not on the
+//! list is still refused by name.
 
 /// The schema this build creates, and the only shape it opens. A library at
 /// any other version is refused by name rather than guessed at.
@@ -33,7 +34,7 @@
 /// existence was written by a build whose chain ended there, and that shape
 /// is the pre-`asset_embeddings` subset of the one below — which is the only
 /// sense in which a version number means anything.
-pub const SCHEMA_VERSION: i64 = 20;
+pub const SCHEMA_VERSION: i64 = 21;
 
 /// One upgrade step: the DDL that takes a library from `from` to `to`, and the
 /// data that DDL cannot move.
@@ -95,7 +96,36 @@ pub const UPGRADES: &[Upgrade] = &[
         sql: UPGRADE_19_TO_20,
         data: Some(analyze_statistics),
     },
+    Upgrade {
+        from: 20,
+        to: 21,
+        sql: UPGRADE_20_TO_21,
+        data: None,
+    },
 ];
+
+/// v20 → v21: the task journal.
+///
+/// Persists task metadata so the UI can surface interrupted work after a
+/// restart and track retry history. The table is append-only for status
+/// updates (upsert on task_id), so a crash mid-write leaves the previous
+/// state intact.
+const UPGRADE_20_TO_21: &str = r#"
+    CREATE TABLE IF NOT EXISTS task_journal (
+        task_id      TEXT PRIMARY KEY,
+        kind         TEXT NOT NULL,
+        label        TEXT NOT NULL,
+        status       TEXT NOT NULL,
+        done         INTEGER NOT NULL DEFAULT 0,
+        total        INTEGER NOT NULL DEFAULT 0,
+        summary      TEXT,
+        error        TEXT,
+        retry_count  INTEGER NOT NULL DEFAULT 0,
+        max_retries  INTEGER NOT NULL DEFAULT 0,
+        started_at   TEXT NOT NULL,
+        finished_at  TEXT
+    );
+"#;
 
 /// v19 → v20: an index the folder queries can actually use.
 ///
@@ -588,4 +618,21 @@ pub const SCHEMA: &str = r#"
     );
 
     CREATE INDEX idx_ai_analysis_model ON ai_analysis(model_version);
+
+    -- The task journal: persists task metadata across restarts so the UI can
+    -- surface interrupted work and track retry history. See [`UPGRADE_20_TO_21`].
+    CREATE TABLE IF NOT EXISTS task_journal (
+        task_id      TEXT PRIMARY KEY,
+        kind         TEXT NOT NULL,
+        label        TEXT NOT NULL,
+        status       TEXT NOT NULL,
+        done         INTEGER NOT NULL DEFAULT 0,
+        total        INTEGER NOT NULL DEFAULT 0,
+        summary      TEXT,
+        error        TEXT,
+        retry_count  INTEGER NOT NULL DEFAULT 0,
+        max_retries  INTEGER NOT NULL DEFAULT 0,
+        started_at   TEXT NOT NULL,
+        finished_at  TEXT
+    );
 "#;

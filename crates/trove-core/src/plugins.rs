@@ -72,6 +72,15 @@ pub trait Plugin: Send + Sync {
     fn commands(&self) -> Vec<PluginCommand> {
         Vec::new()
     }
+
+    /// Custom task kinds this plugin can schedule. Each name becomes a
+    /// [`TaskKind::Custom`] variant the task manager recognises for
+    /// mutual-exclusion, journaling, and progress reporting — so a plugin
+    /// gets its own slot, its own row in the task panel, and survives
+    /// restarts under the same label it registered with.
+    fn task_kinds(&self) -> Vec<&'static str> {
+        Vec::new()
+    }
 }
 
 /// The set of registered plugins. A plain struct so tests can build their own
@@ -119,6 +128,18 @@ impl Registry {
             .flat_map(|plugin| plugin.pipeline_stages())
             .collect()
     }
+
+    /// Every custom task kind registered by enabled plugins, in registration
+    /// order. Duplicates across plugins are kept — the task manager uses the
+    /// string for mutual exclusion, so two plugins sharing a kind name would
+    /// share a slot, which is almost certainly a bug worth surfacing.
+    pub fn task_kinds(&self, disabled: &[String]) -> Vec<&'static str> {
+        self.plugins
+            .iter()
+            .filter(|plugin| !disabled.iter().any(|name| name == plugin.name()))
+            .flat_map(|plugin| plugin.task_kinds())
+            .collect()
+    }
 }
 
 fn global() -> &'static Mutex<Registry> {
@@ -154,6 +175,15 @@ pub fn pipeline_stages(disabled: &[String]) -> Vec<Arc<dyn Stage>> {
         .lock()
         .expect("plugin registry lock")
         .pipeline_stages(disabled)
+}
+
+/// Every custom task kind registered by enabled plugins. The UI uses this to
+/// populate the task panel's filter and the settings page's plugin list.
+pub fn task_kinds(disabled: &[String]) -> Vec<&'static str> {
+    global()
+        .lock()
+        .expect("plugin registry lock")
+        .task_kinds(disabled)
 }
 
 #[cfg(test)]

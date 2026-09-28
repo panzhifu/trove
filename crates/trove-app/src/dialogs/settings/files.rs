@@ -7,7 +7,7 @@
 use super::*;
 use crate::components::controls::muted_label;
 use gpui_kit::component::chart::PieChart;
-use trove_core::config::LibraryConfig;
+use trove_core::config::{AudioCardStyle, LibraryConfig};
 use trove_core::services::storage::{DirUsage, StorageReport};
 
 // =============================== files page ==================================
@@ -41,6 +41,22 @@ pub(super) fn files_page(
         .group(
             SettingGroup::new()
                 .title(t("settings.thumbnails"))
+                .item(
+                    SettingItem::new(
+                        t("settings.audio_card_waveform"),
+                        config_switch(
+                            |config| config.audio_card_style() == AudioCardStyle::Waveform,
+                            |config, on| {
+                                config.audio_card_style = Some(if on {
+                                    AudioCardStyle::Waveform
+                                } else {
+                                    AudioCardStyle::Cover
+                                });
+                            },
+                        ),
+                    )
+                    .description(t("settings.audio_card_waveform_desc")),
+                )
                 .item(
                     SettingItem::new(
                         t("settings.rebuild_thumbs"),

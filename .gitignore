@@ -28,3 +28,11 @@ reference/
 
 # 各 crate 内相对路径 TMPDIR 产生的测试临时目录（正确用法是绝对路径 TMPDIR）
 crates/*/target/
+
+# 性能对照 harness 的产物：fixture（20k + 100k 共 ~172 GB）、生成的 rolldown bundle、
+# 以及每次重跑都会覆盖的原始读数。源码只有 bench/*.mjs、bench/*.sh、bench/serpent/*.ts|md。
+bench/work/
+bench/serpent/fixture-bundle.mjs
+bench/serpent/search-probe-bundle.mjs
+bench/serpent/node_modules
+bench/results/

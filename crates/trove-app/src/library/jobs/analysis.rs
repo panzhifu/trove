@@ -327,7 +327,7 @@ pub fn retry_task_app(
     window: &mut Window,
     cx: &mut App,
 ) -> bool {
-    let Some(retry) = controller.read(cx).retry_inputs(kind).cloned() else {
+    let Some(retry) = controller.read(cx).retry_inputs(&kind).cloned() else {
         return false;
     };
     match retry {

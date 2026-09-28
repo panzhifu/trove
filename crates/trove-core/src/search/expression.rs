@@ -38,10 +38,9 @@
 //! | `desc:` | `description:` | the description |
 //! | `tag:` | `tags:` | the tag names |
 //!
-//! Pinyin and abbreviation are indexed over all four surfaces concatenated
-//! (see `TextIndex::index_asset`), so a *qualified* term deliberately loses
-//! them: matching `tag:mao` against a pinyin that came from the file name
-//! would be a wrong answer with no visible cause.
+//! Pinyin and abbreviation matching is field-scoped: `tag:mao` matches pinyin
+//! from tags only, not from the file name or other surfaces. Each surface has
+//! its own pinyin index (see `TextIndex::index_asset`).
 //!
 //! The remaining qualifiers are structured and go to SQL, since they compare
 //! against columns rather than text:
@@ -71,6 +70,19 @@ pub enum Target {
     Title,
     Description,
     Tags,
+    /// All extracted metadata (camera EXIF, media tags, font facts, tech specs).
+    /// Unqualified terms search here in addition to the four primary surfaces.
+    Facts,
+    /// Camera make and model (EXIF).
+    Camera,
+    /// Music artist tag.
+    Artist,
+    /// Music album name.
+    Album,
+    /// Font family and style.
+    Font,
+    /// Audio technical specs (sample rate, channels, bit depth, bitrate).
+    Audio,
 }
 
 /// One search term: a span of text that must (or must not) match one target.
@@ -245,6 +257,18 @@ const FIELD_TARGETS: &[(&str, Target)] = &[
     ("description", Target::Description),
     ("tag", Target::Tags),
     ("tags", Target::Tags),
+    ("camera", Target::Camera),
+    ("make", Target::Camera),
+    ("model", Target::Camera),
+    ("artist", Target::Artist),
+    ("album", Target::Album),
+    ("font", Target::Font),
+    ("family", Target::Font),
+    ("audio", Target::Audio),
+    ("sample_rate", Target::Audio),
+    ("channels", Target::Audio),
+    ("bit_depth", Target::Audio),
+    ("bitrate", Target::Audio),
 ];
 
 fn field_target(field: &str) -> Option<Target> {

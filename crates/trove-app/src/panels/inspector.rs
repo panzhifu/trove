@@ -87,7 +87,7 @@ impl InspectorPanel {
         let input = this.tag_input.clone();
         cx.subscribe_in(&input, window, |this, _, event, window, cx| {
             if matches!(event, InputEvent::PressEnter { .. }) {
-                this.add_tag_from_input(window, cx);
+                this.append_tags_flat(window, cx);
             }
         })
         .detach();
@@ -108,39 +108,11 @@ impl InspectorPanel {
         this
     }
 
-    fn add_tag_from_input(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let name: String = self.tag_input.read(cx).value().to_string();
-        let name = name.trim().to_string();
-        if name.is_empty() {
-            return;
-        }
-        let controller = self.controller.clone();
-        let Some(asset_id) = controller.read(cx).primary() else {
-            return;
-        };
-        controller.update(cx, |ctl, cx| {
-            if let Ok(tag) = ctl.library.ensure_tag(&name) {
-                let _ = ctl.library.tag_assets(&[asset_id], tag.id, true);
-            }
-            ctl.generation += 1;
-            cx.notify();
-        });
-        // Clear the input after adding the tag.
-        self.tag_input
-            .update(cx, |state, cx| state.set_value("", window, cx));
-    }
-
-    /// Replace the asset's whole tag group with the comma-separated names in
-    /// the tag input (backed by `tags::set_for_asset`). Missing names are
-    /// created; a failure keeps the old group and surfaces a notice.
-    fn replace_tags_from_input(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let raw: String = self.tag_input.read(cx).value().to_string();
-        let names: Vec<String> = raw
-            .split([',', '，', ';', '；'])
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_string)
-            .collect();
+    /// Split the tag input by common separators and append every name to the
+    /// asset. Missing tags are created at the root level. This is the same
+    /// action the Enter key triggers, exposed as a button for discoverability.
+    fn append_tags_flat(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let names = self.split_tag_input(cx);
         if names.is_empty() {
             return;
         }
@@ -148,31 +120,65 @@ impl InspectorPanel {
         let Some(asset_id) = controller.read(cx).primary() else {
             return;
         };
-        let mut failed: Option<String> = None;
         controller.update(cx, |ctl, cx| {
-            let mut ids = Vec::with_capacity(names.len());
             for name in &names {
-                match ctl.library.ensure_tag(name) {
-                    Ok(tag) => ids.push(tag.id),
-                    Err(e) => {
-                        failed = Some(e.to_string());
-                        break;
-                    }
+                if let Ok(tag) = ctl.library.ensure_tag(name) {
+                    let _ = ctl.library.tag_assets(&[asset_id], tag.id, true);
                 }
-            }
-            if failed.is_none() {
-                let _ = ctl.library.set_asset_tags(asset_id, &ids);
-            } else if let Some(e) = failed.clone() {
-                ctl.notice =
-                    Some(rust_i18n::t!("inspector.replace_tags_failed", error = e).to_string());
             }
             ctl.generation += 1;
             cx.notify();
         });
-        if failed.is_none() {
-            self.tag_input
-                .update(cx, |state, cx| state.set_value("", window, cx));
+        self.tag_input
+            .update(cx, |state, cx| state.set_value("", window, cx));
+    }
+
+    /// Split the tag input and create a chain: the first name is a root tag,
+    /// each subsequent name is created as a child of the one before it. All
+    /// tags in the chain are then attached to the asset. This is how a user
+    /// builds a path like `风景 / 山 / 日落` in one keystroke.
+    fn append_tags_chained(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let names = self.split_tag_input(cx);
+        if names.is_empty() {
+            return;
         }
+        let controller = self.controller.clone();
+        let Some(asset_id) = controller.read(cx).primary() else {
+            return;
+        };
+        controller.update(cx, |ctl, cx| {
+            let mut parent_id: Option<Uuid> = None;
+            let mut tag_ids = Vec::with_capacity(names.len());
+            for name in &names {
+                match ctl.library.create_tag(name, parent_id) {
+                    Ok(tag) => {
+                        parent_id = Some(tag.id);
+                        tag_ids.push(tag.id);
+                    }
+                    Err(_) => break,
+                }
+            }
+            for tag_id in tag_ids {
+                let _ = ctl.library.tag_assets(&[asset_id], tag_id, true);
+            }
+            ctl.generation += 1;
+            cx.notify();
+        });
+        self.tag_input
+            .update(cx, |state, cx| state.set_value("", window, cx));
+    }
+
+    /// Split the tag input value by commas and semicolons (both half- and
+    /// full-width), trimming whitespace and dropping empties.
+    fn split_tag_input(&self, cx: &mut Context<Self>) -> Vec<String> {
+        self.tag_input
+            .read(cx)
+            .value()
+            .split([',', '，', ';', '；'])
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect()
     }
 
     /// Write one text field back to the store when it changed. An empty
@@ -497,12 +503,22 @@ impl Render for InspectorPanel {
             .child(Input::new(&self.tag_input).small().flex_1())
             .child(
                 icon_button(
-                    "replace-tags",
-                    IconName::Replace,
-                    rust_i18n::t!("inspector.replace_tags_hint").to_string(),
+                    "append-tags-flat",
+                    IconName::Plus,
+                    rust_i18n::t!("inspector.append_tags_flat_hint").to_string(),
                 )
                 .on_click(cx.listener(|this, _, window, cx| {
-                    this.replace_tags_from_input(window, cx);
+                    this.append_tags_flat(window, cx);
+                })),
+            )
+            .child(
+                icon_button(
+                    "append-tags-chained",
+                    IconName::ArrowDown,
+                    rust_i18n::t!("inspector.append_tags_chained_hint").to_string(),
+                )
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.append_tags_chained(window, cx);
                 })),
             );
 

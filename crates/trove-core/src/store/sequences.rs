@@ -321,9 +321,8 @@ pub fn membership(conn: &Connection, asset_id: Uuid) -> Result<Option<Membership
 /// Every asset that is a member of a sequence, with its own id. Used by the
 /// import path to skip work for frames the grid will never show on its own.
 pub fn hidden_members(conn: &Connection) -> Result<Vec<Uuid>> {
-    let mut statement = conn.prepare(
-        "SELECT f.asset_id FROM asset_sequence_frames f WHERE f.position > 0",
-    )?;
+    let mut statement =
+        conn.prepare("SELECT f.asset_id FROM asset_sequence_frames f WHERE f.position > 0")?;
     let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
     let mut out = Vec::new();
     for row in rows {
@@ -419,8 +418,7 @@ mod tests {
         // The guard is what decides whether the clause is emitted at all, so
         // both halves are pinned: absent while there is nothing to hide,
         // present the moment there is.
-        let (clause, _) =
-            assets::build_where(conn, &query, assets::WhereMode::Driving).unwrap();
+        let (clause, _) = assets::build_where(conn, &query, assets::WhereMode::Driving).unwrap();
         assert!(
             clause.contains("asset_sequence_frames"),
             "a library with a run has to filter its hidden members: {clause}"

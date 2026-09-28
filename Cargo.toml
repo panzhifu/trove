@@ -4,7 +4,8 @@ resolver = "3"
 
 [profile.release]
 strip = true
-lto = "thin"
+lto = true
+codegen-units = 1
 
 [workspace.dependencies]
 # UI

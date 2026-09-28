@@ -10,6 +10,7 @@ use std::ops::Range;
 use std::path::Path;
 use trove_core::model::Asset;
 use trove_core::search::{expression::Target, highlight::Lexicon};
+use trove_core::store::facets::FacetCounts;
 use trove_core::store::{BrowseContext, BrowseSession};
 
 /// The surfaces a listing row shows: one string, the title when the asset has
@@ -178,6 +179,10 @@ pub(super) struct ViewData {
     /// The listing the next page is cut from. `None` for a visual search, whose
     /// id list is frozen on the controller instead.
     pub(super) session: Option<BrowseSession>,
+    /// Facet counts for the current filter context. `None` when the listing
+    /// is a visual search (no session to count against) or when counting
+    /// failed (the grid still renders without facets).
+    pub(super) facets: Option<FacetCounts>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -334,10 +339,16 @@ impl WorkspacePanel {
         key: &DataKey,
         count_total: bool,
         window: usize,
-    ) -> (usize, Vec<Cell>, bool, Option<BrowseSession>) {
+    ) -> (
+        usize,
+        Vec<Cell>,
+        bool,
+        Option<BrowseSession>,
+        Option<FacetCounts>,
+    ) {
         if let Some(ids) = &key.visual {
             let (total, cells, truncated) = self.run_visual_pass(cx, key, ids, 0, window);
-            return (total, cells, truncated, None);
+            return (total, cells, truncated, None, None);
         }
 
         let ctl = self.controller.read(cx);
@@ -395,7 +406,14 @@ impl WorkspacePanel {
             .and_then(|session| {
                 session
                     .page(conn, text_index, 0, Some(window))
-                    .map(|page| (session, page))
+                    // Facet counts are computed here while `conn` is still
+                    // borrowed, so the borrow ends before the mutable borrow
+                    // that `report_notice` needs below. A failed count leaves
+                    // `facets` None and the grid renders without numbers.
+                    .map(|page| {
+                        let facets = session.compute_facets(conn).ok();
+                        (session, page, facets)
+                    })
             });
         if let Err(error) = drained {
             tracing::warn!(%error, "search outbox drain failed before a browse refresh");
@@ -404,13 +422,19 @@ impl WorkspacePanel {
             self.report_notice(cx, msg);
         }
         match frozen {
-            Ok((session, page)) => {
+            Ok((session, page, facets)) => {
                 let (total, truncated) = (page.total as usize, page.truncated);
-                (total, cells_for(key, &page.items), truncated, Some(session))
+                (
+                    total,
+                    cells_for(key, &page.items),
+                    truncated,
+                    Some(session),
+                    facets,
+                )
             }
             Err(error) => {
                 self.report_view_error(cx, error);
-                (0, Vec::new(), false, None)
+                (0, Vec::new(), false, None, None)
             }
         }
     }

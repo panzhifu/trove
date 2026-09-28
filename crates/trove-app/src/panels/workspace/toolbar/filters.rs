@@ -11,6 +11,7 @@ use gpui_kit::{Anchor, App};
 
 use trove_core::config::{AppConfig, FILTER_TOOLS};
 use trove_core::model::{AspectPreset, AssetKind, AssetSort, Orientation, ResolutionBand};
+use trove_core::store::facets::{FacetCounts, FacetValue};
 use trove_core::store::tags;
 
 use crate::components::controls::icon_button;
@@ -163,10 +164,45 @@ pub(crate) fn kind_key(kind: AssetKind) -> &'static str {
 
 // ======================== in-panel filter tools ==============================
 
+/// Look up the count for a value in a facet slice. Returns `None` when the
+/// facet data is absent (the listing has not been counted yet) or when the
+/// value does not appear (zero assets carry it).
+fn facet_count(facets: Option<&[FacetValue]>, value: &str) -> Option<u64> {
+    facets.and_then(|fvs| fvs.iter().find(|fv| fv.value == value).map(|fv| fv.count))
+}
+
+/// The DB string for each kind, matching `kind_str` in `store/assets.rs`.
+/// Facet values are stored as these lowercase English labels.
+fn kind_db_key(kind: AssetKind) -> &'static str {
+    match kind {
+        AssetKind::Image => "image",
+        AssetKind::Video => "video",
+        AssetKind::Audio => "audio",
+        AssetKind::Document => "document",
+        AssetKind::Archive => "archive",
+        AssetKind::Font => "font",
+        AssetKind::Model => "model",
+        AssetKind::Other => "other",
+    }
+}
+
+/// Append a facet count to a label when the data is available: `"PNG" → "PNG (42)"`.
+fn with_count(label: &str, count: Option<u64>) -> String {
+    match count {
+        Some(n) => format!("{label} ({n})"),
+        None => label.to_string(),
+    }
+}
+
 /// The kind dropdown for the in-panel toolbar row.
-pub(crate) fn kind_filter(controller: &Entity<LibraryController>, cx: &App) -> impl IntoElement {
+pub(crate) fn kind_filter(
+    facets: Option<&FacetCounts>,
+    controller: &Entity<LibraryController>,
+    cx: &App,
+) -> impl IntoElement {
     let kind = controller.read(cx).filter_kind;
     let t = |k: &str| rust_i18n::t!(k).to_string();
+    let kind_facets = facets.map(|f| f.kinds.as_slice());
 
     let options: Vec<(Option<AssetKind>, String)> =
         std::iter::once((None, t("workspace.filter_all_kinds")))
@@ -182,7 +218,11 @@ pub(crate) fn kind_filter(controller: &Entity<LibraryController>, cx: &App) -> i
                     AssetKind::Other,
                 ]
                 .into_iter()
-                .map(|k| (Some(k), t(kind_key(k)))),
+                .map(|k| {
+                    let label = t(kind_key(k));
+                    let counted = with_count(&label, facet_count(kind_facets, kind_db_key(k)));
+                    (Some(k), counted)
+                }),
             )
             .collect();
     Button::new("filter-kind")
@@ -214,7 +254,11 @@ pub(crate) fn kind_filter(controller: &Entity<LibraryController>, cx: &App) -> i
 }
 
 /// The tag filter.
-pub(crate) fn tag_filter(controller: &Entity<LibraryController>, cx: &App) -> impl IntoElement {
+pub(crate) fn tag_filter(
+    facets: Option<&FacetCounts>,
+    controller: &Entity<LibraryController>,
+    cx: &App,
+) -> impl IntoElement {
     let active = controller.read(cx).active_tag;
     let tags: Vec<(Uuid, String)> = {
         let conn = controller.read(cx).library.store().conn();
@@ -225,6 +269,17 @@ pub(crate) fn tag_filter(controller: &Entity<LibraryController>, cx: &App) -> im
             .collect()
     };
     let t = |k: &str| rust_i18n::t!(k).to_string();
+    let tag_facets = facets.map(|f| f.tags.as_slice());
+
+    // Pre-compute labels with counts before the closure so the facet borrow
+    // does not need to escape the function.
+    let options: Vec<(Uuid, String)> = tags
+        .iter()
+        .map(|(id, name)| {
+            let counted = with_count(name, facet_count(tag_facets, name));
+            (*id, counted)
+        })
+        .collect();
 
     Button::new("filter-tag")
         .ghost()
@@ -239,11 +294,11 @@ pub(crate) fn tag_filter(controller: &Entity<LibraryController>, cx: &App) -> im
                 menu = menu.item(
                     PopupMenuItem::new(t("workspace.filter_all_tags")).checked(active.is_none()),
                 );
-                for (id, name) in &tags {
+                for (id, label) in &options {
                     let checked = active == Some(*id);
-                    let (id, name) = (*id, name.clone());
+                    let (id, label) = (*id, label.clone());
                     let controller = controller.clone();
-                    menu = menu.item(PopupMenuItem::new(name).checked(checked).on_click(
+                    menu = menu.item(PopupMenuItem::new(label).checked(checked).on_click(
                         move |_, _, cx| {
                             controller.update(cx, |ctl, cx| {
                                 ctl.select_tag(Some(id));
@@ -260,17 +315,40 @@ pub(crate) fn tag_filter(controller: &Entity<LibraryController>, cx: &App) -> im
 /// The shape filter: coarse orientation plus media aspect-ratio presets
 /// (WeChat cover, 4:3 photo, …) in one single-choice menu. The controller
 /// keeps the two mutually exclusive; "all shapes" clears both.
-pub(crate) fn shape_filter(controller: &Entity<LibraryController>, cx: &App) -> impl IntoElement {
+pub(crate) fn shape_filter(
+    facets: Option<&FacetCounts>,
+    controller: &Entity<LibraryController>,
+    cx: &App,
+) -> impl IntoElement {
     let (orientation, aspect) = {
         let ctl = controller.read(cx);
         (ctl.filter_orientation, ctl.filter_aspect)
     };
     let t = |k: &str| rust_i18n::t!(k).to_string();
+    let orient_facets = facets.map(|f| f.orientations.as_slice());
 
     let shape_options: Vec<(Option<Orientation>, String)> = vec![
-        (Some(Orientation::Landscape), t("workspace.shape_landscape")),
-        (Some(Orientation::Portrait), t("workspace.shape_portrait")),
-        (Some(Orientation::Square), t("workspace.shape_square")),
+        (
+            Some(Orientation::Landscape),
+            with_count(
+                &t("workspace.shape_landscape"),
+                facet_count(orient_facets, "landscape"),
+            ),
+        ),
+        (
+            Some(Orientation::Portrait),
+            with_count(
+                &t("workspace.shape_portrait"),
+                facet_count(orient_facets, "portrait"),
+            ),
+        ),
+        (
+            Some(Orientation::Square),
+            with_count(
+                &t("workspace.shape_square"),
+                facet_count(orient_facets, "square"),
+            ),
+        ),
     ];
     let aspect_presets = [
         (AspectPreset::WechatCover, "workspace.aspect_wechat_cover"),
@@ -422,13 +500,28 @@ pub(crate) fn resolution_filter(
 }
 
 /// The rating filter.
-pub(crate) fn rating_filter(controller: &Entity<LibraryController>, cx: &App) -> impl IntoElement {
+pub(crate) fn rating_filter(
+    facets: Option<&FacetCounts>,
+    controller: &Entity<LibraryController>,
+    cx: &App,
+) -> impl IntoElement {
     let current = controller.read(cx).filter_min_rating;
     let t = |k: &str| rust_i18n::t!(k).to_string();
+    let rating_facets = facets.map(|f| f.ratings.as_slice());
 
     let mut options: Vec<(Option<u8>, String)> = vec![(None, t("workspace.filter_all_ratings"))];
     for stars in 1..=5u8 {
-        options.push((Some(stars), format!("★ {}+", stars)));
+        let label = format!("★ {}+", stars);
+        // Sum counts for all ratings >= this threshold.
+        let count = rating_facets.map(|fvs| {
+            fvs.iter()
+                .filter_map(|fv| {
+                    let n = fv.value.trim_end_matches('★').parse::<u8>().ok()?;
+                    if n >= stars { Some(fv.count) } else { None }
+                })
+                .sum::<u64>()
+        });
+        options.push((Some(stars), with_count(&label, count)));
     }
     let label = match current {
         Some(n) => format!("★ {}+", n),
@@ -467,17 +560,20 @@ pub(crate) fn rating_filter(controller: &Entity<LibraryController>, cx: &App) ->
 /// The format filter: distinct file extensions among live assets.
 pub(crate) fn format_filter(
     exts: &[String],
+    facets: Option<&FacetCounts>,
     controller: &Entity<LibraryController>,
     cx: &App,
 ) -> impl IntoElement {
     let current = controller.read(cx).filter_ext.clone();
     let t = |k: &str| rust_i18n::t!(k).to_string();
+    let ext_facets = facets.map(|f| f.exts.as_slice());
 
     let options: Vec<(Option<String>, String)> =
         std::iter::once((None, t("workspace.filter_all_formats")))
             .chain(exts.iter().map(|e| {
                 let label = e.to_uppercase();
-                (Some(e.clone()), label)
+                let counted = with_count(&label, facet_count(ext_facets, e));
+                (Some(e.clone()), counted)
             }))
             .collect();
     let label = current

@@ -11,7 +11,7 @@
 use rusqlite::Connection;
 use uuid::Uuid;
 
-use super::{assets, smart, smart_collections, view_history};
+use super::{assets, facets, smart, smart_collections, view_history};
 use crate::error::{Error, Result};
 use crate::model::{
     AspectPreset, Asset, AssetKind, AssetQuery, AssetSort, Orientation, Page, QueryCondition,
@@ -488,6 +488,20 @@ impl BrowseSession {
             items,
             truncated: self.truncated,
         })
+    }
+
+    /// Compute facet counts for this listing's current filter context.
+    ///
+    /// Dispatches by listing shape: a ranked listing restricts counting to the
+    /// frozen ids, a set listing uses its WHERE clause directly, and a smart
+    /// listing counts within its grid filters (the collection's own rules are
+    /// a separate dimension the sidebar does not break down).
+    pub fn compute_facets(&self, conn: &Connection) -> Result<facets::FacetCounts> {
+        match &self.listing {
+            Listing::Ranked(ids) => facets::compute_for_ranked(conn, ids, &AssetQuery::default()),
+            Listing::Set(q) => facets::compute_for_query(conn, q),
+            Listing::Smart { filters, .. } => facets::compute_for_query(conn, filters),
+        }
     }
 }
 

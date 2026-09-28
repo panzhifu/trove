@@ -456,6 +456,9 @@ impl WorkspacePanel {
             Some((_, exts)) => exts.as_slice(),
             None => &[],
         };
+        // Facet counts for the current filter context. `None` when the listing
+        // has not been counted yet (first frame) or when counting failed.
+        let facets = self.data.as_ref().and_then(|d| d.facets.as_ref());
         // Which filter tools the user enabled; recomputed per render so a
         // toggle in the "+" menu applies immediately.
         let enabled_tools = trove_core::config::AppConfig::load().filter_tools();
@@ -476,22 +479,22 @@ impl WorkspacePanel {
                 cx,
             ))
             .when(tool_enabled("kind"), |row| {
-                row.child(kind_filter(&controller, cx))
+                row.child(kind_filter(facets, &controller, cx))
             })
             .when(tool_enabled("tag"), |row| {
-                row.child(tag_filter(&controller, cx))
+                row.child(tag_filter(facets, &controller, cx))
             })
             .when(tool_enabled("shape"), |row| {
-                row.child(shape_filter(&controller, cx))
+                row.child(shape_filter(facets, &controller, cx))
             })
             .when(tool_enabled("resolution"), |row| {
                 row.child(resolution_filter(&controller, cx))
             })
             .when(tool_enabled("rating"), |row| {
-                row.child(rating_filter(&controller, cx))
+                row.child(rating_filter(facets, &controller, cx))
             })
             .when(tool_enabled("format"), |row| {
-                row.child(format_filter(exts, &controller, cx))
+                row.child(format_filter(exts, facets, &controller, cx))
             })
             .child(add_filter_button(&controller))
             .when(search_active, |row| {
@@ -779,7 +782,7 @@ impl Render for WorkspacePanel {
             // truncation — those belong to the listing as a whole, which is the
             // pass that froze and counted it.
             let previous = self.data.take();
-            let (total, cells, truncated, session) = match previous {
+            let (total, cells, truncated, session, facets) = match previous {
                 Some(previous) if extends => {
                     let (added, nothing_new) = self.run_page_pass(
                         cx,
@@ -795,17 +798,23 @@ impl Render for WorkspacePanel {
                     let mut cells = Rc::unwrap_or_clone(previous.cells);
                     cells.extend(added);
                     appended = true;
-                    (previous.total, cells, previous.truncated, previous.session)
+                    (
+                        previous.total,
+                        cells,
+                        previous.truncated,
+                        previous.session,
+                        previous.facets,
+                    )
                 }
                 _ => {
                     self.page_finished = false;
-                    let (pass_total, cells, pass_truncated, session) =
+                    let (pass_total, cells, pass_truncated, session, facets) =
                         self.run_data_pass(cx, &data_key, need_count, window);
                     if need_count {
-                        (pass_total, cells, pass_truncated, session)
+                        (pass_total, cells, pass_truncated, session, facets)
                     } else {
                         self.arm_total_settle(cx);
-                        (cached_total, cells, cached_truncated, session)
+                        (cached_total, cells, cached_truncated, session, facets)
                     }
                 }
             };
@@ -815,6 +824,7 @@ impl Render for WorkspacePanel {
                 truncated,
                 cells: Rc::new(cells),
                 session,
+                facets,
             });
         }
         let data = self.data.as_ref().unwrap();

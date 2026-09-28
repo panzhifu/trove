@@ -75,6 +75,12 @@ pub struct AppConfig {
     /// wins over them either way.
     #[serde(default)]
     pub material_render: Option<bool>,
+    /// Which picture an audio card shows: the tagged cover art (`cover`, the
+    /// default) or the envelope waveform (`waveform`). Changing this
+    /// invalidates existing audio thumbnails; a rebuild picks up the new
+    /// style.
+    #[serde(default)]
+    pub audio_card_style: Option<AudioCardStyle>,
     /// Light/dark appearance. `System` follows the OS and is the default.
     #[serde(default)]
     pub appearance: Appearance,
@@ -567,6 +573,39 @@ impl Appearance {
     }
 }
 
+/// Which picture an audio card shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AudioCardStyle {
+    /// The tagged cover art, falling back to the waveform when no art is
+    /// embedded. This is the default because a cover is usually more
+    /// informative than a shape.
+    #[default]
+    Cover,
+    /// The envelope waveform, falling back to the cover art when no cached
+    /// envelope exists. Useful for music libraries where every file has art
+    /// and the waveform carries more information about the sound.
+    Waveform,
+}
+
+impl AudioCardStyle {
+    /// The value stored in JSON.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Cover => "cover",
+            Self::Waveform => "waveform",
+        }
+    }
+
+    /// Inverse of [`Self::as_str`]; unknown values fall back to `Cover`.
+    pub fn parse(value: &str) -> Self {
+        match value {
+            "waveform" => Self::Waveform,
+            _ => Self::Cover,
+        }
+    }
+}
+
 /// Undo-history depth used when no explicit cap is configured. See
 /// [`crate::history::undo::DEFAULT_UNDO_CAP`].
 pub use crate::history::undo::DEFAULT_UNDO_CAP;
@@ -991,6 +1030,12 @@ impl AppConfig {
     /// Whether point-cloud previews get eye-dome lighting and gap filling.
     pub fn point_enhance(&self) -> bool {
         self.point_enhance.unwrap_or(true)
+    }
+
+    /// Which picture an audio card shows: the tagged cover art or the
+    /// envelope waveform. Defaults to [`AudioCardStyle::Cover`].
+    pub fn audio_card_style(&self) -> AudioCardStyle {
+        self.audio_card_style.unwrap_or_default()
     }
 }
 

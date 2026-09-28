@@ -31,7 +31,7 @@ use pinyin::ToPinyin;
 use rusqlite::Connection;
 use rusqlite::types::Value;
 use tantivy::collector::TopDocs;
-use tantivy::query::{BooleanQuery, FuzzyTermQuery, Occur, Query, TermQuery};
+use tantivy::query::{BooleanQuery, FuzzyTermQuery, Occur, PhraseQuery, Query, TermQuery};
 use tantivy::schema::{
     Field, IndexRecordOption, Schema, TextFieldIndexing, TextOptions, Value as _,
 };
@@ -43,16 +43,21 @@ use tantivy::{Index, IndexReader, IndexWriter, TantivyDocument, Term};
 use uuid::Uuid;
 
 use crate::error::{Error, Result};
+use crate::model::AssetFacts;
 use crate::store::assets;
 
 /// Bump when the schema or the query semantics change incompatibly: the
 /// version file beside the index is checked on open and a mismatch wipes
 /// the directory for a full rebuild.
 ///
-/// 2: tantivy 0.22 -> 0.26, which changes the on-disk index format. Without
-/// the bump the wipe would still happen (via `Index::open_in_dir` failing),
-/// but only after a failed open; this makes the rebuild deterministic.
-const INDEX_VERSION: u32 = 2;
+/// 3: added metadata fact fields (camera, artist, album, font, composite
+/// facts) so EXIF and media-tag content is searchable.
+/// 4: added per-surface pinyin fields (name_pinyin, title_pinyin,
+/// desc_pinyin, tags_pinyin) so field-qualified terms like `tag:mao` can
+/// match pinyin within that specific surface.
+/// 5: added audio_words / audio_tri fields so `audio:` qualifier has a
+/// dedicated index surface for sample rate, channels, bit depth, bitrate.
+const INDEX_VERSION: u32 = 5;
 /// Heap budget for the index writer, in bytes.
 const WRITER_HEAP: usize = 32 * 1024 * 1024;
 /// How many ranked candidates one text lookup may contribute before the
@@ -163,6 +168,129 @@ fn pinyin_of(text: &str) -> (String, String) {
     (full.join(" "), abbr)
 }
 
+// ============================ facts extraction ===============================
+
+/// Per-category searchable text extracted from an asset's metadata.
+///
+/// Each field is empty when the asset carries no data for that category.
+/// The composite [`composite`](FactTexts::composite) joins them all for the
+/// catch-all `Facts` target and for pinyin/abbreviation derivation.
+#[derive(Default)]
+struct FactTexts {
+    camera: String,
+    artist: String,
+    album: String,
+    font: String,
+    audio: String,
+    embedded_title: String,
+}
+
+impl FactTexts {
+    /// All categories concatenated, for the composite facts field and for
+    /// pinyin/abbreviation derivation.
+    fn composite(&self) -> String {
+        [
+            self.camera.as_str(),
+            self.artist.as_str(),
+            self.album.as_str(),
+            self.font.as_str(),
+            self.audio.as_str(),
+            self.embedded_title.as_str(),
+        ]
+        .iter()
+        .copied()
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+    }
+}
+
+/// Build per-category searchable text from an asset's typed metadata.
+///
+/// Each category collects the human-readable facts a user would type:
+///
+/// - **camera**: make, model, ISO, aperture, focal length, exposure time
+/// - **artist**: embedded artist tag (audio/video)
+/// - **album**: embedded album tag
+/// - **font**: family, style, weight, glyph count
+///
+/// Numbers are formatted the way a user would type them (`"ISO 400"`,
+/// `"f/2.8"`, `"1/60s"`), so a free-text search for `400` or `2.8` finds the
+/// asset without a qualifier.  Source URL is appended to the camera text
+/// because it is the closest analogue to "where this came from".
+fn extract_fact_texts(facts: &AssetFacts, source_url: Option<&str>) -> FactTexts {
+    let mut camera_parts: Vec<String> = Vec::new();
+    if let Some(ref s) = facts.photo.make {
+        camera_parts.push(s.clone());
+    }
+    if let Some(ref s) = facts.photo.model {
+        camera_parts.push(s.clone());
+    }
+    if let Some(iso) = facts.photo.iso {
+        camera_parts.push(format!("ISO {iso}"));
+    }
+    if let Some(ref s) = facts.photo.aperture_f {
+        camera_parts.push(s.clone());
+    }
+    if let Some(ref s) = facts.photo.focal_length_mm {
+        camera_parts.push(s.clone());
+    }
+    if let Some(ref s) = facts.photo.exposure_time {
+        camera_parts.push(s.clone());
+    }
+    if let Some(url) = source_url {
+        camera_parts.push(url.to_owned());
+    }
+
+    let artist = facts.media.artist.clone().unwrap_or_default();
+    let album = facts.media.album.clone().unwrap_or_default();
+
+    let mut font_parts: Vec<String> = Vec::new();
+    if let Some(ref s) = facts.font.family {
+        font_parts.push(s.clone());
+    }
+    if let Some(ref s) = facts.font.style {
+        font_parts.push(s.clone());
+    }
+    if let Some(w) = facts.font.weight {
+        font_parts.push(w.to_string());
+    }
+    if let Some(g) = facts.font.glyphs {
+        font_parts.push(format!("{g}glyphs"));
+    }
+
+    // Audio technical specs: a dedicated `audio:` qualifier scopes to these
+    // (see `Target::Audio`), and the composite facts field still carries them
+    // so unqualified searches for e.g. "48000" or "24bit" find audio assets.
+    let audio_parts: Vec<String> = {
+        let mut v = Vec::new();
+        if let Some(hz) = facts.audio.sample_rate {
+            v.push(format!("{hz} Hz"));
+        }
+        if let Some(ch) = facts.audio.channels {
+            v.push(format!("{ch}c"));
+        }
+        if let Some(bd) = facts.audio.bit_depth {
+            v.push(format!("{bd}bit"));
+        }
+        if let Some(br) = facts.audio.bitrate {
+            v.push(format!("{br}kbps"));
+        }
+        v
+    };
+
+    let embedded_title = facts.media.embedded_title.clone().unwrap_or_default();
+
+    FactTexts {
+        camera: camera_parts.join(" "),
+        artist,
+        album,
+        font: font_parts.join(" "),
+        audio: audio_parts.join(" "),
+        embedded_title,
+    }
+}
+
 // ============================ index ==========================================
 
 /// The indexed fields, resolved once at open.
@@ -179,6 +307,24 @@ struct Fields {
     tags_tri: Field,
     pinyin: Field,
     abbr: Field,
+    // Per-surface pinyin fields for field-qualified pinyin matching
+    name_pinyin: Field,
+    title_pinyin: Field,
+    desc_pinyin: Field,
+    tags_pinyin: Field,
+    // Metadata fact fields — indexed from the asset's `extra` JSON.
+    facts_w: Field,
+    facts_tri: Field,
+    camera_w: Field,
+    camera_tri: Field,
+    artist_w: Field,
+    artist_tri: Field,
+    album_w: Field,
+    album_tri: Field,
+    font_w: Field,
+    font_tri: Field,
+    audio_w: Field,
+    audio_tri: Field,
 }
 
 fn indexed_text(tokenizer: &str) -> TextOptions {
@@ -186,6 +332,16 @@ fn indexed_text(tokenizer: &str) -> TextOptions {
         TextFieldIndexing::default()
             .set_tokenizer(tokenizer)
             .set_index_option(IndexRecordOption::WithFreqs),
+    )
+}
+
+/// Index options for jieba-tokenized fields that support phrase queries.
+/// Phrase queries need position information to enforce term ordering.
+fn indexed_text_with_positions(tokenizer: &str) -> TextOptions {
+    TextOptions::default().set_indexing_options(
+        TextFieldIndexing::default()
+            .set_tokenizer(tokenizer)
+            .set_index_option(IndexRecordOption::WithFreqsAndPositions),
     )
 }
 
@@ -338,14 +494,41 @@ impl TextIndex {
     fn schema() -> Schema {
         let mut builder = Schema::builder();
         builder.add_text_field("asset_id", indexed_basic(TOK_RAW));
+        // Jieba fields need positions for phrase queries
         for name in ["name_words", "title_words", "desc_words", "tags_words"] {
-            builder.add_text_field(name, indexed_text(TOK_JIEBA));
+            builder.add_text_field(name, indexed_text_with_positions(TOK_JIEBA));
         }
         for name in ["name_tri", "title_tri", "desc_tri", "tags_tri"] {
             builder.add_text_field(name, indexed_text(TOK_TRI));
         }
         builder.add_text_field("pinyin", indexed_text(TOK_PINYIN));
         builder.add_text_field("pinyin_abbr", indexed_text(TOK_ABBR));
+        // Per-surface pinyin fields for field-qualified pinyin matching
+        for name in ["name_pinyin", "title_pinyin", "desc_pinyin", "tags_pinyin"] {
+            builder.add_text_field(name, indexed_text(TOK_PINYIN));
+        }
+        // Metadata fact fields: composite + per-category.
+        // Fact fields also need positions for phrase queries
+        builder.add_text_field("facts_words", indexed_text_with_positions(TOK_JIEBA));
+        builder.add_text_field("facts_tri", indexed_text(TOK_TRI));
+        for name in [
+            "camera_words",
+            "artist_words",
+            "album_words",
+            "font_words",
+            "audio_words",
+        ] {
+            builder.add_text_field(name, indexed_text_with_positions(TOK_JIEBA));
+        }
+        for name in [
+            "camera_tri",
+            "artist_tri",
+            "album_tri",
+            "font_tri",
+            "audio_tri",
+        ] {
+            builder.add_text_field(name, indexed_text(TOK_TRI));
+        }
         builder.build()
     }
 
@@ -390,6 +573,22 @@ impl TextIndex {
             tags_tri: field("tags_tri"),
             pinyin: field("pinyin"),
             abbr: field("pinyin_abbr"),
+            name_pinyin: field("name_pinyin"),
+            title_pinyin: field("title_pinyin"),
+            desc_pinyin: field("desc_pinyin"),
+            tags_pinyin: field("tags_pinyin"),
+            facts_w: field("facts_words"),
+            facts_tri: field("facts_tri"),
+            camera_w: field("camera_words"),
+            camera_tri: field("camera_tri"),
+            artist_w: field("artist_words"),
+            artist_tri: field("artist_tri"),
+            album_w: field("album_words"),
+            album_tri: field("album_tri"),
+            font_w: field("font_words"),
+            font_tri: field("font_tri"),
+            audio_w: field("audio_words"),
+            audio_tri: field("audio_tri"),
         };
         let reader = index.reader().expect("index reader");
         Self {
@@ -413,6 +612,7 @@ impl TextIndex {
             return Ok(());
         };
         let tags = assets::tags_for_index(conn, asset_id)?;
+        let facts = extract_fact_texts(&a.facts, a.source_url.as_deref());
         self.index_asset_text(
             &writer,
             &asset_id.to_string(),
@@ -420,6 +620,7 @@ impl TextIndex {
             a.title.as_deref(),
             a.description.as_deref(),
             &tags,
+            &facts,
         );
         Ok(())
     }
@@ -427,6 +628,11 @@ impl TextIndex {
     /// Low-level upsert from already-resolved text. Takes the writer as an
     /// argument rather than borrowing it, so [`TextIndex::writer`] stays the
     /// single place a read-only handle is refused.
+    ///
+    /// `facts` carries per-category metadata text (camera EXIF, artist, album,
+    /// font). The composite is derived internally for the catch-all facts
+    /// field and for pinyin/abbreviation derivation.
+    #[allow(clippy::too_many_arguments)]
     fn index_asset_text(
         &self,
         writer: &IndexWriter,
@@ -435,13 +641,16 @@ impl TextIndex {
         title: Option<&str>,
         description: Option<&str>,
         tags: &str,
+        facts: &FactTexts,
     ) {
+        let facts_composite = facts.composite();
         let searchable = format!(
-            "{} {} {} {}",
+            "{} {} {} {} {}",
             file_name,
             title.unwrap_or_default(),
             description.unwrap_or_default(),
-            tags
+            tags,
+            facts_composite,
         );
         let (pinyin, abbr) = pinyin_of(&searchable);
 
@@ -449,16 +658,58 @@ impl TextIndex {
         doc.add_text(self.f.asset_id, id);
         doc.add_text(self.f.name_w, file_name);
         doc.add_text(self.f.name_tri, file_name);
+        // Per-surface pinyin for field-qualified matching
+        let (name_py, _) = pinyin_of(file_name);
+        if !name_py.is_empty() {
+            doc.add_text(self.f.name_pinyin, &name_py);
+        }
         if let Some(title) = title {
             doc.add_text(self.f.title_w, title);
             doc.add_text(self.f.title_tri, title);
+            let (title_py, _) = pinyin_of(title);
+            if !title_py.is_empty() {
+                doc.add_text(self.f.title_pinyin, &title_py);
+            }
         }
         if let Some(desc) = description {
             doc.add_text(self.f.desc_w, desc);
             doc.add_text(self.f.desc_tri, desc);
+            let (desc_py, _) = pinyin_of(desc);
+            if !desc_py.is_empty() {
+                doc.add_text(self.f.desc_pinyin, &desc_py);
+            }
         }
         doc.add_text(self.f.tags_w, tags);
         doc.add_text(self.f.tags_tri, tags);
+        let (tags_py, _) = pinyin_of(tags);
+        if !tags_py.is_empty() {
+            doc.add_text(self.f.tags_pinyin, &tags_py);
+        }
+        // Metadata fact fields: composite + per-category.
+        if !facts_composite.is_empty() {
+            doc.add_text(self.f.facts_w, &facts_composite);
+            doc.add_text(self.f.facts_tri, &facts_composite);
+        }
+        if !facts.camera.is_empty() {
+            doc.add_text(self.f.camera_w, &facts.camera);
+            doc.add_text(self.f.camera_tri, &facts.camera);
+        }
+        if !facts.artist.is_empty() {
+            doc.add_text(self.f.artist_w, &facts.artist);
+            doc.add_text(self.f.artist_tri, &facts.artist);
+        }
+        if !facts.album.is_empty() {
+            doc.add_text(self.f.album_w, &facts.album);
+            doc.add_text(self.f.album_tri, &facts.album);
+        }
+        if !facts.font.is_empty() {
+            doc.add_text(self.f.font_w, &facts.font);
+            doc.add_text(self.f.font_tri, &facts.font);
+        }
+        if !facts.audio.is_empty() {
+            doc.add_text(self.f.audio_w, &facts.audio);
+            doc.add_text(self.f.audio_tri, &facts.audio);
+        }
         doc.add_text(self.f.pinyin, &pinyin);
         doc.add_text(self.f.abbr, &abbr);
 
@@ -664,11 +915,18 @@ impl TextIndex {
                 self.f.title_tri,
                 self.f.desc_tri,
                 self.f.tags_tri,
+                self.f.facts_tri,
             ],
             expression::Target::Name => vec![self.f.name_tri],
             expression::Target::Title => vec![self.f.title_tri],
             expression::Target::Description => vec![self.f.desc_tri],
             expression::Target::Tags => vec![self.f.tags_tri],
+            expression::Target::Facts => vec![self.f.facts_tri],
+            expression::Target::Camera => vec![self.f.camera_tri],
+            expression::Target::Artist => vec![self.f.artist_tri],
+            expression::Target::Album => vec![self.f.album_tri],
+            expression::Target::Font => vec![self.f.font_tri],
+            expression::Target::Audio => vec![self.f.audio_tri],
         };
         let n = term.chars().count();
         let gram_shoulds = |gram: &str| {
@@ -718,21 +976,32 @@ impl TextIndex {
 
     /// One user term, restricted to `target`'s surfaces.
     ///
-    /// A qualified term keeps the word, fuzzy, prefix and gram paths but loses
-    /// pinyin and abbreviation: those two are indexed over all four surfaces
-    /// concatenated, so answering `tag:mao` from them could hit a pinyin that
-    /// came from the file name — a wrong answer with no visible cause.
+    /// A qualified term keeps the word, fuzzy, prefix and gram paths. Pinyin
+    /// and abbreviation matching is now field-scoped: `tag:mao` matches pinyin
+    /// from tags only, not from the file name or other surfaces.
     fn term_query_on(&self, term: &str, target: expression::Target) -> Box<dyn Query> {
         let lower = term.to_lowercase();
         let n = term.chars().count();
         let words: Vec<Field> = match target {
             expression::Target::All => {
-                vec![self.f.name_w, self.f.title_w, self.f.desc_w, self.f.tags_w]
+                vec![
+                    self.f.name_w,
+                    self.f.title_w,
+                    self.f.desc_w,
+                    self.f.tags_w,
+                    self.f.facts_w,
+                ]
             }
             expression::Target::Name => vec![self.f.name_w],
             expression::Target::Title => vec![self.f.title_w],
             expression::Target::Description => vec![self.f.desc_w],
             expression::Target::Tags => vec![self.f.tags_w],
+            expression::Target::Facts => vec![self.f.facts_w],
+            expression::Target::Camera => vec![self.f.camera_w],
+            expression::Target::Artist => vec![self.f.artist_w],
+            expression::Target::Album => vec![self.f.album_w],
+            expression::Target::Font => vec![self.f.font_w],
+            expression::Target::Audio => vec![self.f.audio_w],
         };
         let global = target == expression::Target::All;
 
@@ -785,6 +1054,7 @@ impl TextIndex {
                 }
             }
             if global {
+                // Unqualified: search the global pinyin/abbr fields (all surfaces)
                 shoulds.push((
                     Occur::Should,
                     Box::new(FuzzyTermQuery::new_prefix(
@@ -801,6 +1071,25 @@ impl TextIndex {
                         false,
                     )) as Box<dyn Query>,
                 ));
+            } else if n >= 2 {
+                // Field-qualified: search per-surface pinyin if available
+                let surface_pinyin = match target {
+                    expression::Target::Name => Some(self.f.name_pinyin),
+                    expression::Target::Title => Some(self.f.title_pinyin),
+                    expression::Target::Description => Some(self.f.desc_pinyin),
+                    expression::Target::Tags => Some(self.f.tags_pinyin),
+                    _ => None,
+                };
+                if let Some(py_field) = surface_pinyin {
+                    shoulds.push((
+                        Occur::Should,
+                        Box::new(FuzzyTermQuery::new_prefix(
+                            Term::from_field_text(py_field, &lower),
+                            0,
+                            false,
+                        )) as Box<dyn Query>,
+                    ));
+                }
             }
             // Grams keep infix substrings findable (`ower` → `flower`).
             if n >= 2 {
@@ -880,10 +1169,77 @@ impl TextIndex {
                 } else {
                     Occur::Must
                 };
-                (occur, self.term_query_on(&atom.text, atom.target))
+                // Quoted phrases use positional matching; unquoted terms use
+                // the regular ranked-alternatives path.
+                let query = if atom.quoted && atom.text.contains(' ') {
+                    self.phrase_query_on(&atom.text, atom.target)
+                } else {
+                    self.term_query_on(&atom.text, atom.target)
+                };
+                (occur, query)
             })
             .collect();
         Box::new(BooleanQuery::new(clauses))
+    }
+
+    /// Build a positional phrase query for a quoted span. The phrase is
+    /// tokenized with jieba, and the resulting terms must appear in sequence
+    /// in the indexed text. Falls back to n-gram matching if the phrase
+    /// tokenizes to a single term (no positional information to enforce).
+    fn phrase_query_on(&self, phrase: &str, target: expression::Target) -> Box<dyn Query> {
+        let lower = phrase.to_lowercase();
+        let words: Vec<Field> = match target {
+            expression::Target::All => {
+                vec![
+                    self.f.name_w,
+                    self.f.title_w,
+                    self.f.desc_w,
+                    self.f.tags_w,
+                    self.f.facts_w,
+                ]
+            }
+            expression::Target::Name => vec![self.f.name_w],
+            expression::Target::Title => vec![self.f.title_w],
+            expression::Target::Description => vec![self.f.desc_w],
+            expression::Target::Tags => vec![self.f.tags_w],
+            expression::Target::Facts => vec![self.f.facts_w],
+            expression::Target::Camera => vec![self.f.camera_w],
+            expression::Target::Artist => vec![self.f.artist_w],
+            expression::Target::Album => vec![self.f.album_w],
+            expression::Target::Font => vec![self.f.font_w],
+            expression::Target::Audio => vec![self.f.audio_w],
+        };
+
+        // Tokenize the phrase with jieba to get the sequence of terms
+        let jieba = jieba();
+        let tokens: Vec<String> = jieba
+            .cut(&lower, true)
+            .into_iter()
+            .filter(|s| !s.trim().is_empty())
+            .map(|s| s.to_string())
+            .collect();
+
+        // If the phrase tokenizes to a single term, there's no positional
+        // constraint to enforce — fall back to the regular term query.
+        if tokens.len() <= 1 {
+            return self.term_query_on(&lower, target);
+        }
+
+        // Build a PhraseQuery for each surface field, OR them together.
+        // PhraseQuery requires terms to appear in sequence with correct positions.
+        let mut phrase_shoulds: Vec<(Occur, Box<dyn Query>)> = Vec::new();
+        for field in &words {
+            let terms: Vec<Term> = tokens
+                .iter()
+                .map(|token| Term::from_field_text(*field, token))
+                .collect();
+            phrase_shoulds.push((Occur::Should, Box::new(PhraseQuery::new(terms))));
+        }
+
+        // Also add n-gram matching as a fallback for partial matches
+        phrase_shoulds.push((Occur::Should, self.gram_query(&lower, target)));
+
+        Box::new(BooleanQuery::new(phrase_shoulds))
     }
 
     /// A term that can never have been indexed, standing in for "no results".
@@ -1079,7 +1435,7 @@ pub fn drain(conn: &Connection, index: &TextIndex) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::TextIndex;
-    use super::{CANDIDATE_CAP, MAX_RANKED_POOL, expression};
+    use super::{CANDIDATE_CAP, FactTexts, MAX_RANKED_POOL, expression};
 
     /// A throwaway index directory, named so parallel tests never collide.
     fn temp_index_dir() -> std::path::PathBuf {
@@ -1107,6 +1463,7 @@ mod tests {
                 None,
                 None,
                 "",
+                &FactTexts::default(),
             );
         }
         drop(writer);
@@ -1172,6 +1529,7 @@ mod tests {
                 None,
                 a.description.as_deref(),
                 "",
+                &FactTexts::default(),
             );
             strong.push(a.id);
         }
@@ -1189,6 +1547,7 @@ mod tests {
             None,
             last.description.as_deref(),
             "",
+            &FactTexts::default(),
         );
         drop(writer);
         idx.commit().unwrap();
@@ -1231,6 +1590,7 @@ mod tests {
             None,
             None,
             "",
+            &FactTexts::default(),
         );
         idx.commit().unwrap();
         assert_eq!(idx.num_docs(), 1);
@@ -1283,7 +1643,7 @@ mod tests {
         {
             let writer = idx.writer().unwrap();
             for (id, name, title, desc, tags) in cases {
-                idx.index_asset_text(&writer, id, name, title, desc, tags);
+                idx.index_asset_text(&writer, id, name, title, desc, tags, &FactTexts::default());
             }
             // The writer must be released before the reader may see the commit.
             drop(writer);
@@ -1384,6 +1744,7 @@ mod tests {
                 None,
                 None,
                 "",
+                &FactTexts::default(),
             );
             idx.index_asset_text(
                 &writer,
@@ -1392,6 +1753,7 @@ mod tests {
                 None,
                 None,
                 "",
+                &FactTexts::default(),
             );
             drop(writer);
         }
@@ -1427,6 +1789,7 @@ mod tests {
                     None,
                     None,
                     "",
+                    &FactTexts::default(),
                 );
             }
             drop(writer);

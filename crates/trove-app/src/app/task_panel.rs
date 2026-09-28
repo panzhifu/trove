@@ -40,7 +40,7 @@ pub fn task_panel(controller: &Entity<LibraryController>, cx: &App) -> AnyElemen
         .iter()
         .map(|card| TaskRow {
             can_retry: matches!(card.status, TaskStatus::Failed | TaskStatus::Cancelled)
-                && ctl.retry_inputs(card.kind).is_some(),
+                && ctl.retry_inputs(&card.kind).is_some(),
             card: card.clone(),
         })
         .collect();
@@ -73,7 +73,7 @@ pub fn task_panel(controller: &Entity<LibraryController>, cx: &App) -> AnyElemen
 }
 
 /// Localized label for a job kind, shown on each panel row.
-fn task_kind_label(kind: TaskKind) -> SharedString {
+fn task_kind_label(kind: &TaskKind) -> SharedString {
     let key = match kind {
         TaskKind::Import | TaskKind::CollectInbox => "task.kind_import",
         TaskKind::EmbeddingBackfill | TaskKind::VisualBackfill => "task.kind_embedding",
@@ -82,6 +82,7 @@ fn task_kind_label(kind: TaskKind) -> SharedString {
         TaskKind::WatchScan => "task.kind_watch",
         TaskKind::ModelPreview => "task.kind_model",
         TaskKind::VideoDecode | TaskKind::BatchConvert => "task.kind_convert",
+        TaskKind::Custom(_) => "task.kind_custom",
     };
     rust_i18n::t!(key).to_string().into()
 }
@@ -102,7 +103,7 @@ fn task_status_label(status: TaskStatus) -> SharedString {
 /// newest live job and its numbers, else an attention hint, else idle.
 fn task_summary(rows: &[TaskRow]) -> String {
     if let Some(row) = rows.iter().rev().find(|row| !row.card.finished()) {
-        let label = task_kind_label(row.card.kind).to_string();
+        let label = task_kind_label(&row.card.kind).to_string();
         if row.card.total > 0 {
             format!("{label} {}/{}", row.card.done, row.card.total)
         } else {
@@ -180,7 +181,7 @@ fn task_panel_body(
 fn task_row(controller: &Entity<LibraryController>, row: &TaskRow, cx: &App) -> AnyElement {
     let card = &row.card;
     let id = card.id;
-    let kind = card.kind;
+    let kind = card.kind.clone();
     let numbers = if card.total > 0 {
         format!("{}/{}", card.done, card.total)
     } else if card.finished() {
@@ -204,7 +205,7 @@ fn task_row(controller: &Entity<LibraryController>, row: &TaskRow, cx: &App) -> 
             cancel_task_button(controller.clone(), id),
         ],
         TaskStatus::Failed | TaskStatus::Cancelled if row.can_retry => {
-            vec![retry_button(controller.clone(), id, kind)]
+            vec![retry_button(controller.clone(), id, kind.clone())]
         }
         TaskStatus::Failed | TaskStatus::Cancelled | TaskStatus::Completed => Vec::new(),
     };
@@ -219,7 +220,7 @@ fn task_row(controller: &Entity<LibraryController>, row: &TaskRow, cx: &App) -> 
                 .flex_1()
                 .min_w_0()
                 .gap_0p5()
-                .child(div().truncate().text_sm().child(task_kind_label(kind)))
+                .child(div().truncate().text_sm().child(task_kind_label(&kind)))
                 .child(
                     h_flex()
                         .gap_1p5()
@@ -273,6 +274,6 @@ fn retry_button(controller: Entity<LibraryController>, id: TaskId, kind: TaskKin
         .icon(IconName::RotateCw)
         .label(rust_i18n::t!("task.retry").to_string())
         .on_click(move |_, window, cx| {
-            jobs::retry_task_app(&controller, kind, window, cx);
+            jobs::retry_task_app(&controller, kind.clone(), window, cx);
         })
 }

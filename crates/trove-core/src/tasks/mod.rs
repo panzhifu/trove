@@ -3,8 +3,8 @@
 //! maintenance — with progress, cancellation and lifecycle events in one
 //! place.
 //!
-//! The manager is deliberately UI-free: jobs run on plain `std::thread`s and
-//! report through an event queue the embedder polls
+//! The manager is deliberately UI-free: jobs run on a shared thread pool
+//! ([`TaskPool`]) and report through an event queue the embedder polls
 //! ([`TaskManager::poll_events`], or [`TaskManager::poll_events_for`] to take
 //! one job's events without disturbing the others'), or waits on
 //! ([`TaskManager::wait_events_for`], which parks the calling thread until that
@@ -26,7 +26,13 @@
 //! other way round. The queue holds one bucket per job (see [`EventQueue`]),
 //! so a watcher's cost tracks its own job's unread events, never everyone
 //! else's, and a job nobody reads cannot push another job's events out.
+//!
+//! Progress events are *lossy*: only the most recent [`TaskEvent::Progress`]
+//! per job is kept, so a flood of progress updates cannot crowd out terminal
+//! events. Terminal events (Started, Completed, Failed, Cancelled, Paused,
+//! Resumed, Retrying) are never evicted.
 
+use std::borrow::Cow;
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, VecDeque};
 use std::panic::{self, AssertUnwindSafe};
@@ -35,6 +41,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::model::new_id;
+use crate::store::task_journal;
 use uuid::Uuid;
 
 pub mod ai_analysis;
@@ -49,15 +56,18 @@ pub type TaskId = Uuid;
 /// How long a job waits between two throttled progress events.
 const PROGRESS_EVENT_INTERVAL: Duration = Duration::from_millis(100);
 
-/// Upper bound on one job's unread events. Each job owns a bucket (see
-/// [`EventQueue`]) and only that bucket is bounded, so a resident job nobody
-/// polls (the folder watcher, one-shot maintenance) fills its own bucket and
-/// evicts its own stale progress — it can no longer push another job's
-/// terminal event out of a shared queue the way the old global bound did. The
-/// live count a job reports always reflects the freshest state, so losing a
-/// stale event is invisible, whereas losing memory is not. At the backend's
-/// ~10 events/s this holds 12 seconds of backlog: a watcher that stalls longer
-/// than that still gets the job's latest numbers.
+/// Upper bound on one job's unread *terminal* events. Each job owns a bucket
+/// (see [`EventQueue`]) and only that bucket is bounded. Progress events are
+/// stored separately as a single latest-value slot per job (lossy: each new
+/// Progress overwrites the previous one), so they never count against this
+/// bound. A resident job nobody polls (the folder watcher, one-shot
+/// maintenance) fills its own bucket with terminal events and evicts its own
+/// stale ones — it can no longer push another job's terminal event out of a
+/// shared queue the way the old global bound did. The live count a job
+/// reports always reflects the freshest state, so losing a stale progress
+/// event is invisible, whereas losing memory is not. Terminal events
+/// (Started, Completed, Failed, Cancelled, Paused, Resumed, Retrying) are
+/// never evicted; at the backend's rate this holds many minutes of backlog.
 const MAX_EVENTS_PER_JOB: usize = 128;
 
 /// How many jobs keep a bucket after their events stop being read. Buckets are
@@ -74,7 +84,11 @@ const MAX_TRACKED_JOBS: usize = 16;
 
 /// The families of long-running work the library runs. The kind doubles as
 /// the mutual-exclusion key: one job per kind at a time.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+///
+/// Built-in variants cover the library's own jobs; [`TaskKind::Custom`] lets
+/// plugins register their own task types with the same scheduling and
+/// persistence guarantees.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum TaskKind {
     Import,
     CollectInbox,
@@ -91,23 +105,27 @@ pub enum TaskKind {
     /// Multimodal AI analysis: description, tags, and rating from a vision
     /// model. One API call per asset.
     AiAnalysis,
+    /// A plugin-registered task type. The string is the plugin's stable name
+    /// for the kind, used in logs, the journal, and mutual-exclusion checks.
+    Custom(Cow<'static, str>),
 }
 
 impl TaskKind {
     /// Stable machine-readable name (logs, task lists, debugging).
-    pub fn name(self) -> &'static str {
+    pub fn name(&self) -> Cow<'_, str> {
         match self {
-            TaskKind::Import => "import",
-            TaskKind::CollectInbox => "collect-inbox",
-            TaskKind::ModelPreview => "model-preview",
-            TaskKind::VideoDecode => "video-decode",
-            TaskKind::BatchConvert => "batch-convert",
-            TaskKind::Maintenance => "maintenance",
-            TaskKind::VisualBackfill => "visual-backfill",
-            TaskKind::WatchScan => "watch-scan",
-            TaskKind::EmbeddingBackfill => "embedding-backfill",
-            TaskKind::AutoTag => "auto-tag",
-            TaskKind::AiAnalysis => "ai-analysis",
+            TaskKind::Import => Cow::Borrowed("import"),
+            TaskKind::CollectInbox => Cow::Borrowed("collect-inbox"),
+            TaskKind::ModelPreview => Cow::Borrowed("model-preview"),
+            TaskKind::VideoDecode => Cow::Borrowed("video-decode"),
+            TaskKind::BatchConvert => Cow::Borrowed("batch-convert"),
+            TaskKind::Maintenance => Cow::Borrowed("maintenance"),
+            TaskKind::VisualBackfill => Cow::Borrowed("visual-backfill"),
+            TaskKind::WatchScan => Cow::Borrowed("watch-scan"),
+            TaskKind::EmbeddingBackfill => Cow::Borrowed("embedding-backfill"),
+            TaskKind::AutoTag => Cow::Borrowed("auto-tag"),
+            TaskKind::AiAnalysis => Cow::Borrowed("ai-analysis"),
+            TaskKind::Custom(name) => Cow::Borrowed(name),
         }
     }
 }
@@ -125,12 +143,46 @@ pub enum TaskStatus {
     Cancelled,
 }
 
+/// How many times a failed task should be retried before giving up.
+///
+/// Passed to [`TaskManager::start_with_retry`]; the manager re-queues the
+/// task on failure until the budget is exhausted. Each retry gets a fresh
+/// closure from the factory, so the task can re-open files, re-connect
+/// sockets, etc.
+#[derive(Debug, Clone, Copy)]
+pub struct RetryPolicy {
+    /// How many times to retry after the first failure. Zero means no retry
+    /// (equivalent to [`TaskManager::start`]).
+    pub max_retries: u8,
+    /// How long to wait between retries. Defaults to 2 seconds.
+    pub backoff: Duration,
+}
+
+impl RetryPolicy {
+    /// No retries: fail immediately on the first error.
+    pub fn none() -> Self {
+        Self {
+            max_retries: 0,
+            backoff: Duration::from_secs(2),
+        }
+    }
+
+    /// Retry up to `n` times with a 2-second backoff.
+    pub fn times(n: u8) -> Self {
+        Self {
+            max_retries: n,
+            backoff: Duration::from_secs(2),
+        }
+    }
+}
+
 /// Point-in-time description of one job (task lists, debugging).
 #[derive(Debug, Clone)]
 pub struct TaskInfo {
     pub id: TaskId,
     pub kind: TaskKind,
     pub label: String,
+    pub priority: TaskPriority,
     pub status: TaskStatus,
     pub done: u64,
     pub total: u64,
@@ -178,6 +230,15 @@ pub enum TaskEvent {
         id: TaskId,
         kind: TaskKind,
     },
+    /// The job failed but has retries remaining; it will be re-queued after
+    /// a short backoff. The UI can use this to show a "retrying" indicator
+    /// instead of a final failure.
+    Retrying {
+        id: TaskId,
+        kind: TaskKind,
+        attempt: u8,
+        max_retries: u8,
+    },
 }
 
 impl TaskEvent {
@@ -191,7 +252,8 @@ impl TaskEvent {
             | TaskEvent::Failed { id, .. }
             | TaskEvent::Cancelled { id, .. }
             | TaskEvent::Paused { id, .. }
-            | TaskEvent::Resumed { id, .. } => *id,
+            | TaskEvent::Resumed { id, .. }
+            | TaskEvent::Retrying { id, .. } => *id,
         }
     }
 }
@@ -199,12 +261,22 @@ impl TaskEvent {
 struct JobState {
     kind: TaskKind,
     label: String,
+    priority: TaskPriority,
     status: TaskStatus,
     done: u64,
     total: u64,
     summary: Option<String>,
     cancel: Arc<AtomicBool>,
     pause: Arc<PauseSignal>,
+    retry: Option<RetryState>,
+}
+
+/// Live retry tracking for one job. Present only when the job was started
+/// via [`TaskManager::start_with_retry`].
+struct RetryState {
+    remaining: u8,
+    max: u8,
+    backoff: Duration,
 }
 
 /// Cooperative pause gate shared between the manager and one job's thread.
@@ -275,7 +347,13 @@ impl PauseSignal {
 /// polls push another job's terminal event out of the shared bound. Per-job
 /// buckets fix both: publishing appends to one bucket, taking one moves that
 /// bucket out alone, and the bound is per bucket, so a job can only evict its
-/// own stale progress.
+/// own stale events.
+///
+/// Progress events are stored separately as a single latest-value slot per
+/// job. Each new [`TaskEvent::Progress`] overwrites the previous one (lossy),
+/// so a flood of progress updates cannot crowd out terminal events. The
+/// bounded VecDeque only holds terminal events (Started, Completed, Failed,
+/// Cancelled, Paused, Resumed, Retrying), which are rare.
 ///
 /// A bucket exists while it has unread events; [`EventQueue::take`] removes the
 /// entry, so the common case (a watcher draining a live job every poll) keeps
@@ -295,31 +373,41 @@ struct EventQueue {
 /// The buckets, plus what it takes to bound them.
 #[derive(Default)]
 struct QueueState {
-    /// `id` → (sequence in which the bucket was created, its unread events).
-    /// The sequence makes "drop the job that has gone unread the longest" a
-    /// scan of a handful of entries instead of a second collection to keep in
-    /// sync with the map.
+    /// `id` → (sequence in which the bucket was created, its unread terminal
+    /// events, latest progress if any). The sequence makes "drop the job that
+    /// has gone unread the longest" a scan of a handful of entries instead of
+    /// a second collection to keep in sync with the map.
     ///
     /// An entry is never present-and-empty: every take removes the entry with
     /// its events, which is what lets [`EventQueue::wait`] sleep on the key's
     /// absence rather than on a length.
-    by_job: HashMap<TaskId, (u64, VecDeque<TaskEvent>)>,
+    by_job: HashMap<TaskId, (u64, VecDeque<TaskEvent>, Option<TaskEvent>)>,
     next_seq: u64,
 }
 
 impl EventQueue {
     /// Append one event to its job's bucket and wake the waiters.
     ///
+    /// Progress events are stored as a single latest-value slot: each new
+    /// Progress overwrites the previous one, so a flood of progress updates
+    /// cannot crowd out terminal events. Terminal events are appended to the
+    /// bounded VecDeque as before.
+    ///
     /// Callers hold no lock this needs; when invoked from [`TaskManager::start`]
     /// the registry lock is already held, preserving the `jobs → events` order.
     fn push(&self, event: TaskEvent) {
         {
             let mut state = self.state.lock().unwrap();
-            let bucket = state.entry(event.task_id());
-            if bucket.len() >= MAX_EVENTS_PER_JOB {
-                bucket.pop_front();
+            let (bucket, progress) = state.entry(event.task_id());
+            if matches!(event, TaskEvent::Progress { .. }) {
+                // Lossy: overwrite the previous progress, never append.
+                *progress = Some(event);
+            } else {
+                if bucket.len() >= MAX_EVENTS_PER_JOB {
+                    bucket.pop_front();
+                }
+                bucket.push_back(event);
             }
-            bucket.push_back(event);
             state.evict_stale();
         }
         // Notified with the lock released: a waiter either sees the event
@@ -360,32 +448,47 @@ impl EventQueue {
     /// on.
     fn take_all(&self) -> Vec<TaskEvent> {
         let mut state = self.state.lock().unwrap();
-        std::mem::take(&mut state.by_job)
-            .into_values()
-            .flat_map(|(_, bucket)| bucket)
-            .collect()
+        let ids: Vec<TaskId> = state.by_job.keys().copied().collect();
+        let mut out = Vec::new();
+        for id in ids {
+            out.extend(state.take_for(id));
+        }
+        out
     }
 }
 
 impl QueueState {
     /// The job's bucket, created — and stamped with the next sequence number —
-    /// if it does not exist yet.
-    fn entry(&mut self, id: TaskId) -> &mut VecDeque<TaskEvent> {
+    /// if it does not exist yet. Returns the terminal event deque and the
+    /// latest-progress slot separately, so [`EventQueue::push`] can route
+    /// progress events into the lossy slot.
+    fn entry(&mut self, id: TaskId) -> (&mut VecDeque<TaskEvent>, &mut Option<TaskEvent>) {
         match self.by_job.entry(id) {
-            Entry::Occupied(entry) => &mut entry.into_mut().1,
+            Entry::Occupied(entry) => {
+                let (_, terminal, progress) = entry.into_mut();
+                (terminal, progress)
+            }
             Entry::Vacant(entry) => {
                 let seq = self.next_seq;
                 self.next_seq += 1;
-                &mut entry.insert((seq, VecDeque::new())).1
+                let (_, terminal, progress) = entry.insert((seq, VecDeque::new(), None));
+                (terminal, progress)
             }
         }
     }
 
-    /// Take one job's bucket out of the map.
+    /// Take one job's bucket out of the map: terminal events oldest first,
+    /// then the latest progress (if any) appended at the end.
     fn take_for(&mut self, id: TaskId) -> Vec<TaskEvent> {
         self.by_job
             .remove(&id)
-            .map_or_else(Vec::new, |(_, bucket)| bucket.into_iter().collect())
+            .map_or_else(Vec::new, |(_, mut terminal, progress)| {
+                let mut out: Vec<TaskEvent> = terminal.drain(..).collect();
+                if let Some(progress) = progress {
+                    out.push(progress);
+                }
+                out
+            })
     }
 
     /// Drop whole buckets, oldest-created first, until the set fits again.
@@ -394,7 +497,7 @@ impl QueueState {
             match self
                 .by_job
                 .iter()
-                .min_by_key(|(_, (seq, _))| *seq)
+                .min_by_key(|(_, (seq, _, _))| *seq)
                 .map(|(id, _)| *id)
             {
                 Some(id) => {
@@ -406,16 +509,150 @@ impl QueueState {
     }
 }
 
+/// Priority of a task. Higher-priority tasks are listed first in snapshots
+/// and may be scheduled before lower-priority ones in the future.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
+pub enum TaskPriority {
+    Low,
+    #[default]
+    Normal,
+    High,
+}
+
+/// A shared thread pool for running background tasks. Workers pull closures
+/// from a common queue; the pool is created once and shared across all tasks
+/// the manager starts, so the thread count stays bounded no matter how many
+/// jobs run concurrently.
+pub struct TaskPool {
+    inner: Arc<TaskPoolInner>,
+}
+
+struct TaskPoolInner {
+    queue: Mutex<Option<VecDeque<Work>>>,
+    /// Signalled when a new task is enqueued; workers sleep on it when the
+    /// queue is empty.
+    notify: Condvar,
+}
+
+type Work = Box<dyn FnOnce() + Send + 'static>;
+
+impl TaskPool {
+    /// Create a pool with `num_threads` workers. Each worker is a named
+    /// daemon thread (`trove-pool-N`) that pulls closures from the shared
+    /// queue and runs them to completion.
+    pub fn new(num_threads: usize) -> Self {
+        let inner = Arc::new(TaskPoolInner {
+            queue: Mutex::new(Some(VecDeque::new())),
+            notify: Condvar::new(),
+        });
+        for i in 0..num_threads {
+            let inner = inner.clone();
+            std::thread::Builder::new()
+                .name(format!("trove-pool-{i}"))
+                .spawn(move || inner.worker_loop())
+                .expect("spawn pool worker");
+        }
+        Self { inner }
+    }
+
+    /// Submit a closure for execution. Returns immediately; the closure runs
+    /// on the next available worker.
+    pub fn execute(&self, work: impl FnOnce() + Send + 'static) {
+        let mut queue = self.inner.queue.lock().unwrap();
+        match queue.as_mut() {
+            Some(q) => {
+                q.push_back(Box::new(work));
+                self.inner.notify.notify_one();
+            }
+            None => {
+                // Pool was shut down. Drop the work silently — callers should
+                // not submit after the pool is dropped.
+            }
+        }
+    }
+}
+
+impl TaskPoolInner {
+    fn worker_loop(&self) {
+        loop {
+            let work = {
+                let mut queue = self.queue.lock().unwrap();
+                loop {
+                    match queue.as_mut() {
+                        Some(q) => {
+                            if let Some(w) = q.pop_front() {
+                                break w;
+                            }
+                            // Queue is empty but still alive: wait for work.
+                            // `wait_while` re-checks on every wake so a
+                            // spurious notify cannot pop an empty queue.
+                            queue = self
+                                .notify
+                                .wait_while(queue, |q| {
+                                    q.as_ref().is_some_and(|inner| inner.is_empty())
+                                })
+                                .unwrap();
+                        }
+                        None => return, // pool shut down
+                    }
+                }
+            };
+            // Run outside the lock so other workers can enqueue / dequeue.
+            work();
+        }
+    }
+}
+
+impl Drop for TaskPool {
+    fn drop(&mut self) {
+        // Setting the queue to None is the shutdown signal workers check.
+        // notify_all wakes every sleeper so it can see the flag and exit.
+        *self.inner.queue.lock().unwrap() = None;
+        self.inner.notify.notify_all();
+    }
+}
+
+/// A thread-safe SQLite connection for the task journal. The manager holds
+/// one of these when persistence is enabled; it opens its own connection to
+/// the library database (WAL mode allows concurrent readers/writers) and
+/// writes only to the `task_journal` table, so it never contends with the
+/// main [`Store`](crate::store::Store) connection.
+type JournalConn = Arc<Mutex<rusqlite::Connection>>;
+
 /// Shared registry of background jobs. Cheap to clone.
 ///
 /// Two independent locks: `jobs` guards the registry, `events` guards the
 /// per-job buckets. Splitting them keeps a job's per-file `progress` call from
 /// contending with the embedder's drain. Lock order, when both are held, is
-/// always `jobs` → `events`.
-#[derive(Clone, Default)]
+/// always `jobs` → `events`. A third optional lock, `journal`, guards the
+/// SQLite connection for task persistence; it is never held while `jobs` or
+/// `events` are held, so journal I/O cannot block progress reporting.
+///
+/// The `pool` is the shared thread pool all tasks run on; it is created once
+/// when the manager is assembled and shared by reference (via `Arc<TaskPool>`)
+/// with every closure the manager submits.
+#[derive(Clone)]
 pub struct TaskManager {
     jobs: Arc<Mutex<HashMap<TaskId, JobState>>>,
     events: Arc<EventQueue>,
+    journal: Option<JournalConn>,
+    pool: Arc<TaskPool>,
+}
+
+impl Default for TaskManager {
+    fn default() -> Self {
+        Self {
+            jobs: Arc::new(Mutex::new(HashMap::new())),
+            events: Arc::new(EventQueue::default()),
+            journal: None,
+            pool: Arc::new(TaskPool::new(
+                std::thread::available_parallelism()
+                    .map(|n| n.get())
+                    .unwrap_or(4)
+                    .max(2),
+            )),
+        }
+    }
 }
 
 /// Why a job could not be started.
@@ -430,17 +667,44 @@ impl TaskManager {
         Self::default()
     }
 
-    /// Spawn `run` on a background thread under `kind`. Returns the task id
+    /// Attach a journal connection so tasks are persisted to the `task_journal`
+    /// table. Called once at library open; without this, tasks are tracked
+    /// in-memory only (the pre-persistence behaviour).
+    pub fn set_journal(&mut self, conn: rusqlite::Connection) {
+        self.journal = Some(Arc::new(Mutex::new(conn)));
+    }
+
+    /// Spawn `run` on the shared thread pool under `kind`. Returns the task id
     /// plus a channel receiving the job's value on success (it closes with
     /// no value on failure, cancellation or panic).
     ///
     /// The job sees a [`JobContext`] for progress reporting and cooperative
     /// cancellation, and must return `Result` — `Err` becomes a
     /// [`TaskEvent::Failed`].
+    ///
+    /// Uses [`TaskPriority::Normal`]; for a different priority use
+    /// [`TaskManager::start_with_priority`].
     pub fn start<T, F>(
         &self,
         kind: TaskKind,
         label: impl Into<String>,
+        run: F,
+    ) -> Result<(TaskId, std::sync::mpsc::Receiver<T>), StartError>
+    where
+        T: Send + 'static,
+        F: FnOnce(&JobContext) -> Result<T, String> + Send + 'static,
+    {
+        self.start_with_priority(kind, label, TaskPriority::Normal, run)
+    }
+
+    /// Like [`TaskManager::start`], but with an explicit priority. Higher-
+    /// priority tasks are listed first in [`TaskManager::snapshot`] and may
+    /// be scheduled before lower-priority ones in the future.
+    pub fn start_with_priority<T, F>(
+        &self,
+        kind: TaskKind,
+        label: impl Into<String>,
+        priority: TaskPriority,
         run: F,
     ) -> Result<(TaskId, std::sync::mpsc::Receiver<T>), StartError>
     where
@@ -466,36 +730,240 @@ impl TaskManager {
         let id: TaskId = new_id();
         let cancel = Arc::new(AtomicBool::new(false));
         let pause = Arc::new(PauseSignal::new());
+        let label = label.into();
         jobs.insert(
             id,
             JobState {
-                kind,
-                label: label.into(),
+                kind: kind.clone(),
+                label: label.clone(),
+                priority,
                 status: TaskStatus::Running,
                 done: 0,
                 total: 0,
                 summary: None,
                 cancel: cancel.clone(),
                 pause: pause.clone(),
+                retry: None,
             },
         );
         // Queued while the registry lock is held so no other job can slip an
         // event in ahead of this job's `Started`.
-        self.events.push(TaskEvent::Started { id, kind });
+        self.events.push(TaskEvent::Started {
+            id,
+            kind: kind.clone(),
+        });
+        // Persist to journal before spawning, so a crash mid-spawn leaves a
+        // "running" row the next startup can surface.
+        if let Some(journal) = &self.journal {
+            let conn = journal.lock().unwrap();
+            let _ = task_journal::record_start(&conn, id, &kind, &label, 0);
+        }
         drop(jobs);
         let (tx, rx) = std::sync::mpsc::channel();
         let ctx = JobContext {
             id,
-            kind,
+            kind: kind.clone(),
             cancel,
             pause,
             jobs: self.jobs.clone(),
             events: self.events.clone(),
             last_progress: Mutex::new(Instant::now() - PROGRESS_EVENT_INTERVAL),
         };
-        std::thread::Builder::new()
-            .name(format!("trove-task-{}", kind.name()))
-            .spawn(move || {
+        let journal = self.journal.clone();
+        self.pool.execute(move || {
+            let outcome = panic::catch_unwind(AssertUnwindSafe(|| run(&ctx)));
+            // Extract the terminal state and the success value (if any)
+            // while the registry lock is held, then drop it before the
+            // journal write and the channel send.
+            let (status, summary, error, done, total, value) = {
+                let mut jobs = ctx.jobs.lock().unwrap();
+                let Some(state) = jobs.get_mut(&ctx.id) else {
+                    return;
+                };
+                match outcome {
+                    Ok(Ok(value)) if !ctx.cancelled() => {
+                        state.status = TaskStatus::Completed;
+                        let summary = state.summary.clone().unwrap_or_default();
+                        ctx.events.push(TaskEvent::Completed {
+                            id: ctx.id,
+                            kind: ctx.kind.clone(),
+                            summary: summary.clone(),
+                        });
+                        (
+                            TaskStatus::Completed,
+                            Some(summary),
+                            None,
+                            state.done,
+                            state.total,
+                            Some(value),
+                        )
+                    }
+                    Ok(Ok(_)) => {
+                        state.status = TaskStatus::Cancelled;
+                        ctx.events.push(TaskEvent::Cancelled {
+                            id: ctx.id,
+                            kind: ctx.kind.clone(),
+                        });
+                        (
+                            TaskStatus::Cancelled,
+                            None,
+                            None,
+                            state.done,
+                            state.total,
+                            None,
+                        )
+                    }
+                    Ok(Err(error)) => {
+                        state.status = TaskStatus::Failed;
+                        ctx.events.push(TaskEvent::Failed {
+                            id: ctx.id,
+                            kind: ctx.kind.clone(),
+                            error: error.clone(),
+                        });
+                        (
+                            TaskStatus::Failed,
+                            None,
+                            Some(error),
+                            state.done,
+                            state.total,
+                            None,
+                        )
+                    }
+                    Err(_) => {
+                        state.status = TaskStatus::Failed;
+                        ctx.events.push(TaskEvent::Failed {
+                            id: ctx.id,
+                            kind: ctx.kind.clone(),
+                            error: "task panicked".into(),
+                        });
+                        (
+                            TaskStatus::Failed,
+                            None,
+                            Some("task panicked".into()),
+                            state.done,
+                            state.total,
+                            None,
+                        )
+                    }
+                }
+            };
+            // Send the value before the journal write: the watcher picks
+            // up the outcome from the channel, so it must arrive first.
+            if let Some(value) = value {
+                let _ = tx.send(value);
+            }
+            if let Some(journal) = &journal {
+                let conn = journal.lock().unwrap();
+                let _ = task_journal::record_status(
+                    &conn,
+                    ctx.id,
+                    status,
+                    done,
+                    total,
+                    summary.as_deref(),
+                    error.as_deref(),
+                );
+            }
+        });
+        Ok((id, rx))
+    }
+
+    /// Spawn `run` with automatic retries on failure. The `factory` is called
+    /// once per attempt to produce a fresh closure, so each retry can re-open
+    /// files, re-connect sockets, etc.
+    ///
+    /// Between attempts the worker sleeps for `policy.backoff` and emits a
+    /// [`TaskEvent::Retrying`] so the UI can show a "retrying" indicator.
+    /// When all retries are exhausted the final failure is reported normally
+    /// via [`TaskEvent::Failed`].
+    ///
+    /// The journal records each retry (incrementing `retry_count`) so a crash
+    /// mid-retry surfaces the right attempt number on restart.
+    pub fn start_with_retry<T, F>(
+        &self,
+        kind: TaskKind,
+        label: impl Into<String>,
+        policy: RetryPolicy,
+        factory: F,
+    ) -> Result<(TaskId, std::sync::mpsc::Receiver<T>), StartError>
+    where
+        T: Send + 'static,
+        F: FnMut() -> Box<dyn FnOnce(&JobContext) -> Result<T, String> + Send> + Send + 'static,
+    {
+        self.start_with_retry_and_priority(kind, label, policy, TaskPriority::Normal, factory)
+    }
+
+    /// Like [`TaskManager::start_with_retry`], but with an explicit priority.
+    pub fn start_with_retry_and_priority<T, F>(
+        &self,
+        kind: TaskKind,
+        label: impl Into<String>,
+        policy: RetryPolicy,
+        priority: TaskPriority,
+        factory: F,
+    ) -> Result<(TaskId, std::sync::mpsc::Receiver<T>), StartError>
+    where
+        T: Send + 'static,
+        F: FnMut() -> Box<dyn FnOnce(&JobContext) -> Result<T, String> + Send> + Send + 'static,
+    {
+        let mut jobs = self.jobs.lock().unwrap();
+        if jobs
+            .values()
+            .any(|j| j.kind == kind && matches!(j.status, TaskStatus::Running | TaskStatus::Paused))
+        {
+            return Err(StartError::AlreadyRunning);
+        }
+        jobs.retain(|_, j| matches!(j.status, TaskStatus::Running | TaskStatus::Paused));
+        let id: TaskId = new_id();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let pause = Arc::new(PauseSignal::new());
+        let label = label.into();
+        jobs.insert(
+            id,
+            JobState {
+                kind: kind.clone(),
+                label: label.clone(),
+                priority,
+                status: TaskStatus::Running,
+                done: 0,
+                total: 0,
+                summary: None,
+                cancel: cancel.clone(),
+                pause: pause.clone(),
+                retry: Some(RetryState {
+                    remaining: policy.max_retries,
+                    max: policy.max_retries,
+                    backoff: policy.backoff,
+                }),
+            },
+        );
+        self.events.push(TaskEvent::Started {
+            id,
+            kind: kind.clone(),
+        });
+        if let Some(journal) = &self.journal {
+            let conn = journal.lock().unwrap();
+            let _ = task_journal::record_start(&conn, id, &kind, &label, policy.max_retries);
+        }
+        drop(jobs);
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let ctx = JobContext {
+            id,
+            kind: kind.clone(),
+            cancel,
+            pause,
+            jobs: self.jobs.clone(),
+            events: self.events.clone(),
+            last_progress: Mutex::new(Instant::now() - PROGRESS_EVENT_INTERVAL),
+        };
+        let journal = self.journal.clone();
+        self.pool.execute(move || {
+            // The factory is wrapped in a Mutex so the worker can call it
+            // once per attempt (it is FnMut, not Fn).
+            let factory = Mutex::new(factory);
+            loop {
+                let run = factory.lock().unwrap()();
                 let outcome = panic::catch_unwind(AssertUnwindSafe(|| run(&ctx)));
                 let mut jobs = ctx.jobs.lock().unwrap();
                 let Some(state) = jobs.get_mut(&ctx.id) else {
@@ -507,38 +975,160 @@ impl TaskManager {
                         let summary = state.summary.clone().unwrap_or_default();
                         ctx.events.push(TaskEvent::Completed {
                             id: ctx.id,
-                            kind: ctx.kind,
-                            summary,
+                            kind: ctx.kind.clone(),
+                            summary: summary.clone(),
                         });
+                        let done = state.done;
+                        let total = state.total;
                         drop(jobs);
                         let _ = tx.send(value);
+                        if let Some(journal) = &journal {
+                            let conn = journal.lock().unwrap();
+                            let _ = task_journal::record_status(
+                                &conn,
+                                ctx.id,
+                                TaskStatus::Completed,
+                                done,
+                                total,
+                                Some(&summary),
+                                None,
+                            );
+                        }
+                        return;
                     }
                     Ok(Ok(_)) => {
+                        // Cancelled mid-run.
                         state.status = TaskStatus::Cancelled;
                         ctx.events.push(TaskEvent::Cancelled {
                             id: ctx.id,
-                            kind: ctx.kind,
+                            kind: ctx.kind.clone(),
                         });
+                        let done = state.done;
+                        let total = state.total;
+                        drop(jobs);
+                        if let Some(journal) = &journal {
+                            let conn = journal.lock().unwrap();
+                            let _ = task_journal::record_status(
+                                &conn,
+                                ctx.id,
+                                TaskStatus::Cancelled,
+                                done,
+                                total,
+                                None,
+                                None,
+                            );
+                        }
+                        return;
                     }
                     Ok(Err(error)) => {
+                        // Check whether we have retries left.
+                        let can_retry = state.retry.as_mut().is_some_and(|r| r.remaining > 0);
+                        if can_retry {
+                            let retry = state.retry.as_mut().unwrap();
+                            retry.remaining -= 1;
+                            let attempt = retry.max - retry.remaining;
+                            let backoff = retry.backoff;
+                            ctx.events.push(TaskEvent::Retrying {
+                                id: ctx.id,
+                                kind: ctx.kind.clone(),
+                                attempt,
+                                max_retries: retry.max,
+                            });
+                            drop(jobs);
+                            if let Some(journal) = &journal {
+                                let conn = journal.lock().unwrap();
+                                let _ = task_journal::record_retry(&conn, ctx.id);
+                            }
+                            // Sleep for backoff, but wake early on cancel.
+                            let deadline = Instant::now() + backoff;
+                            while Instant::now() < deadline && !ctx.cancelled() {
+                                std::thread::sleep(Duration::from_millis(100));
+                            }
+                            if ctx.cancelled() {
+                                let mut jobs = ctx.jobs.lock().unwrap();
+                                if let Some(state) = jobs.get_mut(&ctx.id) {
+                                    state.status = TaskStatus::Cancelled;
+                                    ctx.events.push(TaskEvent::Cancelled {
+                                        id: ctx.id,
+                                        kind: ctx.kind.clone(),
+                                    });
+                                }
+                                drop(jobs);
+                                if let Some(journal) = &journal {
+                                    let conn = journal.lock().unwrap();
+                                    let _ = task_journal::record_status(
+                                        &conn,
+                                        ctx.id,
+                                        TaskStatus::Cancelled,
+                                        0,
+                                        0,
+                                        None,
+                                        None,
+                                    );
+                                }
+                                return;
+                            }
+                            // Reset progress for the next attempt.
+                            let mut jobs = ctx.jobs.lock().unwrap();
+                            if let Some(state) = jobs.get_mut(&ctx.id) {
+                                state.done = 0;
+                                state.total = 0;
+                            }
+                            drop(jobs);
+                            continue;
+                        }
+                        // No retries left: report final failure.
                         state.status = TaskStatus::Failed;
                         ctx.events.push(TaskEvent::Failed {
                             id: ctx.id,
-                            kind: ctx.kind,
-                            error,
+                            kind: ctx.kind.clone(),
+                            error: error.clone(),
                         });
+                        let done = state.done;
+                        let total = state.total;
+                        drop(jobs);
+                        if let Some(journal) = &journal {
+                            let conn = journal.lock().unwrap();
+                            let _ = task_journal::record_status(
+                                &conn,
+                                ctx.id,
+                                TaskStatus::Failed,
+                                done,
+                                total,
+                                None,
+                                Some(&error),
+                            );
+                        }
+                        return;
                     }
                     Err(_) => {
+                        // Panic: treat as a non-retryable failure.
                         state.status = TaskStatus::Failed;
                         ctx.events.push(TaskEvent::Failed {
                             id: ctx.id,
-                            kind: ctx.kind,
+                            kind: ctx.kind.clone(),
                             error: "task panicked".into(),
                         });
+                        let done = state.done;
+                        let total = state.total;
+                        drop(jobs);
+                        if let Some(journal) = &journal {
+                            let conn = journal.lock().unwrap();
+                            let _ = task_journal::record_status(
+                                &conn,
+                                ctx.id,
+                                TaskStatus::Failed,
+                                done,
+                                total,
+                                None,
+                                Some("task panicked"),
+                            );
+                        }
+                        return;
                     }
                 }
-            })
-            .expect("spawn task thread");
+            }
+        });
         Ok((id, rx))
     }
 
@@ -564,7 +1154,7 @@ impl TaskManager {
             state.pause.request_pause();
             self.events.push(TaskEvent::Paused {
                 id,
-                kind: state.kind,
+                kind: state.kind.clone(),
             });
         }
     }
@@ -579,24 +1169,25 @@ impl TaskManager {
             state.pause.request_resume();
             self.events.push(TaskEvent::Resumed {
                 id,
-                kind: state.kind,
+                kind: state.kind.clone(),
             });
         }
     }
 
     /// Whether a job of `kind` is currently running.
-    pub fn is_running(&self, kind: TaskKind) -> bool {
+    pub fn is_running(&self, kind: &TaskKind) -> bool {
         let jobs = self.jobs.lock().unwrap();
         jobs.values()
-            .any(|j| j.kind == kind && j.status == TaskStatus::Running)
+            .any(|j| &j.kind == kind && j.status == TaskStatus::Running)
     }
 
     /// Whether a job of `kind` holds its slot: running *or* paused. Used to
     /// refuse a second job of the same kind while one is paused.
-    pub fn is_active(&self, kind: TaskKind) -> bool {
+    pub fn is_active(&self, kind: &TaskKind) -> bool {
         let jobs = self.jobs.lock().unwrap();
-        jobs.values()
-            .any(|j| j.kind == kind && matches!(j.status, TaskStatus::Running | TaskStatus::Paused))
+        jobs.values().any(|j| {
+            &j.kind == kind && matches!(j.status, TaskStatus::Running | TaskStatus::Paused)
+        })
     }
 
     /// Whether this exact job is still running.
@@ -647,20 +1238,28 @@ impl TaskManager {
 
     /// Snapshot of every known job. Finished jobs leave the registry when the
     /// next one starts (see [`TaskManager::start`]), so the map only ever
-    /// holds running jobs plus the last finished ones.
+    /// holds running jobs plus the last finished ones. Results are sorted by
+    /// priority (high first), then by insertion order within the same level.
     pub fn snapshot(&self) -> Vec<TaskInfo> {
         let jobs = self.jobs.lock().unwrap();
-        jobs.iter()
+        let mut infos: Vec<TaskInfo> = jobs
+            .iter()
             .map(|(id, j)| TaskInfo {
                 id: *id,
-                kind: j.kind,
+                kind: j.kind.clone(),
                 label: j.label.clone(),
+                priority: j.priority,
                 status: j.status,
                 done: j.done,
                 total: j.total,
                 summary: j.summary.clone(),
             })
-            .collect()
+            .collect();
+        // Stable sort: high priority first, same-priority jobs keep their
+        // map-iteration order (which is arbitrary but deterministic per
+        // snapshot).
+        infos.sort_by_key(|task| std::cmp::Reverse(task.priority));
+        infos
     }
 }
 
@@ -682,7 +1281,7 @@ impl JobContext {
     }
 
     pub fn kind(&self) -> TaskKind {
-        self.kind
+        self.kind.clone()
     }
 
     /// A standalone context for tests that call job functions directly.
@@ -863,10 +1462,30 @@ mod tests {
         );
     }
 
-    /// What the per-job buckets bought: a job nobody reads can only evict its
-    /// own stale events. Under the shared bound the same backlog pushed
-    /// whoever else's terminal event out of the queue — the one event a
-    /// watcher cannot afford to miss.
+    /// Progress events are lossy: only the latest one per job is kept, so a
+    /// flood of progress updates cannot crowd out terminal events — not even
+    /// the same job's own.
+    #[test]
+    fn progress_events_are_lossy() {
+        let queue = EventQueue::default();
+        let id = new_id();
+        for done in 0..100 {
+            queue.push(TaskEvent::Progress {
+                id,
+                done,
+                total: 1_000,
+            });
+        }
+        let events = queue.take(id);
+        assert_eq!(events.len(), 1, "progress events should coalesce to one");
+        let TaskEvent::Progress { done, .. } = &events[0] else {
+            panic!("expected a progress event");
+        };
+        assert_eq!(*done, 99, "kept the wrong progress event");
+    }
+
+    /// A foreign backlog of progress events cannot displace another job's
+    /// terminal event — the one event a watcher cannot afford to miss.
     #[test]
     fn an_unread_backlog_evicts_only_its_own_events() {
         let queue = EventQueue::default();
@@ -877,6 +1496,7 @@ mod tests {
             kind: TaskKind::Import,
             summary: String::new(),
         });
+        // Flood progress for the noisy job — all but the latest are discarded.
         for done in 0..(MAX_EVENTS_PER_JOB as u64 + 10) {
             queue.push(TaskEvent::Progress {
                 id: noisy,
@@ -890,13 +1510,17 @@ mod tests {
             1,
             "a foreign backlog dropped a terminal event"
         );
+        // The noisy job's progress coalesced to a single event.
         let backlog = queue.take(noisy);
-        assert_eq!(backlog.len(), MAX_EVENTS_PER_JOB);
-        // Oldest first out: the ten events over the bound are the ones gone.
+        assert_eq!(backlog.len(), 1, "progress should be lossy (one kept)");
         let TaskEvent::Progress { done, .. } = backlog.first().expect("backlog kept") else {
             panic!("expected a progress event");
         };
-        assert_eq!(*done, 10, "evicted the wrong end of the bucket");
+        assert_eq!(
+            *done,
+            MAX_EVENTS_PER_JOB as u64 + 9,
+            "kept the wrong progress event"
+        );
     }
 
     /// Buckets are created per job id, so the jobs nobody ever polls (a watch
@@ -1025,8 +1649,8 @@ mod tests {
 
         mgr.pause(id);
         assert_eq!(status_of(&mgr, id), TaskStatus::Paused);
-        assert!(!mgr.is_running(TaskKind::Import));
-        assert!(mgr.is_active(TaskKind::Import));
+        assert!(!mgr.is_running(&TaskKind::Import));
+        assert!(mgr.is_active(&TaskKind::Import));
         // The kind stays occupied while paused.
         assert!(matches!(
             mgr.start(TaskKind::Import, "second", |_| Ok(())),
