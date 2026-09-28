@@ -13,6 +13,7 @@
 //! is a centered hero — logo, name, version — over one card with the
 //! commands: create, and the interface language.
 
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
 use gpui_kit::base::{h_flex, v_flex};
@@ -76,6 +77,9 @@ impl gpui_kit::Global for LibraryManagerWindowState {}
 /// Open the library manager over a running session — the File menu's
 /// 「素材库」 — or focus it when it is already up.
 pub fn open(cx: &mut App) {
+    // Finish the leftovers of past deletes on the way in -- this is the window
+    // where the user deletes libraries, so it is where reclaimed disk belongs.
+    sweep_staged_removals();
     if let Some(state) = cx.try_global::<LibraryManagerWindowState>()
         && let Some(handle) = state.0
         && handle
@@ -688,26 +692,134 @@ fn row_menu(
     })
 }
 
-/// Remove each directory that is there, stopping at the first one that refuses.
+/// The tail every staged directory carries, and how a later run knows what it
+/// is looking at: `<parent>/<name>.deleting-<stamp>`.
+const STAGED_MARK: &str = ".deleting-";
+
+/// A library directory the user asked deleted, moved aside under a name that
+/// says so, instead of being unlinked where it stands.
 ///
-/// Absent counts as removed: a library that was created but never opened has no
-/// cache directory at all, and `remove_dir_all` reports that as `NotFound` --
-/// which must not read as "the delete failed", because it would leave the entry
-/// behind for a library that really was deleted.
+/// The reason is the failure mode of `remove_dir_all`: it deletes as it walks, so
+/// a refusal halfway through -- a file held open, a permission change, a full disk
+/// reported late -- leaves a directory that is neither the library it was nor gone.
+/// Nothing can put that back. A rename within one directory can fail too, but it
+/// fails *whole*: either the folder is still the library, or it is this folder,
+/// staged and findable by name. So the destructive step happens last, on a path
+/// that no longer answers to the library list, and a leftover from it is a
+/// directory a later run can spot and finish off (see
+/// [`sweep_staged_removals`]).
 ///
-/// `None` means every directory is gone. `Some` names the one that stopped the
-/// walk and why, which is the only thing the user can act on.
-fn clear_directories(
-    dirs: impl IntoIterator<Item = impl AsRef<std::path::Path>>,
-) -> Option<(std::path::PathBuf, std::io::Error)> {
-    for dir in dirs {
-        if dir.as_ref().exists()
-            && let Err(error) = std::fs::remove_dir_all(dir.as_ref())
-        {
-            return Some((dir.as_ref().to_path_buf(), error));
+/// `Ok(None)` means there was nothing to move: a library created but never opened
+/// has no cache directory at all, and that is a delete that already succeeded, not
+/// a failure.
+fn stage_for_removal(dir: &Path, stamp: &str) -> std::io::Result<Option<PathBuf>> {
+    if !dir.exists() {
+        return Ok(None);
+    }
+    let name = dir
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .ok_or_else(|| std::io::Error::other("a library directory with no name"))?;
+    let staged = dir.with_file_name(format!("{name}{STAGED_MARK}{stamp}"));
+    std::fs::rename(dir, &staged)?;
+    Ok(Some(staged))
+}
+
+/// Put staged directories back where the library list expects them.
+///
+/// Only used when a step that comes *after* the staging fails, which is the one
+/// point where the whole delete can still be undone: the entries still exist, the
+/// data was never touched, so the honest outcome is "nothing happened" rather than
+/// a library listed against a folder it can no longer find.
+fn put_back(staged: &[(PathBuf, PathBuf)]) {
+    for (original, to) in staged.iter().rev() {
+        if let Err(error) = std::fs::rename(to, original) {
+            // The window where this was recoverable is closing: the folder is
+            // staged and the entry still points at the original name. Say which
+            // is which, because that is what a person needs in front of a shell.
+            tracing::error!(
+                from = %to.display(),
+                to = %original.display(),
+                %error,
+                "a staged library directory could not be put back"
+            );
         }
     }
-    None
+}
+
+/// Finish the delete: remove staged directories that the entry no longer refers
+/// to. Failures are left staged (and reported) rather than retried here, because
+/// the next [`sweep_staged_removals`] is a better place to try -- the reason a
+/// folder refuses now (a running process holding it open, say) is often gone by
+/// then.
+fn clear_staged(staged: &[(PathBuf, PathBuf)]) -> Vec<(PathBuf, String)> {
+    staged
+        .iter()
+        .filter_map(|(_, to)| {
+            std::fs::remove_dir_all(to)
+                .err()
+                .map(|error| (to.clone(), error.to_string()))
+        })
+        .collect()
+}
+
+/// Every directory under `roots` that is staged and not yet gone.
+///
+/// Sorted by name so a repeated sweep works through them in a stable order, and
+/// the "is this a staged folder" test is the marker alone: a stale directory from
+/// some other cause is nobody's to delete.
+fn find_staged(roots: impl IntoIterator<Item = impl AsRef<std::path::Path>>) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    for root in roots {
+        let Ok(entries) = std::fs::read_dir(root.as_ref()) else {
+            continue; // no such root yet -- nothing staged under it
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.contains(STAGED_MARK) {
+                found.push(entry.path());
+            }
+        }
+    }
+    found.sort();
+    found
+}
+
+/// Delete the leftovers of past library deletions, called when the library
+/// manager opens.
+///
+/// A delete that staged its folders and then died before removing them leaves
+/// exactly one kind of trace -- a `*.deleting-<stamp>` directory beside the
+/// libraries -- and it belongs to a library the user already chose to delete. So
+/// the manager, which is where that choice lives, finishes the job on the way in.
+/// The count is logged rather than shown: the folders are not in the library list
+/// and cannot reappear there, so a dialog about reclaimed disk would be talking
+/// about something the user has no way to have noticed.
+pub(crate) fn sweep_staged_removals() {
+    let staged = find_staged([trove_core::paths::libraries_dir(), cache_roots()]);
+    if staged.is_empty() {
+        return;
+    }
+    let mut cleared = 0_usize;
+    for dir in &staged {
+        match std::fs::remove_dir_all(dir) {
+            Ok(()) => cleared += 1,
+            Err(error) => {
+                tracing::warn!(path = %dir.display(), %error, "a staged library directory is still on disk");
+            }
+        }
+    }
+    tracing::info!(
+        cleared,
+        left = staged.len() - cleared,
+        "finished past library deletions on opening the library manager"
+    );
+}
+
+/// Where per-library caches live -- the sibling of
+/// [`trove_core::paths::library_cache_dir`], whose parent this sweeps.
+fn cache_roots() -> PathBuf {
+    trove_core::paths::cache_dir().join("libraries")
 }
 
 /// The inline editor that replaces a row while it is renamed — the
@@ -751,79 +863,69 @@ fn open_delete_confirm(entry: LibraryEntry, window: &mut Window, cx: &mut App) {
                     .show_cancel(true),
             )
             .on_ok(move |_, window, cx| {
-                // Deleting a library is two steps that fail at different points,
-                // and the two residuals are not equally bad. The order used to be
-                // entry-then-files, which meant a failed delete left a database
-                // and its backups on disk with no entry pointing at them and no
-                // message about it -- an orphan nobody can find. Files first, so a
-                // failure leaves the row exactly where it was: listed, openable,
-                // retryable from the same kebab menu.
+                // Deleting a library runs in three steps -- stage the folders
+                // aside, write the entry away, then remove what is staged -- so
+                // that the one thing that cannot be taken back, an unlink that
+                // dies halfway, happens last and only to a path the library list
+                // no longer refers to. See [`stage_for_removal`].
                 let data = commit_entry.dir();
                 let cache = commit_entry.cache_dir();
-                if let Some((dir, error)) = clear_directories([&data, &cache]) {
-                    // One thing no ordering fixes is a delete that dies *partway*:
-                    // `remove_dir_all` unlinks as it walks, so by the time it
-                    // errors the database may already be gone while the directory
-                    // is not. That is checked rather than assumed, because it
-                    // changes what the entry should do -- a library with no
-                    // database cannot be opened, and leaving it listed would
-                    // promise something the row can no longer deliver.
-                    let database_gone = !data.join("library.db").exists();
-                    tracing::warn!(
-                        path = %dir.display(),
-                        %error,
-                        database_gone,
-                        "a library delete did not finish"
-                    );
-                    if database_gone {
-                        let mut config = AppConfig::load();
-                        settings_write::note(
-                            config.forget_library(&commit_entry.slug),
-                            "library forgotten",
-                        );
-                        window.push_notification(
-                            Notification::warning(
-                                rust_i18n::t!(
-                                    "library_manager.delete_incomplete",
-                                    name = commit_entry.name.clone(),
-                                    path = data.display().to_string(),
-                                    error = error.to_string(),
-                                )
-                                .to_string(),
-                            ),
-                            cx,
-                        );
-                    } else {
-                        window.push_notification(
-                            Notification::warning(
-                                rust_i18n::t!(
-                                    "library_manager.delete_failed",
-                                    name = commit_entry.name.clone(),
-                                    path = dir.display().to_string(),
-                                    error = error.to_string(),
-                                )
-                                .to_string(),
-                            ),
-                            cx,
-                        );
+                let stamp = trove_core::model::now().format("%Y%m%d-%H%M%S").to_string();
+                let mut staged: Vec<(PathBuf, PathBuf)> = Vec::new();
+                for dir in [&data, &cache] {
+                    match stage_for_removal(dir, &stamp) {
+                        Ok(Some(to)) => staged.push((dir.clone(), to)),
+                        // Nothing there: a library that never opened has no cache
+                        // directory, and that half is already done.
+                        Ok(None) => {}
+                        Err(error) => {
+                            // The delete never started. Every folder that did move
+                            // moves back, the entry stays, and the row is still
+                            // openable -- so the message can honestly say the
+                            // library is where it was.
+                            put_back(&staged);
+                            tracing::warn!(
+                                path = %dir.display(),
+                                %error,
+                                "a library delete could not begin"
+                            );
+                            window.push_notification(
+                                Notification::warning(
+                                    rust_i18n::t!(
+                                        "library_manager.delete_failed",
+                                        name = commit_entry.name.clone(),
+                                        path = dir.display().to_string(),
+                                        error = error.to_string(),
+                                    )
+                                    .to_string(),
+                                ),
+                                cx,
+                            );
+                            cx.refresh_windows();
+                            return true;
+                        }
                     }
-                    cx.refresh_windows();
-                    return true;
                 }
 
-                // The files are gone; the entry follows, and a failure to write
-                // that down is not a "nothing happened" case -- the row will come
-                // back after a restart pointing at directories that no longer
-                // exist, so it says that much rather than leaving the status bar
-                // alone to carry it.
                 let mut config = AppConfig::load();
                 let outcome = config.forget_library(&commit_entry.slug);
+                settings_write::note(
+                    match &outcome {
+                        Ok(()) => Ok(()),
+                        Err(error) => Err(error),
+                    },
+                    "library forgotten",
+                );
                 if let Err(error) = &outcome {
-                    tracing::warn!(%error, "a deleted library's entry could not be removed");
+                    put_back(&staged);
+                    tracing::warn!(
+                        %error,
+                        "a library delete was rolled back: its entry could not be removed"
+                    );
                     window.push_notification(
                         Notification::warning(
                             rust_i18n::t!(
-                                "library_manager.entry_left_behind",
+                                "library_manager.delete_rolled_back",
                                 name = commit_entry.name.clone(),
                                 error = error.to_string(),
                             )
@@ -831,8 +933,36 @@ fn open_delete_confirm(entry: LibraryEntry, window: &mut Window, cx: &mut App) {
                         ),
                         cx,
                     );
+                    cx.refresh_windows();
+                    return true;
                 }
-                settings_write::note(outcome, "library forgotten");
+
+                // Past this point the library is gone from the list, and the only
+                // thing left is bytes. A folder that refuses now stays staged --
+                // named `*.deleting-<stamp>`, finished off the next time the
+                // library manager opens -- rather than being retried into the same
+                // refusal; whatever held it open is often gone by then.
+                let leftovers = clear_staged(&staged);
+                for (path, error) in &leftovers {
+                    tracing::warn!(
+                        path = %path.display(),
+                        error,
+                        "a deleted library's files are still staged on disk"
+                    );
+                }
+                if !leftovers.is_empty() {
+                    window.push_notification(
+                        Notification::warning(
+                            rust_i18n::t!(
+                                "library_manager.delete_staged",
+                                name = commit_entry.name.clone(),
+                                count = leftovers.len() as i64,
+                            )
+                            .to_string(),
+                        ),
+                        cx,
+                    );
+                }
                 cx.refresh_windows();
                 true
             })
@@ -841,70 +971,155 @@ fn open_delete_confirm(entry: LibraryEntry, window: &mut Window, cx: &mut App) {
 
 #[cfg(test)]
 mod tests {
-    use super::clear_directories;
+    use super::{STAGED_MARK, clear_staged, find_staged, put_back, stage_for_removal};
+    use std::path::{Path, PathBuf};
 
-    fn unique_dir() -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("trove-libmgr-{}", uuid::Uuid::new_v4()));
+    fn unique_root(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("trove-libmgr-{tag}-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }
 
-    /// A library that was created but never opened has no cache directory, and
-    /// `remove_dir_all` reports that as `NotFound`. Reading that as a failure
-    /// would leave the entry of a genuinely deleted library behind, which is the
-    /// opposite of what the two-step order is for -- so absence is success.
-    #[test]
-    fn an_absent_directory_counts_as_removed() {
-        let missing =
-            std::env::temp_dir().join(format!("trove-libmgr-absent-{}", uuid::Uuid::new_v4()));
-        assert!(!missing.exists(), "the fixture must start absent");
-        assert!(
-            clear_directories([&missing]).is_none(),
-            "nothing to delete is not a failed delete"
-        );
+    fn library_at(root: &Path, slug: &str) -> PathBuf {
+        let dir = root.join(slug);
+        std::fs::create_dir_all(dir.join("backups")).unwrap();
+        std::fs::write(dir.join("library.db"), b"catalog").unwrap();
+        dir
     }
 
-    /// The walk has to stop and name the path that refused it, because that path
-    /// is the whole message the user can act on.
+    /// Staging moves the whole folder and leaves nothing behind at the old name.
     ///
-    /// A regular file is the deterministic refusal: `remove_dir_all` will not
-    /// take one apart on any platform this ships on, so the test does not depend
-    /// on permissions, a busy disk, or who runs it.
+    /// The point of the marker is that a *rename* cannot half-happen: either the
+    /// folder is still the library, or it is this folder.
     #[test]
-    fn a_refusing_path_is_named_and_the_walk_stops_there() {
-        let dir = unique_dir();
-        let not_a_dir = dir.join("library.db");
-        std::fs::write(&not_a_dir, b"x").unwrap();
-        let sibling = dir.join("backups");
-        std::fs::create_dir_all(&sibling).unwrap();
+    fn a_staged_library_moves_whole_and_keeps_its_bytes() {
+        let root = unique_root("stage");
+        let data = library_at(&root, "work");
+        let before = data.join("library.db");
+        assert!(before.is_file());
 
-        let (stopped, error) =
-            clear_directories([&not_a_dir, &sibling]).expect("a file is not a directory");
-        assert_eq!(stopped, not_a_dir, "the report names what refused");
+        let staged = stage_for_removal(&data, "20260928-120000")
+            .expect("a plain directory stages")
+            .expect("it was there");
+        assert!(!data.exists(), "nothing is left at the library's own name");
         assert!(
-            !error.to_string().is_empty(),
-            "and carries the reason the log line needs"
+            staged
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .contains(STAGED_MARK),
+            "and the new name says what it is: {staged:?}"
         );
-        assert!(
-            sibling.exists(),
-            "the walk stopped where it said rather than finishing silently"
+        assert_eq!(
+            staged.parent(),
+            data.parent(),
+            "beside the libraries, not away"
         );
-        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(
+            std::fs::read(staged.join("library.db")).unwrap(),
+            b"catalog",
+            "the folder moved with its database inside"
+        );
+        std::fs::remove_dir_all(&root).ok();
     }
 
-    /// Both directories gone and nothing reported -- the normal path, and the one
-    /// that lets the entry be written away after it.
+    /// Absent counts as staged-nothing: a library that was created but never
+    /// opened has no cache directory, and reporting that as a failure would strand
+    /// the entry of a library that really was deleted.
     #[test]
-    fn two_real_directories_both_go_away() {
-        let dir = unique_dir();
-        let data = dir.join("library");
-        let cache = dir.join("cache");
-        std::fs::create_dir_all(&data).unwrap();
-        std::fs::write(data.join("library.db"), b"x").unwrap();
-        std::fs::create_dir_all(&cache).unwrap();
+    fn an_absent_directory_is_not_a_failure() {
+        let root = unique_root("absent");
+        let missing = root.join("never-opened-cache");
+        assert!(
+            stage_for_removal(&missing, "20260928-120000")
+                .expect("nothing to move is not an error")
+                .is_none(),
+            "and it says so rather than inventing a folder"
+        );
+        assert!(!missing.exists(), "it must not create one either");
+        std::fs::remove_dir_all(&root).ok();
+    }
 
-        assert!(clear_directories([&data, &cache]).is_none());
-        assert!(!data.exists() && !cache.exists(), "both are gone");
-        std::fs::remove_dir_all(&dir).ok();
+    /// A rollback puts every staged folder back under the name the entry uses --
+    /// the one moment a delete is still fully reversible.
+    #[test]
+    fn putting_back_restores_the_names_the_entry_points_at() {
+        let root = unique_root("rollback");
+        let data = library_at(&root, "work");
+        let cache = root.join("work-cache");
+        std::fs::create_dir_all(&cache).unwrap();
+        let staged: Vec<(PathBuf, PathBuf)> = [data.as_path(), cache.as_path()]
+            .into_iter()
+            .map(|dir| {
+                let to = stage_for_removal(dir, "20260928-120001").unwrap().unwrap();
+                (dir.to_path_buf(), to)
+            })
+            .collect();
+        assert!(!data.exists() && !cache.exists());
+
+        put_back(&staged);
+        assert!(
+            data.join("library.db").is_file(),
+            "the library is where it was"
+        );
+        assert!(cache.exists(), "and so is its cache");
+        assert!(
+            find_staged([&root]).is_empty(),
+            "nothing staged is left behind to sweep"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The sweep's whole safety property: it recognises a folder by the marker and
+    /// by nothing else, so a live library beside it is untouched.
+    #[test]
+    fn only_a_staged_folder_is_offered_to_the_sweep() {
+        let root = unique_root("sweep");
+        let live = library_at(&root, "keepme");
+        let staged = root.join(format!("gone{STAGED_MARK}20260928-120002"));
+        std::fs::create_dir_all(&staged).unwrap();
+        let other = root.join("not-a-library");
+        std::fs::create_dir_all(&other).unwrap();
+
+        let found = find_staged([&root]);
+        assert_eq!(found, vec![staged.clone()], "the marker is the only test");
+        assert!(
+            live.join("library.db").is_file(),
+            "a library is not a leftover"
+        );
+
+        let leftovers = clear_staged(&[(live.clone(), staged.clone())]);
+        assert!(
+            leftovers.is_empty(),
+            "the staged folder went: {leftovers:?}"
+        );
+        assert!(!staged.exists());
+        assert!(
+            live.exists(),
+            "and the pair's other half was never the thing to delete"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A folder that refuses removal is reported, not swallowed -- it stays staged
+    /// and named so the next sweep can finish what this one could not.
+    ///
+    /// A regular file is the deterministic refusal: `remove_dir_all` will not take
+    /// one apart, so the test does not depend on permissions, a busy disk, or who
+    /// runs it.
+    #[test]
+    fn a_refusal_is_handed_back_with_its_path() {
+        let root = unique_root("refuse");
+        let not_a_dir = root.join(format!("work{STAGED_MARK}20260928-120003"));
+        std::fs::write(&not_a_dir, b"x").unwrap();
+
+        let leftovers = clear_staged(&[(root.join("work"), not_a_dir.clone())]);
+        assert_eq!(leftovers.len(), 1, "the refusal was reported");
+        assert_eq!(leftovers[0].0, not_a_dir, "and named");
+        assert!(
+            !leftovers[0].1.is_empty(),
+            "with the reason the log line needs"
+        );
+        std::fs::remove_dir_all(&root).ok();
     }
 }
