@@ -194,10 +194,11 @@ fn full_pipeline(paths: &[PathBuf], root: &Path) -> (Duration, Duration) {
     );
     let stage = t0.elapsed();
 
-    let store = Store::open(&root.join("library.db")).unwrap();
+    // Opening the store is what creates the schema the raw connection reads.
+    Store::open(&root.join("library.db")).unwrap();
     let t1 = Instant::now();
     {
-        let conn = store.conn();
+        let conn = &rusqlite::Connection::open(root.join("library.db")).unwrap();
         for chunk in staged.chunks(16) {
             let _ = conn.execute_batch("BEGIN");
             for item in chunk.iter().flatten() {
@@ -444,11 +445,11 @@ fn main() {
         let coll_root = base.join(format!("import-profile-coll-{me}-{}", with_coll as u8));
         let _ = std::fs::remove_dir_all(&coll_root);
         std::fs::create_dir_all(&coll_root).unwrap();
-        let store = Store::open(&coll_root.join("library.db")).unwrap();
+        Store::open(&coll_root.join("library.db")).unwrap();
         let coll = if with_coll {
             Some(
                 trove_core::store::collections::create(
-                    store.conn(),
+                    &rusqlite::Connection::open(coll_root.join("library.db")).unwrap(),
                     &trove_core::model::NewCollection {
                         parent_id: None,
                         name: "bench".to_string(),
@@ -472,7 +473,7 @@ fn main() {
             );
             let t = Instant::now();
             {
-                let conn = store.conn();
+                let conn = &rusqlite::Connection::open(coll_root.join("library.db")).unwrap();
                 for chunk in staged.chunks(16) {
                     let _ = conn.execute_batch("BEGIN");
                     for item in chunk.iter().flatten() {
@@ -483,7 +484,7 @@ fn main() {
             }
             samples.push(t.elapsed().as_secs_f64());
             // Empty the store so the next round starts fresh.
-            let _ = conn_wipe(&store);
+            let _ = conn_wipe(&coll_root.join("library.db"));
         }
         let med = median(samples);
         println!(
@@ -499,8 +500,8 @@ fn main() {
 }
 
 /// Delete every asset row so a collection-cost round starts fresh.
-fn conn_wipe(store: &Store) -> rusqlite::Result<()> {
-    let conn = store.conn();
+fn conn_wipe(db: &std::path::Path) -> rusqlite::Result<()> {
+    let conn = rusqlite::Connection::open(db)?;
     conn.execute_batch(
         "DELETE FROM asset_collection; DELETE FROM assets; DELETE FROM search_queue;
          DELETE FROM collections;",

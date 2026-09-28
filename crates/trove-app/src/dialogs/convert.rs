@@ -17,7 +17,6 @@ use gpui_kit::*;
 
 use trove_core::media::convert::{self, CONVERT_FORMATS, ConvertFormat, ConvertItem};
 use trove_core::model::{Asset, AssetKind};
-use trove_core::store::assets;
 
 use crate::components::controls::{self, muted_label};
 use crate::library::LibraryController;
@@ -33,8 +32,10 @@ impl ConvertDialog {
     /// refuses (with a toast) when the selection has none.
     pub fn open(window: &mut Window, cx: &mut App, controller: Entity<LibraryController>) {
         let selection = controller.read(cx).selected_assets.clone();
-        let conn = controller.read(cx).library.store().conn();
-        let images: Vec<Asset> = assets::by_ids(conn, &selection)
+        let images: Vec<Asset> = controller
+            .read(cx)
+            .library
+            .assets_by_ids(&selection)
             .map(|list| {
                 list.into_iter()
                     .filter(|a| a.kind == AssetKind::Image)

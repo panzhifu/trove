@@ -9,7 +9,7 @@ fn bench(label: &str, n_assets: usize, runs: usize) {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let store = store::Store::open(&dir.join("lib.db")).unwrap();
-    let conn = store.conn();
+    let conn = &rusqlite::Connection::open(dir.join("lib.db")).unwrap();
 
     let mut batch = Vec::new();
     for i in 0..n_assets {

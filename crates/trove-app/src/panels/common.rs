@@ -12,7 +12,6 @@ use gpui_kit::*;
 use uuid::Uuid;
 
 use trove_core::model::{Asset, AssetKind, AssetQuery};
-use trove_core::store::assets;
 
 use crate::library::LibraryController;
 
@@ -71,23 +70,22 @@ pub(crate) fn separator_label(cx: &Context<impl Render>, text: impl Into<String>
 }
 
 pub(crate) fn live_count(controller: &LibraryController) -> u64 {
-    let conn = controller.library.store().conn();
-    assets::query(conn, &AssetQuery::default())
+    controller
+        .library
+        .query_assets(&AssetQuery::default())
         .map(|page| page.total)
         .unwrap_or(0)
 }
 
 pub(crate) fn trash_count(controller: &LibraryController) -> u64 {
-    let conn = controller.library.store().conn();
-    assets::query(
-        conn,
-        &AssetQuery {
+    controller
+        .library
+        .query_assets(&AssetQuery {
             is_trashed: true,
             ..Default::default()
-        },
-    )
-    .map(|page| page.total)
-    .unwrap_or(0)
+        })
+        .map(|page| page.total)
+        .unwrap_or(0)
 }
 
 /// Parse a `#rrggbb` hex (leading `#` optional, case-insensitive) into an

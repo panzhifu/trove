@@ -384,7 +384,6 @@ impl WorkspacePanel {
             // controller.
             tiers: ctl.search_tiers,
         };
-        let conn = ctl.library.store().conn();
         // Flush pending outbox rows first so a just-finished write (import,
         // edit) is reflected in the same refresh. A failed drain (a writer
         // holding the store's write lock past the busy timeout) still renders
@@ -392,7 +391,6 @@ impl WorkspacePanel {
         // not be silent: the log records it and the notice below names it;
         // the resident drain loop and the next refresh both retry.
         let drained = ctl.library.drain_search_queue();
-        let text_index = ctl.library.text_index();
         // The index the vector leg scores against — the same cached one the
         // semantic search uses, fetched only when this pass has a vector and
         // the semantic tier is actually on.
@@ -401,17 +399,19 @@ impl WorkspacePanel {
             .as_ref()
             .filter(|_| ctx.tiers.semantic)
             .map(|query| ctl.library.cached_vector_index(&query.model, query.space));
-        let frozen = ctx
-            .snapshot(conn, text_index, vector_index.as_ref(), count_total)
+        let frozen = ctl
+            .library
+            .browse_snapshot(&ctx, vector_index.as_ref(), count_total)
             .and_then(|session| {
-                session
-                    .page(conn, text_index, 0, Some(window))
-                    // Facet counts are computed here while `conn` is still
-                    // borrowed, so the borrow ends before the mutable borrow
-                    // that `report_notice` needs below. A failed count leaves
+                ctl.library
+                    .browse_page(&session, 0, Some(window))
+                    // Facet counts are taken in the same read-only stretch of
+                    // this pass as the snapshot and the page, so no borrow of
+                    // the library outlives the block — `report_notice` below
+                    // needs the controller mutably. A failed count leaves
                     // `facets` None and the grid renders without numbers.
                     .map(|page| {
-                        let facets = session.compute_facets(conn).ok();
+                        let facets = ctl.library.browse_facets(&session).ok();
                         (session, page, facets)
                     })
             });
@@ -464,8 +464,7 @@ impl WorkspacePanel {
             return (cells, empty);
         };
         let ctl = self.controller.read(cx);
-        let conn = ctl.library.store().conn();
-        let page = session.page(conn, ctl.library.text_index(), offset, Some(window));
+        let page = ctl.library.browse_page(session, offset, Some(window));
         match page {
             Ok(page) => {
                 let empty = page.items.is_empty();
@@ -490,9 +489,12 @@ impl WorkspacePanel {
         offset: usize,
         window: usize,
     ) -> (usize, Vec<Cell>, bool) {
-        let conn = self.controller.read(cx).library.store().conn();
         let slice = &ids[offset.min(ids.len())..ids.len().min(offset + window)];
-        let by_id: HashMap<Uuid, _> = assets::by_ids(conn, slice)
+        let by_id: HashMap<Uuid, _> = self
+            .controller
+            .read(cx)
+            .library
+            .assets_by_ids(slice)
             .unwrap_or_default()
             .into_iter()
             .map(|a| (a.id, a))

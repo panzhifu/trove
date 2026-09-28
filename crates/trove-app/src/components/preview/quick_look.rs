@@ -274,9 +274,7 @@ impl LiveCard {
         // cell should have to resolve.
         let (path, duration_ms) = {
             let controller = controller.read(cx);
-            let record = trove_core::store::assets::get(controller.library.store().conn(), id)
-                .ok()
-                .flatten();
+            let record = controller.library.asset(id).ok().flatten();
             (
                 controller.asset_file(id),
                 record.and_then(|a| a.duration_ms),

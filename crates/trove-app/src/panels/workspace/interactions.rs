@@ -86,8 +86,7 @@ impl WorkspacePanel {
     pub(super) fn clear_view_history(&mut self, cx: &mut Context<Self>) {
         let controller = self.controller.clone();
         controller.update(cx, |ctl, cx| {
-            let conn = ctl.library.store().conn();
-            ctl.notice = match trove_core::store::view_history::clear(conn) {
+            ctl.notice = match ctl.library.clear_view_history() {
                 Ok(_) => Some(rust_i18n::t!("workspace.history_cleared").to_string()),
                 Err(e) => Some(
                     rust_i18n::t!("workspace.history_clear_failed", error = e.to_string())
@@ -131,8 +130,6 @@ impl WorkspacePanel {
         }
 
         let ctl = self.controller.read(cx);
-        let conn = ctl.library.store().conn();
-
         let label = if let Some(visual) = &ctl.visual_results {
             format!(
                 "{} · {}",
@@ -144,15 +141,15 @@ impl WorkspacePanel {
         } else if ctl.showing_recent {
             rust_i18n::t!("app.recent_viewed").to_string()
         } else if let Some(sid) = ctl.active_smart
-            && let Ok(Some(sc)) = smart_collections::get(conn, sid)
+            && let Ok(Some(sc)) = ctl.library.get_smart_collection(sid)
         {
             sc.name
         } else if let Some(cid) = ctl.current_collection
-            && let Ok(Some(c)) = collections::get(conn, cid)
+            && let Ok(Some(c)) = ctl.library.collection(cid)
         {
             match c
                 .parent_id
-                .and_then(|pid| collections::get(conn, pid).ok().flatten())
+                .and_then(|pid| ctl.library.collection(pid).ok().flatten())
             {
                 Some(p) => format!("{} / {}", p.name, c.name),
                 None => c.name,

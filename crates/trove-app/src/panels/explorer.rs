@@ -22,7 +22,6 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use trove_core::model::NewCollection;
-use trove_core::store::{collections, smart_collections};
 use uuid::Uuid;
 
 use crate::library::LibraryController;
@@ -59,7 +58,7 @@ const HEADER_ACTION_PAD: f32 = 8.;
 
 /// Live (non-trashed) entry count of the recently-viewed history.
 fn recent_count(ctl: &LibraryController) -> u64 {
-    trove_core::store::view_history::live_count(ctl.library.store().conn()).unwrap_or(0)
+    ctl.library.viewed_count().unwrap_or(0)
 }
 
 // ============================================================================
@@ -146,9 +145,7 @@ fn nest_order(entries: &[(Uuid, Option<Uuid>)]) -> Vec<(usize, usize)> {
 
 /// Flatten the saved searches into indented rows.
 fn flat_smart_rows(ctl: &LibraryController) -> Vec<SmartRow> {
-    let conn = ctl.library.store().conn();
-    let text_index = ctl.library.text_index();
-    let all = smart_collections::list(conn).unwrap_or_default();
+    let all = ctl.library.list_smart_collections().unwrap_or_default();
     let entries: Vec<(Uuid, Option<Uuid>)> = all.iter().map(|sc| (sc.id, sc.parent_id)).collect();
 
     nest_order(&entries)
@@ -157,11 +154,7 @@ fn flat_smart_rows(ctl: &LibraryController) -> Vec<SmartRow> {
             let sc = &all[ix];
             let count = trove_core::store::smart::node_from_json(&sc.query)
                 .ok()
-                .and_then(|node| {
-                    trove_core::store::smart::evaluate(conn, Some(text_index), &node, None, 0)
-                        .ok()
-                        .map(|page| page.total)
-                })
+                .and_then(|node| ctl.library.count_smart_rule(&node).ok())
                 .unwrap_or(0);
             SmartRow {
                 id: sc.id,
@@ -194,25 +187,23 @@ struct Snapshot {
 
 impl Snapshot {
     fn take(ctl: &LibraryController) -> Self {
-        let conn = ctl.library.store().conn();
-
         let mut rows: Vec<CollectionRow> = Vec::new();
-        if let Ok(roots) = collections::roots(conn) {
+        if let Ok(roots) = ctl.library.collection_roots() {
             for root in roots {
                 rows.push(CollectionRow {
                     id: root.id,
                     name: root.name.clone(),
                     is_root: true,
-                    count: collections::count_assets(conn, root.id).unwrap_or(0),
+                    count: ctl.library.count_collection_assets(root.id).unwrap_or(0),
                     appearance: root.appearance.clone(),
                 });
-                if let Ok(children) = collections::children_of(conn, Some(root.id)) {
+                if let Ok(children) = ctl.library.collection_children(Some(root.id)) {
                     for child in children {
                         rows.push(CollectionRow {
                             id: child.id,
                             name: child.name.clone(),
                             is_root: false,
-                            count: collections::count_assets(conn, child.id).unwrap_or(0),
+                            count: ctl.library.count_collection_assets(child.id).unwrap_or(0),
                             appearance: child.appearance.clone(),
                         });
                     }
@@ -371,24 +362,24 @@ impl ExplorerPanel {
             EditorMode::Adding { parent } => {
                 let controller = self.controller.clone();
                 controller.update(cx, |ctl, cx| {
-                    let conn = ctl.library.store().conn();
                     // Append at the end of the target level.
                     let position = match parent {
-                        Some(pid) => collections::children_of(conn, Some(pid))
+                        Some(pid) => ctl
+                            .library
+                            .collection_children(Some(pid))
                             .map(|c| c.len() as i64)
                             .unwrap_or(0),
-                        None => collections::roots(conn)
+                        None => ctl
+                            .library
+                            .collection_roots()
                             .map(|r| r.len() as i64)
                             .unwrap_or(0),
                     };
-                    if let Ok(collection) = collections::create(
-                        conn,
-                        &NewCollection {
-                            parent_id: parent,
-                            name,
-                            position,
-                        },
-                    ) {
+                    if let Ok(collection) = ctl.library.create_collection(&NewCollection {
+                        parent_id: parent,
+                        name,
+                        position,
+                    }) {
                         ctl.select_collection(Some(collection.id));
                     }
                     cx.notify();
@@ -417,8 +408,6 @@ impl ExplorerPanel {
     /// fallback.
     fn title_label(&self, cx: &Context<Self>) -> String {
         let ctl = self.controller.read(cx);
-        let conn = ctl.library.store().conn();
-
         if ctl.showing_trash {
             return rust_i18n::t!("app.trash").to_string();
         }
@@ -426,15 +415,15 @@ impl ExplorerPanel {
             return rust_i18n::t!("app.recent_viewed").to_string();
         }
         if let Some(sid) = ctl.active_smart
-            && let Ok(Some(sc)) = smart_collections::get(conn, sid)
+            && let Ok(Some(sc)) = ctl.library.get_smart_collection(sid)
         {
             return sc.name;
         }
         if let Some(cid) = ctl.current_collection
-            && let Ok(Some(c)) = collections::get(conn, cid)
+            && let Ok(Some(c)) = ctl.library.collection(cid)
         {
             if let Some(pid) = c.parent_id
-                && let Ok(Some(p)) = collections::get(conn, pid)
+                && let Ok(Some(p)) = ctl.library.collection(pid)
             {
                 return format!("{} / {}", p.name, c.name);
             }
@@ -635,12 +624,15 @@ impl Render for ExplorerPanel {
                         let dragged = payload.0;
                         if dragged != sid {
                             drop_ctl.update(cx, move |ctl, cx| {
-                                let conn = ctl.library.store().conn();
-                                let target_parent = smart_collections::get(conn, sid)
+                                let target_parent = ctl
+                                    .library
+                                    .get_smart_collection(sid)
                                     .ok()
                                     .flatten()
                                     .and_then(|s| s.parent_id);
-                                let target_pos = smart_collections::list(conn)
+                                let target_pos = ctl
+                                    .library
+                                    .list_smart_collections()
                                     .map(|all| {
                                         all.iter()
                                             .filter(|sc| sc.parent_id == target_parent)
@@ -1016,12 +1008,15 @@ fn move_collection(
     target: Option<Uuid>,
     cx: &mut Context<LibraryController>,
 ) {
-    let conn = ctl.library.store().conn();
     let position = match target {
-        Some(pid) => collections::children_of(conn, Some(pid))
+        Some(pid) => ctl
+            .library
+            .collection_children(Some(pid))
             .map(|c| c.len() as i64)
             .unwrap_or(0),
-        None => collections::roots(conn)
+        None => ctl
+            .library
+            .collection_roots()
             .map(|r| r.len() as i64)
             .unwrap_or(0),
     };
@@ -1042,8 +1037,9 @@ fn reparent_smart(
     target: Option<Uuid>,
     cx: &mut Context<LibraryController>,
 ) {
-    let conn = ctl.library.store().conn();
-    let position = smart_collections::list(conn)
+    let position = ctl
+        .library
+        .list_smart_collections()
         .map(|all| all.iter().filter(|sc| sc.parent_id == target).count() as i64)
         .unwrap_or(0);
     if let Err(e) = ctl.library.move_smart_collection(dragged, target, position) {
@@ -1147,8 +1143,12 @@ fn smart_menu(
         .item(
             PopupMenuItem::new(rust_i18n::t!("rules.edit_rule").to_string()).on_click(
                 move |_, window, cx| {
-                    let editing = ctl_edit.read(cx).library.store().conn();
-                    let editing = smart_collections::get(editing, id).ok().flatten();
+                    let editing = ctl_edit
+                        .read(cx)
+                        .library
+                        .get_smart_collection(id)
+                        .ok()
+                        .flatten();
                     crate::dialogs::rules::open_rule_editor(
                         window,
                         cx,

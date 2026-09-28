@@ -700,13 +700,16 @@ pub(crate) enum Target {
 
 impl Target {
     fn stored(&self, ctl: &LibraryController) -> Option<Appearance> {
-        let conn = ctl.library.store().conn();
         match self {
-            Self::Collection(id) => trove_core::store::collections::get(conn, *id)
+            Self::Collection(id) => ctl
+                .library
+                .collection(*id)
                 .ok()
                 .flatten()
                 .map(|found| found.appearance),
-            Self::Smart(id) => trove_core::store::smart_collections::get(conn, *id)
+            Self::Smart(id) => ctl
+                .library
+                .get_smart_collection(*id)
                 .ok()
                 .flatten()
                 .map(|found| found.appearance),
@@ -718,14 +721,9 @@ impl Target {
         ctl: &LibraryController,
         appearance: &Appearance,
     ) -> Result<(), String> {
-        let conn = ctl.library.store().conn();
         let wrote = match self {
-            Self::Collection(id) => {
-                trove_core::store::collections::set_appearance(conn, *id, appearance)
-            }
-            Self::Smart(id) => {
-                trove_core::store::smart_collections::set_appearance(conn, *id, appearance)
-            }
+            Self::Collection(id) => ctl.library.set_collection_appearance(*id, appearance),
+            Self::Smart(id) => ctl.library.set_smart_collection_appearance(*id, appearance),
         };
         wrote.map_err(|error| error.to_string())
     }

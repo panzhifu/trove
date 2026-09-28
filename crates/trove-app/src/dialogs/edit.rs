@@ -24,7 +24,6 @@ use gpui_kit::*;
 
 use trove_core::media::edit::ImageEdit;
 use trove_core::model::{Asset, AssetKind, Origin};
-use trove_core::store::assets;
 
 use crate::components::controls::{self, muted_label};
 use crate::library::LibraryController;
@@ -180,8 +179,10 @@ impl EditDialog {
     /// selection holds nothing this can act on.
     pub fn open(window: &mut Window, cx: &mut App, controller: Entity<LibraryController>) {
         let selection = controller.read(cx).selected_assets.clone();
-        let conn = controller.read(cx).library.store().conn();
-        let images = assets::by_ids(conn, &selection)
+        let images = controller
+            .read(cx)
+            .library
+            .assets_by_ids(&selection)
             .map(live_images)
             .unwrap_or_default();
         Self::open_batch(window, cx, controller, images);
@@ -195,8 +196,10 @@ impl EditDialog {
         controller: Entity<LibraryController>,
         id: uuid::Uuid,
     ) {
-        let conn = controller.read(cx).library.store().conn();
-        let images = assets::by_ids(conn, &[id])
+        let images = controller
+            .read(cx)
+            .library
+            .assets_by_ids(&[id])
             .map(live_images)
             .unwrap_or_default();
         Self::open_batch(window, cx, controller, images);

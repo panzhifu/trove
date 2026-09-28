@@ -11,7 +11,6 @@ use uuid::Uuid;
 use crate::library::LibraryController;
 use crate::panels::workspace_search::open_image_search;
 use trove_core::model::{AssetKind, AssetPatch, UsageStatus};
-use trove_core::store::{assets, collections};
 
 use super::open_with_apps::discover_apps;
 use super::purge_gated;
@@ -29,37 +28,38 @@ pub(crate) fn asset_context_menu(
         return trash_menu(menu, controller, asset_id);
     }
 
-    let conn = controller.read(cx).library.store().conn();
-    let (favorite, current_status, current_clearance, is_image, font_file) =
-        assets::get(conn, asset_id)
-            .ok()
-            .flatten()
-            .map(|a| {
-                let font_file = if a.kind == AssetKind::Font {
-                    a.content_hash.clone().map(|hash| {
-                        // Same blob resolution the Inspector uses: the stored
-                        // blob, or the linked original for linked fonts.
-                        let blob = if a.origin == trove_core::model::Origin::Linked {
-                            a.facts.source_path.as_ref().map(PathBuf::from)
-                        } else {
-                            a.rel_path
-                                .as_ref()
-                                .map(|rel| controller.read(cx).library.root().join(rel))
-                        };
-                        (hash, blob)
-                    })
-                } else {
-                    None
-                };
-                (
-                    a.is_favorite,
-                    a.usage_status,
-                    a.commercial_use,
-                    a.kind == AssetKind::Image,
-                    font_file,
-                )
-            })
-            .unwrap_or((false, UsageStatus::Unused, None, false, None));
+    let (favorite, current_status, current_clearance, is_image, font_file) = controller
+        .read(cx)
+        .library
+        .asset(asset_id)
+        .ok()
+        .flatten()
+        .map(|a| {
+            let font_file = if a.kind == AssetKind::Font {
+                a.content_hash.clone().map(|hash| {
+                    // Same blob resolution the Inspector uses: the stored
+                    // blob, or the linked original for linked fonts.
+                    let blob = if a.origin == trove_core::model::Origin::Linked {
+                        a.facts.source_path.as_ref().map(PathBuf::from)
+                    } else {
+                        a.rel_path
+                            .as_ref()
+                            .map(|rel| controller.read(cx).library.root().join(rel))
+                    };
+                    (hash, blob)
+                })
+            } else {
+                None
+            };
+            (
+                a.is_favorite,
+                a.usage_status,
+                a.commercial_use,
+                a.kind == AssetKind::Image,
+                font_file,
+            )
+        })
+        .unwrap_or((false, UsageStatus::Unused, None, false, None));
     let browsed_collection = controller.read(cx).current_collection;
 
     let ctl_build = controller.clone();
@@ -85,18 +85,15 @@ pub(crate) fn asset_context_menu(
 
     let disk_path = {
         let ctl = controller.read(cx);
-        assets::get(ctl.library.store().conn(), asset_id)
-            .ok()
-            .flatten()
-            .and_then(|a| {
-                // Linked files keep their original path in `source_path`;
-                // stored ones live under the library's `rel_path`.
-                if a.origin == trove_core::model::Origin::Linked {
-                    a.facts.source_path.as_ref().map(PathBuf::from)
-                } else {
-                    a.rel_path.as_ref().map(|rel| ctl.library.root().join(rel))
-                }
-            })
+        ctl.library.asset(asset_id).ok().flatten().and_then(|a| {
+            // Linked files keep their original path in `source_path`;
+            // stored ones live under the library's `rel_path`.
+            if a.origin == trove_core::model::Origin::Linked {
+                a.facts.source_path.as_ref().map(PathBuf::from)
+            } else {
+                a.rel_path.as_ref().map(|rel| ctl.library.root().join(rel))
+            }
+        })
     };
 
     let mut menu = menu
@@ -480,12 +477,15 @@ fn build_collection_submenu(
     asset_id: Uuid,
     cx: &mut Context<PopupMenu>,
 ) -> PopupMenu {
-    let conn = controller.read(cx).library.store().conn();
     let mut items: Vec<(Uuid, String)> = Vec::new();
-    if let Ok(roots) = collections::roots(conn) {
+    if let Ok(roots) = controller.read(cx).library.collection_roots() {
         for root in roots {
             items.push((root.id, root.name.clone()));
-            if let Ok(children) = collections::children_of(conn, Some(root.id)) {
+            if let Ok(children) = controller
+                .read(cx)
+                .library
+                .collection_children(Some(root.id))
+            {
                 for child in children {
                     items.push((child.id, child.name.clone()));
                 }

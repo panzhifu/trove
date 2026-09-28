@@ -19,6 +19,18 @@ use trove_core::model::{
     Asset, AssetKind, AssetPatch, AssetQuery, NewTag, Orientation, Origin, UsageStatus,
 };
 use trove_core::store::{assets, tags};
+
+/// A connection of this benchmark's own to the library's database.
+///
+/// The store's handle is private to the crate, and it should stay that way: one
+/// `&Connection` shared across layers is what let any caller write anywhere.
+/// WAL supports a second reader/writer over the same file, which is what a
+/// harness that issues raw SQL — inserts, queue drains, row counts — actually
+/// wants, since it then measures the same file the app writes.
+fn raw_conn(db: &std::path::Path) -> rusqlite::Connection {
+    rusqlite::Connection::open(db).expect("open the library database")
+}
+
 use uuid::Uuid;
 
 fn asset(name: &str, ext: &str, kind: AssetKind, title: Option<&str>, desc: Option<&str>) -> Asset {
@@ -118,7 +130,7 @@ struct Fixture {
 }
 
 fn build(lib: &Library) -> Fixture {
-    let conn = lib.store().conn();
+    let conn = &raw_conn(&lib.db_path());
 
     let mut photo = asset(
         "sunset-beach.jpg",
@@ -236,7 +248,7 @@ fn micro(n: usize) {
     insert_tx(&lib, n);
     line("insert rows, 1 transaction", t.elapsed());
 
-    let conn = lib.store().conn();
+    let conn = &raw_conn(&lib.db_path());
     let ids = asset_ids(conn);
     assert_eq!(ids.len(), n);
     assert_eq!(queue_len(conn), n as i64, "one insert == one queued row");
@@ -285,7 +297,7 @@ fn micro(n: usize) {
     roots.push(root.clone());
     let lib = Library::open(&root, root.join("cache")).unwrap();
     insert_tx(&lib, n);
-    let conn = lib.store().conn();
+    let conn = &raw_conn(&lib.db_path());
     let t = Instant::now();
     for id in asset_ids(conn) {
         lib.text_index()
@@ -305,9 +317,9 @@ fn micro(n: usize) {
         let lib = Library::open(&root, root.join("cache")).unwrap();
         insert_tx(&lib, n);
         let t = Instant::now();
-        drain_row_by_row(lib.store().conn(), lib.text_index()).unwrap();
+        drain_row_by_row(&raw_conn(&lib.db_path()), lib.text_index()).unwrap();
         line("drain [before, per-row DELETE]", t.elapsed());
-        assert_eq!(queue_len(lib.store().conn()), 0);
+        assert_eq!(queue_len(&raw_conn(&lib.db_path())), 0);
         before_docs = Some(lib.text_index().num_docs());
         drop(lib);
     }
@@ -318,9 +330,9 @@ fn micro(n: usize) {
     let lib = Library::open(&root, root.join("cache")).unwrap();
     insert_tx(&lib, n);
     let t = Instant::now();
-    trove_core::search::drain(lib.store().conn(), lib.text_index()).unwrap();
+    trove_core::search::drain(&raw_conn(&lib.db_path()), lib.text_index()).unwrap();
     line("drain [after, batched DELETE]", t.elapsed());
-    assert_eq!(queue_len(lib.store().conn()), 0);
+    assert_eq!(queue_len(&raw_conn(&lib.db_path())), 0);
     let docs = lib.text_index().num_docs();
     drop(lib);
 
@@ -336,9 +348,9 @@ fn micro(n: usize) {
         let lib = Library::open(&root, root.join("cache")).unwrap();
         insert_tx(&lib, n);
         let t = Instant::now();
-        drain_batched(lib.store().conn(), lib.text_index(), batch).unwrap();
+        drain_batched(&raw_conn(&lib.db_path()), lib.text_index(), batch).unwrap();
         line(&format!("drain, batch={batch}"), t.elapsed());
-        assert_eq!(queue_len(lib.store().conn()), 0);
+        assert_eq!(queue_len(&raw_conn(&lib.db_path())), 0);
         assert_eq!(lib.text_index().num_docs(), docs);
         drop(lib);
     }
@@ -357,7 +369,7 @@ fn micro(n: usize) {
 /// Insert `n` synthetic assets inside one transaction (the autocommit path is
 /// measured separately).
 fn insert_tx(lib: &Library, n: usize) {
-    let conn = lib.store().conn();
+    let conn = &raw_conn(&lib.db_path());
     conn.execute_batch("BEGIN").unwrap();
     insert_rows(lib, n, 0);
     conn.execute_batch("COMMIT").unwrap();
@@ -515,7 +527,7 @@ fn drain_row_by_row(
 }
 
 fn insert_rows(lib: &Library, n: usize, offset: usize) {
-    let conn = lib.store().conn();
+    let conn = &raw_conn(&lib.db_path());
     for i in 0..n {
         let idx = i + offset;
         let name = if idx.is_multiple_of(7) {
@@ -629,7 +641,7 @@ fn profile(n: usize) {
     //
     // Each candidate below re-runs the same intersection with the same real
     // condition, so the plans and timings are directly comparable.
-    let conn = lib.store().conn();
+    let conn = &raw_conn(&lib.db_path());
     let ids = lib
         .text_index()
         .search("sunset", trove_core::search::CANDIDATE_CAP)
@@ -1519,29 +1531,29 @@ fn smoke() {
 
     // --- mutation stays in sync (outbox triggers + drain) -------------------
     r.section("mutations stay in sync");
-    assets::set_trashed(lib.store().conn(), fx.photo, true).unwrap();
+    assets::set_trashed(&raw_conn(&lib.db_path()), fx.photo, true).unwrap();
     r.check(
         r#""sunset" after trashing the photo"#,
         hits(&lib, "sunset"),
         1,
     );
-    assets::set_trashed(lib.store().conn(), fx.photo, false).unwrap();
+    assets::set_trashed(&raw_conn(&lib.db_path()), fx.photo, false).unwrap();
     r.check(r#""sunset" after restore"#, hits(&lib, "sunset"), 2);
 
-    tags::rename(lib.store().conn(), fx.tag_landscape, "seaside").unwrap();
+    tags::rename(&raw_conn(&lib.db_path()), fx.tag_landscape, "seaside").unwrap();
     r.check(
         r#""landscape" after tag rename"#,
         hits(&lib, "landscape"),
         0,
     );
     r.check(r#""seaside" after tag rename"#, hits(&lib, "seaside"), 1);
-    tags::rename(lib.store().conn(), fx.tag_landscape, "landscape").unwrap();
+    tags::rename(&raw_conn(&lib.db_path()), fx.tag_landscape, "landscape").unwrap();
 
     let retitle = AssetPatch {
         title: Some(Some("Replaced keyword".into())),
         ..Default::default()
     };
-    assets::update(lib.store().conn(), fx.scratch, &retitle).unwrap();
+    assets::update(&raw_conn(&lib.db_path()), fx.scratch, &retitle).unwrap();
     r.check(
         r#""ephemeral" gone after retitling"#,
         hits(&lib, "ephemeral"),
@@ -1557,7 +1569,7 @@ fn smoke() {
         title: Some(Some("Winter mountains".into())),
         ..Default::default()
     };
-    assets::update(lib.store().conn(), fx.report, &retitle).unwrap();
+    assets::update(&raw_conn(&lib.db_path()), fx.report, &retitle).unwrap();
     r.check(
         r#""mountains" after title edit"#,
         hits(&lib, "mountains"),
@@ -1572,9 +1584,9 @@ fn smoke() {
         title: Some(None),
         ..Default::default()
     };
-    assets::update(lib.store().conn(), fx.report, &clear).unwrap();
+    assets::update(&raw_conn(&lib.db_path()), fx.report, &clear).unwrap();
 
-    assets::delete(lib.store().conn(), fx.cpp).unwrap();
+    assets::delete(&raw_conn(&lib.db_path()), fx.cpp).unwrap();
     r.check(r#""tips" after purging the doc"#, hits(&lib, "tips"), 0);
 
     // --- persistence --------------------------------------------------------

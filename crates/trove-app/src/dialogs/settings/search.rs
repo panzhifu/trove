@@ -219,26 +219,16 @@ fn backfill_row(controller: Entity<LibraryController>, cx: &mut App) -> Div {
                 });
                 cx.spawn(async move |cx| {
                     // Plan on the main thread (Library is not Send).
-                    let (root, missing): (std::path::PathBuf, Vec<uuid::Uuid>) =
-                        ctl.update(cx, |ctl, _| {
-                            let root = ctl.library.root().to_path_buf();
-                            let missing =
-                                trove_core::store::visual_search::assets_needing_signature(
-                                    ctl.library.store(),
-                                )
-                                .unwrap_or_default();
-                            (root, missing)
-                        });
+                    let missing: Vec<uuid::Uuid> = ctl.update(cx, |ctl, _| {
+                        ctl.library.assets_needing_signature().unwrap_or_default()
+                    });
                     let mut done = 0u64;
                     for id in &missing {
                         let updated = ctl.update(cx, |ctl, _| {
-                            trove_core::store::visual_search::compute_and_store_signature(
-                                ctl.library.store(),
-                                &root,
-                                *id,
-                            )
-                            .map(u64::from)
-                            .unwrap_or(0)
+                            ctl.library
+                                .compute_visual_signature(*id)
+                                .map(u64::from)
+                                .unwrap_or(0)
                         });
                         done += updated;
                         cx.background_executor()

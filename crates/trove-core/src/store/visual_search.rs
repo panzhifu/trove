@@ -147,6 +147,34 @@ pub struct SimilarAsset {
 /// worth showing. The histogram's own scale, not the colour box's.
 const MIN_SIGNATURE_SIMILARITY: f32 = 0.2;
 
+/// [`search_by_image`] against the database at `db_path`, on a connection this
+/// call opens and drops again.
+///
+/// For the caller that cannot borrow the UI thread's store — a background
+/// executor owns no `Rc`, so it needs a connection of its own. Opening it
+/// through `Store::open` applies the same migrations and pragmas as the
+/// library's own connection, which is why this is not a raw `rusqlite::open`.
+pub fn search_by_image_at(
+    db_path: &std::path::Path,
+    query_path: &std::path::Path,
+    limit: Option<u32>,
+) -> Result<Vec<SimilarAsset>> {
+    let store = super::Store::open(db_path)?;
+    search_by_image(store.conn(), query_path, limit)
+}
+
+/// [`search_by_color`] against the database at `db_path`, for the same reason
+/// [`search_by_image_at`] exists.
+pub fn search_by_color_at(
+    db_path: &std::path::Path,
+    hex: &str,
+    similarity: f32,
+    limit: Option<u32>,
+) -> Result<Vec<SimilarAsset>> {
+    let store = super::Store::open(db_path)?;
+    search_by_color(store.conn(), hex, similarity, limit)
+}
+
 /// Find assets visually similar to the given image path.
 ///
 /// Uses the stored pHash + color histogram signatures. Returns up to `limit`

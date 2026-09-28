@@ -36,18 +36,15 @@ impl DuplicateDialog {
                 ctl.duplicates.is_none() && !ctl.duplicates_computing
             };
             if needs_scan {
-                let root = controller.read(cx).library.root().to_path_buf();
+                let db = controller.read(cx).library.db_path();
                 controller.update(cx, |ctl, _| ctl.duplicates_computing = true);
                 let controller = controller.clone();
                 cx.spawn(async move |cx| {
                     let groups = cx
                         .background_executor()
-                        .spawn(async move {
-                            // Store::open creates or checks the schema.
-                            let store =
-                                trove_core::store::Store::open(&root.join("library.db")).ok()?;
-                            trove_core::store::assets::duplicate_groups(store.conn()).ok()
-                        })
+                        .spawn(
+                            async move { trove_core::store::assets::duplicate_groups_at(&db).ok() },
+                        )
                         .await
                         .unwrap_or_default();
                     controller.update(cx, |ctl, cx| {

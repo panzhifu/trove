@@ -11,7 +11,6 @@ use gpui_kit::component::{ActiveTheme, Icon, IconName, Sizable as _};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
-use trove_core::store::tags;
 use uuid::Uuid;
 
 use crate::components::scrollbar;
@@ -103,17 +102,20 @@ impl Render for TagsPanel {
         let counts = match &self.tag_counts {
             Some((cached, counts)) if *cached == generation => counts.clone(),
             _ => {
-                let conn = self.controller.read(cx).library.store().conn();
-                let counts = tags::counts_by_tag(conn).unwrap_or_default();
+                let counts = self
+                    .controller
+                    .read(cx)
+                    .library
+                    .tag_counts()
+                    .unwrap_or_default();
                 self.tag_counts = Some((generation, counts.clone()));
                 counts
             }
         };
 
         let ctl = self.controller.read(cx);
-        let conn = ctl.library.store().conn();
         let active = ctl.active_tag;
-        let all_tags = tags::list(conn).unwrap_or_default();
+        let all_tags = ctl.library.list_tags().unwrap_or_default();
 
         // Build the hierarchy: roots first, children nested under parents
         // (sorted by name at every level).

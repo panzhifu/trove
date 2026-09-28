@@ -51,6 +51,18 @@ use trove_core::model::{
     NewTag, Origin, UsageStatus,
 };
 use trove_core::store::{BrowseContext, assets, collections, tags};
+
+/// A connection of this benchmark's own to the library's database.
+///
+/// The store's handle is private to the crate, and it should stay that way: one
+/// `&Connection` shared across layers is what let any caller write anywhere.
+/// WAL supports a second reader/writer over the same file, which is what a
+/// harness that issues raw SQL — inserts, queue drains, row counts — actually
+/// wants, since it then measures the same file the app writes.
+fn raw_conn(db: &std::path::Path) -> rusqlite::Connection {
+    rusqlite::Connection::open(db).expect("open the library database")
+}
+
 use trove_core::tasks::import::{ImportOptions, ImportSource};
 use trove_core::tasks::{TaskKind, TaskManager};
 use uuid::Uuid;
@@ -247,7 +259,7 @@ fn run_query(
     drop(probe_lib);
 
     let lib = Library::open(&root, &cache).unwrap();
-    let conn = lib.store().conn();
+    let conn = &raw_conn(&lib.db_path());
     let text = lib.text_index();
     let total = count_rows(&lib);
 
@@ -798,7 +810,7 @@ fn build_mirror(
     let mut collection_map: HashMap<Uuid, Uuid> = HashMap::new();
     let mut tag_map: HashMap<Uuid, Uuid> = HashMap::new();
     {
-        let conn = lib.store().conn();
+        let conn = &raw_conn(&lib.db_path());
         for (id, name, position) in triples(
             &src,
             "SELECT collection_id, name, position FROM collections ORDER BY position",
@@ -832,7 +844,7 @@ fn build_mirror(
     let t = Instant::now();
     let mut mirrored = 0usize;
     {
-        let conn = lib.store().conn();
+        let conn = &raw_conn(&lib.db_path());
         conn.execute_batch("BEGIN IMMEDIATE").unwrap();
         let mut stmt = src
             .prepare(
@@ -926,7 +938,7 @@ fn build_mirror(
 
     let t = Instant::now();
     {
-        let conn = lib.store().conn();
+        let conn = &raw_conn(&lib.db_path());
         conn.execute_batch("BEGIN IMMEDIATE").unwrap();
         let mut stmt = src
             .prepare("SELECT collection_id, asset_id FROM collection_assets ORDER BY collection_id, position")
@@ -1012,8 +1024,7 @@ fn folder_prefixes(fixture: &Path) -> (String, String) {
 }
 
 fn count_rows(lib: &Library) -> usize {
-    lib.store()
-        .conn()
+    raw_conn(&lib.db_path())
         .query_row("SELECT count(*) FROM assets", [], |r| r.get::<_, i64>(0))
         .unwrap_or(0) as usize
 }

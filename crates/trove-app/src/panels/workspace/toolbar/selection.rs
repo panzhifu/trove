@@ -11,8 +11,6 @@ use gpui_kit::{Anchor, App, Div, Entity};
 
 use std::rc::Rc;
 
-use trove_core::store::{assets, collections};
-
 use super::super::{purge_gated, trash_or_purge_gated};
 use crate::components::controls::icon_button;
 use crate::library::LibraryController;
@@ -30,8 +28,10 @@ pub(crate) fn selection_toolbar(
     let all_favorite = if in_trash {
         false
     } else {
-        let conn = controller.read(cx).library.store().conn();
-        assets::by_ids(conn, &ids)
+        controller
+            .read(cx)
+            .library
+            .assets_by_ids(&ids)
             .map(|list| list.iter().all(|a| a.is_favorite))
             .unwrap_or(false)
     };
@@ -182,12 +182,13 @@ pub(crate) fn selection_toolbar(
                     rust_i18n::t!("workspace.add_to_collection").to_string(),
                 )
                 .dropdown_menu_with_anchor(Anchor::TopLeft, move |menu, _, cx| {
-                    let conn = ctl_add.read(cx).library.store().conn();
                     let mut items: Vec<(Uuid, String)> = Vec::new();
-                    if let Ok(roots) = collections::roots(conn) {
+                    if let Ok(roots) = ctl_add.read(cx).library.collection_roots() {
                         for root in roots {
                             items.push((root.id, root.name.clone()));
-                            if let Ok(children) = collections::children_of(conn, Some(root.id)) {
+                            if let Ok(children) =
+                                ctl_add.read(cx).library.collection_children(Some(root.id))
+                            {
                                 for child in children {
                                     items.push((child.id, child.name.clone()));
                                 }

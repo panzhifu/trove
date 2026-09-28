@@ -315,7 +315,7 @@ pub fn tag(env: &Env, args: &TagArgs) -> Result<Rendered, CliError> {
     if !args.remove.is_empty() {
         // Removing must not create: a typo in `--remove` would otherwise
         // leave behind a brand new empty tag.
-        let all = trove_core::store::tags::list(env.library.store().conn())?;
+        let all = env.library.list_tags()?;
         for name in &args.remove {
             let found = all
                 .iter()
@@ -424,8 +424,6 @@ pub fn purge(env: &Env, args: &PurgeArgs) -> Result<Rendered, CliError> {
 
 /// Collection maintenance.
 pub fn collection(env: &Env, command: &CollectionCommand) -> Result<Rendered, CliError> {
-    use trove_core::store::collections;
-
     match command {
         CollectionCommand::List => crate::read::collections(env),
 
@@ -434,16 +432,12 @@ pub fn collection(env: &Env, command: &CollectionCommand) -> Result<Rendered, Cl
                 Some(raw) => Some(resolve_collection(env, raw)?.id),
                 None => None,
             };
-            let conn = env.library.store().conn();
-            let siblings = collections::children_of(conn, parent_id)?;
-            let created = collections::create(
-                conn,
-                &NewCollection {
-                    parent_id,
-                    name: name.clone(),
-                    position: siblings.len() as i64,
-                },
-            )?;
+            let siblings = env.library.collection_children(parent_id)?;
+            let created = env.library.create_collection(&NewCollection {
+                parent_id,
+                name: name.clone(),
+                position: siblings.len() as i64,
+            })?;
             Ok(Rendered::new(
                 json!({
                     "created": {
@@ -467,7 +461,7 @@ pub fn collection(env: &Env, command: &CollectionCommand) -> Result<Rendered, Cl
 
         CollectionCommand::Rm { collection } => {
             let target = resolve_collection(env, collection)?;
-            collections::delete(env.library.store().conn(), target.id)?;
+            env.library.delete_collection(target.id)?;
             Ok(Rendered::new(
                 json!({ "deleted": { "id": target.id, "name": target.name } }),
                 format!(

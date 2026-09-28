@@ -6,7 +6,7 @@
 use serde_json::{Map, Value, json};
 
 use trove_core::model::{Asset, AssetKind, AssetQuery, Page};
-use trove_core::{paths, search};
+use trove_core::paths;
 
 use crate::cli::{Cli, FilterArgs, GetArgs, ListArgs, SearchArgs};
 use crate::ctx::{
@@ -121,15 +121,13 @@ pub fn paths(args: &Cli) -> Result<Rendered, CliError> {
 /// Counts, sizes and index state — the first thing to ask about a library.
 pub fn info(env: &Env) -> Result<Rendered, CliError> {
     let stats = env.library.stats()?;
-    let conn = env.library.store().conn();
-
     let mut by_kind = Map::new();
     for (kind, count) in &stats.by_kind {
         by_kind.insert(kind_name(*kind), json!(count));
     }
 
     let documents = env.library.text_index().num_docs();
-    let pending = search::pending_count(conn)?;
+    let pending = env.library.pending_index_count()?;
 
     let result = json!({
         "library": {
@@ -200,7 +198,7 @@ pub fn info(env: &Env) -> Result<Rendered, CliError> {
 /// The general listing.
 pub fn list(env: &Env, args: &ListArgs) -> Result<Rendered, CliError> {
     let query = build_query(env, &args.filter)?;
-    let page = trove_core::store::assets::query(env.library.store().conn(), &query)?;
+    let page = env.library.query_assets(&query)?;
     Ok(page_rendered(env, page))
 }
 
@@ -313,12 +311,10 @@ fn page_rendered(env: &Env, page: Page<Asset>) -> Rendered {
 /// The full record of one or more assets.
 pub fn get(env: &Env, args: &GetArgs) -> Result<Rendered, CliError> {
     let ids = parse_asset_ids(&args.ids)?;
-    let conn = env.library.store().conn();
-
     let mut items = Vec::new();
     let mut missing = Vec::new();
     for id in ids {
-        match trove_core::store::assets::get(conn, id)? {
+        match env.library.asset(id)? {
             Some(asset) => items.push(asset_detail(env, &asset)?),
             None => missing.push(id.to_string()),
         }
@@ -404,9 +400,8 @@ pub fn get(env: &Env, args: &GetArgs) -> Result<Rendered, CliError> {
 
 /// Tags with the size of the subtree each one covers.
 pub fn tags(env: &Env) -> Result<Rendered, CliError> {
-    let conn = env.library.store().conn();
-    let all = trove_core::store::tags::list(conn)?;
-    let counts = trove_core::store::tags::counts_by_tag(conn)?;
+    let all = env.library.list_tags()?;
+    let counts = env.library.tag_counts()?;
 
     let items: Vec<Value> = all
         .iter()
@@ -461,9 +456,8 @@ fn appearance_json(appearance: &trove_core::model::Appearance) -> Value {
 
 /// The collection tree, plus smart collections.
 pub fn collections(env: &Env) -> Result<Rendered, CliError> {
-    let conn = env.library.store().conn();
-    let all = trove_core::store::collections::list(conn)?;
-    let smart = trove_core::store::smart_collections::list(conn)?;
+    let all = env.library.list_collections()?;
+    let smart = env.library.list_smart_collections()?;
 
     let mut items = Vec::new();
     for collection in &all {
@@ -472,7 +466,7 @@ pub fn collections(env: &Env) -> Result<Rendered, CliError> {
             "name": collection.name,
             "parent_id": collection.parent_id,
             "position": collection.position,
-            "assets": trove_core::store::collections::count_assets(conn, collection.id)?,
+            "assets": env.library.count_collection_assets(collection.id)?,
             "kind": "collection",
             "appearance": appearance_json(&collection.appearance),
         }));
@@ -494,7 +488,8 @@ pub fn collections(env: &Env) -> Result<Rendered, CliError> {
         .iter()
         .map(|collection| {
             vec![
-                trove_core::store::collections::count_assets(conn, collection.id)
+                env.library
+                    .count_collection_assets(collection.id)
                     .unwrap_or(0)
                     .to_string(),
                 collection.name.clone(),
@@ -578,7 +573,7 @@ pub fn duplicates(env: &Env) -> Result<Rendered, CliError> {
 
 /// The folders this library's files came from.
 pub fn folders(env: &Env) -> Result<Rendered, CliError> {
-    let folders = trove_core::store::assets::source_folders(env.library.store().conn())?;
+    let folders = env.library.source_folders()?;
     let items: Vec<Value> = folders
         .iter()
         .map(|(path, count)| json!({ "path": path, "assets": count }))
@@ -601,10 +596,9 @@ pub fn folders(env: &Env) -> Result<Rendered, CliError> {
 
 /// Check the things that quietly break a library.
 pub fn doctor(env: &Env) -> Result<Rendered, CliError> {
-    let conn = env.library.store().conn();
     let stats = env.library.stats()?;
     let documents = env.library.text_index().num_docs();
-    let pending = search::pending_count(conn)?;
+    let pending = env.library.pending_index_count()?;
     let inbox = trove_core::services::collect::inbox_items().len();
 
     let mut checks: Vec<Value> = Vec::new();
@@ -721,10 +715,9 @@ pub fn doctor(env: &Env) -> Result<Rendered, CliError> {
 
 /// Where the search index stands relative to the database.
 pub fn index_status(env: &Env) -> Result<Rendered, CliError> {
-    let conn = env.library.store().conn();
     let stats = env.library.stats()?;
     let documents = env.library.text_index().num_docs();
-    let pending = search::pending_count(conn)?;
+    let pending = env.library.pending_index_count()?;
     let index_dir = env.cache_root.join("search_index");
 
     let result = json!({

@@ -228,16 +228,26 @@ impl Store {
         Ok(())
     }
 
-    /// Borrow the underlying SQLite connection.
+    /// Borrow the underlying SQLite connection. Crate-internal.
+    ///
+    /// Nothing outside this crate takes it: every caller asks a `Library`
+    /// (crate::library::Library) for the answer it wants, because a shared
+    /// `&Connection` is a write permission on the whole library — with one, a
+    /// panel could change a row without the undo stack, the generation counter
+    /// or the search outbox ever hearing about it.
     ///
     /// # Safety
     ///
     /// The returned reference is valid for the lifetime of `&self`. The
-    /// `RefCell` enforces at runtime that no mutable borrow exists while
-    /// this reference is in use; the UI is single-threaded, so this is
-    /// always satisfied as long as store functions don't recursively call
-    /// back into the store while holding a borrow.
-    pub fn conn(&self) -> &rusqlite::Connection {
+    /// `RefCell` does *not* guard it: handing out the reference never takes a
+    /// borrow flag, so a later `borrow_mut` (see [`Self::transaction`],
+    /// [`Self::apply_upgrade`]) cannot see that one is in circulation. What
+    /// keeps this sound is a convention, not a check — single thread, one
+    /// operation, and no call that could reach back into the store while a
+    /// borrow is held. Break that convention and the result is simultaneous
+    /// shared and mutable access to one `sqlite3` handle: undefined behaviour,
+    /// not a panic, which is exactly why the door is no longer public.
+    pub(crate) fn conn(&self) -> &rusqlite::Connection {
         unsafe { &*self.conn.as_ptr() }
     }
 

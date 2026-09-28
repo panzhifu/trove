@@ -318,9 +318,7 @@ impl SettingsView {
     fn compute_snapshots(controller: &Entity<LibraryController>, cx: &App) -> StatsSnapshot {
         let ctl = controller.read(cx);
         let library = ctl.library.stats().unwrap_or_default();
-        let sig_coverage =
-            trove_core::store::visual_search::signature_counts(ctl.library.store().conn())
-                .unwrap_or((0, 0));
+        let sig_coverage = ctl.library.visual_signature_counts().unwrap_or((0, 0));
         StatsSnapshot {
             library,
             sig_coverage,

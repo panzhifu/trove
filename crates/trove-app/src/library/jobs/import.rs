@@ -135,15 +135,10 @@ fn start_paths_import(
             return false;
         }
         // Fail fast when the target collection does not exist.
-        if let Some(cid) = into_collection {
-            let conn = ctl.library.store().conn();
-            if trove_core::store::collections::get(conn, cid)
-                .ok()
-                .flatten()
-                .is_none()
-            {
-                return false;
-            }
+        if let Some(cid) = into_collection
+            && ctl.library.collection(cid).ok().flatten().is_none()
+        {
+            return false;
         }
         // Count without walking. Progress totals must cover the folder
         // contents, not just the dropped entries, but the walk that counts them

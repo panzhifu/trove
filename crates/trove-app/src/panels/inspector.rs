@@ -16,7 +16,6 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use trove_core::model::{AssetKind, AssetPatch, MAX_RATING, Origin, UsageStatus};
-use trove_core::store::{assets, tags};
 use uuid::Uuid;
 
 use crate::components::preview::{AssetPreviewData, PreviewContext};
@@ -195,8 +194,7 @@ impl InspectorPanel {
         let value: String = input.read(cx).value().trim().to_string();
         let controller = self.controller.clone();
         controller.update(cx, |ctl, cx| {
-            let conn = ctl.library.store().conn();
-            let Some(asset) = assets::get(conn, asset_id).ok().flatten() else {
+            let Some(asset) = ctl.library.asset(asset_id).ok().flatten() else {
                 return;
             };
             let original: Option<String> = match field {
@@ -249,8 +247,11 @@ impl InspectorPanel {
         if self.editing_id == Some(asset_id) {
             return;
         }
-        let conn = self.controller.read(cx).library.store().conn();
-        let (title, description, source) = assets::get(conn, asset_id)
+        let (title, description, source) = self
+            .controller
+            .read(cx)
+            .library
+            .asset(asset_id)
             .ok()
             .flatten()
             .map(|a| {
@@ -317,8 +318,7 @@ impl Render for InspectorPanel {
                 )
                 .into_any_element();
         };
-        let conn = ctl.library.store().conn();
-        let Some(asset) = assets::get(conn, asset_id).ok().flatten() else {
+        let Some(asset) = ctl.library.asset(asset_id).ok().flatten() else {
             return v_flex()
                 .p_3()
                 .child(
@@ -333,7 +333,7 @@ impl Render for InspectorPanel {
         // Everything read from the store happens under the `ctl` borrow,
         // which ends at the last snapshot below; the owned snapshots
         // (and `sync_editors`'s own re-borrow) follow.
-        let asset_tags = tags::for_asset(conn, asset_id).unwrap_or_default();
+        let asset_tags = ctl.library.tags_for_asset(asset_id).unwrap_or_default();
         let dims = asset
             .width
             .zip(asset.height)

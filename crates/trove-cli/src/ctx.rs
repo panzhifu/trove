@@ -247,14 +247,13 @@ pub fn parse_asset_ids(raw: &[String]) -> Result<Vec<Uuid>, CliError> {
 /// is filed under it), and it is the reason this cannot be a plain name
 /// lookup: the caller gets the same set of assets the UI would show.
 pub fn resolve_tags(env: &Env, names: &[String]) -> Result<Vec<Uuid>, CliError> {
-    let conn = env.library.store().conn();
-    let all = trove_core::store::tags::list(conn)?;
+    let all = env.library.list_tags()?;
     let mut ids = Vec::new();
     for raw in names {
         let tag = find_tag(&all, raw).ok_or_else(|| {
             CliError::usage(format!("no tag named '{raw}'; `trove tags` lists them"))
         })?;
-        ids.extend(trove_core::store::tags::subtree_ids(conn, tag.id)?);
+        ids.extend(env.library.tag_subtree_ids(tag.id)?);
     }
     ids.sort_unstable();
     ids.dedup();
@@ -271,7 +270,7 @@ fn find_tag<'a>(all: &'a [Tag], raw: &str) -> Option<&'a Tag> {
 
 /// Resolve a collection by name or UUID.
 pub fn resolve_collection(env: &Env, raw: &str) -> Result<Collection, CliError> {
-    let all = trove_core::store::collections::list(env.library.store().conn())?;
+    let all = env.library.list_collections()?;
     let raw = raw.trim();
     if let Ok(id) = Uuid::parse_str(raw)
         && let Some(found) = all.iter().find(|collection| collection.id == id)
@@ -326,12 +325,15 @@ pub fn asset_summary(env: &Env, asset: &Asset) -> Value {
 /// The full record `get` returns: the stored row, plus the associations that
 /// save a follow-up query (tags and collections by name) and the file path.
 pub fn asset_detail(env: &Env, asset: &Asset) -> Result<Value, CliError> {
-    let conn = env.library.store().conn();
-    let tags: Vec<String> = trove_core::store::tags::for_asset(conn, asset.id)?
+    let tags: Vec<String> = env
+        .library
+        .tags_for_asset(asset.id)?
         .into_iter()
         .map(|tag| tag.name)
         .collect();
-    let collections: Vec<String> = trove_core::store::collections::for_asset(conn, asset.id)?
+    let collections: Vec<String> = env
+        .library
+        .collections_for_asset(asset.id)?
         .into_iter()
         .map(|collection| collection.name)
         .collect();

@@ -32,7 +32,7 @@ use gpui_kit::component::{ActiveTheme, IconName, Sizable};
 use gpui_kit::*;
 
 use trove_core::model::{AssetKind, SmartCollection, SmartCompare, SmartField, SmartNode};
-use trove_core::store::{smart, smart_collections, tags};
+use trove_core::store::smart;
 use uuid::Uuid;
 
 use crate::components::controls::{self, muted_label};
@@ -235,15 +235,13 @@ impl RuleDraft {
         }
         self.evaluated = self.revision;
         let ctl = self.controller.read(cx);
-        let conn = ctl.library.store().conn();
-        let text_index = ctl.library.text_index();
         let outcome = self.build_json(cx).and_then(|json| {
             // The raw serde message is English internals; the localized
             // "invalid rule" label is enough for the live count status.
             let node = smart::node_from_json(&json)
                 .map_err(|_| rust_i18n::t!("rules.match_error").to_string())?;
-            smart::evaluate(conn, Some(text_index), &node, None, 0)
-                .map(|page| page.total)
+            ctl.library
+                .count_smart_rule(&node)
                 .map_err(|e| e.to_string())
         });
         match outcome {
@@ -446,8 +444,10 @@ pub fn open_rule_editor(
         None => (true, Vec::new()),
     };
     let tag_names = {
-        let conn = controller.read(cx).library.store().conn();
-        tags::list(conn)
+        controller
+            .read(cx)
+            .library
+            .list_tags()
             .map(|list| list.into_iter().map(|t| t.name).collect())
             .unwrap_or_default()
     };
@@ -525,15 +525,22 @@ fn save_draft(draft: &Entity<RuleDraft>, cx: &mut App) -> bool {
     };
 
     let outcome = draft.update(cx, |d, cx| {
-        let conn = d.controller.read(cx).library.store().conn();
         match d.editing {
-            Some(id) => smart_collections::update_query(conn, id, &json)
+            Some(id) => d
+                .controller
+                .read(cx)
+                .library
+                .set_smart_collection_query(id, &json)
                 .map(|_| id)
                 .map_err(|e| e.to_string()),
             None => {
                 // Appended after its siblings, which share one ordering
                 // space per parent.
-                let position = smart_collections::list(conn)
+                let position = d
+                    .controller
+                    .read(cx)
+                    .library
+                    .list_smart_collections()
                     .map(|all| all.iter().filter(|sc| sc.parent_id == d.parent).count())
                     .unwrap_or(0) as i64;
                 let input = trove_core::model::NewSmartCollection {
@@ -542,11 +549,13 @@ fn save_draft(draft: &Entity<RuleDraft>, cx: &mut App) -> bool {
                     query: json,
                     position,
                 };
-                // Name checks live in the model; the condition tree is
-                // validated where it compiles (store::smart).
-                input.validate().map_err(|e| e.to_string())?;
-                trove_core::store::smart::validate_json(&input.query).map_err(|e| e.to_string())?;
-                smart_collections::create(conn, &input)
+                // The facade validates both halves of the input — the name in
+                // the model, the condition tree where it compiles — so the
+                // dialog does not repeat it.
+                d.controller
+                    .read(cx)
+                    .library
+                    .create_smart_collection(&input)
                     .map(|created| created.id)
                     .map_err(|e| e.to_string())
             }

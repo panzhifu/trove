@@ -23,12 +23,9 @@ pub(crate) fn open_image_search(
     // Resolve the query image + asset.
     let (query_path, title) = {
         let ctl = controller.read(cx);
-        let conn = ctl.library.store().conn();
         let library_root = ctl.library.root().to_path_buf();
         let cache_root = ctl.library.cache().to_path_buf();
-        let asset = trove_core::store::assets::get(conn, asset_id)
-            .ok()
-            .flatten();
+        let asset = ctl.library.asset(asset_id).ok().flatten();
         let Some(asset) = asset else { return };
         if asset.kind != trove_core::model::AssetKind::Image {
             return;
@@ -52,7 +49,7 @@ pub(crate) fn open_image_search(
 
     let db_path = {
         let ctl = controller.read(cx);
-        ctl.library.root().join("library.db")
+        ctl.library.db_path()
     };
     let handle = window.window_handle();
     let mode_label = rust_i18n::t!("settings.search_mode_visual").to_string();
@@ -83,7 +80,7 @@ pub(crate) fn open_color_search(
 ) {
     let (db_path, similarity) = {
         let ctl = controller.read(cx);
-        (ctl.library.root().join("library.db"), ctl.colour_similarity)
+        (ctl.library.db_path(), ctl.colour_similarity)
     };
     let handle = window.window_handle();
     let mode_label = rust_i18n::t!("workspace.color_search").to_string();
@@ -113,11 +110,11 @@ pub(crate) fn open_color_search(
 /// Runs on the background executor: it decodes the query and reads every
 /// stored visual signature.
 fn visual_search(db_path: &Path, query_path: &Path) -> Vec<(Uuid, f32)> {
-    let Ok(store) = trove_core::store::Store::open(db_path) else {
-        return Vec::new();
-    };
-    trove_core::store::visual_search::search_by_image(store.conn(), query_path, Some(50))
-        .unwrap_or_default()
+    trove_core::store::visual_search::search_by_image_at(db_path, query_path, Some(50))
+        .unwrap_or_else(|error| {
+            tracing::warn!(%error, "a reverse image search answered nothing");
+            Vec::new()
+        })
         .into_iter()
         .map(|r| (r.asset.id, r.score))
         .collect()
@@ -125,11 +122,11 @@ fn visual_search(db_path: &Path, query_path: &Path) -> Vec<(Uuid, f32)> {
 
 /// Search images whose palette contains a colour close to `hex`.
 fn color_search(db_path: &Path, hex: &str, similarity: f32) -> Vec<(Uuid, f32)> {
-    let Ok(store) = trove_core::store::Store::open(db_path) else {
-        return Vec::new();
-    };
-    trove_core::store::visual_search::search_by_color(store.conn(), hex, similarity, Some(50))
-        .unwrap_or_default()
+    trove_core::store::visual_search::search_by_color_at(db_path, hex, similarity, Some(50))
+        .unwrap_or_else(|error| {
+            tracing::warn!(%error, "a colour search answered nothing");
+            Vec::new()
+        })
         .into_iter()
         .map(|r| (r.asset.id, r.score))
         .collect()

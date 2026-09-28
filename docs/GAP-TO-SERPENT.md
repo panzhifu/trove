@@ -5,7 +5,7 @@
 > **本轮（09-28）只有 Trove 动了，Serpent 一格没变**：上游仓库仍停在 **v0.2.9**，`src/` 仍是 **849 文件 / 258,255 行**、`MIGRATIONS` 仍是 32 段、末条 `version: 56`，与 09-27 那次复核逐字相同。所以 §2026-09-27 复核 那张表**不需要重审 Serpent 侧**，只需要把 Trove 这一轮的工作树改动记进去——记在 **§2026-09-28 复核** 那一节，并且**就地改掉了那一节里三行的状态**（音频卡片、检查器逗号输入标签、以及纵深索引升到的第 4、5 版）。Trove 这一轮动了什么、其中两件事**只做了一半就说自己做完了**，全部记在那一节里。
 >
 > **上一轮（09-27）两边都动了**：Trove 发了 **v0.4.9**（模型材质与共享 GPU 渲染器那一轮、智能集合同级拖拽重排、预览里方向键换素材、以及**卡片"活过来"的触发从指针定住改成按空格**——见 §C 的活卡片行与 [PREVIEW-SYSTEM.md](./PREVIEW-SYSTEM.md)），Serpent 从 v0.2.6 走到 v0.2.9。后者的增量单独成节，见 **§2026-09-27 复核**。
-> 核验日期 **2026-09-28**（同一天连做七轮，见 §2026-09-28 复核 与 第二~第七轮；更早是 09-27 / 09-25 / 09-24 / 09-23）。两边的数字都取自源码而非各自文档：Serpent `src/` **849 文件 / 258,255 行** `.ts`+`.tsx`（与 09-27 逐字相同），**schema 仍是 v56 一格没加**——`MIGRATIONS` 32 段、末条 `version: 56`，`SUPPORTED_SCHEMA_VERSION = MIGRATIONS.at(-1)!.version`。Trove `crates/` **228 文件 / 115,058 行** `.rs`（第四轮加 `media/anim.rs`、第六轮加 `preview/anim.rs`）（09-27 记的是 224 / 110,221）。schema **v21**——v19 加了序列帧两张侧表、v20 加了 `source_path` 虚拟列与索引、**v21 加了 `task_journal` 一张表**；`INDEX_VERSION` 从 09-27 的 3 走到 **5**（见 §D 纵深索引行）；包版本 **0.4.9**（本轮未 bump）；`en.toml` **798** 个叶子键；测试 **804 core + 74 app = 878** 全绿 3 ignored，`cargo test --workspace --all-targets` 实跑，`cargo fmt --all -- --check` 与 `cargo clippy --workspace --all-targets -- -D warnings` 两道门同轮一起过。
+> 核验日期 **2026-09-28**（同一天连做八轮，见 §2026-09-28 复核 与 第二~第八轮；更早是 09-27 / 09-25 / 09-24 / 09-23）。两边的数字都取自源码而非各自文档：Serpent `src/` **849 文件 / 258,255 行** `.ts`+`.tsx`（与 09-27 逐字相同），**schema 仍是 v56 一格没加**——`MIGRATIONS` 32 段、末条 `version: 56`，`SUPPORTED_SCHEMA_VERSION = MIGRATIONS.at(-1)!.version`。Trove `crates/` **228 文件 / 115,346 行** `.rs`（第四轮加 `media/anim.rs`、第六轮加 `preview/anim.rs`）（09-27 记的是 224 / 110,221）。schema **v21**——v19 加了序列帧两张侧表、v20 加了 `source_path` 虚拟列与索引、**v21 加了 `task_journal` 一张表**；`INDEX_VERSION` 从 09-27 的 3 走到 **5**（见 §D 纵深索引行）；包版本 **0.4.9**（本轮未 bump）；`en.toml` **798** 个叶子键；测试 **804 core + 74 app = 878** 全绿 3 ignored，`cargo test --workspace --all-targets` 实跑，`cargo fmt --all -- --check` 与 `cargo clippy --workspace --all-targets -- -D warnings` 两道门同轮一起过。
 >
 > **09-27 那一轮把上上轮三处"确认缺失"推翻了两处**，都是同一个失败模式——按 Serpent 的实现符号去 grep（`CF_HDROP`、`xdnd`、`file_drop`），命中零就记成"没有"，而没有按**能力**去问（"能不能把文件拖出窗口"）：
 > ① **原生文件拖出早就有**（`2026-09-12` 的 `ce6a29d` 起，`panels/workspace/cells.rs:199-215` 网格格、`:494-510` 列表行，见 §A。上一版这里写的 `:192`、`:406` 已经漂走，本轮重数过）；
@@ -244,6 +244,26 @@ Serpent 侧依旧一格没动。这一轮收 §2026-09-27 复核 里那条 S 级
 > P1..P6 的排序、半径和门禁见本节末尾的"数据结构计划"卡片，下一轮直接从 P1 开始：**P1** `Store::conn()` 收 `pub(crate)`，63 处（app 49 / cli 14，散在 23 个 app 文件）改走门面，预计给 `Library` 补 15–25 个方法，那个 unsafe 从公开 API 的前提退成内部细节；**P2** `enum AssetLocation { Stored{rel_path}, Placeholder, Linked{source_path} }`（schema 不动，23 处 `Asset {}` 字面量全在 core、app 0 处）；**P3** `enum Placement { Live, Trashed(DateTime) }` 收掉 `trashed_at`(76)/`is_trashed`(24)/`in_trash`(20) 三种写法与 ≥9 处手写 `trashed_at IS NULL`；**P4** `Rating`/`ContentHash` + 补 SQL CHECK（配 v21→v22，顺带补上一直缺的迁移测试）+ `parse_kind` 改成降级那一行并报告；**P5** 智能集规则 `query: Json` → `SmartNode`（半径 core 24 + app 27，会碰规则编辑器）；**P6** `ai_analysis` 走 v21→v22 DROP。**明确不做**：Repository trait/mock、三层包重命名、把 129 个 `media/` 值对象卷进来、用 `Patch<T>` 泛型替换 6 个 `Option<Option<_>>`（CLI 5 处依赖具体形状）、给 `mime`/`ext` 造 newtype。
 
 **没验的**：面板那条警告条的实际外观与措辞长度（GPUI 窗口在这里跑不起来）；`journal_write` 的 poisoned-lock 分支只有代码路径、没有测试（构造不出毒化的 journal 锁）。
+
+---
+
+## 2026-09-28 第八轮：P1 关门——`&Connection` 不再是公开能力
+
+**做了什么**：`Store::conn()`（store/mod.rs:240）与 `Library::store()` 降为 `pub(crate)`。改动顺序是"先看见再改"：翻掉可见性 → 编译器一次性点出 **64 个**越界点（app 49 / cli 14，散在 23 个文件）→ 逐个改成一次门面调用 → 再翻回来验证门真的关上了（现在 `grep -rn "library.store()" crates/trove-app crates/trove-cli` 是 0）。为此 `Library` 长到 **111 个 `pub fn` / 4,088 行**（原 78 / 3,841）——这是上一轮拍板的取舍：门只有一扇，方法名是领域动词，比一把万能钥匙安全。
+
+**顺带纠正的那条注释**：`Store::conn()` 原来的 `# Safety` 写着"RefCell 会在运行时保证没有可变借用存在"——**这句话不成立**，发引用时从不取借用标志，所以后来的 `borrow_mut`（:191/:213/:257）看不见它。注释现在说的是事实：真正撑着它的是"单线程、一次操作、持借用不回进 store"这条约定，违反约定的后果是同一个 `sqlite3` 句柄上并存 `&` 与 `&mut`（UB，不是 panic），而这正是门不再公开的理由。`unsafe` 本身留着——按上一轮的决定，它的影响面已经从"任何一层"缩到"一个模块"。
+
+**两处诚实的第二连接**：`assets::duplicate_groups_at(db_path)` 与 `visual_search::search_by_image_at` / `search_by_color_at`——路径进、连接自己开自己丢，替掉原来"example/对话框借道 store 拿引用"的做法。同时新增 `Library::db_path()`，因为 `"library.db"` 这个名字原先在 app 里手拼了 4 处（`workspace_search.rs:52/83`、`settings/files.rs:680`、`duplicates.rs`）；库的文件布局不该是调用方的常识。
+
+**必须点名的行为变化（性能工具）**：5 个 `crates/trove-core/examples/*` 原先借 `lib.store().conn()` 跑裸 SQL，现在各自 `rusqlite::Connection::open(lib.db_path())`。**含义**：bench 测的是同一文件上的**另一个连接**（WAL 允许），不再是应用自己那条。语句、schema、pragmas 都一样（都经 `Store::open` 建过 schema），但连接级的语句缓存与 busy 语义不再同源。`PERF-VS-SERPENT.md` 里那些数字因此应当在下一轮重跑后再引用。
+
+**承诺"逐条报"的合并，一共三条，只做了两条**：① `dialogs/rules.rs` 保存路径去掉两次显式校验——`create_smart_collection` 内部本来就是同一顺序做这两步（`input.validate()` 然后 `smart::validate_json`），dialog 是在重复门面的事；② `settings/search.rs` 的签名回填不再把 `root: PathBuf` 带进 worker（`Library::compute_visual_signature(id)` 知道自己的 root）。③ `panels/common.rs` 的 `live_count` / `trash_count` 我**没有**合并：它们现在是 `query_assets(...).total`，换成 `assets::count(...)` 数字相同但查询从"分页 SELECT"变成"COUNT(*)"——这是一次性能改动而非改名，留到 P3 一起决定。
+
+**本轮实测到的第 N 个"写好了没人调"**：`Library::evaluate_smart_collection`（library.rs:1046）除定义外**零调用方**——app、cli、测试全无。explorer 要的是徽标计数，用的是新加的 `count_smart_rule`。它 `pub`，所以 dead-code 门拦不住它。要么 P5 让规则编辑器真正用它，要么删。
+
+**门**：878 测全绿（本轮**没有新增测试**——可见性变更的证据形式不是红测试，而是"把可见性翻回去就得到 64 个编译错误"），`clippy -D warnings` 与 `fmt` 同轮过；`cargo doc` 的断链 10 条**全部先前已有**（我今天新引入的两条已修）。
+
+**没验的，说清楚**：本轮正确性靠的是"每个调用点换成同样一次查询、同样的错误处理"这一机械性质加上编译器，**没有任何一条测试覆盖"面板渲染出同样的数字"**——804+74 个测试里没有一个 UI 渲染断言。也就是说，如果我在某个调用点把 `unwrap_or(0)` 的时机挪错了位置，测试不会响。要复核就看侧栏计数、标签面板数字、文件夹列表和筛选器下拉这四块与改动前是否一致。
 
 ---
 

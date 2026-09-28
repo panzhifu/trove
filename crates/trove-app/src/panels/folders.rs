@@ -11,8 +11,6 @@ use gpui_kit::component::{ActiveTheme, Icon, IconName};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
-use trove_core::store::assets::source_folders;
-
 use crate::components::controls::muted_label;
 use crate::components::scrollbar;
 use crate::library::LibraryController;
@@ -110,8 +108,12 @@ impl Render for FoldersPanel {
         // folders exist.
         let generation = self.controller.read(cx).generation;
         if self.folders.as_ref().map(|(cached, _)| *cached) != Some(generation) {
-            let conn = self.controller.read(cx).library.store().conn();
-            let rows = source_folders(conn).unwrap_or_default();
+            let rows = self
+                .controller
+                .read(cx)
+                .library
+                .source_folders()
+                .unwrap_or_default();
             self.folders = Some((generation, rows));
         }
         let folders: &[(String, u64)] = match &self.folders {

@@ -532,6 +532,19 @@ pub struct DuplicateGroup {
     pub assets: Vec<Asset>,
 }
 
+/// [`duplicate_groups`] against the database at `db_path`, on a connection this
+/// call opens and drops.
+///
+/// Clustering every signature in the library is a background scan, and the UI
+/// thread's [`Store`](super::Store) is thread-confined, so the worker needs a
+/// handle of its own. Opening it through `Store::open` — rather than
+/// `rusqlite::Connection::open` — is what keeps the schema and pragmas the same
+/// on both sides.
+pub fn duplicate_groups_at(db_path: &std::path::Path) -> Result<Vec<DuplicateGroup>> {
+    let store = super::Store::open(db_path)?;
+    duplicate_groups(store.conn())
+}
+
 /// Group live image assets into near-duplicate clusters.
 ///
 /// Needs visual signatures (the `visual_phash` fact, computed in background

@@ -13,8 +13,6 @@ use gpui_kit::*;
 
 use std::rc::Rc;
 
-use trove_core::store::assets;
-
 use crate::components::controls::muted_label;
 use crate::library::LibraryController;
 
@@ -137,11 +135,10 @@ fn preview_block(draft: &Entity<RenameDraft>, cx: &mut App) -> Div {
     };
     let start_number: u32 = start.trim().parse().unwrap_or(1);
 
-    let conn = controller.read(cx).library.store().conn();
     let mut rows: Vec<String> = Vec::new();
     if !pattern.is_empty() {
         for (ix, id) in selection.iter().take(4).enumerate() {
-            if let Ok(Some(asset)) = assets::get(conn, *id) {
+            if let Ok(Some(asset)) = controller.read(cx).library.asset(*id) {
                 let stem = asset.file_stem();
                 rows.push(format!(
                     "{} → {}",

@@ -677,7 +677,7 @@ fn remine_metadata_job(controller: &Entity<LibraryController>, force: bool, cx: 
             // The database path rides along in the payload for the same reason
             // the cache path does for thumbnails: the job thread opens its own
             // connection rather than borrowing a handle it cannot hold.
-            let db = library.root().join("library.db");
+            let db = library.db_path();
             trove_core::services::maintenance::plan_remine(library, force).map(|plan| (db, plan))
         },
         |(db, plan)| {

@@ -394,6 +394,12 @@ impl Library {
         &self.text_index
     }
 
+    /// How many outbox rows are waiting to be flushed into the text index — the
+    /// gap between what the database holds and what a search can see.
+    pub fn pending_index_count(&self) -> Result<u64> {
+        crate::search::pending_count(self.store.conn())
+    }
+
     /// Flush the search_queue outbox into the Tantivy index: upsert rows
     /// whose assets still exist, drop documents for purged ones. Cheap when
     /// the queue is empty (one small SELECT); batches of 500 per commit.
@@ -460,7 +466,7 @@ impl Library {
         &self.tasks
     }
 
-    pub fn store(&self) -> &Store {
+    pub(crate) fn store(&self) -> &Store {
         &self.store
     }
 
@@ -480,6 +486,87 @@ impl Library {
     /// Absolute path of a library-relative path (e.g. a stored `rel_path`).
     pub fn resolve(&self, rel: &str) -> PathBuf {
         self.root.join(rel)
+    }
+
+    /// The stored record behind `id`, or `None` when the asset is gone.
+    ///
+    /// The one read every preview, cell and dialog starts from. Handing callers
+    /// a connection to make this query themselves is what let a preview decide
+    /// its own error policy — three of them silently mapped the failure to
+    /// "no asset", which looks exactly like a deleted one.
+    pub fn asset(&self, id: Uuid) -> Result<Option<crate::model::Asset>> {
+        assets::get(self.store.conn(), id)
+    }
+
+    /// The records for `ids`, in no particular order.
+    pub fn assets_by_ids(&self, ids: &[Uuid]) -> Result<Vec<crate::model::Asset>> {
+        assets::by_ids(self.store.conn(), ids)
+    }
+
+    /// One page of the library answering `query`, with the total it matches.
+    pub fn query_assets(
+        &self,
+        query: &crate::model::AssetQuery,
+    ) -> Result<crate::model::Page<crate::model::Asset>> {
+        assets::query(self.store.conn(), query)
+    }
+
+    /// Every file extension present in the library, most common first — the
+    /// choices the extension filter offers.
+    pub fn distinct_exts(&self) -> Result<Vec<String>> {
+        assets::distinct_exts(self.store.conn())
+    }
+
+    /// The folders linked assets were imported from, with how many each holds —
+    /// the rows of the folder browser.
+    pub fn source_folders(&self) -> Result<Vec<(String, u64)>> {
+        assets::source_folders(self.store.conn())
+    }
+
+    /// The 3D look `asset` was last left in, `Ok(None)` while it still uses the
+    /// app-wide default.
+    pub fn model_look(
+        &self,
+        asset: Uuid,
+    ) -> Result<Option<crate::media::height_color::StoredLook>> {
+        crate::store::model_look::get(self.store.conn(), asset)
+    }
+
+    /// Remember `look` as `asset`'s own, so reopening the model puts the colours
+    /// back the way they were left.
+    pub fn set_model_look(
+        &self,
+        asset: Uuid,
+        look: &crate::media::height_color::StoredLook,
+    ) -> Result<()> {
+        crate::store::model_look::set(self.store.conn(), asset, look)
+    }
+
+    /// How many live images carry a visual signature, out of how many could: the
+    /// coverage figure the settings dialog reports before offering a backfill.
+    pub fn visual_signature_counts(&self) -> Result<(u64, u64)> {
+        crate::store::visual_search::signature_counts(self.store.conn())
+    }
+
+    /// The live image assets that carry no visual signature yet.
+    pub fn assets_needing_signature(&self) -> Result<Vec<Uuid>> {
+        crate::store::visual_search::assets_needing_signature(&self.store)
+    }
+
+    /// Mine and store one asset's visual signature. `Ok(false)` is a skipped
+    /// asset — the file is gone or decodes to nothing — not a failed call.
+    pub fn compute_visual_signature(&self, asset_id: Uuid) -> Result<bool> {
+        crate::store::visual_search::compute_and_store_signature(&self.store, &self.root, asset_id)
+    }
+
+    /// The database file this library's records live in.
+    ///
+    /// Named here rather than spelled out at each call site, because the file
+    /// name is the library's own layout, not the caller's business. A second
+    /// connection — a benchmark running raw SQL off the UI thread, a maintenance
+    /// pass — opens this path; WAL is what makes two handles over one file safe.
+    pub fn db_path(&self) -> PathBuf {
+        self.root.join("library.db")
     }
 
     /// The real file behind `id`: the in-library blob for stored assets, the
@@ -988,6 +1075,46 @@ impl Library {
     pub fn reorder_smart_collection(&self, id: Uuid, position: i64) -> Result<()> {
         let conn = self.store.conn();
         smart_collections::reorder_to(conn, id, position)
+    }
+
+    /// How many live assets `node` matches: the badge beside each saved search.
+    ///
+    /// The rule comes in rather than an id, because the sidebar holds every
+    /// smart collection already — looking one row up per badge would be a query
+    /// per pixel of chrome.
+    pub fn count_smart_rule(&self, node: &crate::model::SmartNode) -> Result<u64> {
+        let page = smart::evaluate(self.store.conn(), Some(self.text_index()), node, None, 0)?;
+        Ok(page.total)
+    }
+
+    /// Freeze a browse into a session: the answer set is decided once here, so
+    /// the pages taken from it afterwards cannot disagree about what matches.
+    pub fn browse_snapshot(
+        &self,
+        browse: &crate::store::BrowseContext,
+        vector: Option<&crate::search::vector::VectorIndex>,
+        count_total: bool,
+    ) -> Result<crate::store::BrowseSession> {
+        browse.snapshot(self.store.conn(), self.text_index(), vector, count_total)
+    }
+
+    /// One window of rows from a frozen browse, in its order.
+    pub fn browse_page(
+        &self,
+        session: &crate::store::BrowseSession,
+        offset: usize,
+        window: Option<usize>,
+    ) -> Result<crate::model::Page<crate::model::Asset>> {
+        session.page(self.store.conn(), self.text_index(), offset, window)
+    }
+
+    /// How many assets each filter choice would return, for the session's whole
+    /// answer set rather than the page on screen.
+    pub fn browse_facets(
+        &self,
+        session: &crate::store::BrowseSession,
+    ) -> Result<crate::store::facets::FacetCounts> {
+        session.compute_facets(self.store.conn())
     }
 
     /// Evaluate a stored smart collection live, materialising the matching
@@ -1704,6 +1831,115 @@ impl Library {
         Ok(())
     }
 
+    /// Every collection in the library.
+    pub fn list_collections(&self) -> Result<Vec<crate::model::Collection>> {
+        collections::list(self.store.conn())
+    }
+
+    /// The collections with no parent: the top of the sidebar tree.
+    pub fn collection_roots(&self) -> Result<Vec<crate::model::Collection>> {
+        collections::roots(self.store.conn())
+    }
+
+    /// The children of `parent`, or the roots when it is `None`. Both in one
+    /// method because the tree asks the same question of the root level as of
+    /// any folder, and `Option<Uuid>` is already the domain's "no parent".
+    pub fn collection_children(
+        &self,
+        parent: Option<Uuid>,
+    ) -> Result<Vec<crate::model::Collection>> {
+        collections::children_of(self.store.conn(), parent)
+    }
+
+    /// One collection by id, `Ok(None)` when it is gone.
+    pub fn collection(&self, id: Uuid) -> Result<Option<crate::model::Collection>> {
+        collections::get(self.store.conn(), id)
+    }
+
+    /// The collections `asset_id` sits in.
+    pub fn collections_for_asset(&self, asset_id: Uuid) -> Result<Vec<crate::model::Collection>> {
+        collections::for_asset(self.store.conn(), asset_id)
+    }
+
+    /// How many assets are members of `id` itself — its own membership rows, not
+    /// a subtree's total, which is what the sidebar's per-folder count means.
+    pub fn count_collection_assets(&self, id: Uuid) -> Result<u64> {
+        collections::count_assets(self.store.conn(), id)
+    }
+
+    /// Create a collection from `input`.
+    pub fn create_collection(
+        &self,
+        input: &crate::model::NewCollection,
+    ) -> Result<crate::model::Collection> {
+        collections::create(self.store.conn(), input)
+    }
+
+    /// Replace a collection's look (icon, colour). Not recorded for undo: an
+    /// appearance is decoration on a row that still exists, and the picker
+    /// previews the change before committing it, so a stack entry would record
+    /// every hover.
+    pub fn set_collection_appearance(
+        &self,
+        id: Uuid,
+        appearance: &crate::model::Appearance,
+    ) -> Result<()> {
+        collections::set_appearance(self.store.conn(), id, appearance)
+    }
+
+    /// The same for a smart collection, for the same reason.
+    pub fn set_smart_collection_appearance(
+        &self,
+        id: Uuid,
+        appearance: &crate::model::Appearance,
+    ) -> Result<()> {
+        smart_collections::set_appearance(self.store.conn(), id, appearance)
+    }
+
+    /// Replace a smart collection's rule.
+    pub fn set_smart_collection_query(&self, id: Uuid, query: &serde_json::Value) -> Result<()> {
+        smart_collections::update_query(self.store.conn(), id, query)
+    }
+
+    /// Every tag, name-ordered.
+    pub fn list_tags(&self) -> Result<Vec<crate::model::Tag>> {
+        tags::list(self.store.conn())
+    }
+
+    /// The tags an asset carries.
+    pub fn tags_for_asset(&self, asset_id: Uuid) -> Result<Vec<crate::model::Tag>> {
+        tags::for_asset(self.store.conn(), asset_id)
+    }
+
+    /// How many live assets carry each tag — the number beside every row of the
+    /// tag panel.
+    pub fn tag_counts(&self) -> Result<std::collections::HashMap<Uuid, u64>> {
+        tags::counts_by_tag(self.store.conn())
+    }
+
+    /// `tag_id` and every tag nested under it.
+    pub fn tag_subtree_ids(&self, tag_id: Uuid) -> Result<Vec<Uuid>> {
+        tags::subtree_ids(self.store.conn(), tag_id)
+    }
+
+    /// How many viewed assets are still live — the recently-viewed row's badge.
+    /// Trashed ones drop out of the count without leaving the table, which is
+    /// why this is not `store::view_history`'s row count.
+    pub fn viewed_count(&self) -> Result<u64> {
+        crate::store::view_history::live_count(self.store.conn())
+    }
+
+    /// Note that `asset_id` was opened, so the recently-viewed list can rank it.
+    pub fn record_view(&self, asset_id: Uuid) -> Result<()> {
+        crate::store::view_history::record(self.store.conn(), asset_id)
+    }
+
+    /// Empty the recently-viewed list.
+    pub fn clear_view_history(&self) -> Result<()> {
+        crate::store::view_history::clear(self.store.conn())
+    }
+
+    /// Rename a collection, recording the previous name for undo.
     /// Rename a collection, recording the previous name.
     pub fn rename_collection(&self, collection_id: Uuid, name: &str) -> Result<()> {
         let conn = self.store.conn();

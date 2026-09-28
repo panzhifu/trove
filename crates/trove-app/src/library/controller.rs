@@ -11,8 +11,6 @@ use trove_core::library::Library;
 use trove_core::media::height_color::StoredLook;
 use trove_core::model::{AspectPreset, AssetKind, AssetSort, Orientation, ResolutionBand};
 use trove_core::store::browse::SearchTiers;
-use trove_core::store::model_look;
-use trove_core::store::view_history;
 
 /// Current import activity, shown by the Explorer panel.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -661,8 +659,7 @@ impl LibraryController {
         {
             return;
         }
-        let conn = self.library.store().conn();
-        if view_history::record(conn, asset).is_ok() {
+        if self.library.record_view(asset).is_ok() {
             self.last_view_record = Some((asset, Instant::now()));
             // Only the recently-viewed grid reorders with history, so only
             // that view invalidates its cached data pass here. Bumping the
@@ -677,8 +674,7 @@ impl LibraryController {
     /// The 3D look this asset was last left in, or `None` while it still uses
     /// the app-wide default.
     pub fn model_look(&self, asset: Uuid) -> Option<StoredLook> {
-        let conn = self.library.store().conn();
-        model_look::get(conn, asset).ok().flatten()
+        self.library.model_look(asset).ok().flatten()
     }
 
     /// Remember `look` as this asset's own, so reopening the model puts the
@@ -689,8 +685,10 @@ impl LibraryController {
     /// already applied the look on screen. Nothing here bumps a generation —
     /// the look is not part of any listing.
     pub fn remember_model_look(&mut self, asset: Uuid, look: StoredLook) {
-        let conn = self.library.store().conn();
-        let _ = model_look::set(conn, asset, &look);
+        // Silent by design, as before: a library whose row cannot be written
+        // should still let the user paint the model, and the panel has already
+        // applied the look on screen.
+        let _ = self.library.set_model_look(asset, &look);
     }
 
     /// Set the active smart collection; `None` returns to "All assets".
@@ -1006,8 +1004,7 @@ impl LibraryController {
     /// the one kind we can hand to the clipboard as pixels.
     pub fn primary_image_file(&self) -> Option<PathBuf> {
         let id = self.primary()?;
-        let conn = self.library.store().conn();
-        let asset = trove_core::store::assets::get(conn, id).ok().flatten()?;
+        let asset = self.library.asset(id).ok().flatten()?;
         (asset.kind == AssetKind::Image).then(|| self.asset_file(id))?
     }
 

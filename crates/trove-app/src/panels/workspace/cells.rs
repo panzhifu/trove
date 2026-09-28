@@ -531,8 +531,7 @@ pub(super) fn model_source(controller: &LibraryController, id: Uuid) -> Option<(
     use trove_core::model::Origin;
 
     let root = controller.library.root().to_path_buf();
-    let conn = controller.library.store().conn();
-    let asset = trove_core::store::assets::get(conn, id).ok().flatten()?;
+    let asset = controller.library.asset(id).ok().flatten()?;
     if asset.kind != AssetKind::Model {
         return None;
     }

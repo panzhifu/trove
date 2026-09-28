@@ -203,8 +203,7 @@ impl AssetPreviewData {
     pub(crate) fn load(controller: &LibraryController, id: Uuid) -> Option<Self> {
         let library_root = controller.library.root().to_path_buf();
         let cache_root = controller.library.cache().to_path_buf();
-        let conn = controller.library.store().conn();
-        let asset = trove_core::store::assets::get(conn, id).ok().flatten()?;
+        let asset = controller.library.asset(id).ok().flatten()?;
         Some(Self::from_asset(&asset, &library_root, &cache_root))
     }
 

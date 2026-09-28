@@ -40,7 +40,6 @@ use trove_core::layout::{
     target_row_height_for_scale,
 };
 use trove_core::model::{AssetKind, AssetSort, NewSmartCollection, Orientation};
-use trove_core::store::{assets, collections, smart_collections};
 use uuid::Uuid;
 
 use crate::app::actions::{
@@ -449,8 +448,12 @@ impl WorkspacePanel {
         // every frame, so it is refilled only when the generation moves.
         let generation = self.controller.read(cx).generation;
         if self.filter_exts.as_ref().map(|(cached, _)| *cached) != Some(generation) {
-            let conn = self.controller.read(cx).library.store().conn();
-            let exts = trove_core::store::assets::distinct_exts(conn).unwrap_or_default();
+            let exts = self
+                .controller
+                .read(cx)
+                .library
+                .distinct_exts()
+                .unwrap_or_default();
             self.filter_exts = Some((generation, exts));
         }
         let exts: &[String] = match &self.filter_exts {

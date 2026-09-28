@@ -50,7 +50,7 @@ impl FrameTimes {
     /// for a frame meant to be composited and immediately overwritten, and
     /// inventing a floor here would move every later frame's start and make the
     /// bar disagree with the picture. A zero-delay frame simply shares the
-    /// instant of the frame before it, which [`frame_at`] resolves to the last
+    /// instant of the frame before it, which [`FrameTimes::frame_at`] resolves to the last
     /// frame starting at or before the requested time.
     pub fn from_delays(delays_ms: Vec<u32>) -> Self {
         let mut starts = Vec::with_capacity(delays_ms.len());

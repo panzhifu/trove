@@ -40,10 +40,11 @@ fn one_round(paths: &[PathBuf], root: &PathBuf, stage_only: bool) -> (Duration, 
         return (stage_time, Duration::ZERO);
     }
 
-    let store = Store::open(&root.join("library.db")).unwrap();
+    // Opening the store is what creates the schema the raw connection reads.
+    Store::open(&root.join("library.db")).unwrap();
     let t1 = Instant::now();
     {
-        let conn = store.conn();
+        let conn = &rusqlite::Connection::open(root.join("library.db")).unwrap();
         // Mirror tasks/import.rs: COMMIT_BATCH = 16, savepoint per file.
         for chunk in staged.chunks(16) {
             let _ = conn.execute_batch("BEGIN");

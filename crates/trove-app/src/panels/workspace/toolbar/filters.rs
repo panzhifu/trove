@@ -12,7 +12,6 @@ use gpui_kit::{Anchor, App};
 use trove_core::config::{AppConfig, FILTER_TOOLS};
 use trove_core::model::{AspectPreset, AssetKind, AssetSort, Orientation, ResolutionBand};
 use trove_core::store::facets::{FacetCounts, FacetValue};
-use trove_core::store::tags;
 
 use crate::components::controls::icon_button;
 use crate::library::{LibraryController, ViewMode};
@@ -261,8 +260,10 @@ pub(crate) fn tag_filter(
 ) -> impl IntoElement {
     let active = controller.read(cx).active_tag;
     let tags: Vec<(Uuid, String)> = {
-        let conn = controller.read(cx).library.store().conn();
-        tags::list(conn)
+        controller
+            .read(cx)
+            .library
+            .list_tags()
             .unwrap_or_default()
             .into_iter()
             .map(|t| (t.id, t.name))
