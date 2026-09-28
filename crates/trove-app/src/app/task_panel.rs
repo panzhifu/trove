@@ -22,6 +22,7 @@ use gpui_kit::*;
 use crate::components::controls::empty_note;
 use crate::components::scrollbar;
 use crate::library::{LibraryController, TaskCard, jobs};
+use trove_core::store::task_journal::JournalEntry;
 use trove_core::tasks::{TaskId, TaskKind, TaskStatus};
 
 /// A panel row bundled with whether its (settled) job can be retried.
@@ -44,8 +45,10 @@ pub fn task_panel(controller: &Entity<LibraryController>, cx: &App) -> AnyElemen
             card: card.clone(),
         })
         .collect();
-    let summary = task_summary(&rows);
-    let body = task_panel_body(controller.clone(), &rows, cx);
+    // Work the journal says was still running when the previous process exited.
+    let interrupted = ctl.library.interrupted_tasks().to_vec();
+    let summary = task_summary(&rows, interrupted.len());
+    let body = task_panel_body(controller.clone(), &rows, &interrupted, cx);
 
     Popover::new("statusbar-tasks")
         .anchor(Anchor::BottomLeft)
@@ -74,7 +77,7 @@ pub fn task_panel(controller: &Entity<LibraryController>, cx: &App) -> AnyElemen
 
 /// Localized label for a job kind, shown on each panel row.
 fn task_kind_label(kind: &TaskKind) -> SharedString {
-    let key = match kind {
+    match kind {
         TaskKind::Import | TaskKind::CollectInbox => "task.kind_import",
         TaskKind::EmbeddingBackfill | TaskKind::VisualBackfill => "task.kind_embedding",
         TaskKind::AiAnalysis | TaskKind::AutoTag => "task.kind_analysis",
@@ -82,9 +85,15 @@ fn task_kind_label(kind: &TaskKind) -> SharedString {
         TaskKind::WatchScan => "task.kind_watch",
         TaskKind::ModelPreview => "task.kind_model",
         TaskKind::VideoDecode | TaskKind::BatchConvert => "task.kind_convert",
-        TaskKind::Custom(_) => "task.kind_custom",
-    };
-    rust_i18n::t!(key).to_string().into()
+        // A plugin kind has no catalog entry of its own, and the name it
+        // registered under is also the string the journal stores — so the
+        // category comes from the catalog and the identity from the plugin.
+        TaskKind::Custom(name) => {
+            return format!("{} · {}", rust_i18n::t!("task.kind_custom"), name).into();
+        }
+    }
+    .to_string()
+    .into()
 }
 
 /// Localized state word for a job, colored by the caller.
@@ -101,7 +110,12 @@ fn task_status_label(status: TaskStatus) -> SharedString {
 
 /// The compact summary drawn on the status bar when the panel is closed: the
 /// newest live job and its numbers, else an attention hint, else idle.
-fn task_summary(rows: &[TaskRow]) -> String {
+///
+/// `interrupted` is how many jobs the journal recorded as still running when
+/// the previous process exited. Without that count the summary would read
+/// "Idle" right after a crash, because an interrupted job has no live row to
+/// make it obvious — the notice would only be visible inside the popover.
+fn task_summary(rows: &[TaskRow], interrupted: usize) -> String {
     if let Some(row) = rows.iter().rev().find(|row| !row.card.finished()) {
         let label = task_kind_label(&row.card.kind).to_string();
         if row.card.total > 0 {
@@ -109,9 +123,10 @@ fn task_summary(rows: &[TaskRow]) -> String {
         } else {
             format!("{label} {}", rust_i18n::t!("task.scanning"))
         }
-    } else if rows
-        .iter()
-        .any(|row| matches!(row.card.status, TaskStatus::Failed | TaskStatus::Cancelled))
+    } else if interrupted > 0
+        || rows
+            .iter()
+            .any(|row| matches!(row.card.status, TaskStatus::Failed | TaskStatus::Cancelled))
     {
         rust_i18n::t!("task.needs_attention").to_string()
     } else {
@@ -127,9 +142,14 @@ fn task_btn_id(action: &str, id: TaskId) -> ElementId {
 
 /// The popover body: a header (title + a dismiss-settled button when any have
 /// settled) over the list of rows, newest first.
+///
+/// `interrupted` renders as its own block above the live rows rather than as
+/// fake rows: those jobs are not running, and putting a `Running` card on them
+/// would make the summary claim work is in flight that is not.
 fn task_panel_body(
     controller: Entity<LibraryController>,
     rows: &[TaskRow],
+    interrupted: &[JournalEntry],
     cx: &App,
 ) -> AnyElement {
     let header = h_flex()
@@ -163,16 +183,92 @@ fn task_panel_body(
             )
         });
 
-    let body = v_flex().w_full().child(header);
+    let mut body = v_flex().w_full().child(header);
+    if !interrupted.is_empty() {
+        body = body.child(interrupted_block(controller.clone(), interrupted, cx));
+    }
     if rows.is_empty() {
         return body
-            .child(empty_note(rust_i18n::t!("task.empty").to_string(), cx))
+            .when(interrupted.is_empty(), |body| {
+                body.child(empty_note(rust_i18n::t!("task.empty").to_string(), cx))
+            })
             .into_any_element();
     }
     body.child(scrollbar::vertical(v_flex().max_h(px(280.)).children(
         rows.iter().rev().map(|row| task_row(&controller, row, cx)),
     )))
     .into_any_element()
+}
+
+/// The jobs the task journal left as running or paused when the previous
+/// process exited, and the one thing the panel can honestly do about them: say
+/// so. Re-running is *not* offered — the journal stores what a job was and how
+/// far it got, never the inputs that started it, and those live only in the
+/// session that started it. See [`Library::interrupted_tasks`].
+fn interrupted_block(
+    controller: Entity<LibraryController>,
+    entries: &[JournalEntry],
+    cx: &App,
+) -> AnyElement {
+    let rows = entries.iter().map(|entry| {
+        let numbers = if entry.total > 0 {
+            format!("{}/{}", entry.done, entry.total)
+        } else {
+            String::new()
+        };
+        h_flex().items_center().gap_2().px_3().py_1p5().child(
+            v_flex()
+                .flex_1()
+                .min_w_0()
+                .gap_0p5()
+                .child(div().truncate().text_sm().child(entry.label.clone()))
+                .child(
+                    h_flex()
+                        .gap_1p5()
+                        .items_center()
+                        .text_xs()
+                        .text_color(cx.theme().warning)
+                        .child(rust_i18n::t!("task.interrupted").to_string())
+                        .child(task_kind_label(&entry.kind))
+                        .when(!numbers.is_empty(), |line| line.child(div().child(numbers))),
+                ),
+        )
+    });
+    v_flex()
+        .w_full()
+        .border_b_1()
+        .border_color(cx.theme().border)
+        .child(
+            h_flex()
+                .px_3()
+                .pt_2()
+                .pb_1()
+                .justify_between()
+                .items_center()
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(rust_i18n::t!("task.interrupted_note").to_string()),
+                )
+                .child(
+                    Button::new("statusbar-tasks-dismiss-interrupted")
+                        .ghost()
+                        .xsmall()
+                        .label(rust_i18n::t!("task.dismiss").to_string())
+                        .on_click({
+                            let controller = controller.clone();
+                            move |_, _, cx| {
+                                controller.update(cx, |ctl, cx| {
+                                    ctl.library.clear_interrupted_tasks();
+                                    cx.notify();
+                                });
+                            }
+                        }),
+                ),
+        )
+        .children(rows)
+        .into_any_element()
 }
 
 /// One job row: kind + numbers + state on the left, its action buttons on the

@@ -75,6 +75,7 @@ fn dispatch(args: &Cli) -> Result<(), CliError> {
                 Command::Purge(purge) => write::purge(&env, purge)?,
                 Command::Collection(collection) => write::collection(&env, collection)?,
                 Command::Index(index) => write::index(&env, index)?,
+                Command::Sequence(sequence) => write::sequence(&env, sequence)?,
                 Command::Libraries | Command::Paths => {
                     unreachable!("handled above, before a library is opened")
                 }

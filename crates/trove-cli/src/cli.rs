@@ -144,6 +144,51 @@ pub enum Command {
     /// Inspect or rebuild the full-text search index.
     #[command(subcommand)]
     Index(IndexCommand),
+
+    /// Group assets into an image sequence, and undo the grouping.
+    #[command(subcommand)]
+    Sequence(SequenceCommand),
+}
+
+// ---------------------------------------------------------------------------
+// `trove sequence …`
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Subcommand)]
+pub enum SequenceCommand {
+    /// Group assets into one sequence.
+    ///
+    /// The frames stay ordinary assets; only the grouping is recorded, so
+    /// `dissolve` reverses it completely. Needs at least three live assets from
+    /// one folder whose sizes agree, and none of them already in another run —
+    /// each refusal names the rule it hit.
+    Create {
+        /// Frames per second for the new run.
+        #[arg(
+            long,
+            default_value_t = trove_core::media::sequence::DEFAULT_FPS,
+            value_name = "FPS"
+        )]
+        fps: f64,
+        #[arg(required = true, value_name = "UUID")]
+        assets: Vec<String>,
+    },
+
+    /// Dissolve every sequence that one of these assets belongs to.
+    Dissolve {
+        #[arg(required = true, value_name = "UUID")]
+        assets: Vec<String>,
+    },
+
+    /// Set a sequence's frame rate.
+    Fps {
+        /// Sequence id, as `list` prints it for a run's card.
+        #[arg(value_name = "UUID")]
+        sequence: String,
+        /// Frames per second, 1…240.
+        #[arg(value_name = "FPS")]
+        fps: f64,
+    },
 }
 
 // ---------------------------------------------------------------------------

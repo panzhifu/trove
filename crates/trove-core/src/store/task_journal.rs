@@ -3,8 +3,14 @@
 //!
 //! The journal is written by the [`TaskManager`](crate::tasks::TaskManager) on
 //! every task lifecycle transition (start, complete, fail, retry). On library
-//! open, [`load_interrupted`] reads tasks that were running or paused when the
-//! process died, so the UI can offer to resume or retry them.
+//! open, [`load_interrupted`] reads the tasks that were running or paused when
+//! the previous process died, and [`Library::interrupted_tasks`]
+//! (crate::library::Library) hands them to the task panel.
+//!
+//! What that is *not* is a resume. A row records the kind, label and progress
+//! of a job, never the inputs that started it, and those live only in the
+//! session that started it — so an interrupted job is reported, not replayed.
+//! Anything that claims otherwise here has not checked the call sites.
 
 use rusqlite::params;
 use uuid::Uuid;
@@ -184,5 +190,103 @@ fn str_to_status(s: &str) -> TaskStatus {
         "failed" => TaskStatus::Failed,
         "cancelled" => TaskStatus::Cancelled,
         _ => TaskStatus::Failed,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::Store;
+
+    /// The journal's whole contract, end to end: a start is readable as
+    /// interrupted work, a terminal status takes it out again, and a custom
+    /// kind comes back under the name it went in as.
+    ///
+    /// These three are the reason `load_interrupted` is worth calling at open —
+    /// without them the module is a table that nothing has ever read back.
+    #[test]
+    fn a_running_task_is_reported_as_interrupted_until_it_settles() {
+        let store = Store::in_memory().unwrap();
+        let conn = store.conn();
+        let id = crate::model::new_id();
+
+        record_start(conn, id, &TaskKind::Import, "import 1200 files", 2).unwrap();
+        let found = load_interrupted(conn).unwrap();
+        assert_eq!(found.len(), 1, "a running job must be readable");
+        let entry = &found[0];
+        assert_eq!(entry.task_id, id);
+        assert_eq!(entry.kind, TaskKind::Import);
+        assert_eq!(entry.label, "import 1200 files");
+        assert_eq!(entry.status, TaskStatus::Running);
+        assert_eq!(entry.max_retries, 2);
+        assert_eq!(entry.retry_count, 0);
+        assert!(entry.finished_at.is_none(), "it has not finished");
+
+        record_status(
+            conn,
+            id,
+            TaskStatus::Completed,
+            1200,
+            1200,
+            Some("done"),
+            None,
+        )
+        .unwrap();
+        assert!(
+            load_interrupted(conn).unwrap().is_empty(),
+            "a settled job is not interrupted work"
+        );
+    }
+
+    /// A failure that used its retries stays out of the interrupted set, and a
+    /// retry increments the counter rather than starting a second row.
+    #[test]
+    fn retries_accumulate_on_one_row() {
+        let store = Store::in_memory().unwrap();
+        let conn = store.conn();
+        let id = crate::model::new_id();
+
+        record_start(conn, id, &TaskKind::AiAnalysis, "ai analysis", 2).unwrap();
+        record_retry(conn, id).unwrap();
+        record_retry(conn, id).unwrap();
+        let found = load_interrupted(conn).unwrap();
+        assert_eq!(found.len(), 1, "a retry must not fork the row");
+        assert_eq!(found[0].retry_count, 2);
+        assert_eq!(found[0].status, TaskStatus::Running);
+
+        record_status(conn, id, TaskStatus::Failed, 3, 10, None, Some("boom")).unwrap();
+        assert!(load_interrupted(conn).unwrap().is_empty());
+    }
+
+    /// A plugin kind round-trips through the `"plugin:<name>"` slug, so a row
+    /// written by a plugin is readable by name after a restart. An unknown slug
+    /// still surfaces rather than being dropped.
+    #[test]
+    fn a_plugin_kind_round_trips_and_an_unknown_slug_survives() {
+        let store = Store::in_memory().unwrap();
+        let conn = store.conn();
+        let id = crate::model::new_id();
+        let kind = TaskKind::Custom(std::borrow::Cow::Borrowed("notes-index"));
+
+        record_start(conn, id, &kind, "index sidecars", 0).unwrap();
+        let found = load_interrupted(conn).unwrap();
+        assert_eq!(found[0].kind, kind, "the custom name did not round-trip");
+
+        // A row written by a build whose kinds this one does not know still
+        // reads back as Custom rather than vanishing from the report.
+        conn.execute(
+            "INSERT INTO task_journal (task_id, kind, label, status, started_at) \
+             VALUES (?1, 'from-a-future-build', 'x', 'running', 'now')",
+            [crate::model::new_id().to_string()],
+        )
+        .unwrap();
+        let found = load_interrupted(conn).unwrap();
+        assert!(
+            found
+                .iter()
+                .any(|e| e.kind
+                    == TaskKind::Custom(std::borrow::Cow::Borrowed("from-a-future-build"))),
+            "an unrecognised kind was dropped instead of surfaced"
+        );
     }
 }

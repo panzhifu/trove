@@ -34,7 +34,7 @@
 
 use std::borrow::Cow;
 use std::collections::hash_map::Entry;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -637,6 +637,10 @@ pub struct TaskManager {
     events: Arc<EventQueue>,
     journal: Option<JournalConn>,
     pool: Arc<TaskPool>,
+    /// Custom task kinds a plugin has declared, so [`TaskKind::Custom`] can be
+    /// checked against something. Set once at library open, before the manager
+    /// is shared — see [`TaskManager::declare_task_kinds`].
+    declared: Arc<HashSet<&'static str>>,
 }
 
 impl Default for TaskManager {
@@ -651,6 +655,7 @@ impl Default for TaskManager {
                     .unwrap_or(4)
                     .max(2),
             )),
+            declared: Arc::new(HashSet::new()),
         }
     }
 }
@@ -660,11 +665,42 @@ impl Default for TaskManager {
 pub enum StartError {
     /// A job of the same kind is still running (one per kind at a time).
     AlreadyRunning,
+    /// The kind is [`TaskKind::Custom`] and no enabled plugin declared that
+    /// name. Either the plugin is switched off or the string is a typo, and
+    /// letting either through would hand a slot, a journal row and a panel row
+    /// to a job nobody owns. The name is in the log, not here, so this stays
+    /// `Copy`.
+    UndeclaredKind,
 }
 
 impl TaskManager {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Declare the custom task kinds plugins contribute, so a job may be
+    /// started under one. Call before the manager is shared — the registry
+    /// is read once, exactly like the import pipeline reads its stages, so a
+    /// plugin registered after this point cannot schedule work in this
+    /// process.
+    pub fn declare_task_kinds(&mut self, kinds: &[&'static str]) {
+        self.declared = Arc::new(kinds.iter().copied().collect());
+    }
+
+    /// A custom kind must be one an enabled plugin claimed. Built-in kinds are
+    /// always allowed, and an empty declaration set only rejects custom ones —
+    /// which is what a process with no plugins (the CLI) looks like.
+    fn gate_kind(&self, kind: &TaskKind) -> Result<(), StartError> {
+        if let TaskKind::Custom(name) = kind
+            && !self.declared.contains(name.as_ref())
+        {
+            tracing::warn!(
+                kind = %name,
+                "refusing to start a custom task kind no enabled plugin declared"
+            );
+            return Err(StartError::UndeclaredKind);
+        }
+        Ok(())
     }
 
     /// Attach a journal connection so tasks are persisted to the `task_journal`
@@ -711,6 +747,7 @@ impl TaskManager {
         T: Send + 'static,
         F: FnOnce(&JobContext) -> Result<T, String> + Send + 'static,
     {
+        self.gate_kind(&kind)?;
         let mut jobs = self.jobs.lock().unwrap();
         if jobs
             .values()
@@ -906,6 +943,7 @@ impl TaskManager {
         T: Send + 'static,
         F: FnMut() -> Box<dyn FnOnce(&JobContext) -> Result<T, String> + Send> + Send + 'static,
     {
+        self.gate_kind(&kind)?;
         let mut jobs = self.jobs.lock().unwrap();
         if jobs
             .values()
@@ -1719,5 +1757,162 @@ mod tests {
             .recv_timeout(Duration::from_millis(1_000))
             .expect("cancel did not wake the parked job");
         assert_eq!(woke, "cancelled");
+    }
+
+    /// A custom task kind must be one an enabled plugin declared. Without this
+    /// gate any call site could mint a name, occupy its slot, and write a
+    /// journal row no plugin will ever read back.
+    #[test]
+    fn an_undeclared_custom_kind_is_refused_and_a_declared_one_runs() {
+        let mut mgr = TaskManager::new();
+        let notes = TaskKind::Custom(Cow::Borrowed("notes-index"));
+        let err = mgr.start(notes.clone(), "x", |_| Ok(())).unwrap_err();
+        assert_eq!(err, StartError::UndeclaredKind);
+        // Built-in kinds are never gated, and an empty declaration set is what
+        // a process with no plugins (the CLI) looks like.
+        assert!(mgr.start(TaskKind::Import, "x", |_| Ok(())).is_ok());
+
+        mgr.declare_task_kinds(&["notes-index"]);
+        assert!(
+            mgr.start(notes.clone(), "x", |_| Ok(())).is_ok(),
+            "a declared kind should hold its slot"
+        );
+        // The same gate covers the retrying entry point.
+        assert!(
+            mgr.start_with_retry(
+                TaskKind::Custom(Cow::Borrowed("never-declared")),
+                "x",
+                RetryPolicy::times(1),
+                || Box::new(|_| Ok(())),
+            )
+            .is_err()
+        );
+    }
+
+    /// A retried job calls the factory again rather than reusing a closure it
+    /// already consumed, reports the intermediate attempt instead of swallowing
+    /// it, and still delivers the value.
+    #[test]
+    fn a_failed_job_retries_and_reports_each_attempt() {
+        let mgr = TaskManager::new();
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = attempts.clone();
+        let (id, rx) = mgr
+            .start_with_retry(
+                TaskKind::Import,
+                "flaky",
+                RetryPolicy {
+                    max_retries: 2,
+                    backoff: Duration::from_millis(10),
+                },
+                move || {
+                    let seen = seen.clone();
+                    Box::new(move |_| {
+                        let n = seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                        if n < 2 {
+                            Err("first attempt fails".to_string())
+                        } else {
+                            Ok(n)
+                        }
+                    })
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            rx.recv().unwrap(),
+            2,
+            "the second attempt is the one that produced a value"
+        );
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 2);
+
+        let events = mgr.poll_events_for(id);
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                TaskEvent::Retrying {
+                    attempt: 1,
+                    max_retries: 2,
+                    ..
+                }
+            )),
+            "a retried attempt was never reported: {events:?}"
+        );
+        assert!(
+            matches!(events.last(), Some(TaskEvent::Completed { .. })),
+            "the terminal event should be last: {events:?}"
+        );
+    }
+
+    /// Exhausting the budget ends the job as failed, on the *last* attempt's
+    /// error — the retry loop must not turn a real failure into a silent one.
+    #[test]
+    fn a_job_that_uses_every_retry_fails_for_good() {
+        let mgr = TaskManager::new();
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = attempts.clone();
+        let (id, rx): (TaskId, std::sync::mpsc::Receiver<()>) = mgr
+            .start_with_retry(
+                TaskKind::Import,
+                "doomed",
+                RetryPolicy::times(1),
+                move || {
+                    let seen = seen.clone();
+                    Box::new(move |_| {
+                        seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        Err("always fails".to_string())
+                    })
+                },
+            )
+            .unwrap();
+        assert!(
+            rx.recv().is_err(),
+            "a job that never succeeded must close the channel"
+        );
+        assert_eq!(
+            attempts.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "one run plus one retry"
+        );
+        let events = mgr.poll_events_for(id);
+        assert!(
+            matches!(events.last(), Some(TaskEvent::Failed { error, .. }) if error == "always fails"),
+            "the final failure was not reported: {events:?}"
+        );
+    }
+
+    /// The panel reads [`TaskManager::snapshot`], so priority is only worth
+    /// having if a user-requested job comes back ahead of a backfill.
+    #[test]
+    fn a_snapshot_lists_higher_priority_jobs_first() {
+        let mgr = TaskManager::new();
+        let park = || -> Result<(), String> {
+            std::thread::sleep(Duration::from_millis(60));
+            Ok(())
+        };
+        // A background backfill first, then the job the user is waiting on.
+        let (low, _) = mgr
+            .start_with_priority(
+                TaskKind::EmbeddingBackfill,
+                "backfill",
+                TaskPriority::Low,
+                move |_| park(),
+            )
+            .unwrap();
+        let (high, _) = mgr
+            .start_with_priority(
+                TaskKind::ModelPreview,
+                "parse",
+                TaskPriority::High,
+                move |_| park(),
+            )
+            .unwrap();
+        let order: Vec<TaskId> = mgr.snapshot().into_iter().map(|t| t.id).collect();
+        let positions = |id: TaskId| order.iter().position(|x| *x == id).unwrap();
+        assert!(
+            positions(high) < positions(low),
+            "a High job should sort before a Low one: {order:?}"
+        );
+        mgr.cancel(high);
+        mgr.cancel(low);
     }
 }

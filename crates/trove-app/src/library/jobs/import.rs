@@ -14,7 +14,7 @@ use gpui_kit::*;
 
 use trove_core::media::import::ImportStorage;
 use trove_core::tasks::import::{self, ImportOptions, ImportOutcome, ImportSource};
-use trove_core::tasks::{TaskId, TaskKind, TaskManager};
+use trove_core::tasks::{RetryPolicy, TaskId, TaskKind, TaskManager, TaskPriority};
 
 use super::{JobStep, NoticeKey, watch_job};
 use crate::library::{LibraryController, Retryable};
@@ -295,9 +295,24 @@ pub(super) fn start_import_job(
     // the status-bar panel; the job closure consumes the other half.
     let retry_options = options.clone();
     let label = kind.name().to_string();
-    let Ok((task_id, rx)) = manager.start(kind.clone(), label.clone(), move |ctx| {
-        import::run(&options, ctx)
-    }) else {
+    // High priority and retried twice. High because the user just asked for
+    // this — the panel should not bury it under a backfill that is outranking
+    // nothing. Retried because every way this job fails *as a whole* is an
+    // opening one (open the database, set the pragmas, begin a batch), and
+    // those are transient when another process holds the same library. A re-run
+    // is safe: the dedup pre-check drops what the library already holds and the
+    // commit path dedups by content hash, so files the first attempt committed
+    // are skipped rather than imported twice.
+    let Ok((task_id, rx)) = manager.start_with_retry_and_priority(
+        kind.clone(),
+        label.clone(),
+        RetryPolicy::times(2),
+        TaskPriority::High,
+        move || {
+            let options = options.clone();
+            Box::new(move |ctx| import::run(&options, ctx))
+        },
+    ) else {
         return false;
     };
 

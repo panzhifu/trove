@@ -177,8 +177,10 @@ pub fn pipeline_stages(disabled: &[String]) -> Vec<Arc<dyn Stage>> {
         .pipeline_stages(disabled)
 }
 
-/// Every custom task kind registered by enabled plugins. The UI uses this to
-/// populate the task panel's filter and the settings page's plugin list.
+/// Every custom task kind registered by enabled plugins. [`Library::assemble`]
+/// feeds this to the task manager at open, which is what lets a plugin start a
+/// job under [`TaskKind::Custom`](crate::tasks::TaskKind::Custom) at all — an
+/// undeclared name is refused rather than quietly given a slot.
 pub fn task_kinds(disabled: &[String]) -> Vec<&'static str> {
     global()
         .lock()
@@ -234,5 +236,32 @@ mod tests {
         registry.register(Arc::new(Stages("stages")));
         assert_eq!(registry.pipeline_stages(&[]).len(), 1);
         assert!(registry.pipeline_stages(&["stages".to_string()]).is_empty());
+    }
+
+    /// A plugin that declares task kinds but contributes no stages.
+    struct Kinds(&'static str, &'static [&'static str]);
+    impl Plugin for Kinds {
+        fn name(&self) -> &'static str {
+            self.0
+        }
+        fn task_kinds(&self) -> Vec<&'static str> {
+            self.1.to_vec()
+        }
+    }
+
+    /// The declared-kind list is what lets the task manager accept
+    /// [`TaskKind::Custom`], so a switched-off plugin must not keep a claim on
+    /// a slot it will never use.
+    #[test]
+    fn disabled_plugins_declare_no_task_kinds() {
+        let mut registry = Registry::new();
+        registry.register(Arc::new(Kinds("notes", &["notes-index"])));
+        registry.register(Arc::new(Kinds("off", &["off-sync"])));
+        assert_eq!(registry.task_kinds(&[]), vec!["notes-index", "off-sync"]);
+        assert_eq!(
+            registry.task_kinds(&["off".to_string()]),
+            vec!["notes-index"],
+            "a switched-off plugin still claimed a task kind"
+        );
     }
 }

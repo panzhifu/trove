@@ -18,7 +18,8 @@ use trove_core::tasks::import::{ImportOptions, ImportSource};
 use trove_core::tasks::{TaskKind, TaskManager};
 
 use crate::cli::{
-    AnalyzeArgs, CollectionCommand, Ids, ImportArgs, IndexCommand, PurgeArgs, SetArgs, TagArgs,
+    AnalyzeArgs, CollectionCommand, Ids, ImportArgs, IndexCommand, PurgeArgs, SequenceCommand,
+    SetArgs, TagArgs,
 };
 use crate::ctx::{CliError, Env, Rendered, parse_asset_ids, resolve_collection};
 
@@ -693,4 +694,60 @@ fn undo_analysis(env: &Env, request: AiAnalysisRunRequest) -> Result<Rendered, C
         ));
     }
     Ok(Rendered::new(result, human))
+}
+
+// ---------------------------------------------------------------------------
+// `trove sequence …`
+// ---------------------------------------------------------------------------
+
+/// Group frames into a run, change its rate, or undo the grouping.
+///
+/// Nothing here touches a file: a sequence is a record over assets that already
+/// exist, so `dissolve` reverses `create` completely and every rule the store
+/// enforces (three frames minimum, one folder, matching sizes, not already
+/// grouped) arrives as a refusal naming the rule it hit.
+pub fn sequence(env: &Env, command: &SequenceCommand) -> Result<Rendered, CliError> {
+    use uuid::Uuid;
+
+    /// `parse_asset_id`'s message says "asset id", which would be a lie here.
+    fn parse_sequence_id(raw: &str) -> Result<Uuid, CliError> {
+        Uuid::parse_str(raw.trim())
+            .map_err(|_| CliError::usage(format!("'{raw}' is not a sequence id; ids are UUIDs")))
+    }
+
+    match command {
+        SequenceCommand::Create { fps, assets } => {
+            let ids = parse_asset_ids(assets)?;
+            let id = env.library.create_sequence(&ids, *fps)?;
+            Ok(Rendered::new(
+                json!({ "created": { "id": id, "frames": ids.len(), "fps": fps } }),
+                format!(
+                    "created sequence {id} from {} frames at {fps} fps",
+                    ids.len()
+                ),
+            ))
+        }
+
+        SequenceCommand::Dissolve { assets } => {
+            let ids = parse_asset_ids(assets)?;
+            let dissolved = env.library.dissolve_for_assets(&ids)?;
+            Ok(Rendered::new(
+                json!({ "dissolved": dissolved }),
+                if dissolved == 1 {
+                    "dissolved 1 sequence".to_string()
+                } else {
+                    format!("dissolved {dissolved} sequences")
+                },
+            ))
+        }
+
+        SequenceCommand::Fps { sequence, fps } => {
+            let id = parse_sequence_id(sequence)?;
+            env.library.set_sequence_fps(id, *fps)?;
+            Ok(Rendered::new(
+                json!({ "updated": { "id": id, "fps": fps } }),
+                format!("set sequence {id} to {fps} fps"),
+            ))
+        }
+    }
 }

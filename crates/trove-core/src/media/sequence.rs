@@ -26,6 +26,13 @@ use crate::model::AssetKind;
 /// The fewest frames that make a run. Two files named 1 and 2 are a pair.
 pub const MIN_FRAMES: usize = 3;
 
+/// The frame rate a run gets when the user groups frames without saying.
+///
+/// 24 is the convention a render or a film run is cut at, so it is the number
+/// that is wrong least often when nobody chose one. It is a starting value, not
+/// a decision: the rate is one `UPDATE` away and the CLI takes `--fps`.
+pub const DEFAULT_FPS: f64 = 24.0;
+
 /// How a frame's number is written in its own name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum NumberStyle {

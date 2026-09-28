@@ -231,6 +231,10 @@ pub struct Library {
     /// Background jobs (imports, maintenance, preview work) owned by this
     /// library; see [`crate::tasks`]. Cheap to share: `Arc` inside.
     tasks: std::sync::Arc<crate::tasks::TaskManager>,
+    /// Jobs the task journal recorded as still running or paused when the
+    /// previous process exited. Read once at open, before this library records
+    /// anything new; see [`Library::interrupted_tasks`].
+    interrupted: Vec<crate::store::task_journal::JournalEntry>,
     /// The Tantivy full-text index under `<cache root>/search_index` — a
     /// disposable derivative of the asset rows, fed by the search_queue
     /// outbox (schema triggers) and drained here.
@@ -316,22 +320,36 @@ impl Library {
         store: Store,
         text_index: crate::search::TextIndex,
     ) -> Self {
+        // One config read for the whole assembly: undo depth, which plugins are
+        // off, and therefore which custom task kinds may be scheduled.
+        let config = crate::config::AppConfig::load();
         // Open a separate SQLite connection for the task journal. The main
         // Store connection is thread-confined (Rc<RefCell<…>), so the journal
         // needs its own. WAL mode lets both coexist on the same database file.
         let mut tasks = crate::tasks::TaskManager::new();
+        tasks.declare_task_kinds(&crate::plugins::task_kinds(&config.disabled_plugins));
+        let mut interrupted = Vec::new();
         if let Ok(journal_conn) = rusqlite::Connection::open(root.join("library.db")) {
             journal_conn
                 .execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=2000;")
                 .ok();
+            // Read before handing the connection to the manager: work that was
+            // running when this process died is surfaced (see
+            // `Library::interrupted_tasks`) before anything new is recorded.
+            interrupted = crate::store::task_journal::load_interrupted(&journal_conn)
+                .unwrap_or_else(|error| {
+                    tracing::warn!(%error, "task journal unread; no interrupted work to report");
+                    Vec::new()
+                });
             tasks.set_journal(journal_conn);
         }
         let lib = Self {
             store,
             root,
             cache,
-            undo: SharedUndoStack::with_cap(crate::config::AppConfig::load().undo_cap()),
+            undo: SharedUndoStack::with_cap(config.undo_cap()),
             tasks: std::sync::Arc::new(tasks),
+            interrupted,
             text_index,
             vector_index: std::cell::RefCell::new(None),
         };
@@ -413,8 +431,27 @@ impl Library {
             cache,
             undo: SharedUndoStack::with_cap(crate::history::undo::DEFAULT_UNDO_CAP),
             tasks: std::sync::Arc::new(crate::tasks::TaskManager::new()),
+            interrupted: Vec::new(),
             vector_index: std::cell::RefCell::new(None),
         })
+    }
+
+    /// Jobs that were running when the previous process exited, as the task
+    /// journal recorded them.
+    ///
+    /// Surfaced, not resumed: a row carries what the job was and how far it
+    /// got, but re-running it needs the inputs that started it, and those live
+    /// only in this session's controller. So the panel can tell the user their
+    /// import stopped at 320 of 1200 — starting another one is their decision,
+    /// not something the library can infer.
+    pub fn interrupted_tasks(&self) -> &[crate::store::task_journal::JournalEntry] {
+        &self.interrupted
+    }
+
+    /// Clear the interrupted list once the user has seen it, so the notice does
+    /// not return on every repaint of the panel.
+    pub fn clear_interrupted_tasks(&mut self) {
+        self.interrupted.clear();
     }
 
     /// The background task manager. One running job per kind; progress and
@@ -643,11 +680,84 @@ impl Library {
             cache_root: self.cache.clone(),
         };
         let label = format!("embedding backfill ({})", provider.id());
-        self.tasks.start(
+        // Retried, and at low priority. Every way this job can fail as a whole
+        // is in its opening — open the database, set the pragmas, list assets —
+        // and each of those is transient when the CLI holds the same library:
+        // retrying two steps later gets a lock rather than a dead job. Past that
+        // point a per-asset failure is recorded and the run continues, so
+        // retrying cannot re-encode what already has an embedding.
+        //
+        // Low priority because it is a backfill: the user asked for it once and
+        // it outranks nothing they are waiting on.
+        self.tasks.start_with_retry_and_priority(
             crate::tasks::TaskKind::EmbeddingBackfill,
             label,
-            move |ctx| crate::tasks::embed::run(&options, provider.as_ref(), ctx),
+            crate::tasks::RetryPolicy::times(2),
+            crate::tasks::TaskPriority::Low,
+            move || {
+                let options = options.clone();
+                let provider = provider.clone();
+                Box::new(move |ctx| crate::tasks::embed::run(&options, provider.as_ref(), ctx))
+            },
         )
+    }
+
+    // -- image sequences -----------------------------------------------------
+
+    /// Group `ids` into one image sequence at `fps` frames per second.
+    ///
+    /// The frames stay ordinary assets — nothing is copied, moved or rewritten
+    /// — and this records only which of them form a run and in what order, so
+    /// the listing rule can hide every frame but the first. Every refusal names
+    /// the thing that went wrong rather than reporting a count: fewer than
+    /// three frames, a frame already in another run, a selection spanning more
+    /// than one directory, or frames whose dimensions disagree (a run of mixed
+    /// sizes animates as a flicker, so it is a mistake rather than a shot).
+    ///
+    /// Not recorded on the undo stack, and it does not need to be: dissolving
+    /// removes the group rows and touches nothing else, so one click reverses
+    /// exactly what this did.
+    pub fn create_sequence(&self, ids: &[Uuid], fps: f64) -> Result<Uuid> {
+        crate::store::sequences::create(self.store.conn(), ids, fps)
+    }
+
+    /// Dissolve the named sequences, leaving their frames as the individual
+    /// assets they were before grouping.
+    pub fn dissolve_sequences(&self, ids: &[Uuid]) -> Result<usize> {
+        crate::store::sequences::dissolve(self.store.conn(), ids)
+    }
+
+    /// Dissolve every sequence that has one of `asset_ids` as a frame.
+    ///
+    /// The selection the user makes is of *assets*, and a run is identified by
+    /// its own id, so this is the shape the grid's context menu needs: select
+    /// any frame — the visible card or a hidden member — and its whole run goes.
+    pub fn dissolve_for_assets(&self, asset_ids: &[Uuid]) -> Result<usize> {
+        let conn = self.store.conn();
+        let mut ids: Vec<Uuid> = Vec::new();
+        for asset_id in asset_ids {
+            if let Some(m) = crate::store::sequences::membership(conn, *asset_id)?
+                && !ids.contains(&m.sequence_id)
+            {
+                ids.push(m.sequence_id);
+            }
+        }
+        crate::store::sequences::dissolve(conn, &ids)
+    }
+
+    /// Change a run's frame rate. The store's `CHECK` bounds it at 1…240 and
+    /// says so in words the UI can show.
+    pub fn set_sequence_fps(&self, id: Uuid, fps: f64) -> Result<()> {
+        crate::store::sequences::set_fps(self.store.conn(), id, fps)
+    }
+
+    /// The run this asset is a frame of, if it is one — with its position and
+    /// the full frame order, which is what a card carousel or a player walks.
+    pub fn sequence_of(
+        &self,
+        asset_id: Uuid,
+    ) -> Result<Option<crate::store::sequences::Membership>> {
+        crate::store::sequences::membership(self.store.conn(), asset_id)
     }
 
     // -- AI analysis ---------------------------------------------------------
@@ -673,10 +783,25 @@ impl Library {
     > {
         let options = self.ai_analysis_options(&request);
         let label = format!("ai analysis ({})", provider.model_version());
-        self.tasks
-            .start(crate::tasks::TaskKind::AiAnalysis, label, move |ctx| {
-                crate::tasks::ai_analysis::run(&options, provider.as_ref(), ctx)
-            })
+        // Retried, and cheap to retry: the run is idempotent through the record
+        // it writes per asset (see `tasks::ai_analysis`'s module doc — "a second
+        // run skips every asset whose fingerprint already matches, which makes
+        // re-running free"). So a retry after the job died re-asks nothing that
+        // was already answered, and the only failures that reach here are the
+        // opening ones — a locked database, unreadable vocabulary — which are
+        // exactly the transient kind.
+        self.tasks.start_with_retry(
+            crate::tasks::TaskKind::AiAnalysis,
+            label,
+            crate::tasks::RetryPolicy::times(2),
+            move || {
+                let options = options.clone();
+                let provider = provider.clone();
+                Box::new(move |ctx| {
+                    crate::tasks::ai_analysis::run(&options, provider.as_ref(), ctx)
+                })
+            },
+        )
     }
 
     /// Detach everything a previous analysis run added.
@@ -697,10 +822,17 @@ impl Library {
         crate::tasks::StartError,
     > {
         let options = self.ai_analysis_options(&request);
-        self.tasks.start(
+        // Retried too, because taking tags back is a repair: detaching a tag
+        // that is already detached and clearing a marker that is already clear
+        // both do nothing, so a second attempt cannot overshoot.
+        self.tasks.start_with_retry(
             crate::tasks::TaskKind::AiAnalysis,
             "ai analysis undo",
-            move |ctx| crate::tasks::ai_analysis::undo(&options, ctx),
+            crate::tasks::RetryPolicy::times(2),
+            move || {
+                let options = options.clone();
+                Box::new(move |ctx| crate::tasks::ai_analysis::undo(&options, ctx))
+            },
         )
     }
 
@@ -3618,6 +3750,91 @@ mod tests {
             .semantic_search(provider.as_ref(), "red car in snow", &AssetQuery::default())
             .unwrap();
         assert_eq!(page.total, 0);
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A frame of a run: an image asset whose `source_path` says which folder it
+    /// came from, since that is what the grouping rule reads.
+    fn frame(dir: &Path, name: &str, id: Uuid) -> crate::model::Asset {
+        let path = dir.join(name);
+        let mut asset = crate::model::test_asset(name, AssetKind::Image, id);
+        asset.facts.source_path = Some(path.to_string_lossy().to_string());
+        (asset.width, asset.height) = (Some(1920), Some(1080));
+        asset
+    }
+
+    /// The facade is the only thing between the grid's selection and the two side
+    /// tables, so it is tested at that level: every refusal has to name the
+    /// reason, because the menu shows that sentence to the user, and the read
+    /// back has to agree with what went in.
+    #[test]
+    fn sequences_can_be_grouped_and_ungrouped_through_the_facade() {
+        let (lib, root) = temp_library("sequences");
+        let dir = root.join("renders");
+        std::fs::create_dir_all(&dir).unwrap();
+        let ids: Vec<Uuid> = (0..4).map(|_| crate::model::new_id()).collect();
+        for (ix, id) in ids.iter().enumerate() {
+            let name = format!("shot_{:03}.png", ix + 1);
+            assets::insert(lib.store.conn(), &frame(&dir, &name, *id)).unwrap();
+        }
+
+        // Refusals first, while nothing is a member yet, so each one fails for
+        // the reason it is meant to.
+        assert!(
+            lib.create_sequence(&ids, 0.0).is_err(),
+            "a rate of zero is not a rate"
+        );
+        assert!(
+            lib.create_sequence(&ids[..2], 24.0).is_err(),
+            "two frames is not a run"
+        );
+        let stray = crate::model::new_id();
+        assets::insert(
+            lib.store.conn(),
+            &frame(&root.join("other"), "elsewhere.png", stray),
+        )
+        .unwrap();
+        let mut cross = ids[..2].to_vec();
+        cross.push(stray);
+        assert!(
+            lib.create_sequence(&cross, 24.0).is_err(),
+            "a run that spans folders is two shots"
+        );
+
+        let seq = lib.create_sequence(&ids, 24.0).unwrap();
+        let first = lib
+            .sequence_of(ids[0])
+            .unwrap()
+            .expect("the first frame is a member");
+        assert_eq!(first.sequence_id, seq);
+        assert_eq!(first.frames.len(), 4, "the run reads back whole");
+        assert_eq!(first.position, 0, "shot_001 is the card the grid shows");
+        assert_eq!(first.fps(), 24.0);
+        assert_eq!(
+            lib.sequence_of(ids[3]).unwrap().unwrap().position,
+            3,
+            "the numbered order survived, not the selection order"
+        );
+
+        lib.set_sequence_fps(seq, 12.0).unwrap();
+        assert_eq!(lib.sequence_of(ids[0]).unwrap().unwrap().fps(), 12.0);
+
+        // A frame already in a run cannot start a second one.
+        assert!(
+            lib.create_sequence(&[ids[1], stray, ids[2]], 24.0).is_err(),
+            "a member was re-grouped"
+        );
+
+        // Dissolving by selecting *any* frame reaches the whole run — that is
+        // what makes the menu item work on a hidden member too.
+        assert_eq!(lib.dissolve_for_assets(&[ids[2]]).unwrap(), 1);
+        assert!(
+            lib.sequence_of(ids[0]).unwrap().is_none(),
+            "the frames are ordinary assets again"
+        );
+        // Dissolving what is already gone is not an error and dissolves nothing.
+        assert_eq!(lib.dissolve_for_assets(&[ids[2]]).unwrap(), 0);
 
         std::fs::remove_dir_all(&root).ok();
     }

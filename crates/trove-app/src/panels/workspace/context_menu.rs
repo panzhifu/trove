@@ -232,6 +232,81 @@ pub(crate) fn asset_context_menu(
             add_submenu,
         ))
         .separator();
+
+    // Image sequences. The store owns every rule — at least three frames, one
+    // folder, matching sizes, not already a member of another run — and each
+    // refusal names what went wrong, so the menu decides only whether an item is
+    // worth showing and lets the status-bar notice carry the answer. Grouping
+    // uses the default rate; a run's rate is one change away and the CLI takes
+    // `--fps`.
+    let targets = controller.read(cx).action_targets(asset_id);
+    let in_sequence = controller
+        .read(cx)
+        .library
+        .sequence_of(asset_id)
+        .ok()
+        .flatten()
+        .is_some();
+    if is_image && !in_sequence && targets.len() >= trove_core::media::sequence::MIN_FRAMES {
+        let c_sequence = controller.clone();
+        menu = menu.item(
+            PopupMenuItem::new(rust_i18n::t!("workspace.create_sequence").to_string()).on_click(
+                move |_, _, cx| {
+                    c_sequence.update(cx, move |ctl, cx| {
+                        let ids = ctl.action_targets(asset_id);
+                        match ctl
+                            .library
+                            .create_sequence(&ids, trove_core::media::sequence::DEFAULT_FPS)
+                        {
+                            Ok(_) => ctl.generation += 1,
+                            Err(error) => {
+                                ctl.notice = Some(
+                                    rust_i18n::t!(
+                                        "workspace.sequence_failed",
+                                        error = error.to_string()
+                                    )
+                                    .to_string(),
+                                );
+                            }
+                        }
+                        cx.notify();
+                    });
+                },
+            ),
+        );
+    }
+    if in_sequence {
+        let c_dissolve = controller.clone();
+        menu = menu.item(
+            PopupMenuItem::new(rust_i18n::t!("workspace.dissolve_sequence").to_string()).on_click(
+                move |_, _, cx| {
+                    c_dissolve.update(cx, move |ctl, cx| {
+                        let ids = ctl.action_targets(asset_id);
+                        match ctl.library.dissolve_for_assets(&ids) {
+                            Ok(0) => {
+                                ctl.notice = Some(
+                                    rust_i18n::t!("workspace.sequence_none_to_dissolve")
+                                        .to_string(),
+                                );
+                            }
+                            Ok(_) => ctl.generation += 1,
+                            Err(error) => {
+                                ctl.notice = Some(
+                                    rust_i18n::t!(
+                                        "workspace.sequence_failed",
+                                        error = error.to_string()
+                                    )
+                                    .to_string(),
+                                );
+                            }
+                        }
+                        cx.notify();
+                    });
+                },
+            ),
+        );
+        menu = menu.separator();
+    }
     if browsed_collection.is_some() {
         menu = menu.item(
             PopupMenuItem::new(rust_i18n::t!("workspace.remove_from_collection").to_string())

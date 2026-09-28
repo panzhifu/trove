@@ -130,9 +130,14 @@ impl ModelViewport {
             return;
         }
 
-        let started = self.tasks.start(
+        // High priority: this parse is the reason a viewport is still showing
+        // a placeholder, so it outranks any backfill on the panel. Not retried —
+        // a mesh that will not parse will not parse again a moment later, and a
+        // retry would only delay the error the user needs to see.
+        let started = self.tasks.start_with_priority(
             trove_core::tasks::TaskKind::ModelPreview,
             format!("parse {}", path.display()),
+            trove_core::tasks::TaskPriority::High,
             move |ctx| {
                 let _ = ctx; // parsing is one indivisible unit; no checkpoints
                 Self::load_mesh(&path)
