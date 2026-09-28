@@ -251,6 +251,23 @@ impl WorkspacePanel {
         }
     }
 
+    /// The asset preview panel, whichever player it hosts.
+    fn preview_asset_panel(&self) -> Option<Entity<AssetPreviewPanel>> {
+        match &self.preview {
+            Some(MainPreview::Asset(panel)) => Some(panel.clone()),
+            _ => None,
+        }
+    }
+
+    /// Whether the open preview has a picture the space bar can hold and
+    /// resume: a video or an animated image.
+    fn preview_has_playback(&self, cx: &App) -> bool {
+        match &self.preview {
+            Some(MainPreview::Asset(panel)) => panel.read(cx).has_playback(),
+            _ => false,
+        }
+    }
+
     /// Which renderer is painting an open model viewport, for the status
     /// bar. `None` when no model preview is open.
     pub(crate) fn viewport_backend(&self) -> Option<&str> {
@@ -592,7 +609,7 @@ impl Render for WorkspacePanel {
         // letters and characters bound there (`f` for fullscreen, `space` for
         // play/pause) would otherwise be those characters, gone from typing in
         // the search box, which shares this node's `Workspace` context.
-        let video_preview = self.preview_player(cx).is_some();
+        let playback_preview = self.preview_has_playback(cx);
         // A node carries one `KeyContext`, but a `KeyContext` is a *set* of
         // names, parsed from a whitespace-separated string. Setting the second
         // name on its own would replace the first: gpui reads a node's single
@@ -600,7 +617,7 @@ impl Render for WorkspacePanel {
         // `Workspace` would vanish from the path for as long as a video was on
         // screen and take every binding scoped to it with it — Escape out of
         // the preview, the arrows that step through it, `Enter`, `Delete`.
-        let key_context = if video_preview {
+        let key_context = if playback_preview {
             format!(
                 "{} {}",
                 crate::app::keybindings::WORKSPACE_CONTEXT,
@@ -649,12 +666,12 @@ impl Render for WorkspacePanel {
                 this.toggle_quick_look(cx);
             }))
             .on_action(cx.listener(|this, _: &TogglePlayback, _, cx| {
-                // Space holds and resumes the previewed clip. The grid's own
-                // space — quick look — is bound in `AssetGrid`, which is not on
-                // the focus path while a preview covers the grid, so the two
-                // never both answer the same press.
-                if let Some(player) = this.preview_player(cx) {
-                    player.update(cx, |player, cx| player.toggle_play(cx));
+                // Space holds and resumes the previewed clip, video or GIF.
+                // The grid's own space — quick look — is bound in `AssetGrid`,
+                // which is not on the focus path while a preview covers the
+                // grid, so the two never both answer the same press.
+                if let Some(panel) = this.preview_asset_panel() {
+                    panel.update(cx, |panel, cx| panel.toggle_playback(cx));
                 }
             }))
             .on_action(cx.listener(|this, _: &ClearSelection, window, cx| {
@@ -1459,6 +1476,28 @@ mod tests {
             font_family: None,
             font_blob: None,
         }
+    }
+
+    /// A model has no pixel size of its own; its thumbnail is the fixed-shape
+    /// card, so the tile must take the card's shape. The 1:1 fallback
+    /// letterboxes the 4:3 card and leaves visible bands at the top and bottom
+    /// of every model tile.
+    #[test]
+    fn a_model_cell_takes_the_card_aspect() {
+        let mut model = cell(1, "2026-09-10");
+        model.kind = AssetKind::Model;
+        model.width = None;
+        model.height = None;
+        assert_eq!(
+            model.aspect(),
+            trove_core::media::thumb::MODEL_CARD_ASPECT,
+            "a model tile must be cut to the card, not the square fallback"
+        );
+
+        // The recorded dimensions still win for kinds whose thumbnail is the
+        // asset's own pixels.
+        let image = cell(2, "2026-09-10");
+        assert_eq!(image.aspect(), 1.0);
     }
 
     /// Appending a page must leave the rows the user is looking at alone: they

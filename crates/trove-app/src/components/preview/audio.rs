@@ -20,7 +20,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use gpui_kit::base::{ElementExt as _, v_flex};
-use gpui_kit::component::ActiveTheme;
+use gpui_kit::component::{ActiveTheme, Size};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
@@ -319,6 +319,7 @@ impl Render for AudioPlayer {
             &self.transport.slider,
             transport::play_pause_button(
                 self.transport.playing,
+                Size::Small,
                 &host,
                 AudioPlayer::toggle_playing,
             ),

@@ -385,6 +385,14 @@ fn write_font_card(blob_path: &Path, out: &Path) -> Option<PathBuf> {
 /// Landscape size of a model card, in pixels.
 const MODEL_CARD_SIZE: (u32, u32) = (512, 384);
 
+/// Aspect ratio (width / height) of a model card.
+///
+/// A model has no pixel size of its own, and [`ensure`] always writes its
+/// thumbnail at the model card's fixed landscape size. The grid lays model
+/// tiles at this shape so the card fills its tile edge to edge instead of
+/// being letterboxed inside a guessed square.
+pub const MODEL_CARD_ASPECT: f32 = MODEL_CARD_SIZE.0 as f32 / MODEL_CARD_SIZE.1 as f32;
+
 /// Render a "model card" for a mesh blob: the geometry framed from the
 /// default three-quarter camera and shaded by the CPU rasterizer.
 ///

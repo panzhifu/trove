@@ -47,10 +47,15 @@ use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::notification::Notification;
 use gpui_kit::component::slider::{Slider, SliderEvent, SliderState};
 use gpui_kit::component::{ActiveTheme, Sizable, WindowExt as _};
+// The component library's control size, aliased: the bare name `Size` in this
+// file is GPUI's `Size<Pixels>` geometry type, which the stage measurement
+// uses.
+use gpui_kit::component::Size as ControlSize;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use trove_core::media::video::{self, FramePipe, VideoStreamFacts};
 
+use super::chrome::{self, Chrome};
 use super::soundtrack::AudioEngine;
 use super::transport;
 use super::{AssetPreviewData, AssetPreviewPanel, fallback};
@@ -59,19 +64,16 @@ use crate::components::controls::muted_label;
 use crate::library::LibraryController;
 use crate::library::jobs;
 
-/// How long the decode loops sleep while paused before looking again.
+/// How long the audio engine's idle loops sleep while there is nothing to do.
 pub(super) const IDLE_POLL: Duration = Duration::from_millis(120);
 
-/// Fullscreen chrome: how long the pointer must rest before the floating
-/// transport row hides itself.
-const CONTROLS_HIDE_AFTER: Duration = Duration::from_millis(2500);
+/// How long the picture loops sleep while paused. Short enough that pressing
+/// play reads as instant, long enough to stay free.
+const PAUSED_POLL: Duration = Duration::from_millis(16);
 
-/// How often the fullscreen auto-hide watcher checks that countdown.
-const CONTROLS_WATCH_INTERVAL: Duration = Duration::from_millis(400);
-
-/// Bottom band of the fullscreen window that counts as "on the controls":
-/// the pointer inside it keeps the floating row visible.
-const CONTROLS_BAND: f32 = 96.;
+/// The presenter's paused tick: it only has to notice a resume, so it can be
+/// slower than [`PRESENT_POLL`] without being felt.
+const PAUSED_PRESENT_POLL: Duration = Duration::from_millis(24);
 
 /// How early (relative to the master clock) a frame may be shown. A few
 /// milliseconds early is invisible; late is judder.
@@ -133,7 +135,13 @@ pub(super) fn load_player(panel: Entity<AssetPreviewPanel>, cx: &mut App) {
             // One engine per playback, owned by the panel: windows come and go
             // without touching the soundtrack.
             let audio = has_audio.then(|| AudioEngine::spawn(path.clone(), cx));
-            this.video = Some(VideoPlayer::spawn(path, facts, poster, audio, cx));
+            // The still the panel is standing in with fills the content area,
+            // so seed the stage with that same area: the first frame occupies
+            // the same box instead of the picture's intrinsic pixels.
+            let stage_area = this.video_stage_area(cx);
+            this.video = Some(VideoPlayer::spawn(
+                path, facts, poster, audio, stage_area, cx,
+            ));
             cx.notify();
         });
     })
@@ -309,9 +317,11 @@ pub(crate) struct VideoPlayer {
     /// drag and the loop stops feeding it, so the thumb is not yanked back
     /// to the playing position every frame.
     seeking: bool,
-    /// Fullscreen chrome: whether the floating transport row is showing.
-    /// Always true outside fullscreen, where the row lives in the layout.
-    controls_shown: bool,
+    /// Visibility of the floating transport row.
+    chrome: Chrome,
+    /// The player's own box, so the bar reveals at the picture's bottom edge
+    /// instead of the window's.
+    chrome_bounds: Entity<Bounds<Pixels>>,
     /// Pan/zoom of the picture stage, the same gestures the still preview
     /// and the 3D viewport carry: wheel zooms toward the cursor, drag pans,
     /// double click resets. The transport row is outside the stage, so the
@@ -323,14 +333,6 @@ pub(crate) struct VideoPlayer {
     /// running.
     drag_from: Point<Pixels>,
     dragging: bool,
-    /// Pointer is on the floating row (or its volume popup): the auto-hide
-    /// watcher leaves it alone then.
-    controls_hovered: bool,
-    /// When the pointer last moved in fullscreen; `None` starts the
-    /// countdown afresh.
-    controls_revealed_at: Option<std::time::Instant>,
-    /// Whether the auto-hide watcher was spawned (fullscreen only).
-    watcher_started: bool,
     _subscription: Subscription,
 }
 
@@ -350,9 +352,12 @@ impl VideoPlayer {
         facts: VideoStreamFacts,
         poster: Option<PathBuf>,
         audio: Option<Entity<AudioEngine>>,
+        stage_area: Option<(f32, f32)>,
         cx: &mut App,
     ) -> Entity<Self> {
-        cx.new(|cx| Self::with_facts(path, facts, poster, audio, cx))
+        let entity = cx.new(|cx| Self::with_facts(path, facts, poster, audio, stage_area, cx));
+        chrome::watch(entity.downgrade(), cx, Self::chrome_mut);
+        entity
     }
 
     fn with_facts(
@@ -360,6 +365,7 @@ impl VideoPlayer {
         facts: VideoStreamFacts,
         poster: Option<PathBuf>,
         audio: Option<Entity<AudioEngine>>,
+        stage_area: Option<(f32, f32)>,
         cx: &mut Context<Self>,
     ) -> Self {
         let slider = cx.new(|_| {
@@ -438,7 +444,16 @@ impl VideoPlayer {
             ..Default::default()
         }));
         let alive = Arc::new(AtomicBool::new(true));
-        let stage = cx.new(|_| size(px(0.), px(0.)));
+        // Seeded with the content area the panel measured while the still was
+        // standing in, so `stage_base` answers with a real box from the first
+        // frame instead of leaving the picture to gpui's intrinsic-pixel
+        // layout. The transport row floats over the stage, so the measured
+        // stage is that same area and nothing shifts when it arrives.
+        let stage = cx.new(|_| {
+            let (w, h) = stage_area.unwrap_or((0.0, 0.0));
+            size(px(w), px(h))
+        });
+        let chrome_bounds = cx.new(|_| Bounds::default());
         let mut this = Self {
             path,
             facts,
@@ -459,10 +474,8 @@ impl VideoPlayer {
             fullscreen_mode: false,
             seeking: false,
             volume_open: false,
-            controls_shown: true,
-            controls_hovered: false,
-            controls_revealed_at: None,
-            watcher_started: false,
+            chrome: Chrome::new(),
+            chrome_bounds,
             pan: super::PanZoom::new(),
             stage,
             drag_from: Point::default(),
@@ -525,18 +538,20 @@ impl VideoPlayer {
                     .as_ref()
                     .and_then(|clock| clock.lock().ok().and_then(|reading| *reading))
                     .map(|(ms, at)| ms + at.elapsed().as_secs_f64() * 1000.0);
-                if !playing {
-                    // Paused (or scrubbing): let go of the pipe so ffmpeg
-                    // blocks on a full one instead of running ahead.
-                    pipe = None;
-                    due = Instant::now();
-                    cx.background_executor().timer(IDLE_POLL).await;
-                    continue;
-                }
                 if let Some(target) = seek {
+                    // A seek means a new position, so the pipe goes: it reopens
+                    // at the target. While paused it reopens on resume.
                     pipe = None;
                     due = Instant::now();
                     playhead = target as f64;
+                }
+                if !playing {
+                    // Keep the pipe: ffmpeg blocks on the full one, and
+                    // resuming reads the next frame instead of paying for a
+                    // fresh process and a seek.
+                    due = Instant::now();
+                    cx.background_executor().timer(PAUSED_POLL).await;
+                    continue;
                 }
 
                 if pipe.is_none() {
@@ -737,7 +752,6 @@ impl VideoPlayer {
         if self.fullscreen_mode != on {
             self.fullscreen_mode = on;
             if on {
-                self.start_controls_watcher(cx);
                 self.reveal_controls(cx);
             }
         }
@@ -768,7 +782,7 @@ impl VideoPlayer {
                 let tick = if playing {
                     PRESENT_POLL
                 } else {
-                    Duration::from_millis(250)
+                    PAUSED_PRESENT_POLL
                 };
                 cx.background_executor().timer(tick).await;
             }
@@ -785,47 +799,44 @@ impl VideoPlayer {
         }
     }
 
-    /// Show the fullscreen controls and restart the auto-hide countdown.
-    fn reveal_controls(&mut self, cx: &mut Context<Self>) {
-        self.controls_revealed_at = Some(std::time::Instant::now());
-        if !self.controls_shown {
-            self.controls_shown = true;
+    /// The chrome accessor the shared auto-hide watcher drives.
+    fn chrome_mut(&mut self) -> &mut Chrome {
+        &mut self.chrome
+    }
+
+    /// The floating transport bar: one surface in both modes, no separator
+    /// line — the popover colour carries the contrast on its own.
+    fn chrome_bar(&self, cx: &mut Context<Self>) -> Div {
+        div()
+            .absolute()
+            .bottom_0()
+            .left_0()
+            .right_0()
+            .px_3()
+            .py_2()
+            .bg(cx.theme().popover)
+            .child(self.controls(cx))
+    }
+
+    /// The pointer moved over the player: reveal the bar when it reaches the
+    /// bottom edge.
+    fn on_pointer_moved(
+        &mut self,
+        event: &MouseMoveEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let bounds = *self.chrome_bounds.read(cx);
+        if self.chrome.moved(bounds, event.position) {
             cx.notify();
         }
     }
 
-    /// Spawn the watcher that hides the fullscreen controls once the
-    /// pointer has rested off them. Only the fullscreen player starts it,
-    /// so nothing ticks outside fullscreen.
-    fn start_controls_watcher(&mut self, cx: &mut Context<Self>) {
-        if self.watcher_started {
-            return;
+    /// Bring the bar up and restart its auto-hide countdown.
+    fn reveal_controls(&mut self, cx: &mut Context<Self>) {
+        if self.chrome.reveal() {
+            cx.notify();
         }
-        self.watcher_started = true;
-        cx.spawn(async move |weak, cx| {
-            loop {
-                cx.background_executor()
-                    .timer(CONTROLS_WATCH_INTERVAL)
-                    .await;
-                let hide = weak.update(cx, |this, _| {
-                    this.controls_shown
-                        && !this.controls_hovered
-                        && !this.volume_open
-                        && this
-                            .controls_revealed_at
-                            .is_some_and(|at| at.elapsed() >= CONTROLS_HIDE_AFTER)
-                });
-                let Ok(hide) = hide else { break };
-                if hide {
-                    let _ = weak.update(cx, |this, cx| {
-                        this.controls_shown = false;
-                        this.controls_revealed_at = None;
-                        cx.notify();
-                    });
-                }
-            }
-        })
-        .detach();
     }
 
     /// Whether the file carries an audio stream.
@@ -845,13 +856,19 @@ impl VideoPlayer {
     /// still starting, or an empty box when there is neither.
     ///
     /// The box comes from [`Self::stage_base`] — the stream's own geometry
-    /// fitted into the measured stage — rather than from whichever picture
-    /// happens to be in hand. gpui lays an `img` out at its intrinsic pixels
-    /// whenever the style leaves the size auto, and the poster is capped at the
-    /// thumbnail's 512 on its long edge while a decoded frame is capped at
+    /// fitted into the stage — rather than from whichever picture happens to
+    /// be in hand. gpui lays an `img` out at its intrinsic pixels whenever the
+    /// style leaves the size auto, and the poster is capped at the thumbnail's
+    /// 512 on its long edge while a decoded frame is capped at
     /// [`trove_core::media::video::DEFAULT_MAX_WIDTH`]'s 720, so a box sized by
     /// the picture grew by forty percent the instant playback started. The
     /// poster and the frames now swap in place.
+    ///
+    /// The stage is seeded with the area the still was drawn in (see
+    /// [`Self::spawn`]), so the first frame after the player takes over is
+    /// fitted the same way the still was; the intrinsic-pixel branch below is
+    /// left for the one case with no box to fit at all — a stream the probe
+    /// reported no geometry for.
     fn frame_element(&self, cx: &Context<Self>) -> AnyElement {
         let source = self
             .shown
@@ -867,6 +884,8 @@ impl VideoPlayer {
                 .h(px(h))
                 .object_fit(ObjectFit::Contain)
                 .into_any_element(),
+            // No box to fit into: the probe reported no geometry. Nothing to
+            // scale against, so the picture keeps its intrinsic pixels.
             (Some(source), None) => img(source)
                 .max_h_full()
                 .max_w_full()
@@ -934,17 +953,19 @@ impl VideoPlayer {
     }
 
     /// The stage's fitted base at zoom 1.0: the stream's own geometry fitted
-    /// into the measured stage.
+    /// into the measured stage, through the one fit the still also uses (see
+    /// [`super::fit_box`]). The stage carries the panel's content area from
+    /// spawn, so this is a real box on the first frame rather than only after
+    /// `on_prepaint`.
     fn stage_base(&self, cx: &Context<Self>) -> Option<(f32, f32)> {
         let (vw, vh) = {
             let stage = self.stage.read(cx);
             (f32::from(stage.width), f32::from(stage.height))
         };
-        let (fw, fh) = (self.facts.width as f32, self.facts.height as f32);
-        if vw <= 0.0 || vh <= 0.0 || fw <= 0.0 || fh <= 0.0 {
-            return None;
-        }
-        Some((fw * (vw / fw).min(vh / fh), fh * (vw / fw).min(vh / fh)))
+        super::fit_box(
+            (self.facts.width as f32, self.facts.height as f32),
+            (vw, vh),
+        )
     }
 
     /// Wheel over the picture: zoom toward the cursor, like every preview.
@@ -1068,20 +1089,15 @@ impl VideoPlayer {
             .w_full()
             .gap_2()
             .items_center()
-            .child(
-                Button::new("video-play")
-                    .ghost()
-                    .xsmall()
-                    .icon(if playing {
-                        MediaIcon::Pause
-                    } else {
-                        MediaIcon::Play
-                    })
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        let playing = this.playing;
-                        this.set_playing(!playing, cx);
-                    })),
-            )
+            // One shared button for every player's play/pause: the same
+            // symbol, tooltip and click contract as the audio transport, at
+            // the compact size this row's other controls use.
+            .child(transport::play_pause_button(
+                playing,
+                ControlSize::XSmall,
+                &cx.entity(),
+                Self::toggle_play,
+            ))
             .child(div().flex_1().child(Slider::new(&self.slider).horizontal()))
             .child(muted_label(
                 format!(
@@ -1210,41 +1226,22 @@ impl Render for VideoPlayer {
             self.volume_slider
                 .update(cx, |slider, cx| slider.set_value(volume, window, cx));
         }
+        self.chrome.pin(self.volume_open);
+        let bar = self.chrome_bar(cx);
+        let chrome_bounds = self.chrome_bounds.clone();
         // Fullscreen is a bare picture: the transport row floats over the
-        // bottom edge and hides itself while the pointer rests, revealed by
-        // movement or by hovering it. Outside fullscreen the row stays in
-        // the flow, under the video.
+        // bottom edge and hides itself, revealed when the pointer reaches it.
         if self.fullscreen_mode {
-            let controls = div()
-                .absolute()
-                .bottom_0()
-                .left_0()
-                .right_0()
-                .px_3()
-                .py_2()
-                // The theme's own surface instead of a translucent black
-                // scrim: buttons, slider and time label keep the contrast
-                // they were designed for (a scrim leaves them dark-on-dark
-                // in a light theme).
-                .bg(cx.theme().popover)
-                .border_t_1()
-                .border_color(cx.theme().border)
-                .child(self.controls(cx));
-            let mut root = div()
+            let root = div()
                 .relative()
                 .size_full()
-                .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, window, cx| {
-                    // The pointer resting on the row (or reaching for it)
-                    // counts as hovering: the watcher then leaves it alone.
-                    let bottom = f32::from(window.bounds().size.height);
-                    let hovering = f32::from(event.position.y) >= bottom - CONTROLS_BAND;
-                    this.controls_hovered = hovering;
-                    if hovering {
-                        this.reveal_controls(cx);
-                    } else {
-                        this.controls_revealed_at = Some(std::time::Instant::now());
+                .on_prepaint({
+                    let bounds = chrome_bounds.clone();
+                    move |measured: Bounds<Pixels>, _, cx| {
+                        bounds.update(cx, |slot, _| *slot = measured);
                     }
-                }))
+                })
+                .on_mouse_move(cx.listener(Self::on_pointer_moved))
                 .child(
                     self.stage_container("video-stage-fs", cx)
                         .absolute()
@@ -1254,11 +1251,8 @@ impl Render for VideoPlayer {
                         .justify_center()
                         .overflow_hidden()
                         .child(self.frame_view(cx)),
-                );
-            if self.controls_shown {
-                root = root.child(controls);
-            }
-            return root
+                )
+                .when(self.chrome.shown(), |root| root.child(bar))
                 .when(self.volume_open, |root| {
                     root.child(div().absolute().inset_0().on_mouse_down(
                         MouseButton::Left,
@@ -1267,23 +1261,29 @@ impl Render for VideoPlayer {
                             cx.notify();
                         }),
                     ))
-                })
-                .into_any_element();
+                });
+            return root.into_any_element();
         }
 
-        // Fill the hosting stage: the frame takes all the height the
-        // transport controls leave, and the picture contains itself inside.
-        // The volume popup is anchored inside, so the root is positioned.
-        // While the popup is open a click-away overlay paints over
-        // everything (the deferred popup paints above it): any click closes
-        // it, exactly like a menu.
+        // Fill the hosting stage: the picture takes the whole area, with the
+        // transport row floating over its bottom edge — the same arrangement
+        // fullscreen uses, and the reason the still that stands in for the
+        // player occupies the same box. The volume popup is anchored inside,
+        // so the root is positioned; while it is open a click-away overlay
+        // paints over everything.
         v_flex()
             .relative()
             .flex_1()
             .min_h_0()
             .w_full()
-            .gap_2()
             .items_center()
+            .on_prepaint({
+                let bounds = chrome_bounds.clone();
+                move |measured: Bounds<Pixels>, _, cx| {
+                    bounds.update(cx, |slot, _| *slot = measured);
+                }
+            })
+            .on_mouse_move(cx.listener(Self::on_pointer_moved))
             .child(
                 self.stage_container("video-stage", cx)
                     .flex_1()
@@ -1295,7 +1295,7 @@ impl Render for VideoPlayer {
                     .overflow_hidden()
                     .child(self.frame_view(cx)),
             )
-            .child(self.controls(cx))
+            .when(self.chrome.shown(), |root| root.child(bar))
             .when(self.volume_open, |root| {
                 root.child(div().absolute().inset_0().on_mouse_down(
                     MouseButton::Left,

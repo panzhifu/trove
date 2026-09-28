@@ -52,6 +52,13 @@ pub(super) struct Cell {
 
 impl Cell {
     pub(super) fn aspect(&self) -> f32 {
+        // A model's thumbnail is the fixed-shape card, not the asset's own
+        // pixels (a mesh has none). Taking the card's aspect here is what lets
+        // `ObjectFit::Contain` fill the tile rather than letterbox a 4:3 card
+        // inside the 1:1 fallback.
+        if self.kind == AssetKind::Model {
+            return trove_core::media::thumb::MODEL_CARD_ASPECT;
+        }
         match (self.width, self.height) {
             (Some(w), Some(h)) if w > 0 && h > 0 => w as f32 / h as f32,
             _ => 1.0,

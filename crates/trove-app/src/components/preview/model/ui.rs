@@ -9,6 +9,7 @@ use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::popover::Popover;
 use gpui_kit::component::separator::Separator;
 use gpui_kit::component::tab::{Tab, TabBar};
+use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{ActiveTheme, IconName, Sizable};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -1280,7 +1281,13 @@ fn field_row(
         row = row.child(if available(field) {
             tab
         } else {
+            let reason = rust_i18n::t!(
+                "viewport.height_field_unavailable",
+                field = field_name(field)
+            )
+            .to_string();
             tab.disabled(true)
+                .tooltip(move |window, cx| Tooltip::new(reason.clone()).build(window, cx))
         });
     }
     v_flex()

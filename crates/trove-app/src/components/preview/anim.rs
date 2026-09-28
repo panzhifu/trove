@@ -24,11 +24,15 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use gpui_kit::base::{ElementExt as _, h_flex};
+use gpui_kit::component::{ActiveTheme as _, Size};
+use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use trove_core::media::anim::FrameTimes;
 
-use super::{AssetPreviewData, AssetPreviewPanel};
+use super::chrome::{self, Chrome};
+use super::{AssetPreviewData, AssetPreviewPanel, transport};
 
 /// Whether this preview's picture wants a player of our own.
 ///
@@ -89,9 +93,9 @@ fn settle(panel: &WeakEntity<AssetPreviewPanel>, cx: &mut App) {
     });
 }
 
-/// How long the loop sleeps when it is paused, before looking again. Long
-/// enough to be free, short enough that resuming feels instant.
-const IDLE_POLL: Duration = Duration::from_millis(120);
+/// How long the loop sleeps when it is paused. Short enough that resuming
+/// reads as instant, long enough to stay free.
+const PAUSED_POLL: Duration = Duration::from_millis(16);
 
 /// The cap on decoded frames held for one preview.
 ///
@@ -129,9 +133,9 @@ fn prepare(path: &std::path::Path) -> Option<(Vec<Arc<RenderImage>>, FrameTimes)
 
 /// What the loop reads each tick, kept off the entity so an `App` borrow can
 /// never stall the clock.
-#[derive(Default)]
 struct Shared {
     playing: bool,
+    speed: f32,
 }
 
 /// A playing animated image: prepared frames, a current index, and the loop
@@ -145,6 +149,10 @@ pub(crate) struct AnimatedPlayer {
     shared: Arc<Mutex<Shared>>,
     /// Cleared on drop so the loop exits with the panel.
     alive: Arc<AtomicBool>,
+    /// Visibility of the floating transport bar.
+    chrome: Chrome,
+    /// The player's own box, so the bar reveals at the picture's bottom edge.
+    chrome_bounds: Entity<Bounds<Pixels>>,
 }
 
 /// How long frame `index` is shown, or nothing for an index off the end.
@@ -152,18 +160,32 @@ fn delay(timing: &FrameTimes, index: usize) -> Duration {
     Duration::from_millis(u64::from(timing.delays().get(index).copied().unwrap_or(0)))
 }
 
+/// [`delay`] at the requested speed, floored so a file that declares a
+/// zero-length frame cannot spin the loop.
+fn frame_delay(timing: &FrameTimes, index: usize, speed: f32) -> Duration {
+    let base = delay(timing, index).as_secs_f64();
+    Duration::from_secs_f64((base / f64::from(speed.max(0.05))).max(0.01))
+}
+
 impl AnimatedPlayer {
     /// Take already-decoded frames and start playing them.
     fn start(frames: Vec<Arc<RenderImage>>, timing: FrameTimes, cx: &mut App) -> Entity<Self> {
         let frame_count = timing.frames();
-        let shared = Arc::new(Mutex::new(Shared { playing: true }));
+        let shared = Arc::new(Mutex::new(Shared {
+            playing: true,
+            speed: 1.0,
+        }));
         let alive = Arc::new(AtomicBool::new(true));
+        let chrome_bounds = cx.new(|_| Bounds::default());
         let entity = cx.new(|_| Self {
             frames,
             frame: 0,
             shared: Arc::clone(&shared),
             alive: Arc::clone(&alive),
+            chrome: Chrome::new(),
+            chrome_bounds,
         });
+        chrome::watch(entity.downgrade(), cx, Self::chrome_mut);
 
         let weak = entity.downgrade();
         let loop_shared = Arc::clone(&shared);
@@ -177,22 +199,25 @@ impl AnimatedPlayer {
             // Frame 0 is on screen from the first tick, so the first wait is
             // its own delay; starting the clock at `now` would show it for no
             // time at all.
-            let mut due = Instant::now() + delay(&timing, index);
+            let mut due = Instant::now() + frame_delay(&timing, index, 1.0);
+            // The showing frame's remaining time at the pause, so resuming
+            // finishes it instead of starting it over.
+            let mut remaining: Option<Duration> = None;
             loop {
                 if !loop_alive.load(Ordering::Relaxed) {
                     break;
                 }
-                let playing = match loop_shared.lock() {
-                    Ok(shared) => shared.playing,
+                let (playing, speed) = match loop_shared.lock() {
+                    Ok(shared) => (shared.playing, shared.speed),
                     Err(_) => break,
                 };
                 if !playing {
-                    // Re-anchor on the frame that is showing, so resuming
-                    // finishes the delay it was paused inside rather than
-                    // jumping straight to the next picture.
-                    due = Instant::now() + delay(&timing, index);
-                    cx.background_executor().timer(IDLE_POLL).await;
+                    remaining.get_or_insert_with(|| due.saturating_duration_since(Instant::now()));
+                    cx.background_executor().timer(PAUSED_POLL).await;
                     continue;
+                }
+                if let Some(left) = remaining.take() {
+                    due = Instant::now() + left;
                 }
                 let now = Instant::now();
                 if due > now {
@@ -215,7 +240,7 @@ impl AnimatedPlayer {
                 }
                 index = (index + 1) % frame_count;
                 due = due
-                    .checked_add(delay(&timing, index))
+                    .checked_add(frame_delay(&timing, index, speed))
                     .unwrap_or_else(Instant::now);
                 if weak
                     .update(cx, |this, cx| {
@@ -232,13 +257,46 @@ impl AnimatedPlayer {
         entity
     }
 
+    /// Whether the loop is advancing, and how fast.
+    fn playback(&self) -> (bool, f32) {
+        self.shared
+            .lock()
+            .map(|shared| (shared.playing, shared.speed))
+            .unwrap_or((false, 1.0))
+    }
+
     /// Toggle play/pause. The loop picks it up on its next look.
     pub(crate) fn toggle_playing(&mut self, cx: &mut Context<Self>) {
-        let Ok(mut shared) = self.shared.lock() else {
-            return;
-        };
-        shared.playing = !shared.playing;
+        if let Ok(mut shared) = self.shared.lock() {
+            shared.playing = !shared.playing;
+        }
         cx.notify();
+    }
+
+    /// The playback rate; re-paces the frame delays.
+    fn set_speed(&mut self, speed: f32, cx: &mut Context<Self>) {
+        if let Ok(mut shared) = self.shared.lock() {
+            shared.speed = speed;
+        }
+        cx.notify();
+    }
+
+    /// The chrome accessor the shared auto-hide watcher drives.
+    fn chrome_mut(&mut self) -> &mut Chrome {
+        &mut self.chrome
+    }
+
+    /// Pointer moved over the player: reveal the bar at the bottom edge.
+    fn on_pointer_moved(
+        &mut self,
+        event: &MouseMoveEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let bounds = *self.chrome_bounds.read(cx);
+        if self.chrome.moved(bounds, event.position) {
+            cx.notify();
+        }
     }
 
     /// Hand every prepared frame back to the window before the entity is
@@ -268,22 +326,49 @@ impl Render for AnimatedPlayer {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let frame = self.frame.min(self.frames.len().saturating_sub(1));
         let source = ImageSource::Render(Arc::clone(&self.frames[frame]));
+        let (playing, speed) = self.playback();
+        let bar = h_flex()
+            .absolute()
+            .bottom_0()
+            .left_0()
+            .right_0()
+            .gap_2()
+            .px_3()
+            .py_2()
+            .bg(cx.theme().popover)
+            .child(transport::play_pause_button(
+                playing,
+                Size::Small,
+                &cx.entity(),
+                Self::toggle_playing,
+            ))
+            .child(transport::speed_button(
+                speed,
+                &cx.entity(),
+                Self::set_speed,
+            ));
+        let shown = self.chrome.shown();
+        let bounds = self.chrome_bounds.clone();
         div()
+            .relative()
             .size_full()
             .flex()
             .items_center()
             .justify_center()
+            .on_prepaint(move |measured: Bounds<Pixels>, _, cx| {
+                bounds.update(cx, |slot, _| *slot = measured);
+            })
+            .on_mouse_move(cx.listener(Self::on_pointer_moved))
             .child(
                 img(source)
                     .size_full()
                     .object_fit(ObjectFit::Contain)
-                    // The one control until there is a transport bar: the
-                    // picture itself answers a click, which is where a viewer's
-                    // cursor already is.
+                    // The picture itself still answers a click.
                     .on_click(cx.listener(|this, _, _window, cx| {
                         this.toggle_playing(cx);
                     })),
             )
+            .when(shown, |root| root.child(bar))
     }
 }
 

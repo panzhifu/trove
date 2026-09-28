@@ -19,6 +19,7 @@
 
 mod anim;
 mod audio;
+mod chrome;
 mod fallback;
 mod font;
 mod gpu3d;
@@ -45,6 +46,10 @@ use uuid::Uuid;
 
 /// Zoom factor per wheel notch.
 const ZOOM_FACTOR: f32 = 1.15;
+
+/// The content container's `p_4`, taken off each axis before a picture is
+/// fitted: the still and the live video stage are both measured against it.
+const STAGE_PAD: f32 = 32.0;
 
 pub(crate) use quick_look::LiveCard;
 pub(crate) use video::VideoPlayer;
@@ -143,6 +148,20 @@ impl PanZoom {
         self.zoom = 1.0;
         self.offset = Point::default();
     }
+}
+
+/// A picture's size at zoom 1.0: `geometry` fitted into `area`, preserving
+/// its aspect ratio. The still, the video stage and the pan/zoom base all
+/// size themselves through this one rule, so a picture never changes size
+/// when the surface behind it does. `None` when either side is degenerate.
+pub(super) fn fit_box(geometry: (f32, f32), area: (f32, f32)) -> Option<(f32, f32)> {
+    let (gw, gh) = geometry;
+    let (aw, ah) = area;
+    if gw <= 0.0 || gh <= 0.0 || aw <= 0.0 || ah <= 0.0 {
+        return None;
+    }
+    let scale = (aw / gw).min(ah / gh);
+    Some((gw * scale, gh * scale))
 }
 
 /// Which placement renders the preview; the kinds differ in what "as large
@@ -506,6 +525,21 @@ impl AssetPreviewPanel {
         self.video.is_some()
     }
 
+    /// Whether a player is on screen whose picture can be held and resumed:
+    /// a video or an animated image. The space bar answers for both.
+    pub(crate) fn has_playback(&self) -> bool {
+        self.video.is_some() || self.anim.is_some()
+    }
+
+    /// Space bar: hold whatever is playing, or pick it back up.
+    pub(crate) fn toggle_playback(&mut self, cx: &mut App) {
+        if let Some(video) = &self.video {
+            video.update(cx, |video, cx| video.toggle_play(cx));
+        } else if let Some(anim) = &self.anim {
+            anim.update(cx, |anim, cx| anim.toggle_playing(cx));
+        }
+    }
+
     /// Save the frame under the video's playhead into the library. A no-op
     /// without a live player — see [`Self::has_video`].
     pub(crate) fn grab_frame(
@@ -570,19 +604,28 @@ impl AssetPreviewPanel {
     /// picture does). `None` when there is nothing measurable behind the
     /// content.
     fn fitted_base(&self, vw: f32, vh: f32) -> Option<(f32, f32)> {
-        let pad = 32.0; // the content container's p_4
-        let fit = |w: f32, h: f32| ((vw - pad).max(60.0) / w).min((vh - pad).max(60.0) / h);
+        let area = ((vw - STAGE_PAD).max(60.0), (vh - STAGE_PAD).max(60.0));
         if self.font_live {
             let (tw, th, _) = font::specimen_metrics();
-            let scale = fit(tw, th);
+            let scale = (area.0 / tw).min(area.1 / th);
             return Some((tw * scale, th * scale));
         }
         let (iw, ih) = self.data.dimensions?;
-        if iw == 0 || ih == 0 {
-            return None;
-        }
-        let scale = fit(iw as f32, ih as f32);
-        Some((iw as f32 * scale, ih as f32 * scale))
+        fit_box((iw as f32, ih as f32), area)
+    }
+
+    /// The area a freshly spawned video player gives its picture stage: the
+    /// content box the player root fills. It is read off the measured viewport
+    /// so the player can be seeded with it — the still that stood in for the
+    /// video was cut to the same box, which is what makes the handover
+    /// size-for-size. `None` before the viewport has been measured.
+    fn video_stage_area(&self, cx: &App) -> Option<(f32, f32)> {
+        let viewport = self.viewport.read(cx);
+        let (w, h) = (
+            f32::from(viewport.width) - STAGE_PAD,
+            f32::from(viewport.height) - STAGE_PAD,
+        );
+        (w > 0.0 && h > 0.0).then_some((w, h))
     }
 
     /// Begin a pan drag.
@@ -700,6 +743,8 @@ impl Render for AssetPreviewPanel {
                 // stage before the zoom does — see `zoomable`.
                 if let Some(player) = &self.anim {
                     player.clone().into_any_element()
+                } else if self.video_loading || self.anim_loading {
+                    image::still_filling(&self.data)
                 } else if self.zoomable() && self.pan.zoom != 1.0 {
                     self.zoomed_still(cx)
                 } else {

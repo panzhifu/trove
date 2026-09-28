@@ -747,7 +747,7 @@ fn integrity_row(controller: &Entity<LibraryController>, cx: &mut App) -> Div {
     let busy = controller.read(cx).busy;
     let report = controller.read(cx).integrity_report.clone();
 
-    let mut bar = h_flex().w_full().justify_end().gap_2();
+    let mut bar = h_flex().w_full().min_w_0().justify_end().gap_2();
     if let Some(report) = &report {
         let clean = report.entries.is_empty();
         bar = bar.child(
@@ -776,6 +776,7 @@ fn integrity_row(controller: &Entity<LibraryController>, cx: &mut App) -> Div {
         Button::new("verify-integrity")
             .outline()
             .small()
+            .flex_shrink_0()
             .disabled(busy)
             .label(rust_i18n::t!("settings.verify_start").to_string())
             .on_click({
@@ -784,7 +785,7 @@ fn integrity_row(controller: &Entity<LibraryController>, cx: &mut App) -> Div {
             }),
     );
 
-    let mut col = v_flex().flex_1().gap_1().child(bar);
+    let mut col = v_flex().flex_1().min_w_0().gap_1().child(bar);
     if let Some(report) = report.filter(|r| !r.entries.is_empty()) {
         let mut list = v_flex().w_full().gap_1();
         for entry in &report.entries {

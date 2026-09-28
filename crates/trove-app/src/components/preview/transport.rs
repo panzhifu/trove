@@ -22,7 +22,7 @@ use gpui_kit::component::slider::{Slider, SliderState};
 use crate::components::controls::muted_label;
 /// Re-exported so a host wires its sliders without importing from two places.
 pub(super) use gpui_kit::component::slider::SliderEvent;
-use gpui_kit::component::{ActiveTheme, IconName, Sizable as _};
+use gpui_kit::component::{ActiveTheme, IconName, Sizable as _, Size};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
@@ -115,21 +115,34 @@ impl Transport {
 
 /// Play or hold. The icon and the tooltip both follow the current state, so a
 /// stalled `playing` flag cannot lie about what the button will do.
+///
+/// Shared by the audio and video transports: one symbol, one wording, one
+/// click contract, so the two players cannot drift apart. `size` is the one
+/// thing they disagree on — the audio row is roomier than the compact row the
+/// video stage sits in.
 pub(super) fn play_pause_button<H: 'static>(
     playing: bool,
+    size: Size,
     host: &Entity<H>,
     toggle: fn(&mut H, &mut Context<H>),
 ) -> AnyElement {
     let host = host.clone();
     Button::new("transport-play-pause")
         .ghost()
-        .small()
+        .with_size(size)
         .icon(if playing {
             IconName::Pause
         } else {
             IconName::Play
         })
-        .tooltip(rust_i18n::t!(if playing { "audio.pause" } else { "audio.play" }).to_string())
+        .tooltip(
+            rust_i18n::t!(if playing {
+                "transport.pause"
+            } else {
+                "transport.play"
+            })
+            .to_string(),
+        )
         .on_click(move |_, _, cx| {
             host.update(cx, toggle);
         })
