@@ -5,6 +5,7 @@
 //! find out about the application itself rather than about their library.
 
 use super::*;
+use crate::app::settings_write;
 use trove_core::services::update::{self, UpdateState};
 
 /// Sentinel value for the "follow the system language" choice, which the
@@ -45,7 +46,7 @@ pub(super) fn about_page(controller: &Entity<LibraryController>) -> SettingPage 
                                 // launch rather than in 24 hours.
                                 config.last_update_check = None;
                             }
-                            let _ = config.save();
+                            settings_write::note(config.save(), "app config");
                             cx.refresh_windows();
                         },
                     ),
@@ -139,7 +140,10 @@ fn version_row(cx: &mut App) -> Div {
                             let version = version.clone();
                             move |_, _, cx| {
                                 let mut config = AppConfig::load();
-                                let _ = config.skip_version(&version);
+                                settings_write::note(
+                                    config.skip_version(&version),
+                                    "skipped release",
+                                );
                                 cx.refresh_windows();
                             }
                         }),

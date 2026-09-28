@@ -27,6 +27,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use super::AppView;
+use super::settings_write;
 use crate::app::actions::RunPluginCommand;
 use crate::components::scrollbar;
 use trove_core::config::{AppConfig, LibraryEntry};
@@ -729,7 +730,10 @@ fn open_delete_confirm(entry: LibraryEntry, window: &mut Window, cx: &mut App) {
             )
             .on_ok(move |_, _, cx| {
                 let mut config = AppConfig::load();
-                let _ = config.forget_library(&commit_entry.slug);
+                settings_write::note(
+                    config.forget_library(&commit_entry.slug),
+                    "library forgotten",
+                );
                 let _ = std::fs::remove_dir_all(commit_entry.dir());
                 let _ = std::fs::remove_dir_all(commit_entry.cache_dir());
                 cx.refresh_windows();

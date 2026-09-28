@@ -12,6 +12,7 @@ pub mod title_bar;
 mod capture;
 pub mod library_manager;
 mod root;
+pub(crate) mod settings_write;
 mod status_bar;
 mod task_panel;
 mod tray;

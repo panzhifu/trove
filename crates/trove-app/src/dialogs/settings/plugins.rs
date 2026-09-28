@@ -6,6 +6,7 @@
 //! them appended after this one by the renderer (see `plugins::settings_pages`).
 
 use super::*;
+use crate::app::settings_write;
 
 /// The plugins page: one switch per registered plugin, plus the note that a
 /// toggle is read when the import pipeline is first built.
@@ -51,7 +52,7 @@ pub(super) fn plugins_page() -> SettingPage {
                         } else if !config.disabled_plugins.iter().any(|known| known == &name) {
                             config.disabled_plugins.push(name.clone());
                         }
-                        let _ = config.save();
+                        settings_write::note(config.save(), "plugin settings");
                         cx.refresh_windows();
                     }
                 },

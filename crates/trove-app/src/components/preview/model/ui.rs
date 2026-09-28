@@ -13,6 +13,7 @@ use gpui_kit::component::{ActiveTheme, IconName, Sizable};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
+use crate::app::settings_write;
 use crate::components::scrollbar;
 use gpui_kit::base::{ColorPickerEvent, ColorPickerState};
 use gpui_kit::component::color_picker::ColorPicker;
@@ -482,7 +483,7 @@ impl ModelViewport {
         self.material_render = !self.material_render;
         let mut config = trove_core::config::AppConfig::load();
         config.material_render = Some(self.material_render);
-        let _ = config.save();
+        settings_write::note(config.save(), "3D viewer settings");
         self.enhance_checked = Some(std::time::Instant::now());
         self.redraw(cx);
     }
@@ -618,7 +619,7 @@ impl ModelViewport {
     pub(super) fn add_custom_scale(&mut self, cx: &mut Context<Self>) {
         let mut config = trove_core::config::AppConfig::load();
         let id = config.add_custom_scale();
-        let _ = config.save();
+        settings_write::note(config.save(), "3D viewer settings");
         self.height_scales = config.height_custom_scales;
         let ramp = self
             .height_scales
@@ -649,7 +650,7 @@ impl ModelViewport {
         };
         let mut config = trove_core::config::AppConfig::load();
         config.remove_custom_scale(&id);
-        let _ = config.save();
+        settings_write::note(config.save(), "3D viewer settings");
         self.height_scales = config.height_custom_scales.clone();
         self.set_height(
             HeightLook {
@@ -760,7 +761,7 @@ impl ModelViewport {
         self.height_unsaved = false;
         let mut config = trove_core::config::AppConfig::load();
         config.set_height_look(self.height.clone());
-        let _ = config.save();
+        settings_write::note(config.save(), "3D viewer settings");
         // The panel's rows come from this list, so a scale just edited is read
         // back from exactly what was written.
         self.height_scales = config.height_custom_scales;

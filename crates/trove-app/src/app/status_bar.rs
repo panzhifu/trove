@@ -4,7 +4,9 @@
 //!
 //! Split out of `app::root`. The only two fields it ever read from the view —
 //! the controller and the last renderer description — are now passed in, so the
-//! bar is a pure function of controller state.
+//! bar is a pure function of controller state. One clause reads process state
+//! instead: the standing "settings did not reach the disk" warning, because the
+//! writers that can trigger it are not all inside a window that could hold it.
 
 use gpui_kit::base::h_flex;
 use gpui_kit::component::ActiveTheme as _;
@@ -15,6 +17,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use crate::app::root::pending_update;
+use crate::app::settings_write;
 use crate::app::task_panel;
 use crate::library::LibraryController;
 
@@ -119,6 +122,31 @@ pub fn status_bar(
                     })
                     .on_click(move |_, _, _| {
                         let _ = trove_core::services::open_external::open_url(&page);
+                    }),
+            )
+        })
+        // A settings write that did not reach the disk. Unlike the notice, this
+        // is not about the action the user just took — it is a standing fact about
+        // the session, so it stays while the last write is still failing and
+        // disappears when one lands again (see [`crate::app::settings_write`]).
+        // It reads process state rather than the controller, the one exception to
+        // this bar being a function of controller state: two of the writers have no
+        // controller in scope to notify.
+        .when(settings_write::degraded(), |bar| {
+            bar.child(
+                div()
+                    .id("statusbar-settings-not-saved")
+                    .truncate()
+                    .text_color(cx.theme().danger)
+                    .child(rust_i18n::t!("statusbar.settings_not_saved").to_string())
+                    .tooltip({
+                        // The reason itself went to the log, with the first failure
+                        // carrying it; this says what the user can still do.
+                        let hint = rust_i18n::t!("statusbar.settings_not_saved_hint").to_string();
+                        move |window, cx| {
+                            gpui_kit::component::tooltip::Tooltip::new(hint.clone())
+                                .build(window, cx)
+                        }
                     }),
             )
         })

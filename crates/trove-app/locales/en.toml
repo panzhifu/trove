@@ -678,6 +678,8 @@ import_running = "Importing… (%{done}/%{total})"
 import_done = "Import done: %{imported} imported, %{skipped} skipped"
 update_available = "Update %{version} available"
 update_hint = "Open the release page to download it"
+settings_not_saved = "Settings could not be saved: changes are lost on restart."
+settings_not_saved_hint = "Free up space or fix the file's permissions; the rest of this session keeps working from the values you chose."
 
 [viewport]
 loading = "Loading model…"

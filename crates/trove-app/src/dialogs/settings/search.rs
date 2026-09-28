@@ -8,6 +8,7 @@
 
 use super::files::{finish_job, start_job};
 use super::*;
+use crate::app::settings_write;
 
 // ============================ tiers =========================================
 
@@ -25,7 +26,7 @@ fn save_search(
 ) {
     let mut config = AppConfig::load();
     edit(&mut config.search);
-    let _ = config.save();
+    settings_write::note(config.save(), "search tiers");
     controller.update(cx, |ctl, cx| {
         ctl.refresh_search_tiers();
         cx.notify();

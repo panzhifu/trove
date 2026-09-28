@@ -34,6 +34,7 @@ mod shortcuts;
 
 pub(super) use std::path::PathBuf;
 
+use crate::app::settings_write;
 pub(super) use crate::components::scrollbar;
 pub(super) use gpui_kit::base::{h_flex, v_flex};
 pub(super) use gpui_kit::component::button::{Button, ButtonVariants as _};
@@ -66,7 +67,7 @@ pub(super) fn config_switch(
         move |value, cx| {
             let mut config = AppConfig::load();
             write(&mut config, value);
-            let _ = config.save();
+            settings_write::note(config.save(), "app config");
             cx.refresh_windows();
         },
     )
@@ -378,7 +379,7 @@ impl SettingsView {
         if let Some(key) = key {
             let mut config = AppConfig::load();
             config.keybindings.insert(action.to_string(), key);
-            let _ = config.save();
+            settings_write::note(config.save(), "app config");
             // Bindings are matched latest-first, so the override wins over
             // the default it replaces without a restart. This only registers;
             // it never reads the view, so it is safe mid-update.

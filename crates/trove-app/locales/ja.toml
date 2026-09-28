@@ -612,6 +612,8 @@ import_running = "インポート中…（%{done}/%{total}）"
 import_done = "インポート完了：%{imported} インポート済み、%{skipped} スキップ"
 update_available = "アップデート %{version} が利用可能"
 update_hint = "リリースページを開いてダウンロード"
+settings_not_saved = "設定を保存できませんでした。変更は再起動後に失われます。"
+settings_not_saved_hint = "空き領域の確保かファイルの権限を修正してください。このセッションは選択した値で動作を続けます。"
 
 [viewport]
 loading = "モデルを読み込み中…"

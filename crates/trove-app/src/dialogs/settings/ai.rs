@@ -12,6 +12,7 @@
 use gpui_kit::component::setting::NumberFieldOptions;
 
 use super::*;
+use crate::app::settings_write;
 use crate::library::{AiProbe, AnalysisProbe};
 
 // ============================ config ========================================
@@ -30,7 +31,7 @@ fn save_embedding_config(
 ) {
     let mut config = AppConfig::load();
     edit(config.ai_embedding.get_or_insert_with(Default::default));
-    let _ = config.save();
+    settings_write::note(config.save(), "AI settings");
     cx.refresh_windows();
 }
 
@@ -283,7 +284,7 @@ fn save_analysis_config(
 ) {
     let mut config = AppConfig::load();
     edit(config.ai_analysis.get_or_insert_with(Default::default));
-    let _ = config.save();
+    settings_write::note(config.save(), "AI settings");
     cx.refresh_windows();
 }
 

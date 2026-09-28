@@ -13,6 +13,7 @@ use trove_core::config::{AppConfig, FILTER_TOOLS};
 use trove_core::model::{AspectPreset, AssetKind, AssetSort, Orientation, Rating, ResolutionBand};
 use trove_core::store::facets::{FacetCounts, FacetValue};
 
+use crate::app::settings_write;
 use crate::components::controls::icon_button;
 use crate::library::{LibraryController, ViewMode};
 use uuid::Uuid;
@@ -641,7 +642,10 @@ pub(crate) fn add_filter_button(controller: &Entity<LibraryController>) -> impl 
             menu = menu.item(PopupMenuItem::new(t(&label_key)).checked(checked).on_click(
                 move |_, _, cx| {
                     let mut config = AppConfig::load();
-                    let _ = config.toggle_filter_tool(&tool_click);
+                    settings_write::note(
+                        config.toggle_filter_tool(&tool_click),
+                        "filter tool visibility",
+                    );
                     // The toolbar row reads the config every render.
                     controller.update(cx, |_, cx| cx.notify());
                 },

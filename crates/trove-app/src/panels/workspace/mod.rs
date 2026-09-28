@@ -32,6 +32,7 @@ use gpui_kit::list as list_element;
 use gpui_kit::{Bounds, ListOffset, Pixels};
 use gpui_kit::{ListAlignment, ListState};
 
+use crate::app::settings_write;
 use crate::panels::search_box::SearchBox;
 
 use serde_json::json;
@@ -292,7 +293,7 @@ impl WorkspacePanel {
             });
             let mut config = trove_core::config::AppConfig::load();
             config.grid_zoom = Some(scale);
-            let _ = config.save();
+            settings_write::note(config.save(), "app config");
         }
         cx.notify();
     }

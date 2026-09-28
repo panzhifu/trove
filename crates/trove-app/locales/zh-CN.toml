@@ -676,6 +676,8 @@ import_running = "正在导入…（%{done}/%{total}）"
 import_done = "导入完成：%{imported} 个已导入，%{skipped} 个跳过"
 update_available = "有新版本 %{version}"
 update_hint = "打开发布页下载"
+settings_not_saved = "设置无法保存：重启后这些改动会丢失。"
+settings_not_saved_hint = "请清理磁盘空间或修正文件权限；本次会话仍会按你选择的值继续工作。"
 
 [viewport]
 loading = "正在加载模型…"

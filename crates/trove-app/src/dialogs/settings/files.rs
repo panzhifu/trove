@@ -5,6 +5,7 @@
 //! keep the derived files honest — thumbnails, backups, orphans, integrity.
 
 use super::*;
+use crate::app::settings_write;
 use crate::components::controls::muted_label;
 use gpui_kit::component::chart::PieChart;
 use trove_core::config::{AudioCardStyle, LibraryConfig};
@@ -395,7 +396,7 @@ fn deletion_group() -> SettingGroup {
                         let dir = library_dir();
                         let mut config = LibraryConfig::load(&dir);
                         config.purge_delete_sources = Some(enabled);
-                        let _ = config.save(&dir);
+                        settings_write::note(config.save(&dir), "library config");
                         cx.refresh_windows();
                     },
                 ),
@@ -969,7 +970,7 @@ fn watch_folders_group() -> SettingGroup {
                 let dir = library_dir();
                 let mut config = LibraryConfig::load(&dir);
                 config.watch_folders_enabled = Some(enabled);
-                let _ = config.save(&dir);
+                settings_write::note(config.save(&dir), "library config");
                 cx.refresh_windows();
             },
         ),
@@ -1003,7 +1004,10 @@ fn watch_folder_row(path: PathBuf, _cx: &mut App) -> Div {
             .on_click(move |_, _, cx| {
                 let dir = library_dir();
                 let mut config = LibraryConfig::load(&dir);
-                let _ = config.remove_watched_folder(&dir, &path);
+                settings_write::note(
+                    config.remove_watched_folder(&dir, &path),
+                    "watched folder removed",
+                );
                 cx.refresh_windows();
             }),
     )
@@ -1035,7 +1039,10 @@ fn add_watch_folder_row(_cx: &mut App) -> Div {
                         cx.update(|cx| {
                             let dir = library_dir();
                             let mut config = LibraryConfig::load(&dir);
-                            let _ = config.add_watched_folder(&dir, path);
+                            settings_write::note(
+                                config.add_watched_folder(&dir, path),
+                                "watched folder added",
+                            );
                             cx.refresh_windows();
                         });
                     }

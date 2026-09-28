@@ -612,6 +612,8 @@ import_running = "Importation…（%{done}/%{total}）"
 import_done = "Importation terminée : %{imported} importés, %{skipped} ignorés"
 update_available = "Mise à jour %{version} disponible"
 update_hint = "Ouvrez la page de version pour la télécharger"
+settings_not_saved = "Impossible d'enregistrer les paramètres : les modifications seront perdues au redémarrage."
+settings_not_saved_hint = "Libérez de l'espace ou corrigez les permissions du fichier ; cette session continue avec les valeurs choisies."
 
 [viewport]
 loading = "Chargement du modèle…"

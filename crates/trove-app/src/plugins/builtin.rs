@@ -31,6 +31,7 @@ use gpui_kit::{App, IntoElement as _, ParentElement as _, SharedString, Styled a
 use gpui_kit::Keystroke;
 use trove_core::config::AppConfig;
 
+use crate::app::settings_write;
 use crate::plugins::i18n::pt;
 
 use crate::components::controls::muted_label;
@@ -113,7 +114,7 @@ impl SidecarNotes {
                 "mode".to_string(),
                 serde_json::Value::String(mode.as_str().to_string()),
             );
-        let _ = config.save();
+        settings_write::note(config.save(), "plugin settings");
     }
 
     const PLUGIN_NAME: &'static str = "sidecar-notes";
@@ -256,7 +257,7 @@ fn self_set_mode(state: &Arc<RwLock<Mode>>, mode: Mode) {
             "mode".to_string(),
             serde_json::Value::String(mode.as_str().to_string()),
         );
-    let _ = config.save();
+    settings_write::note(config.save(), "plugin settings");
 }
 
 /// The command's shortcut line on the settings page: the chord it answers to

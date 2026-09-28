@@ -18,6 +18,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 // Render, IntoElement, ExternalPaths, …) plus gpui-kit's styling extensions.
 use gpui_kit::*;
 
+use super::settings_write;
 use crate::app::actions::*;
 use crate::app::title_bar::TitleBarView;
 use crate::app::tray;
@@ -61,7 +62,10 @@ fn spawn_update_check(cx: &mut App, delay: std::time::Duration) {
             .await;
         cx.update(|cx| {
             let mut config = AppConfig::load();
-            let _ = config.record_update_check(update::now_unix());
+            settings_write::note(
+                config.record_update_check(update::now_unix()),
+                "update check recorded",
+            );
             cx.refresh_windows();
         });
     })

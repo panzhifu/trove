@@ -323,9 +323,30 @@ fn psd_dimensions(path: &std::path::Path) -> Option<Dimensions> {
 /// simple at the cost of some CPU).
 fn raw_dimensions(path: &std::path::Path) -> Option<Dimensions> {
     let raw = rawler::decode_file(path).ok()?;
+    sensor_size(raw.width as i64, raw.height as i64)
+}
+
+/// A decoded size, or `None` when the header reported no pixels.
+///
+/// The `i64` is the point, not ceremony: a header can carry a zero or a negative
+/// side, and both mean "this file did not tell me its size". Rounding either up
+/// to 1 — which an earlier version of this function did with `.max(1)` — turns
+/// an unknown into a *fact* the library then cannot recover: a 1×1 asset sorts
+/// into the resolution and aspect filters as the tiniest image there is, draws a
+/// card as if it were one, and never says "unknown" again, because nothing
+/// downstream knows it was ever a zero. `None` is the honest answer, and the
+/// column already carries it for the five records in a real library that have no
+/// decodable size at all.
+///
+/// Same rule [`video_facts`] already applies to an mp4 track that reports no
+/// pixels: refuse the size, keep the file.
+fn sensor_size(width: i64, height: i64) -> Option<Dimensions> {
+    if width <= 0 || height <= 0 {
+        return None;
+    }
     Some(Dimensions {
-        width: raw.width.max(1) as u32,
-        height: raw.height.max(1) as u32,
+        width: width as u32,
+        height: height as u32,
     })
 }
 
@@ -397,6 +418,37 @@ pub(crate) fn heif_to_image(path: &std::path::Path) -> Option<image::DynamicImag
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A header that reports no pixels is an unknown size, never a 1×1 one.
+    ///
+    /// Measured before writing: this cannot currently fabricate a row, because
+    /// the import pipeline deliberately does not call `image_dimensions` for RAW
+    /// extensions (`dimensions_need_full_decode` sends those to the decode
+    /// stage). The lie is in the function, waiting for a caller.
+    #[test]
+    fn a_header_without_pixels_has_no_size_rather_than_a_small_one() {
+        assert_eq!(sensor_size(0, 0), None, "the empty header this came from");
+        assert_eq!(sensor_size(0, 4000), None, "one side of zero is still zero");
+        assert_eq!(sensor_size(4000, 0), None);
+        assert_eq!(
+            sensor_size(-1, 100),
+            None,
+            "a negative is not a size either, and must not become a huge one"
+        );
+        let real = sensor_size(1, 1).expect("a 1x1 sensor is rare but possible");
+        assert_eq!(
+            (real.width, real.height),
+            (1, 1),
+            "and a real one still reads"
+        );
+        assert_eq!(
+            sensor_size(6000, 4000),
+            Some(Dimensions {
+                width: 6000,
+                height: 4000
+            })
+        );
+    }
 
     #[test]
     fn avif_and_jxl_are_first_class_images() {

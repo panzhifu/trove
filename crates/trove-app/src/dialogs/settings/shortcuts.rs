@@ -5,6 +5,7 @@
 use std::collections::HashMap;
 
 use super::*;
+use crate::app::settings_write;
 use crate::components::controls::{kbd_or_raw, muted_label};
 
 // ============================ shortcuts page ================================
@@ -466,7 +467,7 @@ fn context_label(context: &str) -> String {
 fn reset_keybindings(cx: &mut App) {
     let mut config = AppConfig::load();
     config.keybindings.clear();
-    let _ = config.save();
+    settings_write::note(config.save(), "shortcut overrides");
     crate::app::keybindings::register(cx, &config);
     cx.refresh_windows();
 }
