@@ -1,8 +1,8 @@
 [package]
 name = "trove-core"
-version = "0.5.0"
-edition = "2024"
-license = "MIT"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
 
 [dependencies]
 chrono = { workspace = true }

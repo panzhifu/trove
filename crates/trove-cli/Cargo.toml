@@ -1,8 +1,8 @@
 [package]
 name = "trove-cli"
-version = "0.5.0"
-edition = "2024"
-license = "MIT"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
 description = "Command-line access to a Trove library, for scripts and agents."
 
 [[bin]]
