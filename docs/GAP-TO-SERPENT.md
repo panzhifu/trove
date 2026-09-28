@@ -5,7 +5,7 @@
 > **本轮（09-28）只有 Trove 动了，Serpent 一格没变**：上游仓库仍停在 **v0.2.9**，`src/` 仍是 **849 文件 / 258,255 行**、`MIGRATIONS` 仍是 32 段、末条 `version: 56`，与 09-27 那次复核逐字相同。所以 §2026-09-27 复核 那张表**不需要重审 Serpent 侧**，只需要把 Trove 这一轮的工作树改动记进去——记在 **§2026-09-28 复核** 那一节，并且**就地改掉了那一节里三行的状态**（音频卡片、检查器逗号输入标签、以及纵深索引升到的第 4、5 版）。Trove 这一轮动了什么、其中两件事**只做了一半就说自己做完了**，全部记在那一节里。
 >
 > **上一轮（09-27）两边都动了**：Trove 发了 **v0.4.9**（模型材质与共享 GPU 渲染器那一轮、智能集合同级拖拽重排、预览里方向键换素材、以及**卡片"活过来"的触发从指针定住改成按空格**——见 §C 的活卡片行与 [PREVIEW-SYSTEM.md](./PREVIEW-SYSTEM.md)），Serpent 从 v0.2.6 走到 v0.2.9。后者的增量单独成节，见 **§2026-09-27 复核**。
-> 核验日期 **2026-09-28**（同一天连做十轮，见 §2026-09-28 复核 与 第二~第十轮；更早是 09-27 / 09-25 / 09-24 / 09-23）。两边的数字都取自源码而非各自文档：Serpent `src/` **849 文件 / 258,255 行** `.ts`+`.tsx`（与 09-27 逐字相同），**schema 仍是 v56 一格没加**——`MIGRATIONS` 32 段、末条 `version: 56`，`SUPPORTED_SCHEMA_VERSION = MIGRATIONS.at(-1)!.version`。Trove `crates/` **228 文件 / 115,969 行** `.rs`（第四轮加 `media/anim.rs`、第六轮加 `preview/anim.rs`）（09-27 记的是 224 / 110,221）。schema **v22**——v19 加了序列帧两张侧表、v20 加了 `source_path` 虚拟列与索引、v21 加了 `task_journal` 一张表、**v22 把没人读写过的 `ai_analysis` 删掉**；`INDEX_VERSION` 从 09-27 的 3 走到 **5**（见 §D 纵深索引行）；包版本 **0.4.9**（本轮未 bump）；`en.toml` **798** 个叶子键；测试 **810 core + 74 app = 884** 全绿 3 ignored，`cargo test --workspace --all-targets` 实跑，`cargo fmt --all -- --check` 与 `cargo clippy --workspace --all-targets -- -D warnings` 两道门同轮一起过。
+> 核验日期 **2026-09-28**（同一天连做十一轮，见 §2026-09-28 复核 与 第二~第十一轮；更早是 09-27 / 09-25 / 09-24 / 09-23）。两边的数字都取自源码而非各自文档：Serpent `src/` **849 文件 / 258,255 行** `.ts`+`.tsx`（与 09-27 逐字相同），**schema 仍是 v56 一格没加**——`MIGRATIONS` 32 段、末条 `version: 56`，`SUPPORTED_SCHEMA_VERSION = MIGRATIONS.at(-1)!.version`。Trove `crates/` **228 文件 / 116,283 行** `.rs`（第四轮加 `media/anim.rs`、第六轮加 `preview/anim.rs`）（09-27 记的是 224 / 110,221）。schema **v22**——v19 加了序列帧两张侧表、v20 加了 `source_path` 虚拟列与索引、v21 加了 `task_journal` 一张表、**v22 把没人读写过的 `ai_analysis` 删掉**；`INDEX_VERSION` 从 09-27 的 3 走到 **5**（见 §D 纵深索引行）；包版本 **0.4.9**（本轮未 bump）；`en.toml` **798** 个叶子键；测试 **812 core + 74 app = 886** 全绿 3 ignored，`cargo test --workspace --all-targets` 实跑，`cargo fmt --all -- --check` 与 `cargo clippy --workspace --all-targets -- -D warnings` 两道门同轮一起过。
 >
 > **09-27 那一轮把上上轮三处"确认缺失"推翻了两处**，都是同一个失败模式——按 Serpent 的实现符号去 grep（`CF_HDROP`、`xdnd`、`file_drop`），命中零就记成"没有"，而没有按**能力**去问（"能不能把文件拖出窗口"）：
 > ① **原生文件拖出早就有**（`2026-09-12` 的 `ce6a29d` 起，`panels/workspace/cells.rs:199-215` 网格格、`:494-510` 列表行，见 §A。上一版这里写的 `:192`、`:406` 已经漂走，本轮重数过）；
@@ -300,6 +300,30 @@ Serpent 侧依旧一格没动。这一轮收 §2026-09-27 复核 里那条 S 级
 **门**：**810 core + 74 app = 884** 全绿 3 ignored；`fmt`、`clippy -D warnings` 同轮过。`crates/` **228 文件 / 115,969 行**，schema 仍 v22。
 
 **没做的**：占位资产的可见行为一字未改（批准范围内）——它在网格里仍表现为"没有文件"，"内容未导入"这句要单独一轮；`set_location(Unrecorded)` 会清掉 `source_path`，这是唯一会清出处的情形，因为那条记录本来就无处可去；P3（`Placement` 收掉 `trashed_at`/`is_trashed`/`in_trash` 三种写法）、P4（`Rating`/`ContentHash` + SQL CHECK + 坏行降级不失败整份列表）、P5（智能集规则 `Json` → `SmartNode`）未动。
+
+---
+
+## 2026-09-28 第十一轮：P3 —— 一条记录在不在回收站，只有一种说法
+
+**落了什么**。三样东西各改掉一种"同一件事写好几种写法"：
+
+① **`Placement { Live | Trashed(DateTime<Utc>) }`** 取代 `Asset::trashed_at: Option<_>`（列也收成 private，入口是 `placement()` / `set_placement()`）。同一个事实在模型里原本是 `Option<DateTime>`，在查询里是 `is_trashed: bool`，在浏览会话里是 `in_trash: bool`——三次拼写，三次都能各自漂。时间戳留着，因为它是事实本身：restore 要清掉它，purge 要报告"回收站里那批是何时进去的"。
+
+② **`TrashPool { Live | Trashed }`** 取代 `AssetQuery::is_trashed`，并且 **`AssetQuery` 不再有 `Default`**——入口只有 `live()` 和 `trashed()`。理由不是好看：`..Default::default()` 会静默填上"活的那池"，一条差一个字段没写的回收站列表于是变成库列表，排序对、分页对、计数对，只有答案是错的。`BrowseContext` 那边同步换成 `pool`，`build_where` 从两个分支各写一遍字面量改成引用常量。
+
+③ **`Flip<T> { id, before, after }`** 取代 undo 里三个批量操作（`SetTrashed` / `SetFavorite` / `SetTitles`）的 `before: Vec<(Uuid, T)>` + `after: Vec<(Uuid, T)>`。两个平行向量拦不住的是同一件事：往一个 push、忘了另一个，撤销于是去改一条正向从没碰过的行，而且**不报错**——错的 id 集、错的长度、错的方向都不会被类型发现。现在一个资产的两个面绑在同一条记录上，`inverse` 对整批只做一件事：逐条交换两面。
+
+**谓词收成两个常量，并且和索引钉在一起**。`LIVE_ROWS` / `TRASHED_ROWS` 替掉 20 处手写的 `trashed_at IS NULL`（stats / view_history / embeddings / sequences / smart 规则 / visual_search / assets 七处文件）。真正的理由是：**库里那 6 条 partial index 的定义文本就是这个字符串**，而 SQLite 只会为"能证明蕴含索引谓词"的 `WHERE` 使用 partial index——同义改写（`COALESCE(trashed_at,'')=''`、小写 `is null`、`+trashed_at IS NULL`）答案一样、索引全丢，表现出来是"库变慢了"，不是报错。
+
+两条钉测试，一条看行为一条看文本：**plan 测试的查询现在用常量拼**，把常量改成 `+trashed_at IS NULL` 之后它给出的就是 planner 的原话 `SCAN assets USING INDEX idx_assets_created; USE TEMP B-TREE FOR LAST TERM OF ORDER BY`——正是那 188 ms 的计划；另一条 `the_live_predicate_matches_the_index_it_needs` 从 `sqlite_master` 读出每条 partial index 的存储 SQL，逐条比对常量，并按名字和条数核对那 6 条，所以改 DDL 或漏一条索引同样是红的。**迁移脚本里的字面量故意不动**：一段 step 必须描述它真实产出的形状，v17→v18 那五条索引当年写成什么样就得是什么样。
+
+**撤销那半有实测**：新增的测试把三条资产一起恢复，其中两条本来就在回收站（`before: true`），一条本来活着（`before: false`）；撤销要求各回各的侧。把 `Flip::swapped` 改成不交换，这条红，另外两条原有 round-trip 测试也红——所以它守的是配对，不是我的说法。
+
+**顺带抓到一处文档失真，按代码为准改掉文档**：`sort_desc` 的字段注释写着"`true` (default) = descending"，而它 derive 出来的默认一直是 `false`。本轮**保留代码行为**（升序）并把注释改成实话：面向用户的列表全都自己指定方向（`BrowseContext`、CLI 的 `--asc`、分析任务），所以这个默认只是"没问过的人拿到的东西"。要不要把类型默认改成最新在前，是 P4 的决定，不该藏在一次类型重构里。
+
+**门**：**812 core + 74 app = 886** 全绿 3 ignored；`fmt`、`clippy -D warnings` 同轮过。`crates/` **228 文件 / 116,283 行**，schema 仍 v22，`en.toml` 仍 **798** 键（本轮没加文案）。
+
+**没做的**：`store/assets.rs` 里三处**注释**仍写 `trashed_at IS NULL` 字面量——那是解释文字不是谓词，改它只会让解释更难读；P4（`Rating` / `ContentHash` 两个 newtype + SQL `CHECK` + 坏行降级而不失败整份列表）、P5（智能集规则的裸 `Json` → `SmartNode`，并决定 `Library::evaluate_smart_collection` 那颗零调用方去留）未动；app 侧约 40 处 `let _ =` 静默写失败也仍是原样。
 
 ---
 
