@@ -19,7 +19,6 @@ pub mod task_journal;
 pub mod view_history;
 pub mod visual_search;
 
-use std::cell::RefCell;
 use std::path::Path;
 use std::rc::Rc;
 
@@ -45,9 +44,16 @@ pub(crate) const TRASHED_ROWS: &str = "trashed_at IS NOT NULL";
 ///
 /// Cheap to clone. The store is synchronous and thread-confined, simple to
 /// use from the UI thread.
+///
+/// The connection is behind `Rc`, not `Rc<RefCell>`: every `rusqlite` call
+/// takes `&self` (writes included), and a transaction comes from
+/// [`rusqlite::Connection::unchecked_transaction`], which also takes `&self`.
+/// There is therefore no `&mut` to hand out and no interior mutability to
+/// need — which is what lets [`Store::conn`] return a plain `&Connection`
+/// with no `unsafe` and no borrow flag to keep in step.
 #[derive(Clone)]
 pub struct Store {
-    conn: Rc<RefCell<rusqlite::Connection>>,
+    conn: Rc<rusqlite::Connection>,
 }
 
 impl Store {
@@ -77,7 +83,7 @@ impl Store {
         // reads; wait briefly instead.
         let _ = conn.busy_timeout(std::time::Duration::from_secs(5));
         let store = Self {
-            conn: Rc::new(RefCell::new(conn)),
+            conn: Rc::new(conn),
         };
         store.enable_foreign_keys()?;
         store.migrate()?;
@@ -89,7 +95,7 @@ impl Store {
     pub fn in_memory() -> Result<Self> {
         let conn = rusqlite::Connection::open_in_memory()?;
         let store = Self {
-            conn: Rc::new(RefCell::new(conn)),
+            conn: Rc::new(conn),
         };
         store.enable_foreign_keys()?;
         store.migrate()?;
@@ -204,8 +210,7 @@ impl Store {
     /// than only adding to one; any other error still fails the migration and
     /// leaves the library at its recorded version.
     fn apply_upgrade(&self, step: &schema::Upgrade) -> Result<()> {
-        let mut conn = self.conn.borrow_mut();
-        let tx = conn.transaction()?;
+        let tx = self.conn.unchecked_transaction()?;
         for statement in step_statements(step.sql) {
             if let Err(error) = tx.execute_batch(&statement)
                 && !already_applied(&statement, &error.to_string())
@@ -222,8 +227,7 @@ impl Store {
 
     /// Apply one DDL script atomically.
     fn apply(&self, sql: &str) -> Result<()> {
-        let mut mut_borrow = self.conn.borrow_mut();
-        let tx = mut_borrow.transaction()?;
+        let tx = self.conn.unchecked_transaction()?;
         tx.execute_batch(sql).map_err(crate::error::Error::from)?;
         tx.commit().map_err(crate::error::Error::from)?;
         Ok(())
@@ -248,31 +252,26 @@ impl Store {
     /// panel could change a row without the undo stack, the generation counter
     /// or the search outbox ever hearing about it.
     ///
-    /// # Safety
-    ///
-    /// The returned reference is valid for the lifetime of `&self`. The
-    /// `RefCell` does *not* guard it: handing out the reference never takes a
-    /// borrow flag, so a later `borrow_mut` (see [`Self::transaction`],
-    /// [`Self::apply_upgrade`]) cannot see that one is in circulation. What
-    /// keeps this sound is a convention, not a check — single thread, one
-    /// operation, and no call that could reach back into the store while a
-    /// borrow is held. Break that convention and the result is simultaneous
-    /// shared and mutable access to one `sqlite3` handle: undefined behaviour,
-    /// not a panic, which is exactly why the door is no longer public.
+    /// Safe by construction: the connection is shared immutably, and every
+    /// operation on it — queries, writes, and transactions alike — takes
+    /// `&self`, so there is no `&mut` for a second borrower to collide with.
+    /// A caller that reaches back into the store while holding this reference
+    /// is therefore merely borrowing twice, not aliasing a mutable handle.
     pub(crate) fn conn(&self) -> &rusqlite::Connection {
-        // SAFETY: the convention in the `# Safety` note above is upheld —
-        // single-threaded, one operation at a time, nothing re-enters the
-        // store while this reference is live. The reference is tied to
-        // `&self`, and no `borrow_mut` runs during its life.
-        unsafe { &*self.conn.as_ptr() }
+        &self.conn
     }
 
     /// Run a closure inside a SQLite transaction. The closure receives a
     /// `&Transaction` and must return a `Result`. On success the transaction
     /// commits; on error it rolls back.
+    ///
+    /// Uses [`Connection::unchecked_transaction`](rusqlite::Connection::unchecked_transaction),
+    /// which takes `&self` — the reason a transaction no longer needs a
+    /// mutable borrow of the connection. In exchange it does not *refuse* a
+    /// nested transaction: callers must not start one from inside the closure,
+    /// and if one does, SQLite reports it as an error rather than a panic.
     pub fn transaction<T>(&self, f: impl FnOnce(&rusqlite::Transaction) -> Result<T>) -> Result<T> {
-        let mut conn = self.conn.borrow_mut();
-        let tx = conn.transaction()?;
+        let tx = self.conn.unchecked_transaction()?;
         match f(&tx) {
             Ok(v) => {
                 tx.commit().map_err(crate::error::Error::from)?;
