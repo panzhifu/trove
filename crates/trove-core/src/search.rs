@@ -113,6 +113,12 @@ impl Tokenizer for JiebaTokenizer {
         let mut cursor = 0usize;
         let mut position = 0usize;
         for word in self.0.cut_for_search(text, true) {
+            // An empty "word" would index an empty term and, because `find("")`
+            // succeeds at offset 0, would also advance the cursor past a byte of
+            // real text.
+            let Some(first) = word.chars().next() else {
+                continue;
+            };
             let Some(rel) = text[cursor.min(text.len())..].find(word) else {
                 continue;
             };
@@ -125,7 +131,9 @@ impl Tokenizer for JiebaTokenizer {
                 position_length: 1,
             });
             position += 1;
-            cursor = from + word.chars().next().map_or(1, |c| c.len_utf8()).max(1);
+            // One character, not the whole word: `cut_for_search` emits
+            // overlapping sub-words that start inside the previous one.
+            cursor = from + first.len_utf8();
         }
         JiebaTokenStream { tokens, ix: 0 }
     }
@@ -325,6 +333,83 @@ struct Fields {
     font_tri: Field,
     audio_w: Field,
     audio_tri: Field,
+}
+
+impl Fields {
+    /// The word surfaces — jieba-tokenized, position-aware — that a target
+    /// answers on.
+    ///
+    /// One table with several readers on purpose. `term_query_on`,
+    /// `phrase_query_on` and the ranked paths all ask the same question, "which
+    /// indexed field is `album:`", and each copy that answers it separately is
+    /// one place to forget a new target: `Target::Audio` was added by editing
+    /// three of these in lockstep, and the fourth reader failing to compile was
+    /// the only thing that caught it.
+    fn words_for(&self, target: expression::Target) -> Vec<Field> {
+        use expression::Target::*;
+        match target {
+            All => vec![
+                self.name_w,
+                self.title_w,
+                self.desc_w,
+                self.tags_w,
+                self.facts_w,
+            ],
+            Name => vec![self.name_w],
+            Title => vec![self.title_w],
+            Description => vec![self.desc_w],
+            Tags => vec![self.tags_w],
+            Facts => vec![self.facts_w],
+            Camera => vec![self.camera_w],
+            Artist => vec![self.artist_w],
+            Album => vec![self.album_w],
+            Font => vec![self.font_w],
+            Audio => vec![self.audio_w],
+        }
+    }
+
+    /// The same surfaces in their trigram form, which is what an infix
+    /// substring (`ower` → `flower`) is looked up in.
+    fn tris_for(&self, target: expression::Target) -> Vec<Field> {
+        use expression::Target::*;
+        match target {
+            All => vec![
+                self.name_tri,
+                self.title_tri,
+                self.desc_tri,
+                self.tags_tri,
+                self.facts_tri,
+            ],
+            Name => vec![self.name_tri],
+            Title => vec![self.title_tri],
+            Description => vec![self.desc_tri],
+            Tags => vec![self.tags_tri],
+            Facts => vec![self.facts_tri],
+            Camera => vec![self.camera_tri],
+            Artist => vec![self.artist_tri],
+            Album => vec![self.album_tri],
+            Font => vec![self.font_tri],
+            Audio => vec![self.audio_tri],
+        }
+    }
+
+    /// The per-surface pinyin field for a target, where one exists.
+    ///
+    /// Only the four hand-written text surfaces have one. The metadata facts
+    /// deliberately do not: a camera model or an artist name reaching a pinyin
+    /// match would answer a question nobody asked, which is the same
+    /// "wrong answer with no visible cause" the field-scoped pinyin exists to
+    /// avoid. `All` uses the concatenated [`pinyin`](Fields::pinyin) instead.
+    fn pinyin_for(&self, target: expression::Target) -> Option<Field> {
+        use expression::Target::*;
+        match target {
+            Name => Some(self.name_pinyin),
+            Title => Some(self.title_pinyin),
+            Description => Some(self.desc_pinyin),
+            Tags => Some(self.tags_pinyin),
+            All | Facts | Camera | Artist | Album | Font | Audio => None,
+        }
+    }
 }
 
 fn indexed_text(tokenizer: &str) -> TextOptions {
@@ -888,12 +973,23 @@ impl TextIndex {
         let mut ids = Vec::with_capacity(top.len());
         for (_, addr) in top {
             let Ok(doc) = searcher.doc::<TantivyDocument>(addr) else {
+                tracing::warn!(?addr, "ranked document could not be read from the index");
                 continue;
             };
-            if let Some(s) = doc.get_first(asset_id).and_then(|v| v.as_str())
-                && let Ok(id) = Uuid::parse_str(s)
-            {
-                ids.push(id);
+            let Some(raw) = doc.get_first(asset_id).and_then(|v| v.as_str()) else {
+                tracing::warn!(?addr, "indexed document carries no asset_id");
+                continue;
+            };
+            match Uuid::parse_str(raw) {
+                Ok(id) => ids.push(id),
+                // Silently dropping this would make the row unfindable with no
+                // trace of why, and the index is a disposable derivative — so
+                // the only clue that it went stale is a message like this.
+                Err(error) => tracing::warn!(
+                    raw,
+                    %error,
+                    "indexed asset_id is not a UUID; document skipped"
+                ),
             }
         }
         Ok(ids)
@@ -909,25 +1005,7 @@ impl TextIndex {
     /// what makes a quoted phrase a real substring match rather than a mere
     /// AND of its words.
     fn gram_query(&self, term: &str, target: expression::Target) -> Box<dyn Query> {
-        let tris: Vec<Field> = match target {
-            expression::Target::All => vec![
-                self.f.name_tri,
-                self.f.title_tri,
-                self.f.desc_tri,
-                self.f.tags_tri,
-                self.f.facts_tri,
-            ],
-            expression::Target::Name => vec![self.f.name_tri],
-            expression::Target::Title => vec![self.f.title_tri],
-            expression::Target::Description => vec![self.f.desc_tri],
-            expression::Target::Tags => vec![self.f.tags_tri],
-            expression::Target::Facts => vec![self.f.facts_tri],
-            expression::Target::Camera => vec![self.f.camera_tri],
-            expression::Target::Artist => vec![self.f.artist_tri],
-            expression::Target::Album => vec![self.f.album_tri],
-            expression::Target::Font => vec![self.f.font_tri],
-            expression::Target::Audio => vec![self.f.audio_tri],
-        };
+        let tris = self.f.tris_for(target);
         let n = term.chars().count();
         let gram_shoulds = |gram: &str| {
             tris.iter()
@@ -982,27 +1060,7 @@ impl TextIndex {
     fn term_query_on(&self, term: &str, target: expression::Target) -> Box<dyn Query> {
         let lower = term.to_lowercase();
         let n = term.chars().count();
-        let words: Vec<Field> = match target {
-            expression::Target::All => {
-                vec![
-                    self.f.name_w,
-                    self.f.title_w,
-                    self.f.desc_w,
-                    self.f.tags_w,
-                    self.f.facts_w,
-                ]
-            }
-            expression::Target::Name => vec![self.f.name_w],
-            expression::Target::Title => vec![self.f.title_w],
-            expression::Target::Description => vec![self.f.desc_w],
-            expression::Target::Tags => vec![self.f.tags_w],
-            expression::Target::Facts => vec![self.f.facts_w],
-            expression::Target::Camera => vec![self.f.camera_w],
-            expression::Target::Artist => vec![self.f.artist_w],
-            expression::Target::Album => vec![self.f.album_w],
-            expression::Target::Font => vec![self.f.font_w],
-            expression::Target::Audio => vec![self.f.audio_w],
-        };
+        let words = self.f.words_for(target);
         let global = target == expression::Target::All;
 
         let mut shoulds: Vec<(Occur, Box<dyn Query>)> = Vec::new();
@@ -1073,13 +1131,7 @@ impl TextIndex {
                 ));
             } else if n >= 2 {
                 // Field-qualified: search per-surface pinyin if available
-                let surface_pinyin = match target {
-                    expression::Target::Name => Some(self.f.name_pinyin),
-                    expression::Target::Title => Some(self.f.title_pinyin),
-                    expression::Target::Description => Some(self.f.desc_pinyin),
-                    expression::Target::Tags => Some(self.f.tags_pinyin),
-                    _ => None,
-                };
+                let surface_pinyin = self.f.pinyin_for(target);
                 if let Some(py_field) = surface_pinyin {
                     shoulds.push((
                         Occur::Should,
@@ -1188,27 +1240,7 @@ impl TextIndex {
     /// tokenizes to a single term (no positional information to enforce).
     fn phrase_query_on(&self, phrase: &str, target: expression::Target) -> Box<dyn Query> {
         let lower = phrase.to_lowercase();
-        let words: Vec<Field> = match target {
-            expression::Target::All => {
-                vec![
-                    self.f.name_w,
-                    self.f.title_w,
-                    self.f.desc_w,
-                    self.f.tags_w,
-                    self.f.facts_w,
-                ]
-            }
-            expression::Target::Name => vec![self.f.name_w],
-            expression::Target::Title => vec![self.f.title_w],
-            expression::Target::Description => vec![self.f.desc_w],
-            expression::Target::Tags => vec![self.f.tags_w],
-            expression::Target::Facts => vec![self.f.facts_w],
-            expression::Target::Camera => vec![self.f.camera_w],
-            expression::Target::Artist => vec![self.f.artist_w],
-            expression::Target::Album => vec![self.f.album_w],
-            expression::Target::Font => vec![self.f.font_w],
-            expression::Target::Audio => vec![self.f.audio_w],
-        };
+        let words = self.f.words_for(target);
 
         // Tokenize the phrase with jieba to get the sequence of terms
         let jieba = jieba();
@@ -1267,20 +1299,26 @@ impl TextIndex {
             clauses.push((Occur::Should, self.term_query(synonym)));
         }
 
+        // A plan can arrive with nothing positive in it: the planner rejects a
+        // plan only when keywords, synonyms, exclusions, filters *and* sort are
+        // all empty, so one exclusion and no keywords is a valid plan.
+        //
+        // Measured on tantivy 0.26, a `BooleanQuery` whose only clauses are
+        // `MustNot` answers **nothing** — not "every document minus the
+        // matches", which is what the Lucene-flavoured reading of that shape
+        // predicts. So this guard is not patching a live wrong answer; it is
+        // refusing to depend on that fact, and it makes this path and
+        // `build_group_query` reach the same verdict for the same shape by the
+        // same words rather than by two engines' semantics.
+        if clauses.is_empty() {
+            return self.no_match();
+        }
+
         // Exclusions: must NOT match.
         for exclusion in &plan.exclusions {
             clauses.push((Occur::MustNot, self.term_query(exclusion)));
         }
 
-        if clauses.is_empty() {
-            clauses.push((
-                Occur::Must,
-                Box::new(TermQuery::new(
-                    Term::from_field_text(self.f.abbr, "\u{0}no-match"),
-                    IndexRecordOption::Basic,
-                )),
-            ));
-        }
         Box::new(BooleanQuery::new(clauses))
     }
 }
@@ -1730,6 +1768,57 @@ mod tests {
         let minus = ids_of_expr(&idx, "png -name:zong");
         assert_eq!(minus.len(), 3, "{minus:?}");
         assert!(!minus.contains(&"aaaa0000-0000-0000-0000-000000000001".to_string()));
+    }
+
+    /// The same shape on the AI-planned path, which reaches `BooleanQuery`
+    /// through a different door than the hand-typed one above.
+    ///
+    /// The planner accepts a plan carrying one exclusion and no keywords — it
+    /// only rejects a plan where keywords, synonyms, exclusions, filters *and*
+    /// sort are all empty. Tantivy 0.26 already answers nothing for an
+    /// all-`MustNot` query (verified by disabling the guard and re-running this
+    /// assertion: it passes either way), so this pins the *decision*, not a live
+    /// wrong answer — it is what keeps the two paths agreeing if that engine
+    /// behaviour ever changes.
+    #[test]
+    fn a_plan_with_nothing_positive_matches_nothing() {
+        use crate::ai::search_planner::AiSearchPlan;
+        let idx = sample_index();
+        assert_eq!(
+            idx.search_plan(&AiSearchPlan::default(), 100)
+                .unwrap()
+                .len(),
+            0
+        );
+
+        // A term that matches nothing, so an accidental "match all minus X"
+        // anywhere in this path would show up as four rows rather than zero.
+        let exclusions_only = AiSearchPlan {
+            exclusions: vec!["nothing-carries-this".into()],
+            ..Default::default()
+        };
+        assert_eq!(
+            ids_of(&idx, "png").len(),
+            4,
+            "the sample library has four rows to accidentally return"
+        );
+        assert!(
+            idx.search_plan(&exclusions_only, 100).unwrap().is_empty(),
+            "an exclusions-only plan returned the whole library"
+        );
+
+        // With something positive to subtract from, the exclusion still applies.
+        let positive = AiSearchPlan {
+            keywords: vec!["png".into()],
+            ..Default::default()
+        };
+        assert_eq!(idx.search_plan(&positive, 100).unwrap().len(), 4);
+        let subtract = AiSearchPlan {
+            keywords: vec!["png".into()],
+            exclusions: vec!["png".into()],
+            ..Default::default()
+        };
+        assert!(idx.search_plan(&subtract, 100).unwrap().is_empty());
     }
 
     #[test]

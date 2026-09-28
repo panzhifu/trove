@@ -232,18 +232,22 @@ impl Expression {
     /// caller drop the vector leg rather than let it rank against a
     /// paraphrase the user did not type.
     pub fn embeddable_text(&self) -> Option<String> {
-        self.is_plain().then(|| {
-            self.groups
-                .first()
-                .map(|g| {
-                    g.atoms
-                        .iter()
-                        .map(|a| a.text.as_str())
-                        .collect::<Vec<_>>()
-                        .join(" ")
-                })
-                .unwrap_or_default()
-        })
+        if !self.is_plain() {
+            return None;
+        }
+        // `is_plain` requires exactly one non-empty group, so reaching through
+        // `first()` cannot fail here — and an `unwrap_or_default` would have
+        // turned a broken invariant into a silently empty embedding rather than
+        // a panic with a name on it.
+        let group = self.groups.first().expect("is_plain guarantees one group");
+        Some(
+            group
+                .atoms
+                .iter()
+                .map(|a| a.text.as_str())
+                .collect::<Vec<_>>()
+                .join(" "),
+        )
     }
 }
 
@@ -335,12 +339,12 @@ impl Parser {
             if self.at_end() {
                 break;
             }
-            if self.peek() == '|' {
+            if self.peek_char() == Some('|') {
                 self.bump();
+                // `take` already left `group` at its default, so there is no
+                // else: an empty group before a `|` is simply still empty.
                 if !group.is_empty() {
                     groups.push(std::mem::take(&mut group));
-                } else {
-                    group = Group::default();
                 }
                 continue;
             }
@@ -532,10 +536,10 @@ impl Parser {
         if self.at_end() {
             return Ok(None);
         }
-        if self.peek() == '"' {
+        if self.peek_char() == Some('"') {
             self.bump();
             return Ok(Some(Token {
-                text: self.read_to('"')?,
+                text: self.read_to('"'),
                 quoted: true,
                 value_quoted: true,
             }));
@@ -549,7 +553,7 @@ impl Parser {
             }
             if c == '"' {
                 self.bump();
-                text.push_str(&self.read_to('"')?);
+                text.push_str(&self.read_to('"'));
                 value_quoted = true;
                 break;
             }
@@ -563,8 +567,14 @@ impl Parser {
         }))
     }
 
-    /// Read up to and past `close`, complaining once if the input ends first.
-    fn read_to(&mut self, close: char) -> Result<String, SyntaxError> {
+    /// Read up to and past `close`, returning the text between.
+    ///
+    /// An unterminated quote is not an `Err`: the rest of the input is still
+    /// the best available text, so it is returned and the complaint goes into
+    /// `self.errors` for the caller to report alongside the results. Returning
+    /// a `Result` whose `Err` arm was never reachable only pushed a `?` onto
+    /// every call site.
+    fn read_to(&mut self, close: char) -> String {
         let mut out = String::new();
         loop {
             match self.peek_char() {
@@ -573,11 +583,11 @@ impl Parser {
                         SyntaxErrorKind::UnclosedQuote,
                         out.clone(),
                     ));
-                    return Ok(out);
+                    return out;
                 }
                 Some(c) if c == close => {
                     self.bump();
-                    return Ok(out);
+                    return out;
                 }
                 Some(c) => {
                     self.bump();
@@ -588,10 +598,6 @@ impl Parser {
     }
 
     // ---- cursor ----------------------------------------------------------
-
-    fn peek(&self) -> char {
-        self.chars[self.at]
-    }
 
     fn peek_char(&self) -> Option<char> {
         self.chars.get(self.at).copied()
