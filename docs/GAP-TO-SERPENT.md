@@ -5,7 +5,7 @@
 > **本轮（09-28）只有 Trove 动了，Serpent 一格没变**：上游仓库仍停在 **v0.2.9**，`src/` 仍是 **849 文件 / 258,255 行**、`MIGRATIONS` 仍是 32 段、末条 `version: 56`，与 09-27 那次复核逐字相同。所以 §2026-09-27 复核 那张表**不需要重审 Serpent 侧**，只需要把 Trove 这一轮的工作树改动记进去——记在 **§2026-09-28 复核** 那一节，并且**就地改掉了那一节里三行的状态**（音频卡片、检查器逗号输入标签、以及纵深索引升到的第 4、5 版）。Trove 这一轮动了什么、其中两件事**只做了一半就说自己做完了**，全部记在那一节里。
 >
 > **上一轮（09-27）两边都动了**：Trove 发了 **v0.4.9**（模型材质与共享 GPU 渲染器那一轮、智能集合同级拖拽重排、预览里方向键换素材、以及**卡片"活过来"的触发从指针定住改成按空格**——见 §C 的活卡片行与 [PREVIEW-SYSTEM.md](./PREVIEW-SYSTEM.md)），Serpent 从 v0.2.6 走到 v0.2.9。后者的增量单独成节，见 **§2026-09-27 复核**。
-> 核验日期 **2026-09-28**（同一天连做八轮，见 §2026-09-28 复核 与 第二~第八轮；更早是 09-27 / 09-25 / 09-24 / 09-23）。两边的数字都取自源码而非各自文档：Serpent `src/` **849 文件 / 258,255 行** `.ts`+`.tsx`（与 09-27 逐字相同），**schema 仍是 v56 一格没加**——`MIGRATIONS` 32 段、末条 `version: 56`，`SUPPORTED_SCHEMA_VERSION = MIGRATIONS.at(-1)!.version`。Trove `crates/` **228 文件 / 115,346 行** `.rs`（第四轮加 `media/anim.rs`、第六轮加 `preview/anim.rs`）（09-27 记的是 224 / 110,221）。schema **v21**——v19 加了序列帧两张侧表、v20 加了 `source_path` 虚拟列与索引、**v21 加了 `task_journal` 一张表**；`INDEX_VERSION` 从 09-27 的 3 走到 **5**（见 §D 纵深索引行）；包版本 **0.4.9**（本轮未 bump）；`en.toml` **798** 个叶子键；测试 **804 core + 74 app = 878** 全绿 3 ignored，`cargo test --workspace --all-targets` 实跑，`cargo fmt --all -- --check` 与 `cargo clippy --workspace --all-targets -- -D warnings` 两道门同轮一起过。
+> 核验日期 **2026-09-28**（同一天连做九轮，见 §2026-09-28 复核 与 第二~第九轮；更早是 09-27 / 09-25 / 09-24 / 09-23）。两边的数字都取自源码而非各自文档：Serpent `src/` **849 文件 / 258,255 行** `.ts`+`.tsx`（与 09-27 逐字相同），**schema 仍是 v56 一格没加**——`MIGRATIONS` 32 段、末条 `version: 56`，`SUPPORTED_SCHEMA_VERSION = MIGRATIONS.at(-1)!.version`。Trove `crates/` **228 文件 / 115,474 行** `.rs`（第四轮加 `media/anim.rs`、第六轮加 `preview/anim.rs`）（09-27 记的是 224 / 110,221）。schema **v22**——v19 加了序列帧两张侧表、v20 加了 `source_path` 虚拟列与索引、v21 加了 `task_journal` 一张表、**v22 把没人读写过的 `ai_analysis` 删掉**；`INDEX_VERSION` 从 09-27 的 3 走到 **5**（见 §D 纵深索引行）；包版本 **0.4.9**（本轮未 bump）；`en.toml` **798** 个叶子键；测试 **806 core + 74 app = 880** 全绿 3 ignored，`cargo test --workspace --all-targets` 实跑，`cargo fmt --all -- --check` 与 `cargo clippy --workspace --all-targets -- -D warnings` 两道门同轮一起过。
 >
 > **09-27 那一轮把上上轮三处"确认缺失"推翻了两处**，都是同一个失败模式——按 Serpent 的实现符号去 grep（`CF_HDROP`、`xdnd`、`file_drop`），命中零就记成"没有"，而没有按**能力**去问（"能不能把文件拖出窗口"）：
 > ① **原生文件拖出早就有**（`2026-09-12` 的 `ce6a29d` 起，`panels/workspace/cells.rs:199-215` 网格格、`:494-510` 列表行，见 §A。上一版这里写的 `:192`、`:406` 已经漂走，本轮重数过）；
@@ -264,6 +264,22 @@ Serpent 侧依旧一格没动。这一轮收 §2026-09-27 复核 里那条 S 级
 **门**：878 测全绿（本轮**没有新增测试**——可见性变更的证据形式不是红测试，而是"把可见性翻回去就得到 64 个编译错误"），`clippy -D warnings` 与 `fmt` 同轮过；`cargo doc` 的断链 10 条**全部先前已有**（我今天新引入的两条已修）。
 
 **没验的，说清楚**：本轮正确性靠的是"每个调用点换成同样一次查询、同样的错误处理"这一机械性质加上编译器，**没有任何一条测试覆盖"面板渲染出同样的数字"**——804+74 个测试里没有一个 UI 渲染断言。也就是说，如果我在某个调用点把 `unwrap_or(0)` 的时机挪错了位置，测试不会响。要复核就看侧栏计数、标签面板数字、文件夹列表和筛选器下拉这四块与改动前是否一致。
+
+---
+
+## 2026-09-28 第九轮：P6 删掉 `ai_analysis` 死表，并补上缺的两条迁移测试
+
+上一轮拍板"删表"，本轮执行，因为它是这份清单里少见的**删比加风险低**的一格。
+
+**做了什么**：`SCHEMA_VERSION` 21 → **22**。v21→v22 一步 `DROP INDEX IF EXISTS idx_ai_analysis_model; DROP TABLE IF EXISTS ai_analysis;`，并从"从零建形"的脚本里去掉这张表——也就是说这个 build 创建的库从来没有它。v14→v15 那一步**仍然创建它**：一步必须描述它当时代产生的那个形状，改成"后来被删了所以不建"会让链条中间那一段说谎。结果是一条走满链的库在 v15 得到表、在 v22 失去表，这正是链条该有的样子。
+
+**顺带补的测试债**：`store/mod.rs` 里 v14/v15/v17/v19 各有命名的迁移测试，**v20→v21（任务日志）没有**——这个缺口是加日志读写测试那一轮留下的，本轮补上 `a_v20_library_gains_the_task_journal_and_keeps_its_rows`。新增的 v21→v22 测试断言三件事：本 build 新建的库没有该表、带着它的库会被删掉、以及在"已经没有东西可删"的库上重跑这一步依然走完。另把老的 v14 测试里 `assert_eq!(tables, 1, "the upgrade created the cache table")` 翻成 `0`，措辞改成"走完之后当前形状里没有缓存表"——原先那句在 v22 之后是在替一个不存在的形状背书。
+
+**两条测试都做了变异核验**：把 `sql: UPGRADE_20_TO_21` 与 `sql: UPGRADE_21_TO_22` 换成空串，两条各自失败（前者在 `load_interrupted` 处报 `no such table`，后者在 `the table and everything in it are gone` 上 `left: 1 / right: 0`）。改回来全绿。**没走这一步，"我写了迁移测试"只是意图**。
+
+**门**：**806 core + 74 app = 880** 全绿 3 ignored，`fmt` 与 `clippy -D warnings` 同轮过。分析结果本身不受影响：它一直住在 `assets.extra` 的 `ai_analysis` 标记里（`tasks/ai_analysis.rs` 的 `MARKER_KEY`），撤销路径读的就是那一处，那张表从来没人写过。
+
+**下一格 P2**（`AssetLocation` 三态命名）与 P1 的区别要说清：P1 的 64 个点由编译器逐个点名，P2 改的是 `Asset` 本身——`origin` 57 处、`rel_path` 56 处、`source_path` 77 处、9 个构造点，且决定里包含"导出 JSON 字节兼容"。做法是先用一个 wire 影子结构把今天的形状钉成测试（round-trip 全字段相等，漏一个字段就红），再动类型。解码器必须是全函数，而 `Linked` 缺 `source_path` 只可能来自坏数据（`media/import.rs:440` 写侧总是填），所以类型给它第四个状态而不是撒谎——这一条是我定的，不在批准的选择之外，改名或去掉只动一处。
 
 ---
 

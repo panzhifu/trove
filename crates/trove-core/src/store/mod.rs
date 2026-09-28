@@ -286,7 +286,7 @@ mod tests {
         Asset, AssetKind, AssetPatch, AssetQuery, NewCollection, NewTag, Origin, Page, UsageStatus,
         now,
     };
-    use crate::store::{assets, collections, sequences, smart_collections, tags};
+    use crate::store::{assets, collections, sequences, smart_collections, tags, task_journal};
     use uuid::Uuid;
 
     fn sample_asset(name: &str, kind: AssetKind) -> Asset {
@@ -519,7 +519,10 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(tables, 1, "the upgrade created the cache table");
+        assert_eq!(
+            tables, 0,
+            "the walk ends at the current shape, and that shape has no cache table"
+        );
         assert!(
             assets::get(store.conn(), asset.id).unwrap().is_some(),
             "the upgrade is additive: existing rows survive"
@@ -529,6 +532,115 @@ mod tests {
         drop(store);
         let store = Store::open(&path).unwrap();
         assert_eq!(store.user_version().unwrap(), schema::SCHEMA_VERSION);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// v20 → v21 added the task journal — and until this test it was the one
+    /// step in the list with no named test of its own, which matters because
+    /// the journal is the only record a restarted process has of a job it lost.
+    #[test]
+    fn a_v20_library_gains_the_task_journal_and_keeps_its_rows() {
+        let dir = std::env::temp_dir().join(format!("trove-schema-v20-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("library.db");
+        let asset = sample_asset("kept.png", AssetKind::Image);
+
+        {
+            let store = Store::open(&path).unwrap();
+            assets::insert(store.conn(), &asset).unwrap();
+        }
+
+        // Rewind: v21 added exactly one table, so dropping it and the number
+        // leaves the shape v20 described.
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .execute_batch("DROP TABLE IF EXISTS task_journal; PRAGMA user_version = 20;")
+            .unwrap();
+
+        let store = Store::open(&path).unwrap();
+        assert_eq!(
+            store.user_version().unwrap(),
+            schema::SCHEMA_VERSION,
+            "the step ran and the walk continued to the current shape"
+        );
+        // The table answers rather than erroring: that is the difference between
+        // a journal that is empty and a library that cannot report anything.
+        let interrupted = task_journal::load_interrupted(store.conn()).unwrap();
+        assert!(
+            interrupted.is_empty(),
+            "a journal nobody has written to holds nothing"
+        );
+        assert!(
+            assets::get(store.conn(), asset.id).unwrap().is_some(),
+            "the upgrade is additive: existing rows survive"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// v21 → v22 removes a table that was never used. Three promises to keep:
+    /// a library created by this build has no such table at all, a library that
+    /// still carries one from the v15 step loses it, and the step is harmless
+    /// when there is nothing to drop.
+    #[test]
+    fn the_unused_ai_analysis_table_is_absent_then_dropped_then_harmless() {
+        let dir = std::env::temp_dir().join(format!("trove-schema-v22-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("library.db");
+        let count = |store: &Store| -> i64 {
+            store
+                .conn()
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'ai_analysis'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap()
+        };
+
+        let store = Store::open(&path).unwrap();
+        assert_eq!(
+            count(&store),
+            0,
+            "the shape this build creates has no cache table"
+        );
+
+        // Back to the v21 shape a walked library ends in: table and index there,
+        // version on record.
+        store
+            .conn()
+            .execute_batch(
+                "CREATE TABLE ai_analysis (
+                     asset_id TEXT NOT NULL, model_version TEXT NOT NULL,
+                     result_json TEXT NOT NULL, analysed_at TEXT NOT NULL,
+                     PRIMARY KEY (asset_id, model_version));
+                 CREATE INDEX idx_ai_analysis_model ON ai_analysis(model_version);
+                 PRAGMA user_version = 21;",
+            )
+            .unwrap();
+        drop(store);
+
+        let store = Store::open(&path).unwrap();
+        assert_eq!(
+            store.user_version().unwrap(),
+            schema::SCHEMA_VERSION,
+            "the removal step is on the chain, not a one-off fixup"
+        );
+        assert_eq!(count(&store), 0, "the table and everything in it are gone");
+        drop(store);
+
+        // And replaying it over a library that no longer has the table must not
+        // strand it: a crash between the DDL and the version bump is the case
+        // every step is written against.
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .execute_batch("PRAGMA user_version = 21;")
+            .unwrap();
+        let store = Store::open(&path).unwrap();
+        assert_eq!(
+            store.user_version().unwrap(),
+            schema::SCHEMA_VERSION,
+            "the second pass found nothing to drop and still finished the walk"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

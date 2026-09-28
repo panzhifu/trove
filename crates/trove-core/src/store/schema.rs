@@ -19,13 +19,24 @@
 //! come back — with the rule that a step must be applicable from a shape that
 //! matches the version on record.
 //!
-//! That is where this file stands now: [`UPGRADES`] holds seven steps, because
+//! That is where this file stands now: [`UPGRADES`] holds eight steps, because
 //! every one of them landed while the version before it was already in the
 //! field — v14 → v15 for the `ai_analysis` cache, v15 → v16 for a container's
 //! appearance, v16 → v17 for the 3D viewport's look, v17 → v18 for the ordered
 //! live-listing indexes, v18 → v19 for image sequences, v19 → v20 for the
-//! indexed source path, v20 → v21 for the task journal. Everything not on the
-//! list is still refused by name.
+//! indexed source path, v20 → v21 for the task journal, and v21 → v22 to take
+//! the `ai_analysis` cache back out again. Everything not on the list is still
+//! refused by name.
+//!
+//! The last step is the first removal this schema has made, and it is worth
+//! reading as a fact rather than a tidy-up: `ai_analysis` was created, indexed
+//! and given its own migration step, and **no code ever inserted into it or
+//! selected from it**. What an analysis run records — and what its undo reads
+//! back — is a marker inside `assets.extra`. So the table was schema weight
+//! plus a step to keep correct forever, for a row nobody wrote. The v14 → v15
+//! step still creates it, because a step must describe the shape it actually
+//! produced; a library walking the whole chain therefore gains the table at v15
+//! and loses it at v22, which is what a chain is for.
 
 /// The schema this build creates, and the only shape it opens. A library at
 /// any other version is refused by name rather than guessed at.
@@ -34,7 +45,7 @@
 /// existence was written by a build whose chain ended there, and that shape
 /// is the pre-`asset_embeddings` subset of the one below — which is the only
 /// sense in which a version number means anything.
-pub const SCHEMA_VERSION: i64 = 21;
+pub const SCHEMA_VERSION: i64 = 22;
 
 /// One upgrade step: the DDL that takes a library from `from` to `to`, and the
 /// data that DDL cannot move.
@@ -102,7 +113,24 @@ pub const UPGRADES: &[Upgrade] = &[
         sql: UPGRADE_20_TO_21,
         data: None,
     },
+    Upgrade {
+        from: 21,
+        to: 22,
+        sql: UPGRADE_21_TO_22,
+        data: None,
+    },
 ];
+
+/// v21 → v22: drop the `ai_analysis` cache table and its index.
+///
+/// Both statements are `IF EXISTS` because the shape a library arrives at is not
+/// guaranteed to have them: a v14 library creates the table at v15, while one
+/// made fresh by *this* build never has it — the create-from-nothing script
+/// stopped writing it. Re-running the step is harmless for the same reason.
+const UPGRADE_21_TO_22: &str = r#"
+    DROP INDEX IF EXISTS idx_ai_analysis_model;
+    DROP TABLE IF EXISTS ai_analysis;
+"#;
 
 /// v20 → v21: the task journal.
 ///
@@ -603,21 +631,9 @@ pub const SCHEMA: &str = r#"
 
     CREATE INDEX idx_asset_embeddings_model ON asset_embeddings(model, space);
 
-    -- AI analysis results, one row per (asset, model_version). The structured
-    -- output (description, tags, rating) is stored as JSON so the schema
-    -- evolves without migrations. `analysed_at` is used to skip unchanged
-    -- assets on re-runs. Tags applied from the analysis live in the
-    -- asset_tag table, not here — this table only caches the raw result.
-    -- Deleting an asset deletes its analysis rows with it (CASCADE).
-    CREATE TABLE ai_analysis (
-        asset_id      TEXT NOT NULL REFERENCES assets(id) ON DELETE CASCADE,
-        model_version TEXT NOT NULL,
-        result_json   TEXT NOT NULL,
-        analysed_at   TEXT NOT NULL,
-        PRIMARY KEY (asset_id, model_version)
-    );
-
-    CREATE INDEX idx_ai_analysis_model ON ai_analysis(model_version);
+    -- No `ai_analysis` table. It existed from v15 to v21 and held nothing: no
+    -- code ever wrote or read it, because an analysis run records its marker in
+    -- `assets.extra` and its undo reads that back. See [`UPGRADE_21_TO_22`].
 
     -- The task journal: persists task metadata across restarts so the UI can
     -- surface interrupted work and track retry history. See [`UPGRADE_20_TO_21`].
