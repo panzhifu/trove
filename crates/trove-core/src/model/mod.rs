@@ -22,8 +22,8 @@ mod tag;
 
 pub use appearance::{Accent, Appearance, Glyph};
 pub use asset::{
-    ASPECT_TOLERANCE, AspectPreset, Asset, AssetKind, AssetPatch, NewAsset, Orientation, Origin,
-    RESOLUTION_BAND_BOUNDS, ResolutionBand, UsageStatus,
+    ASPECT_TOLERANCE, AspectPreset, Asset, AssetKind, AssetLocation, AssetPatch, NewAsset,
+    Orientation, Origin, RESOLUTION_BAND_BOUNDS, ResolutionBand, UsageStatus,
 };
 pub use collection::{Collection, NewCollection, NewSmartCollection, SmartCollection};
 pub use embedding::{EmbeddingSpace, MAX_DIM, NewEmbedding, VectorMatch, normalized};

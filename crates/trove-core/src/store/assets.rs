@@ -9,8 +9,8 @@ use uuid::Uuid;
 use super::rows::{self, bind_opt_int, bind_opt_str, bind_opt_ts};
 use crate::error::{Error, Result};
 use crate::model::{
-    Asset, AssetFacts, AssetKind, AssetPatch, AssetQuery, Orientation, Origin, Page, UsageStatus,
-    now,
+    Asset, AssetFacts, AssetKind, AssetLocation, AssetPatch, AssetQuery, Orientation, Origin, Page,
+    UsageStatus, now,
 };
 
 /// Column list shared by every read; index order matches `asset_from_row`.
@@ -657,13 +657,20 @@ pub(crate) fn asset_from_row(row: &rusqlite::Row) -> Result<Asset> {
 }
 
 fn asset_values(a: &Asset) -> Vec<Value> {
+    // The two location columns are written from one decision, not read from two
+    // fields that can disagree: a stored record with no path puts `NULL` in
+    // `rel_path` because that *is* what a placeholder means, and the linked
+    // paths live in `extra` (their indexed column is generated from that key),
+    // so neither state writes the other's column.
+    let (origin_word, rel_path) = match a.location() {
+        AssetLocation::Stored { rel_path } => ("stored", Some(rel_path)),
+        AssetLocation::Placeholder => ("stored", None),
+        AssetLocation::Linked { .. } | AssetLocation::Unrecorded => ("linked", None),
+    };
     vec![
         rows::uuid(a.id).into(),
-        match a.origin {
-            Origin::Stored => "stored".to_string().into(),
-            Origin::Linked => "linked".to_string().into(),
-        },
-        bind_opt_str(a.rel_path.as_deref()),
+        origin_word.to_string().into(),
+        bind_opt_str(rel_path.as_deref()),
         a.file_name.clone().into(),
         a.ext.clone().into(),
         a.mime.clone().into(),

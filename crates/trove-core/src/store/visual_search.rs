@@ -9,7 +9,7 @@ use super::assets::{self, COLS};
 use super::rows;
 use crate::error::Result;
 use crate::media::search::{self, ColorHistogram, PHash, VisualSignature};
-use crate::model::Asset;
+use crate::model::{Asset, AssetLocation};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::Path;
@@ -77,15 +77,19 @@ pub fn compute_and_store_signature(
         return Ok(false);
     }
 
-    if let Some(ref rel) = asset.rel_path {
-        let path = library_root.join(rel);
-        let sig = VisualSignature::from_image(&path);
-        if sig.phash != PHash(0) {
-            let mut facts = asset.facts.clone();
-            sig.apply_to_facts(&mut facts);
-            assets::update_facts(conn, asset.id, &facts)?;
-            return Ok(true);
-        }
+    // Only a blob the library itself holds can be decoded here: a linked file
+    // lives outside the root this call was handed, and a placeholder has no file
+    // yet at all.
+    let AssetLocation::Stored { rel_path } = asset.location() else {
+        return Ok(false);
+    };
+    let path = library_root.join(rel_path);
+    let sig = VisualSignature::from_image(&path);
+    if sig.phash != PHash(0) {
+        let mut facts = asset.facts.clone();
+        sig.apply_to_facts(&mut facts);
+        assets::update_facts(conn, asset.id, &facts)?;
+        return Ok(true);
     }
     Ok(false)
 }
@@ -335,8 +339,11 @@ pub fn backfill_signatures(
 
     let mut updated = 0_u64;
     for asset in rows_vec {
-        if let Some(ref rel) = asset.rel_path {
-            let path = library_root.join(rel);
+        let AssetLocation::Stored { rel_path } = asset.location() else {
+            continue;
+        };
+        {
+            let path = library_root.join(rel_path);
             let sig = VisualSignature::from_image(&path);
             if sig.phash != PHash(0) {
                 let mut facts = asset.facts.clone();
