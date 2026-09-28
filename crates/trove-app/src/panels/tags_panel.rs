@@ -329,7 +329,8 @@ fn render_tag_row(
         .drag_over::<AssetsDrag>(|this, _, _, cx| this.bg(cx.theme().secondary))
         .on_drop(move |payload: &AssetsDrag, _window, cx| {
             ctl_tag.update(cx, move |ctl, cx| {
-                let _ = ctl.library.tag_assets(&payload.0, id, true);
+                let outcome = ctl.library.tag_assets(&payload.0, id, true);
+                ctl.report_failed("tagging dropped assets", outcome);
                 ctl.generation += 1;
                 cx.notify();
             });
@@ -398,7 +399,8 @@ fn tag_context_menu(
             menu = menu.item(PopupMenuItem::new(label).on_click(move |_, _, cx| {
                 let value = value.clone();
                 ctl.update(cx, move |ctl, cx| {
-                    let _ = ctl.library.set_tag_color(tag_id, Some(&value));
+                    let outcome = ctl.library.set_tag_color(tag_id, Some(&value));
+                    ctl.report_failed("tag colour", outcome);
                     ctl.generation += 1;
                     cx.notify();
                 });
@@ -409,7 +411,8 @@ fn tag_context_menu(
             PopupMenuItem::new(rust_i18n::t!("tags.no_color").to_string()).on_click(
                 move |_, _, cx| {
                     ctl_clear.update(cx, move |ctl, cx| {
-                        let _ = ctl.library.set_tag_color(tag_id, None);
+                        let outcome = ctl.library.set_tag_color(tag_id, None);
+                        ctl.report_failed("tag colour cleared", outcome);
                         ctl.generation += 1;
                         cx.notify();
                     });
@@ -428,7 +431,8 @@ fn tag_context_menu(
             PopupMenuItem::new(rust_i18n::t!("tags.delete_tag").to_string()).on_click(
                 move |_, _, cx| {
                     ctl_del.update(cx, move |ctl, cx| {
-                        let _ = ctl.library.delete_tag(tag_id);
+                        let outcome = ctl.library.delete_tag(tag_id);
+                        ctl.report_failed("deleting a tag", outcome);
                         if ctl.active_tag == Some(tag_id) {
                             ctl.select_tag(None);
                         }
@@ -474,7 +478,8 @@ fn open_create_dialog(
                             // Same name under a different parent is still the
                             // same tag (names stay globally unique); the
                             // library layer dedupes.
-                            let _ = ctl.library.create_tag(&name, parent);
+                            let outcome = ctl.library.create_tag(&name, parent);
+                            ctl.report_failed("creating a tag", outcome);
                             ctl.generation += 1;
                             cx.notify();
                         });
@@ -514,7 +519,8 @@ fn open_rename_dialog(
                     let name: String = name_input.read(cx).value().trim().to_string();
                     if !name.is_empty() {
                         ctl.update(cx, |ctl, cx| {
-                            let _ = ctl.library.rename_tag(tag_id, &name);
+                            let outcome = ctl.library.rename_tag(tag_id, &name);
+                            ctl.report_failed("renaming a tag", outcome);
                             ctl.generation += 1;
                             cx.notify();
                         });

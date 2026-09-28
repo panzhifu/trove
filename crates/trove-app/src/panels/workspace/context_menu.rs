@@ -493,7 +493,8 @@ fn build_collection_submenu(
         menu = menu.item(PopupMenuItem::new(cname).on_click(move |_, _, cx| {
             controller.update(cx, move |ctl, cx| {
                 let ids = ctl.action_targets(asset_id);
-                let _ = ctl.library.add_assets_to_collection(cid, &ids);
+                let outcome = ctl.library.add_assets_to_collection(cid, &ids);
+                ctl.report_failed("adding assets to a folder", outcome);
                 ctl.generation += 1;
                 cx.notify();
             });

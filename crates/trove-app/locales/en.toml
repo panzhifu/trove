@@ -516,6 +516,7 @@ lang_pt = "Português"
 lang_ru = "Русский"
 
 [notice]
+change_not_saved = "That change did not reach the library: {error}"
 collect_started = "Collecting %{count} files…"
 collect_done = "Collected %{imported} files into the library"
 import_started = "Importing %{count} files…"

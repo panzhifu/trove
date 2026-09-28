@@ -71,7 +71,8 @@ pub(crate) fn selection_toolbar(
                 .on_click(move |_, _, cx| {
                     ctl_restore.update(cx, |ctl, cx| {
                         let ids = std::mem::take(Rc::make_mut(&mut ctl.selected_assets));
-                        let _ = ctl.library.restore_assets(&ids);
+                        let outcome = ctl.library.restore_assets(&ids);
+                        ctl.report_failed("restoring assets", outcome);
                         ctl.selection_anchor = None;
                         ctl.generation += 1;
                         cx.notify();
@@ -169,7 +170,8 @@ pub(crate) fn selection_toolbar(
                 .on_click(move |_, _, cx| {
                     ctl_fav.update(cx, |ctl, cx| {
                         let ids = ctl.selected_assets.clone();
-                        let _ = ctl.library.set_assets_favorite(&ids, !all_favorite);
+                        let outcome = ctl.library.set_assets_favorite(&ids, !all_favorite);
+                        ctl.report_failed("changing favourites", outcome);
                         ctl.generation += 1;
                         cx.notify();
                     });
@@ -206,7 +208,8 @@ pub(crate) fn selection_toolbar(
                         menu = menu.item(PopupMenuItem::new(cname).on_click(move |_, _, cx| {
                             ctl.update(cx, |ctl, cx| {
                                 let ids = ctl.selected_assets.clone();
-                                let _ = ctl.library.add_assets_to_collection(cid, &ids);
+                                let outcome = ctl.library.add_assets_to_collection(cid, &ids);
+                                ctl.report_failed("adding assets to a folder", outcome);
                                 ctl.generation += 1;
                                 cx.notify();
                             });

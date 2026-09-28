@@ -685,10 +685,15 @@ impl LibraryController {
     /// already applied the look on screen. Nothing here bumps a generation —
     /// the look is not part of any listing.
     pub fn remember_model_look(&mut self, asset: Uuid, look: StoredLook) {
-        // Silent by design, as before: a library whose row cannot be written
-        // should still let the user paint the model, and the panel has already
-        // applied the look on screen.
-        let _ = self.library.set_model_look(asset, &look);
+        // Silent *to the user*, by design: a library whose row cannot be written
+        // should still let them paint the model, and the panel has already applied
+        // the look on screen. A 3D view's look is not something to interrupt a
+        // drag for -- but it is something to leave a trace about, so the failure
+        // goes to the log rather than nowhere. Losing it means the next time this
+        // model opens, the lighting is the default, and that is worth one line.
+        if let Err(error) = self.library.set_model_look(asset, &look) {
+            tracing::warn!(%error, "a model's look could not be remembered");
+        }
     }
 
     /// Set the active smart collection; `None` returns to "All assets".
@@ -962,6 +967,39 @@ impl LibraryController {
         // workspace's cached data pass must be invalidated; `generation` is
         // part of its key.
         self.generation += 1;
+    }
+
+    /// Report a mutation the user asked for that did not reach the library.
+    ///
+    /// The screen updates from what was *asked*, not from what was stored: a
+    /// caller tags an asset, bumps `generation`, and the chip appears. If the
+    /// write failed -- a read-only library on a dead disk, a row another process
+    /// locked -- nothing said so until this helper existed, and the honest
+    /// sequence was "the chip shows for this session and the asset is untagged
+    /// after a restart". So the notice names the failure, and callers still bump
+    /// their generation: the re-read shows what the library actually holds, which
+    /// is the pair the user can act on (the chip goes back away, and the line
+    /// says why) rather than a screen that quietly disagrees with the file.
+    ///
+    /// `what` is for the log line only -- a static English label like "tagging",
+    /// never shown. The message the user sees is one key for every action,
+    /// because they just performed the action and do not need it named back to
+    /// them in a translation that cannot possibly be better than "that change".
+    pub(crate) fn report_failed<T>(
+        &mut self,
+        what: &'static str,
+        outcome: std::result::Result<T, trove_core::Error>,
+    ) -> Option<T> {
+        match outcome {
+            Ok(value) => Some(value),
+            Err(error) => {
+                tracing::warn!(what, %error, "a change the user made did not reach the library");
+                self.report_error(
+                    rust_i18n::t!("notice.change_not_saved", error = error.to_string()).to_string(),
+                );
+                None
+            }
+        }
     }
 
     /// Record an error notice. Returns `true` only when the message is new,

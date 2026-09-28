@@ -450,6 +450,7 @@ lang_pt = "Português"
 lang_ru = "Русский"
 
 [notice]
+change_not_saved = "Essa alteração não chegou à biblioteca: {error}"
 collect_started = "Coletando %{count} arquivos…"
 collect_done = "Coletados %{imported} arquivos na biblioteca"
 import_started = "Importando %{count} arquivos…"

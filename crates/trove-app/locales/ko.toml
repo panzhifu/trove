@@ -450,6 +450,7 @@ lang_pt = "Português"
 lang_ru = "Русский"
 
 [notice]
+change_not_saved = "해당 변경 사항이 라이브러리에 저장되지 않았습니다: {error}"
 collect_started = "%{count}개 파일 수집 중…"
 collect_done = "%{imported}개 파일을 라이브러리에 수집했습니다"
 import_started = "%{count}개 파일 가져오기 중…"

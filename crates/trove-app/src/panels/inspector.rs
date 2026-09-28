@@ -121,8 +121,25 @@ impl InspectorPanel {
         };
         controller.update(cx, |ctl, cx| {
             for name in &names {
-                if let Ok(tag) = ctl.library.ensure_tag(name) {
-                    let _ = ctl.library.tag_assets(&[asset_id], tag.id, true);
+                // Both halves can fail and both are the same user action: a comma
+                // list that reaches the screen and not the library is the exact
+                // shape this round is closing, so the loop stops reporting at the
+                // first failure (the notice is one line) and keeps going.
+                match ctl.library.ensure_tag(name) {
+                    Ok(tag) => {
+                        let outcome = ctl.library.tag_assets(&[asset_id], tag.id, true);
+                        if ctl
+                            .report_failed("tagging from the inspector", outcome)
+                            .is_none()
+                        {
+                            break;
+                        }
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, name, "a typed tag name could not be ensured");
+                        ctl.report_failed::<()>("typing a tag", Err(error));
+                        break;
+                    }
                 }
             }
             ctl.generation += 1;
@@ -158,7 +175,13 @@ impl InspectorPanel {
                 }
             }
             for tag_id in tag_ids {
-                let _ = ctl.library.tag_assets(&[asset_id], tag_id, true);
+                let outcome = ctl.library.tag_assets(&[asset_id], tag_id, true);
+                if ctl
+                    .report_failed("tagging from the inspector", outcome)
+                    .is_none()
+                {
+                    break;
+                }
             }
             ctl.generation += 1;
             cx.notify();
@@ -489,7 +512,12 @@ impl Render for InspectorPanel {
                                     .label("×")
                                     .on_click(move |_, _, cx| {
                                         controller.update(cx, move |ctl, cx| {
-                                            let _ = ctl.library.tag_assets(&[asset_id], id, false);
+                                            let outcome =
+                                                ctl.library.tag_assets(&[asset_id], id, false);
+                                            ctl.report_failed(
+                                                "untagging from the inspector",
+                                                outcome,
+                                            );
                                             ctl.generation += 1;
                                             cx.notify();
                                         });

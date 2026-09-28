@@ -450,6 +450,7 @@ lang_pt = "Português"
 lang_ru = "Русский"
 
 [notice]
+change_not_saved = "その変更はライブラリに保存されませんでした: {error}"
 collect_started = "%{count} ファイルを収集中…"
 collect_done = "%{imported} ファイルをライブラリに収集しました"
 import_started = "%{count} ファイルをインポート中…"

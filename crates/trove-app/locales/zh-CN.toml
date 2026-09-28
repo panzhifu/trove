@@ -514,6 +514,7 @@ lang_pt = "Português"
 lang_ru = "Русский"
 
 [notice]
+change_not_saved = "这次改动没有写入素材库：{error}"
 collect_started = "正在采集 %{count} 个文件…"
 collect_done = "已采集 %{imported} 个文件入库"
 import_started = "正在导入 %{count} 个文件…"

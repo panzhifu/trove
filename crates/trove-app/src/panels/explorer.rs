@@ -387,13 +387,15 @@ impl ExplorerPanel {
             }
             EditorMode::Renaming(id) => {
                 self.controller.update(cx, |ctl, cx| {
-                    let _ = ctl.library.rename_collection(id, &name);
+                    let outcome = ctl.library.rename_collection(id, &name);
+                    ctl.report_failed("renaming a folder", outcome);
                     cx.notify();
                 });
             }
             EditorMode::RenamingSmart(id) => {
                 self.controller.update(cx, |ctl, cx| {
-                    let _ = ctl.library.rename_smart_collection(id, &name);
+                    let outcome = ctl.library.rename_smart_collection(id, &name);
+                    ctl.report_failed("renaming a smart folder", outcome);
                     cx.notify();
                 });
             }
@@ -785,7 +787,8 @@ fn attach_trash_drop(row: Stateful<Div>, controller: Entity<LibraryController>) 
     row.drag_over::<AssetsDrag>(|this, _, _, cx| this.bg(cx.theme().secondary))
         .on_drop(move |payload: &AssetsDrag, _window, cx| {
             controller.update(cx, move |ctl, cx| {
-                let _ = ctl.library.trash_assets(&payload.0);
+                let outcome = ctl.library.trash_assets(&payload.0);
+                ctl.report_failed("trashing dropped assets", outcome);
                 ctl.deselect(&payload.0);
                 cx.notify();
             });
@@ -965,7 +968,8 @@ fn collection_row(
                 .drag_over::<AssetsDrag>(|this, _, _, cx| this.bg(cx.theme().secondary))
                 .on_drop(move |payload: &AssetsDrag, _window, cx| {
                     drop_assets.update(cx, move |ctl, cx| {
-                        let _ = ctl.library.add_assets_to_collection(cid, &payload.0);
+                        let outcome = ctl.library.add_assets_to_collection(cid, &payload.0);
+                        ctl.report_failed("adding dropped assets to a folder", outcome);
                         ctl.generation += 1;
                         cx.notify();
                     });
