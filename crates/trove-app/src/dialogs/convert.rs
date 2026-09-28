@@ -347,7 +347,7 @@ fn start_conversion(
             let result = cx
                 .background_executor()
                 .spawn(async move {
-                    let mut used = used.lock().expect("convert name registry poisoned");
+                    let mut used = trove_core::sync::lock(&used);
                     convert::convert_item(&dest, &item, &opts, &mut used)
                 })
                 .await;

@@ -93,3 +93,51 @@ jobs:
             echo "::error::$line"
           done
         shell: bash
+
+  miri:
+    name: Miri (pure-Rust UB check)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: miri-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            miri-cargo-
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          # The same set the `check` job installs: miri still *builds* the
+          # native dependencies, it just does not execute their code.
+          sudo apt-get install -y \
+            libxcb1-dev libxkbcommon-dev libxkbcommon-x11-dev \
+            libegl1-mesa-dev libgl1-mesa-dev libfontconfig-dev \
+            libasound2-dev libwayland-dev libdrm-dev libzstd-dev \
+            libgbm-dev libpipewire-0.3-dev
+
+      # Miri cannot execute foreign functions, so it cannot reach the two
+      # FFI-backed `unsafe` sites: `store::Store::conn` aliases the sqlite3
+      # handle behind a RefCell, and `media::chunked` maps a file. Both are
+      # held by their single-thread convention and their tests, not by miri.
+      # What miri *can* check is the pure-Rust surface, which is where a new
+      # hand-written `unsafe` would most likely appear; the filters keep the
+      # run off the FFI paths it would abort on.
+      - name: Miri (model)
+        run: "cargo +nightly miri test -p trove-core --lib model::"
+
+      - name: Miri (sync)
+        run: "cargo +nightly miri test -p trove-core --lib sync::"

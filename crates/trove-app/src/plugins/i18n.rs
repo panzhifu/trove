@@ -27,7 +27,7 @@ fn store() -> &'static Mutex<HashMap<String, HashMap<String, String>>> {
 /// Register one plugin's language files. Called once at startup, from
 /// `plugins::init`; the plugin name is only carried for the log line.
 pub fn register(plugin: &str, files: &[(&'static str, &'static str)]) {
-    let mut store = store().lock().expect("plugin translations lock");
+    let mut store = trove_core::sync::lock(store());
     for (lang, text) in files {
         let Ok(table) = toml::from_str::<toml::Table>(text) else {
             tracing::warn!(
@@ -70,7 +70,7 @@ fn flatten(prefix: &str, value: &toml::Value, out: &mut HashMap<String, String>)
 /// language has no catalog for it), with `t!`'s `%{var}` interpolation.
 /// `None` when no plugin carries the key — the caller decides the fallback.
 pub fn translate(key: &str, patterns: &[&str], values: &[String]) -> Option<String> {
-    let store = store().lock().expect("plugin translations lock");
+    let store = trove_core::sync::lock(store());
     let current = rust_i18n::locale().to_string();
     let text = store
         .get(&current)

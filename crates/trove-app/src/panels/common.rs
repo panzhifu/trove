@@ -217,7 +217,7 @@ pub(crate) fn ensure_font_registered(
     cx: &mut App,
 ) -> bool {
     let set = REGISTERED_FONTS.get_or_init(|| Mutex::new(std::collections::HashSet::new()));
-    if set.lock().unwrap().contains(family) {
+    if trove_core::sync::lock(set).contains(family) {
         return true;
     }
     let Some(path) = blob else {
@@ -231,7 +231,7 @@ pub(crate) fn ensure_font_registered(
         .add_fonts(vec![std::borrow::Cow::Owned(bytes)])
         .is_ok()
     {
-        set.lock().unwrap().insert(family.to_string());
+        trove_core::sync::lock(set).insert(family.to_string());
         true
     } else {
         false
@@ -340,7 +340,7 @@ pub(crate) fn animated_preview_source(
         // APNG needs manual frame extraction (mime for PNG is image/png).
         Some("image/png") => {
             let cache = APNG_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-            let mut cache = cache.lock().unwrap();
+            let mut cache = trove_core::sync::lock(cache);
             if let Some(hit) = cache.get(path) {
                 return hit.clone().map(ImageSource::Render);
             }

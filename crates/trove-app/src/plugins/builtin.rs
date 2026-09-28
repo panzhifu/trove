@@ -99,12 +99,12 @@ impl SidecarNotes {
     }
 
     fn mode(&self) -> Mode {
-        *self.state.read().expect("sidecar-notes mode lock")
+        *trove_core::sync::read(&self.state)
     }
 
     /// Apply the mode to the live state and persist it for the next launch.
     fn set_mode(&self, mode: Mode) {
-        *self.state.write().expect("sidecar-notes mode lock") = mode;
+        *trove_core::sync::write(&self.state) = mode;
         let mut config = AppConfig::load();
         config
             .plugin_settings
@@ -240,14 +240,14 @@ impl SidecarNotes {
         ("sidecar-notes/toggle-mode", "ctrl-alt-s");
 
     fn mode_of(state: &Arc<RwLock<Mode>>) -> Mode {
-        *state.read().expect("sidecar-notes mode lock")
+        *trove_core::sync::read(state)
     }
 }
 
 /// Free-standing `set_mode` for the settings closures, which own a state
 /// clone rather than the plugin itself.
 fn self_set_mode(state: &Arc<RwLock<Mode>>, mode: Mode) {
-    *state.write().expect("sidecar-notes mode lock") = mode;
+    *trove_core::sync::write(state) = mode;
     let mut config = AppConfig::load();
     config
         .plugin_settings
@@ -316,10 +316,9 @@ impl Stage for SidecarNotesStage {
             if title.is_empty() {
                 return Ok(());
             }
-            let fill_only = self.state.read().map(|m| *m == Mode::FillMissing);
-            match fill_only {
-                Ok(true) if io.mined.title.is_some() => return Ok(()),
-                _ => {}
+            if *trove_core::sync::read(&self.state) == Mode::FillMissing && io.mined.title.is_some()
+            {
+                return Ok(());
             }
             io.mined.title = Some(title.to_string());
         }

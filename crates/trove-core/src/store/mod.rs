@@ -260,6 +260,10 @@ impl Store {
     /// shared and mutable access to one `sqlite3` handle: undefined behaviour,
     /// not a panic, which is exactly why the door is no longer public.
     pub(crate) fn conn(&self) -> &rusqlite::Connection {
+        // SAFETY: the convention in the `# Safety` note above is upheld —
+        // single-threaded, one operation at a time, nothing re-enters the
+        // store while this reference is live. The reference is tied to
+        // `&self`, and no `borrow_mut` runs during its life.
         unsafe { &*self.conn.as_ptr() }
     }
 

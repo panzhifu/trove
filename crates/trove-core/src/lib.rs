@@ -17,6 +17,7 @@ pub mod plugins;
 pub mod search;
 pub mod services;
 pub mod store;
+pub mod sync;
 pub mod tasks;
 
 pub use error::{Error, Result};

@@ -304,13 +304,13 @@ impl PauseSignal {
         // Flip under the lock so a thread that is between its `while` check
         // and `cond.wait` (and therefore still holding the lock) cannot miss
         // the transition.
-        let _guard = self.lock.lock().unwrap();
+        let _guard = crate::sync::lock(&self.lock);
         self.paused.store(true, Ordering::SeqCst);
     }
 
     fn request_resume(&self) {
         {
-            let _guard = self.lock.lock().unwrap();
+            let _guard = crate::sync::lock(&self.lock);
             self.paused.store(false, Ordering::SeqCst);
         }
         self.cond.notify_all();
@@ -322,7 +322,7 @@ impl PauseSignal {
     /// before `notify_all` can otherwise be lost against a thread not yet
     /// parked.
     fn wake(&self) {
-        drop(self.lock.lock().unwrap());
+        drop(crate::sync::lock(&self.lock));
         self.cond.notify_all();
     }
 
@@ -332,7 +332,7 @@ impl PauseSignal {
         if !self.paused.load(Ordering::SeqCst) {
             return;
         }
-        let mut guard = self.lock.lock().unwrap();
+        let mut guard = crate::sync::lock(&self.lock);
         while self.paused.load(Ordering::SeqCst) && !cancel.load(Ordering::Relaxed) {
             guard = self.cond.wait(guard).unwrap();
         }
@@ -397,7 +397,7 @@ impl EventQueue {
     /// the registry lock is already held, preserving the `jobs → events` order.
     fn push(&self, event: TaskEvent) {
         {
-            let mut state = self.state.lock().unwrap();
+            let mut state = crate::sync::lock(&self.state);
             let (bucket, progress) = state.entry(event.task_id());
             if matches!(event, TaskEvent::Progress { .. }) {
                 // Lossy: overwrite the previous progress, never append.
@@ -418,7 +418,7 @@ impl EventQueue {
 
     /// Take `id`'s events, oldest first, leaving every other job's alone.
     fn take(&self, id: TaskId) -> Vec<TaskEvent> {
-        let mut state = self.state.lock().unwrap();
+        let mut state = crate::sync::lock(&self.state);
         state.take_for(id)
     }
 
@@ -430,7 +430,7 @@ impl EventQueue {
     /// background pool is a fixed set of workers, and a parked watcher is a
     /// worker no other background task can use.
     fn wait(&self, id: TaskId, timeout: Duration) -> Vec<TaskEvent> {
-        let state = self.state.lock().unwrap();
+        let state = crate::sync::lock(&self.state);
         // `wait_timeout_while` re-checks the predicate on every wake-up, so a
         // push for another job — or a spurious wake — goes back to sleep.
         let (mut state, _waited) = self
@@ -447,7 +447,7 @@ impl EventQueue {
     /// bucket is always non-empty, which is what [`EventQueue::wait`] sleeps
     /// on.
     fn take_all(&self) -> Vec<TaskEvent> {
-        let mut state = self.state.lock().unwrap();
+        let mut state = crate::sync::lock(&self.state);
         let ids: Vec<TaskId> = state.by_job.keys().copied().collect();
         let mut out = Vec::new();
         for id in ids {
@@ -558,7 +558,7 @@ impl TaskPool {
     /// Submit a closure for execution. Returns immediately; the closure runs
     /// on the next available worker.
     pub fn execute(&self, work: impl FnOnce() + Send + 'static) {
-        let mut queue = self.inner.queue.lock().unwrap();
+        let mut queue = crate::sync::lock(&self.inner.queue);
         match queue.as_mut() {
             Some(q) => {
                 q.push_back(Box::new(work));
@@ -576,7 +576,7 @@ impl TaskPoolInner {
     fn worker_loop(&self) {
         loop {
             let work = {
-                let mut queue = self.queue.lock().unwrap();
+                let mut queue = crate::sync::lock(&self.queue);
                 loop {
                     match queue.as_mut() {
                         Some(q) => {
@@ -607,7 +607,7 @@ impl Drop for TaskPool {
     fn drop(&mut self) {
         // Setting the queue to None is the shutdown signal workers check.
         // notify_all wakes every sleeper so it can see the flag and exit.
-        *self.inner.queue.lock().unwrap() = None;
+        *crate::sync::lock(&self.inner.queue) = None;
         self.inner.notify.notify_all();
     }
 }
@@ -806,7 +806,7 @@ impl TaskManager {
         F: FnOnce(&JobContext) -> crate::error::Result<T> + Send + 'static,
     {
         self.gate_kind(&kind)?;
-        let mut jobs = self.jobs.lock().unwrap();
+        let mut jobs = crate::sync::lock(&self.jobs);
         if jobs
             .values()
             .any(|j| j.kind == kind && matches!(j.status, TaskStatus::Running | TaskStatus::Paused))
@@ -875,7 +875,7 @@ impl TaskManager {
             // while the registry lock is held, then drop it before the
             // journal write and the channel send.
             let (status, summary, error, done, total, value) = {
-                let mut jobs = ctx.jobs.lock().unwrap();
+                let mut jobs = crate::sync::lock(&ctx.jobs);
                 let Some(state) = jobs.get_mut(&ctx.id) else {
                     return;
                 };
@@ -1013,7 +1013,7 @@ impl TaskManager {
             + 'static,
     {
         self.gate_kind(&kind)?;
-        let mut jobs = self.jobs.lock().unwrap();
+        let mut jobs = crate::sync::lock(&self.jobs);
         if jobs
             .values()
             .any(|j| j.kind == kind && matches!(j.status, TaskStatus::Running | TaskStatus::Paused))
@@ -1074,9 +1074,9 @@ impl TaskManager {
             // once per attempt (it is FnMut, not Fn).
             let factory = Mutex::new(factory);
             loop {
-                let run = factory.lock().unwrap()();
+                let run = crate::sync::lock(&factory)();
                 let outcome = panic::catch_unwind(AssertUnwindSafe(|| run(&ctx)));
-                let mut jobs = ctx.jobs.lock().unwrap();
+                let mut jobs = crate::sync::lock(&ctx.jobs);
                 let Some(state) = jobs.get_mut(&ctx.id) else {
                     return;
                 };
@@ -1154,7 +1154,7 @@ impl TaskManager {
                                 std::thread::sleep(Duration::from_millis(100));
                             }
                             if ctx.cancelled() {
-                                let mut jobs = ctx.jobs.lock().unwrap();
+                                let mut jobs = crate::sync::lock(&ctx.jobs);
                                 if let Some(state) = jobs.get_mut(&ctx.id) {
                                     state.status = TaskStatus::Cancelled;
                                     ctx.events.push(TaskEvent::Cancelled {
@@ -1183,7 +1183,7 @@ impl TaskManager {
                                 return;
                             }
                             // Reset progress for the next attempt.
-                            let mut jobs = ctx.jobs.lock().unwrap();
+                            let mut jobs = crate::sync::lock(&ctx.jobs);
                             if let Some(state) = jobs.get_mut(&ctx.id) {
                                 state.done = 0;
                                 state.total = 0;
@@ -1248,7 +1248,7 @@ impl TaskManager {
     /// at a pause checkpoint is woken too, so it can observe the request and
     /// unwind instead of waiting forever for a resume that will not come.
     pub fn cancel(&self, id: TaskId) {
-        let jobs = self.jobs.lock().unwrap();
+        let jobs = crate::sync::lock(&self.jobs);
         if let Some(state) = jobs.get(&id) {
             state.cancel.store(true, Ordering::Relaxed);
             state.pause.wake();
@@ -1258,7 +1258,7 @@ impl TaskManager {
     /// Hold a running job at its next checkpoint. It keeps its slot and can be
     /// resumed; nothing happens if the job is not running.
     pub fn pause(&self, id: TaskId) {
-        let mut jobs = self.jobs.lock().unwrap();
+        let mut jobs = crate::sync::lock(&self.jobs);
         if let Some(state) = jobs.get_mut(&id)
             && state.status == TaskStatus::Running
         {
@@ -1273,7 +1273,7 @@ impl TaskManager {
 
     /// Release a parked job to continue from its next checkpoint.
     pub fn resume(&self, id: TaskId) {
-        let mut jobs = self.jobs.lock().unwrap();
+        let mut jobs = crate::sync::lock(&self.jobs);
         if let Some(state) = jobs.get_mut(&id)
             && state.status == TaskStatus::Paused
         {
@@ -1288,7 +1288,7 @@ impl TaskManager {
 
     /// Whether a job of `kind` is currently running.
     pub fn is_running(&self, kind: &TaskKind) -> bool {
-        let jobs = self.jobs.lock().unwrap();
+        let jobs = crate::sync::lock(&self.jobs);
         jobs.values()
             .any(|j| &j.kind == kind && j.status == TaskStatus::Running)
     }
@@ -1296,7 +1296,7 @@ impl TaskManager {
     /// Whether a job of `kind` holds its slot: running *or* paused. Used to
     /// refuse a second job of the same kind while one is paused.
     pub fn is_active(&self, kind: &TaskKind) -> bool {
-        let jobs = self.jobs.lock().unwrap();
+        let jobs = crate::sync::lock(&self.jobs);
         jobs.values().any(|j| {
             &j.kind == kind && matches!(j.status, TaskStatus::Running | TaskStatus::Paused)
         })
@@ -1304,7 +1304,7 @@ impl TaskManager {
 
     /// Whether this exact job is still running.
     pub fn is_task_running(&self, id: TaskId) -> bool {
-        let jobs = self.jobs.lock().unwrap();
+        let jobs = crate::sync::lock(&self.jobs);
         jobs.get(&id)
             .is_some_and(|j| j.status == TaskStatus::Running)
     }
@@ -1313,7 +1313,7 @@ impl TaskManager {
     /// library swap waits on this so a paused-but-not-yet-wound-down job gets
     /// its chance to observe cancellation and stop before the store is swapped.
     pub fn is_task_active(&self, id: TaskId) -> bool {
-        let jobs = self.jobs.lock().unwrap();
+        let jobs = crate::sync::lock(&self.jobs);
         jobs.get(&id)
             .is_some_and(|j| matches!(j.status, TaskStatus::Running | TaskStatus::Paused))
     }
@@ -1353,7 +1353,7 @@ impl TaskManager {
     /// holds running jobs plus the last finished ones. Results are sorted by
     /// priority (high first), then by insertion order within the same level.
     pub fn snapshot(&self) -> Vec<TaskInfo> {
-        let jobs = self.jobs.lock().unwrap();
+        let jobs = crate::sync::lock(&self.jobs);
         let mut infos: Vec<TaskInfo> = jobs
             .iter()
             .map(|(id, j)| TaskInfo {
@@ -1435,7 +1435,7 @@ impl JobContext {
     /// directories). Pushes an immediate progress event.
     pub fn set_total(&self, total: u64) {
         let done = {
-            let mut jobs = self.jobs.lock().unwrap();
+            let mut jobs = crate::sync::lock(&self.jobs);
             match jobs.get_mut(&self.id) {
                 Some(state) => {
                     state.total = total;
@@ -1449,21 +1449,21 @@ impl JobContext {
             done,
             total,
         });
-        *self.last_progress.lock().unwrap() = Instant::now();
+        *crate::sync::lock(&self.last_progress) = Instant::now();
     }
 
     /// Report progress. State updates always land; the event is throttled to
     /// [`PROGRESS_EVENT_INTERVAL`] except for the final unit.
     pub fn progress(&self, done: u64, total: u64) {
         {
-            let mut jobs = self.jobs.lock().unwrap();
+            let mut jobs = crate::sync::lock(&self.jobs);
             if let Some(state) = jobs.get_mut(&self.id) {
                 state.done = done;
                 state.total = total;
             }
         }
         let due = done == total || {
-            let mut last = self.last_progress.lock().unwrap();
+            let mut last = crate::sync::lock(&self.last_progress);
             if *last < Instant::now() - PROGRESS_EVENT_INTERVAL {
                 *last = Instant::now();
                 true
@@ -1482,7 +1482,7 @@ impl JobContext {
 
     /// Set the human-readable line carried by the completion event.
     pub fn set_summary(&self, summary: String) {
-        let mut jobs = self.jobs.lock().unwrap();
+        let mut jobs = crate::sync::lock(&self.jobs);
         if let Some(state) = jobs.get_mut(&self.id) {
             state.summary = Some(summary);
         }
