@@ -1692,7 +1692,7 @@ impl Library {
                 title: asset.title.clone(),
                 description: asset.description.clone(),
                 tags: tag_names,
-                rating: asset.rating,
+                rating: asset.rating.map(|rating| rating.get()),
             };
             if crate::services::xmp::write_sidecar(&target, &data).is_ok() {
                 report.written += 1;
@@ -2382,7 +2382,9 @@ impl Library {
 mod tests {
     use super::Library;
     use crate::media::thumb;
-    use crate::model::{AssetKind, AssetLocation, AssetQuery, NewCollection, NewSmartCollection};
+    use crate::model::{
+        AssetKind, AssetLocation, AssetQuery, NewCollection, NewSmartCollection, Rating,
+    };
     use crate::store::{assets, collections, tags};
     use std::path::{Path, PathBuf};
     use uuid::Uuid;
@@ -3904,7 +3906,7 @@ mod tests {
             &crate::model::AssetPatch {
                 title: Some(Some("Sunset & <beach>".into())),
                 description: Some(Some("Golden hour".into())),
-                rating: Some(Some(5)),
+                rating: Some(Some(Rating::new(5).unwrap())),
                 ..Default::default()
             },
         )

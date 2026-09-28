@@ -332,7 +332,9 @@ pub fn backfill_signatures(
     library_root: &std::path::Path,
 ) -> Result<u64> {
     let conn = store.conn();
-    let rows_vec = rows::query_map(
+    // A backfill pass over many rows: one row this build cannot read costs that
+    // row its signature, not the whole run its candidates.
+    let rows_vec = rows::query_map_skipping_unreadable(
         conn,
         &format!(
             "SELECT {COLS} FROM assets WHERE kind = 'image' AND {LIVE_ROWS} \

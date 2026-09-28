@@ -8,7 +8,7 @@ use super::*;
 use std::collections::HashMap;
 use std::ops::Range;
 use std::path::Path;
-use trove_core::model::Asset;
+use trove_core::model::{Asset, Rating};
 use trove_core::search::{expression::Target, highlight::Lexicon};
 use trove_core::store::facets::FacetCounts;
 use trove_core::store::{BrowseContext, BrowseSession};
@@ -151,7 +151,7 @@ pub(super) struct DataKey {
     pub(super) filter_orientation: Option<Orientation>,
     pub(super) filter_aspect: Option<trove_core::model::AspectPreset>,
     pub(super) filter_resolution: Option<trove_core::model::ResolutionBand>,
-    pub(super) filter_min_rating: Option<u8>,
+    pub(super) filter_min_rating: Option<Rating>,
     pub(super) filter_ext: Option<String>,
     pub(super) sort: AssetSort,
     pub(super) sort_desc: bool,

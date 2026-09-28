@@ -39,6 +39,49 @@ pub fn query_map<T>(
     Ok(out)
 }
 
+/// `query_map` for a listing that has to survive one unreadable row.
+///
+/// A row the mapper rejects is dropped and named in a `warn!`; every other row
+/// still comes back. Without it, one row this build cannot read — an `origin`
+/// word some other tool wrote, a JSON column edited by hand — fails the whole
+/// statement, and the grid that asked for a page of two hundred shows nothing at
+/// all and blames the library.
+///
+/// For reads of *many* rows only. A caller that asked for one asset by id has no
+/// remaining rows to fall back on, and [`query_one`] keeps reporting.
+pub fn query_map_skipping_unreadable<T>(
+    conn: &Connection,
+    sql: &str,
+    params: Vec<Value>,
+    mut map: impl FnMut(&Row) -> Result<T>,
+) -> Result<Vec<T>> {
+    let mut stmt = conn.prepare_cached(sql).map_err(Error::from)?;
+    let mut rows = stmt
+        .query(rusqlite::params_from_iter(params))
+        .map_err(Error::from)?;
+    let mut out = Vec::new();
+    let mut skipped = 0_u64;
+    while let Some(row) = rows.next().map_err(Error::from)? {
+        match map(row) {
+            Ok(value) => out.push(value),
+            Err(error) => {
+                skipped += 1;
+                // Column 0 is the row's own identity in every listing this is
+                // used for; when it is not readable either, say so rather than
+                // naming nothing.
+                let named = row
+                    .get::<_, String>(0)
+                    .unwrap_or_else(|_| "<unreadable row>".into());
+                tracing::warn!(row = %named, %error, "a row this build cannot read was left out of a listing");
+            }
+        }
+    }
+    if skipped > 0 {
+        tracing::warn!(count = skipped, "rows left out of one listing");
+    }
+    Ok(out)
+}
+
 /// Run a `SELECT` expecting at most one row.
 pub fn query_one<T>(
     conn: &Connection,

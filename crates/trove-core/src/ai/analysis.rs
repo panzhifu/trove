@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::error::{Error, Result};
-use crate::model::{Asset, AssetKind, MAX_NAME_LEN};
+use crate::model::{Asset, AssetKind, MAX_NAME_LEN, Rating};
 
 /// Bumped whenever the prompt or the parsing changes in a way that makes
 /// earlier results stale. It is part of the fingerprint stored beside every
@@ -43,9 +43,12 @@ pub struct AiAnalysisResult {
     pub description: Option<String>,
     /// Relevant keyword tags describing the asset.
     pub tags: Vec<String>,
-    /// Aesthetic score from 1 to 5, when the model was asked for one.
+    /// Aesthetic score from 1 to 5, when the model was asked for one. Typed, so
+    /// a model answering `0` or `9` yields `None` rather than a rating the star
+    /// row cannot draw -- the check this field used to need in
+    /// [`normalize_result`] is the type now.
     #[serde(default)]
-    pub rating: Option<u8>,
+    pub rating: Option<Rating>,
     /// The vendor model version that produced this result. Stored beside
     /// every asset it tagged, so a later run can tell whose work it is
     /// looking at.
@@ -448,8 +451,8 @@ pub fn post_process(
         }
     }
 
-    // Rating: clamp to 1..=5, reject 0.
-    result.rating = result.rating.filter(|&r| (1..=5).contains(&r));
+    // No rating fix-up here: `Rating` only holds 1..=5, and the parser below
+    // already turned anything else into `None`.
 
     result
 }
@@ -514,10 +517,16 @@ pub fn parse_model_reply(text: &str, model_version: &str) -> Result<AiAnalysisRe
         })
         .unwrap_or_default();
 
+    // A model's number becomes a rating or nothing. `u8::try_from` rather than
+    // `as u8`: a wild 300 would truncate to 5 and read as the top rating, which
+    // is the one mistake this type exists to make impossible.
     let rating = obj.get("rating").and_then(|v| match v {
         serde_json::Value::Null => None,
-        serde_json::Value::Number(n) => n.as_u64().map(|u| u as u8),
-        serde_json::Value::String(s) => s.trim().parse::<u8>().ok(),
+        serde_json::Value::Number(n) => n
+            .as_u64()
+            .and_then(|u| u8::try_from(u).ok())
+            .and_then(Rating::new),
+        serde_json::Value::String(s) => s.trim().parse::<u8>().ok().and_then(Rating::new),
         _ => None,
     });
 
@@ -610,13 +619,13 @@ mod tests {
         let result = AiAnalysisResult {
             description: Some("A nice beach".into()),
             tags: vec!["Beach".into(), "ocean".into(), "sunset".into()],
-            rating: Some(4),
+            rating: Some(Rating::new(4).unwrap()),
             model_version: "test-model".into(),
         };
         let processed = post_process(result, &["beach".into()], &[], &settings, "en");
         assert_eq!(processed.tags, vec!["beach".to_string()]);
         assert!(processed.description.is_some());
-        assert_eq!(processed.rating, Some(4));
+        assert_eq!(processed.rating, Some(Rating::new(4).unwrap()));
     }
 
     #[test]
@@ -640,26 +649,43 @@ mod tests {
         );
     }
 
+    /// A model's answer becomes a rating or nothing, at the moment it is parsed.
+    ///
+    /// `post_process` used to carry this rule as a `filter(|&r| (1..=5).contains(&r))`
+    /// line — one place out of the four that can put a rating on an asset. With
+    /// [`Rating`] the range lives in the type, so the only way to get an
+    /// out-of-domain value in is through this parser, and it is the one place
+    /// that has to refuse.
     #[test]
-    fn post_process_rejects_zero_rating_and_caps_five() {
-        let settings = AiAnalysisSettings::default();
-        let result = AiAnalysisResult {
-            description: None,
-            tags: vec![],
-            rating: Some(0),
-            model_version: "test".into(),
-        };
-        let processed = post_process(result, &[], &[], &settings, "en");
-        assert_eq!(processed.rating, None);
+    fn parse_model_reply_refuses_a_rating_the_stars_cannot_draw() {
+        for (reply, expected) in [
+            (r#"{"tags": [], "rating": 0}"#, None),
+            (r#"{"tags": [], "rating": 6}"#, None),
+            (r#"{"tags": [], "rating": 261}"#, None),
+            (r#"{"tags": [], "rating": -3}"#, None),
+            (r#"{"tags": [], "rating": "seven"}"#, None),
+            (r#"{"tags": [], "rating": null}"#, None),
+            (r#"{"tags": [], "rating": 3}"#, Some(3)),
+            (r#"{"tags": [], "rating": "5"}"#, Some(5)),
+        ] {
+            let result = parse_model_reply(reply, "test-model").unwrap();
+            assert_eq!(
+                result.rating,
+                expected.map(|n| Rating::new(n).unwrap()),
+                "the reply was {reply}"
+            );
+        }
+    }
 
-        let result = AiAnalysisResult {
-            description: None,
-            tags: vec![],
-            rating: Some(7),
-            model_version: "test".into(),
-        };
-        let processed = post_process(result, &[], &[], &settings, "en");
-        assert_eq!(processed.rating, None);
+    /// 261 is the case that used to be possible: `as u8` wraps it to 5, which is
+    /// not "the model was unsure", it is the top rating.
+    #[test]
+    fn a_wild_rating_number_does_not_wrap_into_the_top_star() {
+        let result = parse_model_reply(r#"{"tags": [], "rating": 261}"#, "test-model").unwrap();
+        assert_eq!(
+            result.rating, None,
+            "261 mod 256 is 5, and 5 is not the answer"
+        );
     }
 
     #[test]
@@ -668,7 +694,7 @@ mod tests {
         let result = parse_model_reply(reply, "test-model").unwrap();
         assert_eq!(result.description.as_deref(), Some("a beach"));
         assert_eq!(result.tags, vec!["ocean", "sand"]);
-        assert_eq!(result.rating, Some(4));
+        assert_eq!(result.rating, Some(Rating::new(4).unwrap()));
     }
 
     #[test]

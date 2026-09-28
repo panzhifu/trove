@@ -8,8 +8,9 @@
 //! typed per-kind metadata persisted in the `extra` JSON column,
 //! [`collection`] the two container types (manual and smart), [`appearance`]
 //! how either draws itself in the folder tree, [`smart_query`]
-//! the saved-search condition tree, [`tag`] the tag tree, and [`query`] the
-//! listing filters and paging types.
+//! the saved-search condition tree, [`tag`] the tag tree, [`rating`] the star
+//! rating and the domain it cannot leave, and [`query`] the listing filters and
+//! paging types.
 
 mod appearance;
 mod asset;
@@ -17,6 +18,7 @@ mod collection;
 mod embedding;
 mod facts;
 mod query;
+mod rating;
 mod smart_query;
 mod tag;
 
@@ -29,6 +31,7 @@ pub use collection::{Collection, NewCollection, NewSmartCollection, SmartCollect
 pub use embedding::{EmbeddingSpace, MAX_DIM, NewEmbedding, VectorMatch, normalized};
 pub use facts::{AssetFacts, AudioFacts, FontFacts, MediaTagsFacts, PhotoFacts, VisualFacts};
 pub use query::{AssetQuery, AssetSort, Page, QueryCondition, TrashPool};
+pub use rating::{MAX_RATING, MIN_RATING, Rating};
 pub use smart_query::{SmartCompare, SmartField, SmartNode};
 pub use tag::{NewTag, Tag};
 
@@ -37,7 +40,6 @@ use uuid::Uuid;
 
 pub const MAX_NAME_LEN: usize = 255;
 pub const MAX_DESCRIPTION_LEN: usize = 8_000;
-pub const MAX_RATING: u8 = 5;
 
 /// Create a fresh id.
 pub fn new_id() -> Uuid {

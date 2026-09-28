@@ -846,6 +846,13 @@ fn render_row(
         SmartField::Rating => h_flex().flex_1().min_w_0().child(dropdown_button(
             format!("row-{ix}-rating"),
             format!("{rating} ★"),
+            // The rule's own comparison value, so it is still a plain number and
+            // not a `Rating`: "0 ★ or fewer" is a question a rule may ask. What it
+            // can no longer answer is "which assets" -- a stored 0 folded onto
+            // unrated in v22 -> v23, and no row can hold one any more, so this
+            // choice now matches nothing. Typing the rule tree (`SmartNode`, the
+            // plan's P5) is where that gets decided rather than left to a
+            // dropdown.
             (0..=5u8).map(|n| (n, format!("{n} ★"))).collect(),
             rating,
             {

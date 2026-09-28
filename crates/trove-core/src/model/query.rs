@@ -4,7 +4,7 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use super::{AspectPreset, AssetKind, Orientation, ResolutionBand, UsageStatus};
+use super::{AspectPreset, AssetKind, Orientation, Rating, ResolutionBand, UsageStatus};
 
 /// Sort key of an asset listing. The Tantivy search path always sorts by
 /// relevance and ignores this.
@@ -60,8 +60,9 @@ pub struct AssetQuery {
     /// any ratio, so the three compose.
     pub resolution: Option<ResolutionBand>,
     /// Only assets rated `min_rating` or higher (unrated assets match
-    /// nothing).
-    pub min_rating: Option<u8>,
+    /// nothing). A [`Rating`], so a filter cannot ask for a number of stars the
+    /// picker cannot draw.
+    pub min_rating: Option<Rating>,
     /// Only assets with this file extension (case-insensitive).
     pub ext: Option<String>,
     /// Only assets carrying this commercial-use clearance. Unverified rows
@@ -205,7 +206,10 @@ pub enum QueryCondition {
     /// Source-path prefix, matched the way the folders panel matches one.
     Path { prefix: String, negate: bool },
     /// At least this many stars.
-    MinRating(u8),
+    /// `rating:4` in a search box, and the smart rule's own
+    /// "at least this many stars" arm: a [`Rating`], because the value a user typed
+    /// is only a condition if a star row could show it.
+    MinRating(Rating),
     /// Favourite, required or excluded.
     Favorite(bool),
 }

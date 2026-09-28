@@ -59,7 +59,7 @@
 
 use std::fmt;
 
-use crate::model::{AssetKind, QueryCondition};
+use crate::model::{AssetKind, QueryCondition, Rating};
 
 /// Where a term is allowed to match.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -643,9 +643,11 @@ fn parse_kind(text: &str) -> Option<AssetKind> {
     }
 }
 
-fn parse_rating(text: &str) -> Option<u8> {
+fn parse_rating(text: &str) -> Option<Rating> {
     let digits: String = text.trim().chars().filter(|c| c.is_ascii_digit()).collect();
-    digits.parse::<u8>().ok().filter(|r| (1..=5).contains(r))
+    // `Rating::new` *is* the old `(1..=5).contains` filter, with the range
+    // written down once instead of at each place that needed it.
+    digits.parse::<u8>().ok().and_then(Rating::new)
 }
 
 fn parse_bool(text: &str) -> Option<bool> {
@@ -843,7 +845,7 @@ mod tests {
         );
         assert_eq!(
             parse("rating:4").into_expression().filters,
-            vec![QueryCondition::MinRating(4)]
+            vec![QueryCondition::MinRating(Rating::new(4).unwrap())]
         );
         assert_eq!(
             parse("fav:yes").into_expression().filters,

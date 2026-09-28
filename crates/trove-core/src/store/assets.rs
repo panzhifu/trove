@@ -135,10 +135,13 @@ pub fn by_ids(conn: &Connection, ids: &[Uuid]) -> Result<Vec<Asset>> {
         args.push(rows::uuid(*id).into());
     }
     sql.push(')');
-    let found: HashMap<Uuid, Asset> = rows::query_map(conn, &sql, args, asset_from_row)?
-        .into_iter()
-        .map(|a| (a.id, a))
-        .collect();
+    // One row this build cannot read leaves the page short by one; it does not
+    // take the page down. See [`rows::query_map`].
+    let found: HashMap<Uuid, Asset> =
+        rows::query_map_skipping_unreadable(conn, &sql, args, asset_from_row)?
+            .into_iter()
+            .map(|a| (a.id, a))
+            .collect();
     Ok(ids.iter().filter_map(|id| found.get(id).cloned()).collect())
 }
 
@@ -371,7 +374,8 @@ fn query_items(
         args.push(Value::Integer(q.offset as i64));
     }
 
-    rows::query_map(conn, &sql, args, asset_from_row)
+    // As in [`by_ids`]: a listing is allowed to come back short rather than empty.
+    rows::query_map_skipping_unreadable(conn, &sql, args, asset_from_row)
 }
 
 /// Apply a partial patch. `None` fields leave the column untouched.
@@ -402,7 +406,7 @@ pub fn update(conn: &Connection, id: Uuid, patch: &AssetPatch) -> Result<Option<
     }
     if let Some(rating) = &patch.rating {
         sets.push(format!("rating = ?{}", args.len() + 1));
-        args.push(bind_opt_int(rating.map(|r| r as i64)));
+        args.push(bind_opt_int(rating.map(|r| r.get() as i64)));
     }
     if let Some(fav) = patch.is_favorite {
         sets.push(format!("is_favorite = ?{}", args.len() + 1));
@@ -554,7 +558,7 @@ pub fn duplicate_groups_at(db_path: &std::path::Path) -> Result<Vec<DuplicateGro
 pub fn duplicate_groups(conn: &Connection) -> Result<Vec<DuplicateGroup>> {
     use crate::media::search::PHash;
 
-    let rows_vec = rows::query_map(
+    let rows_vec = rows::query_map_skipping_unreadable(
         conn,
         &format!(
             "SELECT {COLS} FROM assets \
@@ -621,6 +625,23 @@ pub fn duplicate_groups(conn: &Connection) -> Result<Vec<DuplicateGroup>> {
 
 // -- row mapping -------------------------------------------------------------
 
+/// The rating column as a [`Rating`], degrading one stray value instead of
+/// losing the row.
+///
+/// A number outside `1..=MAX_RATING` is not a rating the user could have chosen:
+/// the migration folds the stored zeros that an older build did allow onto NULL,
+/// and the guards refuse anything else this build writes. So this reader is
+/// looking at a row from outside -- and the asset is still a file the user has,
+/// with a name and a path and tags. Dropping the judgement keeps the thing.
+///
+/// That is the one exception to "a row this build cannot name is left out of the
+/// listing": an unknown `origin` word says the row is not an asset, while a bad
+/// rating says only that one column is not a rating.
+fn read_rating(row: &rusqlite::Row, col: usize) -> Result<Option<crate::model::Rating>> {
+    let raw = rows::opt_int(row, col)?;
+    Ok(raw.and_then(|v| u8::try_from(v).ok().and_then(crate::model::Rating::new)))
+}
+
 pub(crate) fn asset_from_row(row: &rusqlite::Row) -> Result<Asset> {
     let origin_word = rows::req_str(row, 1)?;
     let rel_path = rows::opt_str(row, 2)?;
@@ -660,7 +681,7 @@ pub(crate) fn asset_from_row(row: &rusqlite::Row) -> Result<Asset> {
         captured_at: rows::opt_ts(row, 12)?,
         title: rows::opt_str(row, 13)?,
         description: rows::opt_str(row, 14)?,
-        rating: rows::opt_int(row, 15)?.map(|v| v as u8),
+        rating: read_rating(row, 15)?,
         is_favorite: rows::boolean(row, 16)?,
         source_url: rows::opt_str(row, 17)?,
         facts,
@@ -716,7 +737,7 @@ fn asset_values(a: &Asset) -> Vec<Value> {
         bind_opt_str(a.title.as_deref()),
         bind_opt_str(a.description.as_deref()),
         a.rating
-            .map(|v| Value::Integer(v as i64))
+            .map(|v| Value::Integer(v.get() as i64))
             .unwrap_or(Value::Null),
         Value::Integer(a.is_favorite as i64),
         bind_opt_str(a.source_url.as_deref()),
@@ -887,7 +908,7 @@ pub(super) fn build_where(
     if let Some(min_rating) = q.min_rating {
         // Unrated assets (NULL) fail the comparison naturally.
         conds.push(format!("{ni}rating >= ?{}", args.len() + 1));
-        args.push(Value::Integer(min_rating as i64));
+        args.push(Value::Integer(min_rating.get() as i64));
     }
     if let Some(aspect) = q.aspect {
         // Ratio band from the media preset. The CASE maps rows without
@@ -976,7 +997,7 @@ pub(super) fn build_where(
             C::MinRating(rating) => {
                 // Unrated assets (NULL) fail the comparison naturally.
                 conds.push(format!("{ni}rating >= ?{}", args.len() + 1));
-                args.push(Value::Integer(*rating as i64));
+                args.push(Value::Integer(rating.get() as i64));
             }
             C::Favorite(want) => {
                 conds.push(format!("{ni}is_favorite = ?{}", args.len() + 1));

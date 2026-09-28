@@ -15,7 +15,7 @@ use super::{assets, facets, smart, smart_collections, view_history};
 use crate::error::{Error, Result};
 use crate::model::{
     AspectPreset, Asset, AssetKind, AssetQuery, AssetSort, Orientation, Page, QueryCondition,
-    ResolutionBand, TrashPool,
+    Rating, ResolutionBand, TrashPool,
 };
 use crate::search::vector::{self, QueryVector, VECTOR_CANDIDATE_CAP, VectorIndex};
 
@@ -98,7 +98,7 @@ pub struct BrowseContext {
     /// shape filters, which are about proportions and say nothing about size.
     pub resolution: Option<ResolutionBand>,
     /// Minimum star rating (unrated assets match nothing).
-    pub min_rating: Option<u8>,
+    pub min_rating: Option<Rating>,
     pub ext: Option<String>,
     /// Listing sort (ignored by the live search, which sorts by
     /// relevance).
@@ -595,11 +595,14 @@ fn apply_plan_filters(plan: &crate::ai::search_planner::AiSearchPlan, q: &mut As
                 }
             }
             crate::ai::search_planner::PlanFilterField::Rating => {
-                // Take the highest minimum rating from the plan.
+                // Take the highest minimum rating from the plan. A model that
+                // answers "0" or "9" stars contributes nothing: those are not
+                // ratings a picker can draw, so they are dropped here rather
+                // than becoming a condition that matches everything or nothing.
                 let min_from_plan = filter
                     .values
                     .iter()
-                    .filter_map(|v| v.parse::<u8>().ok())
+                    .filter_map(|v| v.parse::<u8>().ok().and_then(Rating::new))
                     .max();
                 if let Some(min) = min_from_plan {
                     q.min_rating = Some(q.min_rating.map_or(min, |existing| existing.max(min)));
@@ -1301,7 +1304,7 @@ mod tests {
         (square.width, square.height) = (Some(64), Some(64));
         assets::insert(conn, &square).unwrap();
         let mut rated = test_asset("d.png", AssetKind::Image, Uuid::new_v4());
-        rated.rating = Some(4);
+        rated.rating = Some(Rating::new(4).unwrap());
         rated.ext = "jpg".into();
         assets::insert(conn, &rated).unwrap();
 
@@ -1313,7 +1316,7 @@ mod tests {
             vec![square.id]
         );
 
-        let page = ctx(&|c: &mut BrowseContext| c.min_rating = Some(4))
+        let page = ctx(&|c: &mut BrowseContext| c.min_rating = Some(Rating::new(4).unwrap()))
             .run(conn, &idx, None, None)
             .unwrap();
         assert_eq!(
@@ -1369,7 +1372,7 @@ mod tests {
         let page = recent(&|c: &mut BrowseContext| c.kind = Some(AssetKind::Document));
         assert_eq!(ids(&page), vec![doc.id], "kind narrows the recent list");
 
-        let page = recent(&|c: &mut BrowseContext| c.min_rating = Some(4));
+        let page = recent(&|c: &mut BrowseContext| c.min_rating = Some(Rating::new(4).unwrap()));
         assert_eq!(ids(&page), vec![rated.id], "so does the rating floor");
 
         let page = recent(&|c: &mut BrowseContext| c.ext = Some("JPG".into()));

@@ -206,13 +206,9 @@ impl Store {
     fn apply_upgrade(&self, step: &schema::Upgrade) -> Result<()> {
         let mut conn = self.conn.borrow_mut();
         let tx = conn.transaction()?;
-        for statement in step.sql.split(';') {
-            let statement = statement.trim();
-            if statement.is_empty() {
-                continue;
-            }
-            if let Err(error) = tx.execute_batch(statement)
-                && !already_applied(statement, &error.to_string())
+        for statement in step_statements(step.sql) {
+            if let Err(error) = tx.execute_batch(&statement)
+                && !already_applied(&statement, &error.to_string())
             {
                 return Err(error.into());
             }
@@ -286,6 +282,48 @@ impl Store {
     }
 }
 
+/// Split one upgrade step's DDL into the statements it is made of.
+///
+/// A `;` does not always end a statement: a trigger body is
+/// `BEGIN SELECT …; END;`, and cutting it there hands SQLite half a trigger, which
+/// answers `incomplete input` and stops the library opening. So the split keeps
+/// buffering until every trigger block a piece opened has also been closed by it.
+///
+/// Statements come back owned because the pieces have to be re-joined; a step runs
+/// once per library upgrade, not once per query.
+fn step_statements(sql: &str) -> Vec<String> {
+    let mut statements: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut open_bodies = 0_usize;
+    for piece in sql.split(';') {
+        current.push_str(piece);
+        let upper = piece.to_ascii_uppercase();
+        open_bodies += block_words(&upper, "BEGIN");
+        open_bodies = open_bodies.saturating_sub(block_words(&upper, "END"));
+        if open_bodies == 0 {
+            let statement = current.trim();
+            if !statement.is_empty() {
+                statements.push(statement.to_string());
+            }
+            current.clear();
+        } else {
+            current.push(';');
+        }
+    }
+    let left = current.trim();
+    if !left.is_empty() {
+        statements.push(left.to_string());
+    }
+    statements
+}
+
+/// How many times `word` appears as its own word in `text`.
+fn block_words(text: &str, word: &str) -> usize {
+    text.split(|c: char| !c.is_ascii_alphabetic())
+        .filter(|token| *token == word)
+        .count()
+}
+
 /// Whether a failed `ALTER` is the harmless second attempt: the column a step
 /// adds is already there, or the column it drops is already gone. Only an
 /// `ALTER` may be excused this way, so a statement with a typo in it still
@@ -297,10 +335,10 @@ fn already_applied(statement: &str, message: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{LIVE_ROWS, Store, schema};
+    use super::{LIVE_ROWS, Store, schema, step_statements};
     use crate::model::{
         Asset, AssetKind, AssetLocation, AssetPatch, AssetQuery, AssetSeed, NewCollection, NewTag,
-        Page, Placement, TrashPool, UsageStatus, now,
+        Page, Placement, Rating, TrashPool, UsageStatus, now,
     };
     use crate::store::{assets, collections, sequences, smart_collections, tags, task_journal};
     use uuid::Uuid;
@@ -592,6 +630,274 @@ mod tests {
             "the upgrade is additive: existing rows survive"
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// v22 → v23 narrows a column that was already open, so it has two promises:
+    /// the library it walks forward loses the value that cannot be a rating any
+    /// more, and the guards it gains refuse that value from then on -- while every
+    /// rating a picker can draw still writes.
+    #[test]
+    fn a_v22_library_folds_a_zero_rating_and_gains_the_guards() {
+        let dir = std::env::temp_dir().join(format!("trove-schema-v23-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("library.db");
+        let mut zero = sample_asset("zero.png", AssetKind::Image);
+        zero.rating = Rating::new(3);
+        let mut top = sample_asset("top.png", AssetKind::Image);
+        top.rating = Rating::new(3);
+
+        {
+            let store = Store::open(&path).unwrap();
+            assets::insert(store.conn(), &zero).unwrap();
+            assets::insert(store.conn(), &top).unwrap();
+        }
+
+        // Back to the v22 shape: no guards on the table, and a rating of `0` --
+        // the value that build's `0..=5` bound accepted and a star row never
+        // could. Written past the guards, which is the point of rewinding.
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "DROP TRIGGER IF EXISTS assets_rating_insert_guard;
+             DROP TRIGGER IF EXISTS assets_rating_update_guard;
+             UPDATE assets SET rating = 0 WHERE file_name = 'zero.png';
+             PRAGMA user_version = 22;",
+        )
+        .unwrap();
+        drop(conn);
+
+        let store = Store::open(&path).unwrap();
+        assert_eq!(
+            store.user_version().unwrap(),
+            schema::SCHEMA_VERSION,
+            "the step ran and the version moved"
+        );
+        assert_eq!(
+            assets::get(store.conn(), zero.id).unwrap().unwrap().rating,
+            None,
+            "a stored 0 is not a rating, and the step folds it onto unrated"
+        );
+        assert_eq!(
+            assets::get(store.conn(), top.id).unwrap().unwrap().rating,
+            Rating::new(3),
+            "the fold touches only the values that were never ratings"
+        );
+
+        // Both guards are there, and both bite.
+        for (what, sql) in [
+            (
+                "an insert",
+                "INSERT INTO assets (id, origin, file_name, created_at, updated_at, extra,
+                                     rating) VALUES ('x', 'stored', 'x', 't', 't', '{}', 9)",
+            ),
+            (
+                "an update",
+                "UPDATE assets SET rating = 9 WHERE file_name = 'top.png'",
+            ),
+        ] {
+            let error = store
+                .conn()
+                .execute(sql, [])
+                .expect_err(&format!("{what} of nine stars should be refused"));
+            assert!(
+                error.to_string().contains("rating must be"),
+                "{what} should be refused by the guard, not by luck: {error}"
+            );
+        }
+
+        // And a rating the picker offers still writes.
+        assets::update(
+            store.conn(),
+            top.id,
+            &AssetPatch {
+                rating: Some(Rating::new(5)),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            assets::get(store.conn(), top.id).unwrap().unwrap().rating,
+            Rating::new(5)
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The whole domain stays writable: five stars down to one, and NULL. A guard
+    /// that refused a legal value would be worse than no guard, and the only way to
+    /// find out whether one does is to write every case.
+    #[test]
+    fn the_rating_guards_leave_the_whole_picker_alone() {
+        let store = Store::in_memory().unwrap();
+        let conn = store.conn();
+        let mut asset = sample_asset("a.png", AssetKind::Image);
+        assets::insert(conn, &asset).unwrap();
+
+        for stars in 1..=5 {
+            asset.id = Uuid::new_v4();
+            asset.file_name = format!("a{stars}.png");
+            asset.rating = Rating::new(stars);
+            assets::insert(conn, &asset)
+                .unwrap_or_else(|error| panic!("a rating of {stars} must be writable: {error}"));
+        }
+        asset.id = Uuid::new_v4();
+        asset.file_name = "unrated.png".into();
+        asset.rating = None;
+        assets::insert(conn, &asset).unwrap();
+        assets::update(
+            conn,
+            asset.id,
+            &AssetPatch {
+                rating: Some(None),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        // On the shape this build creates, not only on the walk: a library made
+        // today is guarded from its first write.
+        let guards: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'trigger' \
+                 AND name IN ('assets_rating_insert_guard', 'assets_rating_update_guard')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(guards, 2, "a fresh library carries both guards");
+    }
+
+    /// One row this build cannot decode leaves a listing short, not empty.
+    ///
+    /// The row is made by writing past the types with raw SQL, which is how a real
+    /// library gets one. `kind` is the column that can actually be reached: it has
+    /// no `CHECK`, and the decoder maps it through a word list, so a word from
+    /// another tool is a row that exists and cannot be named. The two neighbours
+    /// cannot -- `origin` has carried a `CHECK` since the first shape, and `extra`
+    /// cannot hold invalid JSON because the generated `source_path` column runs
+    /// `json_extract` over it and SQLite refuses the write. Both were measured, not
+    /// assumed: an `UPDATE assets SET extra = '{not json'` fails as `malformed JSON`
+    /// at the statement, before any row is read.
+    ///
+    /// `Err` was the old answer, and it arrived for the *whole page* -- a grid of
+    /// two hundred showing nothing because one row had a word no build recognised.
+    #[test]
+    fn one_undecodable_row_leaves_the_others_in_the_listing() {
+        let store = Store::in_memory().unwrap();
+        let conn = store.conn();
+        let mut good = Vec::new();
+        for i in 0..5 {
+            let asset = sample_asset(&format!("k{i}.png"), AssetKind::Image);
+            assets::insert(conn, &asset).unwrap();
+            good.push(asset.id);
+        }
+        let broken = sample_asset("broken.png", AssetKind::Image);
+        assets::insert(conn, &broken).unwrap();
+        conn.execute(
+            "UPDATE assets SET kind = 'spreadsheet' WHERE id = ?1",
+            [broken.id.to_string().as_str()],
+        )
+        .unwrap();
+
+        let page = assets::query(conn, &AssetQuery::live()).unwrap();
+        assert_eq!(
+            page.items.len(),
+            5,
+            "the listing keeps the five rows it can read and drops the one it cannot"
+        );
+        assert!(
+            page.items.iter().all(|a| a.id != broken.id) && page.items.len() == good.len(),
+            "the undecodable row is the one that went"
+        );
+        assert_eq!(
+            page.total, 6,
+            "the total comes from SQL, which counts a row the decoder cannot read"
+        );
+
+        // A point read of that row still reports, because its caller asked for
+        // *that* asset, and "not there" would be a different answer.
+        let error = assets::get(conn, broken.id).unwrap_err();
+        assert!(
+            error.to_string().contains("kind"),
+            "a single read names what it could not decode: {error}"
+        );
+    }
+
+    /// A stray rating costs the number, not the asset.
+    ///
+    /// The line the row decoder draws: a row it cannot *name* is left out of a
+    /// listing, while one column that is out of domain is read as absent. Dropping
+    /// the record over `rating = 9` would hide a file the user still has, with its
+    /// name and its tags.
+    #[test]
+    fn a_stray_rating_costs_the_number_and_not_the_asset() {
+        let store = Store::in_memory().unwrap();
+        let conn = store.conn();
+        let asset = sample_asset("a.png", AssetKind::Image);
+        assets::insert(conn, &asset).unwrap();
+        // Past the guards, the way a pre-v23 library or a hand edit would.
+        conn.execute_batch("DROP TRIGGER assets_rating_update_guard;")
+            .unwrap();
+        conn.execute(
+            "UPDATE assets SET rating = 9 WHERE id = ?1",
+            [asset.id.to_string().as_str()],
+        )
+        .unwrap();
+
+        let read = assets::get(conn, asset.id).unwrap().unwrap();
+        assert_eq!(read.rating, None, "nine stars is not a rating");
+        assert_eq!(read.file_name, "a.png", "and the asset is still the asset");
+        let page = assets::query(conn, &AssetQuery::live()).unwrap();
+        assert_eq!(page.items.len(), 1, "the listing keeps it");
+        // A negative value is the same story: it is not a rating either.
+        conn.execute(
+            "UPDATE assets SET rating = -2 WHERE id = ?1",
+            [asset.id.to_string().as_str()],
+        )
+        .unwrap();
+        assert_eq!(
+            assets::get(conn, asset.id).unwrap().unwrap().rating,
+            None,
+            "and `u8::try_from` refusing it is the row surviving, not failing"
+        );
+    }
+
+    /// The step splitter has to keep a trigger body in one piece. Splitting on
+    /// every `;` hands SQLite `CREATE TRIGGER … BEGIN` as one statement and calls
+    /// the rest another, which is the `incomplete input` that would stop a library
+    /// opening -- and it would stop it for every upgrade step after this one too.
+    #[test]
+    fn a_step_splitter_keeps_a_trigger_body_whole() {
+        let statements = step_statements(
+            "CREATE TRIGGER t BEFORE INSERT ON assets \
+             WHEN NEW.rating > 5 BEGIN SELECT RAISE(ABORT, 'no'); END;
+             CREATE INDEX i ON assets(rating);",
+        );
+        assert_eq!(
+            statements.len(),
+            2,
+            "one trigger and one index: {statements:?}"
+        );
+        assert!(statements[0].starts_with("CREATE TRIGGER"));
+        assert!(statements[0].ends_with("END"));
+        assert_eq!(statements[1], "CREATE INDEX i ON assets(rating)");
+
+        // And the step this build actually ships splits the same way, so the two
+        // cannot drift apart.
+        let step = schema::UPGRADES
+            .iter()
+            .find(|upgrade| upgrade.from == 22)
+            .expect("the v22 -> v23 step");
+        let parts = step_statements(step.sql);
+        assert_eq!(
+            parts.len(),
+            2,
+            "the v23 step is exactly its two guards: {parts:?}"
+        );
+        assert!(
+            parts
+                .iter()
+                .all(|part| part.to_ascii_uppercase().starts_with("CREATE TRIGGER")),
+            "{parts:?}"
+        );
     }
 
     /// v21 → v22 removes a table that was never used. Three promises to keep:
@@ -1088,14 +1394,14 @@ mod tests {
             store.conn(),
             members[1].id,
             &AssetPatch {
-                rating: Some(Some(4)),
+                rating: Some(Some(Rating::new(4).unwrap())),
                 ..Default::default()
             },
         )
         .unwrap();
         let rated = AssetQuery {
             collection_id: Some(collection.id),
-            min_rating: Some(3),
+            min_rating: Some(Rating::new(3).unwrap()),
             ..AssetQuery::live()
         };
         assert_eq!(assets::count(store.conn(), &rated).unwrap(), 1);
@@ -1765,7 +2071,7 @@ mod tests {
             is_favorite: Some(true),
             source_path_prefix: Some("/home/shot".into()),
             orientation: Some(crate::model::Orientation::Landscape),
-            min_rating: Some(3),
+            min_rating: Some(Rating::new(3).unwrap()),
             ext: Some("png".into()),
             ..AssetQuery::live()
         };
@@ -2205,11 +2511,11 @@ mod tests {
     fn smart_collection_evaluates_trees() {
         let store = Store::in_memory().unwrap();
         let mut img = sample_asset("p1.png", AssetKind::Image);
-        img.rating = Some(4);
+        img.rating = Some(Rating::new(4).unwrap());
         let mut vid = sample_asset("v1.mp4", AssetKind::Video);
-        vid.rating = Some(2);
+        vid.rating = Some(Rating::new(2).unwrap());
         let mut doc = sample_asset("d1.md", AssetKind::Document);
-        doc.rating = Some(5);
+        doc.rating = Some(Rating::new(5).unwrap());
         assets::insert(store.conn(), &img).unwrap();
         assets::insert(store.conn(), &vid).unwrap();
         assets::insert(store.conn(), &doc).unwrap();
@@ -2398,7 +2704,7 @@ mod tests {
         let store = Store::in_memory().unwrap();
         for i in 0..10 {
             let mut a = sample_asset(&format!("f{i}.png"), AssetKind::Image);
-            a.rating = Some(5);
+            a.rating = Some(Rating::new(5).unwrap());
             assets::insert(store.conn(), &a).unwrap();
         }
         let node = smart_node(serde_json::json!({
@@ -2757,10 +3063,10 @@ mod tests {
         let conn = store.conn();
         let mut a = sample_asset("aaa.png", AssetKind::Image);
         a.size_bytes = 300;
-        a.rating = Some(2);
+        a.rating = Some(Rating::new(2).unwrap());
         let mut b = sample_asset("zzz.png", AssetKind::Image);
         b.size_bytes = 100;
-        b.rating = Some(5);
+        b.rating = Some(Rating::new(5).unwrap());
         // Stagger import times so the default newest-first order is
         // deterministic (sample timestamps would otherwise collide).
         let mut c = sample_asset("mmm.png", AssetKind::Image);

@@ -884,7 +884,7 @@ fn concurrency(explicit: Option<usize>) -> usize {
 mod tests {
     use super::*;
     use crate::ai::vendor::{VendorError, VendorErrorKind, VendorId};
-    use crate::model::AssetLocation;
+    use crate::model::{AssetLocation, Rating};
     use crate::store::Store;
 
     struct MockAdapter {
@@ -1054,7 +1054,7 @@ mod tests {
         let conn = open(&data);
         let asset = &live_assets(&conn)[0];
         assert_eq!(asset.description.as_deref(), Some("A red wall"));
-        assert_eq!(asset.rating, Some(4));
+        assert_eq!(asset.rating, Some(Rating::new(4).unwrap()));
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -1069,7 +1069,7 @@ mod tests {
                 id,
                 &AssetPatch {
                     description: Some(Some("mine".into())),
-                    rating: Some(Some(5)),
+                    rating: Some(Some(Rating::new(5).unwrap())),
                     ..Default::default()
                 },
             )
@@ -1081,7 +1081,7 @@ mod tests {
         let conn = open(&data);
         let asset = &live_assets(&conn)[0];
         assert_eq!(asset.description.as_deref(), Some("mine"), "not clobbered");
-        assert_eq!(asset.rating, Some(5), "not clobbered");
+        assert_eq!(asset.rating, Some(Rating::new(5).unwrap()), "not clobbered");
         let _ = std::fs::remove_dir_all(&root);
     }
 

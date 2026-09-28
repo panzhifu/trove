@@ -19,14 +19,21 @@
 //! come back — with the rule that a step must be applicable from a shape that
 //! matches the version on record.
 //!
-//! That is where this file stands now: [`UPGRADES`] holds eight steps, because
+//! That is where this file stands now: [`UPGRADES`] holds nine steps, because
 //! every one of them landed while the version before it was already in the
 //! field — v14 → v15 for the `ai_analysis` cache, v15 → v16 for a container's
 //! appearance, v16 → v17 for the 3D viewport's look, v17 → v18 for the ordered
 //! live-listing indexes, v18 → v19 for image sequences, v19 → v20 for the
-//! indexed source path, v20 → v21 for the task journal, and v21 → v22 to take
-//! the `ai_analysis` cache back out again. Everything not on the list is still
-//! refused by name.
+//! indexed source path, v20 → v21 for the task journal, v21 → v22 to take the
+//! `ai_analysis` cache back out again, and v22 → v23 to put the star rating's
+//! domain in the database. Everything not on the list is still refused by name.
+//!
+//! v23 is also the first step this schema has run that *moves data toward a
+//! narrower rule* rather than only adding to the shape: `0` was a legal rating
+//! until the type made it unnameable, so the step folds stored zeros onto NULL
+//! in the same transaction that installs the guards (which do not fire for a
+//! NULL, so the fold itself passes them). It is still not a rescue for a library
+//! that refuses to open — nothing here repairs a row the build cannot read.
 //!
 //! The last step is the first removal this schema has made, and it is worth
 //! reading as a fact rather than a tidy-up: `ai_analysis` was created, indexed
@@ -45,7 +52,7 @@
 /// existence was written by a build whose chain ended there, and that shape
 /// is the pre-`asset_embeddings` subset of the one below — which is the only
 /// sense in which a version number means anything.
-pub const SCHEMA_VERSION: i64 = 22;
+pub const SCHEMA_VERSION: i64 = 23;
 
 /// One upgrade step: the DDL that takes a library from `from` to `to`, and the
 /// data that DDL cannot move.
@@ -119,7 +126,62 @@ pub const UPGRADES: &[Upgrade] = &[
         sql: UPGRADE_21_TO_22,
         data: None,
     },
+    Upgrade {
+        from: 22,
+        to: 23,
+        sql: UPGRADE_22_TO_23,
+        data: Some(fold_zero_ratings),
+    },
 ];
+
+/// v22 → v23: put the star rating's domain in the database.
+///
+/// A rating is one of five stars or it is absent, and until this step only Rust
+/// said so -- in one function, [`crate::model::AssetPatch::validate`], which every
+/// other writer (import, AI analysis, the CLI, a hand-edited file) could and did
+/// route around. The column accepted any integer.
+///
+/// Two guards rather than a column `CHECK`, and the reason is what a `CHECK` would
+/// cost: SQLite cannot add one to an existing column, so asking for it means
+/// recreating `assets` -- its twenty-one indexes, and the three outbox triggers
+/// that fire on it -- inside a migration whose whole job is to not touch the rows.
+/// A trigger is additive DDL that says the same thing and can be re-run.
+///
+/// `ABORT` rather than `ROLLBACK` because the statement is the unit the caller
+/// expects to fail: a batch metadata write that hits one out-of-domain value
+/// loses that statement, not the transaction the caller had already opened.
+const UPGRADE_22_TO_23: &str = r#"
+    CREATE TRIGGER IF NOT EXISTS assets_rating_insert_guard
+    BEFORE INSERT ON assets
+    WHEN NEW.rating IS NOT NULL AND (NEW.rating < 1 OR NEW.rating > 5)
+    BEGIN
+        SELECT RAISE(ABORT, 'rating must be 1..=5, or NULL for unrated');
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS assets_rating_update_guard
+    BEFORE UPDATE OF rating ON assets
+    WHEN NEW.rating IS NOT NULL AND (NEW.rating < 1 OR NEW.rating > 5)
+    BEGIN
+        SELECT RAISE(ABORT, 'rating must be 1..=5, or NULL for unrated');
+    END;
+"#;
+
+/// Fold the ratings a library already holds onto the domain the guards accept.
+///
+/// `0` was reachable: the bound this build checked was `0..=5`, and a star row
+/// cannot draw it -- so a stored zero is "not rated" with a number attached, and
+/// that is exactly the state [`crate::model::Rating`] refuses to hold. It becomes
+/// NULL, which is what an unrated asset already is. Values above five are left
+/// where they are rather than clamped: nobody chose them, and silently rewriting a
+/// judgement the user may have made in another tool is worse than reading it as
+/// unrated at the row boundary (see `store::assets`'s rating read).
+///
+/// Safe to land twice -- after the first pass no row matches, and the guards the
+/// same step installed do not fire for a NULL.
+fn fold_zero_ratings(conn: &rusqlite::Connection) -> crate::error::Result<()> {
+    conn.execute("UPDATE assets SET rating = NULL WHERE rating = 0", [])?;
+    Ok(())
+}
 
 /// v21 → v22: drop the `ai_analysis` cache table and its index.
 ///
@@ -405,6 +467,8 @@ pub const SCHEMA: &str = r#"
         captured_at    TEXT,
         title          TEXT,
         description    TEXT,
+        -- One of five stars, or NULL for "not rated". A pair of guards keeps
+        -- anything else out of this column -- see UPGRADE_22_TO_23.
         rating         INTEGER,
         is_favorite    INTEGER NOT NULL DEFAULT 0,
         source_url     TEXT,
@@ -463,6 +527,22 @@ pub const SCHEMA: &str = r#"
     -- `json_extract` this replaced was already a case-insensitive `LIKE`.
     CREATE INDEX idx_assets_source_path ON assets(source_path COLLATE NOCASE)
         WHERE trashed_at IS NULL;
+
+    -- The rating's domain, in the database rather than only in Rust: see
+    -- UPGRADE_22_TO_23 for why this is a pair of guards and not a column CHECK.
+    CREATE TRIGGER assets_rating_insert_guard
+    BEFORE INSERT ON assets
+    WHEN NEW.rating IS NOT NULL AND (NEW.rating < 1 OR NEW.rating > 5)
+    BEGIN
+        SELECT RAISE(ABORT, 'rating must be 1..=5, or NULL for unrated');
+    END;
+
+    CREATE TRIGGER assets_rating_update_guard
+    BEFORE UPDATE OF rating ON assets
+    WHEN NEW.rating IS NOT NULL AND (NEW.rating < 1 OR NEW.rating > 5)
+    BEGIN
+        SELECT RAISE(ABORT, 'rating must be 1..=5, or NULL for unrated');
+    END;
 
     CREATE TABLE collections (
         id         TEXT PRIMARY KEY,

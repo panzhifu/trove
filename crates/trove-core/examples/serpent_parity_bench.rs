@@ -48,7 +48,7 @@ use trove_core::library::Library;
 use trove_core::media::probe;
 use trove_core::model::{
     Asset, AssetFacts, AssetKind, AssetLocation, AssetQuery, AssetSeed, AssetSort,
-    MAX_DESCRIPTION_LEN, NewCollection, NewTag, UsageStatus,
+    MAX_DESCRIPTION_LEN, NewCollection, NewTag, Rating, UsageStatus,
 };
 use trove_core::store::{BrowseContext, assets, collections, tags};
 
@@ -403,7 +403,11 @@ fn run_query(
         });
     }
     measure(&mut report, "filterRatingMs", rounds, || {
-        run(conn, text, &browse(|c| c.min_rating = Some(3)));
+        run(
+            conn,
+            text,
+            &browse(|c| c.min_rating = Some(Rating::new(3).unwrap())),
+        );
     });
     measure(&mut report, "filterKindImageMs", rounds, || {
         run(conn, text, &browse(|c| c.kind = Some(AssetKind::Image)));
@@ -926,8 +930,11 @@ fn build_mirror(
                 captured_at: None,
                 title: None,
                 description: description.map(|d| d.chars().take(MAX_DESCRIPTION_LEN).collect()),
-                // Serpent's unrated is 0; Trove's is NULL.
-                rating: rating.filter(|v| *v > 0).map(|v| v as u8),
+                // Serpent's unrated is 0; Trove's is NULL -- and `Rating::new` is
+                // the function that says so.
+                rating: rating
+                    .and_then(|v| u8::try_from(v).ok())
+                    .and_then(Rating::new),
                 is_favorite: favorite.unwrap_or(0) == 1,
                 source_url: None,
                 usage_status: UsageStatus::default(),

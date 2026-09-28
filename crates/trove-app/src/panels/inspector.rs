@@ -15,7 +15,7 @@ use gpui_kit::component::{ActiveTheme, Icon, IconName, Sizable};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
-use trove_core::model::{AssetKind, AssetPatch, MAX_RATING, UsageStatus};
+use trove_core::model::{AssetKind, AssetPatch, Rating, UsageStatus};
 use uuid::Uuid;
 
 use crate::components::preview::{AssetPreviewData, PreviewContext};
@@ -1031,12 +1031,15 @@ impl InspectorPanel {
     }
 
     /// Five star toggles; clicking the current top star clears the rating.
-    fn rating_row(&self, rating: Option<u8>) -> Div {
-        let current = rating.unwrap_or(0);
-        h_flex().gap_0p5().children((1..=MAX_RATING).map(|star| {
-            let filled = star <= current;
+    ///
+    /// The row iterates [`Rating::all()`] rather than counting to a constant: a
+    /// star can only be one of the values the type accepts, so the picker cannot
+    /// offer a rating the record would then refuse to hold.
+    fn rating_row(&self, rating: Option<Rating>) -> Div {
+        h_flex().gap_0p5().children(Rating::all().map(|star| {
+            let filled = rating.is_some_and(|current| star <= current);
             let controller = self.controller.clone();
-            Button::new(format!("rating-{star}"))
+            Button::new(format!("rating-{}", star.get()))
                 .xsmall()
                 .ghost()
                 .icon(if filled {
@@ -1047,7 +1050,7 @@ impl InspectorPanel {
                 .on_click(move |_, _, cx| {
                     controller.update(cx, |ctl, cx| {
                         let Some(id) = ctl.primary() else { return };
-                        let value = if filled && current == star {
+                        let value = if rating == Some(star) {
                             None
                         } else {
                             Some(star)

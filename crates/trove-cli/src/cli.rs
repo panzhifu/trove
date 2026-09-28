@@ -10,8 +10,22 @@ use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use trove_core::model::{
-    AspectPreset, AssetKind, AssetSort, Orientation, ResolutionBand, UsageStatus,
+    AspectPreset, AssetKind, AssetSort, Orientation, Rating, ResolutionBand, UsageStatus,
 };
+
+/// Parse a star count typed on the command line.
+///
+/// Both `--rating` and `--min-rating` go through this, so a flag is the one place
+/// the range is checked: `trove set --rating 9` stops as a usage error naming the
+/// argument, instead of reaching a library whose guards then refuse the write for
+/// a reason the user cannot connect to the flag they typed.
+fn parse_stars(raw: &str) -> Result<Rating, String> {
+    let value = raw
+        .trim()
+        .parse::<u8>()
+        .map_err(|_| format!("expected a whole number of stars, got {raw:?}"))?;
+    Rating::new(value).ok_or_else(|| format!("a rating is 1 to 5 stars, got {value}"))
+}
 
 /// Query and edit a Trove library from the command line.
 ///
@@ -215,8 +229,8 @@ pub struct FilterArgs {
     pub favorite: bool,
 
     /// Only assets rated at least this high.
-    #[arg(long, value_name = "1-5")]
-    pub min_rating: Option<u8>,
+    #[arg(long, value_name = "1-5", value_parser = parse_stars)]
+    pub min_rating: Option<Rating>,
 
     /// Only this file extension, without the dot (`png`, `mp4`).
     #[arg(long, value_name = "EXT")]
@@ -426,8 +440,8 @@ pub struct SetArgs {
     pub clear_description: bool,
 
     /// Set the star rating.
-    #[arg(long, value_name = "1-5")]
-    pub rating: Option<u8>,
+    #[arg(long, value_name = "1-5", value_parser = parse_stars)]
+    pub rating: Option<Rating>,
     /// Clear the star rating.
     #[arg(long, conflicts_with = "rating")]
     pub clear_rating: bool,

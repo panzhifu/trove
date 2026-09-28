@@ -17,7 +17,7 @@ use chrono::Utc;
 use trove_core::library::Library;
 use trove_core::model::{
     Asset, AssetKind, AssetLocation, AssetPatch, AssetQuery, AssetSeed, NewTag, Orientation,
-    UsageStatus,
+    Rating, UsageStatus,
 };
 use trove_core::store::{assets, tags};
 
@@ -562,7 +562,9 @@ fn insert_rows(lib: &Library, n: usize, offset: usize) {
         a.width = Some(w);
         a.height = Some(h);
         if idx.is_multiple_of(4) {
-            a.rating = Some((idx % 5) as u8);
+            // A fifth of the fixture rows are rated; `Rating::new(0)` is `None`,
+            // which is what "the user never rated this" now means.
+            a.rating = Rating::new((idx % 5) as u8);
         }
         a.is_favorite = idx.is_multiple_of(11);
         assets::insert(conn, &a).unwrap();
@@ -803,7 +805,7 @@ fn profile(n: usize) {
         (
             "rating >= 3",
             AssetQuery {
-                min_rating: Some(3),
+                min_rating: Some(Rating::new(3).unwrap()),
                 ..base()
             },
         ),
@@ -1203,7 +1205,7 @@ fn profile(n: usize) {
         (
             "rating >= 3",
             AssetQuery {
-                min_rating: Some(3),
+                min_rating: Some(Rating::new(3).unwrap()),
                 ..base()
             },
         ),

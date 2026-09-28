@@ -9,7 +9,7 @@ use uuid::Uuid;
 use trove_core::config::AppConfig;
 use trove_core::library::Library;
 use trove_core::media::height_color::StoredLook;
-use trove_core::model::{AspectPreset, AssetKind, AssetSort, Orientation, ResolutionBand};
+use trove_core::model::{AspectPreset, AssetKind, AssetSort, Orientation, Rating, ResolutionBand};
 use trove_core::store::browse::SearchTiers;
 
 /// Current import activity, shown by the Explorer panel.
@@ -282,7 +282,7 @@ pub struct LibraryController {
     /// (0 loosest, 100 tightest). It is a *question width*, not a score
     /// threshold: see `trove_core::media::search::ColourMatch`.
     pub colour_similarity: f32,
-    pub filter_min_rating: Option<u8>,
+    pub filter_min_rating: Option<Rating>,
     pub filter_ext: Option<String>,
     /// Grid or list presentation of the asset area.
     pub view_mode: ViewMode,
@@ -768,7 +768,7 @@ impl LibraryController {
         }
     }
 
-    pub fn set_filter_min_rating(&mut self, rating: Option<u8>) {
+    pub fn set_filter_min_rating(&mut self, rating: Option<Rating>) {
         if self.filter_min_rating != rating {
             self.filter_min_rating = rating;
             self.reset_grid_page();

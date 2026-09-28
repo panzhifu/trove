@@ -10,7 +10,7 @@ use gpui_kit::*;
 use gpui_kit::{Anchor, App};
 
 use trove_core::config::{AppConfig, FILTER_TOOLS};
-use trove_core::model::{AspectPreset, AssetKind, AssetSort, Orientation, ResolutionBand};
+use trove_core::model::{AspectPreset, AssetKind, AssetSort, Orientation, Rating, ResolutionBand};
 use trove_core::store::facets::{FacetCounts, FacetValue};
 
 use crate::components::controls::icon_button;
@@ -510,22 +510,30 @@ pub(crate) fn rating_filter(
     let t = |k: &str| rust_i18n::t!(k).to_string();
     let rating_facets = facets.map(|f| f.ratings.as_slice());
 
-    let mut options: Vec<(Option<u8>, String)> = vec![(None, t("workspace.filter_all_ratings"))];
-    for stars in 1..=5u8 {
-        let label = format!("★ {}+", stars);
-        // Sum counts for all ratings >= this threshold.
+    let mut options: Vec<(Option<Rating>, String)> =
+        vec![(None, t("workspace.filter_all_ratings"))];
+    for stars in Rating::all() {
+        let label = format!("★ {}+", stars.get());
+        // Sum counts for all ratings >= this threshold. A facet value the type
+        // refuses -- an unrated bucket, or a number a future format change made
+        // meaningless -- contributes to no threshold rather than to all of them.
         let count = rating_facets.map(|fvs| {
             fvs.iter()
                 .filter_map(|fv| {
-                    let n = fv.value.trim_end_matches('★').parse::<u8>().ok()?;
-                    if n >= stars { Some(fv.count) } else { None }
+                    let n = fv
+                        .value
+                        .trim_end_matches('★')
+                        .parse::<u8>()
+                        .ok()
+                        .and_then(Rating::new)?;
+                    (n.at_least(stars)).then_some(fv.count)
                 })
                 .sum::<u64>()
         });
         options.push((Some(stars), with_count(&label, count)));
     }
     let label = match current {
-        Some(n) => format!("★ {}+", n),
+        Some(n) => format!("★ {}+", n.get()),
         None => t("workspace.filter_rating"),
     };
     Button::new("filter-rating")

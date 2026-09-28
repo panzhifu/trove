@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use super::facts::AssetFacts;
-use super::{MAX_DESCRIPTION_LEN, MAX_NAME_LEN, MAX_RATING};
+use super::{MAX_DESCRIPTION_LEN, MAX_NAME_LEN, Rating};
 
 /// Where the asset's file lives.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -239,8 +239,12 @@ pub struct Asset {
     /// Display title; defaults to the file name without extension.
     pub title: Option<String>,
     pub description: Option<String>,
-    /// 0..=MAX_RATING. `None` means unrated.
-    pub rating: Option<u8>,
+    /// The stars the user gave this asset, or `None` for "not rated".
+    ///
+    /// [`Rating`] cannot hold a value outside `1..=MAX_RATING`, which is why the
+    /// bounds check this field used to lean on is gone from
+    /// [`AssetPatch::validate`].
+    pub rating: Option<Rating>,
     pub is_favorite: bool,
     /// Where the asset was collected from, when applicable.
     pub source_url: Option<String>,
@@ -284,7 +288,7 @@ pub struct AssetSeed {
     pub captured_at: Option<DateTime<Utc>>,
     pub title: Option<String>,
     pub description: Option<String>,
-    pub rating: Option<u8>,
+    pub rating: Option<Rating>,
     pub is_favorite: bool,
     pub source_url: Option<String>,
     pub usage_status: UsageStatus,
@@ -472,7 +476,7 @@ pub struct AssetPatch {
     pub title: Option<Option<String>>,
     pub description: Option<Option<String>>,
     pub kind: Option<AssetKind>,
-    pub rating: Option<Option<u8>>,
+    pub rating: Option<Option<Rating>>,
     pub is_favorite: Option<bool>,
     pub source_url: Option<Option<String>>,
     /// Set the usage state.
@@ -485,15 +489,14 @@ pub struct AssetPatch {
 }
 
 impl AssetPatch {
-    /// Validate against a rule set; applies `rating` bounds.
+    /// Validate the rules a type cannot carry.
+    ///
+    /// Rating is no longer one of them: [`Rating`] only holds `1..=MAX_RATING`, so
+    /// a patch asking for six stars does not compile. Before that type existed,
+    /// this was the one function in the crate that remembered the bound -- every
+    /// other writer (import, AI analysis, the CLI, the smart-rule editor) was free
+    /// to forget it, and the column had nothing saying otherwise.
     pub fn validate(&self) -> Result<(), crate::error::Error> {
-        if let Some(Some(rating)) = self.rating
-            && rating > MAX_RATING
-        {
-            return Err(crate::error::Error::Validation(format!(
-                "rating must be 0..={MAX_RATING}, got {rating}"
-            )));
-        }
         if let Some(Some(desc)) = &self.description
             && desc.len() > MAX_DESCRIPTION_LEN
         {
@@ -606,7 +609,7 @@ mod tests {
             captured_at: Some(stamp),
             title: Some("A title".into()),
             description: Some("A description".into()),
-            rating: Some(4),
+            rating: Some(Rating::new(4).unwrap()),
             is_favorite: true,
             source_url: Some("https://example.test/pinned".into()),
             usage_status: UsageStatus::Used,

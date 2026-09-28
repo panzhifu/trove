@@ -220,11 +220,6 @@ pub fn search(
 }
 
 fn build_query(env: &Env, filter: &FilterArgs) -> Result<AssetQuery, CliError> {
-    if let Some(rating) = filter.min_rating
-        && !(1..=5).contains(&rating)
-    {
-        return Err(CliError::usage("--min-rating takes a value from 1 to 5"));
-    }
     if filter.limit == 0 {
         return Err(CliError::usage("--limit must be at least 1"));
     }
