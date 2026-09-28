@@ -5,7 +5,7 @@
 > **本轮（09-28）只有 Trove 动了，Serpent 一格没变**：上游仓库仍停在 **v0.2.9**，`src/` 仍是 **849 文件 / 258,255 行**、`MIGRATIONS` 仍是 32 段、末条 `version: 56`，与 09-27 那次复核逐字相同。所以 §2026-09-27 复核 那张表**不需要重审 Serpent 侧**，只需要把 Trove 这一轮的工作树改动记进去——记在 **§2026-09-28 复核** 那一节，并且**就地改掉了那一节里三行的状态**（音频卡片、检查器逗号输入标签、以及纵深索引升到的第 4、5 版）。Trove 这一轮动了什么、其中两件事**只做了一半就说自己做完了**，全部记在那一节里。
 >
 > **上一轮（09-27）两边都动了**：Trove 发了 **v0.4.9**（模型材质与共享 GPU 渲染器那一轮、智能集合同级拖拽重排、预览里方向键换素材、以及**卡片"活过来"的触发从指针定住改成按空格**——见 §C 的活卡片行与 [PREVIEW-SYSTEM.md](./PREVIEW-SYSTEM.md)），Serpent 从 v0.2.6 走到 v0.2.9。后者的增量单独成节，见 **§2026-09-27 复核**。
-> 核验日期 **2026-09-28**（同日还有一轮接线，见 §2026-09-28 第二轮；更早是 09-27 / 09-25 / 09-24 / 09-23）。两边的数字都取自源码而非各自文档：Serpent `src/` **849 文件 / 258,255 行** `.ts`+`.tsx`（与 09-27 逐字相同），**schema 仍是 v56 一格没加**——`MIGRATIONS` 32 段、末条 `version: 56`，`SUPPORTED_SCHEMA_VERSION = MIGRATIONS.at(-1)!.version`。Trove `crates/` **226 文件 / 113,206 行** `.rs`（09-27 记的是 224 / 110,221）。schema **v21**——v19 加了序列帧两张侧表、v20 加了 `source_path` 虚拟列与索引、**v21 加了 `task_journal` 一张表**；`INDEX_VERSION` 从 09-27 的 3 走到 **5**（见 §D 纵深索引行）；包版本 **0.4.9**（本轮未 bump）；`en.toml` **790** 个叶子键；测试 **791 core + 70 app = 861** 全绿 3 ignored，`cargo test --workspace --all-targets` 实跑，`cargo fmt --all -- --check` 与 `cargo clippy --workspace --all-targets -- -D warnings` 两道门同轮一起过。
+> 核验日期 **2026-09-28**（同日还有一轮接线，见 §2026-09-28 第二轮；更早是 09-27 / 09-25 / 09-24 / 09-23）。两边的数字都取自源码而非各自文档：Serpent `src/` **849 文件 / 258,255 行** `.ts`+`.tsx`（与 09-27 逐字相同），**schema 仍是 v56 一格没加**——`MIGRATIONS` 32 段、末条 `version: 56`，`SUPPORTED_SCHEMA_VERSION = MIGRATIONS.at(-1)!.version`。Trove `crates/` **226 文件 / 113,206 行** `.rs`（09-27 记的是 224 / 110,221）。schema **v21**——v19 加了序列帧两张侧表、v20 加了 `source_path` 虚拟列与索引、**v21 加了 `task_journal` 一张表**；`INDEX_VERSION` 从 09-27 的 3 走到 **5**（见 §D 纵深索引行）；包版本 **0.4.9**（本轮未 bump）；`en.toml` **792** 个叶子键；测试 **794 core + 71 app = 865** 全绿 3 ignored，`cargo test --workspace --all-targets` 实跑，`cargo fmt --all -- --check` 与 `cargo clippy --workspace --all-targets -- -D warnings` 两道门同轮一起过。
 >
 > **09-27 那一轮把上上轮三处"确认缺失"推翻了两处**，都是同一个失败模式——按 Serpent 的实现符号去 grep（`CF_HDROP`、`xdnd`、`file_drop`），命中零就记成"没有"，而没有按**能力**去问（"能不能把文件拖出窗口"）：
 > ① **原生文件拖出早就有**（`2026-09-12` 的 `ce6a29d` 起，`panels/workspace/cells.rs:199-215` 网格格、`:494-510` 列表行，见 §A。上一版这里写的 `:192`、`:406` 已经漂走，本轮重数过）；
@@ -59,7 +59,7 @@ Serpent 在这两轮之间走了 **88 个提交**（其中 79 个非发布提交
 | **忽略规则面板**（内嵌草稿预览，点保存才写入） | `.serpentignore` 编辑器 + 预览 | **无**。Trove 只**读** Git 的忽略文件（`tasks/ignore.rs:46 OWN_IGNORE_FILES = [".gitignore", ".ignore"]`），从不写，也没有编辑面板。但**草稿-修订-保存这个形状已经有了**：`dialogs/rules.rs:12` 的 `RuleDraft` 就是"这里什么都不写" | **L**（新存储 + 写路径 + 对真实扫描的预览；UI 骨架可复用 rules） |
 | **拖文件夹到库根 = 建一个链接文件夹** | 链接树里出现该文件夹节点，规则/扫描都挂在它身上 | **部分**。拖入确实**不复制**（`library/jobs/import.rs:104` 注释即"用户导入是链接"），但落下去是**逐个文件的 `Origin::Linked`**，文件夹身份只剩 `facts.source_path`，靠 `panels/folders.rs` 事后归组 | **L** |
 | **侧栏文件夹快捷键** | 新增 | **无**。`Explorer` 上下文只绑了一个 `Cancel`（`explorer.rs:719-720`） | **M** |
-| **搜索历史**（回呼以前输入过的查询） | 新增 | **无**。`search_box.rs:22-31` 的 `SearchBox` 只有 controller/input/open 三个字段，没有存储也没有回呼列表（`en.toml:163` 的 `clear_history_tooltip` 是**浏览**历史，不是查询历史） | **S** |
+| **搜索历史**（回呼以前输入过的查询） | 上限 **24** 条、最新在前、大小写不敏感去重并保留新拼法、忽略空串，按 `libraryId` 分键存 localStorage（`src/renderer/search-history.ts`，`SEARCH_HISTORY_LIMIT`） | ✅ **已于 2026-09-28 第三轮做完**：存 `LibraryConfig::search_history`（每库一份 `library.json`，与它的 `libraryId` 分键范围一致），规则逐条对齐（24 / 最新在前 / Unicode 折叠去重 / 空串不记），提交点是**回车**——参照实现自己就写着"只记 settle 的查询，不记逐字符前缀"，所以这条选择不是折中而是照抄。列表挂在已有的 `search-popover` 输入条下面，点一条**既回填输入框也立刻执行**（能改而不是只能重复），带一颗清除钮 | ~~**S**~~ ✅ |
 | **乱序 / 随机排序** | 修好虚拟画布上的乱序生效 | **无**。`AssetSort` 只有 CreatedAt / UpdatedAt / Name / SizeBytes / Rating / Duration / Color（`model/query.rs:12-28`），全仓无 random/shuffle 排序码 | **M**（难点不是 SQL，是"追加一页不能重新洗"这条不变量，`store/browse.rs:1086`） |
 | **内嵌元数据显示** | 新增 `embedded-metadata.ts`，归一 15+ 字段成行显示 | **部分，而且差得很便宜**。抽取是真的（`media/metadata.rs:163` exif-rs 已挖出 Make/Model/ISO/FNumber/FocalLength/ExposureTime/GPS），但**挖出来的 `facts.photo` 在 `crates/trove-app/src` 里零引用**——一块已经躺在库里的数据没上界面。没抽的：视频/文档/归档（`metadata.rs:67` `_ => MinedMetadata::default()`）；没有 XMP/IPTC **读**（`library/jobs/xmp.rs` 是 sidecar **导出**） | ~~**S**（先把已挖的显示出来）~~ **已于 2026-09-27 做完**：检查器属性页新增相机 / 拍摄参数 / 拍摄时间 / GPS 四行，全部 `when_some`，无 EXIF 的文件一行都不出现。**过程中挖出两个真 bug**（`display_value()` 给 ASCII 加引号，导致 `captured_at` 对每张照片都是 None——时间线一直在按导入日期排序；快门被写成 `0.016666666666666666s` 而不是 `1/60s`），并补上一份真 EXIF JPEG 的内联夹具做端到端回归。**剩下的洞是回填**：`plan_remine` 只扫 `[Audio, Font]`（`services/maintenance.rs:99`），图片永不重挖，所以已入库的照片补不上这些字段（新导入的完全正常）；补它要动 `AssetPatch`（没有 `captured_at` 字段）+ 强制按钮文案。全打平（视频/文档标签抽取、XMP 读、custom tags）仍是 **L** |
 | **检查器逗号一次输入多个标签** | 输入即拆成待提交 chip，Enter 全给 | ~~**部分**~~ ✅ **已于 2026-09-28 收平**：Enter 现在就是"拆分并追加"（`inspector.rs` 的 `append_tags_flat`）。本节下面记的旧形状——拆分挂在 `replace_tags_from_input`（`:136`）上而且是**替换**整组、Enter 走 `add_tag_from_input`（`:111`）把整串当一个人名字——已经不存在了。见 §2026-09-28 复核 | ~~**S**~~ ✅ |
@@ -118,7 +118,9 @@ Serpent 侧一个提交都没有：上游仓库仍是 **v0.2.9**，`src/` 849 �
 
 ### 本轮重新逐条 grep 过、状态未变的行
 
-`media/probe.rs:327` 仍写 `raw.width.max(1)`——RAW 头报 0×0 时**记成 1×1 存进库**；`Cargo.toml` 无 `qcms`，`crates/trove-core/src` 里 `icc` / `qcms` 按词边界扫零命中（§C 色彩管理 T8 未动）；`grep -rn sequence crates/trove-app/src/` 仍只有两条无关注释（序列帧**用户能碰的那一半**一行没有）；`model/query.rs` 无 random/shuffle（乱序排序没有）；`panels/search_box.rs` 无 history（搜索历史没有）；`components/preview/video.rs:90` 第一句仍是 `if data.kind != AssetKind::Video { return None; }`（动画 GIF 到不了播放条）；`context_menu.rs:305-312` 与 `toolbar/selection.rs:89` 的「永久删除」仍直接 `purge_assets(&ids)`**没有任何确认**——09-27 建议把这条按缺陷而非差距排期，本轮它仍是缺陷；原生拖出仍只交出指针下**一个**文件（`cells.rs:210-215`、`:505-510`，闭包签名 `_: &AssetsDrag` 把选中集丢在参数里）。
+（标题里的"未变"只对这一轮当时成立：下面十条里有序列帧与搜索历史两条在**同日第二、第三轮**被做掉了，已在原句里就地标注；其余八条到 09-28 第三轮结束时重跑仍然成立。）
+
+`media/probe.rs:327` 仍写 `raw.width.max(1)`——RAW 头报 0×0 时**记成 1×1 存进库**；`Cargo.toml` 无 `qcms`，`crates/trove-core/src` 里 `icc` / `qcms` 按词边界扫零命中（§C 色彩管理 T8 未动）；`grep -rn sequence crates/trove-app/src/` 当时仍只有两条无关注释（序列帧用户能碰的那一半一行没有）——**这句已被同日第二轮推翻**，`panels/workspace/context_menu.rs:236-296` 现在有创建与解散两颗；`model/query.rs` 无 random/shuffle（乱序排序没有）；`panels/search_box.rs` 当时无 history（搜索历史没有）——**这句已被同日第三轮推翻**，那里现在有 23 处 history 引用；`components/preview/video.rs:90` 第一句仍是 `if data.kind != AssetKind::Video { return None; }`（动画 GIF 到不了播放条）；`context_menu.rs:305-312` 与 `toolbar/selection.rs:89` 的「永久删除」仍直接 `purge_assets(&ids)`**没有任何确认**——09-27 建议把这条按缺陷而非差距排期，本轮它仍是缺陷；原生拖出仍只交出指针下**一个**文件（`cells.rs:210-215`、`:505-510`，闭包签名 `_: &AssetsDrag` 把选中集丢在参数里）。
 
 ---
 
@@ -136,6 +138,24 @@ Serpent 侧仍然一格没动（v0.2.9 / 849 文件 / 258,255 行 / schema v56�
 两处顺带修掉的**注释性失真**（都是 §2026-09-28 复核 记过的同一形状）：`store/task_journal.rs` 的模块注释原本承诺"开库时读回来、界面就能恢复或重试"，`plugins.rs::task_kinds` 的注释原本写着"UI 用它填任务面板的筛选器和设置页的插件列表"——两句都不成立，现在都改成了实际成立的说法。
 
 **这一轮没解决的**：§I 里 `inspector.replace_tags_hint` / `replace_tags_failed` 那两个孤儿键仍在九份 catalog 里；`PERF-VS-SERPENT.md` 的 `:58` / `:197` 两行仍写着 thin LTO；分面计数的成本仍未进基准。**新添的一处**：序列帧的右键项与"上次中断"区各用了 4 条和 2 条新 locale 键（`workspace.create_sequence` 等，九份一起加，棘轮 allowance 未动），而 `docs/MEDIA-FORMATS.md` 与 `docs/TAG-COLLECTION.md` 里关于序列帧的说法还没跟着这轮改。
+
+---
+
+## 2026-09-28 第三轮：搜索历史
+
+Serpent 侧依旧一格没动。这一轮收 §2026-09-27 复核 里那条 S 级的**搜索历史**。
+
+**存储选了 `LibraryConfig`（每库一份 `library.json`），没开新表。** 核过三件事才敢这么定：Serpent 自己按 `libraryId` 分键（`search-history.ts` 的 `Record<string, string[]>` + `clearSearchHistory(storage, libraryId)`），所以"每库一份"是参照行为不是取舍；`LibraryConfig` 已经在存同形状的有界列表（`watched_folders: Vec<PathBuf>`），`remember_query` / `clear_search_history` 照 `add_watched_folder` 那个先例写；`services/archive.rs:24` 的整包导出目录清单里就有 `library.json  per-library preferences`，所以它不会因为不是 SQLite 就漏出备份。**代价一条**：每日自动快照走 `VACUUM INTO` 只覆盖数据库，**历史进不了每日快照，只进显式整包导出**——要连快照一起带走就得回到开表那条路，为这个付一次迁移不值。
+
+**规则逐条对齐参照实现**：上限 24、最新在前、**Unicode 折叠的大小写不敏感去重**（`ASCII` 折叠会把 `ÄNDER` 和 `änder` 存成两条）、空串不记、重复提交同一串是 no-op 不重写文件。提交点是**回车**，而且这不是折中：那份实现的头注释原话是"只记 settle 的查询，逐字符前缀不记"。
+
+**一处要记的自错**：本轮动手前我在讨论里断言过"这个框子没有提交事件、`search_box.rs` 里连 `PressEnter` 处理器都没有"。那次 grep 的打印结果没带上匹配行，我就把"没显示"当成了"没有"。**`PressEnter` 一直在**（`search_box.rs` 的输入订阅里），提交点现成。这是同一个失败模式的第四次，且这次不是参照方的符号名也不是自家模块注释，而是**我自己的 grep 输出没看全就下结论**。
+
+**回呼列表**挂在已有的 `search-popover` 输入条下面（那颗 pill 的样式一行没改），点一条**既回填输入框也立刻执行**——能改而不只是重复；带一颗清除钮；列表为空时整块不渲染，所以从没搜过的库看起来和以前一样。行内按字符截断到 40 再加省略号（按字节切会在第一个够长的中文查询上 panic，而只用 ASCII 写的测试恰好发现不了），完整串仍是执行的那一条。
+
+**没做**：上下键走历史。那要新增一个可配动作（`keybindings.rs` 今天 21 条）+ 一份焦点归属决定，而点击回呼已经满足 §2026-09-27 那条能力描述。
+
+测试 +3（`config::tests` 两条：有界/去重/持久/缺字段仍能读；`search_box::tests` 一条：截断按字符），总数 **794 core + 71 app = 865** 全绿；locale +2 键九份齐加，棘轮 allowance 未动。
 
 ---
 

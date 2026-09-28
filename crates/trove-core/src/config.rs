@@ -459,6 +459,14 @@ pub struct LibraryConfig {
     /// they keep it.
     #[serde(default)]
     pub purge_delete_sources: Option<bool>,
+    /// Recent search queries for this library, newest first.
+    ///
+    /// Settled queries only — what the user committed by pressing Enter, never
+    /// the half-typed prefixes along the way — so that reopening the box offers
+    /// questions actually asked. Capped at [`SEARCH_HISTORY_LIMIT`]; see
+    /// [`LibraryConfig::remember_query`].
+    #[serde(default)]
+    pub search_history: Vec<String>,
 }
 
 impl LibraryConfig {
@@ -527,7 +535,56 @@ impl LibraryConfig {
         self.watched_folders.retain(|p| p != path);
         self.save(library_dir)
     }
+
+    /// Record a settled query at the front of this library's history.
+    ///
+    /// Three rules, each covering a way a naive version gets ugly:
+    ///
+    /// - Whitespace-only and empty queries are dropped — an Enter on an empty
+    ///   box is a dismiss, not a question.
+    /// - Comparison is Unicode-case-folded, and the **new** spelling wins. A
+    ///   user who typed `TAG:猫` after `tag:猫` gets one entry reading
+    ///   `TAG:猫`, moved to the front. Matching ASCII only would leave
+    ///   `ÄNDER` and `änder` as two entries for one query.
+    /// - The list is capped, oldest end first, so this cannot grow without
+    ///   bound in a file that is rewritten whole.
+    ///
+    /// Returns whether anything changed, so the caller can skip a rewrite (and
+    /// a repaint) when the query was already at the front.
+    pub fn remember_query(&mut self, library_dir: &std::path::Path, query: &str) -> Result<bool> {
+        let trimmed = query.trim();
+        if trimmed.is_empty() {
+            return Ok(false);
+        }
+        if self
+            .search_history
+            .first()
+            .is_some_and(|top| top == trimmed)
+        {
+            return Ok(false);
+        }
+        let fold = trimmed.to_lowercase();
+        self.search_history
+            .retain(|kept| kept.to_lowercase() != fold);
+        self.search_history.insert(0, trimmed.to_string());
+        self.search_history.truncate(SEARCH_HISTORY_LIMIT);
+        self.save(library_dir)?;
+        Ok(true)
+    }
+
+    /// Forget every recorded query for this library.
+    pub fn clear_search_history(&mut self, library_dir: &std::path::Path) -> Result<()> {
+        self.search_history.clear();
+        self.save(library_dir)
+    }
 }
+
+/// How many settled queries one library remembers.
+///
+/// Sized to what the recall list can show without scrolling — a few rows of
+/// short queries — rather than to a database-ish round number. The oldest goes
+/// first.
+pub const SEARCH_HISTORY_LIMIT: usize = 24;
 
 /// Default minimum preview zoom (0.25×).
 pub const DEFAULT_MIN_PREVIEW_ZOOM: f32 = 0.25;
@@ -1372,6 +1429,85 @@ mod tests {
             .unwrap();
         assert!(LibraryConfig::load(&dir).watched_folders.is_empty());
 
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The recall list's three rules, each covering a way the naive version of
+    /// it gets ugly: a dismiss masquerading as a question, one query stored
+    /// twice because the shift key was down, and a list that grows inside a
+    /// file rewritten whole on every Enter.
+    #[test]
+    fn search_history_is_capped_deduplicated_case_insensitively_and_persisted() {
+        let dir = std::env::temp_dir().join(format!("trove-libhist-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut config = LibraryConfig::default();
+
+        // Empty and whitespace-only queries are a dismiss, not a question.
+        assert!(!config.remember_query(&dir, "").unwrap());
+        assert!(!config.remember_query(&dir, "   ").unwrap());
+        assert!(config.search_history.is_empty());
+
+        assert!(config.remember_query(&dir, "tag:猫").unwrap());
+        // Surrounding whitespace is not part of the query.
+        assert!(config.remember_query(&dir, "  png -fav:no  ").unwrap());
+        assert_eq!(
+            config.search_history,
+            vec!["png -fav:no".to_string(), "tag:猫".to_string()],
+            "newest first, trimmed"
+        );
+
+        // A repeat moves to the front rather than duplicating, and the spelling
+        // the user just used wins. ASCII-only folding would leave these two.
+        assert!(config.remember_query(&dir, "TAG:猫").unwrap());
+        assert_eq!(config.search_history.len(), 2, "one query, two entries");
+        assert_eq!(config.search_history[0], "TAG:猫");
+
+        // Re-committing the exact front is a no-op — no rewrite, no repaint.
+        assert!(!config.remember_query(&dir, "TAG:猫").unwrap());
+
+        // The cap holds at the oldest end.
+        for n in 0..40 {
+            config.remember_query(&dir, &format!("q{n}")).unwrap();
+        }
+        assert_eq!(config.search_history.len(), SEARCH_HISTORY_LIMIT);
+        assert_eq!(config.search_history[0], "q39", "newest still first");
+        assert!(
+            !config.search_history.iter().any(|q| q == "tag:猫"),
+            "the cap evicted from the wrong end"
+        );
+
+        // And it survives a reload, because it is the library's, not the
+        // window's.
+        config.save(&dir).unwrap();
+        assert_eq!(
+            LibraryConfig::load(&dir).search_history,
+            config.search_history
+        );
+
+        let mut config = LibraryConfig::load(&dir);
+        config.clear_search_history(&dir).unwrap();
+        assert!(LibraryConfig::load(&dir).search_history.is_empty());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A history list written by a different shape of `library.json` must not
+    /// fail the read: the whole config is one `serde_json` document, so a
+    /// missing or malformed `search_history` would take the watched folders and
+    /// the purge setting down with it.
+    #[test]
+    fn a_library_config_without_a_history_field_still_loads() {
+        let dir =
+            std::env::temp_dir().join(format!("trove-libhist-missing-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            LibraryConfig::file(&dir),
+            r#"{"watched_folders":["/tmp/a"]}"#,
+        )
+        .unwrap();
+        let config = LibraryConfig::load(&dir);
+        assert!(config.search_history.is_empty());
+        assert_eq!(config.watched_folders.len(), 1);
         std::fs::remove_dir_all(&dir).ok();
     }
 }
