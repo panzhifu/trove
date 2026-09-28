@@ -272,6 +272,20 @@ impl Asset {
         }
     }
 
+    /// Record where the file came from.
+    ///
+    /// This is *provenance*, not the location: every import writes it, including
+    /// the ones that copied the file into the library, and the folders panel
+    /// groups by it for both kinds. For a linked record the two answers happen to
+    /// be the same path, which is why one JSON key has carried both questions
+    /// since the schema's indexed `source_path` column was generated from it.
+    /// `location()` reads that key only under [`AssetLocation::Linked`], and
+    /// [`Asset::set_location`] deliberately never clears it, so setting one does
+    /// not silently rewrite the other.
+    pub fn set_provenance(&mut self, path: impl Into<String>) {
+        self.facts.source_path = Some(path.into());
+    }
+
     /// Point this record at `location`, writing the `origin` and `rel_path`
     /// columns and the `extra.source_path` key that state implies.
     ///

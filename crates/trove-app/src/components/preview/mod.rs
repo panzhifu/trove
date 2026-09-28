@@ -220,15 +220,11 @@ impl AssetPreviewData {
             .as_deref()
             .map(|hash| trove_core::media::thumb::abs_path(cache_root, hash))
             .filter(|p| p.is_file());
-        let original = if asset.origin == trove_core::model::Origin::Linked {
-            asset
-                .facts
-                .source_path
-                .as_ref()
-                .map(std::path::PathBuf::from)
-        } else {
-            asset.rel_path.as_ref().map(|rel| library_root.join(rel))
-        };
+        // Where the record's own bytes are: the library blob, or the linked
+        // original. `blob_path` is that rule in one place rather than a fifth
+        // copy of it here -- five callers had each re-derived it, and a rule
+        // restated five times is a rule that drifts.
+        let original = trove_core::media::thumb::blob_path(library_root, asset);
         let animated = crate::panels::common::animated_preview_source(
             Some(asset.mime.as_str()),
             original.as_deref(),

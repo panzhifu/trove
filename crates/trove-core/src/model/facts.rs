@@ -152,8 +152,18 @@ pub struct AssetFacts {
     /// import and updated by relinking; also filtered on by the folders
     /// panel, which reads it through the schema's generated `source_path`
     /// column so the query has an index behind it.
+    /// Where a linked file lives. `pub(crate)`: the owned-by-anyone-readable
+    /// form of this is [`crate::model::Asset::location`], and the only writer is
+    /// `Asset::set_location` -- two copies of a path, one in the record's
+    /// location and one in its facts, is the disagreement this removed.
+    ///
+    /// The field stays *here* rather than moving into the enum on purpose: this
+    /// struct passes unknown JSON keys through to `AssetFacts::unknown`, so
+    /// deleting the field would not delete the key -- it would re-ingest it as
+    /// an untyped entry, i.e. create the second copy from the other direction.
+    /// Storage and the indexed generated column both need the key in `extra`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub source_path: Option<String>,
+    pub(crate) source_path: Option<String>,
     /// Keys not claimed by any typed field, preserved verbatim.
     #[serde(flatten)]
     pub unknown: BTreeMap<String, Json>,

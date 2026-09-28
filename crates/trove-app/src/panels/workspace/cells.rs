@@ -528,8 +528,6 @@ pub(super) fn build_list_row_element(
 /// a linked model whose source has gone missing — in every one of those cases
 /// the caller falls back to the full-size asset preview.
 pub(super) fn model_source(controller: &LibraryController, id: Uuid) -> Option<(String, PathBuf)> {
-    use trove_core::model::Origin;
-
     let root = controller.library.root().to_path_buf();
     let asset = controller.library.asset(id).ok().flatten()?;
     if asset.kind != AssetKind::Model {
@@ -537,9 +535,6 @@ pub(super) fn model_source(controller: &LibraryController, id: Uuid) -> Option<(
     }
     // Imported models live in the library as a blob; linked ones stay where
     // they are and are read in place.
-    let path = match asset.origin {
-        Origin::Linked => asset.facts.source_path.as_deref()?.into(),
-        _ => root.join(asset.rel_path.as_ref()?),
-    };
+    let path = trove_core::media::thumb::blob_path(&root, &asset)?;
     path.is_file().then(|| (display_name(&asset), path))
 }

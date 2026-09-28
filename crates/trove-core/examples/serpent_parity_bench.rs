@@ -620,7 +620,12 @@ fn run_query(
                                 Box::new(e),
                             )
                         })?;
-                        Ok(usize::from(facts.source_path.is_some()))
+                        // Any field touches the whole parsed value; what the
+                        // probe measures is the deserialisation, not which key
+                        // it reads. `source_path` is no longer readable from
+                        // outside the crate now that a record's location is
+                        // read through `Asset::location`.
+                        Ok(usize::from(facts.photo.make.is_some()))
                     })
                     .unwrap()
                     .count();
@@ -896,7 +901,7 @@ fn build_mirror(
             ) = row.unwrap();
             let ext = probe::normalize_ext(file_name.rsplit('.').next().unwrap_or(""));
             let probed = probe::probe(&ext);
-            let asset = Asset {
+            let mut asset = Asset {
                 id: Uuid::parse_str(&id).unwrap(),
                 origin: Origin::Linked,
                 rel_path: None,
@@ -921,14 +926,15 @@ fn build_mirror(
                 source_url: None,
                 usage_status: UsageStatus::default(),
                 commercial_use: None,
-                facts: AssetFacts {
-                    source_path: Some(format!("{assets_root}/{rel}")),
-                    ..Default::default()
-                },
+                facts: AssetFacts::default(),
                 created_at: parse_time(&created_at),
                 updated_at: parse_time(&updated_at),
                 trashed_at: None,
             };
+            // Where the file came from, recorded the way the importer records
+            // it -- provenance on the row, not a location the library does not
+            // own (these mirrored rows are stored blobs).
+            asset.set_provenance(format!("{assets_root}/{rel}"));
             assets::insert(conn, &asset).unwrap();
             mirrored += 1;
         }

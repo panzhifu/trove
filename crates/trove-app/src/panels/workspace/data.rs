@@ -577,12 +577,7 @@ fn cell_from_asset(library_root: &Path, cache_root: &Path, a: &Asset, marks: &Le
     // Live font preview inputs: family (probed at import) plus the font
     // file to register (blob or linked source).
     let (font_family, font_blob) = if a.kind == AssetKind::Font {
-        let blob = if a.origin == trove_core::model::Origin::Linked {
-            a.facts.source_path.as_ref().map(PathBuf::from)
-        } else {
-            a.rel_path.as_ref().map(|rel| library_root.join(rel))
-        }
-        .filter(|p| p.is_file());
+        let blob = trove_core::media::thumb::blob_path(library_root, a).filter(|p| p.is_file());
         (a.facts.font.family.clone(), blob)
     } else {
         (None, None)

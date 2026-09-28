@@ -39,13 +39,8 @@ pub(crate) fn asset_context_menu(
                 a.content_hash.clone().map(|hash| {
                     // Same blob resolution the Inspector uses: the stored
                     // blob, or the linked original for linked fonts.
-                    let blob = if a.origin == trove_core::model::Origin::Linked {
-                        a.facts.source_path.as_ref().map(PathBuf::from)
-                    } else {
-                        a.rel_path
-                            .as_ref()
-                            .map(|rel| controller.read(cx).library.root().join(rel))
-                    };
+                    let blob =
+                        trove_core::media::thumb::blob_path(controller.read(cx).library.root(), &a);
                     (hash, blob)
                 })
             } else {
@@ -85,15 +80,11 @@ pub(crate) fn asset_context_menu(
 
     let disk_path = {
         let ctl = controller.read(cx);
-        ctl.library.asset(asset_id).ok().flatten().and_then(|a| {
-            // Linked files keep their original path in `source_path`;
-            // stored ones live under the library's `rel_path`.
-            if a.origin == trove_core::model::Origin::Linked {
-                a.facts.source_path.as_ref().map(PathBuf::from)
-            } else {
-                a.rel_path.as_ref().map(|rel| ctl.library.root().join(rel))
-            }
-        })
+        ctl.library
+            .asset(asset_id)
+            .ok()
+            .flatten()
+            .and_then(|a| trove_core::media::thumb::blob_path(ctl.library.root(), &a))
     };
 
     let mut menu = menu

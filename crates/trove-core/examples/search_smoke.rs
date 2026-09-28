@@ -548,7 +548,7 @@ fn insert_rows(lib: &Library, n: usize, offset: usize) {
         // orientation is decided by the same CASE the SQL uses), a rating and a
         // favourite flag. The source path is a full file path (the directories
         // panel groups by its parent), spread over 50 folders.
-        a.facts.source_path = Some(format!(
+        a.set_provenance(format!(
             "/photos/2026/09/roll-{:02}/IMG_{idx:06}.jpg",
             idx % 50
         ));
