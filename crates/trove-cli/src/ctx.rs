@@ -316,7 +316,7 @@ pub fn asset_summary(env: &Env, asset: &Asset) -> Value {
         "rating": asset.rating,
         "is_favorite": asset.is_favorite,
         "usage_status": asset.usage_status,
-        "trashed": asset.trashed_at.is_some(),
+        "trashed": asset.placement().is_trashed(),
         // The v2 word for the storage shape, derived from the one value that
         // carries it now. `is_linked` is also true for a linked record that
         // lost its path, which is exactly what the old column said about it.

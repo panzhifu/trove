@@ -354,7 +354,11 @@ impl WorkspacePanel {
         let ctl = self.controller.read(cx);
         let ctx = BrowseContext {
             collection: key.collection,
-            in_trash: key.in_trash,
+            pool: if key.in_trash {
+                trove_core::model::TrashPool::Trashed
+            } else {
+                trove_core::model::TrashPool::Live
+            },
             in_recent: key.in_recent,
             smart: key.smart,
             tag: key.tag,
@@ -561,7 +565,7 @@ fn cells_for(key: &DataKey, list: &[Asset]) -> Vec<Cell> {
     // disagree about what the user asked for.
     let marks = Lexicon::from_query(&key.search);
     list.iter()
-        .filter(|a| key.in_trash || a.trashed_at.is_none())
+        .filter(|a| key.in_trash || !a.placement().is_trashed())
         .map(|a| cell_from_asset(&key.library_root, &key.cache_root, a, &marks))
         .collect()
 }
@@ -590,7 +594,7 @@ fn cell_from_asset(library_root: &Path, cache_root: &Path, a: &Asset, marks: &Le
         thumb,
         width: a.width,
         height: a.height,
-        trashed: a.trashed_at.is_some(),
+        trashed: a.placement().is_trashed(),
         name,
         name_marks,
         score: None,

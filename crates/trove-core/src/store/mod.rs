@@ -25,6 +25,22 @@ use std::rc::Rc;
 
 use crate::error::Result;
 
+/// The predicate that separates the live library from its trash.
+///
+/// One spelling, because the partial indexes over `assets` are *defined* with
+/// this exact text (`schema.rs`) and SQLite only uses one for a query whose
+/// `WHERE` it can prove implies the index predicate. A reworded equivalent —
+/// `COALESCE(trashed_at, '') = ''`, a lowercase `is null` — is the same
+/// question and silently stops the index applying, which is the kind of change
+/// that shows up as a slow library rather than a failing test. The test
+/// [`crate::store::tests::the_live_predicate_matches_the_index_it_needs`] pins
+/// the two against each other.
+pub(crate) const LIVE_ROWS: &str = "trashed_at IS NULL";
+
+/// The other side: the rows in the trash. No index is defined over it, so it is
+/// a constant for the same reason only — one way to ask.
+pub(crate) const TRASHED_ROWS: &str = "trashed_at IS NOT NULL";
+
 /// A local (single-file) Trove library database.
 ///
 /// Cheap to clone. The store is synchronous and thread-confined, simple to
@@ -281,10 +297,10 @@ fn already_applied(statement: &str, message: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{Store, schema};
+    use super::{LIVE_ROWS, Store, schema};
     use crate::model::{
         Asset, AssetKind, AssetLocation, AssetPatch, AssetQuery, AssetSeed, NewCollection, NewTag,
-        Page, UsageStatus, now,
+        Page, Placement, TrashPool, UsageStatus, now,
     };
     use crate::store::{assets, collections, sequences, smart_collections, tags, task_journal};
     use uuid::Uuid;
@@ -316,7 +332,7 @@ mod tests {
             facts: Default::default(),
             created_at: now(),
             updated_at: now(),
-            trashed_at: None,
+            placement: Placement::Live,
         })
     }
 
@@ -330,7 +346,7 @@ mod tests {
             store.conn(),
             &AssetQuery {
                 kind: Some(AssetKind::Font),
-                ..Default::default()
+                ..AssetQuery::live()
             },
         )
         .unwrap();
@@ -351,7 +367,7 @@ mod tests {
             store.conn(),
             &AssetQuery {
                 kind: Some(AssetKind::Font),
-                ..Default::default()
+                ..AssetQuery::live()
             },
         )
         .unwrap();
@@ -368,7 +384,7 @@ mod tests {
             store.conn(),
             &AssetQuery {
                 kind: Some(AssetKind::Model),
-                ..Default::default()
+                ..AssetQuery::live()
             },
         )
         .unwrap();
@@ -410,7 +426,7 @@ mod tests {
         // A trashed row must not contribute its extension.
         let mut gone = sample_asset("f.tiff", AssetKind::Image);
         gone.ext = "tiff".into();
-        gone.trashed_at = Some(now());
+        gone.set_placement(Placement::Trashed(now()));
         assets::insert(store.conn(), &gone).unwrap();
 
         assert_eq!(
@@ -1041,7 +1057,7 @@ mod tests {
 
         let q = AssetQuery {
             collection_id: Some(collection.id),
-            ..Default::default()
+            ..AssetQuery::live()
         };
         let (sql, args) = assets::count_statement(store.conn(), &q).unwrap();
         let plan = {
@@ -1080,7 +1096,7 @@ mod tests {
         let rated = AssetQuery {
             collection_id: Some(collection.id),
             min_rating: Some(3),
-            ..Default::default()
+            ..AssetQuery::live()
         };
         assert_eq!(assets::count(store.conn(), &rated).unwrap(), 1);
     }
@@ -1118,37 +1134,103 @@ mod tests {
 
         for (sql, name) in [
             (
-                "SELECT id FROM assets WHERE trashed_at IS NULL \
-                 ORDER BY created_at DESC, id ASC LIMIT 200 OFFSET 1000",
+                format!(
+                    "SELECT id FROM assets WHERE {LIVE_ROWS} \
+                     ORDER BY created_at DESC, id ASC LIMIT 200 OFFSET 1000"
+                ),
                 "idx_assets_live_created",
             ),
             (
-                "SELECT id FROM assets WHERE trashed_at IS NULL \
-                 ORDER BY file_name COLLATE NOCASE DESC, id ASC LIMIT 200 OFFSET 1000",
+                format!(
+                    "SELECT id FROM assets WHERE {LIVE_ROWS} \
+                     ORDER BY file_name COLLATE NOCASE DESC, id ASC LIMIT 200 OFFSET 1000"
+                ),
                 "idx_assets_live_name",
             ),
             (
-                "SELECT id FROM assets WHERE trashed_at IS NULL \
-                 ORDER BY size_bytes DESC, id ASC LIMIT 200 OFFSET 1000",
+                format!(
+                    "SELECT id FROM assets WHERE {LIVE_ROWS} \
+                     ORDER BY size_bytes DESC, id ASC LIMIT 200 OFFSET 1000"
+                ),
                 "idx_assets_live_size",
             ),
             (
-                "SELECT id FROM assets WHERE trashed_at IS NULL \
-                 ORDER BY rating DESC, id ASC LIMIT 200 OFFSET 1000",
+                format!(
+                    "SELECT id FROM assets WHERE {LIVE_ROWS} \
+                     ORDER BY rating DESC, id ASC LIMIT 200 OFFSET 1000"
+                ),
                 "idx_assets_live_rating",
             ),
             (
-                "SELECT id FROM assets WHERE kind = 'image' AND trashed_at IS NULL \
-                 ORDER BY created_at DESC, id ASC LIMIT 200 OFFSET 1000",
+                format!(
+                    "SELECT id FROM assets WHERE kind = 'image' AND {LIVE_ROWS} \
+                     ORDER BY created_at DESC, id ASC LIMIT 200 OFFSET 1000"
+                ),
                 "idx_assets_live_kind_created",
             ),
         ] {
-            let plan = plan_of(sql);
+            let plan = plan_of(&sql);
             assert!(
                 plan.contains(name) && !plan.contains("TEMP B-TREE"),
                 "{name} should serve this listing, got {plan}"
             );
         }
+    }
+
+    /// The other half of the promise [`LIVE_ROWS`] makes: the constant and the
+    /// partial indexes it exists to match are checked against each other, in
+    /// the schema SQLite actually loaded.
+    ///
+    /// Two failure modes this covers that a plan assertion alone does not. A
+    /// reworded constant keeps answering the same question and stops matching
+    /// any index text, so the query side silently loses every partial index; a
+    /// dropped or renamed index changes the count the library's listings were
+    /// priced with. Both read as "the library got slow", never as an error.
+    #[test]
+    fn the_live_predicate_matches_the_index_it_needs() {
+        let store = Store::in_memory().unwrap();
+        let mut stmt = store
+            .conn()
+            .prepare(
+                "SELECT name, sql FROM sqlite_master \
+                 WHERE type = 'index' AND sql LIKE '%WHERE%'",
+            )
+            .unwrap();
+        let partial: Vec<(String, String)> = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+        drop(stmt);
+
+        // Every partial index is defined with the constant's own text — the
+        // exact spelling, not an equivalent.
+        for (name, sql) in &partial {
+            assert!(
+                sql.contains(LIVE_ROWS),
+                "{name} is defined as {sql:?}, which does not carry the live-row \
+                 predicate the query side emits"
+            );
+        }
+
+        // The set the listings depend on, by name. A missing one is the same
+        // silent slowdown, so the count is part of the assertion.
+        let mut names: Vec<&str> = partial.iter().map(|(name, _)| name.as_str()).collect();
+        names.sort_unstable();
+        assert_eq!(
+            names,
+            [
+                "idx_assets_live_created",
+                "idx_assets_live_kind_created",
+                "idx_assets_live_name",
+                "idx_assets_live_rating",
+                "idx_assets_live_size",
+                "idx_assets_source_path",
+            ],
+            "these six partial indexes are what the live listings are priced against"
+        );
     }
 
     /// A folder's look is stored with the folder and read back with it, for
@@ -1335,8 +1417,7 @@ mod tests {
             store.conn(),
             &AssetQuery {
                 is_favorite: Some(true),
-                is_trashed: false,
-                ..Default::default()
+                ..AssetQuery::live()
             },
         )
         .unwrap();
@@ -1372,8 +1453,7 @@ mod tests {
             store.conn(),
             &AssetQuery {
                 collection_id: Some(c1.id),
-                is_trashed: false,
-                ..Default::default()
+                ..AssetQuery::live()
             },
         )
         .unwrap();
@@ -1382,25 +1462,23 @@ mod tests {
 
         // Trash hides from normal queries, restores bring it back.
         assert!(assets::set_trashed(store.conn(), doc.id, true).unwrap());
-        let live = assets::query(store.conn(), &AssetQuery::default()).unwrap();
+        let live = assets::query(store.conn(), &AssetQuery::live()).unwrap();
         assert_eq!(live.items.len(), 1);
         let trash = assets::query(
             store.conn(),
             &AssetQuery {
-                is_trashed: true,
-                ..Default::default()
+                ..AssetQuery::trashed()
             },
         )
         .unwrap();
         assert_eq!(trash.items.len(), 1);
 
-        let live = assets::query(store.conn(), &AssetQuery::default()).unwrap();
+        let live = assets::query(store.conn(), &AssetQuery::live()).unwrap();
         assert_eq!(live.items.len(), 1);
         let trash = assets::query(
             store.conn(),
             &AssetQuery {
-                is_trashed: true,
-                ..Default::default()
+                ..AssetQuery::trashed()
             },
         )
         .unwrap();
@@ -1454,8 +1532,12 @@ mod tests {
             let page = assets::query(
                 store.conn(),
                 &AssetQuery {
-                    is_trashed: trashed,
-                    ..Default::default()
+                    pool: if trashed {
+                        TrashPool::Trashed
+                    } else {
+                        TrashPool::Live
+                    },
+                    ..AssetQuery::live()
                 },
             )
             .unwrap();
@@ -1558,7 +1640,7 @@ mod tests {
         let q = AssetQuery {
             kind: Some(AssetKind::Image),
             is_favorite: Some(true),
-            ..Default::default()
+            ..AssetQuery::live()
         };
         let (ranked, args) =
             assets::build_where(store.conn(), &q, assets::WhereMode::Rejecting).unwrap();
@@ -1685,7 +1767,7 @@ mod tests {
             orientation: Some(crate::model::Orientation::Landscape),
             min_rating: Some(3),
             ext: Some("png".into()),
-            ..Default::default()
+            ..AssetQuery::live()
         };
         let (clause, mixed_args) =
             assets::build_where(store.conn(), &mixed, assets::WhereMode::Rejecting).unwrap();
@@ -1730,7 +1812,7 @@ mod tests {
         }
         let q = AssetQuery {
             kind: Some(AssetKind::Image),
-            ..Default::default()
+            ..AssetQuery::live()
         };
 
         // A pool twice the size of the library, alternating a live id with one
@@ -1754,7 +1836,7 @@ mod tests {
         let favorites = AssetQuery {
             kind: Some(AssetKind::Image),
             is_favorite: Some(true),
-            ..Default::default()
+            ..AssetQuery::live()
         };
         assert_eq!(
             assets::rank_intersect(conn, &ranked, &favorites).unwrap().0,
@@ -1814,7 +1896,7 @@ mod tests {
         // Tag alone.
         let q = AssetQuery {
             tag_ids: vec![day.id],
-            ..Default::default()
+            ..AssetQuery::live()
         };
         assert_eq!(tagged(&q), vec![photo.id]);
 
@@ -1823,25 +1905,25 @@ mod tests {
         let q = AssetQuery {
             kind: Some(AssetKind::Image),
             tag_ids: vec![day.id],
-            ..Default::default()
+            ..AssetQuery::live()
         };
         assert_eq!(tagged(&q), vec![photo.id]);
         let q = AssetQuery {
             kind: Some(AssetKind::Document),
             tag_ids: vec![day.id],
-            ..Default::default()
+            ..AssetQuery::live()
         };
         assert!(tagged(&q).is_empty(), "day is only on the image");
 
         // Two tags are AND-ed and each keeps its own placeholders.
         let q = AssetQuery {
             tag_ids: vec![day.id, night.id],
-            ..Default::default()
+            ..AssetQuery::live()
         };
         assert_eq!(tagged(&q), vec![photo.id]);
         let q = AssetQuery {
             tag_ids: vec![night.id],
-            ..Default::default()
+            ..AssetQuery::live()
         };
         assert_eq!(tagged(&q), sorted(vec![photo.id, doc.id]));
 
@@ -1849,7 +1931,7 @@ mod tests {
         // rather than build invalid SQL.
         let q = AssetQuery {
             tag_ids: vec![Uuid::new_v4()],
-            ..Default::default()
+            ..AssetQuery::live()
         };
         assert!(tagged(&q).is_empty());
     }
@@ -2594,9 +2676,7 @@ mod tests {
 
         let n = crate::services::maintenance::rebuild_search_index(&lib).unwrap();
         assert_eq!(n, 2);
-        let page = lib
-            .search_assets("treasure", &AssetQuery::default())
-            .unwrap();
+        let page = lib.search_assets("treasure", &AssetQuery::live()).unwrap();
         assert_eq!(page.total, 1);
     }
 
@@ -2701,14 +2781,14 @@ mod tests {
         };
         // Default: newest first (insert order C, B, A).
         assert_eq!(
-            names(AssetQuery::default()),
+            names(AssetQuery::live()),
             vec!["mmm.png", "zzz.png", "aaa.png"]
         );
         assert_eq!(
             names(AssetQuery {
                 sort: AssetSort::Name,
                 sort_desc: false,
-                ..Default::default()
+                ..AssetQuery::live()
             }),
             vec!["aaa.png", "mmm.png", "zzz.png"]
         );
@@ -2716,7 +2796,7 @@ mod tests {
             names(AssetQuery {
                 sort: AssetSort::SizeBytes,
                 sort_desc: true,
-                ..Default::default()
+                ..AssetQuery::live()
             }),
             vec!["aaa.png", "mmm.png", "zzz.png"]
         );
@@ -2725,7 +2805,7 @@ mod tests {
             names(AssetQuery {
                 sort: AssetSort::Rating,
                 sort_desc: true,
-                ..Default::default()
+                ..AssetQuery::live()
             }),
             vec!["zzz.png", "aaa.png", "mmm.png"]
         );

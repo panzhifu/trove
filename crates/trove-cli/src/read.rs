@@ -250,12 +250,17 @@ fn build_query(env: &Env, filter: &FilterArgs) -> Result<AssetQuery, CliError> {
         resolution: filter.resolution.map(Into::into),
         source_path_prefix: filter.folder.clone(),
         usage_status: filter.usage.map(Into::into),
-        is_trashed: filter.trashed,
         sort: filter.sort.into(),
         sort_desc: !filter.asc,
         limit: Some(filter.limit),
         offset: filter.offset,
-        ..AssetQuery::default()
+        // The pool is the one thing a listing cannot leave to a default, so the
+        // base is chosen rather than filled in.
+        ..(if filter.trashed {
+            AssetQuery::trashed()
+        } else {
+            AssetQuery::live()
+        })
     };
 
     if !filter.tag.is_empty() {

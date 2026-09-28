@@ -35,7 +35,9 @@ use crate::ai::analysis::{
     self, AiAnalysisFields, AiAnalysisRequest, AiAnalysisResult, AiAnalysisSettings, MediaType,
 };
 use crate::ai::vendor::{VendorAdapter, VendorError};
-use crate::model::{Asset, AssetFacts, AssetKind, AssetPatch, AssetQuery, AssetSort, NewTag};
+use crate::model::{
+    Asset, AssetFacts, AssetKind, AssetPatch, AssetQuery, AssetSort, NewTag, TrashPool,
+};
 use crate::store::{assets, tags};
 use crate::tasks::JobContext;
 
@@ -700,12 +702,12 @@ fn candidates(conn: &Connection, options: &AiAnalysisOptions) -> crate::Result<V
         let page = assets::query(
             conn,
             &AssetQuery {
-                is_trashed: false,
+                pool: TrashPool::Live,
                 sort: AssetSort::CreatedAt,
                 sort_desc: true,
                 limit: Some(PAGE),
                 offset,
-                ..AssetQuery::default()
+                ..AssetQuery::live()
             },
         )?;
         if page.items.is_empty() {
@@ -734,12 +736,12 @@ fn marked_assets(conn: &Connection) -> crate::Result<Vec<Asset>> {
         let page = assets::query(
             conn,
             &AssetQuery {
-                is_trashed: false,
+                pool: TrashPool::Live,
                 sort: AssetSort::CreatedAt,
                 sort_desc: true,
                 limit: Some(PAGE),
                 offset,
-                ..AssetQuery::default()
+                ..AssetQuery::live()
             },
         )?;
         if page.items.is_empty() {
@@ -998,7 +1000,7 @@ mod tests {
     }
 
     fn live_assets(conn: &Connection) -> Vec<Asset> {
-        assets::query(conn, &AssetQuery::default()).unwrap().items
+        assets::query(conn, &AssetQuery::live()).unwrap().items
     }
 
     fn tag_names(conn: &Connection, id: Uuid) -> Vec<String> {

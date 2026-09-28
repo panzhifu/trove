@@ -825,7 +825,7 @@ mod tests {
         assert!(!sidecar.exists(), "the sidecar is consumed");
 
         let store = crate::store::Store::open(&options.db_path()).unwrap();
-        let all = assets::query(store.conn(), &crate::model::AssetQuery::default()).unwrap();
+        let all = assets::query(store.conn(), &crate::model::AssetQuery::live()).unwrap();
         let asset = &all.items[0];
         assert_eq!(
             asset.facts.source_path.as_deref(),
@@ -908,7 +908,7 @@ mod tests {
         assert!(second.report.skipped.is_empty());
 
         let store = crate::store::Store::open(&options.db_path()).unwrap();
-        let all = assets::query(store.conn(), &crate::model::AssetQuery::default()).unwrap();
+        let all = assets::query(store.conn(), &crate::model::AssetQuery::live()).unwrap();
         assert_eq!(all.items.len(), 1, "no duplicate row appeared");
     }
 

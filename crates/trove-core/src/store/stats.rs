@@ -2,6 +2,7 @@
 //! in one pass over cheap `COUNT` queries.
 
 use super::rows;
+use super::{LIVE_ROWS, TRASHED_ROWS};
 use crate::error::Result;
 use crate::model::AssetKind;
 
@@ -34,7 +35,7 @@ pub fn library_stats(conn: &rusqlite::Connection) -> Result<LibraryStats> {
     {
         let mut stmt = conn.prepare(&format!(
             "SELECT kind, COUNT(*) FROM assets \
-                 WHERE trashed_at IS NULL AND {hidden} GROUP BY kind"
+                 WHERE {LIVE_ROWS} AND {hidden} GROUP BY kind"
         ))?;
         let mut it = stmt.query([])?;
         while let Some(row) = it.next()? {
@@ -64,19 +65,19 @@ pub fn library_stats(conn: &rusqlite::Connection) -> Result<LibraryStats> {
         conn,
         &format!(
             "SELECT COALESCE(SUM(size_bytes), 0) FROM assets \
-             WHERE trashed_at IS NULL AND {hidden}"
+             WHERE {LIVE_ROWS} AND {hidden}"
         ),
         vec![],
     )? as u64;
 
     stats.live = rows::query_count(
         conn,
-        &format!("SELECT COUNT(*) FROM assets WHERE trashed_at IS NULL AND {hidden}"),
+        &format!("SELECT COUNT(*) FROM assets WHERE {LIVE_ROWS} AND {hidden}"),
         vec![],
     )? as u64;
     stats.trashed = rows::query_count(
         conn,
-        "SELECT COUNT(*) FROM assets WHERE trashed_at IS NOT NULL",
+        &format!("SELECT COUNT(*) FROM assets WHERE {TRASHED_ROWS}"),
         vec![],
     )? as u64;
     stats.tags = rows::query_count(conn, "SELECT COUNT(*) FROM tags", vec![])? as u64;

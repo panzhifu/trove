@@ -6,9 +6,9 @@ use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
 use crate::error::Result;
-use crate::history::undo::{self, Op, OpAction, OpDesc, SharedUndoStack};
+use crate::history::undo::{self, Flip, Op, OpAction, OpDesc, SharedUndoStack};
 use crate::media;
-use crate::model::AssetLocation;
+use crate::model::{AssetLocation, AssetQuery, Placement};
 use crate::services::collect;
 use crate::store::{Store, assets, batch, collections, rows, smart, smart_collections, tags};
 
@@ -17,7 +17,7 @@ use crate::store::{Store, assets, batch, collections, rows, smart, smart_collect
 /// the export is a portable catalog, not a backup of the files.
 pub fn export_metadata_from_store(store: &Store) -> Result<String> {
     let conn = store.conn();
-    let assets = assets::query(conn, &crate::model::AssetQuery::default())?.items;
+    let assets = assets::query(conn, &crate::model::AssetQuery::live())?.items;
     let collections = collections::list(conn)?;
     let tags = tags::list(conn)?;
     let smart_collections = smart_collections::list(conn)?;
@@ -1170,13 +1170,7 @@ impl Library {
     /// from the trash is treated exactly like one deleted outright — this used
     /// to be a second copy of the purge rules that could drift from the first.
     pub(crate) fn empty_trash_against(&self, inbox: &Path) -> Result<u64> {
-        let page = assets::query(
-            self.store.conn(),
-            &crate::model::AssetQuery {
-                is_trashed: true,
-                ..Default::default()
-            },
-        )?;
+        let page = assets::query(self.store.conn(), &AssetQuery::trashed())?;
         let ids: Vec<Uuid> = page.items.iter().map(|asset| asset.id).collect();
         Ok(self.purge_assets_against(&ids, inbox)?.purged)
     }
@@ -1200,8 +1194,7 @@ impl Library {
             ));
         }
         let conn = self.store.conn();
-        let mut before: Vec<(Uuid, Option<String>)> = Vec::with_capacity(ids.len());
-        let mut after: Vec<(Uuid, Option<String>)> = Vec::with_capacity(ids.len());
+        let mut flips: Vec<Flip<Option<String>>> = Vec::with_capacity(ids.len());
         let mut n = start_number;
         for id in ids {
             let Some(asset) = assets::get(conn, *id)? else {
@@ -1211,26 +1204,29 @@ impl Library {
             let title = pattern
                 .replace("{n}", &n.to_string())
                 .replace("{name}", &stem);
-            before.push((*id, asset.title.clone()));
-            after.push((*id, Some(title)));
+            flips.push(Flip {
+                id: *id,
+                before: asset.title,
+                after: Some(title),
+            });
             n += 1;
         }
-        let count = after.len() as u64;
+        let count = flips.len() as u64;
         if count == 0 {
             return Ok(0);
         }
-        let desc = OpDesc::counted(OpAction::Rename, after.len());
-        for (id, title) in &after {
+        let desc = OpDesc::counted(OpAction::Rename, flips.len());
+        for flip in &flips {
             assets::update(
                 conn,
-                *id,
+                flip.id,
                 &crate::model::AssetPatch {
-                    title: Some(title.clone()),
+                    title: Some(flip.after.clone()),
                     ..Default::default()
                 },
             )?;
         }
-        self.undo.record(Op::SetTitles { before, after }, desc);
+        self.undo.record(Op::SetTitles { flips }, desc);
         Ok(count)
     }
 
@@ -1247,7 +1243,7 @@ impl Library {
         std::fs::write(pkg.join("trove-export.json"), json)?;
 
         let conn = self.store.conn();
-        let live = assets::query(conn, &crate::model::AssetQuery::default())?;
+        let live = assets::query(conn, &crate::model::AssetQuery::live())?;
         let mut files = 0u64;
         let mut bytes = 0u64;
         for asset in &live.items {
@@ -1318,24 +1314,21 @@ impl Library {
     /// Favorite / unfavorite many assets (single atomic statement).
     pub fn set_assets_favorite(&self, ids: &[Uuid], favorite: bool) -> Result<u64> {
         let conn = self.store.conn();
-        let before = ids
-            .iter()
-            .map(|id| {
-                Ok((
-                    *id,
-                    assets::get(conn, *id)?
-                        .map(|a| a.is_favorite)
-                        .unwrap_or(false),
-                ))
-            })
-            .collect::<Result<Vec<_>>>()?;
+        let mut flips = Vec::with_capacity(ids.len());
+        for id in ids {
+            let was = assets::get(conn, *id)?
+                .map(|a| a.is_favorite)
+                .unwrap_or(false);
+            flips.push(Flip {
+                id: *id,
+                before: was,
+                after: favorite,
+            });
+        }
         let changed = batch::set_favorite_many(conn, ids, favorite)?;
         if changed > 0 {
             self.undo.record(
-                Op::SetFavorite {
-                    before,
-                    after: ids.iter().map(|id| (*id, favorite)).collect(),
-                },
+                Op::SetFavorite { flips },
                 OpDesc::counted(
                     if favorite {
                         OpAction::Favorite
@@ -1511,7 +1504,7 @@ impl Library {
         let Some(asset) = assets::get(conn, id)? else {
             return Ok(false);
         };
-        if asset.trashed_at.is_some() || asset.kind != crate::model::AssetKind::Image {
+        if asset.placement().is_trashed() || asset.kind != crate::model::AssetKind::Image {
             return Ok(false);
         }
         let location = asset.location();
@@ -1678,7 +1671,7 @@ impl Library {
                 report.skipped += 1;
                 continue;
             };
-            if asset.trashed_at.is_some() {
+            if asset.placement().is_trashed() {
                 report.skipped += 1;
                 continue;
             }
@@ -2051,24 +2044,21 @@ impl Library {
 
     fn set_assets_trashed(&self, ids: &[Uuid], trashed: bool) -> Result<u64> {
         let conn = self.store.conn();
-        let before = ids
-            .iter()
-            .map(|id| {
-                Ok((
-                    *id,
-                    assets::get(conn, *id)?
-                        .map(|a| a.trashed_at.is_some())
-                        .unwrap_or(false),
-                ))
-            })
-            .collect::<Result<Vec<_>>>()?;
+        let mut flips = Vec::with_capacity(ids.len());
+        for id in ids {
+            let was = assets::get(conn, *id)?
+                .map(|a| a.placement().is_trashed())
+                .unwrap_or(false);
+            flips.push(Flip {
+                id: *id,
+                before: was,
+                after: trashed,
+            });
+        }
         let changed = batch::set_trashed_many(conn, ids, trashed)?;
         if changed > 0 {
             self.undo.record(
-                Op::SetTrashed {
-                    before,
-                    after: ids.iter().map(|id| (*id, trashed)).collect(),
-                },
+                Op::SetTrashed { flips },
                 OpDesc::counted(
                     if trashed {
                         OpAction::Trash
@@ -2232,7 +2222,7 @@ impl Library {
                 facts: asset.facts.clone(),
                 created_at: asset.created_at,
                 updated_at: asset.updated_at,
-                trashed_at: None,
+                placement: Placement::Live,
             });
             assets::insert(conn, &placeholder)?;
             asset_map.insert(asset.id, id);
@@ -2453,7 +2443,7 @@ mod tests {
         let report = commit_staged_all(lib.store().conn(), None, staged);
         assert_eq!(report.imported_count(), 1);
         let conn = lib.store().conn();
-        let all = assets::query(conn, &AssetQuery::default()).unwrap();
+        let all = assets::query(conn, &AssetQuery::live()).unwrap();
         let id = all.items[0].id;
         assert!(all.items[0].location().is_linked());
 
@@ -2480,7 +2470,7 @@ mod tests {
         let stored = write_source(&root, "stored.txt", b"stored content");
         lib.import_into_store(std::slice::from_ref(&stored), None)
             .unwrap();
-        let all2 = assets::query(conn, &AssetQuery::default()).unwrap();
+        let all2 = assets::query(conn, &AssetQuery::live()).unwrap();
         let stored_id = all2
             .items
             .iter()
@@ -2512,7 +2502,7 @@ mod tests {
         assert_eq!(roots.len(), 0);
 
         // Total asset count is 1.
-        let page = assets::query(lib.store().conn(), &crate::model::AssetQuery::default()).unwrap();
+        let page = assets::query(lib.store().conn(), &crate::model::AssetQuery::live()).unwrap();
         assert_eq!(page.total, 1);
 
         // Re-importing identical content dedupes.
@@ -2534,7 +2524,7 @@ mod tests {
         assert!(!item.reused);
         assert_eq!(item.kind, AssetKind::Image);
 
-        let page = assets::query(lib.store().conn(), &AssetQuery::default()).unwrap();
+        let page = assets::query(lib.store().conn(), &AssetQuery::live()).unwrap();
         assert_eq!(page.total, 1);
         let asset = &page.items[0];
         assert_eq!(asset.mime, "image/png");
@@ -2569,7 +2559,7 @@ mod tests {
         assert!(second.imported[0].reused);
         assert_eq!(first.imported[0].asset_id, second.imported[0].asset_id);
 
-        let page = assets::query(lib.store().conn(), &AssetQuery::default()).unwrap();
+        let page = assets::query(lib.store().conn(), &AssetQuery::live()).unwrap();
         assert_eq!(page.total, 1);
     }
 
@@ -2807,8 +2797,7 @@ mod tests {
         let trash = assets::query(
             lib.store().conn(),
             &AssetQuery {
-                is_trashed: true,
-                ..Default::default()
+                ..AssetQuery::trashed()
             },
         )
         .unwrap();
@@ -2843,8 +2832,7 @@ mod tests {
             lib.store().conn(),
             &AssetQuery {
                 tag_ids: vec![blue.id],
-                is_trashed: false,
-                ..Default::default()
+                ..AssetQuery::live()
             },
         )
         .unwrap();
@@ -2869,13 +2857,12 @@ mod tests {
         assert!(!second.imported[0].reused);
         assert_ne!(second.imported[0].asset_id, id);
 
-        let page = assets::query(lib.store().conn(), &AssetQuery::default()).unwrap();
+        let page = assets::query(lib.store().conn(), &AssetQuery::live()).unwrap();
         assert_eq!(page.total, 1);
         let trashed = assets::query(
             lib.store().conn(),
             &AssetQuery {
-                is_trashed: true,
-                ..Default::default()
+                ..AssetQuery::trashed()
             },
         )
         .unwrap();
@@ -2891,7 +2878,7 @@ mod tests {
         let mp4 = write_source(&root, "reel.mp4", b"not really a video");
         lib.import_into_store(&[png], None).unwrap();
         lib.import_into_store(&[mp4], None).unwrap();
-        for asset in assets::query(lib.store().conn(), &AssetQuery::default())
+        for asset in assets::query(lib.store().conn(), &AssetQuery::live())
             .unwrap()
             .items
         {
@@ -2907,13 +2894,9 @@ mod tests {
         }
         lib.rebuild_text_index().unwrap();
 
-        let total = |query: &str| {
-            lib.search_assets(query, &AssetQuery::default())
-                .unwrap()
-                .total
-        };
+        let total = |query: &str| lib.search_assets(query, &AssetQuery::live()).unwrap().total;
         let ids = |query: &str| {
-            let page = lib.search_assets(query, &AssetQuery::default()).unwrap();
+            let page = lib.search_assets(query, &AssetQuery::live()).unwrap();
             let mut names: Vec<String> = page.items.iter().map(|a| a.file_name.clone()).collect();
             names.sort();
             names
@@ -2941,7 +2924,7 @@ mod tests {
         lib.import_into_store(&[two], None).unwrap();
 
         // The photo is retitled so it participates in full-text search.
-        let all = assets::query(lib.store().conn(), &AssetQuery::default()).unwrap();
+        let all = assets::query(lib.store().conn(), &AssetQuery::live()).unwrap();
         let photo_id = all
             .items
             .iter()
@@ -2960,7 +2943,7 @@ mod tests {
         .unwrap();
 
         // search_assets hits only the retitled photo.
-        let hits = lib.search_assets("sunset", &AssetQuery::default()).unwrap();
+        let hits = lib.search_assets("sunset", &AssetQuery::live()).unwrap();
         assert_eq!(hits.total, 1);
         assert_eq!(hits.items[0].id, photo_id);
 
@@ -3006,7 +2989,7 @@ mod tests {
         lib.import_into_store(&[src], None).unwrap();
 
         let conn = lib.store().conn();
-        let all = assets::query(conn, &AssetQuery::default()).unwrap();
+        let all = assets::query(conn, &AssetQuery::live()).unwrap();
         let photo_id = all.items[0].id;
         assets::update(
             conn,
@@ -3036,14 +3019,14 @@ mod tests {
         let _conn = reopened.store().conn();
 
         let hits = reopened
-            .search_assets("sunset", &AssetQuery::default())
+            .search_assets("sunset", &AssetQuery::live())
             .unwrap();
         assert_eq!(hits.total, 1);
         assert_eq!(hits.items[0].id, photo_id);
 
         // The rebuilt index carries tag names too.
         let page = reopened
-            .search_assets("landscape", &AssetQuery::default())
+            .search_assets("landscape", &AssetQuery::live())
             .unwrap();
         assert_eq!(page.total, 1);
     }
@@ -3119,7 +3102,7 @@ mod tests {
             conn,
             &AssetQuery {
                 usage_status: Some(UsageStatus::Used),
-                ..Default::default()
+                ..AssetQuery::live()
             },
         )
         .unwrap();
@@ -3128,7 +3111,7 @@ mod tests {
             conn,
             &AssetQuery {
                 commercial_use: Some(false),
-                ..Default::default()
+                ..AssetQuery::live()
             },
         )
         .unwrap();
@@ -3138,7 +3121,7 @@ mod tests {
             conn,
             &AssetQuery {
                 commercial_use: Some(true),
-                ..Default::default()
+                ..AssetQuery::live()
             },
         )
         .unwrap();
@@ -3161,7 +3144,7 @@ mod tests {
             .unwrap();
         lib.import_into_store(std::slice::from_ref(&src), None)
             .unwrap();
-        let page = assets::query(lib.store().conn(), &AssetQuery::default()).unwrap();
+        let page = assets::query(lib.store().conn(), &AssetQuery::live()).unwrap();
         assert_eq!(page.total, 1);
         assert!(lib.find_duplicates().unwrap().is_empty());
     }
@@ -3281,7 +3264,7 @@ mod tests {
         assert_eq!(report.collections, 1);
         assert_eq!(report.tags, 1);
         let conn = other.store().conn();
-        let restored = assets::query(conn, &AssetQuery::default()).unwrap();
+        let restored = assets::query(conn, &AssetQuery::live()).unwrap();
         let restored_ids: Vec<Uuid> = restored.items.iter().map(|x| x.id).collect();
         assert_eq!(restored.items.len(), 2);
         // Membership survived the id remap.
@@ -3309,7 +3292,7 @@ mod tests {
         let report = lib.import_metadata(&json).unwrap();
         assert_eq!(report.assets_linked, 2);
         assert_eq!(report.assets_placeholder, 0);
-        let page = assets::query(lib.store().conn(), &AssetQuery::default()).unwrap();
+        let page = assets::query(lib.store().conn(), &AssetQuery::live()).unwrap();
         assert_eq!(page.total, 2);
     }
 
@@ -3404,7 +3387,7 @@ mod tests {
         let (other, _) = temp_library("heal-target");
         other.import_metadata(&json).unwrap();
         let conn = other.store().conn();
-        let restored = assets::query(conn, &AssetQuery::default()).unwrap();
+        let restored = assets::query(conn, &AssetQuery::live()).unwrap();
         assert_eq!(restored.items.len(), 1);
         assert_eq!(restored.items[0].location(), AssetLocation::Placeholder);
 
@@ -3414,7 +3397,7 @@ mod tests {
             .unwrap();
         let healed = assets::get(conn, restored.items[0].id).unwrap().unwrap();
         assert!(matches!(healed.location(), AssetLocation::Stored { .. }));
-        let page = assets::query(conn, &AssetQuery::default()).unwrap();
+        let page = assets::query(conn, &AssetQuery::live()).unwrap();
         assert_eq!(page.total, 1);
     }
     #[test]
@@ -3476,7 +3459,7 @@ mod tests {
         // Filtering by the parent finds assets tagged with the child.
         let q = AssetQuery {
             tag_ids: vec![animal.id],
-            ..Default::default()
+            ..AssetQuery::live()
         };
         let page = assets::query(conn, &q).unwrap();
         assert_eq!((page.total, page.items.len()), (1, 1));
@@ -3568,7 +3551,7 @@ mod tests {
         // Prefix filter narrows to the subtree of that folder.
         let q = AssetQuery {
             source_path_prefix: Some(sub.to_string_lossy().to_string()),
-            ..Default::default()
+            ..AssetQuery::live()
         };
         let page = assets::query(lib.store().conn(), &q).unwrap();
         assert_eq!((page.total, page.items.len()), (1, 1));
@@ -3620,7 +3603,7 @@ mod tests {
         assert_eq!(imported.metadata.assets_placeholder, 2);
         assert_eq!(imported.imported, 2);
         let conn = other.store().conn();
-        let restored = assets::query(conn, &AssetQuery::default()).unwrap();
+        let restored = assets::query(conn, &AssetQuery::live()).unwrap();
         assert_eq!(restored.items.len(), 2);
         assert!(
             restored
@@ -3878,7 +3861,7 @@ mod tests {
         commit_staged_all(lib.store().conn(), None, staged);
         let conn = lib.store().conn();
         let linked_id = {
-            let page = assets::query(conn, &AssetQuery::default()).unwrap();
+            let page = assets::query(conn, &AssetQuery::live()).unwrap();
             page.items
                 .into_iter()
                 .find(|a| a.location().is_linked())
@@ -4000,7 +3983,7 @@ mod tests {
                     title,
                     &AssetQuery {
                         kind: Some(AssetKind::Image),
-                        ..Default::default()
+                        ..AssetQuery::live()
                     },
                 )
                 .unwrap();
@@ -4014,7 +3997,7 @@ mod tests {
 
         // An empty query is an empty page, not a scan.
         let page = lib
-            .semantic_search(provider.as_ref(), "   ", &AssetQuery::default())
+            .semantic_search(provider.as_ref(), "   ", &AssetQuery::live())
             .unwrap();
         assert!(page.items.is_empty() && page.total == 0);
 
@@ -4025,7 +4008,7 @@ mod tests {
                 "red car in snow",
                 &AssetQuery {
                     kind: Some(AssetKind::Document),
-                    ..Default::default()
+                    ..AssetQuery::live()
                 },
             )
             .unwrap();
@@ -4036,7 +4019,7 @@ mod tests {
         assert_eq!(lib.delete_embeddings("mock-embed").unwrap(), 3);
         assert_eq!(lib.embedding_coverage("mock-embed").unwrap(), (0, 3));
         let page = lib
-            .semantic_search(provider.as_ref(), "red car in snow", &AssetQuery::default())
+            .semantic_search(provider.as_ref(), "red car in snow", &AssetQuery::live())
             .unwrap();
         assert_eq!(page.total, 0);
 

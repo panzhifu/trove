@@ -35,7 +35,7 @@ pub enum AssetSort {
 /// below (`store::assets::rank_intersect`). Keeping a second, `LIKE`-based
 /// text path in SQL is what this type no longer offers — see
 /// `Library::search_assets` and `store::browse::BrowseContext`.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AssetQuery {
     pub kind: Option<AssetKind>,
     pub collection_id: Option<Uuid>,
@@ -77,17 +77,89 @@ pub struct AssetQuery {
     /// `store::assets::build_where`, so a qualified filter means the same thing
     /// in the grid, the trash and a search result.
     pub conditions: Vec<QueryCondition>,
-    pub is_trashed: bool,
+    /// Which side of the trash the query ranges over.
+    ///
+    /// Not an `Option` and not a defaulted flag: the library keeps live and
+    /// deleted rows in one table, so a query has to say which one it means. The
+    /// only ways to build an [`AssetQuery`] are `live()` and `trashed()`, so a
+    /// field-update cannot introduce a pool by omission.
+    pub pool: TrashPool,
     /// Sort key of the listing (default: import time).
     pub sort: AssetSort,
-    /// Sort direction: `true` (default) = descending.
+    /// Sort direction: `true` = descending, `false` = ascending. The default is
+    /// ascending, which is *not* what a user sees: every listing that faces the
+    /// UI names its own direction (`store::browse::BrowseContext`, the CLI's
+    /// `--asc`, the analysis tasks), so this field's default is only what a
+    /// caller that never asked gets.
     pub sort_desc: bool,
     /// `Some(limit)` enables paging; cap applied by the caller.
     pub limit: Option<u32>,
     pub offset: u64,
 }
 
+/// Which side of the trash a listing ranges over. See [`AssetQuery::pool`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum TrashPool {
+    /// The library as the user sees it.
+    ///
+    /// `Default` exists for [`BrowseContext`](crate::store::BrowseContext), whose
+    /// trash view is a toggle the toolbar sets explicitly and whose default state
+    /// is the live library. `AssetQuery` deliberately has no `Default` at all: a
+    /// query is the thing that reaches the database, so it names its pool through
+    /// `live()` / `trashed()` rather than inheriting one.
+    #[default]
+    Live,
+    /// The trash.
+    Trashed,
+}
+
 impl AssetQuery {
+    /// An unfiltered listing of live assets.
+    ///
+    /// Every other live query is built by updating this one
+    /// (`AssetQuery { kind, ..AssetQuery::live() }`), which is how the pool is
+    /// decided once per query rather than defaulted into place field by field.
+    pub fn live() -> Self {
+        Self {
+            pool: TrashPool::Live,
+            ..Self::empty()
+        }
+    }
+
+    /// An unfiltered listing of the trash. See [`AssetQuery::live`] for why a
+    /// query has to name its pool.
+    pub fn trashed() -> Self {
+        Self {
+            pool: TrashPool::Trashed,
+            ..Self::empty()
+        }
+    }
+
+    /// The shared body of the two constructors: everything empty, the default
+    /// sort, no paging.
+    fn empty() -> Self {
+        Self {
+            kind: None,
+            collection_id: None,
+            tag_ids: Vec::new(),
+            is_favorite: None,
+            source_path_prefix: None,
+            usage_status: None,
+            orientation: None,
+            aspect: None,
+            resolution: None,
+            min_rating: None,
+            ext: None,
+            commercial_use: None,
+            conditions: Vec::new(),
+            pool: TrashPool::Live,
+            sort: AssetSort::default(),
+            sort_desc: false,
+            limit: None,
+            offset: 0,
+        }
+    }
+
     /// Whether this query turns a row set into a smaller one.
     ///
     /// Sort, direction and paging are deliberately left out: they reorder and
@@ -110,7 +182,11 @@ impl AssetQuery {
             || self.ext.is_some()
             || self.commercial_use.is_some()
             || !self.conditions.is_empty()
-            || self.is_trashed
+            // The pool is not a narrowing filter -- it selects which rows exist
+            // at all -- but a caller sizing a ranked pool has to treat it as
+            // one: the ranking path gathers candidates from the library, and a
+            // trash listing must not be sized as though it were a subset of them.
+            || self.pool == TrashPool::Trashed
     }
 }
 

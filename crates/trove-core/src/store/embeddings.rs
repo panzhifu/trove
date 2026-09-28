@@ -6,10 +6,11 @@
 //! its vectors with it (CASCADE), and `source_hash` lets a backfill skip
 //! rows whose input has not changed.
 
+use super::LIVE_ROWS;
 use super::assets;
 use super::rows;
 use crate::error::{Error, Result};
-use crate::model::{Asset, EmbeddingSpace, NewEmbedding, normalized};
+use crate::model::{Asset, AssetQuery, EmbeddingSpace, NewEmbedding, normalized};
 use std::collections::HashMap;
 use uuid::Uuid;
 
@@ -108,14 +109,16 @@ pub fn coverage(
 ) -> Result<(u64, u64)> {
     let embedded = rows::query_count(
         conn,
-        "SELECT COUNT(*) FROM asset_embeddings e
+        &format!(
+            "SELECT COUNT(*) FROM asset_embeddings e
          JOIN assets a ON a.id = e.asset_id
-         WHERE e.model = ?1 AND e.space = ?2 AND a.trashed_at IS NULL",
+         WHERE e.model = ?1 AND e.space = ?2 AND a.{LIVE_ROWS}"
+        ),
         vec![text(model), text(space.as_str())],
     )? as u64;
     let total = rows::query_count(
         conn,
-        "SELECT COUNT(*) FROM assets WHERE trashed_at IS NULL",
+        &format!("SELECT COUNT(*) FROM assets WHERE {LIVE_ROWS}"),
         vec![],
     )? as u64;
     Ok((embedded, total))
@@ -143,8 +146,7 @@ pub fn embeddable_assets(
     let live = assets::query(
         conn,
         &crate::model::AssetQuery {
-            is_trashed: false,
-            ..Default::default()
+            ..AssetQuery::live()
         },
     )?;
     Ok(live

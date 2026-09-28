@@ -9,6 +9,7 @@ use chrono::Utc;
 use rusqlite::Connection;
 use uuid::Uuid;
 
+use super::LIVE_ROWS;
 use super::rows;
 use crate::error::Result;
 
@@ -45,11 +46,13 @@ pub fn prune(conn: &Connection, cap: usize) -> Result<()> {
 pub fn recent_ids(conn: &Connection, limit: usize) -> Result<Vec<Uuid>> {
     rows::query_map(
         conn,
-        "SELECT view_history.asset_id FROM view_history \
-         JOIN assets ON assets.id = view_history.asset_id \
-         WHERE assets.trashed_at IS NULL \
-         ORDER BY view_history.viewed_at DESC \
-         LIMIT ?1",
+        &format!(
+            "SELECT view_history.asset_id FROM view_history \
+             JOIN assets ON assets.id = view_history.asset_id \
+             WHERE assets.{LIVE_ROWS} \
+             ORDER BY view_history.viewed_at DESC \
+             LIMIT ?1"
+        ),
         vec![(limit as i64).into()],
         |row| rows::req_uuid(row, 0),
     )
@@ -59,9 +62,11 @@ pub fn recent_ids(conn: &Connection, limit: usize) -> Result<Vec<Uuid>> {
 pub fn live_count(conn: &Connection) -> Result<u64> {
     Ok(rows::query_count(
         conn,
-        "SELECT COUNT(*) FROM view_history \
-         JOIN assets ON assets.id = view_history.asset_id \
-         WHERE assets.trashed_at IS NULL",
+        &format!(
+            "SELECT COUNT(*) FROM view_history \
+             JOIN assets ON assets.id = view_history.asset_id \
+             WHERE assets.{LIVE_ROWS}"
+        ),
         vec![],
     )? as u64)
 }

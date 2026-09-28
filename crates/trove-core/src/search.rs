@@ -1610,7 +1610,7 @@ mod tests {
 
         let q = AssetQuery {
             is_favorite: Some(true),
-            ..Default::default()
+            ..AssetQuery::live()
         };
         let (total, kept) = assets::rank_intersect(conn, &pool, &q).unwrap();
         assert_eq!(kept, vec![last.id]);

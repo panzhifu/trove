@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use crate::error::Result;
 use crate::library::Library;
 use crate::media::thumb;
-use crate::model::{AssetKind, AssetLocation, AssetQuery};
+use crate::model::{AssetKind, AssetLocation, AssetQuery, TrashPool};
 use crate::store::assets;
 use uuid::Uuid;
 
@@ -101,8 +101,7 @@ pub fn plan_remine(lib: &Library, force: bool) -> Result<ReminePlan> {
             conn,
             &AssetQuery {
                 kind: Some(kind),
-                is_trashed: false,
-                ..Default::default()
+                ..AssetQuery::live()
             },
         )?;
         for asset in page.items {
@@ -214,8 +213,7 @@ pub fn plan_thumbnail_rebuild(lib: &Library, force: bool) -> Result<ThumbPlan> {
             conn,
             &AssetQuery {
                 kind: Some(kind),
-                is_trashed: false,
-                ..Default::default()
+                ..AssetQuery::live()
             },
         )?;
         for asset in assets.items {
@@ -322,8 +320,7 @@ pub fn clean_orphans(lib: &Library) -> Result<OrphanReport> {
     let live = assets::query(
         conn,
         &AssetQuery {
-            is_trashed: false,
-            ..Default::default()
+            ..AssetQuery::live()
         },
     )?;
     for asset in live.items {
@@ -447,8 +444,12 @@ pub fn plan_integrity(lib: &Library) -> Result<IntegrityPlan> {
         let list = assets::query(
             conn,
             &AssetQuery {
-                is_trashed: trashed,
-                ..Default::default()
+                pool: if trashed {
+                    TrashPool::Trashed
+                } else {
+                    TrashPool::Live
+                },
+                ..AssetQuery::live()
             },
         )?;
         for asset in list.items {
@@ -623,8 +624,7 @@ mod tests {
         let all = crate::store::assets::query(
             lib.store().conn(),
             &AssetQuery {
-                is_trashed: false,
-                ..Default::default()
+                ..AssetQuery::live()
             },
         )
         .unwrap();
@@ -803,7 +803,7 @@ mod tests {
         std::fs::write(stray_dir.join(format!("{stray}.png")), b"orphan bytes").unwrap();
 
         // Simulate the asset's blob going missing.
-        let all = crate::store::assets::query(lib.store().conn(), &AssetQuery::default()).unwrap();
+        let all = crate::store::assets::query(lib.store().conn(), &AssetQuery::live()).unwrap();
         let AssetLocation::Stored { rel_path } = all.items[0].location() else {
             panic!("an imported asset is stored");
         };
@@ -819,8 +819,7 @@ mod tests {
         let trashed = crate::store::assets::query(
             lib.store().conn(),
             &AssetQuery {
-                is_trashed: true,
-                ..Default::default()
+                ..AssetQuery::trashed()
             },
         )
         .unwrap();
@@ -853,7 +852,7 @@ mod tests {
         import_png(&lib, &root, "ok.png");
 
         // Look the asset up (id + stored blob path).
-        let all = crate::store::assets::query(lib.store().conn(), &AssetQuery::default()).unwrap();
+        let all = crate::store::assets::query(lib.store().conn(), &AssetQuery::live()).unwrap();
         let asset = &all.items[0];
         let AssetLocation::Stored { rel_path } = asset.location() else {
             panic!("an imported asset is stored");
@@ -908,7 +907,7 @@ mod tests {
             conn,
             &AssetQuery {
                 kind: Some(AssetKind::Audio),
-                ..Default::default()
+                ..AssetQuery::live()
             },
         )
         .unwrap()
@@ -980,7 +979,7 @@ mod tests {
             conn,
             &AssetQuery {
                 kind: Some(AssetKind::Audio),
-                ..Default::default()
+                ..AssetQuery::live()
             },
         )
         .unwrap()

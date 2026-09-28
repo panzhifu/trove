@@ -5,6 +5,7 @@
 //!   (using perceptual hash + color histogram from the stored signatures).
 //! - [`search_by_color`] — find assets matching a specific hex color.
 
+use super::LIVE_ROWS;
 use super::assets::{self, COLS};
 use super::rows;
 use crate::error::Result;
@@ -115,8 +116,10 @@ pub fn assets_needing_signature(store: &crate::store::Store) -> Result<Vec<Uuid>
     let conn = store.conn();
     rows::query_map(
         conn,
-        "SELECT id FROM assets WHERE kind = 'image' AND trashed_at IS NULL \
-             AND (extra NOT LIKE '%visual_phash%' OR extra IS NULL)",
+        &format!(
+            "SELECT id FROM assets WHERE kind = 'image' AND {LIVE_ROWS} \
+             AND (extra NOT LIKE '%visual_phash%' OR extra IS NULL)"
+        ),
         vec![],
         |row| rows::req_uuid(row, 0),
     )
@@ -127,13 +130,15 @@ pub fn assets_needing_signature(store: &crate::store::Store) -> Result<Vec<Uuid>
 pub fn signature_counts(conn: &rusqlite::Connection) -> Result<(u64, u64)> {
     let total = rows::query_count(
         conn,
-        "SELECT COUNT(*) FROM assets WHERE kind = 'image' AND trashed_at IS NULL",
+        &format!("SELECT COUNT(*) FROM assets WHERE kind = 'image' AND {LIVE_ROWS}"),
         vec![],
     )? as u64;
     let signed = rows::query_count(
         conn,
-        "SELECT COUNT(*) FROM assets WHERE kind = 'image' AND trashed_at IS NULL
-         AND extra LIKE '%visual_phash%'",
+        &format!(
+            "SELECT COUNT(*) FROM assets WHERE kind = 'image' AND {LIVE_ROWS}
+         AND extra LIKE '%visual_phash%'"
+        ),
         vec![],
     )? as u64;
     Ok((signed, total))
@@ -279,7 +284,7 @@ fn scan_and_rank(
         // No `extra LIKE '%visual_phash%'` predicate: it is a substring test on
         // a JSON blob, so it can match the string inside a *value* and miss the
         // point, and the row's JSON is parsed two lines below anyway.
-        "SELECT id, extra FROM assets WHERE kind = 'image' AND trashed_at IS NULL",
+        &format!("SELECT id, extra FROM assets WHERE kind = 'image' AND {LIVE_ROWS}"),
         vec![],
         |row| {
             let id = rows::req_uuid(row, 0)?;
@@ -330,7 +335,7 @@ pub fn backfill_signatures(
     let rows_vec = rows::query_map(
         conn,
         &format!(
-            "SELECT {COLS} FROM assets WHERE kind = 'image' AND trashed_at IS NULL \
+            "SELECT {COLS} FROM assets WHERE kind = 'image' AND {LIVE_ROWS} \
              AND (extra NOT LIKE '%visual_phash%' OR extra IS NULL)"
         ),
         vec![],

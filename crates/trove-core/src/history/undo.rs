@@ -102,6 +102,30 @@ impl OpDesc {
     }
 }
 
+/// One asset's two sides of a batch mutation. The id travels *with* both the
+/// before and the after value, so a recorded batch cannot describe one set of
+/// assets on the way in and a different set on the way back. Two parallel
+/// `Vec<(Uuid, T)>` allow exactly that: append to one, forget the other, and
+/// undo rewrites a row the forward half never touched — without an error.
+#[derive(Debug, Clone)]
+pub struct Flip<T> {
+    pub id: Uuid,
+    pub before: T,
+    pub after: T,
+}
+
+impl<T: Clone> Flip<T> {
+    /// The same asset with its two sides exchanged. Turning every flip in a
+    /// recorded batch is what undo runs, and its inverse is what redo runs.
+    fn swapped(&self) -> Self {
+        Self {
+            id: self.id,
+            before: self.after.clone(),
+            after: self.before.clone(),
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Operations
 // ---------------------------------------------------------------------------
@@ -117,22 +141,12 @@ pub enum Op {
         before: Box<AssetPatch>,
         after: Box<AssetPatch>,
     },
-    /// Per-asset trash flags around a batch flip (`before`/`after` are
-    /// parallel per-id states).
-    SetTrashed {
-        before: Vec<(Uuid, bool)>,
-        after: Vec<(Uuid, bool)>,
-    },
+    /// Per-asset trash flags around a batch flip.
+    SetTrashed { flips: Vec<Flip<bool>> },
     /// Per-asset favorite flags around a batch flip.
-    SetFavorite {
-        before: Vec<(Uuid, bool)>,
-        after: Vec<(Uuid, bool)>,
-    },
+    SetFavorite { flips: Vec<Flip<bool>> },
     /// One batch title rewrite (multi-select rename).
-    SetTitles {
-        before: Vec<(Uuid, Option<String>)>,
-        after: Vec<(Uuid, Option<String>)>,
-    },
+    SetTitles { flips: Vec<Flip<Option<String>>> },
     /// Replace one asset's whole tag group.
     SetTags {
         asset: Uuid,
@@ -180,30 +194,30 @@ impl Op {
             Op::PatchAsset { id, after, .. } => {
                 assets::update(conn, *id, after)?;
             }
-            Op::SetTrashed { after, .. } => {
-                for (id, trashed) in after {
-                    assets::set_trashed(conn, *id, *trashed)?;
+            Op::SetTrashed { flips } => {
+                for flip in flips {
+                    assets::set_trashed(conn, flip.id, flip.after)?;
                 }
             }
-            Op::SetFavorite { after, .. } => {
-                for (id, favorite) in after {
+            Op::SetFavorite { flips } => {
+                for flip in flips {
                     assets::update(
                         conn,
-                        *id,
+                        flip.id,
                         &AssetPatch {
-                            is_favorite: Some(*favorite),
+                            is_favorite: Some(flip.after),
                             ..Default::default()
                         },
                     )?;
                 }
             }
-            Op::SetTitles { after, .. } => {
-                for (id, title) in after {
+            Op::SetTitles { flips } => {
+                for flip in flips {
                     assets::update(
                         conn,
-                        *id,
+                        flip.id,
                         &AssetPatch {
-                            title: Some(title.clone()),
+                            title: Some(flip.after.clone()),
                             ..Default::default()
                         },
                     )?;
@@ -253,17 +267,14 @@ impl Op {
                 before: Box::new(after.as_ref().clone()),
                 after: Box::new(before.as_ref().clone()),
             },
-            Op::SetTrashed { before, after } => Op::SetTrashed {
-                before: after.clone(),
-                after: before.clone(),
+            Op::SetTrashed { flips } => Op::SetTrashed {
+                flips: flips.iter().map(Flip::swapped).collect(),
             },
-            Op::SetFavorite { before, after } => Op::SetFavorite {
-                before: after.clone(),
-                after: before.clone(),
+            Op::SetFavorite { flips } => Op::SetFavorite {
+                flips: flips.iter().map(Flip::swapped).collect(),
             },
-            Op::SetTitles { before, after } => Op::SetTitles {
-                before: after.clone(),
-                after: before.clone(),
+            Op::SetTitles { flips } => Op::SetTitles {
+                flips: flips.iter().map(Flip::swapped).collect(),
             },
             Op::SetTags {
                 asset,
@@ -511,7 +522,8 @@ mod tests {
     use super::*;
     use crate::library::Library;
     use crate::model::{
-        Asset, AssetKind, AssetLocation, AssetSeed, NewCollection, NewTag, UsageStatus, now,
+        Asset, AssetKind, AssetLocation, AssetSeed, NewCollection, NewTag, Placement, UsageStatus,
+        now,
     };
     use crate::store::Store;
 
@@ -542,7 +554,7 @@ mod tests {
             facts: Default::default(),
             created_at: now(),
             updated_at: now(),
-            trashed_at: None,
+            placement: Placement::Live,
         })
     }
 
@@ -626,8 +638,11 @@ mod tests {
         // Forward: favorite flip.
         stack.record(
             Op::SetFavorite {
-                before: vec![(a.id, false)],
-                after: vec![(a.id, true)],
+                flips: vec![Flip {
+                    id: a.id,
+                    before: false,
+                    after: true,
+                }],
             },
             OpDesc::counted(OpAction::Favorite, 1),
         );
@@ -680,6 +695,81 @@ mod tests {
         );
         assert_eq!(stack.redo_len(), 0);
         assert_eq!(stack.undo_len(), 4);
+    }
+
+    /// A batch flip pairs every asset with *its own* before value, so undoing a
+    /// mixed selection puts each row back on the side it came from instead of
+    /// flattening the group onto one state.
+    #[test]
+    fn a_batch_flip_undoes_each_asset_to_its_own_side() {
+        fn is_trashed(conn: &Connection, id: Uuid) -> bool {
+            assets::get(conn, id)
+                .unwrap()
+                .unwrap()
+                .placement()
+                .is_trashed()
+        }
+
+        let store = Store::in_memory().unwrap();
+        let conn = store.conn();
+        let mut stack = UndoStack::default();
+
+        // Two of three are already in the trash; the batch empties it.
+        let a = {
+            let mut asset = sample_asset("a.png", AssetKind::Image);
+            asset.set_placement(Placement::Trashed(now()));
+            asset
+        };
+        let b = sample_asset("b.png", AssetKind::Image);
+        let c = {
+            let mut asset = sample_asset("c.png", AssetKind::Image);
+            asset.set_placement(Placement::Trashed(now()));
+            asset
+        };
+        for asset in [&a, &b, &c] {
+            assets::insert(conn, asset).unwrap();
+        }
+
+        let op = Op::SetTrashed {
+            flips: vec![
+                Flip {
+                    id: a.id,
+                    before: true,
+                    after: false,
+                },
+                Flip {
+                    id: b.id,
+                    before: false,
+                    after: false,
+                },
+                Flip {
+                    id: c.id,
+                    before: true,
+                    after: false,
+                },
+            ],
+        };
+        // Forward is the caller's move, recorded here so the stack describes
+        // what actually happened to the library.
+        op.clone().apply(conn).unwrap();
+        stack.record(op, OpDesc::counted(OpAction::Restore, 3));
+        assert!(
+            !is_trashed(conn, a.id) && !is_trashed(conn, b.id) && !is_trashed(conn, c.id),
+            "the forward half empties the trash"
+        );
+
+        stack.undo(conn).unwrap();
+        assert!(is_trashed(conn, a.id), "a came from the trash");
+        assert!(
+            !is_trashed(conn, b.id),
+            "b was live on the way in, so undo leaves it live"
+        );
+        assert!(is_trashed(conn, c.id), "c came from the trash");
+
+        stack.redo(conn).unwrap();
+        for id in [a.id, b.id, c.id] {
+            assert!(!is_trashed(conn, id), "redo takes the whole batch");
+        }
     }
 
     #[test]
@@ -794,8 +884,11 @@ mod tests {
         for i in 0..5 {
             stack.record(
                 Op::SetFavorite {
-                    before: vec![(a.id, i % 2 == 0)],
-                    after: vec![(a.id, i % 2 == 1)],
+                    flips: vec![Flip {
+                        id: a.id,
+                        before: i % 2 == 0,
+                        after: i % 2 == 1,
+                    }],
                 },
                 OpDesc::new(OpAction::Favorite, Some(format!("f{i}.png")), 1),
             );

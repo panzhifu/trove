@@ -5,6 +5,7 @@ use rusqlite::types::Value;
 use serde_json::Value as Json;
 use uuid::Uuid;
 
+use super::LIVE_ROWS;
 use super::rows;
 
 /// How many text-condition candidates one Tantivy lookup may contribute to
@@ -350,7 +351,7 @@ fn rule_where(
         expr.push_str(&format!(" AND ({fragment})"));
         args.append(&mut fragment_args);
     }
-    Ok((format!("WHERE trashed_at IS NULL AND ({expr})"), args))
+    Ok((format!("WHERE {LIVE_ROWS} AND ({expr})"), args))
 }
 
 /// How many live assets a rule tree selects, without fetching them. The browse

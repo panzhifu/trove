@@ -61,7 +61,7 @@ fn asset(name: &str, ext: &str, kind: AssetKind, title: Option<&str>, desc: Opti
         facts: Default::default(),
         created_at: Utc::now(),
         updated_at: Utc::now(),
-        trashed_at: None,
+        placement: trove_core::model::Placement::Live,
     })
 }
 
@@ -80,7 +80,7 @@ fn query(lib: &Library, q: &str, kind: Option<AssetKind>) -> (u64, Vec<Uuid>) {
             &AssetQuery {
                 kind,
                 limit: Some(20),
-                ..Default::default()
+                ..AssetQuery::live()
             },
         )
         .unwrap_or_else(|e| panic!("search {q:?} failed: {e}"));
@@ -782,7 +782,7 @@ fn profile(n: usize) {
     );
     let base = || AssetQuery {
         limit: Some(20),
-        ..Default::default()
+        ..AssetQuery::live()
     };
     let shapes: [(&str, AssetQuery); 7] = [
         ("none", base()),

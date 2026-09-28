@@ -11,6 +11,7 @@
 use rusqlite::Connection;
 use uuid::Uuid;
 
+use super::LIVE_ROWS;
 use super::rows;
 use crate::error::{Error, Result};
 use crate::media::sequence;
@@ -134,8 +135,10 @@ pub fn create(conn: &Connection, ids: &[Uuid], fps: f64) -> Result<Uuid> {
     for &id in ids {
         let found: Option<(String, Option<u32>, Option<u32>)> = rows::query_one(
             conn,
-            "SELECT COALESCE(source_path, ''), width, height
-             FROM assets WHERE id = ?1 AND trashed_at IS NULL",
+            &format!(
+                "SELECT COALESCE(source_path, ''), width, height
+             FROM assets WHERE id = ?1 AND {LIVE_ROWS}"
+            ),
             vec![rows::uuid(id).into()],
             |row| {
                 Ok((
@@ -336,7 +339,7 @@ pub fn hidden_members(conn: &Connection) -> Result<Vec<Uuid>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{Asset, AssetKind};
+    use crate::model::{Asset, AssetKind, AssetQuery};
     use crate::store::{Store, assets};
     use std::path::Path;
 
@@ -404,7 +407,7 @@ mod tests {
         for (id, name) in ids.iter().zip((1..=6).map(|i| format!("f{i:03}.png"))) {
             insert(conn, &frame(&dir, &name, *id));
         }
-        let query = crate::model::AssetQuery::default();
+        let query = crate::model::AssetQuery::live();
         assert_eq!(assets::count(conn, &query).unwrap(), 6, "before");
         assert!(
             !any_hidden_frames(conn).unwrap(),
@@ -482,8 +485,7 @@ mod tests {
         let trashed = assets::query(
             conn,
             &crate::model::AssetQuery {
-                is_trashed: true,
-                ..Default::default()
+                ..AssetQuery::trashed()
             },
         )
         .unwrap();

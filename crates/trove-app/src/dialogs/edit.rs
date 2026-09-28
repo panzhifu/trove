@@ -279,7 +279,7 @@ impl EditDialog {
 /// pixel edit can act on. Applied to whatever `assets::by_ids` returned.
 fn live_images(list: Vec<Asset>) -> Vec<Asset> {
     list.into_iter()
-        .filter(|a| a.kind == AssetKind::Image && a.trashed_at.is_none())
+        .filter(|a| a.kind == AssetKind::Image && !a.placement().is_trashed())
         .collect()
 }
 

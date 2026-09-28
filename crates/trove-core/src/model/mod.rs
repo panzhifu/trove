@@ -23,12 +23,12 @@ mod tag;
 pub use appearance::{Accent, Appearance, Glyph};
 pub use asset::{
     ASPECT_TOLERANCE, AspectPreset, Asset, AssetKind, AssetLocation, AssetPatch, AssetSeed,
-    NewAsset, Orientation, Origin, RESOLUTION_BAND_BOUNDS, ResolutionBand, UsageStatus,
+    NewAsset, Orientation, Origin, Placement, RESOLUTION_BAND_BOUNDS, ResolutionBand, UsageStatus,
 };
 pub use collection::{Collection, NewCollection, NewSmartCollection, SmartCollection};
 pub use embedding::{EmbeddingSpace, MAX_DIM, NewEmbedding, VectorMatch, normalized};
 pub use facts::{AssetFacts, AudioFacts, FontFacts, MediaTagsFacts, PhotoFacts, VisualFacts};
-pub use query::{AssetQuery, AssetSort, Page, QueryCondition};
+pub use query::{AssetQuery, AssetSort, Page, QueryCondition, TrashPool};
 pub use smart_query::{SmartCompare, SmartField, SmartNode};
 pub use tag::{NewTag, Tag};
 
@@ -82,6 +82,6 @@ pub fn test_asset(name: &str, kind: AssetKind, id: Uuid) -> Asset {
         facts: AssetFacts::default(),
         created_at: now(),
         updated_at: now(),
-        trashed_at: None,
+        placement: Placement::Live,
     })
 }

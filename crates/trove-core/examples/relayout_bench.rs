@@ -26,7 +26,7 @@ fn bench(label: &str, n_assets: usize, runs: usize) {
             height: Some(1067),
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
-            trashed_at: None,
+            placement: trove_core::model::Placement::Live,
             duration_ms: None,
             captured_at: None,
             title: None,
@@ -53,7 +53,7 @@ fn bench(label: &str, n_assets: usize, runs: usize) {
         sort: AssetSort::CreatedAt,
         sort_desc: true,
         limit: Some(n_assets as u32),
-        ..Default::default()
+        ..AssetQuery::live()
     };
 
     // Time the SQL query alone.

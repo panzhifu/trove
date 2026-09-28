@@ -7,10 +7,11 @@ use rusqlite::{Connection, types::Value};
 use uuid::Uuid;
 
 use super::rows::{self, bind_opt_int, bind_opt_str, bind_opt_ts};
+use super::{LIVE_ROWS, TRASHED_ROWS};
 use crate::error::{Error, Result};
 use crate::model::{
     Asset, AssetFacts, AssetKind, AssetLocation, AssetPatch, AssetQuery, AssetSeed, Orientation,
-    Page, UsageStatus, now,
+    Page, Placement, TrashPool, UsageStatus, now,
 };
 
 /// Column list shared by every read; index order matches `asset_from_row`.
@@ -110,7 +111,7 @@ pub fn linked_hashes(conn: &Connection) -> Result<Vec<String>> {
 pub fn find_by_content_hash(conn: &Connection, content_hash: &str) -> Result<Option<Asset>> {
     rows::query_one(
         conn,
-        &format!("SELECT {COLS} FROM assets WHERE content_hash = ?1 AND trashed_at IS NULL"),
+        &format!("SELECT {COLS} FROM assets WHERE content_hash = ?1 AND {LIVE_ROWS}"),
         vec![content_hash.to_string().into()],
         asset_from_row,
     )
@@ -557,7 +558,7 @@ pub fn duplicate_groups(conn: &Connection) -> Result<Vec<DuplicateGroup>> {
         conn,
         &format!(
             "SELECT {COLS} FROM assets \
-             WHERE kind = 'image' AND trashed_at IS NULL \
+             WHERE kind = 'image' AND {LIVE_ROWS} \
              ORDER BY created_at DESC, id ASC"
         ),
         vec![],
@@ -665,7 +666,10 @@ pub(crate) fn asset_from_row(row: &rusqlite::Row) -> Result<Asset> {
         facts,
         created_at: rows::req_ts(row, 19)?,
         updated_at: rows::req_ts(row, 20)?,
-        trashed_at: rows::opt_ts(row, 21)?,
+        placement: match rows::opt_ts(row, 21)? {
+            Some(at) => Placement::Trashed(at),
+            None => Placement::Live,
+        },
         usage_status: parse_usage_status(&rows::req_str(row, 22)?)?,
         commercial_use: rows::opt_int(row, 23)?.map(|v| v != 0),
     }))
@@ -677,6 +681,13 @@ fn asset_values(a: &Asset) -> Vec<Value> {
     // `rel_path` because that *is* what a placeholder means, and the linked
     // paths live in `extra` (their indexed column is generated from that key),
     // so neither state writes the other's column.
+    // Same shape on the way out as on the way in: the placement decides the one
+    // column that says whether a row is live, so no caller can write
+    // `trashed_at` without also having meant it.
+    let trashed_at = match a.placement() {
+        Placement::Live => None,
+        Placement::Trashed(at) => Some(at),
+    };
     let (origin_word, rel_path) = match a.location() {
         AssetLocation::Stored { rel_path } => ("stored", Some(rel_path)),
         AssetLocation::Placeholder => ("stored", None),
@@ -714,7 +725,7 @@ fn asset_values(a: &Asset) -> Vec<Value> {
             .into(),
         rows::ts(a.created_at).into(),
         rows::ts(a.updated_at).into(),
-        bind_opt_ts(a.trashed_at),
+        bind_opt_ts(trashed_at),
         usage_status_str(a.usage_status).into(),
         a.commercial_use
             .map(|b| Value::Integer(b as i64))
@@ -973,11 +984,13 @@ pub(super) fn build_where(
             }
         }
     }
-    // Unconditional, so `where_sql` is never empty.
-    if q.is_trashed {
-        conds.push(format!("{ni}trashed_at IS NOT NULL"));
+    // Unconditional, so `where_sql` is never empty. The pool arrives from the
+    // query rather than defaulting: `AssetQuery` cannot be built without naming
+    // one, so a caller that forgot the trash cannot quietly list the library.
+    if q.pool == TrashPool::Trashed {
+        conds.push(format!("{ni}{TRASHED_ROWS}"));
     } else {
-        conds.push(format!("{ni}trashed_at IS NULL"));
+        conds.push(format!("{ni}{LIVE_ROWS}"));
         // A sequence shows one card, not one per frame: the members past the
         // first are hidden here, which is the single place every browse,
         // search, recent and smart path comes through.
@@ -1078,7 +1091,7 @@ pub fn source_folders(conn: &Connection) -> Result<Vec<(String, u64)>> {
         conn,
         &format!(
             "SELECT source_path FROM assets INDEXED BY idx_assets_source_path \
-             WHERE trashed_at IS NULL AND source_path IS NOT NULL \
+             WHERE {LIVE_ROWS} AND source_path IS NOT NULL \
              AND {}",
             super::sequences::hidden_beside_guarded(conn, "assets.id")?
         ),
@@ -1205,8 +1218,10 @@ pub fn distinct_exts(conn: &Connection) -> Result<Vec<String>> {
     // ASCII-only.
     let raw: Vec<String> = rows::query_map(
         conn,
-        "SELECT DISTINCT ext FROM assets \
-         WHERE trashed_at IS NULL AND ext != '' ORDER BY ext",
+        &format!(
+            "SELECT DISTINCT ext FROM assets \
+         WHERE {LIVE_ROWS} AND ext != '' ORDER BY ext"
+        ),
         vec![],
         |row| row.get::<_, String>(0).map_err(Error::from),
     )?;
@@ -1256,9 +1271,9 @@ pub fn known_key(path: &std::path::Path) -> Option<(String, u64)> {
 /// is known yet" — the caller's next move is to offer the files to the
 /// importer, which checks again. That is the safe direction to fail in.
 pub fn known_keys(conn: &Connection) -> HashSet<(String, u64)> {
-    let Ok(mut stmt) =
-        conn.prepare("SELECT file_name, size_bytes FROM assets WHERE trashed_at IS NULL")
-    else {
+    let Ok(mut stmt) = conn.prepare(&format!(
+        "SELECT file_name, size_bytes FROM assets WHERE {LIVE_ROWS}",
+    )) else {
         return HashSet::new();
     };
     let rows = stmt.query_map([], |row| {

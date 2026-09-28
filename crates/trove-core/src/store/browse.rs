@@ -15,7 +15,7 @@ use super::{assets, facets, smart, smart_collections, view_history};
 use crate::error::{Error, Result};
 use crate::model::{
     AspectPreset, Asset, AssetKind, AssetQuery, AssetSort, Orientation, Page, QueryCondition,
-    ResolutionBand,
+    ResolutionBand, TrashPool,
 };
 use crate::search::vector::{self, QueryVector, VECTOR_CANDIDATE_CAP, VectorIndex};
 
@@ -53,8 +53,10 @@ impl Default for SearchTiers {
 pub struct BrowseContext {
     /// The browsed collection (`None` = all assets).
     pub collection: Option<Uuid>,
-    /// Browse the trash instead of a collection.
-    pub in_trash: bool,
+    /// Which side of the trash this browse ranges over — the same value the
+    /// query carries, so a browse cannot ask the database for one pool while
+    /// its own state says another.
+    pub pool: TrashPool,
     /// Browse the recently-viewed history.
     pub in_recent: bool,
     /// Browse the live results of this smart collection.
@@ -240,7 +242,7 @@ impl BrowseContext {
         // containers the user cannot see while the trash is open, so a lingering
         // one would silently shrink a list whose whole point is to hold
         // everything deleted — a wrong answer with no visible cause.
-        if self.in_trash {
+        if self.pool == TrashPool::Trashed {
             conditions.retain(|c| !matches!(c, QueryCondition::Path { .. }));
         }
         let conditions = conditions.as_slice();
@@ -250,7 +252,7 @@ impl BrowseContext {
         // a stray `"` empty the search box and list the whole library.
         let noise_only = !self.search.trim().is_empty() && !has_terms && !has_filters;
         let search_active = (self.tiers.full_text || self.tiers.semantic)
-            && !self.in_trash
+            && self.pool == TrashPool::Live
             && !self.in_recent
             && (has_terms || noise_only);
 
@@ -498,7 +500,7 @@ impl BrowseSession {
     /// a separate dimension the sidebar does not break down).
     pub fn compute_facets(&self, conn: &Connection) -> Result<facets::FacetCounts> {
         match &self.listing {
-            Listing::Ranked(ids) => facets::compute_for_ranked(conn, ids, &AssetQuery::default()),
+            Listing::Ranked(ids) => facets::compute_for_ranked(conn, ids, &AssetQuery::live()),
             Listing::Set(q) => facets::compute_for_query(conn, q),
             Listing::Smart { filters, .. } => facets::compute_for_query(conn, filters),
         }
@@ -526,7 +528,7 @@ impl BrowseContext {
     /// point is to hold everything deleted — a wrong answer with no visible
     /// cause.
     fn filter_query(&self, conditions: &[QueryCondition]) -> AssetQuery {
-        let container = !self.in_trash;
+        let container = self.pool == TrashPool::Live;
         AssetQuery {
             collection_id: if container { self.collection } else { None },
             source_path_prefix: if container { self.folder.clone() } else { None },
@@ -539,12 +541,12 @@ impl BrowseContext {
             min_rating: self.min_rating,
             ext: self.ext.clone(),
             conditions: conditions.to_vec(),
-            is_trashed: self.in_trash,
+            pool: self.pool,
             sort: self.sort,
             sort_desc: self.sort_desc,
             // Paging belongs to the session, never to this: a listing stores
             // the set, and each window says where in it it starts.
-            ..Default::default()
+            ..AssetQuery::live()
         }
     }
 
@@ -565,7 +567,7 @@ impl BrowseContext {
             min_rating: self.min_rating,
             ext: self.ext.clone(),
             conditions: conditions.to_vec(),
-            ..Default::default()
+            ..AssetQuery::live()
         }
     }
 }
@@ -706,7 +708,7 @@ mod tests {
             }],
             sort: None,
         };
-        let mut q = AssetQuery::default();
+        let mut q = AssetQuery::live();
         apply_plan_filters(&plan, &mut q);
         assert_eq!(
             q.conditions,
@@ -731,7 +733,7 @@ mod tests {
         let browse = |search: &str| {
             let ctx = BrowseContext {
                 search: search.into(),
-                in_trash: true,
+                pool: TrashPool::Trashed,
                 ..Default::default()
             };
             ctx.run(conn, &idx, None, None).unwrap().total
@@ -1246,16 +1248,16 @@ mod tests {
         // old contract, and the bar was hidden to match.
         assets::set_trashed(conn, img.id, true).unwrap();
 
-        let page = ctx(&|c: &mut BrowseContext| c.in_trash = true)
+        let page = ctx(&|c: &mut BrowseContext| c.pool = TrashPool::Trashed)
             .run(conn, &idx, None, None)
             .unwrap();
         assert_eq!(page.total, 1, "only the deleted asset");
         assert_eq!(page.items[0].id, img.id);
-        assert!(page.items[0].trashed_at.is_some());
+        assert!(page.items[0].placement().is_trashed());
 
         // A kind filter that matches the deleted asset still finds it …
         let page = ctx(&|c: &mut BrowseContext| {
-            c.in_trash = true;
+            c.pool = TrashPool::Trashed;
             c.kind = Some(AssetKind::Image);
         })
         .run(conn, &idx, None, None)
@@ -1266,7 +1268,7 @@ mod tests {
         // … and one that does not rules it out instead of being dropped.
         for excluded in [AssetKind::Font, AssetKind::Document, AssetKind::Video] {
             let page = ctx(&|c: &mut BrowseContext| {
-                c.in_trash = true;
+                c.pool = TrashPool::Trashed;
                 c.kind = Some(excluded);
             })
             .run(conn, &idx, None, None)
@@ -1275,7 +1277,7 @@ mod tests {
         }
 
         let page = ctx(&|c: &mut BrowseContext| {
-            c.in_trash = true;
+            c.pool = TrashPool::Trashed;
             c.is_favorite = true;
         })
         .run(conn, &idx, None, None)
@@ -1286,7 +1288,7 @@ mod tests {
         let keep = crate::store::tags::ensure_named(conn, "keep").unwrap();
         crate::store::tags::add_to_asset(conn, img.id, keep.id).unwrap();
         let page = ctx(&|c: &mut BrowseContext| {
-            c.in_trash = true;
+            c.pool = TrashPool::Trashed;
             c.tag = Some(keep.id);
         })
         .run(conn, &idx, None, None)

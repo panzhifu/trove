@@ -272,7 +272,7 @@ fn run_query(
         &AssetQuery {
             limit: Some(PAGE),
             sort_desc: true,
-            ..Default::default()
+            ..AssetQuery::live()
         },
     )
     .ok()
@@ -309,7 +309,7 @@ fn run_query(
             .unwrap();
     });
     measure(&mut report, "exactCountOnlyMs", rounds, || {
-        assets::count(conn, &AssetQuery::default()).unwrap();
+        assets::count(conn, &AssetQuery::live()).unwrap();
     });
     measure(&mut report, "browseSessionOpenMs", rounds, || {
         browse(|_| {}).snapshot(conn, text, None, true).unwrap();
@@ -397,7 +397,7 @@ fn run_query(
                 &BrowseContext {
                     sort,
                     sort_desc: desc,
-                    ..Default::default()
+                    ..BrowseContext::default()
                 },
             );
         });
@@ -537,7 +537,7 @@ fn run_query(
             let mut best = f64::MAX;
             for _ in 0..5 {
                 let t = Instant::now();
-                assets::count(conn, &AssetQuery::default()).unwrap();
+                assets::count(conn, &AssetQuery::live()).unwrap();
                 best = best.min(t.elapsed().as_secs_f64() * 1000.0);
             }
             best
@@ -551,7 +551,7 @@ fn run_query(
                     &AssetQuery {
                         limit: Some(PAGE),
                         sort_desc: true,
-                        ..Default::default()
+                        ..AssetQuery::live()
                     },
                 )
                 .unwrap();
@@ -747,7 +747,7 @@ fn run_query(
 fn browse(over: impl FnOnce(&mut BrowseContext)) -> BrowseContext {
     let mut ctx = BrowseContext {
         sort_desc: true,
-        ..Default::default()
+        ..BrowseContext::default()
     };
     over(&mut ctx);
     ctx
@@ -935,7 +935,7 @@ fn build_mirror(
                 facts: AssetFacts::default(),
                 created_at: parse_time(&created_at),
                 updated_at: parse_time(&updated_at),
-                trashed_at: None,
+                placement: trove_core::model::Placement::Live,
             });
             assets::insert(conn, &asset).unwrap();
             mirrored += 1;

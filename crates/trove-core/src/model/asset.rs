@@ -68,6 +68,28 @@ impl AssetLocation {
     }
 }
 
+/// Where a record sits in the user's view of the library: live, or in the
+/// trash since a moment.
+///
+/// The trash carries its timestamp because that is the fact -- restoring clears
+/// it, a purge reports what was in there -- while an `Option` sitting beside
+/// `is_trashed`-style booleans elsewhere let one state be spelled three ways and
+/// every SQL fragment spell it again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Placement {
+    /// Visible in the library.
+    Live,
+    /// In the trash, from this moment.
+    Trashed(DateTime<Utc>),
+}
+
+impl Placement {
+    /// Whether the record is in the trash.
+    pub fn is_trashed(&self) -> bool {
+        matches!(self, Self::Trashed(_))
+    }
+}
+
 /// Coarse asset classification, derived from the mime type and overridable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -235,8 +257,9 @@ pub struct Asset {
     pub facts: AssetFacts,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
-    /// `None` while live; set to the deletion moment when in the trash.
-    pub trashed_at: Option<DateTime<Utc>>,
+    /// The column behind [`Asset::placement`]: private for the same reason the
+    /// location columns are -- see [`Asset::set_placement`].
+    trashed_at: Option<DateTime<Utc>>,
 }
 
 /// Everything needed to make an [`Asset`] that is not derived from a row.
@@ -269,7 +292,8 @@ pub struct AssetSeed {
     pub facts: AssetFacts,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
-    pub trashed_at: Option<DateTime<Utc>>,
+    /// Live or trashed-since-when, as one value: see [`Placement`].
+    pub placement: Placement,
 }
 
 impl Asset {
@@ -304,9 +328,10 @@ impl Asset {
             facts: seed.facts,
             created_at: seed.created_at,
             updated_at: seed.updated_at,
-            trashed_at: seed.trashed_at,
+            trashed_at: None,
         };
         asset.set_location(seed.location);
+        asset.set_placement(seed.placement);
         asset
     }
 }
@@ -345,6 +370,22 @@ impl Asset {
                 None => AssetLocation::Unrecorded,
             },
         }
+    }
+
+    /// Whether the record is live or in the trash, and since when.
+    pub fn placement(&self) -> Placement {
+        match self.trashed_at {
+            None => Placement::Live,
+            Some(trashed_at) => Placement::Trashed(trashed_at),
+        }
+    }
+
+    /// Move the record to `placement`.
+    pub fn set_placement(&mut self, placement: Placement) {
+        self.trashed_at = match placement {
+            Placement::Live => None,
+            Placement::Trashed(at) => Some(at),
+        };
     }
 
     /// Record where the file came from.

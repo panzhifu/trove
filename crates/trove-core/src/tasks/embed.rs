@@ -394,7 +394,7 @@ mod tests {
 
         // Retitle one asset: only its fingerprint moves.
         let store = Store::open(&dir.join("library.db")).unwrap();
-        let page = assets::query(store.conn(), &crate::model::AssetQuery::default()).unwrap();
+        let page = assets::query(store.conn(), &crate::model::AssetQuery::live()).unwrap();
         assets::update(
             store.conn(),
             page.items[0].id,
@@ -443,7 +443,7 @@ mod tests {
         let dir = library_dir();
         seed(&dir, 4);
         let store = Store::open(&dir.join("library.db")).unwrap();
-        let page = assets::query(store.conn(), &crate::model::AssetQuery::default()).unwrap();
+        let page = assets::query(store.conn(), &crate::model::AssetQuery::live()).unwrap();
         assets::set_trashed(store.conn(), page.items[0].id, true).unwrap();
 
         let options = EmbedOptions {

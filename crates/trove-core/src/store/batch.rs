@@ -73,7 +73,9 @@ pub fn add_to_collection_many(conn: &Connection, collection_id: Uuid, ids: &[Uui
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{Asset, AssetKind, AssetLocation, AssetSeed, UsageStatus, now};
+    use crate::model::{
+        Asset, AssetKind, AssetLocation, AssetQuery, AssetSeed, Placement, UsageStatus, now,
+    };
     use crate::store::Store;
 
     fn sample_asset(store: &Store, name: &str, kind: AssetKind) -> Uuid {
@@ -103,7 +105,7 @@ mod tests {
             facts: Default::default(),
             created_at: now(),
             updated_at: now(),
-            trashed_at: None,
+            placement: Placement::Live,
         });
         crate::store::assets::insert(store.conn(), &asset).unwrap();
         id
@@ -120,8 +122,7 @@ mod tests {
         let trashed = crate::store::assets::query(
             store.conn(),
             &crate::model::AssetQuery {
-                is_trashed: true,
-                ..Default::default()
+                ..AssetQuery::trashed()
             },
         )
         .unwrap();
@@ -129,8 +130,8 @@ mod tests {
 
         // Restore only one.
         assert_eq!(set_trashed_many(store.conn(), &[a], false).unwrap(), 1);
-        let live = crate::store::assets::query(store.conn(), &crate::model::AssetQuery::default())
-            .unwrap();
+        let live =
+            crate::store::assets::query(store.conn(), &crate::model::AssetQuery::live()).unwrap();
         assert_eq!(live.items.len(), 1);
 
         // Bring `b` back so both are live, then favorite both in one statement.
@@ -140,7 +141,7 @@ mod tests {
             store.conn(),
             &crate::model::AssetQuery {
                 is_favorite: Some(true),
-                ..Default::default()
+                ..AssetQuery::live()
             },
         )
         .unwrap();

@@ -25,7 +25,7 @@ use uuid::Uuid;
 use super::metadata;
 use super::pipeline::{self, StageIo};
 use crate::error::{Error, Result};
-use crate::model::{Asset, AssetKind, AssetLocation, AssetSeed, UsageStatus, now};
+use crate::model::{Asset, AssetKind, AssetLocation, AssetSeed, Placement, UsageStatus, now};
 use crate::store::{Store, assets, collections};
 use rusqlite::Connection;
 
@@ -479,7 +479,7 @@ pub fn commit_staged(
         facts,
         created_at: now(),
         updated_at: now(),
-        trashed_at: None,
+        placement: Placement::Live,
     });
     assets::insert(conn, &asset)?;
     for cid in &targets {
@@ -586,7 +586,7 @@ mod tests {
         assert_eq!(report.imported_count(), 1);
 
         let conn = store.conn();
-        let all = assets::query(conn, &AssetQuery::default()).unwrap();
+        let all = assets::query(conn, &AssetQuery::live()).unwrap();
         let asset = &all.items[0];
         // Linked record: no blob copied, origin linked, original location
         // recorded in the facts.
@@ -639,7 +639,7 @@ mod tests {
         let report = commit_staged_all(store.conn(), None, staged);
         assert_eq!(report.imported_count(), 1);
 
-        let all = assets::query(store.conn(), &AssetQuery::default()).unwrap();
+        let all = assets::query(store.conn(), &AssetQuery::live()).unwrap();
         let asset = &all.items[0];
         assert!(matches!(asset.location(), AssetLocation::Stored { .. }));
         // The blob is inside the data root, so deleting the source afterwards

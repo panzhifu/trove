@@ -235,7 +235,7 @@ impl AssetPreviewData {
             kind: asset.kind,
             is_image: asset.kind == trove_core::model::AssetKind::Image,
             write_back: asset.location().is_linked(),
-            edit_blocker: if asset.trashed_at.is_some() {
+            edit_blocker: if asset.placement().is_trashed() {
                 Some("edit.blocked_trashed")
             } else if !trove_core::media::edit::is_editable_ext(&asset.ext) {
                 // Read-only here means *read-only in place*: a format the

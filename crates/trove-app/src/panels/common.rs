@@ -72,7 +72,7 @@ pub(crate) fn separator_label(cx: &Context<impl Render>, text: impl Into<String>
 pub(crate) fn live_count(controller: &LibraryController) -> u64 {
     controller
         .library
-        .query_assets(&AssetQuery::default())
+        .query_assets(&AssetQuery::live())
         .map(|page| page.total)
         .unwrap_or(0)
 }
@@ -80,10 +80,7 @@ pub(crate) fn live_count(controller: &LibraryController) -> u64 {
 pub(crate) fn trash_count(controller: &LibraryController) -> u64 {
     controller
         .library
-        .query_assets(&AssetQuery {
-            is_trashed: true,
-            ..Default::default()
-        })
+        .query_assets(&AssetQuery::trashed())
         .map(|page| page.total)
         .unwrap_or(0)
 }

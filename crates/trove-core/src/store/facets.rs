@@ -375,7 +375,7 @@ mod tests {
     fn facets_count_by_kind_and_ext() {
         let (store, _) = seed_library();
         let conn = store.conn();
-        let q = AssetQuery::default();
+        let q = AssetQuery::live();
         let facets = compute_for_query(conn, &q).unwrap();
 
         // 5 images, 1 video, 1 font
@@ -407,7 +407,7 @@ mod tests {
         // Filter to images only.
         let q = AssetQuery {
             kind: Some(AssetKind::Image),
-            ..Default::default()
+            ..AssetQuery::live()
         };
         let facets = compute_for_query(conn, &q).unwrap();
 
@@ -434,7 +434,7 @@ mod tests {
         let conn = store.conn();
         // Only the first 3 ids (all PNGs).
         let subset = ids[..3].to_vec();
-        let q = AssetQuery::default();
+        let q = AssetQuery::live();
         let facets = compute_for_ranked(conn, &subset, &q).unwrap();
 
         let ext_map: HashMap<&str, u64> = facets

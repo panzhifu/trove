@@ -12,4 +12,4 @@ pub mod app;
 pub mod undo;
 
 pub use app::AppHistory;
-pub use undo::{DEFAULT_UNDO_CAP, Op, OpAction, OpDesc};
+pub use undo::{DEFAULT_UNDO_CAP, Flip, Op, OpAction, OpDesc};
