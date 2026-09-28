@@ -786,7 +786,7 @@ impl TaskManager {
     ) -> Result<(TaskId, std::sync::mpsc::Receiver<T>), StartError>
     where
         T: Send + 'static,
-        F: FnOnce(&JobContext) -> Result<T, String> + Send + 'static,
+        F: FnOnce(&JobContext) -> crate::error::Result<T> + Send + 'static,
     {
         self.start_with_priority(kind, label, TaskPriority::Normal, run)
     }
@@ -803,7 +803,7 @@ impl TaskManager {
     ) -> Result<(TaskId, std::sync::mpsc::Receiver<T>), StartError>
     where
         T: Send + 'static,
-        F: FnOnce(&JobContext) -> Result<T, String> + Send + 'static,
+        F: FnOnce(&JobContext) -> crate::error::Result<T> + Send + 'static,
     {
         self.gate_kind(&kind)?;
         let mut jobs = self.jobs.lock().unwrap();
@@ -913,6 +913,10 @@ impl TaskManager {
                         )
                     }
                     Ok(Err(error)) => {
+                        // The event and the journal carry text, not the error
+                        // value: both outlive the job and are read by other
+                        // processes, so one message has to be materialized here.
+                        let error = error.to_string();
                         state.status = TaskStatus::Failed;
                         ctx.events.push(TaskEvent::Failed {
                             id: ctx.id,
@@ -986,7 +990,9 @@ impl TaskManager {
     ) -> Result<(TaskId, std::sync::mpsc::Receiver<T>), StartError>
     where
         T: Send + 'static,
-        F: FnMut() -> Box<dyn FnOnce(&JobContext) -> Result<T, String> + Send> + Send + 'static,
+        F: FnMut() -> Box<dyn FnOnce(&JobContext) -> crate::error::Result<T> + Send>
+            + Send
+            + 'static,
     {
         self.start_with_retry_and_priority(kind, label, policy, TaskPriority::Normal, factory)
     }
@@ -1002,7 +1008,9 @@ impl TaskManager {
     ) -> Result<(TaskId, std::sync::mpsc::Receiver<T>), StartError>
     where
         T: Send + 'static,
-        F: FnMut() -> Box<dyn FnOnce(&JobContext) -> Result<T, String> + Send> + Send + 'static,
+        F: FnMut() -> Box<dyn FnOnce(&JobContext) -> crate::error::Result<T> + Send>
+            + Send
+            + 'static,
     {
         self.gate_kind(&kind)?;
         let mut jobs = self.jobs.lock().unwrap();
@@ -1122,6 +1130,7 @@ impl TaskManager {
                         return;
                     }
                     Ok(Err(error)) => {
+                        let error = error.to_string();
                         // Check whether we have retries left.
                         let can_retry = state.retry.as_mut().is_some_and(|r| r.remaining > 0);
                         if can_retry {
@@ -1936,7 +1945,7 @@ mod tests {
                     Box::new(move |_| {
                         let n = seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
                         if n < 2 {
-                            Err("first attempt fails".to_string())
+                            Err(crate::error::Error::Message("first attempt fails".into()))
                         } else {
                             Ok(n)
                         }
@@ -1985,7 +1994,7 @@ mod tests {
                     let seen = seen.clone();
                     Box::new(move |_| {
                         seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                        Err("always fails".to_string())
+                        Err(crate::error::Error::Message("always fails".into()))
                     })
                 },
             )
@@ -2011,7 +2020,7 @@ mod tests {
     #[test]
     fn a_snapshot_lists_higher_priority_jobs_first() {
         let mgr = TaskManager::new();
-        let park = || -> Result<(), String> {
+        let park = || -> crate::error::Result<()> {
             std::thread::sleep(Duration::from_millis(60));
             Ok(())
         };

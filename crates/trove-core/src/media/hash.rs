@@ -47,11 +47,12 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
-/// Hex characters in a content hash. 64 rather than 32: the blob layout, the
-/// thumbnail file names and the storage column all read a hash as opaquely
-/// 64-hex, and a shorter digest would mean revisiting every one of them for
-/// nothing a longer digest does not already give.
-pub const HEX_LEN: usize = 64;
+/// Hex characters in a content hash.
+///
+/// Defined next to [`crate::model::ContentHash`], which the digest becomes once
+/// it enters the domain; re-exported here so the two subsystems that spell the
+/// number — this module and that type — cannot drift apart.
+pub use crate::model::HEX_LEN;
 
 // ---------------------------------------------------------------------------
 // Buffer sizing

@@ -22,6 +22,8 @@
 //!   borderless overlay holds the pointer.
 
 use std::path::PathBuf;
+
+use crate::error::Error;
 use std::sync::Mutex;
 use std::sync::mpsc;
 use std::time::Duration;
@@ -166,8 +168,8 @@ pub fn window_list() -> Option<Vec<WindowInfo>> {
     let _ = std::fs::remove_file(&script);
     match outcome {
         Ok(json) => parse(&json),
-        Err(reason) => {
-            tracing::debug!(reason, "kwin script: no window list");
+        Err(error) => {
+            tracing::debug!(%error, "kwin script: no window list");
             None
         }
     }
@@ -185,26 +187,35 @@ fn write_script(service: &str, source: &str) -> Option<PathBuf> {
     }
 }
 
+/// A failure talking to KWin's scripting interface, as an [`Error::External`]
+/// naming the program: every step here is "the compositor did not answer".
+fn kwin(message: String) -> Error {
+    Error::External {
+        program: "KWin".into(),
+        message,
+    }
+}
+
 /// Serve the callback name, run the script once, wait for the answer.
-fn run(service: &str, script: &std::path::Path) -> Result<String, String> {
+fn run(service: &str, script: &std::path::Path) -> Result<String, Error> {
     use zbus::blocking::connection::Builder;
 
     let (sender, receiver) = mpsc::channel();
     // The connection owns both the well-known name and the object that
     // receives the reply, so it has to outlive the wait below.
     let connection = Builder::session()
-        .map_err(|e| format!("session bus: {e}"))?
+        .map_err(|e| kwin(format!("session bus: {e}")))?
         .name(service.to_string())
-        .map_err(|e| format!("claiming {service}: {e}"))?
+        .map_err(|e| kwin(format!("claiming {service}: {e}")))?
         .serve_at(
             "/capture",
             Callback {
                 sender: Mutex::new(sender),
             },
         )
-        .map_err(|e| format!("serving {service}: {e}"))?
+        .map_err(|e| kwin(format!("serving {service}: {e}")))?
         .build()
-        .map_err(|e| format!("{service}: {e}"))?;
+        .map_err(|e| kwin(format!("{service}: {e}")))?;
 
     let scripting = zbus::blocking::Proxy::new(
         &connection,
@@ -212,7 +223,7 @@ fn run(service: &str, script: &std::path::Path) -> Result<String, String> {
         "/Scripting",
         "org.kde.kwin.Scripting",
     )
-    .map_err(|e| format!("scripting proxy: {e}"))?;
+    .map_err(|e| kwin(format!("scripting proxy: {e}")))?;
 
     // A previous run leaves the plugin loaded with the same file path; drop
     // it first so this call always runs the script it just wrote.
@@ -222,14 +233,14 @@ fn run(service: &str, script: &std::path::Path) -> Result<String, String> {
             "loadScript",
             &(script.to_string_lossy().to_string(), PLUGIN),
         )
-        .map_err(|e| format!("loadScript: {e}"))?;
+        .map_err(|e| kwin(format!("loadScript: {e}")))?;
     scripting
         .call_method("start", &())
-        .map_err(|e| format!("scripting start: {e}"))?;
+        .map_err(|e| kwin(format!("scripting start: {e}")))?;
 
     let outcome = receiver
         .recv_timeout(TIMEOUT)
-        .map_err(|e| format!("no answer within {TIMEOUT:?}: {e}"));
+        .map_err(|e| kwin(format!("no answer within {TIMEOUT:?}: {e}")));
 
     // Both of these are housekeeping: a failure here must not lose the
     // answer that already arrived.

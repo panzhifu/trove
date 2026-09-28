@@ -255,8 +255,8 @@ impl AssetPreviewData {
             duration_ms: asset.duration_ms,
             wave_cache: asset
                 .content_hash
-                .clone()
-                .map(|sha| (cache_root.to_path_buf(), sha)),
+                .as_deref()
+                .map(|sha| (cache_root.to_path_buf(), sha.to_string())),
         }
     }
 

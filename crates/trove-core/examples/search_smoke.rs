@@ -45,7 +45,10 @@ fn asset(name: &str, ext: &str, kind: AssetKind, title: Option<&str>, desc: Opti
         ext: ext.to_string(),
         mime: format!("application/{ext}"),
         size_bytes: 128,
-        content_hash: Some(format!("{:0>64}", id.simple())),
+        content_hash: Some(trove_core::model::ContentHash::from_hasher(format!(
+            "{:0>64}",
+            id.simple()
+        ))),
         kind,
         width: None,
         height: None,
@@ -191,7 +194,12 @@ fn build(lib: &Library) -> Fixture {
     )
     .unwrap()
     .id;
-    tags::add_to_asset(conn, photo.id, tag_landscape).unwrap();
+    tags::add_to_asset(
+        conn,
+        trove_core::model::AssetId(photo.id),
+        trove_core::model::TagId(tag_landscape),
+    )
+    .unwrap();
 
     Fixture {
         photo: photo.id,

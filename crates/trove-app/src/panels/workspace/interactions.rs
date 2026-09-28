@@ -35,11 +35,11 @@ impl WorkspacePanel {
                                 let input = NewSmartCollection {
                                     parent_id: None,
                                     name,
-                                    query: json!({
-                                        "op": "match",
-                                        "field": "text",
-                                        "value": search,
-                                    }),
+                                    query: trove_core::model::SmartNode::Match {
+                                        field: trove_core::model::SmartField::Text,
+                                        op: trove_core::model::SmartCompare::Eq,
+                                        value: json!(search),
+                                    },
                                     position: 0,
                                 };
                                 match ctl.library.create_smart_collection(&input) {

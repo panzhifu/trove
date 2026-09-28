@@ -219,27 +219,26 @@ pub fn run(
     options: &AiAnalysisOptions,
     provider: &dyn VendorAdapter,
     ctx: &JobContext,
-) -> Result<AiAnalysisOutcome, String> {
+) -> Result<AiAnalysisOutcome, crate::error::Error> {
     let started = Instant::now();
     // Open through the store once so pending migrations apply, then take a
     // connection of our own — the same arrangement every job uses.
-    crate::store::Store::open(&options.db_path)
-        .map_err(|e| format!("open library database: {e}"))?;
-    let conn =
-        Connection::open(&options.db_path).map_err(|e| format!("open library database: {e}"))?;
+    crate::store::Store::open(&options.db_path)?;
+    let conn = Connection::open(&options.db_path)
+        .map_err(|e| crate::error::Error::Db(format!("open library database: {e}")))?;
     conn.busy_timeout(BUSY_TIMEOUT)
-        .map_err(|e| format!("set busy timeout: {e}"))?;
+        .map_err(|e| crate::error::Error::Db(format!("set busy timeout: {e}")))?;
     conn.execute_batch(
         "PRAGMA foreign_keys = ON; PRAGMA synchronous = NORMAL; PRAGMA cache_size = -16000;",
     )
-    .map_err(|e| format!("set connection pragmas: {e}"))?;
+    .map_err(|e| crate::error::Error::Db(format!("set connection pragmas: {e}")))?;
 
     let mut outcome = AiAnalysisOutcome::default();
 
     // The vocabulary is read once and then kept up to date as this run
     // invents tags, so the parsing layer can reuse the spelling of a word the
     // library already has.
-    let mut vocabulary = vocabulary(&conn).map_err(|e| format!("list tags: {e}"))?;
+    let mut vocabulary = vocabulary(&conn)?;
     // Created on demand, the first time a run actually invents a tag: a run
     // that finds nothing new — or a dry run, which sends nothing at all —
     // must not leave an empty parent tag behind.
@@ -305,7 +304,9 @@ pub fn run(
         .num_threads(threads)
         .thread_name(|index| format!("trove-analysis-{index}"))
         .build()
-        .map_err(|e| format!("build the analysis thread pool: {e}"))?;
+        .map_err(|e| {
+            crate::error::Error::Message(format!("build the analysis thread pool: {e}"))
+        })?;
     let chunk = (threads * 4).max(1);
     // Once the endpoint refuses an image, every later request in this run goes
     // text-only — the point is to pay for that discovery once, not once per
@@ -324,7 +325,7 @@ pub fn run(
             break;
         }
 
-        let replies: Vec<Result<AiAnalysisResult, String>> = pool.install(|| {
+        let replies: Vec<Result<AiAnalysisResult, crate::error::Error>> = pool.install(|| {
             batch
                 .par_iter()
                 .map(|prepared| ask(provider, prepared, &image_rejected, cancel))
@@ -417,13 +418,15 @@ pub fn run(
 /// that is what the per-asset record is for. Descriptions and ratings are a
 /// deliberate exception: the record does not keep their previous values, so
 /// undo leaves them in place rather than guessing.
-pub fn undo(options: &AiAnalysisOptions, ctx: &JobContext) -> Result<UndoOutcome, String> {
-    crate::store::Store::open(&options.db_path)
-        .map_err(|e| format!("open library database: {e}"))?;
-    let conn =
-        Connection::open(&options.db_path).map_err(|e| format!("open library database: {e}"))?;
+pub fn undo(
+    options: &AiAnalysisOptions,
+    ctx: &JobContext,
+) -> Result<UndoOutcome, crate::error::Error> {
+    crate::store::Store::open(&options.db_path)?;
+    let conn = Connection::open(&options.db_path)
+        .map_err(|e| crate::error::Error::Db(format!("open library database: {e}")))?;
     conn.busy_timeout(BUSY_TIMEOUT)
-        .map_err(|e| format!("set busy timeout: {e}"))?;
+        .map_err(|e| crate::error::Error::Db(format!("set busy timeout: {e}")))?;
 
     let mut outcome = UndoOutcome::default();
     let marked: Vec<Asset> = match marked_assets(&conn) {
@@ -448,7 +451,11 @@ pub fn undo(options: &AiAnalysisOptions, ctx: &JobContext) -> Result<UndoOutcome
         for name in &added {
             match tags::get_by_name(&conn, name) {
                 Ok(Some(tag)) => {
-                    if let Err(error) = tags::remove_from_asset(&conn, asset.id, tag.id) {
+                    if let Err(error) = tags::remove_from_asset(
+                        &conn,
+                        crate::model::AssetId(asset.id),
+                        crate::model::TagId(tag.id),
+                    ) {
                         tracing::warn!(tag = %name, error = %error, "analysis undo: detach failed");
                         continue;
                     }
@@ -494,7 +501,7 @@ fn ask(
     prepared: &Prepared,
     rejected: &AtomicBool,
     cancel: &AtomicBool,
-) -> Result<AiAnalysisResult, String> {
+) -> Result<AiAnalysisResult, crate::error::Error> {
     let mut request = prepared.request.clone();
     if !rejected.load(Ordering::Relaxed) {
         request.thumbnail_jpeg = prepared
@@ -509,8 +516,7 @@ fn ask(
     let had_image = request.thumbnail_jpeg.is_some() || request.contact_sheet_jpeg.is_some();
 
     match provider.analyze(&request, cancel) {
-        Ok(text) => analysis::parse_model_reply(&text, provider.model_version())
-            .map_err(|error| error.to_string()),
+        Ok(text) => analysis::parse_model_reply(&text, provider.model_version()),
         Err(error) if had_image && is_request_rejection(&error) => {
             // The endpoint refused the request itself, and the image is the
             // only part of it a text-only server would object to.
@@ -518,15 +524,20 @@ fn ask(
             rejected.store(true, Ordering::Relaxed);
             request.thumbnail_jpeg = None;
             request.contact_sheet_jpeg = None;
-            let text = provider
-                .analyze(&request, cancel)
-                .map_err(|error| error.message.clone())?;
+            let text = provider.analyze(&request, cancel).map_err(|error| {
+                crate::error::Error::External {
+                    program: provider.model_version().to_string(),
+                    message: error.message.clone(),
+                }
+            })?;
             analysis::parse_model_reply(&text, provider.model_version())
-                .map_err(|error| error.to_string())
         }
         // A transport failure already exhausted the retries; downgrading
         // would hide a broken endpoint behind a silent quality drop.
-        Err(error) => Err(error.message),
+        Err(error) => Err(crate::error::Error::External {
+            program: provider.model_version().to_string(),
+            message: error.message,
+        }),
     }
 }
 
@@ -625,7 +636,11 @@ fn apply(
                 tag
             }
         };
-        tags::add_to_asset(conn, prepared.asset.id, tag.id)?;
+        tags::add_to_asset(
+            conn,
+            crate::model::AssetId(prepared.asset.id),
+            crate::model::TagId(tag.id),
+        )?;
         applied.push(tag.name);
     }
 
@@ -958,7 +973,7 @@ mod tests {
                 AssetKind::Image,
                 Uuid::new_v4(),
             );
-            asset.content_hash = Some(hash);
+            asset.content_hash = Some(crate::model::ContentHash::from_hasher(hash));
             asset.width = Some(32);
             asset.height = Some(32);
             asset.set_location(AssetLocation::Linked {

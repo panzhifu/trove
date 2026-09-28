@@ -65,7 +65,11 @@ pub fn set_favorite_many(conn: &Connection, ids: &[Uuid], favorite: bool) -> Res
 /// the number of ids processed.
 pub fn add_to_collection_many(conn: &Connection, collection_id: Uuid, ids: &[Uuid]) -> Result<u64> {
     for id in ids {
-        super::collections::add_asset(conn, collection_id, *id)?;
+        super::collections::add_asset(
+            conn,
+            crate::model::CollectionId(collection_id),
+            crate::model::AssetId(*id),
+        )?;
     }
     Ok(ids.len() as u64)
 }
@@ -89,7 +93,7 @@ mod tests {
             ext: "png".into(),
             mime: "image/png".into(),
             size_bytes: 128,
-            content_hash: Some("a".repeat(64)),
+            content_hash: Some(crate::model::ContentHash::from_hasher("a".repeat(64))),
             kind,
             width: Some(1),
             height: Some(1),

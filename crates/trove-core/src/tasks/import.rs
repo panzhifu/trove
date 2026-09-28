@@ -260,7 +260,10 @@ fn walk(
 
 /// Run one import to completion. Synchronous and self-contained: tests call
 /// it directly, [`super::TaskManager`] runs it on a thread.
-pub fn run(options: &ImportOptions, ctx: &JobContext) -> Result<ImportOutcome, String> {
+pub fn run(
+    options: &ImportOptions,
+    ctx: &JobContext,
+) -> Result<ImportOutcome, crate::error::Error> {
     let started = std::time::Instant::now();
     let (mut paths, into_collection, walk_skips) = match &options.source {
         ImportSource::Paths {
@@ -294,14 +297,15 @@ pub fn run(options: &ImportOptions, ctx: &JobContext) -> Result<ImportOutcome, S
     // reopen a plain connection for the job (transactions need &mut, and the
     // store keeps its connection behind a RefCell).
     let db_path = options.db_path();
-    crate::store::Store::open(&db_path).map_err(|e| format!("open library database: {e}"))?;
-    let mut conn = Connection::open(&db_path).map_err(|e| format!("open library database: {e}"))?;
+    crate::store::Store::open(&db_path)?;
+    let mut conn = Connection::open(&db_path)
+        .map_err(|e| crate::error::Error::Db(format!("open library database: {e}")))?;
     conn.busy_timeout(BUSY_TIMEOUT)
-        .map_err(|e| format!("set busy timeout: {e}"))?;
+        .map_err(|e| crate::error::Error::Db(format!("set busy timeout: {e}")))?;
     conn.execute_batch(
         "PRAGMA foreign_keys = ON; PRAGMA synchronous = NORMAL; PRAGMA cache_size = -16000;",
     )
-    .map_err(|e| format!("set connection pragmas: {e}"))?;
+    .map_err(|e| crate::error::Error::Db(format!("set connection pragmas: {e}")))?;
 
     let mut report = ImportReport {
         skipped: walk_skips,
@@ -393,8 +397,9 @@ pub fn run(options: &ImportOptions, ctx: &JobContext) -> Result<ImportOutcome, S
                 // fresh transaction, and a report that died here would hide
                 // everything already committed.
                 tracing::error!(error = %batch_error, "import batch failed; its files are reported as skipped");
+                let reason = batch_error.to_string();
                 if error.is_none() {
-                    error = Some(batch_error.clone());
+                    error = Some(reason.clone());
                 }
                 for item in chunk {
                     let path = match item {
@@ -403,7 +408,7 @@ pub fn run(options: &ImportOptions, ctx: &JobContext) -> Result<ImportOutcome, S
                     };
                     report.skipped.push(import::ImportSkip {
                         path,
-                        reason: batch_error.clone(),
+                        reason: reason.clone(),
                     });
                 }
             }
@@ -449,20 +454,23 @@ fn commit_chunk(
     into_collection: Option<uuid::Uuid>,
     sidecars: &HashMap<PathBuf, Option<PathBuf>>,
     report: &mut ImportReport,
-) -> Result<(), String> {
+) -> Result<(), crate::error::Error> {
     let mut tx = conn
         .transaction()
-        .map_err(|e| format!("begin batch: {e}"))?;
+        .map_err(|e| crate::error::Error::Db(format!("begin batch: {e}")))?;
     let mut imported = Vec::new();
     let mut skipped = Vec::new();
     for item in chunk {
         match item {
             Ok(file) => {
-                let sp = tx.savepoint().map_err(|e| format!("savepoint: {e}"))?;
+                let sp = tx
+                    .savepoint()
+                    .map_err(|e| crate::error::Error::Db(format!("savepoint: {e}")))?;
                 match import::commit_staged(&sp, into_collection, file) {
                     Ok(imported_item) => {
                         stamp_collect_source(&sp, sidecars, file, &imported_item);
-                        sp.commit().map_err(|e| format!("commit file: {e}"))?;
+                        sp.commit()
+                            .map_err(|e| crate::error::Error::Db(format!("commit file: {e}")))?;
                         imported.push(imported_item);
                     }
                     Err(e) => {
@@ -477,7 +485,8 @@ fn commit_chunk(
             Err(skip) => skipped.push(skip.clone()),
         }
     }
-    tx.commit().map_err(|e| format!("commit batch: {e}"))?;
+    tx.commit()
+        .map_err(|e| crate::error::Error::Db(format!("commit batch: {e}")))?;
     // Only on a successful commit do the results enter the report — a failed
     // commit rolls the batch back, so its files must not read as imported.
     report.imported.extend(imported);
@@ -859,7 +868,7 @@ mod tests {
         conn.execute_batch("ROLLBACK;").unwrap();
 
         let error = outcome.expect_err("the nested batch must fail");
-        assert!(error.contains("begin batch"), "{error}");
+        assert!(error.to_string().contains("begin batch"), "{error}");
         assert!(report.imported.is_empty());
         assert!(report.skipped.is_empty());
     }

@@ -140,7 +140,9 @@ impl ModelViewport {
             trove_core::tasks::TaskPriority::High,
             move |ctx| {
                 let _ = ctx; // parsing is one indivisible unit; no checkpoints
-                Self::load_mesh(&path)
+                // The mesh loaders still speak `String`; the task contract
+                // speaks the crate error, so the message is carried across.
+                Self::load_mesh(&path).map_err(trove_core::Error::Message)
             },
         );
         let (id, rx) = match started {

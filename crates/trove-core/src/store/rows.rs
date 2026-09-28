@@ -197,10 +197,3 @@ pub fn parse_ts(s: &str) -> Result<DateTime<Utc>> {
 pub fn parse_uuid(s: &str) -> Result<Uuid> {
     Uuid::parse_str(s).map_err(|e| Error::Validation(format!("bad uuid {s:?}: {e}")))
 }
-
-/// Map a rusqlite error onto the crate error type.
-impl From<rusqlite::Error> for Error {
-    fn from(e: rusqlite::Error) -> Self {
-        Error::Db(e.to_string())
-    }
-}

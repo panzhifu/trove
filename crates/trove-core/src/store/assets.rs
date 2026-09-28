@@ -10,8 +10,8 @@ use super::rows::{self, bind_opt_int, bind_opt_str, bind_opt_ts};
 use super::{LIVE_ROWS, TRASHED_ROWS};
 use crate::error::{Error, Result};
 use crate::model::{
-    Asset, AssetFacts, AssetKind, AssetLocation, AssetPatch, AssetQuery, AssetSeed, Orientation,
-    Page, Placement, TrashPool, UsageStatus, now,
+    Asset, AssetFacts, AssetKind, AssetLocation, AssetPatch, AssetQuery, AssetSeed, ContentHash,
+    Orientation, Page, Placement, TrashPool, UsageStatus, now,
 };
 
 /// Column list shared by every read; index order matches `asset_from_row`.
@@ -673,7 +673,11 @@ pub(crate) fn asset_from_row(row: &rusqlite::Row) -> Result<Asset> {
             let v = rows::int(row, 6)?;
             v.max(0) as u64
         },
-        content_hash: rows::opt_str(row, 7)?,
+        // A hash of the wrong shape names no blob this build wrote, so it is
+        // degraded to "no hash" rather than failing the row — the same trade
+        // `read_rating` makes for a stray star count. The asset is still a file
+        // the user has; only the dedup key is dropped.
+        content_hash: rows::opt_str(row, 7)?.and_then(|s| ContentHash::parse(&s)),
         kind: parse_kind(&rows::req_str(row, 8)?)?,
         width: rows::opt_int(row, 9)?.map(|v| v as u32),
         height: rows::opt_int(row, 10)?.map(|v| v as u32),

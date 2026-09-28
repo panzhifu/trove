@@ -442,7 +442,7 @@ impl Picker {
                 // its old look reads as a bug, not as a failure. With no dialog
                 // to close, the controller's notice is the only place it can go.
                 if let Err(error) = target.write(ctl, &appearance) {
-                    ctl.notice = Some(error);
+                    ctl.notice = Some(error.to_string());
                 }
                 ctl.generation += 1;
                 cx.notify();
@@ -720,12 +720,11 @@ impl Target {
         &self,
         ctl: &LibraryController,
         appearance: &Appearance,
-    ) -> Result<(), String> {
-        let wrote = match self {
+    ) -> Result<(), trove_core::Error> {
+        match self {
             Self::Collection(id) => ctl.library.set_collection_appearance(*id, appearance),
             Self::Smart(id) => ctl.library.set_smart_collection_appearance(*id, appearance),
-        };
-        wrote.map_err(|error| error.to_string())
+        }
     }
 }
 

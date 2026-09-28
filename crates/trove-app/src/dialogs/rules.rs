@@ -205,9 +205,9 @@ impl RuleDraft {
         self.touch(cx);
     }
 
-    /// Compile the draft into the stored JSON tree. Incomplete rows are
+    /// Compile the draft into the stored rule tree. Incomplete rows are
     /// skipped; an empty result is an error the dialog surfaces.
-    fn build_json(&self, cx: &App) -> Result<serde_json::Value, String> {
+    fn build_json(&self, cx: &App) -> Result<SmartNode, trove_core::Error> {
         let t = |k: &str| rust_i18n::t!(k).to_string();
         let children: Vec<SmartNode> = self
             .rows
@@ -220,12 +220,11 @@ impl RuleDraft {
                     value: row_value(row, cx)?,
                 })
             })
-            .collect::<Result<Vec<SmartNode>, String>>()?;
+            .collect::<Result<Vec<SmartNode>, trove_core::Error>>()?;
         if children.is_empty() {
-            return Err(t("rules.need_condition"));
+            return Err(trove_core::Error::Message(t("rules.need_condition")));
         }
-        serde_json::to_value(join_tree(self.match_all, children))
-            .map_err(|_| t("rules.match_error"))
+        Ok(join_tree(self.match_all, children))
     }
 
     /// Re-run the live match count when the draft moved since last draw.
@@ -235,15 +234,14 @@ impl RuleDraft {
         }
         self.evaluated = self.revision;
         let ctl = self.controller.read(cx);
-        let outcome = self.build_json(cx).and_then(|json| {
-            // The raw serde message is English internals; the localized
-            // "invalid rule" label is enough for the live count status.
-            let node = smart::node_from_json(&json)
-                .map_err(|_| rust_i18n::t!("rules.match_error").to_string())?;
-            ctl.library
-                .count_smart_rule(&node)
-                .map_err(|e| e.to_string())
-        });
+        let outcome = self
+            .build_json(cx)
+            .map_err(|e| e.to_string())
+            .and_then(|node| {
+                ctl.library
+                    .count_smart_rule(&node)
+                    .map_err(|e| e.to_string())
+            });
         match outcome {
             Ok(total) => {
                 self.match_total = Some(total);
@@ -258,7 +256,7 @@ impl RuleDraft {
 }
 
 /// The stored value side of one condition row.
-fn row_value(row: &ConditionRow, cx: &App) -> Result<serde_json::Value, String> {
+fn row_value(row: &ConditionRow, cx: &App) -> Result<serde_json::Value, trove_core::Error> {
     let t = |k: &str| rust_i18n::t!(k).to_string();
     Ok(match row.field {
         SmartField::Text => serde_json::json!(row.text.read(cx).value().trim()),
@@ -267,23 +265,23 @@ fn row_value(row: &ConditionRow, cx: &App) -> Result<serde_json::Value, String> 
         }
         SmartField::Color => match normalize_color(&row.text.read(cx).value()) {
             Some(hex) => serde_json::json!(hex),
-            None => return Err(t("rules.invalid_color")),
+            None => return Err(trove_core::Error::Message(t("rules.invalid_color"))),
         },
         SmartField::SizeBytes => match row.text.read(cx).value().trim().parse::<i64>() {
             Ok(n) if n > 0 => serde_json::json!(n),
-            _ => return Err(t("rules.invalid_bytes")),
+            _ => return Err(trove_core::Error::Message(t("rules.invalid_bytes"))),
         },
         SmartField::CapturedAt => {
             let s = row.text.read(cx).value().trim().to_string();
             if smart::valid_date(&s) {
                 serde_json::json!(s)
             } else {
-                return Err(t("rules.invalid_date"));
+                return Err(trove_core::Error::Message(t("rules.invalid_date")));
             }
         }
         SmartField::AspectRatio => match row.text.read(cx).value().trim().parse::<f64>() {
             Ok(v) if v > 0.0 && v.is_finite() => serde_json::json!(v),
-            _ => return Err(t("rules.invalid_aspect")),
+            _ => return Err(trove_core::Error::Message(t("rules.invalid_aspect"))),
         },
         SmartField::Orientation => serde_json::json!(row.orientation),
         SmartField::Tag => serde_json::json!(row.tag),
@@ -340,15 +338,8 @@ fn normalize_color(raw: &str) -> Option<String> {
 /// Load a stored tree into `(combine with and, rows)`. A tree the flat
 /// editor cannot surface (nested groups) loads as no rows; an empty tree
 /// also falls back to no rows.
-fn load_rules(
-    json: &serde_json::Value,
-    window: &mut Window,
-    cx: &mut App,
-) -> (bool, Vec<ConditionRow>) {
-    let node = smart::node_from_json(json).unwrap_or(SmartNode::And {
-        children: Vec::new(),
-    });
-    match split_tree(node) {
+fn load_rules(node: &SmartNode, window: &mut Window, cx: &mut App) -> (bool, Vec<ConditionRow>) {
+    match split_tree(node.clone()) {
         Ok((match_all, matches)) => {
             let rows = matches
                 .into_iter()
@@ -440,7 +431,12 @@ pub fn open_rule_editor(
         name_input.update(cx, |state, cx| state.set_value(name, window, cx));
     }
     let (match_all, rows) = match &editing {
-        Some(sc) => load_rules(&sc.query, window, cx),
+        // A tree this build cannot read opens as no rows, exactly as a nested
+        // group does — the record is not lost, it just cannot be edited here.
+        Some(sc) => match sc.query.node() {
+            Some(node) => load_rules(node, window, cx),
+            None => (true, Vec::new()),
+        },
         None => (true, Vec::new()),
     };
     let tag_names = {
@@ -521,7 +517,7 @@ fn save_draft(draft: &Entity<RuleDraft>, cx: &mut App) -> bool {
     }
     let json = match draft.read(cx).build_json(cx) {
         Ok(json) => json,
-        Err(msg) => return fail(msg, draft, cx),
+        Err(error) => return fail(error.to_string(), draft, cx),
     };
 
     let outcome = draft.update(cx, |d, cx| {
@@ -571,7 +567,7 @@ fn save_draft(draft: &Entity<RuleDraft>, cx: &mut App) -> bool {
             if let Err(error) = appearance::Target::Smart(saved)
                 .write(draft.read(cx).controller.read(cx), &appearance)
             {
-                return fail(error, draft, cx);
+                return fail(error.to_string(), draft, cx);
             }
             draft.update(cx, |d, cx| {
                 let created = d.editing.is_none();

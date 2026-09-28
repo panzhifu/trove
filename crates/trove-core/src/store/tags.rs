@@ -7,7 +7,7 @@ use uuid::Uuid;
 
 use super::rows::{self, req_ts, req_uuid};
 use crate::error::{Error, Result};
-use crate::model::{NewTag, Tag};
+use crate::model::{AssetId, NewTag, Tag, TagId};
 
 /// Column list shared by every tag read; order matches `tag_from_row`.
 const COLS: &str = "id, name, color, created_at, parent_id";
@@ -217,21 +217,24 @@ pub fn counts_by_tag(conn: &Connection) -> Result<std::collections::HashMap<Uuid
 }
 
 /// Attach a tag to an asset (idempotent).
-pub fn add_to_asset(conn: &Connection, asset_id: Uuid, tag_id: Uuid) -> Result<()> {
+///
+/// The two ids are different types so they cannot be swapped — see
+/// [`crate::model::AssetId`].
+pub fn add_to_asset(conn: &Connection, asset_id: AssetId, tag_id: TagId) -> Result<()> {
     rows::execute(
         conn,
         "INSERT OR IGNORE INTO asset_tag (asset_id, tag_id) VALUES (?1, ?2)",
-        vec![rows::uuid(asset_id).into(), rows::uuid(tag_id).into()],
+        vec![rows::uuid(asset_id.0).into(), rows::uuid(tag_id.0).into()],
     )?;
     Ok(())
 }
 
 /// Detach a tag from an asset.
-pub fn remove_from_asset(conn: &Connection, asset_id: Uuid, tag_id: Uuid) -> Result<()> {
+pub fn remove_from_asset(conn: &Connection, asset_id: AssetId, tag_id: TagId) -> Result<()> {
     rows::execute(
         conn,
         "DELETE FROM asset_tag WHERE asset_id = ?1 AND tag_id = ?2",
-        vec![rows::uuid(asset_id).into(), rows::uuid(tag_id).into()],
+        vec![rows::uuid(asset_id.0).into(), rows::uuid(tag_id.0).into()],
     )?;
     Ok(())
 }

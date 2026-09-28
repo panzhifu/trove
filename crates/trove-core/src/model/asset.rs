@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use super::facts::AssetFacts;
-use super::{MAX_DESCRIPTION_LEN, MAX_NAME_LEN, Rating};
+use super::{ContentHash, MAX_DESCRIPTION_LEN, MAX_NAME_LEN, Rating};
 
 /// Where the asset's file lives.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -226,9 +226,14 @@ pub struct Asset {
     pub ext: String,
     pub mime: String,
     pub size_bytes: u64,
-    /// BLAKE3 of the file content, hex (64 characters). Deduplication key,
-    /// blob name and thumbnail cache key at once.
-    pub content_hash: Option<String>,
+    /// BLAKE3 of the file content. Deduplication key, blob name and thumbnail
+    /// cache key at once.
+    ///
+    /// `None` is a real state, not a missing value: a metadata placeholder was
+    /// created before its blob arrived. [`ContentHash`] cannot hold a string
+    /// the blob layout could not name, which is why the length and alphabet
+    /// are no longer re-checked by every reader.
+    pub content_hash: Option<ContentHash>,
     pub kind: AssetKind,
     /// Media dimensions / duration, present only when the file carries them.
     pub width: Option<u32>,
@@ -280,7 +285,7 @@ pub struct AssetSeed {
     pub ext: String,
     pub mime: String,
     pub size_bytes: u64,
-    pub content_hash: Option<String>,
+    pub content_hash: Option<ContentHash>,
     pub kind: AssetKind,
     pub width: Option<u32>,
     pub height: Option<u32>,
@@ -447,7 +452,7 @@ pub struct NewAsset {
     pub ext: String,
     pub mime: String,
     pub size_bytes: u64,
-    pub content_hash: String,
+    pub content_hash: ContentHash,
     pub kind: AssetKind,
     pub title: Option<String>,
     pub description: Option<String>,
@@ -601,7 +606,7 @@ mod tests {
             ext: "png".into(),
             mime: "image/png".into(),
             size_bytes: 4096,
-            content_hash: Some("b".repeat(64)),
+            content_hash: Some(ContentHash::from_hasher("b".repeat(64))),
             kind: AssetKind::Image,
             width: Some(800),
             height: Some(600),

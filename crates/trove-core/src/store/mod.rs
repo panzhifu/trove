@@ -354,7 +354,7 @@ mod tests {
             ext: "png".into(),
             mime: "image/png".into(),
             size_bytes: 128,
-            content_hash: Some("a".repeat(64)),
+            content_hash: Some(crate::model::ContentHash::from_hasher("a".repeat(64))),
             kind,
             width: Some(800),
             height: Some(600),
@@ -483,51 +483,86 @@ mod tests {
 
     #[test]
     fn smart_collection_update_query_validates() {
-        use crate::store::smart_collections;
+        use crate::store::{smart, smart_collections};
         let store = Store::in_memory().unwrap();
         let sc = smart_collections::create(
             store.conn(),
             &crate::model::NewSmartCollection {
                 parent_id: None,
                 name: "pics".into(),
-                query: serde_json::json!({"op": "match", "field": "kind", "value": "image"}),
+                query: smart::node_from_json(
+                    &serde_json::json!({"op": "match", "field": "kind", "value": "image"}),
+                )
+                .unwrap(),
                 position: 0,
             },
         )
         .unwrap();
 
         // A valid tree replaces the stored query.
-        let tree = serde_json::json!({
+        let tree = smart::node_from_json(&serde_json::json!({
             "op": "and",
             "children": [
                 {"op": "match", "field": "rating", "compare": "gte", "value": 4},
                 {"op": "match", "field": "tag", "value": "三毛"}
             ]
-        });
+        }))
+        .unwrap();
         smart_collections::update_query(store.conn(), sc.id, &tree).unwrap();
         let stored = smart_collections::get(store.conn(), sc.id)
             .unwrap()
             .unwrap();
-        assert_eq!(stored.query, tree);
+        assert_eq!(stored.query.node(), Some(&tree));
         // Saving a rule tree leaves the folder's look alone: the two are
         // edited apart and neither may undo the other behind the user's back.
         assert!(stored.appearance.is_plain());
 
         // A garbage tree is refused and the stored one survives.
-        assert!(smart_collections::update_query(
-            store.conn(),
-            sc.id,
+        let garbage = smart::node_from_json(
             &serde_json::json!({"op": "match", "field": "text", "compare": "gte", "value": "x"}),
         )
-        .is_err());
+        .unwrap();
+        assert!(smart_collections::update_query(store.conn(), sc.id, &garbage).is_err());
         assert_eq!(
             smart_collections::get(store.conn(), sc.id)
                 .unwrap()
                 .unwrap()
-                .query,
-            tree
+                .query
+                .node(),
+            Some(&tree)
         );
         assert!(smart_collections::update_query(store.conn(), Uuid::new_v4(), &tree).is_err());
+    }
+
+    /// A saved search whose stored tree this build cannot read is still a row
+    /// the user owns: it lists, it renames, and only its *evaluation* fails.
+    #[test]
+    fn a_smart_collection_with_a_foreign_tree_still_reads_and_renames() {
+        use crate::store::smart_collections;
+        let store = Store::in_memory().unwrap();
+        let id = Uuid::new_v4();
+        store
+            .conn()
+            .execute(
+                "INSERT INTO smart_collections (id, parent_id, name, query, position, created_at, updated_at)
+                 VALUES (?1, NULL, 'Old', '{\"op\":\"all\"}', 0, ?2, ?2)",
+                rusqlite::params![id.to_string(), "2026-01-01T00:00:00+00:00"],
+            )
+            .unwrap();
+
+        let fetched = smart_collections::get(store.conn(), id).unwrap().unwrap();
+        assert!(
+            fetched.query.node().is_none(),
+            "a foreign tree is not a node"
+        );
+        assert_eq!(smart_collections::list(store.conn()).unwrap().len(), 1);
+
+        // Renaming touches the name, not the tree, so the unreadable rule does
+        // not stand in the way.
+        smart_collections::rename(store.conn(), id, "Renamed").unwrap();
+        let renamed = smart_collections::get(store.conn(), id).unwrap().unwrap();
+        assert_eq!(renamed.name, "Renamed");
+        assert!(renamed.query.node().is_none());
     }
 
     #[test]
@@ -1349,7 +1384,12 @@ mod tests {
         for i in 0..600 {
             let asset = sample_asset(&format!("m{i:04}.png"), AssetKind::Image);
             assets::insert(store.conn(), &asset).unwrap();
-            collections::add_asset(store.conn(), collection.id, asset.id).unwrap();
+            collections::add_asset(
+                store.conn(),
+                crate::model::CollectionId(collection.id),
+                crate::model::AssetId(asset.id),
+            )
+            .unwrap();
             members.push(asset);
         }
         // A library around the collection, so a count that scanned `assets`
@@ -1748,9 +1788,24 @@ mod tests {
             },
         )
         .unwrap();
-        collections::add_asset(store.conn(), c1.id, img.id).unwrap();
-        collections::add_asset(store.conn(), c1.id, doc.id).unwrap();
-        collections::add_asset(store.conn(), c2.id, img.id).unwrap();
+        collections::add_asset(
+            store.conn(),
+            crate::model::CollectionId(c1.id),
+            crate::model::AssetId(img.id),
+        )
+        .unwrap();
+        collections::add_asset(
+            store.conn(),
+            crate::model::CollectionId(c1.id),
+            crate::model::AssetId(doc.id),
+        )
+        .unwrap();
+        collections::add_asset(
+            store.conn(),
+            crate::model::CollectionId(c2.id),
+            crate::model::AssetId(img.id),
+        )
+        .unwrap();
 
         assert_eq!(collections::count_assets(store.conn(), c1.id).unwrap(), 2);
         assert_eq!(collections::count_assets(store.conn(), c2.id).unwrap(), 1);
@@ -1812,8 +1867,8 @@ mod tests {
             .unwrap();
             collections::add_asset(
                 store.conn(),
-                c.id,
-                sample_asset("kept.png", AssetKind::Image).id,
+                crate::model::CollectionId(c.id),
+                crate::model::AssetId(sample_asset("kept.png", AssetKind::Image).id),
             )
             .unwrap_err(); // not inserted yet — ok, ignore for roundtrip of collection
             let _ = c;
@@ -2180,9 +2235,24 @@ mod tests {
         };
         let day = mk("day");
         let night = mk("night");
-        tags::add_to_asset(conn, photo.id, day.id).unwrap();
-        tags::add_to_asset(conn, photo.id, night.id).unwrap();
-        tags::add_to_asset(conn, doc.id, night.id).unwrap();
+        tags::add_to_asset(
+            conn,
+            crate::model::AssetId(photo.id),
+            crate::model::TagId(day.id),
+        )
+        .unwrap();
+        tags::add_to_asset(
+            conn,
+            crate::model::AssetId(photo.id),
+            crate::model::TagId(night.id),
+        )
+        .unwrap();
+        tags::add_to_asset(
+            conn,
+            crate::model::AssetId(doc.id),
+            crate::model::TagId(night.id),
+        )
+        .unwrap();
 
         let tagged = |q: &AssetQuery| -> Vec<Uuid> {
             let mut ids: Vec<Uuid> = assets::query(conn, q)
@@ -2273,10 +2343,30 @@ mod tests {
             assets::insert(conn, asset).unwrap();
         }
 
-        tags::add_to_asset(conn, a.id, root.id).unwrap();
-        tags::add_to_asset(conn, a.id, child.id).unwrap();
-        tags::add_to_asset(conn, b.id, grandchild.id).unwrap();
-        tags::add_to_asset(conn, c.id, unrelated.id).unwrap();
+        tags::add_to_asset(
+            conn,
+            crate::model::AssetId(a.id),
+            crate::model::TagId(root.id),
+        )
+        .unwrap();
+        tags::add_to_asset(
+            conn,
+            crate::model::AssetId(a.id),
+            crate::model::TagId(child.id),
+        )
+        .unwrap();
+        tags::add_to_asset(
+            conn,
+            crate::model::AssetId(b.id),
+            crate::model::TagId(grandchild.id),
+        )
+        .unwrap();
+        tags::add_to_asset(
+            conn,
+            crate::model::AssetId(c.id),
+            crate::model::TagId(unrelated.id),
+        )
+        .unwrap();
 
         let counts = tags::counts_by_tag(conn).unwrap();
         for tag in [&root, &child, &grandchild, &unrelated, &childless] {
@@ -2421,7 +2511,12 @@ mod tests {
 
         // Attach: the tag name becomes searchable, prefix included. The
         // outbox trigger enqueues the asset; the drain refreshes the doc.
-        tags::add_to_asset(conn, photo.id, tag.id).unwrap();
+        tags::add_to_asset(
+            conn,
+            crate::model::AssetId(photo.id),
+            crate::model::TagId(tag.id),
+        )
+        .unwrap();
         crate::search::drain(conn, &idx).unwrap();
         let hits = search_page(&store, &idx, "landscape", None);
         assert_eq!(hits.total, 1);
@@ -2430,7 +2525,12 @@ mod tests {
         assert_eq!(page.total, 1);
 
         // Detach: the stale index entry must disappear.
-        tags::remove_from_asset(conn, photo.id, tag.id).unwrap();
+        tags::remove_from_asset(
+            conn,
+            crate::model::AssetId(photo.id),
+            crate::model::TagId(tag.id),
+        )
+        .unwrap();
         crate::search::drain(conn, &idx).unwrap();
         let page = search_page(&store, &idx, "landscape", None);
         assert_eq!(page.total, 0);
@@ -2521,8 +2621,18 @@ mod tests {
         assets::insert(store.conn(), &doc).unwrap();
 
         let tags = super::tags::ensure_named(store.conn(), "Trip").unwrap();
-        super::tags::add_to_asset(store.conn(), img.id, tags.id).unwrap();
-        super::tags::add_to_asset(store.conn(), doc.id, tags.id).unwrap();
+        super::tags::add_to_asset(
+            store.conn(),
+            crate::model::AssetId(img.id),
+            crate::model::TagId(tags.id),
+        )
+        .unwrap();
+        super::tags::add_to_asset(
+            store.conn(),
+            crate::model::AssetId(doc.id),
+            crate::model::TagId(tags.id),
+        )
+        .unwrap();
 
         // rating >= 4  → img + doc
         let node = smart_node(serde_json::json!({
@@ -2642,10 +2752,12 @@ mod tests {
         super::tags::ensure_named(store.conn(), "Travel").unwrap();
         super::tags::add_to_asset(
             store.conn(),
-            a.id,
-            super::tags::ensure_named(store.conn(), "travel")
-                .unwrap()
-                .id,
+            crate::model::AssetId(a.id),
+            crate::model::TagId(
+                super::tags::ensure_named(store.conn(), "travel")
+                    .unwrap()
+                    .id,
+            ),
         )
         .unwrap();
         let tree = smart_node(serde_json::json!({
@@ -2813,9 +2925,9 @@ mod tests {
         let input = crate::model::NewSmartCollection {
             parent_id: None,
             name: "Favorites".into(),
-            query: serde_json::json!({
+            query: smart_node(serde_json::json!({
                 "op": "match", "field": "is_favorite", "value": true
-            }),
+            })),
             position: 0,
         };
         let created = super::smart_collections::create(store.conn(), &input).unwrap();
@@ -2823,7 +2935,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(fetched.name, "Favorites");
-        assert_eq!(fetched.query, input.query);
+        assert_eq!(fetched.query.node(), Some(&input.query));
         let listed = super::smart_collections::list(store.conn()).unwrap();
         assert_eq!(listed.len(), 1);
         // The look of the folder round-trips, and clearing it stores nothing
@@ -2883,7 +2995,8 @@ mod tests {
 
         let store = Store::in_memory().unwrap();
         let conn = store.conn();
-        let fav = serde_json::json!({"op": "match", "field": "is_favorite", "value": true});
+        let fav =
+            smart_node(serde_json::json!({"op": "match", "field": "is_favorite", "value": true}));
         let mk = |parent_id: Option<Uuid>, name: &str| NewSmartCollection {
             parent_id,
             name: name.into(),
@@ -3002,7 +3115,12 @@ mod tests {
         let mut a = sample_asset("a.png", AssetKind::Image);
         a.title = Some("sunset".into());
         assets::insert(conn, &a).unwrap();
-        tags::add_to_asset(conn, a.id, tag.id).unwrap();
+        tags::add_to_asset(
+            conn,
+            crate::model::AssetId(a.id),
+            crate::model::TagId(tag.id),
+        )
+        .unwrap();
         let idx = crate::search::TextIndex::in_ram().unwrap();
         index_all(&store, &idx);
         // The old name is searchable before the rename.
@@ -3134,7 +3252,12 @@ mod tests {
             },
         )
         .unwrap();
-        collections::add_asset(conn, coll.id, a.id).unwrap();
+        collections::add_asset(
+            conn,
+            crate::model::CollectionId(coll.id),
+            crate::model::AssetId(a.id),
+        )
+        .unwrap();
         let tag = tags::create(
             conn,
             &NewTag {
@@ -3144,15 +3267,20 @@ mod tests {
             },
         )
         .unwrap();
-        tags::add_to_asset(conn, a.id, tag.id).unwrap();
+        tags::add_to_asset(
+            conn,
+            crate::model::AssetId(a.id),
+            crate::model::TagId(tag.id),
+        )
+        .unwrap();
         smart_collections::create(
             conn,
             &crate::model::NewSmartCollection {
                 parent_id: None,
                 name: "fav".into(),
-                query: serde_json::json!({
+                query: smart_node(serde_json::json!({
                     "op": "match", "field": "is_favorite", "value": true
-                }),
+                })),
                 position: 0,
             },
         )

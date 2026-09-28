@@ -197,7 +197,7 @@ mod tests {
         let (size, mtime) = hash_cache::stamp(&file).unwrap();
         let mut asset = test_asset("photo.png", AssetKind::Image, Uuid::new_v4());
         asset.size_bytes = size;
-        asset.content_hash = Some("b".repeat(64));
+        asset.content_hash = Some(crate::model::ContentHash::from_hasher("b".repeat(64)));
         assets::insert(store.conn(), &asset).unwrap();
 
         let held = Held::load(store.conn());
@@ -232,7 +232,7 @@ mod tests {
 
         let mut asset = test_asset("photo.png", AssetKind::Image, Uuid::new_v4());
         asset.size_bytes = 10;
-        asset.content_hash = Some("d".repeat(64));
+        asset.content_hash = Some(crate::model::ContentHash::from_hasher("d".repeat(64)));
         assets::insert(store.conn(), &asset).unwrap();
 
         let held = Held::load(store.conn());

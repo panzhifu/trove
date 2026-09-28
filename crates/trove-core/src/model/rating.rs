@@ -97,11 +97,14 @@ impl From<Rating> for u8 {
 }
 
 impl TryFrom<u8> for Rating {
-    type Error = String;
+    type Error = crate::error::Error;
 
     fn try_from(value: u8) -> Result<Self, Self::Error> {
-        Rating::new(value)
-            .ok_or_else(|| format!("rating must be {MIN_RATING}..={MAX_RATING}, got {value}"))
+        Rating::new(value).ok_or_else(|| {
+            crate::error::Error::Validation(format!(
+                "rating must be {MIN_RATING}..={MAX_RATING}, got {value}"
+            ))
+        })
     }
 }
 

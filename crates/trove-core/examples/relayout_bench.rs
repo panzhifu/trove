@@ -20,7 +20,9 @@ fn bench(label: &str, n_assets: usize, runs: usize) {
             ext: "jpg".into(),
             mime: "image/jpeg".into(),
             size_bytes: 1_234_567,
-            content_hash: Some(format!("{i:064x}")),
+            content_hash: Some(trove_core::model::ContentHash::from_hasher(format!(
+                "{i:064x}"
+            ))),
             kind: AssetKind::Image,
             width: Some(1600),
             height: Some(1067),

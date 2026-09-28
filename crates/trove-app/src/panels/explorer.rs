@@ -152,9 +152,10 @@ fn flat_smart_rows(ctl: &LibraryController) -> Vec<SmartRow> {
         .into_iter()
         .map(|(ix, depth)| {
             let sc = &all[ix];
-            let count = trove_core::store::smart::node_from_json(&sc.query)
-                .ok()
-                .and_then(|node| ctl.library.count_smart_rule(&node).ok())
+            let count = sc
+                .query
+                .node()
+                .and_then(|node| ctl.library.count_smart_rule(node).ok())
                 .unwrap_or(0);
             SmartRow {
                 id: sc.id,

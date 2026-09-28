@@ -244,7 +244,11 @@ impl Op {
             Op::MembershipAdd { collection, added } => {
                 for id in added {
                     // Idempotent: re-adding an existing membership is a no-op.
-                    collections::add_asset(conn, *collection, *id)?;
+                    collections::add_asset(
+                        conn,
+                        crate::model::CollectionId(*collection),
+                        crate::model::AssetId(*id),
+                    )?;
                 }
             }
             Op::MembershipRemove {
@@ -252,7 +256,11 @@ impl Op {
                 removed,
             } => {
                 for id in removed {
-                    let _ = collections::remove_asset(conn, *collection, *id);
+                    let _ = collections::remove_asset(
+                        conn,
+                        crate::model::CollectionId(*collection),
+                        crate::model::AssetId(*id),
+                    );
                 }
             }
         }
@@ -538,7 +546,7 @@ mod tests {
             ext: "png".into(),
             mime: "image/png".into(),
             size_bytes: 128,
-            content_hash: Some("a".repeat(64)),
+            content_hash: Some(crate::model::ContentHash::from_hasher("a".repeat(64))),
             kind,
             width: Some(800),
             height: Some(600),
@@ -670,7 +678,12 @@ mod tests {
             },
         )
         .unwrap();
-        tags::add_to_asset(conn, a.id, t1.id).unwrap();
+        tags::add_to_asset(
+            conn,
+            crate::model::AssetId(a.id),
+            crate::model::TagId(t1.id),
+        )
+        .unwrap();
         stack.record(
             Op::SetTags {
                 asset: a.id,
@@ -860,7 +873,12 @@ mod tests {
             },
         )
         .unwrap();
-        tags::add_to_asset(conn, a.id, tag.id).unwrap();
+        tags::add_to_asset(
+            conn,
+            crate::model::AssetId(a.id),
+            crate::model::TagId(tag.id),
+        )
+        .unwrap();
         lib.rename_tag(tag.id, "coastline").unwrap();
         assert_eq!(tags::get(conn, tag.id).unwrap().unwrap().name, "coastline");
         lib.undo().unwrap();

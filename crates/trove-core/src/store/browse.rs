@@ -317,7 +317,11 @@ impl BrowseContext {
             let Some(sc) = smart_collections::get(conn, sid)? else {
                 return Err(Error::NotFound("smart_collection"));
             };
-            let node = smart::node_from_json(&sc.query)?;
+            let Some(node) = sc.query.node().cloned() else {
+                return Err(Error::Validation(
+                    "smart collection rule is unreadable by this build".into(),
+                ));
+            };
             let kind = self.kind;
             let favorite = self.is_favorite.then_some(true);
             let filters = self.smart_grid_filters(conditions);
@@ -630,6 +634,11 @@ mod tests {
     use super::*;
     use crate::model::test_asset;
     use crate::store::Store;
+
+    /// A stored-rule literal (`json!`) as the typed tree the model now holds.
+    fn smart_node(value: serde_json::Value) -> crate::model::SmartNode {
+        crate::store::smart::node_from_json(&value).unwrap()
+    }
 
     /// The grammar has to survive the whole path — parse, rank, then filter —
     /// not just the parser and the index in isolation.
@@ -984,9 +993,9 @@ mod tests {
             &crate::model::NewSmartCollection {
                 parent_id: None,
                 name: "images".into(),
-                query: serde_json::json!({
+                query: smart_node(serde_json::json!({
                     "op": "match", "field": "kind", "value": "image"
-                }),
+                })),
                 position: 0,
             },
         )
@@ -1046,9 +1055,9 @@ mod tests {
             &crate::model::NewSmartCollection {
                 parent_id: None,
                 name: "images".into(),
-                query: serde_json::json!({
+                query: smart_node(serde_json::json!({
                     "op": "match", "field": "kind", "value": "image"
-                }),
+                })),
                 position: 0,
             },
         )
@@ -1220,9 +1229,9 @@ mod tests {
             &crate::model::NewSmartCollection {
                 parent_id: None,
                 name: "docs".into(),
-                query: serde_json::json!({
+                query: smart_node(serde_json::json!({
                     "op": "match", "field": "kind", "value": "document"
-                }),
+                })),
                 position: 0,
             },
         )
@@ -1289,7 +1298,12 @@ mod tests {
 
         // Tags narrow the trash as well.
         let keep = crate::store::tags::ensure_named(conn, "keep").unwrap();
-        crate::store::tags::add_to_asset(conn, img.id, keep.id).unwrap();
+        crate::store::tags::add_to_asset(
+            conn,
+            crate::model::AssetId(img.id),
+            crate::model::TagId(keep.id),
+        )
+        .unwrap();
         let page = ctx(&|c: &mut BrowseContext| {
             c.pool = TrashPool::Trashed;
             c.tag = Some(keep.id);
@@ -1442,9 +1456,9 @@ mod tests {
                 &crate::model::NewSmartCollection {
                     parent_id: None,
                     name: format!("smart-{preset:?}"),
-                    query: serde_json::json!({
+                    query: smart_node(serde_json::json!({
                         "op": "match", "field": "kind", "value": "image"
-                    }),
+                    })),
                     position: 0,
                 },
             )
@@ -1534,9 +1548,9 @@ mod tests {
                 &crate::model::NewSmartCollection {
                     parent_id: None,
                     name: format!("smart-{band:?}"),
-                    query: serde_json::json!({
+                    query: smart_node(serde_json::json!({
                         "op": "match", "field": "kind", "value": "image"
-                    }),
+                    })),
                     position: 0,
                 },
             )

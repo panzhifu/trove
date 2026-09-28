@@ -9,10 +9,9 @@
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use serde_json::Value as Json;
 use uuid::Uuid;
 
-use super::{Appearance, MAX_NAME_LEN};
+use super::{Appearance, MAX_NAME_LEN, SavedQuery, SmartNode};
 
 // ---------------------------------------------------------------------------
 // Collection
@@ -65,8 +64,15 @@ pub struct SmartCollection {
     #[serde(default)]
     pub parent_id: Option<Uuid>,
     pub name: String,
-    /// The condition tree (`SmartNode`), serialized as JSON.
-    pub query: Json,
+    /// The condition tree. Typed, not a JSON blob: the tree a user saved and
+    /// the tree the store compiles are the same value, so a stored rule cannot
+    /// be one shape here and another where it is evaluated. It is serialized
+    /// as JSON in the `query` column, which is a storage detail of the store.
+    ///
+    /// [`SavedQuery`] rather than a bare [`SmartNode`] because the read side
+    /// meets trees written by other versions: a shape this build cannot parse
+    /// is kept, not dropped, so its row still renames and exports.
+    pub query: SavedQuery,
     /// The user's own glyph and accent for this folder, or nothing. Same
     /// column and same type as a plain [`Collection`]'s: the tree draws the two
     /// alike, and `color` — a free-form hex only this field's picker could
@@ -86,15 +92,15 @@ pub struct SmartCollection {
 pub struct NewSmartCollection {
     pub parent_id: Option<Uuid>,
     pub name: String,
-    pub query: Json,
+    pub query: SmartNode,
     pub position: i64,
 }
 
 impl NewSmartCollection {
-    /// Validate the name. The condition tree is *not* checked here — the
-    /// model layer carries no storage concerns, so runnability is validated
-    /// where the tree is compiled (`store::smart::validate_json`) at every
-    /// creation entry point.
+    /// Validate the name. The condition tree is typed, but *runnable* is a
+    /// storage concern: the model layer cannot know which fields the current
+    /// schema compiles, so that check stays where the tree is compiled
+    /// (`store::smart::validate`) at every creation entry point.
     pub fn validate(&self) -> Result<(), crate::error::Error> {
         validate_name("smart collection name", &self.name)
     }

@@ -12,7 +12,7 @@ use uuid::Uuid;
 
 use super::rows::{self, bind_opt_uuid, req_ts, req_uuid};
 use crate::error::{Error, Result};
-use crate::model::{Appearance, NewSmartCollection, SmartCollection};
+use crate::model::{Appearance, NewSmartCollection, SavedQuery, SmartCollection, SmartNode};
 
 /// Insert a smart collection, creating its id and timestamps.
 pub fn create(conn: &Connection, input: &NewSmartCollection) -> Result<SmartCollection> {
@@ -43,7 +43,7 @@ pub fn create(conn: &Connection, input: &NewSmartCollection) -> Result<SmartColl
         id,
         parent_id: input.parent_id,
         name: input.name.trim().to_string(),
-        query: input.query.clone(),
+        query: SavedQuery::from(input.query.clone()),
         appearance: Appearance::default(),
         position: input.position,
         created_at: now,
@@ -62,8 +62,12 @@ pub fn get(conn: &Connection, id: Uuid) -> Result<Option<SmartCollection>> {
 }
 
 /// All smart collections in display order.
+///
+/// A row whose stored tree this build cannot read is skipped rather than
+/// failing the listing: an unreadable rule is one saved search, not a reason
+/// the folder tree shows nothing. [`get`] still reports it.
 pub fn list(conn: &Connection) -> Result<Vec<SmartCollection>> {
-    rows::query_map(
+    rows::query_map_skipping_unreadable(
         conn,
         "SELECT id, parent_id, name, query, position, created_at, updated_at, appearance
          FROM smart_collections ORDER BY position ASC, created_at ASC",
@@ -102,10 +106,9 @@ pub fn rename(conn: &Connection, id: Uuid, name: &str) -> Result<()> {
 /// The look of the folder is not part of this: rules and appearance are edited
 /// in different places and rewriting one while saving the other would quietly
 /// undo an edit made in between.
-pub fn update_query(conn: &Connection, id: Uuid, query: &serde_json::Value) -> Result<()> {
+pub fn update_query(conn: &Connection, id: Uuid, query: &SmartNode) -> Result<()> {
     // Validate up front: an uncompilable tree must not land in the store.
-    let node = super::smart::node_from_json(query)?;
-    super::smart::compile(None, None, &node)?;
+    super::smart::compile(None, None, query)?;
     let changed = rows::execute(
         conn,
         "UPDATE smart_collections SET query = ?1, updated_at = ?2 WHERE id = ?3",
@@ -278,7 +281,9 @@ pub fn delete_under_collection(conn: &Connection, collection_id: Uuid) -> Result
 
 fn collection_from_row(row: &rusqlite::Row) -> Result<SmartCollection> {
     let query_json = rows::req_str(row, 3)?;
-    let query = serde_json::from_str(&query_json)
+    // Total: a tree this build cannot parse becomes `SavedQuery::Foreign`, so
+    // the row still reads. See that type for why.
+    let query: SavedQuery = serde_json::from_str(&query_json)
         .map_err(|e| Error::Db(format!("smart_collections: bad query json: {e}")))?;
     Ok(SmartCollection {
         id: req_uuid(row, 0)?,

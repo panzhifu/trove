@@ -80,19 +80,19 @@ pub fn run(
     options: &EmbedOptions,
     provider: &dyn EmbeddingProvider,
     ctx: &JobContext,
-) -> Result<EmbedOutcome, String> {
+) -> Result<EmbedOutcome, crate::error::Error> {
     let started = Instant::now();
     // Open through the store once so pending schema migrations apply, then
     // reopen a plain connection for the job.
-    Store::open(&options.db_path).map_err(|e| format!("open library database: {e}"))?;
-    let mut conn =
-        Connection::open(&options.db_path).map_err(|e| format!("open library database: {e}"))?;
+    Store::open(&options.db_path)?;
+    let mut conn = Connection::open(&options.db_path)
+        .map_err(|e| crate::error::Error::Db(format!("open library database: {e}")))?;
     conn.busy_timeout(BUSY_TIMEOUT)
-        .map_err(|e| format!("set busy timeout: {e}"))?;
+        .map_err(|e| crate::error::Error::Db(format!("set busy timeout: {e}")))?;
     conn.execute_batch(
         "PRAGMA foreign_keys = ON; PRAGMA synchronous = NORMAL; PRAGMA cache_size = -16000;",
     )
-    .map_err(|e| format!("set connection pragmas: {e}"))?;
+    .map_err(|e| crate::error::Error::Db(format!("set connection pragmas: {e}")))?;
 
     let mut outcome = EmbedOutcome::default();
     let model = provider.id().to_string();
@@ -113,7 +113,7 @@ pub fn run(
     // alone — this is what makes a second run cheap.
     ctx.set_summary("scanning library".into());
     let candidates = embeddings::embeddable_assets(&conn, &model, space)
-        .map_err(|e| format!("list assets: {e}"))?;
+        .map_err(|e| crate::error::Error::Db(format!("list assets: {e}")))?;
     let mut work: Vec<Work> = Vec::new();
     for (asset, stored) in candidates {
         ctx.park_if_paused();
@@ -122,7 +122,7 @@ pub fn run(
             return Ok(outcome);
         }
         let tag_names: Vec<String> = crate::store::tags::for_asset(&conn, asset.id)
-            .map_err(|e| format!("load tags: {e}"))?
+            .map_err(|e| crate::error::Error::Db(format!("load tags: {e}")))?
             .into_iter()
             .map(|t| t.name)
             .collect();
@@ -134,7 +134,7 @@ pub fn run(
         let (input, hash) = match space {
             EmbeddingSpace::Image => {
                 match (thumbnail_for(options, &asset), asset.content_hash.clone()) {
-                    (Some(path), Some(hash)) => (Input::Image(path), hash),
+                    (Some(path), Some(hash)) => (Input::Image(path), hash.to_string()),
                     _ => {
                         let text = asset_embed_text(&asset, &tag_names);
                         let hash = source_hash(&text);
@@ -238,7 +238,7 @@ pub fn run(
 
         let tx = conn
             .transaction()
-            .map_err(|e| format!("begin batch: {e}"))?;
+            .map_err(|e| crate::error::Error::Db(format!("begin batch: {e}")))?;
         for (work, vector) in batch.iter().zip(vectors) {
             let embedding = NewEmbedding {
                 asset_id: work.asset.id,
@@ -257,7 +257,8 @@ pub fn run(
                 }
             }
         }
-        tx.commit().map_err(|e| format!("commit batch: {e}"))?;
+        tx.commit()
+            .map_err(|e| crate::error::Error::Db(format!("commit batch: {e}")))?;
 
         done += batch.len() as u64;
         ctx.progress(done, total);
@@ -505,7 +506,7 @@ mod tests {
             .unwrap();
         let hash = crate::media::hash::hash_bytes(&std::fs::read(&source).unwrap());
         let mut asset = test_asset("cat.png", crate::model::AssetKind::Image, Uuid::new_v4());
-        asset.content_hash = Some(hash);
+        asset.content_hash = Some(crate::model::ContentHash::from_hasher(hash));
         asset.width = Some(32);
         asset.height = Some(32);
         asset.set_location(AssetLocation::Linked {

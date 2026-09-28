@@ -238,7 +238,7 @@ pub fn plan_thumbnail_rebuild(lib: &Library, force: bool) -> Result<ThumbPlan> {
             if !force && thumb::abs_path(cache, &sha).is_file() {
                 continue;
             }
-            plan.items.push((blob, sha, kind));
+            plan.items.push((blob, sha.to_string(), kind));
         }
     }
     Ok(plan)
@@ -460,7 +460,7 @@ pub fn plan_integrity(lib: &Library) -> Result<IntegrityPlan> {
                 continue;
             };
             plan.items
-                .push((asset.id, asset.file_name, root.join(rel), sha));
+                .push((asset.id, asset.file_name, root.join(rel), sha.to_string()));
         }
     }
     Ok(plan)
@@ -634,6 +634,7 @@ mod tests {
             .unwrap()
             .content_hash
             .unwrap()
+            .to_string()
     }
 
     #[test]
@@ -839,7 +840,12 @@ mod tests {
             },
         )
         .unwrap();
-        collections::add_asset(lib.store().conn(), c.id, trashed.items[0].id).unwrap();
+        collections::add_asset(
+            lib.store().conn(),
+            crate::model::CollectionId(c.id),
+            crate::model::AssetId(trashed.items[0].id),
+        )
+        .unwrap();
         assert_eq!(
             collections::count_assets(lib.store().conn(), c.id).unwrap(),
             1
@@ -884,7 +890,7 @@ mod tests {
         // The plan carries the recorded hash for context.
         let plan = plan_integrity(&lib).unwrap();
         assert_eq!(plan.items.len(), 1);
-        assert_eq!(plan.items[0].3, expected);
+        assert_eq!(plan.items[0].3, expected.to_string());
     }
 
     /// Re-mining must not destroy what it did not produce.

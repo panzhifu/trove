@@ -25,7 +25,9 @@ use uuid::Uuid;
 use super::metadata;
 use super::pipeline::{self, StageIo};
 use crate::error::{Error, Result};
-use crate::model::{Asset, AssetKind, AssetLocation, AssetSeed, Placement, UsageStatus, now};
+use crate::model::{
+    Asset, AssetKind, AssetLocation, AssetSeed, ContentHash, Placement, UsageStatus, now,
+};
 use crate::store::{Store, assets, collections};
 use rusqlite::Connection;
 
@@ -423,7 +425,11 @@ pub fn commit_staged(
             assets::set_rel_path(conn, existing.id, &staged.rel_path)?;
         }
         for cid in &targets {
-            collections::add_asset(conn, *cid, existing.id)?;
+            collections::add_asset(
+                conn,
+                crate::model::CollectionId(*cid),
+                crate::model::AssetId(existing.id),
+            )?;
         }
         return Ok(ImportItem {
             asset_id: existing.id,
@@ -463,7 +469,7 @@ pub fn commit_staged(
         ext: staged.ext.clone(),
         mime: staged.mime.clone(),
         size_bytes: staged.size,
-        content_hash: Some(staged.content_hash.clone()),
+        content_hash: Some(ContentHash::from_hasher(staged.content_hash.clone())),
         kind: staged.kind,
         width: staged.width,
         height: staged.height,
@@ -483,7 +489,11 @@ pub fn commit_staged(
     });
     assets::insert(conn, &asset)?;
     for cid in &targets {
-        collections::add_asset(conn, *cid, asset.id)?;
+        collections::add_asset(
+            conn,
+            crate::model::CollectionId(*cid),
+            crate::model::AssetId(asset.id),
+        )?;
     }
 
     Ok(ImportItem {

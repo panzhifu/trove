@@ -91,7 +91,7 @@ pub fn run(
     signals: Sender<WatchSignal>,
     accepted: std::sync::mpsc::Receiver<Vec<PathBuf>>,
     ctx: &JobContext,
-) -> Result<(), String> {
+) -> Result<(), crate::error::Error> {
     let mut seen: HashSet<PathBuf> = HashSet::new();
     let mut baselined: HashSet<PathBuf> = HashSet::new();
     let mut events: Option<Events> = None;

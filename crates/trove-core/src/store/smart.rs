@@ -20,11 +20,11 @@ pub fn node_from_json(json: &Json) -> Result<SmartNode> {
         .map_err(|e| Error::Validation(format!("invalid condition tree: {e}")))
 }
 
-/// Parse and compile a serialized condition tree, checking it is runnable
-/// against the current schema. Creation entry points (facade, rules dialog)
-/// call this instead of the model layer, which carries no storage concerns.
-pub fn validate_json(query: &Json) -> Result<()> {
-    compile(None, None, &node_from_json(query)?).map(|_| ())
+/// Compile a condition tree once to check it is runnable against the current
+/// schema. Creation entry points (facade, rules dialog) call this instead of
+/// the model layer, which carries no storage concerns.
+pub fn validate(node: &SmartNode) -> Result<()> {
+    compile(None, None, node).map(|_| ())
 }
 
 /// Compile a condition tree into a boolean `WHERE` fragment (no leading

@@ -104,18 +104,18 @@ const MAX_TERM_LEN: usize = 512;
 impl AiSearchPlan {
     /// Validate and normalize a raw plan from the wire. Returns a clean plan
     /// the search engine can execute, or an error naming the first problem.
-    pub fn validate(raw: raw::Plan) -> std::result::Result<Self, String> {
+    pub fn validate(raw: raw::Plan) -> Result<Self> {
         if raw.keywords.len() > MAX_TERMS {
-            return Err("too many keywords".into());
+            return Err(Error::Validation("too many keywords".into()));
         }
         if raw.synonyms.len() > MAX_TERMS {
-            return Err("too many synonyms".into());
+            return Err(Error::Validation("too many synonyms".into()));
         }
         if raw.exclusions.len() > MAX_TERMS {
-            return Err("too many exclusions".into());
+            return Err(Error::Validation("too many exclusions".into()));
         }
         if raw.filters.len() > MAX_FILTERS {
-            return Err("too many filters".into());
+            return Err(Error::Validation("too many filters".into()));
         }
 
         let keywords = normalize_terms(raw.keywords);
@@ -128,32 +128,38 @@ impl AiSearchPlan {
             && raw.filters.is_empty()
             && raw.sort.is_none()
         {
-            return Err("empty plan".into());
+            return Err(Error::Validation("empty plan".into()));
         }
 
         let mut filters = Vec::new();
         for raw_filter in raw.filters {
             if raw_filter.values.len() > MAX_VALUES {
-                return Err(format!("filter {:?}: too many values", raw_filter.field));
+                return Err(Error::Validation(format!(
+                    "filter {:?}: too many values",
+                    raw_filter.field
+                )));
             }
             if raw_filter.ranges.len() > MAX_VALUES {
-                return Err(format!("filter {:?}: too many ranges", raw_filter.field));
+                return Err(Error::Validation(format!(
+                    "filter {:?}: too many ranges",
+                    raw_filter.field
+                )));
             }
             let is_numeric = matches!(
                 raw_filter.field,
                 raw::FilterField::Width | raw::FilterField::Height | raw::FilterField::DurationMs
             );
             if is_numeric && raw_filter.ranges.is_empty() {
-                return Err(format!(
+                return Err(Error::Validation(format!(
                     "filter {:?}: numeric filters require ranges",
                     raw_filter.field
-                ));
+                )));
             }
             if !is_numeric && !raw_filter.ranges.is_empty() {
-                return Err(format!(
+                return Err(Error::Validation(format!(
                     "filter {:?}: categorical filters cannot have ranges",
                     raw_filter.field
-                ));
+                )));
             }
             let values = if is_numeric {
                 vec![]
@@ -353,7 +359,7 @@ pub fn plan(
 
     // Parse the JSON plan from the model's reply.
     let raw_plan: raw::Plan = parse_raw_plan(&raw_text)?;
-    AiSearchPlan::validate(raw_plan).map_err(Error::Validation)
+    AiSearchPlan::validate(raw_plan)
 }
 
 fn parse_raw_plan(text: &str) -> std::result::Result<raw::Plan, Error> {

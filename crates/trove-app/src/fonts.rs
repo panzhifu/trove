@@ -48,10 +48,11 @@ pub(crate) fn is_installed(hash: &str) -> bool {
 /// Copy the font into the user fonts directory (named `<hash>.<ext>`),
 /// register it with the OS and refresh the font cache. Returns the
 /// installed path.
-pub(crate) fn install(source: &Path, hash: &str) -> Result<PathBuf, String> {
-    let dir =
-        fonts_dir().ok_or_else(|| "font install is not supported on this platform".to_string())?;
-    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+pub(crate) fn install(source: &Path, hash: &str) -> Result<PathBuf, trove_core::Error> {
+    let dir = fonts_dir().ok_or(trove_core::Error::Unsupported(
+        "font install is not supported on this platform".into(),
+    ))?;
+    std::fs::create_dir_all(&dir).map_err(trove_core::Error::from)?;
     let ext = source
         .extension()
         .and_then(|e| e.to_str())
@@ -59,7 +60,7 @@ pub(crate) fn install(source: &Path, hash: &str) -> Result<PathBuf, String> {
         .to_ascii_lowercase();
     let dest = dir.join(format!("{hash}.{ext}"));
     if source != dest.as_path() {
-        std::fs::copy(source, &dest).map_err(|e| e.to_string())?;
+        std::fs::copy(source, &dest).map_err(trove_core::Error::from)?;
     }
     // Windows ignores a per-user font without its registry entry.
     #[cfg(target_os = "windows")]
@@ -75,13 +76,13 @@ pub(crate) fn install(source: &Path, hash: &str) -> Result<PathBuf, String> {
 
 /// Unregister the installed font, remove its file and refresh the font
 /// cache.
-pub(crate) fn uninstall(hash: &str) -> Result<(), String> {
-    let path = installed_path(hash).ok_or_else(|| "font is not installed".to_string())?;
+pub(crate) fn uninstall(hash: &str) -> Result<(), trove_core::Error> {
+    let path = installed_path(hash).ok_or(trove_core::Error::NotFound("installed font"))?;
     #[cfg(target_os = "windows")]
     if let Some((family, _)) = trove_core::media::metadata::font_family(&path) {
         registry_remove(&format!("{family} (TrueType)"));
     }
-    std::fs::remove_file(path).map_err(|e| e.to_string())?;
+    std::fs::remove_file(path).map_err(trove_core::Error::from)?;
     refresh_cache();
     Ok(())
 }

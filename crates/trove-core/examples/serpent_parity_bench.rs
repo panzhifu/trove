@@ -922,7 +922,9 @@ fn build_mirror(
                 // A stand-in digest, not a measurement: the fixture's own
                 // `content_fingerprint` column is NULL and nothing here reads
                 // the bytes. It only has to be stable and per-row unique.
-                content_hash: Some(blake3::hash(rel.as_bytes()).to_hex().to_string()),
+                content_hash: Some(trove_core::model::ContentHash::from_hasher(
+                    blake3::hash(rel.as_bytes()).to_hex().to_string(),
+                )),
                 kind: probed.kind,
                 width: width.map(|v| v.max(0) as u32),
                 height: height.map(|v| v.max(0) as u32),
@@ -971,7 +973,12 @@ fn build_mirror(
             let Some(new_collection) = collection_map.get(&old_collection).copied() else {
                 continue;
             };
-            collections::add_asset(conn, new_collection, asset_id).ok();
+            collections::add_asset(
+                conn,
+                trove_core::model::CollectionId(new_collection),
+                trove_core::model::AssetId(asset_id),
+            )
+            .ok();
         }
         let mut stmt = src
             .prepare("SELECT asset_id, tag_id FROM human_asset_tags")
@@ -988,7 +995,12 @@ fn build_mirror(
             let Some(new_tag) = tag_map.get(&tag_id).copied() else {
                 continue;
             };
-            tags::add_to_asset(conn, asset_id, new_tag).ok();
+            tags::add_to_asset(
+                conn,
+                trove_core::model::AssetId(asset_id),
+                trove_core::model::TagId(new_tag),
+            )
+            .ok();
         }
         conn.execute_batch("COMMIT").unwrap();
     }

@@ -194,7 +194,7 @@ pub(crate) fn asset_context_menu(
                 } else {
                     match &blob_font {
                         Some(blob) => crate::fonts::install(blob, &hash_font).map(|_| ()),
-                        None => Err("font file not found".to_string()),
+                        None => Err(trove_core::Error::NotFound("font file")),
                     }
                 };
                 if let Err(e) = outcome {

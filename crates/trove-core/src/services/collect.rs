@@ -50,6 +50,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 use crate::config::AppConfig;
+use crate::error::Error;
 
 /// Default listen port for the collect service.
 pub const DEFAULT_PORT: u16 = 23916;
@@ -699,24 +700,24 @@ fn sanitize_name(raw_name: &str) -> String {
 /// In-app URL import: download `url` into the inbox with a source-URL sidecar,
 /// so the next inbox drain imports it and records the source on the asset.
 /// Returns the saved file name.
-pub fn fetch_to_inbox(url: &str) -> Result<String, String> {
+pub fn fetch_to_inbox(url: &str) -> Result<String, Error> {
     // Checked before the landing exists, so a rejected URL leaves no trace.
     ensure_http(url)?;
     let name = suggested_name(url).unwrap_or_else(|| "collected.bin".to_string());
-    let mut landing = Landing::new(&inbox_dir(), &name).map_err(|e| e.to_string())?;
+    let mut landing = Landing::new(&inbox_dir(), &name).map_err(Error::from)?;
     if let Err(e) = download(url, None, false, |chunk| landing.write(chunk)) {
         landing.abort();
         return Err(e);
     }
-    landing.finish(Some(url)).map_err(|e| e.to_string())
+    landing.finish(Some(url)).map_err(Error::from)
 }
 
 /// The two schemes this service will fetch.
-fn ensure_http(url: &str) -> Result<(), String> {
+fn ensure_http(url: &str) -> Result<(), Error> {
     if url.starts_with("http://") || url.starts_with("https://") {
         Ok(())
     } else {
-        Err("only http(s) URLs are supported".into())
+        Err(Error::Validation("only http(s) URLs are supported".into()))
     }
 }
 
@@ -733,7 +734,7 @@ fn download(
     referer: Option<&str>,
     reject_html: bool,
     mut sink: impl FnMut(&[u8]) -> std::io::Result<()>,
-) -> Result<(), String> {
+) -> Result<(), Error> {
     ensure_http(url)?;
     let request = ureq::get(url).header("User-Agent", BROWSER_UA);
     let request = match referer {
@@ -744,8 +745,7 @@ fn download(
         .config()
         .timeout_global(Some(Duration::from_secs(60)))
         .build()
-        .call()
-        .map_err(|e| e.to_string())?;
+        .call()?;
     if reject_html {
         let is_html = response
             .headers()
@@ -761,17 +761,19 @@ fn download(
             })
             .is_some_and(|value| value.starts_with("text/html"));
         if is_html {
-            return Err("the URL answered with a webpage (text/html), not a file".into());
+            return Err(Error::Validation(
+                "the URL answered with a webpage (text/html), not a file".into(),
+            ));
         }
     }
     let mut reader = response.body_mut().with_config().limit(MAX_BODY).reader();
     let mut chunk = vec![0_u8; PUMP_CHUNK];
     loop {
-        let n = reader.read(&mut chunk).map_err(|e| e.to_string())?;
+        let n = reader.read(&mut chunk).map_err(Error::from)?;
         if n == 0 {
             return Ok(());
         }
-        sink(&chunk[..n]).map_err(|e| e.to_string())?;
+        sink(&chunk[..n]).map_err(Error::from)?;
     }
 }
 

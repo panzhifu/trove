@@ -8,6 +8,8 @@
 use std::path::Path;
 use std::process::Command;
 
+use crate::error::Error;
+
 /// What `open` should do with the resolved file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OpenTarget<'a> {
@@ -70,13 +72,16 @@ pub fn plan<'a>(path: &Path, target: OpenTarget<'a>) -> Command {
     }
 }
 
-/// Open `path` using `target`. The command is spawned detached; failures are
-/// returned as a string so the caller can surface them in the status bar.
-pub fn open(path: &Path, target: OpenTarget<'_>) -> Result<(), String> {
+/// Open `path` using `target`. The command is spawned detached; a failure is
+/// returned so the caller can surface it in the status bar.
+pub fn open(path: &Path, target: OpenTarget<'_>) -> Result<(), Error> {
     plan(path, target)
         .spawn()
         .map(|_| ())
-        .map_err(|e| format!("{e}"))
+        .map_err(|e| Error::External {
+            program: "system opener".into(),
+            message: e.to_string(),
+        })
 }
 
 /// Build the command that opens `url` in the user's browser.
@@ -101,21 +106,25 @@ pub fn plan_url(url: &str) -> Command {
     }
 }
 
-/// Open `url` in the system browser (detached, like [`open`]; failures come
-/// back as a string).
+/// Open `url` in the system browser (detached, like [`open`]).
 ///
 /// Only `http(s)` is accepted. Everything reachable from here is a link Trove
 /// itself produced, and this keeps a path — or a `file:`/`javascript:`
 /// payload smuggled into one — from being handed to the OS opener, which
 /// would happily run it.
-pub fn open_url(url: &str) -> Result<(), String> {
+pub fn open_url(url: &str) -> Result<(), Error> {
     if !url.starts_with("http://") && !url.starts_with("https://") {
-        return Err(format!("refusing to open a non-http(s) url: {url}"));
+        return Err(Error::Validation(format!(
+            "refusing to open a non-http(s) url: {url}"
+        )));
     }
     plan_url(url)
         .spawn()
         .map(|_| ())
-        .map_err(|e| format!("{e}"))
+        .map_err(|e| Error::External {
+            program: "system opener".into(),
+            message: e.to_string(),
+        })
 }
 
 // ---------------------------------------------------------------------------

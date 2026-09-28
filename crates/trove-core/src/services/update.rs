@@ -19,6 +19,8 @@
 use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
 
+use crate::error::Error;
+
 /// The repository releases are published from.
 const REPO: &str = "panzhifu/trove";
 
@@ -106,7 +108,9 @@ pub fn check_now(current: &str) -> UpdateState {
         Ok(None) => UpdateState::Current {
             version: current.to_string(),
         },
-        Err(error) => UpdateState::Failed { error },
+        Err(error) => UpdateState::Failed {
+            error: error.to_string(),
+        },
     };
     set_state(next.clone());
     next
@@ -118,7 +122,7 @@ pub fn check_now(current: &str) -> UpdateState {
 /// `current` is the running build's version, passed in rather than read from
 /// this crate's manifest: releases are cut from `trove-app`'s version, and
 /// the two must not be allowed to drift apart silently.
-pub fn probe(current: &str) -> Result<Option<(String, String)>, String> {
+pub fn probe(current: &str) -> Result<Option<(String, String)>, Error> {
     let tag = latest_tag()?;
     // `releases/latest` already skips releases GitHub knows are pre-release,
     // but a tag like `v0.5.0-rc.1` published as a *normal* release would come
@@ -131,7 +135,7 @@ pub fn probe(current: &str) -> Result<Option<(String, String)>, String> {
 }
 
 /// The newest release tag with the leading `v` stripped.
-pub fn latest_tag() -> Result<String, String> {
+pub fn latest_tag() -> Result<String, Error> {
     let config = ureq::config::Config::builder()
         // Hand back the `302` itself: the tag we want is in its `location`
         // header, and following the redirect would only fetch an HTML page.
@@ -142,17 +146,19 @@ pub fn latest_tag() -> Result<String, String> {
         .build();
     let response = ureq::Agent::new_with_config(config)
         .head(LATEST_URL)
-        .call()
-        .map_err(|e| e.to_string())?;
+        .call()?;
     let location = response
         .headers()
         .get("location")
         .and_then(|value| value.to_str().ok())
-        .ok_or_else(|| "no location header on the releases/latest response".to_string())?;
+        .ok_or_else(|| {
+            Error::Network("no location header on the releases/latest response".into())
+        })?;
     // Only the tag is taken from the header — the page the user is sent to is
     // always built from `REPO` above, so a hostile or broken response cannot
     // redirect them anywhere.
-    parse_tag(location).ok_or_else(|| format!("unexpected release location: {location}"))
+    parse_tag(location)
+        .ok_or_else(|| Error::Network(format!("unexpected release location: {location}")))
 }
 
 /// Whether `remote` is a newer release than `current`, comparing dotted

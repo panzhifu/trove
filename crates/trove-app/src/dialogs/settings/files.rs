@@ -539,7 +539,7 @@ fn spawn_maintenance_job<T, P>(
         move |_ctx| {
             // Job outcomes are plain values: a panicked/failed job closes the
             // channel and surfaces as a failed task, not through this value.
-            Ok::<_, String>(job(payload))
+            Ok::<_, trove_core::Error>(job(payload))
         },
     );
     let Ok((_task_id, rx)) = started else {

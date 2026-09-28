@@ -105,8 +105,13 @@ struct ExportFile {
     collections: Vec<crate::model::Collection>,
     #[serde(default)]
     tags: Vec<crate::model::Tag>,
+    /// Raw values, parsed one at a time in the import loop: a rule tree an
+    /// older or newer version wrote in a shape this build cannot read is a
+    /// saved search to skip, not a reason the whole catalog fails to parse —
+    /// which is what a `Vec<SmartCollection>` field would make it, since the
+    /// tree is a typed [`crate::model::SmartNode`] now.
     #[serde(default)]
-    smart_collections: Vec<crate::model::SmartCollection>,
+    smart_collections: Vec<serde_json::Value>,
     /// Membership tables. Required rather than defaulted: a file without them
     /// is not something this build's exporter writes, so it is not silently
     /// restored as a library with no memberships.
@@ -1045,7 +1050,7 @@ impl Library {
         input: &crate::model::NewSmartCollection,
     ) -> Result<crate::model::SmartCollection> {
         input.validate()?;
-        smart::validate_json(&input.query)?;
+        smart::validate(&input.query)?;
         smart_collections::create(self.store.conn(), input)
     }
 
@@ -1140,8 +1145,12 @@ impl Library {
         let Some(smart_collection) = smart_collections::get(conn, id)? else {
             return Err(crate::Error::NotFound("smart_collection"));
         };
-        let node = smart::node_from_json(&smart_collection.query)?;
-        let ids = smart::evaluate_filtered(conn, Some(self.text_index()), &node, page)?;
+        let Some(node) = smart_collection.query.node() else {
+            return Err(crate::Error::Validation(
+                "smart collection rule is unreadable by this build".into(),
+            ));
+        };
+        let ids = smart::evaluate_filtered(conn, Some(self.text_index()), node, page)?;
         let items = assets::by_ids(conn, &ids.items)?;
         Ok(crate::model::Page::new(ids.total, items))
     }
@@ -1383,7 +1392,11 @@ impl Library {
             .copied()
             .collect();
         for id in &removed {
-            collections::remove_asset(conn, collection_id, *id)?;
+            collections::remove_asset(
+                conn,
+                crate::model::CollectionId(collection_id),
+                crate::model::AssetId(*id),
+            )?;
         }
         let count = removed.len();
         if count > 0 {
@@ -1587,7 +1600,7 @@ impl Library {
             return Err(error);
         }
 
-        let old_hash = asset.content_hash.clone().unwrap_or_default();
+        let old_hash = asset.content_hash.clone();
         assets::set_linked_media_columns(
             self.store.conn(),
             asset.id,
@@ -1600,9 +1613,10 @@ impl Library {
         // The old thumbnail described content no record references anymore
         // once the last asset on that hash is gone; the new one is rebuilt
         // from the file where it lives.
-        if !old_hash.is_empty() && assets::count_by_content_hash(self.store.conn(), &old_hash)? == 0
+        if let Some(old_hash) = old_hash.as_deref()
+            && assets::count_by_content_hash(self.store.conn(), old_hash)? == 0
         {
-            media::thumb::remove_derived(self.cache(), &old_hash);
+            media::thumb::remove_derived(self.cache(), old_hash);
         }
         media::thumb::regenerate(self.cache(), &hash, asset.kind, &source);
         Ok(true)
@@ -1620,12 +1634,15 @@ impl Library {
         height: u32,
     ) -> Result<()> {
         let staged = media::blob::stage(new_file, self.root(), &asset.ext)?;
-        let old_hash = asset.content_hash.clone().unwrap_or_default();
+        let old_hash = asset.content_hash.clone();
         let old_rel = match asset.location() {
             AssetLocation::Stored { rel_path } => Some(rel_path),
             _ => None,
         };
-        if staged.content_hash.eq_ignore_ascii_case(&old_hash) {
+        if old_hash
+            .as_deref()
+            .is_some_and(|old| staged.content_hash.eq_ignore_ascii_case(old))
+        {
             // The edits produced byte-identical content: the blob in place
             // is already correct.
             return Ok(());
@@ -1645,11 +1662,12 @@ impl Library {
         // Free the old content when this was the last reference to it. Its
         // derived files describe the old pixels and go with it; the new
         // content's card is regenerated below.
-        if assets::count_by_content_hash(self.store.conn(), &old_hash)? == 0
+        let old_hash_ref = old_hash.as_deref().unwrap_or("");
+        if assets::count_by_content_hash(self.store.conn(), old_hash_ref)? == 0
             && let Some(rel) = &old_rel
         {
             self.remove_blob_file(rel);
-            media::thumb::remove_derived(self.cache(), &old_hash);
+            media::thumb::remove_derived(self.cache(), old_hash_ref);
         }
 
         // Thumbnail and visual fingerprint describe the old pixels; both
@@ -1906,7 +1924,11 @@ impl Library {
     }
 
     /// Replace a smart collection's rule.
-    pub fn set_smart_collection_query(&self, id: Uuid, query: &serde_json::Value) -> Result<()> {
+    pub fn set_smart_collection_query(
+        &self,
+        id: Uuid,
+        query: &crate::model::SmartNode,
+    ) -> Result<()> {
         smart_collections::update_query(self.store.conn(), id, query)
     }
 
@@ -2145,14 +2167,24 @@ impl Library {
         // tree (foreign version) is skipped, not fatal.
         let mut sc_map: std::collections::HashMap<Uuid, Uuid> = Default::default();
         let mut created_smarts: Vec<(Uuid, Option<Uuid>, i64)> = Vec::new();
-        for sc in file.smart_collections {
+        for raw in file.smart_collections {
+            let Ok(sc) = serde_json::from_value::<crate::model::SmartCollection>(raw) else {
+                report.skipped += 1;
+                continue;
+            };
+            // A tree this build cannot read (or compile) is a saved search to
+            // skip: the rest of the catalog still restores.
+            let Some(query) = sc.query.node().cloned() else {
+                report.skipped += 1;
+                continue;
+            };
             let input = NewSmartCollection {
                 parent_id: None,
                 name: sc.name.clone(),
-                query: sc.query.clone(),
+                query,
                 position: sc.position,
             };
-            if input.validate().is_ok() && smart::validate_json(&input.query).is_ok() {
+            if input.validate().is_ok() && smart::validate(&input.query).is_ok() {
                 match smart_collections::create(conn, &input) {
                     Ok(created) => {
                         if !sc.appearance.is_plain() {
@@ -2234,7 +2266,11 @@ impl Library {
         for (old_asset, old_coll) in file.asset_collections {
             match (asset_map.get(&old_asset), coll_map.get(&old_coll)) {
                 (Some(a), Some(c)) => {
-                    collections::add_asset(conn, *c, *a)?;
+                    collections::add_asset(
+                        conn,
+                        crate::model::CollectionId(*c),
+                        crate::model::AssetId(*a),
+                    )?;
                 }
                 _ => report.skipped += 1,
             }
@@ -2242,7 +2278,7 @@ impl Library {
         for (old_asset, old_tag) in file.asset_tags {
             match (asset_map.get(&old_asset), tag_map.get(&old_tag)) {
                 (Some(a), Some(t)) => {
-                    tags::add_to_asset(conn, *a, *t)?;
+                    tags::add_to_asset(conn, crate::model::AssetId(*a), crate::model::TagId(*t))?;
                 }
                 _ => report.skipped += 1,
             }
@@ -2301,15 +2337,15 @@ impl Library {
                     _ => None,
                 };
                 assets::delete(tx, *id)?;
-                if let Some(hash) = &hash
-                    && !derived_tx.contains(hash)
-                {
-                    derived_tx.push(hash.clone());
-                }
-                if let (Some(hash), Some(rel)) = (hash, rel)
-                    && assets::count_by_content_hash(tx, &hash)? == 0
-                {
-                    freed_tx.push((rel, hash));
+                if let Some(hash) = hash.as_deref() {
+                    if !derived_tx.iter().any(|seen| seen == hash) {
+                        derived_tx.push(hash.to_string());
+                    }
+                    if let Some(rel) = rel
+                        && assets::count_by_content_hash(tx, hash)? == 0
+                    {
+                        freed_tx.push((rel, hash.to_string()));
+                    }
                 }
             }
             freed = freed_tx;
@@ -2819,7 +2855,12 @@ mod tests {
         assert_eq!(red.id, again.id);
         assert_eq!(red.name, "Red");
 
-        tags::add_to_asset(lib.store().conn(), asset_id, red.id).unwrap();
+        tags::add_to_asset(
+            lib.store().conn(),
+            crate::model::AssetId(asset_id),
+            crate::model::TagId(red.id),
+        )
+        .unwrap();
         let on_asset = tags::for_asset(lib.store().conn(), asset_id).unwrap();
         assert_eq!(on_asset.len(), 1);
         assert_eq!(tags::count_assets(lib.store().conn(), red.id).unwrap(), 1);
@@ -2954,13 +2995,14 @@ mod tests {
             .create_smart_collection(&NewSmartCollection {
                 parent_id: None,
                 name: "Dockpics".into(),
-                query: serde_json::json!({
+                query: crate::store::smart::node_from_json(&serde_json::json!({
                     "op": "and",
                     "children": [
                         { "op": "match", "field": "text", "value": "sunset" },
                         { "op": "match", "field": "is_favorite", "value": true },
                     ]
-                }),
+                }))
+                .unwrap(),
                 position: 0,
             })
             .unwrap();
@@ -3011,7 +3053,12 @@ mod tests {
             },
         )
         .unwrap();
-        tags::add_to_asset(conn, photo_id, tag.id).unwrap();
+        tags::add_to_asset(
+            conn,
+            crate::model::AssetId(photo_id),
+            crate::model::TagId(tag.id),
+        )
+        .unwrap();
 
         // Wipe the index, then reopen the library from disk: the reconcile
         // step must notice the empty index and rebuild it from the rows.
@@ -3059,11 +3106,12 @@ mod tests {
             .create_smart_collection(&NewSmartCollection {
                 parent_id: None,
                 name: "old".into(),
-                query: serde_json::json!({
+                query: crate::store::smart::node_from_json(&serde_json::json!({
                     "op": "match",
                     "field": "text",
                     "value": "x",
-                }),
+                }))
+                .unwrap(),
                 position: 0,
             })
             .unwrap();
@@ -3313,7 +3361,10 @@ mod tests {
             },
         )
         .unwrap();
-        let fav = serde_json::json!({"op": "match", "field": "is_favorite", "value": true});
+        let fav = crate::store::smart::node_from_json(&serde_json::json!({
+            "op": "match", "field": "is_favorite", "value": true
+        }))
+        .unwrap();
         let under_coll = lib
             .create_smart_collection(&NewSmartCollection {
                 parent_id: Some(coll.id),
@@ -3449,7 +3500,7 @@ mod tests {
         )
         .unwrap();
 
-        tags::add_to_asset(conn, ia, cat.id).unwrap();
+        tags::add_to_asset(conn, crate::model::AssetId(ia), crate::model::TagId(cat.id)).unwrap();
         lib.patch_asset(
             ib,
             &AssetPatch {

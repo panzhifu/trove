@@ -15,8 +15,10 @@
 mod appearance;
 mod asset;
 mod collection;
+mod content_hash;
 mod embedding;
 mod facts;
+mod id;
 mod query;
 mod rating;
 mod smart_query;
@@ -28,11 +30,13 @@ pub use asset::{
     NewAsset, Orientation, Origin, Placement, RESOLUTION_BAND_BOUNDS, ResolutionBand, UsageStatus,
 };
 pub use collection::{Collection, NewCollection, NewSmartCollection, SmartCollection};
+pub use content_hash::{ContentHash, HEX_LEN};
 pub use embedding::{EmbeddingSpace, MAX_DIM, NewEmbedding, VectorMatch, normalized};
 pub use facts::{AssetFacts, AudioFacts, FontFacts, MediaTagsFacts, PhotoFacts, VisualFacts};
+pub use id::{AssetId, CollectionId, TagId};
 pub use query::{AssetQuery, AssetSort, Page, QueryCondition, TrashPool};
 pub use rating::{MAX_RATING, MIN_RATING, Rating};
-pub use smart_query::{SmartCompare, SmartField, SmartNode};
+pub use smart_query::{SavedQuery, SmartCompare, SmartField, SmartNode};
 pub use tag::{NewTag, Tag};
 
 use chrono::{DateTime, Utc};
@@ -68,7 +72,7 @@ pub fn test_asset(name: &str, kind: AssetKind, id: Uuid) -> Asset {
         }
         .into(),
         size_bytes: 128,
-        content_hash: Some("a".repeat(64)),
+        content_hash: Some(ContentHash::from_hasher("a".repeat(64))),
         kind,
         width: Some(800),
         height: Some(600),

@@ -780,7 +780,7 @@ impl Render for InspectorPanel {
                 font_glyphs,
                 font_italic,
                 font_blob.as_deref(),
-                asset.content_hash.clone(),
+                asset.content_hash.as_deref().map(str::to_string),
             );
             content = content.child(self.collapsible_section(
                 "font",

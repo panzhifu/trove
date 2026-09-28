@@ -7,7 +7,7 @@ use uuid::Uuid;
 
 use super::rows::{self, bind_opt_uuid, int, opt_str, req_str, req_ts, req_uuid};
 use crate::error::{Error, Result};
-use crate::model::{Appearance, Collection, NewCollection};
+use crate::model::{Appearance, AssetId, Collection, CollectionId, NewCollection};
 
 /// Insert a collection, creating its id and timestamps.
 pub fn create(conn: &Connection, input: &NewCollection) -> Result<Collection> {
@@ -202,25 +202,32 @@ pub fn delete(conn: &Connection, id: Uuid) -> Result<()> {
 
 /// Attach an asset to a collection. Re-attaching is a no-op that keeps the
 /// existing position.
-pub fn add_asset(conn: &Connection, collection_id: Uuid, asset_id: Uuid) -> Result<()> {
+///
+/// The two ids are different types so they cannot be swapped — see
+/// [`crate::model::AssetId`].
+pub fn add_asset(conn: &Connection, collection_id: CollectionId, asset_id: AssetId) -> Result<()> {
     rows::execute(
         conn,
         "INSERT OR IGNORE INTO asset_collection (asset_id, collection_id, position)
          VALUES (?1, ?2,
              (SELECT COALESCE(MAX(position) + 1, 0) FROM asset_collection WHERE collection_id = ?2))",
-        vec![rows::uuid(asset_id).into(), rows::uuid(collection_id).into()],
+        vec![rows::uuid(asset_id.0).into(), rows::uuid(collection_id.0).into()],
     )?;
     Ok(())
 }
 
 /// Detach an asset from a collection.
-pub fn remove_asset(conn: &Connection, collection_id: Uuid, asset_id: Uuid) -> Result<()> {
+pub fn remove_asset(
+    conn: &Connection,
+    collection_id: CollectionId,
+    asset_id: AssetId,
+) -> Result<()> {
     rows::execute(
         conn,
         "DELETE FROM asset_collection WHERE collection_id = ?1 AND asset_id = ?2",
         vec![
-            rows::uuid(collection_id).into(),
-            rows::uuid(asset_id).into(),
+            rows::uuid(collection_id.0).into(),
+            rows::uuid(asset_id.0).into(),
         ],
     )?;
     Ok(())

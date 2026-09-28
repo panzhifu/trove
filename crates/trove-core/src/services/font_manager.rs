@@ -11,6 +11,8 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::error::Error;
+
 /// `(directory, user_writable)` pairs scanned for fonts, user dirs first.
 pub fn system_font_dirs() -> Vec<(PathBuf, bool)> {
     let mut dirs = Vec::new();
@@ -49,14 +51,16 @@ pub fn is_user_writable(path: &Path) -> bool {
 
 /// Remove a user-installed font file and refresh the font cache. Refuses
 /// anything outside the per-user directories.
-pub fn uninstall_system_font(path: &Path) -> Result<(), String> {
+pub fn uninstall_system_font(path: &Path) -> Result<(), Error> {
     if !path.is_file() {
-        return Err("font file not found".to_string());
+        return Err(Error::NotFound("font file"));
     }
     if !is_user_writable(path) {
-        return Err("this font belongs to the system and cannot be removed here".to_string());
+        return Err(Error::Validation(
+            "this font belongs to the system and cannot be removed here".into(),
+        ));
     }
-    std::fs::remove_file(path).map_err(|e| e.to_string())?;
+    std::fs::remove_file(path)?;
     refresh_cache();
     Ok(())
 }
