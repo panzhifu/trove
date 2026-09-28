@@ -510,15 +510,18 @@ fn apply_atomic(conn: &Connection, step: impl FnOnce(&Connection) -> Result<()>)
 mod tests {
     use super::*;
     use crate::library::Library;
-    use crate::model::{Asset, AssetKind, NewCollection, NewTag, Origin, UsageStatus, now};
+    use crate::model::{
+        Asset, AssetKind, AssetLocation, AssetSeed, NewCollection, NewTag, UsageStatus, now,
+    };
     use crate::store::Store;
 
     fn sample_asset(name: &str, kind: AssetKind) -> Asset {
         let id = Uuid::new_v4();
-        Asset {
+        Asset::from_seed(AssetSeed {
             id,
-            origin: Origin::Stored,
-            rel_path: Some(format!("media/{}/{}", &id.to_string()[..2], name)),
+            location: AssetLocation::Stored {
+                rel_path: format!("media/{}/{}", &id.to_string()[..2], name),
+            },
             file_name: name.to_string(),
             ext: "png".into(),
             mime: "image/png".into(),
@@ -540,7 +543,7 @@ mod tests {
             created_at: now(),
             updated_at: now(),
             trashed_at: None,
-        }
+        })
     }
 
     /// Undo runs its inverse inside a transaction, so an inverse that cannot

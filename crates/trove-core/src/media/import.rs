@@ -25,7 +25,7 @@ use uuid::Uuid;
 use super::metadata;
 use super::pipeline::{self, StageIo};
 use crate::error::{Error, Result};
-use crate::model::{Asset, AssetKind, AssetLocation, Origin, UsageStatus, now};
+use crate::model::{Asset, AssetKind, AssetLocation, AssetSeed, UsageStatus, now};
 use crate::store::{Store, assets, collections};
 use rusqlite::Connection;
 
@@ -444,18 +444,21 @@ pub fn commit_staged(
     // decode the thumbnail and the palette were read from, so nothing is
     // decoded twice and nothing is deferred.
 
-    let asset = Asset {
+    // One decision rather than two columns that have to agree: a linked import
+    // points at the file where it already is, a stored one at the blob the
+    // stager placed under the library root.
+    let location = if staged.linked {
+        AssetLocation::Linked {
+            source_path: staged.path.display().to_string(),
+        }
+    } else {
+        AssetLocation::Stored {
+            rel_path: staged.rel_path.clone(),
+        }
+    };
+    let asset = Asset::from_seed(AssetSeed {
         id: Uuid::new_v4(),
-        origin: if staged.linked {
-            Origin::Linked
-        } else {
-            Origin::Stored
-        },
-        rel_path: if staged.linked {
-            None
-        } else {
-            Some(staged.rel_path.clone())
-        },
+        location,
         file_name: staged.file_name.clone(),
         ext: staged.ext.clone(),
         mime: staged.mime.clone(),
@@ -477,7 +480,7 @@ pub fn commit_staged(
         created_at: now(),
         updated_at: now(),
         trashed_at: None,
-    };
+    });
     assets::insert(conn, &asset)?;
     for cid in &targets {
         collections::add_asset(conn, *cid, asset.id)?;
@@ -587,8 +590,7 @@ mod tests {
         let asset = &all.items[0];
         // Linked record: no blob copied, origin linked, original location
         // recorded in the facts.
-        assert_eq!(asset.origin, Origin::Linked);
-        assert!(asset.rel_path.is_none());
+        assert!(matches!(asset.location(), AssetLocation::Linked { .. }));
         assert!(walk_blobs(&root.join("media")).is_empty());
         assert_eq!(
             asset.facts.source_path.as_deref(),
@@ -639,13 +641,15 @@ mod tests {
 
         let all = assets::query(store.conn(), &AssetQuery::default()).unwrap();
         let asset = &all.items[0];
-        assert_eq!(asset.origin, Origin::Stored);
-        assert!(asset.rel_path.is_some());
+        assert!(matches!(asset.location(), AssetLocation::Stored { .. }));
         // The blob is inside the data root, so deleting the source afterwards
         // leaves the asset intact.
         assert_eq!(walk_blobs(&root.join("media")).len(), 1);
         std::fs::remove_file(&src).unwrap();
-        assert!(root.join(asset.rel_path.as_deref().unwrap()).is_file());
+        let AssetLocation::Stored { rel_path } = asset.location() else {
+            panic!("a stored import names its own blob");
+        };
+        assert!(root.join(rel_path).is_file());
 
         std::fs::remove_dir_all(&root).ok();
     }

@@ -23,7 +23,7 @@ use gpui_kit::component::{Sizable, WindowExt as _};
 use gpui_kit::*;
 
 use trove_core::media::edit::ImageEdit;
-use trove_core::model::{Asset, AssetKind, Origin};
+use trove_core::model::{Asset, AssetKind};
 
 use crate::components::controls::{self, muted_label};
 use crate::library::LibraryController;
@@ -225,7 +225,7 @@ impl EditDialog {
         // Linked assets are editable — the result is written back over the
         // original file — but the user should see that coming before they
         // pick options.
-        let linked = images.iter().filter(|a| a.origin == Origin::Linked).count();
+        let linked = images.iter().filter(|a| a.location().is_linked()).count();
         window.open_dialog(cx, move |dialog, window, cx| {
             let crop_left = cx.new(|cx| InputState::new(window, cx).placeholder("0"));
             let crop_top = cx.new(|cx| InputState::new(window, cx).placeholder("0"));

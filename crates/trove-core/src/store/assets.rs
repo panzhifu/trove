@@ -9,8 +9,8 @@ use uuid::Uuid;
 use super::rows::{self, bind_opt_int, bind_opt_str, bind_opt_ts};
 use crate::error::{Error, Result};
 use crate::model::{
-    Asset, AssetFacts, AssetKind, AssetLocation, AssetPatch, AssetQuery, Orientation, Origin, Page,
-    UsageStatus, now,
+    Asset, AssetFacts, AssetKind, AssetLocation, AssetPatch, AssetQuery, AssetSeed, Orientation,
+    Page, UsageStatus, now,
 };
 
 /// Column list shared by every read; index order matches `asset_from_row`.
@@ -621,14 +621,29 @@ pub fn duplicate_groups(conn: &Connection) -> Result<Vec<DuplicateGroup>> {
 // -- row mapping -------------------------------------------------------------
 
 pub(crate) fn asset_from_row(row: &rusqlite::Row) -> Result<Asset> {
-    Ok(Asset {
-        id: rows::req_uuid(row, 0)?,
-        origin: match rows::req_str(row, 1)?.as_str() {
-            "stored" => Origin::Stored,
-            "linked" => Origin::Linked,
-            other => return Err(Error::Db(format!("bad origin {other}"))),
+    let origin_word = rows::req_str(row, 1)?;
+    let rel_path = rows::opt_str(row, 2)?;
+    let facts = parse_facts(&rows::req_str(row, 18)?)?;
+    // The two location columns and the `extra.source_path` key are one fact, so
+    // they are read as one value here. An unknown `origin` word is still an
+    // error -- that is a row this build cannot name at all; the two shapes it
+    // *can* name but no writer produces (`stored`-without-path arrived here as
+    // a NULL, and so did `linked`-without-path) are now named states rather than
+    // absent values.
+    let location = match origin_word.as_str() {
+        "stored" => match rel_path {
+            Some(rel_path) => AssetLocation::Stored { rel_path },
+            None => AssetLocation::Placeholder,
         },
-        rel_path: rows::opt_str(row, 2)?,
+        "linked" => match facts.source_path.clone() {
+            Some(source_path) => AssetLocation::Linked { source_path },
+            None => AssetLocation::Unrecorded,
+        },
+        other => return Err(Error::Db(format!("bad origin {other}"))),
+    };
+    Ok(Asset::from_seed(AssetSeed {
+        id: rows::req_uuid(row, 0)?,
+        location,
         file_name: rows::req_str(row, 3)?,
         ext: rows::req_str(row, 4)?,
         mime: rows::req_str(row, 5)?,
@@ -647,13 +662,13 @@ pub(crate) fn asset_from_row(row: &rusqlite::Row) -> Result<Asset> {
         rating: rows::opt_int(row, 15)?.map(|v| v as u8),
         is_favorite: rows::boolean(row, 16)?,
         source_url: rows::opt_str(row, 17)?,
-        facts: parse_facts(&rows::req_str(row, 18)?)?,
+        facts,
         created_at: rows::req_ts(row, 19)?,
         updated_at: rows::req_ts(row, 20)?,
         trashed_at: rows::opt_ts(row, 21)?,
         usage_status: parse_usage_status(&rows::req_str(row, 22)?)?,
         commercial_use: rows::opt_int(row, 23)?.map(|v| v != 0),
-    })
+    }))
 }
 
 fn asset_values(a: &Asset) -> Vec<Value> {

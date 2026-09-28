@@ -15,7 +15,7 @@ use gpui_kit::component::{ActiveTheme, Icon, IconName, Sizable};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
-use trove_core::model::{AssetKind, AssetPatch, MAX_RATING, Origin, UsageStatus};
+use trove_core::model::{AssetKind, AssetPatch, MAX_RATING, UsageStatus};
 use uuid::Uuid;
 
 use crate::components::preview::{AssetPreviewData, PreviewContext};
@@ -360,7 +360,7 @@ impl Render for InspectorPanel {
         // Where the file lives: linked assets point at their original
         // location (recorded at import), stored assets at the library blob.
         // `None` (file missing) renders the "File missing" row below.
-        let linked = asset.origin == Origin::Linked;
+        let linked = asset.location().is_linked();
         let disk_path: Option<std::path::PathBuf> = ctl.library.asset_file(asset.id);
         let kind = asset.kind;
         let rating = asset.rating;
@@ -390,10 +390,12 @@ impl Render for InspectorPanel {
                 // Linked fonts are read straight from their original file.
                 disk_path.clone()
             } else {
-                asset
-                    .rel_path
-                    .as_ref()
-                    .map(|rel| ctl.library.root().join(rel))
+                match asset.location() {
+                    trove_core::model::AssetLocation::Stored { rel_path } => {
+                        Some(ctl.library.root().join(rel_path))
+                    }
+                    _ => None,
+                }
             }
         } else {
             None

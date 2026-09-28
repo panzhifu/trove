@@ -5,7 +5,7 @@
 > **本轮（09-28）只有 Trove 动了，Serpent 一格没变**：上游仓库仍停在 **v0.2.9**，`src/` 仍是 **849 文件 / 258,255 行**、`MIGRATIONS` 仍是 32 段、末条 `version: 56`，与 09-27 那次复核逐字相同。所以 §2026-09-27 复核 那张表**不需要重审 Serpent 侧**，只需要把 Trove 这一轮的工作树改动记进去——记在 **§2026-09-28 复核** 那一节，并且**就地改掉了那一节里三行的状态**（音频卡片、检查器逗号输入标签、以及纵深索引升到的第 4、5 版）。Trove 这一轮动了什么、其中两件事**只做了一半就说自己做完了**，全部记在那一节里。
 >
 > **上一轮（09-27）两边都动了**：Trove 发了 **v0.4.9**（模型材质与共享 GPU 渲染器那一轮、智能集合同级拖拽重排、预览里方向键换素材、以及**卡片"活过来"的触发从指针定住改成按空格**——见 §C 的活卡片行与 [PREVIEW-SYSTEM.md](./PREVIEW-SYSTEM.md)），Serpent 从 v0.2.6 走到 v0.2.9。后者的增量单独成节，见 **§2026-09-27 复核**。
-> 核验日期 **2026-09-28**（同一天连做九轮，见 §2026-09-28 复核 与 第二~第九轮；更早是 09-27 / 09-25 / 09-24 / 09-23）。两边的数字都取自源码而非各自文档：Serpent `src/` **849 文件 / 258,255 行** `.ts`+`.tsx`（与 09-27 逐字相同），**schema 仍是 v56 一格没加**——`MIGRATIONS` 32 段、末条 `version: 56`，`SUPPORTED_SCHEMA_VERSION = MIGRATIONS.at(-1)!.version`。Trove `crates/` **228 文件 / 115,474 行** `.rs`（第四轮加 `media/anim.rs`、第六轮加 `preview/anim.rs`）（09-27 记的是 224 / 110,221）。schema **v22**——v19 加了序列帧两张侧表、v20 加了 `source_path` 虚拟列与索引、v21 加了 `task_journal` 一张表、**v22 把没人读写过的 `ai_analysis` 删掉**；`INDEX_VERSION` 从 09-27 的 3 走到 **5**（见 §D 纵深索引行）；包版本 **0.4.9**（本轮未 bump）；`en.toml` **798** 个叶子键；测试 **806 core + 74 app = 880** 全绿 3 ignored，`cargo test --workspace --all-targets` 实跑，`cargo fmt --all -- --check` 与 `cargo clippy --workspace --all-targets -- -D warnings` 两道门同轮一起过。
+> 核验日期 **2026-09-28**（同一天连做十轮，见 §2026-09-28 复核 与 第二~第十轮；更早是 09-27 / 09-25 / 09-24 / 09-23）。两边的数字都取自源码而非各自文档：Serpent `src/` **849 文件 / 258,255 行** `.ts`+`.tsx`（与 09-27 逐字相同），**schema 仍是 v56 一格没加**——`MIGRATIONS` 32 段、末条 `version: 56`，`SUPPORTED_SCHEMA_VERSION = MIGRATIONS.at(-1)!.version`。Trove `crates/` **228 文件 / 115,969 行** `.rs`（第四轮加 `media/anim.rs`、第六轮加 `preview/anim.rs`）（09-27 记的是 224 / 110,221）。schema **v22**——v19 加了序列帧两张侧表、v20 加了 `source_path` 虚拟列与索引、v21 加了 `task_journal` 一张表、**v22 把没人读写过的 `ai_analysis` 删掉**；`INDEX_VERSION` 从 09-27 的 3 走到 **5**（见 §D 纵深索引行）；包版本 **0.4.9**（本轮未 bump）；`en.toml` **798** 个叶子键；测试 **810 core + 74 app = 884** 全绿 3 ignored，`cargo test --workspace --all-targets` 实跑，`cargo fmt --all -- --check` 与 `cargo clippy --workspace --all-targets -- -D warnings` 两道门同轮一起过。
 >
 > **09-27 那一轮把上上轮三处"确认缺失"推翻了两处**，都是同一个失败模式——按 Serpent 的实现符号去 grep（`CF_HDROP`、`xdnd`、`file_drop`），命中零就记成"没有"，而没有按**能力**去问（"能不能把文件拖出窗口"）：
 > ① **原生文件拖出早就有**（`2026-09-12` 的 `ce6a29d` 起，`panels/workspace/cells.rs:199-215` 网格格、`:494-510` 列表行，见 §A。上一版这里写的 `:192`、`:406` 已经漂走，本轮重数过）；
@@ -280,6 +280,26 @@ Serpent 侧依旧一格没动。这一轮收 §2026-09-27 复核 里那条 S 级
 **门**：**806 core + 74 app = 880** 全绿 3 ignored，`fmt` 与 `clippy -D warnings` 同轮过。分析结果本身不受影响：它一直住在 `assets.extra` 的 `ai_analysis` 标记里（`tasks/ai_analysis.rs` 的 `MARKER_KEY`），撤销路径读的就是那一处，那张表从来没人写过。
 
 **下一格 P2**（`AssetLocation` 三态命名）与 P1 的区别要说清：P1 的 64 个点由编译器逐个点名，P2 改的是 `Asset` 本身——`origin` 57 处、`rel_path` 56 处、`source_path` 77 处、9 个构造点，且决定里包含"导出 JSON 字节兼容"。做法是先用一个 wire 影子结构把今天的形状钉成测试（round-trip 全字段相等，漏一个字段就红），再动类型。解码器必须是全函数，而 `Linked` 缺 `source_path` 只可能来自坏数据（`media/import.rs:440` 写侧总是填），所以类型给它第四个状态而不是撒谎——这一条是我定的，不在批准的选择之外，改名或去掉只动一处。
+
+---
+
+## 2026-09-28 第十轮：P2 —— 资产"文件在哪"变成一个值
+
+**落了什么**。`AssetLocation` 四态：`Stored { rel_path }` / `Placeholder` / `Linked { source_path }` / `Unrecorded`。`Asset` 的两列 `origin` + `rel_path` 收成 **private**，唯一入口是 `Asset::from_seed(AssetSeed { location, .. })`（构造）与 `Asset::location()` / `set_location()`（读写）。14 个 `Asset { … }` 构造点（5 生产写者 + 行解码器 + 6 测试夹具 + 2 bench example）全部改走 `from_seed`，改完 `grep` 核实：**core 之外 0 处读写这两个字段，core 内除 `model/asset.rs` 也 0 处**。
+
+**为什么是四态而不是三态**。解码器必须是全函数。`Linked` 缺 `source_path` 只可能来自坏数据（`media/import.rs` 每个链接导入都写路径），把它塞进 `Placeholder` 是撒谎——`Placeholder` 的含义是"restore 会来救它"，而一个丢了路径的链接没有 restore 能救。命名出来比 `Option` 强：调用方现在必须面对它。
+
+**一个中途被实测推翻的假设**。原计划把 `source_path` 从 `AssetFacts` 里删掉、由行编码器写回 JSON 键。两件事让它不成立：① `AssetFacts` 有 `unknown` 兜底，删字段不会删键，只会让它以无类型条目的形式**被读回来**——等于从另一个方向造出要消灭的第二份副本；② 那个键**从来不只是链接位置**：`media/import.rs:440` 给每个导入都写它（含复制进库的 stored），注释自己写着"记住文件从哪来：文件夹面板按它分组"。所以字段留在 `AssetFacts`（收 `pub(crate)`），另给一个具名写入口 `Asset::set_provenance`；`location()` 只在 `Linked` 下读那个键，`set_location` 不清它，两件事不再互相覆盖。schema 的生成列 `source_path` 与它的专用索引因此一格没动。
+
+**顺带删掉的一份重复**：app 里有 5 处各自实现"这条记录的文件在哪"（preview / 检查器字体 / 右键两处 / 网格 model / 反向搜图）。它们全改成调已经存在的 `media::thumb::blob_path`。一条规则写五遍就是会漂的规则——这也是 P1 关门之后才能这样收口的那类事。
+
+**两处行为差异，都只在"没有写者会产生的行"上**，写进 commit 而不埋进 diff：`relink_asset` 原先拒绝一条"linked 但带 rel_path"的行，现在接受（它的报错文案一直说它要的是 linked 资产）；`purge_assets` 原先会因为一条 linked 行上恰好有 `rel_path` 就去删那个文件，现在只删 `Stored` 指名的——永久删除这条路上，缩小权限是唯一不会说错的方向。
+
+**字节兼容怎么证的**：P2a 那四条测试是**先写、对着旧形状跑绿、再动类型**（键集 24 个、四种状态各把路径写在哪、一条全字段 round-trip、`location`/`set_location` 互逆），所以"导出格式没动"这句话有东西在守，不是我的断言。
+
+**门**：**810 core + 74 app = 884** 全绿 3 ignored；`fmt`、`clippy -D warnings` 同轮过。`crates/` **228 文件 / 115,969 行**，schema 仍 v22。
+
+**没做的**：占位资产的可见行为一字未改（批准范围内）——它在网格里仍表现为"没有文件"，"内容未导入"这句要单独一轮；`set_location(Unrecorded)` 会清掉 `source_path`，这是唯一会清出处的情形，因为那条记录本来就无处可去；P3（`Placement` 收掉 `trashed_at`/`is_trashed`/`in_trash` 三种写法）、P4（`Rating`/`ContentHash` + SQL CHECK + 坏行降级不失败整份列表）、P5（智能集规则 `Json` → `SmartNode`）未动。
 
 ---
 

@@ -16,7 +16,8 @@ use std::time::Instant;
 use chrono::Utc;
 use trove_core::library::Library;
 use trove_core::model::{
-    Asset, AssetKind, AssetPatch, AssetQuery, NewTag, Orientation, Origin, UsageStatus,
+    Asset, AssetKind, AssetLocation, AssetPatch, AssetQuery, AssetSeed, NewTag, Orientation,
+    UsageStatus,
 };
 use trove_core::store::{assets, tags};
 
@@ -35,10 +36,11 @@ use uuid::Uuid;
 
 fn asset(name: &str, ext: &str, kind: AssetKind, title: Option<&str>, desc: Option<&str>) -> Asset {
     let id = Uuid::new_v4();
-    Asset {
+    Asset::from_seed(AssetSeed {
         id,
-        origin: Origin::Stored,
-        rel_path: Some(format!("media/{}/{}", &id.to_string()[..2], name)),
+        location: AssetLocation::Stored {
+            rel_path: format!("media/{}/{}", &id.to_string()[..2], name),
+        },
         file_name: name.to_string(),
         ext: ext.to_string(),
         mime: format!("application/{ext}"),
@@ -60,7 +62,7 @@ fn asset(name: &str, ext: &str, kind: AssetKind, title: Option<&str>, desc: Opti
         created_at: Utc::now(),
         updated_at: Utc::now(),
         trashed_at: None,
-    }
+    })
 }
 
 fn tmp_root(label: &str) -> PathBuf {

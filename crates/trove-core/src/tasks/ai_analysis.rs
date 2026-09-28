@@ -882,7 +882,7 @@ fn concurrency(explicit: Option<usize>) -> usize {
 mod tests {
     use super::*;
     use crate::ai::vendor::{VendorError, VendorErrorKind, VendorId};
-    use crate::model::Origin;
+    use crate::model::AssetLocation;
     use crate::store::Store;
 
     struct MockAdapter {
@@ -956,11 +956,12 @@ mod tests {
                 AssetKind::Image,
                 Uuid::new_v4(),
             );
-            asset.origin = Origin::Linked;
             asset.content_hash = Some(hash);
             asset.width = Some(32);
             asset.height = Some(32);
-            asset.facts.source_path = Some(source.display().to_string());
+            asset.set_location(AssetLocation::Linked {
+                source_path: source.display().to_string(),
+            });
             assets::insert(store.conn(), &asset).unwrap();
         }
         (root, data, cache)

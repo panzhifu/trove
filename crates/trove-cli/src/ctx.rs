@@ -317,7 +317,10 @@ pub fn asset_summary(env: &Env, asset: &Asset) -> Value {
         "is_favorite": asset.is_favorite,
         "usage_status": asset.usage_status,
         "trashed": asset.trashed_at.is_some(),
-        "origin": asset.origin,
+        // The v2 word for the storage shape, derived from the one value that
+        // carries it now. `is_linked` is also true for a linked record that
+        // lost its path, which is exactly what the old column said about it.
+        "origin": if asset.location().is_linked() { "linked" } else { "stored" },
         "created_at": asset.created_at,
     })
 }

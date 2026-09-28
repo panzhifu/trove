@@ -283,18 +283,19 @@ fn already_applied(statement: &str, message: &str) -> bool {
 mod tests {
     use super::{Store, schema};
     use crate::model::{
-        Asset, AssetKind, AssetPatch, AssetQuery, NewCollection, NewTag, Origin, Page, UsageStatus,
-        now,
+        Asset, AssetKind, AssetLocation, AssetPatch, AssetQuery, AssetSeed, NewCollection, NewTag,
+        Page, UsageStatus, now,
     };
     use crate::store::{assets, collections, sequences, smart_collections, tags, task_journal};
     use uuid::Uuid;
 
     fn sample_asset(name: &str, kind: AssetKind) -> Asset {
         let id = Uuid::new_v4();
-        Asset {
+        Asset::from_seed(AssetSeed {
             id,
-            origin: Origin::Stored,
-            rel_path: Some(format!("media/{}/{}", &id.to_string()[..2], name)),
+            location: AssetLocation::Stored {
+                rel_path: format!("media/{}/{}", &id.to_string()[..2], name),
+            },
             file_name: name.to_string(),
             ext: "png".into(),
             mime: "image/png".into(),
@@ -316,7 +317,7 @@ mod tests {
             created_at: now(),
             updated_at: now(),
             trashed_at: None,
-        }
+        })
     }
 
     #[test]
@@ -826,9 +827,9 @@ mod tests {
 
         let before = {
             let mut asset = sample_asset("before.png", AssetKind::Image);
-            asset.origin = Origin::Linked;
-            asset.rel_path = None;
-            asset.facts.source_path = Some("/photos/2025/old roll/before.png".into());
+            asset.set_location(AssetLocation::Linked {
+                source_path: "/photos/2025/old roll/before.png".into(),
+            });
             asset
         };
         {
@@ -936,9 +937,9 @@ mod tests {
         let store = Store::in_memory().unwrap();
         for i in 0..2000 {
             let mut asset = sample_asset(&format!("a{i:05}.png"), AssetKind::Image);
-            asset.origin = Origin::Linked;
-            asset.rel_path = None;
-            asset.facts.source_path = Some(format!("/photos/2026/roll-{:04}/a{i:05}.png", i % 160));
+            asset.set_location(AssetLocation::Linked {
+                source_path: format!("/photos/2026/roll-{:04}/a{i:05}.png", i % 160),
+            });
             assets::insert(store.conn(), &asset).unwrap();
         }
         store.ensure_statistics().unwrap();

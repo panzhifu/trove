@@ -192,10 +192,13 @@ pub enum UsageStatus {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Asset {
     pub id: Uuid,
-    pub origin: Origin,
-    /// Content-addressed path inside the library when `origin == Stored`,
-    /// e.g. `media/ab/cdef0123….png`. `None` for `Linked`.
-    pub rel_path: Option<String>,
+    /// The two columns that back [`Asset::location`]: private, because a pair
+    /// of them could disagree, and the only way to write them is
+    /// [`Asset::set_location`] (or [`Asset::from_seed`], which calls it). Readers
+    /// outside this module ask for the location; the storage shape stays visible
+    /// to serde, whose derives run here.
+    origin: Origin,
+    rel_path: Option<String>,
     /// Original file name, kept for export / display. May repeat.
     pub file_name: String,
     pub ext: String,
@@ -234,6 +237,78 @@ pub struct Asset {
     pub updated_at: DateTime<Utc>,
     /// `None` while live; set to the deletion moment when in the trash.
     pub trashed_at: Option<DateTime<Utc>>,
+}
+
+/// Everything needed to make an [`Asset`] that is not derived from a row.
+///
+/// Shaped like `NewAsset`/`NewCollection`/`NewTag`: an input struct with one
+/// field per column, so a construction site that forgets something fails to
+/// compile rather than inventing a default. The location is one field here, not
+/// the two it is stored as — which is the entire reason this type exists.
+#[derive(Debug, Clone)]
+pub struct AssetSeed {
+    pub id: Uuid,
+    pub location: AssetLocation,
+    pub file_name: String,
+    pub ext: String,
+    pub mime: String,
+    pub size_bytes: u64,
+    pub content_hash: Option<String>,
+    pub kind: AssetKind,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+    pub duration_ms: Option<u64>,
+    pub captured_at: Option<DateTime<Utc>>,
+    pub title: Option<String>,
+    pub description: Option<String>,
+    pub rating: Option<u8>,
+    pub is_favorite: bool,
+    pub source_url: Option<String>,
+    pub usage_status: UsageStatus,
+    pub commercial_use: Option<bool>,
+    pub facts: AssetFacts,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    pub trashed_at: Option<DateTime<Utc>>,
+}
+
+impl Asset {
+    /// Build a record from `seed`.
+    ///
+    /// The location arrives as one value and is written through
+    /// [`Asset::set_location`], so no caller can put `stored` next to an absent
+    /// path — the pair that used to be reachable by setting two fields and that
+    /// four separate places then had to detect and repair at runtime.
+    pub fn from_seed(seed: AssetSeed) -> Asset {
+        let mut asset = Self {
+            id: seed.id,
+            origin: Origin::Stored,
+            rel_path: None,
+            file_name: seed.file_name,
+            ext: seed.ext,
+            mime: seed.mime,
+            size_bytes: seed.size_bytes,
+            content_hash: seed.content_hash,
+            kind: seed.kind,
+            width: seed.width,
+            height: seed.height,
+            duration_ms: seed.duration_ms,
+            captured_at: seed.captured_at,
+            title: seed.title,
+            description: seed.description,
+            rating: seed.rating,
+            is_favorite: seed.is_favorite,
+            source_url: seed.source_url,
+            usage_status: seed.usage_status,
+            commercial_use: seed.commercial_use,
+            facts: seed.facts,
+            created_at: seed.created_at,
+            updated_at: seed.updated_at,
+            trashed_at: seed.trashed_at,
+        };
+        asset.set_location(seed.location);
+        asset
+    }
 }
 
 impl Asset {

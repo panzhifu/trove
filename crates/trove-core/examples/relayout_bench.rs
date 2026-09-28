@@ -1,7 +1,7 @@
 //! Times the per-render work that surrounds `justify_layout` during a
 //! resize: SQL query, per-asset `is_file()` stats, and Cell rebuilding.
 use std::time::Instant;
-use trove_core::model::{Asset, AssetKind, AssetQuery, AssetSort, UsageStatus};
+use trove_core::model::{Asset, AssetKind, AssetQuery, AssetSeed, AssetSort, UsageStatus};
 use trove_core::store::{self, assets};
 
 fn bench(label: &str, n_assets: usize, runs: usize) {
@@ -13,9 +13,9 @@ fn bench(label: &str, n_assets: usize, runs: usize) {
 
     let mut batch = Vec::new();
     for i in 0..n_assets {
-        let a = Asset {
+        let a = Asset::from_seed(AssetSeed {
             id: uuid::Uuid::new_v4(),
-            origin: trove_core::model::Origin::Linked,
+            location: trove_core::model::AssetLocation::Unrecorded,
             file_name: format!("photo-seventeen-{i:06}.jpg"),
             ext: "jpg".into(),
             mime: "image/jpeg".into(),
@@ -27,7 +27,6 @@ fn bench(label: &str, n_assets: usize, runs: usize) {
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
             trashed_at: None,
-            rel_path: None,
             duration_ms: None,
             captured_at: None,
             title: None,
@@ -38,7 +37,7 @@ fn bench(label: &str, n_assets: usize, runs: usize) {
             usage_status: UsageStatus::Unused,
             commercial_use: None,
             facts: Default::default(),
-        };
+        });
         batch.push(a);
     }
     let t = Instant::now();

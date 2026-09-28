@@ -2095,7 +2095,7 @@ impl Library {
     /// a placeholder record that self-heals when the file is re-imported
     /// (content-addressed storage keys both paths by hash).
     pub fn import_metadata(&self, json: &str) -> Result<MetadataImportReport> {
-        use crate::model::{NewSmartCollection, Origin};
+        use crate::model::NewSmartCollection;
 
         let file: ExportFile = serde_json::from_str(json)
             .map_err(|e| crate::Error::Validation(format!("not a Trove export: {e}")))?;
@@ -2204,10 +2204,14 @@ impl Library {
                 continue;
             }
             let id = Uuid::new_v4();
-            let placeholder = crate::model::Asset {
+            let placeholder = crate::model::Asset::from_seed(crate::model::AssetSeed {
                 id,
-                origin: Origin::Stored,
-                rel_path: None,
+                // The exported record's location is deliberately *not* carried
+                // over: a restore has the metadata and none of the bytes, which
+                // is what a placeholder is. A linked export's recorded path
+                // stays in `facts`, where it is provenance — the row is still
+                // `stored`-with-nothing, and `location()` reads it that way.
+                location: crate::model::AssetLocation::Placeholder,
                 file_name: asset.file_name.clone(),
                 ext: asset.ext.clone(),
                 mime: asset.mime.clone(),
@@ -2229,7 +2233,7 @@ impl Library {
                 created_at: asset.created_at,
                 updated_at: asset.updated_at,
                 trashed_at: None,
-            };
+            });
             assets::insert(conn, &placeholder)?;
             asset_map.insert(asset.id, id);
             report.assets_placeholder += 1;
@@ -2388,7 +2392,7 @@ impl Library {
 mod tests {
     use super::Library;
     use crate::media::thumb;
-    use crate::model::{AssetKind, AssetQuery, NewCollection, NewSmartCollection};
+    use crate::model::{AssetKind, AssetLocation, AssetQuery, NewCollection, NewSmartCollection};
     use crate::store::{assets, collections, tags};
     use std::path::{Path, PathBuf};
     use uuid::Uuid;
@@ -2408,6 +2412,20 @@ mod tests {
         (lib, root)
     }
 
+    /// The blob path a stored record names, with a failure that says what the
+    /// record actually was.
+    ///
+    /// Tests reach for this because a location is one value now: an `unwrap` on
+    /// the old optional column could only report "none", while a stored record
+    /// with no path is a *named* state — a placeholder — and telling those two
+    /// apart is the whole point of a restore test.
+    fn stored_rel(asset: &crate::model::Asset) -> String {
+        match asset.location() {
+            crate::model::AssetLocation::Stored { rel_path } => rel_path,
+            other => panic!("expected a stored asset, found {other:?}"),
+        }
+    }
+
     fn write_source(dir: &Path, name: &str, bytes: &[u8]) -> PathBuf {
         let path = dir.join(name);
         std::fs::write(&path, bytes).unwrap();
@@ -2417,7 +2435,6 @@ mod tests {
     #[test]
     fn relink_asset_repoints_a_moved_file() {
         use crate::media::import::{ImportStorage, commit_staged_all, stage_all};
-        use crate::model::Origin;
 
         let (lib, root) = temp_library("relink");
         let outside = std::env::temp_dir().join(format!("trove-relink-{}", Uuid::new_v4()));
@@ -2438,7 +2455,7 @@ mod tests {
         let conn = lib.store().conn();
         let all = assets::query(conn, &AssetQuery::default()).unwrap();
         let id = all.items[0].id;
-        assert_eq!(all.items[0].origin, Origin::Linked);
+        assert!(all.items[0].location().is_linked());
 
         // Move the file elsewhere, then reconnect the record to it.
         let moved = outside.join("moved-elsewhere.png");
@@ -2467,7 +2484,7 @@ mod tests {
         let stored_id = all2
             .items
             .iter()
-            .find(|a| a.origin != Origin::Linked)
+            .find(|a| !a.location().is_linked())
             .expect("stored import")
             .id;
         assert!(lib.relink_asset(stored_id, &stored).is_err());
@@ -2527,8 +2544,8 @@ mod tests {
         assert_eq!(asset.file_name, "photo.png");
 
         // The blob exists on disk under a content-addressed name.
-        let rel = asset.rel_path.as_ref().expect("stored asset has rel_path");
-        assert!(lib.resolve(rel).is_file());
+        let rel = stored_rel(asset);
+        assert!(lib.resolve(&rel).is_file());
 
         // A JPEG thumbnail was generated next to it.
         let thumb_path = thumb::abs_path(lib.cache(), asset.content_hash.as_deref().unwrap());
@@ -2611,7 +2628,7 @@ mod tests {
         assert_eq!(report.imported_count(), 1);
         let first_id = report.imported[0].asset_id;
         let stored = assets::get(lib.store().conn(), first_id).unwrap().unwrap();
-        let blob = lib.resolve(stored.rel_path.as_ref().unwrap());
+        let blob = lib.resolve(&stored_rel(&stored));
 
         // …moved to trash, then re-imported with a different file name but the
         // same bytes: a second record sharing the same blob.
@@ -3389,14 +3406,14 @@ mod tests {
         let conn = other.store().conn();
         let restored = assets::query(conn, &AssetQuery::default()).unwrap();
         assert_eq!(restored.items.len(), 1);
-        assert!(restored.items[0].rel_path.is_none());
+        assert_eq!(restored.items[0].location(), AssetLocation::Placeholder);
 
         // Re-importing the same content links the blob into the placeholder.
         other
             .import_into_store(std::slice::from_ref(&a), None)
             .unwrap();
         let healed = assets::get(conn, restored.items[0].id).unwrap().unwrap();
-        assert!(healed.rel_path.is_some());
+        assert!(matches!(healed.location(), AssetLocation::Stored { .. }));
         let page = assets::query(conn, &AssetQuery::default()).unwrap();
         assert_eq!(page.total, 1);
     }
@@ -3605,7 +3622,12 @@ mod tests {
         let conn = other.store().conn();
         let restored = assets::query(conn, &AssetQuery::default()).unwrap();
         assert_eq!(restored.items.len(), 2);
-        assert!(restored.items.iter().all(|x| x.rel_path.is_some()));
+        assert!(
+            restored
+                .items
+                .iter()
+                .all(|x| matches!(x.location(), AssetLocation::Stored { .. }))
+        );
         // Membership + tags survived.
         let image = restored
             .items
@@ -3715,8 +3737,10 @@ mod tests {
         let id = report.imported[0].asset_id;
         let conn = lib.store().conn();
         let before = assets::get(conn, id).unwrap().unwrap();
-        assert_eq!(before.origin, crate::model::Origin::Linked);
-        assert!(before.rel_path.is_none());
+        assert!(matches!(
+            before.location(),
+            crate::model::AssetLocation::Linked { .. }
+        ));
         let old_hash = before.content_hash.clone().unwrap();
         assert!(thumb::abs_path(lib.cache(), &old_hash).is_file());
 
@@ -3733,8 +3757,10 @@ mod tests {
 
         // The record moved with the content; the link columns did not.
         let after = assets::get(conn, id).unwrap().unwrap();
-        assert_eq!(after.origin, crate::model::Origin::Linked);
-        assert!(after.rel_path.is_none());
+        assert!(matches!(
+            after.location(),
+            crate::model::AssetLocation::Linked { .. }
+        ));
         assert_eq!(
             after.facts.source_path.as_deref(),
             Some(src.to_str().unwrap())
@@ -3793,7 +3819,7 @@ mod tests {
         let conn = lib.store().conn();
         let before = assets::get(conn, id).unwrap().unwrap();
         let old_hash = before.content_hash.clone().unwrap();
-        let old_rel = before.rel_path.clone().unwrap();
+        let old_rel = stored_rel(&before);
         let old_thumb = thumb::abs_path(lib.cache(), &old_hash);
         assert!(old_thumb.is_file(), "precondition: thumbnail exists");
 
@@ -3815,15 +3841,15 @@ mod tests {
         // The old blob and its thumbnail are gone, the new ones exist.
         assert!(!lib.resolve(&old_rel).is_file(), "old blob removed");
         assert!(!old_thumb.is_file(), "old thumbnail removed");
-        let new_rel = after.rel_path.as_ref().unwrap();
-        assert!(lib.resolve(new_rel).is_file(), "new blob exists");
+        let new_rel = stored_rel(&after);
+        assert!(lib.resolve(&new_rel).is_file(), "new blob exists");
         let new_thumb = thumb::abs_path(lib.cache(), after.content_hash.as_deref().unwrap());
         assert!(new_thumb.is_file(), "new thumbnail generated");
 
         // The pixel content is really rotated: decoding the new blob gives
         // the swapped geometry.
         use image::GenericImageView as _;
-        let decoded = image::open(lib.resolve(new_rel)).unwrap();
+        let decoded = image::open(lib.resolve(&new_rel)).unwrap();
         assert_eq!(decoded.dimensions(), (3, 4));
     }
 
@@ -3841,7 +3867,7 @@ mod tests {
         // UI confirms before handing a batch to this path).
         let linked_src = write_source(&root, "linked.png", PNG_1X1);
         use crate::media::import::{ImportStorage, commit_staged_all, stage_all};
-        use crate::model::Origin;
+
         let staged = stage_all(
             &root,
             &root.join("cache"),
@@ -3855,7 +3881,7 @@ mod tests {
             let page = assets::query(conn, &AssetQuery::default()).unwrap();
             page.items
                 .into_iter()
-                .find(|a| a.origin == Origin::Linked)
+                .find(|a| a.location().is_linked())
                 .expect("linked asset imported")
                 .id
         };
@@ -3908,9 +3934,7 @@ mod tests {
         assert_eq!(out.skipped, 0);
 
         let asset = assets::get(conn, id).unwrap().unwrap();
-        let sidecar = lib
-            .resolve(asset.rel_path.as_ref().unwrap())
-            .with_extension("xmp");
+        let sidecar = lib.resolve(&stored_rel(&asset)).with_extension("xmp");
         let body = std::fs::read_to_string(&sidecar).unwrap();
         assert!(body.contains("Sunset &amp; &lt;beach&gt;"));
         assert!(body.contains("Golden hour"));

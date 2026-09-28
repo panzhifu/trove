@@ -47,8 +47,8 @@ use trove_core::layout::justify_layout;
 use trove_core::library::Library;
 use trove_core::media::probe;
 use trove_core::model::{
-    Asset, AssetFacts, AssetKind, AssetQuery, AssetSort, MAX_DESCRIPTION_LEN, NewCollection,
-    NewTag, Origin, UsageStatus,
+    Asset, AssetFacts, AssetKind, AssetLocation, AssetQuery, AssetSeed, AssetSort,
+    MAX_DESCRIPTION_LEN, NewCollection, NewTag, UsageStatus,
 };
 use trove_core::store::{BrowseContext, assets, collections, tags};
 
@@ -901,10 +901,16 @@ fn build_mirror(
             ) = row.unwrap();
             let ext = probe::normalize_ext(file_name.rsplit('.').next().unwrap_or(""));
             let probed = probe::probe(&ext);
-            let mut asset = Asset {
+            let asset = Asset::from_seed(AssetSeed {
                 id: Uuid::parse_str(&id).unwrap(),
-                origin: Origin::Linked,
-                rel_path: None,
+                // Serpent's rows are all external files: the mirror links to
+                // the path it is assembled from below, which is what
+                // `AssetLocation::Linked` *is* -- the path and the state are one
+                // value now, so a mirrored row cannot claim one without the
+                // other.
+                location: AssetLocation::Linked {
+                    source_path: format!("{assets_root}/{rel}"),
+                },
                 file_name,
                 ext,
                 mime: probed.mime,
@@ -930,11 +936,7 @@ fn build_mirror(
                 created_at: parse_time(&created_at),
                 updated_at: parse_time(&updated_at),
                 trashed_at: None,
-            };
-            // Where the file came from, recorded the way the importer records
-            // it -- provenance on the row, not a location the library does not
-            // own (these mirrored rows are stored blobs).
-            asset.set_provenance(format!("{assets_root}/{rel}"));
+            });
             assets::insert(conn, &asset).unwrap();
             mirrored += 1;
         }

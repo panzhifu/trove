@@ -22,8 +22,8 @@ mod tag;
 
 pub use appearance::{Accent, Appearance, Glyph};
 pub use asset::{
-    ASPECT_TOLERANCE, AspectPreset, Asset, AssetKind, AssetLocation, AssetPatch, NewAsset,
-    Orientation, Origin, RESOLUTION_BAND_BOUNDS, ResolutionBand, UsageStatus,
+    ASPECT_TOLERANCE, AspectPreset, Asset, AssetKind, AssetLocation, AssetPatch, AssetSeed,
+    NewAsset, Orientation, Origin, RESOLUTION_BAND_BOUNDS, ResolutionBand, UsageStatus,
 };
 pub use collection::{Collection, NewCollection, NewSmartCollection, SmartCollection};
 pub use embedding::{EmbeddingSpace, MAX_DIM, NewEmbedding, VectorMatch, normalized};
@@ -51,10 +51,11 @@ pub fn now() -> DateTime<Utc> {
 
 #[cfg(test)]
 pub fn test_asset(name: &str, kind: AssetKind, id: Uuid) -> Asset {
-    Asset {
+    Asset::from_seed(AssetSeed {
         id,
-        origin: Origin::Stored,
-        rel_path: Some(format!("media/{}/{}", &id.to_string()[..2], name)),
+        location: AssetLocation::Stored {
+            rel_path: format!("media/{}/{}", &id.to_string()[..2], name),
+        },
         file_name: name.into(),
         ext: name.split('.').next_back().unwrap_or("").into(),
         mime: match kind {
@@ -82,5 +83,5 @@ pub fn test_asset(name: &str, kind: AssetKind, id: Uuid) -> Asset {
         created_at: now(),
         updated_at: now(),
         trashed_at: None,
-    }
+    })
 }

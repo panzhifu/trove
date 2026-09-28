@@ -804,7 +804,10 @@ mod tests {
 
         // Simulate the asset's blob going missing.
         let all = crate::store::assets::query(lib.store().conn(), &AssetQuery::default()).unwrap();
-        let blob = root.join(all.items[0].rel_path.as_deref().unwrap());
+        let AssetLocation::Stored { rel_path } = all.items[0].location() else {
+            panic!("an imported asset is stored");
+        };
+        let blob = root.join(rel_path);
         std::fs::remove_file(&blob).unwrap();
 
         let report = clean_orphans(&lib).unwrap();
@@ -852,7 +855,10 @@ mod tests {
         // Look the asset up (id + stored blob path).
         let all = crate::store::assets::query(lib.store().conn(), &AssetQuery::default()).unwrap();
         let asset = &all.items[0];
-        let blob_path = root.join(asset.rel_path.as_deref().unwrap());
+        let AssetLocation::Stored { rel_path } = asset.location() else {
+            panic!("an imported asset is stored");
+        };
+        let blob_path = root.join(rel_path);
         let expected = asset.content_hash.clone().unwrap();
 
         // Healthy library: the blob is read and matches the record.

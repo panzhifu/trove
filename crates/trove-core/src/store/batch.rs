@@ -73,15 +73,16 @@ pub fn add_to_collection_many(conn: &Connection, collection_id: Uuid, ids: &[Uui
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{Asset, AssetKind, Origin, UsageStatus, now};
+    use crate::model::{Asset, AssetKind, AssetLocation, AssetSeed, UsageStatus, now};
     use crate::store::Store;
 
     fn sample_asset(store: &Store, name: &str, kind: AssetKind) -> Uuid {
         let id = Uuid::new_v4();
-        let asset = Asset {
+        let asset = Asset::from_seed(AssetSeed {
             id,
-            origin: Origin::Stored,
-            rel_path: Some(format!("media/{}/{}", &id.to_string()[..2], name)),
+            location: AssetLocation::Stored {
+                rel_path: format!("media/{}/{}", &id.to_string()[..2], name),
+            },
             file_name: name.to_string(),
             ext: "png".into(),
             mime: "image/png".into(),
@@ -103,7 +104,7 @@ mod tests {
             created_at: now(),
             updated_at: now(),
             trashed_at: None,
-        };
+        });
         crate::store::assets::insert(store.conn(), &asset).unwrap();
         id
     }

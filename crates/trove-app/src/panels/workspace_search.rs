@@ -35,13 +35,14 @@ pub(crate) fn open_image_search(
             .content_hash
             .as_deref()
             .map(|hash| trove_core::media::thumb::abs_path(&cache_root, hash));
-        let path = thumb.filter(|p| p.is_file()).or_else(|| {
-            asset
-                .rel_path
-                .as_ref()
-                .map(|rel| library_root.join(rel))
-                .filter(|p| p.is_file())
-        });
+        let path = thumb
+            .filter(|p| p.is_file())
+            .or_else(|| match asset.location() {
+                trove_core::model::AssetLocation::Stored { rel_path } => {
+                    Some(library_root.join(rel_path)).filter(|p| p.is_file())
+                }
+                _ => None,
+            });
         (path, name)
     };
 

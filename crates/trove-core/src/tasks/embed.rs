@@ -489,7 +489,7 @@ mod tests {
 
     #[test]
     fn an_image_space_provider_embeds_the_thumbnail_not_the_metadata() {
-        use crate::model::Origin;
+        use crate::model::AssetLocation;
 
         let root = library_dir();
         let data = root.join("data");
@@ -505,11 +505,12 @@ mod tests {
             .unwrap();
         let hash = crate::media::hash::hash_bytes(&std::fs::read(&source).unwrap());
         let mut asset = test_asset("cat.png", crate::model::AssetKind::Image, Uuid::new_v4());
-        asset.origin = Origin::Linked;
         asset.content_hash = Some(hash);
         asset.width = Some(32);
         asset.height = Some(32);
-        asset.facts.source_path = Some(source.display().to_string());
+        asset.set_location(AssetLocation::Linked {
+            source_path: source.display().to_string(),
+        });
         assets::insert(store.conn(), &asset).unwrap();
 
         let options = EmbedOptions {
