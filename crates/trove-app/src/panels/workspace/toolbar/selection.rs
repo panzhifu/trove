@@ -13,6 +13,7 @@ use std::rc::Rc;
 
 use trove_core::store::{assets, collections};
 
+use super::super::{purge_gated, trash_or_purge_gated};
 use crate::components::controls::icon_button;
 use crate::library::LibraryController;
 use uuid::Uuid;
@@ -83,19 +84,9 @@ pub(crate) fn selection_toolbar(
                     IconName::Delete,
                     rust_i18n::t!("workspace.delete_forever").to_string(),
                 )
-                .on_click(move |_, _, cx| {
-                    ctl_purge.update(cx, |ctl, cx| {
-                        let ids = std::mem::take(Rc::make_mut(&mut ctl.selected_assets));
-                        if let Err(e) = ctl.library.purge_assets(&ids) {
-                            ctl.notice = Some(
-                                rust_i18n::t!("workspace.purge_failed", error = e.to_string())
-                                    .to_string(),
-                            );
-                        }
-                        ctl.selection_anchor = None;
-                        ctl.generation += 1;
-                        cx.notify();
-                    });
+                .on_click(move |_, window, cx| {
+                    let ids = ctl_purge.read(cx).selected_assets.iter().copied().collect();
+                    purge_gated(&ctl_purge, ids, window, cx);
                 }),
             );
     } else {
@@ -229,12 +220,8 @@ pub(crate) fn selection_toolbar(
                     IconName::Delete,
                     rust_i18n::t!("app.move_to_trash").to_string(),
                 )
-                .on_click(move |_, _, cx| {
-                    ctl_trash.update(cx, |ctl, cx| {
-                        ctl.trash_or_purge_selection();
-                        ctl.selection_anchor = None;
-                        cx.notify();
-                    });
+                .on_click(move |_, window, cx| {
+                    trash_or_purge_gated(&ctl_trash, window, cx);
                 }),
             );
     }

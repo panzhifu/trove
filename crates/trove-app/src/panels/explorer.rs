@@ -1181,11 +1181,25 @@ fn smart_menu(
             PopupMenuItem::new(rust_i18n::t!("explorer.delete").to_string()).on_click(
                 move |_, _, cx| {
                     ctl_delete.update(cx, move |ctl, cx| {
-                        let _ = ctl.library.delete_smart_collection(id);
-                        if ctl.active_smart == Some(id) {
-                            ctl.select_smart(None);
+                        // The same gate as a managed collection's delete: the
+                        // active smart set is only left once the row is gone.
+                        match ctl.library.delete_smart_collection(id) {
+                            Ok(()) => {
+                                if ctl.active_smart == Some(id) {
+                                    ctl.select_smart(None);
+                                }
+                                ctl.generation += 1;
+                            }
+                            Err(error) => {
+                                ctl.report_error(
+                                    rust_i18n::t!(
+                                        "explorer.delete_failed",
+                                        error = error.to_string()
+                                    )
+                                    .to_string(),
+                                );
+                            }
                         }
-                        ctl.generation += 1;
                         cx.notify();
                     });
                 },
@@ -1239,12 +1253,29 @@ fn collection_menu(
                     explorer_delete.update(cx, |this, cx| {
                         let ctl = this.controller.clone();
                         ctl.update(cx, |ctl, cx| {
-                            let conn = ctl.library.store().conn();
-                            let _ = collections::delete(conn, id);
-                            if ctl.current_collection == Some(id) {
-                                ctl.select_collection(None);
+                            // The row leaves the sidebar only when the delete
+                            // landed. The error used to be discarded and
+                            // `generation` bumped anyway, so the list re-read the
+                            // database, found the collection still there, and the
+                            // user had already been told by an empty slot that it
+                            // was gone.
+                            match ctl.library.delete_collection(id) {
+                                Ok(()) => {
+                                    if ctl.current_collection == Some(id) {
+                                        ctl.select_collection(None);
+                                    }
+                                    ctl.generation += 1;
+                                }
+                                Err(error) => {
+                                    ctl.report_error(
+                                        rust_i18n::t!(
+                                            "explorer.delete_failed",
+                                            error = error.to_string()
+                                        )
+                                        .to_string(),
+                                    );
+                                }
                             }
-                            ctl.generation += 1;
                             cx.notify();
                         });
                         cx.notify();

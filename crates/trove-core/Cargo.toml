@@ -72,6 +72,12 @@ pinyin = "0.10"
 # the graph at this version (the `image/exr` feature pulls it in), so this costs
 # no download and no second copy.
 exr = "1"
+# Same reasoning as `exr` above, and the same shape of problem: `image`'s GIF
+# encoder can write a still but exposes no per-frame API, so a test that needs a
+# real animated GIF with known delays has to write one with `gif` directly.
+# Already in the graph at this version (`image`'s `gif` feature pulls it in), so
+# this costs no download and no second copy.
+gif = "0.13"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # KWin's own capture interface (org.kde.KWin.ScreenShot2): KDE implements

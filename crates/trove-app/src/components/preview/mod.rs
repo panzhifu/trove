@@ -17,6 +17,7 @@
 //! through [`PanZoom`], so drag-to-pan and wheel-zoom read the same in all
 //! of them as they do in the 3D viewport.
 
+mod anim;
 mod audio;
 mod fallback;
 mod font;
@@ -337,6 +338,18 @@ pub(crate) struct AssetPreviewPanel {
     data: AssetPreviewData,
     /// Live player for videos; `None` renders the still variants instead.
     video: Option<Entity<VideoPlayer>>,
+    /// The animated-picture player, when the asset is one. See [`anim`].
+    anim: Option<Entity<anim::AnimatedPlayer>>,
+    /// An animated picture whose player has not arrived yet. Decoding every
+    /// frame is real work, so it happens off this thread and the panel opens on
+    /// the still until it lands; this is what tells that still apart from a
+    /// picture that will never play.
+    anim_loading: bool,
+    /// A video whose live player has not arrived yet. The probe that decides
+    /// whether there is one runs on a background thread, so the panel opens on
+    /// the still and swaps the player in when ffmpeg answers; until it does,
+    /// this is what tells the still apart from a video that will never play.
+    video_loading: bool,
     /// Live transport for audio assets. Its own entity because the soundtrack
     /// engine it drives outlives any window, exactly as the video one does.
     audio: Option<Entity<audio::AudioPlayer>>,
@@ -376,9 +389,19 @@ impl AssetPreviewPanel {
     /// Open the panel for preview inputs the caller already resolved (a
     /// virtual system font, for instance).
     pub(crate) fn spawn_with_data(data: AssetPreviewData, cx: &mut App) -> Entity<Self> {
-        // The live player is spawned once, here — never per render. An
-        // undecodable file (or no ffmpeg) keeps the poster still.
-        let video = video::spawn_player(&data, cx);
+        // The live player is spawned once, here — never per render. Probing the
+        // stream is an `ffprobe` round trip that waits on a subprocess slot an
+        // import burst can be holding, so it runs off this thread and the panel
+        // opens on the still until it lands; an undecodable file (or no ffmpeg)
+        // just keeps the still.
+        let video_loading = data.kind == trove_core::model::AssetKind::Video;
+        // An animated picture is decoded once, off this thread, and advanced on
+        // a clock this panel owns. gpui can animate a GIF itself, but only while
+        // the window is active and only when something else happens to repaint
+        // it, which is what made a GIF look frozen in a preview that was
+        // otherwise just sitting there. A still never gets here at all, so the
+        // ordinary thumbnail path is untouched.
+        let anim_loading = !video_loading && anim::wants_player(&data);
         // An audio file is a soundtrack with no picture beside it; the engine
         // the video player uses is already file-agnostic, so this spawns the
         // transport over it. `None` (no ffmpeg, no decodable stream) leaves the
@@ -400,13 +423,15 @@ impl AssetPreviewPanel {
         // A font whose specimen registers zooms the text itself; one that
         // falls back to its thumbnail still zooms only if that still has
         // recorded dimensions.
-        let font_live = video.is_none()
-            && data.kind == trove_core::model::AssetKind::Font
-            && font::specimen_available(&data, cx);
+        let font_live =
+            data.kind == trove_core::model::AssetKind::Font && font::specimen_available(&data, cx);
         let viewport = cx.new(|_| size(px(0.), px(0.)));
-        cx.new(|_| Self {
+        let panel = cx.new(|_| Self {
             data,
-            video,
+            video: None,
+            video_loading,
+            anim: None,
+            anim_loading,
             audio,
             text,
             font_live,
@@ -414,16 +439,31 @@ impl AssetPreviewPanel {
             viewport,
             drag_from: Point::default(),
             dragging: false,
-        })
+        });
+        if video_loading {
+            video::load_player(panel.clone(), cx);
+        }
+        if anim_loading {
+            anim::load_player(panel.clone(), cx);
+        }
+        panel
     }
 
     /// Stills, font specimens and videos all move through [`PanZoom`]; the
     /// flag decides whether the stage carries the gestures at all.
     pub(crate) fn zoomable(&self) -> bool {
-        if self.video.is_some() || self.audio.is_some() || self.text.is_some() {
+        if self.video.is_some()
+            || self.video_loading
+            || self.anim.is_some()
+            || self.anim_loading
+            || self.audio.is_some()
+            || self.text.is_some()
+        {
             // The video player stages its own picture and the text viewer owns
             // its own scrolling; this panel's gestures would fight the controls
-            // inside them.
+            // inside them. `video_loading` counts as the player because the
+            // player is on its way: gestures on the poster would vanish the
+            // moment it took the stage over.
             return false;
         }
         self.data.dimensions.is_some() || self.font_live
@@ -494,6 +534,11 @@ impl AssetPreviewPanel {
     pub(crate) fn release(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(video) = &self.video {
             video.update(cx, |video, _| video.release(window));
+        }
+        // The animated player holds one atlas entry per frame of the picture,
+        // so it has more to hand back than the video one does.
+        if let Some(anim) = &self.anim {
+            anim.update(cx, |anim, _| anim.release(window));
         }
     }
 
@@ -656,7 +701,11 @@ impl Render for AssetPreviewPanel {
             // needs a window the moment it first builds a line layout.
             (None, None, Some(viewer)) => viewer.clone().into_any_element(),
             (None, None, None) => {
-                if self.zoomable() && self.pan.zoom != 1.0 {
+                // The animated player stages its own picture, so it takes the
+                // stage before the zoom does — see `zoomable`.
+                if let Some(player) = &self.anim {
+                    player.clone().into_any_element()
+                } else if self.zoomable() && self.pan.zoom != 1.0 {
                     self.zoomed_still(cx)
                 } else {
                     element(&self.data, PreviewContext::Main, cx)

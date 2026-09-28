@@ -434,6 +434,7 @@ fn action_label(action: &str) -> String {
             rust_i18n::t!("shortcuts.actions.EnterVideoFullscreen").to_string()
         }
         "ExitVideoFullscreen" => rust_i18n::t!("shortcuts.actions.ExitVideoFullscreen").to_string(),
+        "TogglePlayback" => rust_i18n::t!("shortcuts.actions.TogglePlayback").to_string(),
         other => {
             // Plugin commands use a per-plugin catalog key:
             // `commands.<id with "/" and "-" folded to "_">`. The owning

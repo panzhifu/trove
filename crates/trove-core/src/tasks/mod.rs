@@ -619,14 +619,59 @@ impl Drop for TaskPool {
 /// main [`Store`](crate::store::Store) connection.
 type JournalConn = Arc<Mutex<rusqlite::Connection>>;
 
+/// One journal write, with its failure reported instead of discarded.
+///
+/// Every lifecycle transition goes through here, because a journal error the
+/// manager swallows is the one background-task failure the *next* process cannot
+/// see: if `record_start` never landed, nothing at startup can report the job
+/// that was cut off mid-import, and the files it staged have no record of who
+/// owns them. `let _ =` made that invisible by construction.
+fn journal_write(
+    journal: &Option<JournalConn>,
+    degraded: &AtomicBool,
+    task_id: TaskId,
+    what: &str,
+    run: impl FnOnce(&rusqlite::Connection) -> crate::error::Result<()>,
+) {
+    // No journal attached is the documented in-memory-only mode, not a failure.
+    let Some(conn) = journal else {
+        return;
+    };
+    let Ok(conn) = conn.lock() else {
+        report_journal_failure(degraded, task_id, what, "journal lock is poisoned");
+        return;
+    };
+    if let Err(error) = run(&conn) {
+        report_journal_failure(degraded, task_id, what, &error.to_string());
+    }
+}
+
+/// Raise the degraded flag and log the first reason only. A broken journal fails
+/// on every transition of every job, so one warning per write would bury the
+/// single fact the user needs — that interrupted tasks cannot be reported —
+/// under a hundred identical lines.
+fn report_journal_failure(degraded: &AtomicBool, task_id: TaskId, what: &str, reason: &str) {
+    if !degraded.swap(true, Ordering::Relaxed) {
+        tracing::warn!(
+            %task_id,
+            what,
+            reason,
+            "task journal is not recording; interrupted work cannot be reported after a restart"
+        );
+    }
+}
+
 /// Shared registry of background jobs. Cheap to clone.
 ///
 /// Two independent locks: `jobs` guards the registry, `events` guards the
 /// per-job buckets. Splitting them keeps a job's per-file `progress` call from
 /// contending with the embedder's drain. Lock order, when both are held, is
 /// always `jobs` → `events`. A third optional lock, `journal`, guards the
-/// SQLite connection for task persistence; it is never held while `jobs` or
-/// `events` are held, so journal I/O cannot block progress reporting.
+/// SQLite connection for task persistence. Terminal writes happen after `jobs`
+/// is released; the two *start* writes happen while it is held, so the order
+/// that actually exists is `jobs` → `journal`. Nothing takes `journal` and then
+/// `jobs`, which is the only shape that could deadlock, and a journal write is
+/// one `INSERT` — it cannot hold the registry up long enough to matter.
 ///
 /// The `pool` is the shared thread pool all tasks run on; it is created once
 /// when the manager is assembled and shared by reference (via `Arc<TaskPool>`)
@@ -636,6 +681,8 @@ pub struct TaskManager {
     jobs: Arc<Mutex<HashMap<TaskId, JobState>>>,
     events: Arc<EventQueue>,
     journal: Option<JournalConn>,
+    /// Set once a task-journal write fails; see [`TaskManager::journal_degraded`].
+    journal_degraded: Arc<AtomicBool>,
     pool: Arc<TaskPool>,
     /// Custom task kinds a plugin has declared, so [`TaskKind::Custom`] can be
     /// checked against something. Set once at library open, before the manager
@@ -649,6 +696,7 @@ impl Default for TaskManager {
             jobs: Arc::new(Mutex::new(HashMap::new())),
             events: Arc::new(EventQueue::default()),
             journal: None,
+            journal_degraded: Arc::new(AtomicBool::new(false)),
             pool: Arc::new(TaskPool::new(
                 std::thread::available_parallelism()
                     .map(|n| n.get())
@@ -708,6 +756,16 @@ impl TaskManager {
     /// in-memory only (the pre-persistence behaviour).
     pub fn set_journal(&mut self, conn: rusqlite::Connection) {
         self.journal = Some(Arc::new(Mutex::new(conn)));
+    }
+
+    /// Whether a task-journal write has failed in this process.
+    ///
+    /// `false` means every transition of every job was recorded, so the rows a
+    /// later process reads are complete. `true` means they are not: a job that
+    /// was interrupted may have no row at all, and the task panel says so rather
+    /// than letting an absent row read as "nothing was running".
+    pub fn journal_degraded(&self) -> bool {
+        self.journal_degraded.load(Ordering::Relaxed)
     }
 
     /// Spawn `run` on the shared thread pool under `kind`. Returns the task id
@@ -791,10 +849,13 @@ impl TaskManager {
         });
         // Persist to journal before spawning, so a crash mid-spawn leaves a
         // "running" row the next startup can surface.
-        if let Some(journal) = &self.journal {
-            let conn = journal.lock().unwrap();
-            let _ = task_journal::record_start(&conn, id, &kind, &label, 0);
-        }
+        journal_write(
+            &self.journal,
+            &self.journal_degraded,
+            id,
+            "record_start",
+            |conn| task_journal::record_start(conn, id, &kind, &label, 0),
+        );
         drop(jobs);
         let (tx, rx) = std::sync::mpsc::channel();
         let ctx = JobContext {
@@ -807,6 +868,7 @@ impl TaskManager {
             last_progress: Mutex::new(Instant::now() - PROGRESS_EVENT_INTERVAL),
         };
         let journal = self.journal.clone();
+        let degraded = self.journal_degraded.clone();
         self.pool.execute(move || {
             let outcome = panic::catch_unwind(AssertUnwindSafe(|| run(&ctx)));
             // Extract the terminal state and the success value (if any)
@@ -889,18 +951,17 @@ impl TaskManager {
             if let Some(value) = value {
                 let _ = tx.send(value);
             }
-            if let Some(journal) = &journal {
-                let conn = journal.lock().unwrap();
-                let _ = task_journal::record_status(
-                    &conn,
+            journal_write(&journal, &degraded, ctx.id, "record_status", |conn| {
+                task_journal::record_status(
+                    conn,
                     ctx.id,
                     status,
                     done,
                     total,
                     summary.as_deref(),
                     error.as_deref(),
-                );
-            }
+                )
+            });
         });
         Ok((id, rx))
     }
@@ -979,10 +1040,13 @@ impl TaskManager {
             id,
             kind: kind.clone(),
         });
-        if let Some(journal) = &self.journal {
-            let conn = journal.lock().unwrap();
-            let _ = task_journal::record_start(&conn, id, &kind, &label, policy.max_retries);
-        }
+        journal_write(
+            &self.journal,
+            &self.journal_degraded,
+            id,
+            "record_start",
+            |conn| task_journal::record_start(conn, id, &kind, &label, policy.max_retries),
+        );
         drop(jobs);
 
         let (tx, rx) = std::sync::mpsc::channel();
@@ -996,6 +1060,7 @@ impl TaskManager {
             last_progress: Mutex::new(Instant::now() - PROGRESS_EVENT_INTERVAL),
         };
         let journal = self.journal.clone();
+        let degraded = self.journal_degraded.clone();
         self.pool.execute(move || {
             // The factory is wrapped in a Mutex so the worker can call it
             // once per attempt (it is FnMut, not Fn).
@@ -1020,18 +1085,17 @@ impl TaskManager {
                         let total = state.total;
                         drop(jobs);
                         let _ = tx.send(value);
-                        if let Some(journal) = &journal {
-                            let conn = journal.lock().unwrap();
-                            let _ = task_journal::record_status(
-                                &conn,
+                        journal_write(&journal, &degraded, ctx.id, "record_status", |conn| {
+                            task_journal::record_status(
+                                conn,
                                 ctx.id,
                                 TaskStatus::Completed,
                                 done,
                                 total,
                                 Some(&summary),
                                 None,
-                            );
-                        }
+                            )
+                        });
                         return;
                     }
                     Ok(Ok(_)) => {
@@ -1044,18 +1108,17 @@ impl TaskManager {
                         let done = state.done;
                         let total = state.total;
                         drop(jobs);
-                        if let Some(journal) = &journal {
-                            let conn = journal.lock().unwrap();
-                            let _ = task_journal::record_status(
-                                &conn,
+                        journal_write(&journal, &degraded, ctx.id, "record_status", |conn| {
+                            task_journal::record_status(
+                                conn,
                                 ctx.id,
                                 TaskStatus::Cancelled,
                                 done,
                                 total,
                                 None,
                                 None,
-                            );
-                        }
+                            )
+                        });
                         return;
                     }
                     Ok(Err(error)) => {
@@ -1073,10 +1136,9 @@ impl TaskManager {
                                 max_retries: retry.max,
                             });
                             drop(jobs);
-                            if let Some(journal) = &journal {
-                                let conn = journal.lock().unwrap();
-                                let _ = task_journal::record_retry(&conn, ctx.id);
-                            }
+                            journal_write(&journal, &degraded, ctx.id, "record_retry", |conn| {
+                                task_journal::record_retry(conn, ctx.id)
+                            });
                             // Sleep for backoff, but wake early on cancel.
                             let deadline = Instant::now() + backoff;
                             while Instant::now() < deadline && !ctx.cancelled() {
@@ -1092,18 +1154,23 @@ impl TaskManager {
                                     });
                                 }
                                 drop(jobs);
-                                if let Some(journal) = &journal {
-                                    let conn = journal.lock().unwrap();
-                                    let _ = task_journal::record_status(
-                                        &conn,
-                                        ctx.id,
-                                        TaskStatus::Cancelled,
-                                        0,
-                                        0,
-                                        None,
-                                        None,
-                                    );
-                                }
+                                journal_write(
+                                    &journal,
+                                    &degraded,
+                                    ctx.id,
+                                    "record_status",
+                                    |conn| {
+                                        task_journal::record_status(
+                                            conn,
+                                            ctx.id,
+                                            TaskStatus::Cancelled,
+                                            0,
+                                            0,
+                                            None,
+                                            None,
+                                        )
+                                    },
+                                );
                                 return;
                             }
                             // Reset progress for the next attempt.
@@ -1125,18 +1192,17 @@ impl TaskManager {
                         let done = state.done;
                         let total = state.total;
                         drop(jobs);
-                        if let Some(journal) = &journal {
-                            let conn = journal.lock().unwrap();
-                            let _ = task_journal::record_status(
-                                &conn,
+                        journal_write(&journal, &degraded, ctx.id, "record_status", |conn| {
+                            task_journal::record_status(
+                                conn,
                                 ctx.id,
                                 TaskStatus::Failed,
                                 done,
                                 total,
                                 None,
                                 Some(&error),
-                            );
-                        }
+                            )
+                        });
                         return;
                     }
                     Err(_) => {
@@ -1150,18 +1216,17 @@ impl TaskManager {
                         let done = state.done;
                         let total = state.total;
                         drop(jobs);
-                        if let Some(journal) = &journal {
-                            let conn = journal.lock().unwrap();
-                            let _ = task_journal::record_status(
-                                &conn,
+                        journal_write(&journal, &degraded, ctx.id, "record_status", |conn| {
+                            task_journal::record_status(
+                                conn,
                                 ctx.id,
                                 TaskStatus::Failed,
                                 done,
                                 total,
                                 None,
                                 Some("task panicked"),
-                            );
-                        }
+                            )
+                        });
                         return;
                     }
                 }
@@ -1426,6 +1491,67 @@ mod tests {
             .find(|t| t.id == id)
             .map(|t| t.status)
             .expect("job present in registry")
+    }
+
+    /// The journal is the only record a *later* process has of a job, so a write
+    /// that fails in silence is a hole nobody can see from the other side: an
+    /// absent row reads exactly like a job that never ran.
+    ///
+    /// An in-memory database with no `task_journal` table stands in for the real
+    /// causes — a full disk, a locked file, a library moved mid-run. Every
+    /// lifecycle write against it returns `Err`.
+    #[test]
+    fn a_journal_write_that_fails_is_reported_not_swallowed() {
+        let mut mgr = TaskManager::new();
+        mgr.set_journal(rusqlite::Connection::open_in_memory().unwrap());
+        assert!(
+            !mgr.journal_degraded(),
+            "a manager that has written nothing is not yet broken"
+        );
+        let (_id, _rx) = mgr
+            .start(TaskKind::Import, "unrecorded", |_ctx| Ok(()))
+            .unwrap();
+        assert!(
+            mgr.journal_degraded(),
+            "record_start failed and the manager stayed silent"
+        );
+    }
+
+    /// The two halves the test above cannot fail by accident: a journal that
+    /// writes must not raise the flag, and having no journal at all is the
+    /// documented in-memory mode rather than a failure. Either one violated would
+    /// make the warning fire on every healthy library open.
+    #[test]
+    fn a_working_journal_and_a_missing_one_both_stay_clean() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE task_journal (
+                 task_id TEXT PRIMARY KEY, kind TEXT NOT NULL, label TEXT NOT NULL,
+                 status TEXT NOT NULL, done INTEGER NOT NULL DEFAULT 0,
+                 total INTEGER NOT NULL DEFAULT 0, summary TEXT, error TEXT,
+                 retry_count INTEGER NOT NULL DEFAULT 0,
+                 max_retries INTEGER NOT NULL DEFAULT 0,
+                 started_at TEXT NOT NULL, finished_at TEXT);",
+        )
+        .unwrap();
+        let mut mgr = TaskManager::new();
+        mgr.set_journal(conn);
+        let (_id, _rx) = mgr
+            .start(TaskKind::Import, "recorded", |_ctx| Ok(()))
+            .unwrap();
+        assert!(
+            !mgr.journal_degraded(),
+            "a write that landed was reported as a failure"
+        );
+
+        let plain = TaskManager::new();
+        let (_id, _rx) = plain
+            .start(TaskKind::Import, "no journal", |_ctx| Ok(()))
+            .unwrap();
+        assert!(
+            !plain.journal_degraded(),
+            "running without a journal is a mode, not an error"
+        );
     }
 
     /// A watcher polling one job's id must not consume another job's events —

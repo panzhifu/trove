@@ -3,9 +3,16 @@
 //! Static pictures render the library thumbnail, not the original — the
 //! thumbnail is what the import pipeline keeps on disk, and a 50-megapixel
 //! original would decode into hundreds of megabytes of pixels for one
-//! frame. Animated images (GIF / animated WebP / APNG) play from the
-//! original file; gpui decodes GIF and animated WebP natively, APNG goes
-//! through the cached multi-frame decoder in `panels::common`.
+//! frame. Animated images (GIF / animated WebP / APNG) come from the original
+//! file: gpui decodes GIF and animated WebP natively, APNG goes through the
+//! cached multi-frame decoder in `panels::common`.
+//!
+//! Which is to say what these two functions are *not*: the main area's playing
+//! animation is the `anim` module, which holds its own frames and its own clock.
+//! The animated source here is what a preview shows while that decoder is still
+//! running, what it shows if the file turns out not to animate, and what the
+//! inspector card shows — the card is small and inside a list that repaints
+//! constantly, so gpui advancing it during a repaint happens to work.
 
 use gpui_kit::*;
 

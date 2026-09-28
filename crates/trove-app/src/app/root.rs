@@ -1074,11 +1074,11 @@ impl Render for AppView {
             .on_action(cx.listener(|this, _: &ClearSelection, _, cx| {
                 this.controller.update(cx, |ctl, _cx| ctl.clear_selection());
             }))
-            .on_action(cx.listener(|this, _: &TrashSelected, _, cx| {
-                this.controller.update(cx, |ctl, cx| {
-                    ctl.trash_or_purge_selection();
-                    cx.notify();
-                });
+            .on_action(cx.listener(|this, _: &TrashSelected, window, cx| {
+                // Same action, same gate as the toolbar button: the key is the
+                // faster way to lose a library, and in the trash view it deletes
+                // for good rather than moving anything.
+                crate::panels::workspace::trash_or_purge_gated(&this.controller, window, cx);
             }))
             .on_action(cx.listener(|this, _: &Undo, _, cx| {
                 this.controller.update(cx, |ctl, cx| {

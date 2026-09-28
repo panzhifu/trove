@@ -8810,6 +8810,7 @@ version = "0.4.9"
 dependencies = [
  "arboard",
  "dirs 5.0.1",
+ "gif 0.13.3",
  "gpui-kit",
  "image",
  "naga",
@@ -8849,6 +8850,7 @@ dependencies = [
  "encoding_rs",
  "exr",
  "fontdue",
+ "gif 0.13.3",
  "gltf",
  "ignore",
  "image",

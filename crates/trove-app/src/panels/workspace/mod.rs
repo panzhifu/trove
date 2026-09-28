@@ -15,7 +15,8 @@ use std::rc::Rc;
 use gpui_kit::base::{ElementExt as _, h_flex, v_flex};
 use gpui_kit::component::Sizable;
 use gpui_kit::component::WindowExt as _;
-use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::button::{Button, ButtonVariant, ButtonVariants as _};
+use gpui_kit::component::dialog::DialogButtonProps;
 use gpui_kit::component::dock::{BasePanel, PanelEvent};
 use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::component::menu::ContextMenuExt as _;
@@ -43,7 +44,7 @@ use trove_core::store::{assets, collections, smart_collections};
 use uuid::Uuid;
 
 use crate::app::actions::{
-    ClearSelection, MoveDown, MoveLeft, MoveRight, MoveUp, OpenPreview, QuickLook,
+    ClearSelection, MoveDown, MoveLeft, MoveRight, MoveUp, OpenPreview, QuickLook, TogglePlayback,
 };
 use crate::components::preview::{
     AssetPreviewEvent, AssetPreviewPanel, LiveCard, ModelViewport, ModelViewportEvent, VideoPlayer,
@@ -583,18 +584,31 @@ impl Render for WorkspacePanel {
         // The action handlers are shared by both modes, so the shell is built
         // before the branch below picks what goes inside it.
         //
-        // `VideoPreview` rides along only while a video is open: the `f`
-        // binding for fullscreen lives there, so the letter is dead in the
-        // grid (where the search box would otherwise lose it) and live the
-        // moment the preview replaces the grid.
+        // `VideoPreview` rides along only while a video is open: the bare
+        // letters and characters bound there (`f` for fullscreen, `space` for
+        // play/pause) would otherwise be those characters, gone from typing in
+        // the search box, which shares this node's `Workspace` context.
         let video_preview = self.preview_player(cx).is_some();
+        // A node carries one `KeyContext`, but a `KeyContext` is a *set* of
+        // names, parsed from a whitespace-separated string. Setting the second
+        // name on its own would replace the first: gpui reads a node's single
+        // context slot when it builds the keymap's context stack, so
+        // `Workspace` would vanish from the path for as long as a video was on
+        // screen and take every binding scoped to it with it — Escape out of
+        // the preview, the arrows that step through it, `Enter`, `Delete`.
+        let key_context = if video_preview {
+            format!(
+                "{} {}",
+                crate::app::keybindings::WORKSPACE_CONTEXT,
+                crate::app::keybindings::VIDEO_PREVIEW_CONTEXT
+            )
+        } else {
+            crate::app::keybindings::WORKSPACE_CONTEXT.to_string()
+        };
         let shell = v_flex()
             .size_full()
             .gap_1()
-            .key_context(crate::app::keybindings::WORKSPACE_CONTEXT)
-            .when(video_preview, |shell| {
-                shell.key_context(crate::app::keybindings::VIDEO_PREVIEW_CONTEXT)
-            })
+            .key_context(key_context.as_str())
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(|this, _: &MoveLeft, window, cx| {
                 if this.preview.is_some() {
@@ -629,6 +643,15 @@ impl Render for WorkspacePanel {
             }))
             .on_action(cx.listener(|this, _: &QuickLook, _, cx| {
                 this.toggle_quick_look(cx);
+            }))
+            .on_action(cx.listener(|this, _: &TogglePlayback, _, cx| {
+                // Space holds and resumes the previewed clip. The grid's own
+                // space — quick look — is bound in `AssetGrid`, which is not on
+                // the focus path while a preview covers the grid, so the two
+                // never both answer the same press.
+                if let Some(player) = this.preview_player(cx) {
+                    player.update(cx, |player, cx| player.toggle_play(cx));
+                }
             }))
             .on_action(cx.listener(|this, _: &ClearSelection, window, cx| {
                 // Escape backs out of the innermost thing: out of the
@@ -1245,8 +1268,164 @@ fn next_window(
     (ask > cached_cells).then(|| (cached_cells, ask - cached_cells))
 }
 
+// ============================ irreversible-delete gate =======================
+
+/// The confirmation in front of an irreversible delete.
+///
+/// Four doors lead to a permanent delete — the grid's context menu, the trash
+/// bar's button, the Delete key while the trash is open, and emptying the whole
+/// trash — and all four acted on a single click. Guarding only some of them is
+/// worse than guarding none: once the menu asks, the user assumes the key does
+/// too and stops looking at what they press.
+///
+/// Shaped like the preview toolbar's write-back confirmation, which has asked
+/// before overwriting a user's own file for a while. The `Rc` is that helper's
+/// reason, not a flourish: the dialog builder is `Fn` because gpui may build it
+/// again, while the action must run at most once.
+pub(crate) fn confirm_destruction(
+    window: &mut Window,
+    cx: &mut App,
+    body: String,
+    run: impl Fn(&mut App) + 'static,
+) {
+    let run = Rc::new(run);
+    window.open_dialog(cx, move |dialog, _, _| {
+        let run = Rc::clone(&run);
+        let body = body.clone();
+        dialog
+            .title(rust_i18n::t!("workspace.delete_forever").to_string())
+            .width(px(440.))
+            .close_button(false)
+            .child(div().text_sm().p_1().child(body))
+            .button_props(
+                DialogButtonProps::default()
+                    .ok_text(rust_i18n::t!("workspace.purge_confirm_ok").to_string())
+                    .ok_variant(ButtonVariant::Danger)
+                    .show_cancel(true),
+            )
+            .on_ok(move |_, _, cx| {
+                run(cx);
+                true
+            })
+    });
+}
+
+/// What the confirmation says: how much goes, and whether the user's own files
+/// go with it.
+///
+/// The second part is the only thing truly unrecoverable from inside Trove — a
+/// blob the library owns can be re-imported, a photo in the user's folder
+/// cannot. So the extra line appears only when the setting that deletes linked
+/// sources is actually on: a warning that always threatens the worst case
+/// teaches people to dismiss it.
+pub(crate) fn purge_warning(ctl: &crate::library::LibraryController, count: usize) -> String {
+    purge_warning_for(
+        trove_core::config::LibraryConfig::load(ctl.library.root()).purge_delete_sources(),
+        count,
+    )
+}
+
+/// The same warning given the setting directly, so the branch that decides
+/// whether the scariest line appears is testable without a window, a library,
+/// or a gpui entity — and without mutating the user's config to reach it.
+pub(crate) fn purge_warning_for(delete_sources: bool, count: usize) -> String {
+    let mut body = rust_i18n::t!("workspace.purge_confirm_body", count = count as i64).to_string();
+    if delete_sources {
+        body.push('\n');
+        body.push_str(rust_i18n::t!("workspace.purge_confirm_sources").as_ref());
+    }
+    body
+}
+
+/// Permanent-delete `ids` behind the gate.
+///
+/// Shared by the context menu and the trash bar so the two cannot disagree
+/// about whether to ask, and so the failure notice stays worded the same as the
+/// one the button used to set on its own.
+pub(crate) fn purge_gated(
+    controller: &Entity<crate::library::LibraryController>,
+    ids: Vec<Uuid>,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    if ids.is_empty() {
+        return;
+    }
+    let body = purge_warning(controller.read(cx), ids.len());
+    let controller = controller.clone();
+    confirm_destruction(window, cx, body, move |cx| {
+        controller.update(cx, |ctl, cx| {
+            if let Err(error) = ctl.library.purge_assets(&ids) {
+                ctl.notice = Some(
+                    rust_i18n::t!("workspace.purge_failed", error = error.to_string()).to_string(),
+                );
+            }
+            ctl.deselect(&ids);
+            ctl.selection_anchor = None;
+            ctl.generation += 1;
+            cx.notify();
+        });
+    });
+}
+
+/// The Delete key and the trash bar's trash button.
+///
+/// Normally a move to the trash, which needs no asking because it is
+/// reversible. While the trash is open the same action deletes for good, and
+/// that is the case the gate exists for.
+pub(crate) fn trash_or_purge_gated(
+    controller: &Entity<crate::library::LibraryController>,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let (in_trash, count) =
+        controller.read_with(cx, |ctl, _| (ctl.showing_trash, ctl.selected_assets.len()));
+    if count == 0 {
+        return;
+    }
+    let run = {
+        let controller = controller.clone();
+        move |cx: &mut App| {
+            controller.update(cx, |ctl, cx| {
+                ctl.trash_or_purge_selection();
+                ctl.selection_anchor = None;
+                cx.notify();
+            });
+        }
+    };
+    if !in_trash {
+        run(cx);
+        return;
+    }
+    let body = purge_warning(controller.read(cx), count);
+    confirm_destruction(window, cx, body, run);
+}
+
 #[cfg(test)]
 mod tests {
+    /// The one judgement in the confirmation that could be wrong in the
+    /// dangerous direction: a warning that always threatened source files would
+    /// be dismissed like the always-true one it is, and one that never mentioned
+    /// them would hide the only unrecoverable part.
+    #[test]
+    fn the_source_file_threat_appears_only_when_the_setting_is_on() {
+        let off = super::purge_warning_for(false, 3);
+        assert!(off.contains('3'), "the count must be in the warning: {off}");
+        assert_eq!(
+            off.lines().count(),
+            1,
+            "without the setting on, nothing may claim files are deleted: {off}"
+        );
+
+        let on = super::purge_warning_for(true, 12);
+        assert!(on.contains("12"), "the count went missing: {on}");
+        assert!(
+            on.lines().count() > 1,
+            "with the setting on, the source-file line must appear: {on}"
+        );
+        assert_ne!(off, on, "the two cases must not read the same");
+    }
+
     // Explicit imports, not `use super::*`: the glob drags in a `test`
     // attribute macro from the gpui prelude, which makes expanding `#[test]`
     // below recurse.

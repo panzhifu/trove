@@ -14,6 +14,7 @@ use trove_core::model::{AssetKind, AssetPatch, UsageStatus};
 use trove_core::store::{assets, collections};
 
 use super::open_with_apps::discover_apps;
+use super::purge_gated;
 
 /// Build the right-click context menu for an asset cell.
 pub(crate) fn asset_context_menu(
@@ -378,18 +379,9 @@ fn trash_menu(
         .separator()
         .item(
             PopupMenuItem::new(rust_i18n::t!("workspace.delete_forever").to_string()).on_click(
-                move |_, _, cx| {
-                    ctl_purge.update(cx, move |ctl, cx| {
-                        let ids = ctl.action_targets(asset_id);
-                        if let Err(e) = ctl.library.purge_assets(&ids) {
-                            ctl.notice = Some(
-                                rust_i18n::t!("workspace.purge_failed", error = e.to_string())
-                                    .to_string(),
-                            );
-                        }
-                        ctl.deselect(&ids);
-                        cx.notify();
-                    });
+                move |_, window, cx| {
+                    let ids = ctl_purge.read(cx).action_targets(asset_id);
+                    purge_gated(&ctl_purge, ids, window, cx);
                 },
             ),
         )

@@ -50,7 +50,10 @@ pub(super) fn spawn_player(data: &AssetPreviewData, cx: &mut App) -> Option<Enti
     if !path.is_file() {
         return None;
     }
-    let engine = AudioEngine::spawn(path, cx)?;
+    if !trove_core::media::video::has_audio_track(&path) {
+        return None;
+    }
+    let engine = AudioEngine::spawn(path, cx);
     let player = cx.new(|cx| AudioPlayer::new(data, engine, cx));
     player.update(cx, |player, cx| player.start_ticker(cx));
     Some(player)

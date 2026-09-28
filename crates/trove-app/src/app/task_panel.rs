@@ -184,6 +184,13 @@ fn task_panel_body(
         });
 
     let mut body = v_flex().w_full().child(header);
+    // A journal that stopped recording is the one state of this panel that lies
+    // by omission: an absent row reads as "nothing was interrupted", when the
+    // honest meaning is "we could not write it down". Say it on the panel rather
+    // than leaving the claim to a log line.
+    if controller.read(cx).library.tasks().journal_degraded() {
+        body = body.child(journal_degraded_note(cx));
+    }
     if !interrupted.is_empty() {
         body = body.child(interrupted_block(controller.clone(), interrupted, cx));
     }
@@ -198,6 +205,16 @@ fn task_panel_body(
         rows.iter().rev().map(|row| task_row(&controller, row, cx)),
     )))
     .into_any_element()
+}
+
+/// The warning strip shown when a task-journal write failed this session.
+fn journal_degraded_note(cx: &App) -> Div {
+    div()
+        .px_3()
+        .py_1p5()
+        .text_xs()
+        .text_color(cx.theme().warning)
+        .child(rust_i18n::t!("task.journal_degraded").to_string())
 }
 
 /// The jobs the task journal left as running or paused when the previous

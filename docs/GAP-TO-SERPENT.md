@@ -5,7 +5,7 @@
 > **本轮（09-28）只有 Trove 动了，Serpent 一格没变**：上游仓库仍停在 **v0.2.9**，`src/` 仍是 **849 文件 / 258,255 行**、`MIGRATIONS` 仍是 32 段、末条 `version: 56`，与 09-27 那次复核逐字相同。所以 §2026-09-27 复核 那张表**不需要重审 Serpent 侧**，只需要把 Trove 这一轮的工作树改动记进去——记在 **§2026-09-28 复核** 那一节，并且**就地改掉了那一节里三行的状态**（音频卡片、检查器逗号输入标签、以及纵深索引升到的第 4、5 版）。Trove 这一轮动了什么、其中两件事**只做了一半就说自己做完了**，全部记在那一节里。
 >
 > **上一轮（09-27）两边都动了**：Trove 发了 **v0.4.9**（模型材质与共享 GPU 渲染器那一轮、智能集合同级拖拽重排、预览里方向键换素材、以及**卡片"活过来"的触发从指针定住改成按空格**——见 §C 的活卡片行与 [PREVIEW-SYSTEM.md](./PREVIEW-SYSTEM.md)），Serpent 从 v0.2.6 走到 v0.2.9。后者的增量单独成节，见 **§2026-09-27 复核**。
-> 核验日期 **2026-09-28**（同日还有一轮接线，见 §2026-09-28 第二轮；更早是 09-27 / 09-25 / 09-24 / 09-23）。两边的数字都取自源码而非各自文档：Serpent `src/` **849 文件 / 258,255 行** `.ts`+`.tsx`（与 09-27 逐字相同），**schema 仍是 v56 一格没加**——`MIGRATIONS` 32 段、末条 `version: 56`，`SUPPORTED_SCHEMA_VERSION = MIGRATIONS.at(-1)!.version`。Trove `crates/` **226 文件 / 113,206 行** `.rs`（09-27 记的是 224 / 110,221）。schema **v21**——v19 加了序列帧两张侧表、v20 加了 `source_path` 虚拟列与索引、**v21 加了 `task_journal` 一张表**；`INDEX_VERSION` 从 09-27 的 3 走到 **5**（见 §D 纵深索引行）；包版本 **0.4.9**（本轮未 bump）；`en.toml` **792** 个叶子键；测试 **794 core + 71 app = 865** 全绿 3 ignored，`cargo test --workspace --all-targets` 实跑，`cargo fmt --all -- --check` 与 `cargo clippy --workspace --all-targets -- -D warnings` 两道门同轮一起过。
+> 核验日期 **2026-09-28**（同一天连做七轮，见 §2026-09-28 复核 与 第二~第七轮；更早是 09-27 / 09-25 / 09-24 / 09-23）。两边的数字都取自源码而非各自文档：Serpent `src/` **849 文件 / 258,255 行** `.ts`+`.tsx`（与 09-27 逐字相同），**schema 仍是 v56 一格没加**——`MIGRATIONS` 32 段、末条 `version: 56`，`SUPPORTED_SCHEMA_VERSION = MIGRATIONS.at(-1)!.version`。Trove `crates/` **228 文件 / 115,058 行** `.rs`（第四轮加 `media/anim.rs`、第六轮加 `preview/anim.rs`）（09-27 记的是 224 / 110,221）。schema **v21**——v19 加了序列帧两张侧表、v20 加了 `source_path` 虚拟列与索引、**v21 加了 `task_journal` 一张表**；`INDEX_VERSION` 从 09-27 的 3 走到 **5**（见 §D 纵深索引行）；包版本 **0.4.9**（本轮未 bump）；`en.toml` **798** 个叶子键；测试 **804 core + 74 app = 878** 全绿 3 ignored，`cargo test --workspace --all-targets` 实跑，`cargo fmt --all -- --check` 与 `cargo clippy --workspace --all-targets -- -D warnings` 两道门同轮一起过。
 >
 > **09-27 那一轮把上上轮三处"确认缺失"推翻了两处**，都是同一个失败模式——按 Serpent 的实现符号去 grep（`CF_HDROP`、`xdnd`、`file_drop`），命中零就记成"没有"，而没有按**能力**去问（"能不能把文件拖出窗口"）：
 > ① **原生文件拖出早就有**（`2026-09-12` 的 `ce6a29d` 起，`panels/workspace/cells.rs:199-215` 网格格、`:494-510` 列表行，见 §A。上一版这里写的 `:192`、`:406` 已经漂走，本轮重数过）；
@@ -53,7 +53,7 @@ Serpent 在这两轮之间走了 **88 个提交**（其中 79 个非发布提交
 
 | 能力 | Serpent | Trove | 量级 |
 |---|---|---|---|
-| **动画 GIF 用播放条控制** | 新增 `GifViewerPlayer` + `gif-playback-timeline`，GIF 与视频共用一条传输带，可拖可定位 | **无**。GIF 交给 gpui 自行循环播放（`panels/common.rs:344` → `preview/image.rs:17`），而传输带压根到不了它：`preview/video.rs:90` 第一句就是 `if data.kind != AssetKind::Video { return None; }`。全仓也没有 GIF 帧索引 | **L**（帧解码 + 每帧延时 + 把 transport 接进图片舞台；APNG 顺带能白拿，WebP 不能） |
+| **动画 GIF 用播放条控制** | 新增 `GifViewerPlayer` + `gif-playback-timeline`，GIF 与视频共用一条传输带，可拖可定位 | ◐ **核已于 2026-09-28 做完并量过；播放头那一半没有**。新模块 `media/anim.rs`：`FrameTimes`（每帧起始毫秒表 + `frame_at(ms)` / `ms_at(frame)` 双向映射，纯函数）与 `delays(path)`（按 magic bytes 分派，GIF / APNG / 动 WebP 三容器统一交帧延时）。**这一格原来的两个前提都不成立，已换成实测**：① 零新依赖、零外部进程——`image` 0.25.10 对 `GifDecoder`（`codecs/gif.rs:426`）、`ApngDecoder`（`png.rs:514`）**以及 `WebPDecoder`（`webp/decoder.rs:104`）** 全都实现了 `AnimationDecoder`，而 `png`/`gif`/`webp` 三个 feature 在 workspace `Cargo.toml` 里本来就开着；上一版那句「APNG 顺带能白拿，**WebP 不能**」里 WebP 那半句是错的。② 端到端量过：用 `gif` crate 写一张真实动 GIF（80/120/40/200 ms）再读回来，逐帧延时**无损往返**（40 ms 在百分之一秒单位下是 4 而不是 0，我第一版断言就按 0 写、被自己的测试驳回了）。**仍然缺的只有一件，而且它是真缺**：`media::anim` 目前**没有任何调用方**——`preview/video.rs:90` 那句 `data.kind != AssetKind::Video` 一行没改，播放条到 GIF 仍不通。见 §2026-09-28 第四轮。（**同日第六轮推翻了这条的一半**：`media::anim` 现在有调用方了，`preview/anim.rs` 用自己拥有的时钟驱动主区预览，动图不再靠 gpui 碰巧重绘——「按播放条那格的核」已经通了。上面那句「没有任何调用方」按原样留着，因为它正是那一轮记下的账。真缺的只剩传输带本身：`video.rs` 那句 `kind != Video` 仍未改，可拖可定位还没做。）| ~~**L**~~ **剩 S**（只差传输带接进来：`frame_at` 换帧重绘，帧表已在手） |
 | **PDF 兼容的 `.ai` 当图片看** | 嗅前 1024 字节的 `%PDF-`，命中就按图片显示 | **无**。`.ai` 只出现在"用外部程序打开"的分派里（`open_with_apps.rs:35`），`probe.rs:96-108` 的图片臂与文档臂都不含它 → 落 `AssetKind::Other`，无缩略图无预览。更根本的是 **Trove 没有任何 PDF 光栅化路径**（无 pdfium，PDF 只有文本视图） | **L**（先要一个 PDF→位图的依赖，这条同时是"文档真缩略图"那块欠的） |
 | **文件夹检查器**（对齐资产检查器的字段 + 封面 / 数量 / 大小） | 新增 `folder-inspector`：封面拼贴、名称、路径、资产数、子文件夹数、总大小 | **无**。检查器只认资产：`inspector.rs:303` 的入口是 `ctl.primary()`，而它读的是选中集里最后一个**资产 id**（`library/controller.rs:981`）；浏览合集时没有任何右侧详情。合集的字节数与封面在 `store/` 里也没有查询面（唯一的 `SUM(size_bytes)` 是全库的，`store/stats.rs:62`） | **L** |
 | **忽略规则面板**（内嵌草稿预览，点保存才写入） | `.serpentignore` 编辑器 + 预览 | **无**。Trove 只**读** Git 的忽略文件（`tasks/ignore.rs:46 OWN_IGNORE_FILES = [".gitignore", ".ignore"]`），从不写，也没有编辑面板。但**草稿-修订-保存这个形状已经有了**：`dialogs/rules.rs:12` 的 `RuleDraft` 就是"这里什么都不写" | **L**（新存储 + 写路径 + 对真实扫描的预览；UI 骨架可复用 rules） |
@@ -64,7 +64,7 @@ Serpent 在这两轮之间走了 **88 个提交**（其中 79 个非发布提交
 | **内嵌元数据显示** | 新增 `embedded-metadata.ts`，归一 15+ 字段成行显示 | **部分，而且差得很便宜**。抽取是真的（`media/metadata.rs:163` exif-rs 已挖出 Make/Model/ISO/FNumber/FocalLength/ExposureTime/GPS），但**挖出来的 `facts.photo` 在 `crates/trove-app/src` 里零引用**——一块已经躺在库里的数据没上界面。没抽的：视频/文档/归档（`metadata.rs:67` `_ => MinedMetadata::default()`）；没有 XMP/IPTC **读**（`library/jobs/xmp.rs` 是 sidecar **导出**） | ~~**S**（先把已挖的显示出来）~~ **已于 2026-09-27 做完**：检查器属性页新增相机 / 拍摄参数 / 拍摄时间 / GPS 四行，全部 `when_some`，无 EXIF 的文件一行都不出现。**过程中挖出两个真 bug**（`display_value()` 给 ASCII 加引号，导致 `captured_at` 对每张照片都是 None——时间线一直在按导入日期排序；快门被写成 `0.016666666666666666s` 而不是 `1/60s`），并补上一份真 EXIF JPEG 的内联夹具做端到端回归。**剩下的洞是回填**：`plan_remine` 只扫 `[Audio, Font]`（`services/maintenance.rs:99`），图片永不重挖，所以已入库的照片补不上这些字段（新导入的完全正常）；补它要动 `AssetPatch`（没有 `captured_at` 字段）+ 强制按钮文案。全打平（视频/文档标签抽取、XMP 读、custom tags）仍是 **L** |
 | **检查器逗号一次输入多个标签** | 输入即拆成待提交 chip，Enter 全给 | ~~**部分**~~ ✅ **已于 2026-09-28 收平**：Enter 现在就是"拆分并追加"（`inspector.rs` 的 `append_tags_flat`）。本节下面记的旧形状——拆分挂在 `replace_tags_from_input`（`:136`）上而且是**替换**整组、Enter 走 `add_tag_from_input`（`:111`）把整串当一个人名字——已经不存在了。见 §2026-09-28 复核 | ~~**S**~~ ✅ |
 | **音频卡片可选封面或波形，切换重建缩略图** | 新增设置项 | ~~**部分**~~ ✅ **已于 2026-09-28 收平**：`AppConfig::audio_card_style` 就是这个设置项，缩略图策略不再硬编码（旧文案指的 `thumb.rs:716` 那条硬规则已被两臂取代），重建走现成的"强制重建缩略图"。见 §2026-09-28 复核 | ~~**S**~~ ✅ |
-| **从硬盘删除走当前主题的确认框** | 新增 | **无，而且这条是数据安全的**。`context_menu.rs:304-312` 的「永久删除」直接 `purge_assets(&ids)`，**没有任何确认**，而 `en.toml:459 purge_delete_sources` 说明它确实会删源文件。 themed 确认框的现成样式在 `app/library_manager.rs:704` | **S** |
+| **从硬盘删除走当前主题的确认框** | 新增 | ~~**无，而且这条是数据安全的**~~ ✅ **已于 2026-09-28 第五轮做完，而且做的比这一格写的多**。这一格原来只数了右键那一条；实测**有四条**不可逆路径全都在单击即执行（见 §2026-09-28 第五轮）。共用闸门 `panels/workspace/mod.rs::confirm_destruction`，样式照 `title.rs:340 confirm_write_back`（`Danger` 主按钮 + `close_button(false)` + `Rc` 包回调） | ~~**S**~~ ✅ |
 | **RAW 头 0×0 不要记成假尺寸** | 新增 `usablePixelDimension` 判掉占位 0 | **部分**。光栅这条路结构上免疫（Trove 根本不读 EXIF 维度标签，尺寸取解码器自己的帧头 `probe.rs:286`），但 RAW 那条 `probe.rs:327` 写的是 `raw.width.max(1)`——**把 0 变成 1×1 记进库**，正是 Serpent 刚关掉的那类撒谎 | **S** |
 | **多文件原生拖出** | 整页可拖 | **部分**。应用内拖的是选中集，但拖出窗口时只解析被点那一个文件（`cells.rs:215` 单条 `FileDragPaths`） | **S** |
 
@@ -120,7 +120,7 @@ Serpent 侧一个提交都没有：上游仓库仍是 **v0.2.9**，`src/` 849 �
 
 （标题里的"未变"只对这一轮当时成立：下面十条里有序列帧与搜索历史两条在**同日第二、第三轮**被做掉了，已在原句里就地标注；其余八条到 09-28 第三轮结束时重跑仍然成立。）
 
-`media/probe.rs:327` 仍写 `raw.width.max(1)`——RAW 头报 0×0 时**记成 1×1 存进库**；`Cargo.toml` 无 `qcms`，`crates/trove-core/src` 里 `icc` / `qcms` 按词边界扫零命中（§C 色彩管理 T8 未动）；`grep -rn sequence crates/trove-app/src/` 当时仍只有两条无关注释（序列帧用户能碰的那一半一行没有）——**这句已被同日第二轮推翻**，`panels/workspace/context_menu.rs:236-296` 现在有创建与解散两颗；`model/query.rs` 无 random/shuffle（乱序排序没有）；`panels/search_box.rs` 当时无 history（搜索历史没有）——**这句已被同日第三轮推翻**，那里现在有 23 处 history 引用；`components/preview/video.rs:90` 第一句仍是 `if data.kind != AssetKind::Video { return None; }`（动画 GIF 到不了播放条）；`context_menu.rs:305-312` 与 `toolbar/selection.rs:89` 的「永久删除」仍直接 `purge_assets(&ids)`**没有任何确认**——09-27 建议把这条按缺陷而非差距排期，本轮它仍是缺陷；原生拖出仍只交出指针下**一个**文件（`cells.rs:210-215`、`:505-510`，闭包签名 `_: &AssetsDrag` 把选中集丢在参数里）。
+`media/probe.rs:327` 仍写 `raw.width.max(1)`——RAW 头报 0×0 时**记成 1×1 存进库**；`Cargo.toml` 无 `qcms`，`crates/trove-core/src` 里 `icc` / `qcms` 按词边界扫零命中（§C 色彩管理 T8 未动）；`grep -rn sequence crates/trove-app/src/` 当时仍只有两条无关注释（序列帧用户能碰的那一半一行没有）——**这句已被同日第二轮推翻**，`panels/workspace/context_menu.rs:236-296` 现在有创建与解散两颗；`model/query.rs` 无 random/shuffle（乱序排序没有）；`panels/search_box.rs` 当时无 history（搜索历史没有）——**这句已被同日第三轮推翻**，那里现在有 23 处 history 引用；`components/preview/video.rs:90` 第一句仍是 `if data.kind != AssetKind::Video { return None; }`（动画 GIF 到不了播放条）；`context_menu.rs` 与 `toolbar/selection.rs` 的「永久删除」当时仍直接 `purge_assets(&ids)` **没有任何确认**——09-27 建议把这条按缺陷而非差距排期，本轮它仍是缺陷；**同日第五轮已修，且发现不可逆路径其实是四条而不是两条**；原生拖出仍只交出指针下**一个**文件（`cells.rs:210-215`、`:505-510`，闭包签名 `_: &AssetsDrag` 把选中集丢在参数里）。
 
 ---
 
@@ -156,6 +156,94 @@ Serpent 侧依旧一格没动。这一轮收 §2026-09-27 复核 里那条 S 级
 **没做**：上下键走历史。那要新增一个可配动作（`keybindings.rs` 今天 21 条）+ 一份焦点归属决定，而点击回呼已经满足 §2026-09-27 那条能力描述。
 
 测试 +3（`config::tests` 两条：有界/去重/持久/缺字段仍能读；`search_box::tests` 一条：截断按字符），总数 **794 core + 71 app = 865** 全绿；locale +2 键九份齐加，棘轮 allowance 未动。
+
+---
+
+## 2026-09-28 第四轮：动画图片的时间轴核（功能未完成）
+
+**这一轮只解决了那个 L 的第一个未知量，功能本身没做完。** 记在这里是为了不让下一轮重新猜一遍。
+
+阻塞问题是"帧表从哪儿来"。上一版的推断是**动 WebP 可能拿不到帧延时，要外部进程**——那是从 `panels/common.rs` 的旧注释（"gpui 原生解 GIF 与动 WebP"）推的，没查编解码器。查了：`image` 0.25.10 对 `GifDecoder`、`ApngDecoder`、**`WebPDecoder`** 三个都实现了 `AnimationDecoder`（`codecs/gif.rs:426`、`png.rs:514`、`webp/decoder.rs:104`），而 `png` / `gif` / `webp` feature 在 workspace `Cargo.toml` 里本来就开着。**零新依赖、零外部进程。** 所以那三种格式的帧表都能在同一套代码里拿到，"APNG 最容易、WebP 是例外"那个排序建议作废。
+
+**落了什么**：`media/anim.rs`。`FrameTimes` 是一张纯数据表（每帧起始毫秒 + 双向映射 `frame_at(ms)` / `ms_at(frame)`），和任何解码器无关，所以边界能在没有窗口、没有像素的情况下钉死；`delays(path)` 是按 **magic bytes** 而不是扩展名分派的适配器，GIF 改名成 `.png` 也拿到它真实的帧表。契约照 `panels::common::decode_apng` 那个先例走 `Option`：静 PNG、JPEG、坏文件、单帧文件一律 `None`（意思是"退回静态缩略图"），不是错误——把最常见的情况报成错会让日志淹掉。
+
+**量的结果**：测试用 `gif` crate 现场写一张真实动 GIF（80/120/40/200 ms）再读回来，**逐帧延时无损往返**。两个我自己写错、被测试驳回的地方记一下，因为它们都是"看着像对的算术/语义"：40 ms 在 GIF 的百分之一秒单位下是 `4` 不是 `0`（我按 `0` 写了断言）；零时长帧在 tie 里**不会被选中**，因为后一帧起始于同一瞬间且取最后者，而 `image` 的 `GifEncoder` 根本没有逐帧 API（只有 `write_image` 静图），夹具必须走 `gif` crate——这与 `exr` 那条 dev-dependency 是同一个理由，`gif` 0.13.3 也已在图里。
+
+**没做什么，说清楚**：`media::anim` **零调用方**。`preview/video.rs:90` 的 `data.kind != AssetKind::Video` 一行没动，`image.rs:17` 仍是把文件丢给 gpui 循环播。所以**"GIF 能用播放条控制"这句今天仍然不成立**，这一轮只是把它从"要先决定帧表从哪来"变成"纯 UI 接线"。剩下的是 S–M：让 transport 接受动图资产、把解码出的帧持有住（`decode_apng` 那个 256 MB 预算可以照用）、seek 时按 `frame_at` 换帧重绘。
+
+> **同日第六轮记（这条下面的"要么接上、要么不该留在树里"已经还上了）**：`preview/anim.rs` 现在就是那个调用方——持帧、按自己的时钟换帧，用的正是这一轮定的 `Option` 契约和那个 256 MB 预算。剩下 seek 与传输带仍没做，所以这一格还是 ◐ 而不是 ✓。见 §2026-09-28 第六轮。
+
+**这一轮也提醒一件本仓库反复出事的事**：一个测试齐全、文档写好的新模块，如果没有调用方，它就是这份文档 §2026-09-28 复核 里点名的第五个"写好了没人调"。要么下一轮把 UI 接上，要么这个模块不该留在树里。
+
+---
+
+## 2026-09-28 第五轮：不可逆删除的确认框
+
+差距文档从 09-27 起就建议把这条**按缺陷排期而不是按差距排期**——理由不是"能力缺失"而是"少了一道本该有的门，代价是不可恢复地删掉用户的源文件"。本轮做它。
+
+**这一格原来数错了规模。** 09-27 那行只点了右键菜单一处。实测 `grep -rn "purge_assets\|empty_trash()\|trash_or_purge_selection" crates/trove-app/src` 之后是**四条**单击即永久删除的路径：
+
+| 路径 | 位置 | 原来 |
+|---|---|---|
+| 右键「永久删除」 | `context_menu.rs` | 直接 `purge_assets` |
+| 回收站工具条「永久删除」钮 | `toolbar/selection.rs` | 直接 `purge_assets` |
+| **Delete 键**（回收站视图里同键走 purge） | `toolbar/selection.rs` + `app/root.rs` 的 `TrashSelected` 动作 | `trash_or_purge_selection()` 内部判 `showing_trash` |
+| **清空回收站** | `toolbar/title.rs` → `interactions.rs::empty_trash` | 零确认，且是四条里删得最多的 |
+
+**只堵其中两条比一条都不堵更坏**：用户从菜单学到"这个操作会问我"，就会假定快捷键也会问，于是更快地去按它。所以四条一起接同一个闸门 `panels/workspace/mod.rs::confirm_destruction`，共用一个 `purge_gated` / `trash_or_purge_gated`；Delete 键那条只在**回收站视图**里要确认（平时它是可逆的移入回收站，给可逆操作加门会把人训练成随手点掉）。样式照 `toolbar/title.rs:340` 已有的 `confirm_write_back`（`ButtonVariant::Danger` 主按钮、`close_button(false)`、`Rc` 包回调因为 dialog builder 是 `Fn` 而非 `FnOnce`），不是新造一套。
+
+**警告文案分两种情形，而且这是本轮唯一有真判断的地方**：`purge_delete_sources` 关着时只说"N 个素材将永久删除，无法撤销"；**开着时**才追加一行"Trove 之外你自己的文件也会一并删除"。理由是每次都威胁最坏情况会把人训练成不看对话框——真正不可恢复的只有源文件那一半，库里的 blob 本来就能重新导入。为此把判断拆成纯函数 `purge_warning_for(delete_sources, count)`，这样它能在没有窗口、没有库、不改动用户配置的情况下被测（`the_source_file_threat_appears_only_when_the_setting_is_on` 钉住两分支不同且各含/不含第二行）。
+
+**闸门覆盖性复核**：改完再 grep 一遍全 app，剩下的每一处直接调用都在闸门函数体内（`purge_gated` 的 on_ok、`trash_or_purge_gated`、`WorkspacePanel::empty_trash` 的唯一调用点），**没有绕过路径**。
+
+**没验的**：对话框的实际外观（宽度、换行、Danger 配色）——GPUI 窗口在这里跑不起来，只能靠 `confirm_write_back` 是同一种对话框这一点来推断。计数为 0 时不弹（清空回收站在空库上直接返回）。测试 **800 core + 72 app = 872** 全绿，locale +3 键九份齐加、棘轮 allowance 未动。
+
+---
+
+## 2026-09-28 第六轮：动图真的在播了（接上第四轮那张账）
+
+**症状是"进入预览界面 GIF 不动"**，而它不是没解码——gpui 解了，只是它换帧的时机不归我们。读 `gpui-pre 0.3.5` 的 `elements/img.rs:318-339`：帧推进写在 `request_layout` 里，条件是 `frame_count > 1 && !cx.reduce_motion()`，外面还套着一层 `window.is_window_active()`。两个后果都不是从"把路径交给它"那行代码看得出来的：**没有别的东西重绘这个窗口就不换帧**，以及**窗口失焦时彻底冻住**（`last_frame_time` 直接被清成 `None`，重新聚焦才重新计时）。用户能做的只有晃鼠标。所以这一轮换的是"谁决定什么时候换帧"，不是"能不能解码"。
+
+**落了什么**：`preview/anim.rs`。一次解码（`trove_core::media::anim::decode`，就是第四轮那个核）成 N 张**各含一帧**的 `gpui_kit::RenderImage`，BGRA 交换在这里做掉而不是每次重绘做一次；一条自己的循环按墙上时钟决定 `frame` 是哪一张；`Drop` 时置 `alive`，循环随之退出（循环只持 `WeakEntity`，不会把面板留住）。形状抄 `video.rs` 的循环，理由是同一条：控制状态放 `Arc<Mutex<…>>`，循环永远不需要借 `App` 就能知道用户刚刚做了什么；每一帧的到期时间用 `Instant` 排程而不是"睡固定时长后换帧"，否则每次 notify 花掉的毫秒都被加进下一帧的延时里，看起来就是抖。
+
+**三个决定，各自都有代价**：
+
+1. **解码挪出 UI 线程。** 第四轮的核是"要拿帧表就得整份解码"，几百帧的 GIF 那是几百毫秒到一秒——在打开预览的那一下发生，等于把一坏掉的动画换成一个卡住的窗口。照 `video::load_player` 现成的样子加了一个 `anim_loading`：面板先显示它本来就在显示的静图，帧到了再换。**代价**：动图播放期间 `zoomable()` 为假，滚轮缩放与拖拽平移没了。这是本轮唯一的功能退让，说清楚它换掉了什么——原来的缩放走 `zoomed_still`，而那条路用的是 gpui 原生动画源，也就是**放大之后本来就不换帧**，是一个不动的高清图。视频、音频、文本三个舞台同样不缩放，所以现在是全库一致，只是 GIF 从"能缩、不会动"变成"会动、不能缩"。
+2. **`wants_player` 按 mime 判，不按文件嗅探。** 用的是 `data.animated.is_some()`（`panels::common::animated_preview_source` 已经算好的那半份判断），因为这个 gate 在每一次预览的必经之路上，而"这张 GIF 到底有几帧"要整份解码才知道。判错的代价是一个后台任务答 `None`、静图照常显示；JPEG 与静 PNG 连这个任务都不会起。
+3. **`Shared` 里只有 `playing`。** `seek` 与 `frame_at` 那一半本轮不写，因为没有播放条可以拖；写了就是这份文档点名的第 N 个"写好了没人调"。点击画面切暂停是眼下唯一控件，也是光标本来就在的地方。核心侧 `FrameTimes::frame_at` / `ms_at` 仍是 `pub`（trove-core 的公开 API，不会被 dead-code 门拦下），播放条那一步直接接。
+
+**量的结果**：+2 测（`each_prepared_frame_is_one_bgra_image`、`a_single_frame_picture_prepares_nothing`），合计 **802 core + 74 app = 876** 全绿 3 ignored，`fmt` 与 `clippy -D warnings` 同轮过。回归性按老规矩证过一遍：把 `pixel.swap(0, 2)` 改成 `swap(1, 2)`，断言立刻失败在 `left: [1, 70, 40, 255]` / `right: [70, 40, 1, 255]`——通道序错位在这套代码里没有任何别的地方会说话。顺带记一个不指向原因的坑：测试模块里 `use super::*` 会把父模块 `gpui_kit::*` 里那个**名为 `test` 的属性宏**一起带进来，于是每个 `#[test]` 都报 "recursion limit reached while expanding `#[test]`"；本仓库其他测试模块都是具名 `use super::xxx`，所以从没撞上。改成具名 import 即解。
+
+**没做的，逐条**：
+- 传输带（播放条）仍不通：`preview/video.rs` 那句 `kind != AssetKind::Video` 一行没动，可拖可定位还没有。`FrameTimes` 已经在等它。
+- **检查器卡片与缩放态仍走 gpui 原生那条路**（`image.rs:37` 的 `compact`、`zoomed_still`）。主区是本轮的范围；小卡片在滚动侧栏里被不停重绘，症状不明显，换它要另做一份帧缓存，不值。
+- 一条遗留要说明白：`panels::common::animated_preview_source` 对 `image/png` 仍会在 `AssetPreviewData::from_asset` 的调用路径上**同步整份解码 APNG**（`decode_apng`），也就是说打开任何 PNG 预览都还在 UI 线程解一次。本轮没动它，因为它同时是检查器卡片和 `zoomed_still` 的数据来源；新的播放器只是不再需要它。这是"动图预览"这件事剩下的、唯一还在 UI 线程上的那份开销。
+
+**没验的**：视觉上到底动没动——GPUI 窗口在这里跑不起来，像素层面的判断留给用户。有一条能自己确认的判别法：**把焦点切到别的窗口再切回来**。gpui 原来会在失焦期间冻住并清掉计时起点，新循环不归它管，回来时应当停在别处而不是第一帧。
+
+---
+
+## 2026-09-28 第七轮：数据结构的分层审计，以及 P0 止血
+
+这一轮不是追 Serpent，是回答"这些数据结构是不是在反映领域"。审计结论 + 排好的计划记在一起，是为了下一轮不用重新推导一遍。
+
+**审计的四问四答**（数字都是实测）：① 有没有独立领域实体——`model/` 目录是独立的，但 `Asset` 就是 `assets` 表那行（24 字段≈列，`store::assets::get` 经 `asset_from_row` 直接产出领域类型，中间没有行类型），所以 domain 与 db 是同一个结构体；② 充血还是 Service——贫血，`impl Asset` 只有 `file_stem()` 一个方法，业务在 `library.rs`（3,841 行 / 78 `pub fn`）和 134 个 `store/` 自由函数里；③ DB 模型有没有挡住接口层——没挡住：app 里 49 处 `library.store().conn()` + 65 处直接 `store::xxx::`，CLI 里 14 处 `conn()`，而 `trove-cli/src/ctx.rs:339` 的资产详情就是 `serde_json::to_value(asset)`，函数自己的注释写着"the stored row"；④ 有没有仓储抽象——只有具体类，`Store::conn()`（store/mod.rs:240）是 `unsafe { &*self.conn.as_ptr() }`，一扇可绕的门等于没有门。
+
+**一个纠正自己的框架**：这不是"全库贫血"。275 个 `pub` 类型里 ROW 只有 16 个，129 个值对象全在 `media/`（3D/成像内部，与 SQLite 零耦合），面向库的只有 `model/` 34 + `store/` 13 + `library.rs` 7。真正的结构病是一句话：**16 个 ROW 类型里 10 个住在 `model/`，只有 2 个住在 `store/`**——域包持有行形状。要动的范围比"DDD 重构"小一个数量级。已经做对的先例也记下来，因为计划要照抄它们而不是另造一套：`EmbeddingSpace`（类型 / SQL CHECK / 解码器三者一致，全库唯一）、`NewEmbedding::validate`、`Appearance` + `Accent`（`migrate_appearance` 把自由 hex 折掉并**删列**，是"用类型替换字符串列"的完整范例）、`Page{total,items,truncated}`、`Listing`（browse.rs:377-395，想要的分层其实已经写好了，只是私有）。
+
+**几条实测到的具体缺陷**（每条都在源码里读过，不是从注释推的）：`Asset` 的 `origin` + `rel_path: Option` 其实表达**三**态——`library.rs:1932-1947` 从导出档恢复元数据时会造一条"有名字没 blob"的记录，代码自己叫它 placeholder，注释写着"invisible to orphan cleanup until healed"，`media/import.rs:422` 负责愈合；`Linked` 那半同样无约束（`Linked ⇒ facts.source_path` 无人检查），`library.rs:491` 与 `media/thumb.rs:69` 都是 `?`，静默变 `None` 后被调用方报成"文件不见了"——**误诊**。`MAX_RATING` 只在 `model/asset.rs:254` 一扇门上查，读回时 `rating: v as u8` 截断（`assets.rs:631`）、`size_bytes` 用 `.max(0)` 静默修（:623），schema 对 `rating`/`kind`/`usage_status` 没有 CHECK（只有 origin/space/fps/position/frame_number 有），而 `parse_kind` 遇脏值让整份 `list()` 失败（:1157）。`ai_analysis` 表建了、索引了、独占一个升级步、还被版本探测查过——**全仓 0 处 INSERT/SELECT**，真数据住在 `facts.unknown["ai_analysis"]` 当无类型 JSON。`Store::conn()` 的 `# Safety` 注释说 RefCell 会在运行时保证没有可变借用，**这句不成立**：读路径从不取借用，而 :191/:213/:248 用 `borrow_mut()`，所以是静默 `&`/`&mut` 并存而不是 panic。
+> 顺手记下两个我纠正掉的**误报**，因为它们都来自我自己派出去的审计：① "tag 名打错会编译成空 `IN ()` 匹配零条"——错，`ids.is_empty()` 走的是名字等值的 `EXISTS` 分支（`store/smart.rs:126-130`），真实缺陷是 `subtree_ids(...).ok()` 把 DB 错误吞掉后，一条"含整个子树"的规则**静默降级**成"精确同名"；② "`record_retry` 写 `finished_at = NULL` 所以 Completed+None 可达"——错，它同时把 status 写成 Running，是自洽的；那一处真正的问题是 `str_to_status` 的 `_ => TaskStatus::Failed` 把无法识别的状态读成 Failed。
+
+**本轮决定（四条，已拍板）**：占位态**在类型里命名**（不打算靠"从源头消灭"）；`ai_analysis` **删表**；P1 关门**app + CLI 一起**（63 处）；本轮范围 **P0 + P1**。
+
+**P0 落了什么**：① 任务日志的 9 处 `let _ = task_journal::…`（`tasks/mod.rs`）全部改走一个 `journal_write` 助手——失败就置 `journal_degraded` 标志并只记一条 warn（一个坏日志会在此后每次转移都失败，逐条 warn 会把那句唯一需要的话埋了）。标志由 `TaskManager::journal_degraded()` 暴露，**调用方是任务面板**：它原来会因"没有行"而读出"没有任务被中断"，这正是日志失败唯一无法被后来进程看见的代价，所以面板加了一条警告行（`journal_degraded_note`，新键 `task.journal_degraded`）。② 侧栏两处删除（托管集合 `explorer.rs:1243`、智能集 :1184）原来是 `let _ =` 吞掉错误**且无条件** `generation += 1` → 列表重读数据库发现集合还在，而用户已经看见一个空位说明它没了。改成 `context_menu.rs:330-345` 早就有的那个 Ok/Err 形状：成功才换视图、才 bump，失败走 `report_error`（新键 `explorer.delete_failed`）。③ 为此新增 `Library::delete_collection`，形状照现成的先例 `delete_smart_collection`（一行门面、不记 undo），并把"为什么不记 undo"写进文档：集合就是它的成员表，撤销删除要重建 undo 栈没有快照的行。④ 顺带纠正一处注释与代码不符：`TaskManager` 的文档声称 journal 锁"never held while `jobs` … are held"，实测两处 `record_start` 就在 `jobs` 持有期间发生——真实的锁序是 `jobs` → `journal`，且没有反向路径，所以把注释改成事实而不是改锁序（没有可观测的死锁路径，动它不属于止血）。
+
+**量的结果**：测试 **804 core + 74 app = 878** 全绿 3 ignored，`fmt` 与 `clippy -D warnings` 同轮过，locale +2 键九份齐加、棘轮 allowance 未动（de 64/2、其余 63/1、zh-CN 0/0 实测照旧）。新测试的回归性按老规矩**用变异证明**：把 `journal_write` 的 `if let Err(error) = …` 换回 `let _ = run(&conn);`，`a_journal_write_that_fails_is_reported_not_swallowed` 立刻 FAILED，而同批另一条 `a_working_journal_and_a_missing_one_both_stay_clean` 仍过——后者存在的理由就是防止"永远置标志"这种作弊实现蒙过前者。
+
+**没做的，逐条**：51 处守写的 `let _ =` 只处理了 11 处（9 journal + 2 explorer），其余 ~40 处里 17 处是 `config.save()`；`AppConfig::load()` 的 82 处不缓存、`toolbar_row` 在 render 路径里每帧 `read_to_string` 一次磁盘的事，本轮没动；`data.rs:387` 那条"持着 `&Connection` 跨越另一次 `conn()` 写"的可能撕开读，以及 CLI `open_read_only` 的连接实际仍可写——这两条是子代理报的，**我没有逐行复核，所以没写进依据**，P1 关门时自然会被逼到眼前。
+> P1..P6 的排序、半径和门禁见本节末尾的"数据结构计划"卡片，下一轮直接从 P1 开始：**P1** `Store::conn()` 收 `pub(crate)`，63 处（app 49 / cli 14，散在 23 个 app 文件）改走门面，预计给 `Library` 补 15–25 个方法，那个 unsafe 从公开 API 的前提退成内部细节；**P2** `enum AssetLocation { Stored{rel_path}, Placeholder, Linked{source_path} }`（schema 不动，23 处 `Asset {}` 字面量全在 core、app 0 处）；**P3** `enum Placement { Live, Trashed(DateTime) }` 收掉 `trashed_at`(76)/`is_trashed`(24)/`in_trash`(20) 三种写法与 ≥9 处手写 `trashed_at IS NULL`；**P4** `Rating`/`ContentHash` + 补 SQL CHECK（配 v21→v22，顺带补上一直缺的迁移测试）+ `parse_kind` 改成降级那一行并报告；**P5** 智能集规则 `query: Json` → `SmartNode`（半径 core 24 + app 27，会碰规则编辑器）；**P6** `ai_analysis` 走 v21→v22 DROP。**明确不做**：Repository trait/mock、三层包重命名、把 129 个 `media/` 值对象卷进来、用 `Patch<T>` 泛型替换 6 个 `Option<Option<_>>`（CLI 5 处依赖具体形状）、给 `mime`/`ext` 造 newtype。
+
+**没验的**：面板那条警告条的实际外观与措辞长度（GPUI 窗口在这里跑不起来）；`journal_write` 的 poisoned-lock 分支只有代码路径、没有测试（构造不出毒化的 journal 锁）。
 
 ---
 

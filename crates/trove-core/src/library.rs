@@ -1749,6 +1749,17 @@ impl Library {
         Ok(())
     }
 
+    /// Delete a managed collection, memberships and all.
+    ///
+    /// Not recorded for undo, same as [`Self::delete_smart_collection`]: a
+    /// collection is its membership list, so undoing a delete means re-creating
+    /// rows the undo stack has no snapshot of. The callers that do record —
+    /// [`Self::rename_collection`], [`Self::move_collection`] — only ever put
+    /// back a field of a row that still exists.
+    pub fn delete_collection(&self, id: Uuid) -> Result<()> {
+        collections::delete(self.store.conn(), id)
+    }
+
     /// Undo the most recent recorded mutation. Returns `false` when there is
     /// nothing to undo.
     pub fn undo(&self) -> Result<bool> {

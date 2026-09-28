@@ -34,9 +34,11 @@ pub(crate) const WORKSPACE_CONTEXT: &str = "Workspace";
 pub(crate) const GRID_CONTEXT: &str = "AssetGrid";
 
 /// Key context of the video preview (a video is open in the main area). It
-/// exists only while a video is previewed, so a bare letter bound here — the
-/// fullscreen key — never shadows typing in the search box, which sits in the
-/// `Workspace` context.
+/// exists only while a video is previewed, so a bare character bound here — the
+/// fullscreen letter, the play/pause space — never shadows typing in the search
+/// box, which sits in the `Workspace` context. `Workspace` rides along on the
+/// same node while a preview is open, so the grid's own bindings keep working
+/// over the preview.
 pub(crate) const VIDEO_PREVIEW_CONTEXT: &str = "VideoPreview";
 
 /// Key context of the fullscreen video window. Its only binding is Escape:
@@ -138,6 +140,11 @@ pub(crate) fn register(cx: &mut App, config: &trove_core::config::AppConfig) {
     // video is on screen — the search box shares the `Workspace` context and
     // would lose the letter otherwise.
     bind!(EnterVideoFullscreen, Some(VIDEO_PREVIEW_CONTEXT));
+    // Space holds and resumes the video that replaced the grid. Its context is
+    // the preview's, not the grid's, so the two space bars never both match:
+    // `AssetGrid` is not on the focus path while a preview is up, and
+    // `VideoPreview` is not on it while the grid is.
+    bind!(TogglePlayback, Some(VIDEO_PREVIEW_CONTEXT));
 
     // Plugin commands: declared by registered plugins, bound with each
     // command's default key or the user's override (an empty effective key

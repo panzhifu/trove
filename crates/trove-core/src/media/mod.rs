@@ -1,6 +1,7 @@
 //! Media import: content-addressed blob storage, type probing, thumbnails and
 //! the file import pipeline.
 
+pub mod anim;
 pub mod blob;
 pub mod chunked;
 pub mod color;

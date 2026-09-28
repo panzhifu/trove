@@ -9,6 +9,7 @@
 use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdout, Command, Stdio};
+use std::sync::OnceLock;
 
 /// Width cap for decoded frames: 720p BGRA is ~3.7 MB per frame and the
 /// player keeps a single frame alive at a time.
@@ -17,15 +18,26 @@ pub const DEFAULT_MAX_WIDTH: u32 = 720;
 /// Frame rate assumed when the container reports a nonsense value (`0/0`).
 const FALLBACK_FPS: f64 = 30.0;
 
-/// Whether `ffmpeg` is on PATH. Probed once per preview; the result is cheap
-/// enough (a `-version` spawn) not to cache.
+/// Whether `ffmpeg` is on PATH. Answered once per process and kept: the
+/// `-version` spawn costs a tenth of a second on this machine, which is a
+/// visible stall wherever it is asked — and the live card asks on the thread
+/// that paints. Someone installing ffmpeg mid-session is not a case worth
+/// paying for; restarting Trove answers it.
 pub fn ffmpeg_available() -> bool {
-    runs("ffmpeg")
+    cached("ffmpeg", &FFMPEG_AVAILABLE)
 }
 
-/// Whether `ffprobe` is on PATH.
+/// Whether `ffprobe` is on PATH. Cached for the same reason as
+/// [`ffmpeg_available`].
 pub fn ffprobe_available() -> bool {
-    runs("ffprobe")
+    cached("ffprobe", &FFPROBE_AVAILABLE)
+}
+
+static FFMPEG_AVAILABLE: OnceLock<bool> = OnceLock::new();
+static FFPROBE_AVAILABLE: OnceLock<bool> = OnceLock::new();
+
+fn cached(program: &str, slot: &'static OnceLock<bool>) -> bool {
+    *slot.get_or_init(|| runs(program))
 }
 
 /// Run `program -version` and report whether it exits successfully.
@@ -195,8 +207,16 @@ impl FramePipe {
     /// Start decoding at `seek_ms` into a stream scaled to `max_width`.
     /// `-ss` before `-i` seeks to the preceding keyframe — fast, and close
     /// enough for a scrub.
-    pub fn open(path: &Path, seek_ms: u64, max_width: u32) -> Option<Self> {
-        let facts = probe(path)?;
+    ///
+    /// `facts` come from the caller rather than a fresh [`probe`]: the player
+    /// already holds them, and re-probing here put an `ffprobe` round trip in
+    /// front of every seek and every loop back to zero.
+    pub fn open(
+        path: &Path,
+        seek_ms: u64,
+        max_width: u32,
+        facts: &VideoStreamFacts,
+    ) -> Option<Self> {
         let (width, height) = scaled_size(facts.width, facts.height, max_width);
         if width == 0 || height == 0 {
             return None;
@@ -675,7 +695,7 @@ mod tests {
         assert_eq!(facts.fps, 10);
         assert!(facts.duration_ms >= 900, "duration {facts:?}");
 
-        let mut pipe = FramePipe::open(&clip, 0, 320).expect("pipe opens");
+        let mut pipe = FramePipe::open(&clip, 0, 320, &facts).expect("pipe opens");
         assert_eq!(pipe.width(), 320);
         assert_eq!(pipe.height(), 240);
         let frame = pipe.read_frame().expect("first frame decodes");

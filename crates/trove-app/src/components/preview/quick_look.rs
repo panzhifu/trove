@@ -288,10 +288,9 @@ impl LiveCard {
         let duration_ms = duration_ms.unwrap_or(0);
         if kind == AssetKind::Audio {
             // No picture to advance, so the card stays the card and only the
-            // sound arrives. `spawn` answers `None` with no ffmpeg, no decodable
-            // stream, or no audio track at all — and then there is nothing to do,
-            // which is the same card the pointer found.
-            let audio = AudioEngine::spawn(path, cx);
+            // sound arrives. A file with no audio stream to feed it leaves
+            // nothing to do, which is the same card the pointer found.
+            let audio = video::has_audio_track(&path).then(|| AudioEngine::spawn(path, cx));
             if let Some(audio) = &audio {
                 audio.update(cx, |audio, _| audio.set_playing(true));
             }
@@ -313,7 +312,7 @@ impl LiveCard {
         }
         let mailbox = Arc::new(Mutex::new(Mailbox::default()));
         let alive = Arc::new(AtomicBool::new(true));
-        let audio = AudioEngine::spawn(path.clone(), cx);
+        let audio = video::has_audio_track(&path).then(|| AudioEngine::spawn(path.clone(), cx));
         if let Some(audio) = &audio {
             audio.update(cx, |audio, _| audio.set_playing(true));
         }
@@ -350,17 +349,15 @@ impl LiveCard {
                     .spawn(async move { video::probe(&path) })
                     .await
             };
-            let (duration_ms, frame_ms) = match facts {
-                Some(facts) => (facts.duration_ms, facts.frame_ms()),
-                // Undecodable: the card stays a card.
-                None => {
-                    entity.update(cx, |this, cx| {
-                        this.stop();
-                        cx.notify();
-                    });
-                    return;
-                }
+            // Undecodable: the card stays a card.
+            let Some(facts) = facts else {
+                entity.update(cx, |this, cx| {
+                    this.stop();
+                    cx.notify();
+                });
+                return;
             };
+            let (duration_ms, frame_ms) = (facts.duration_ms, facts.frame_ms());
             if let Ok(mut mailbox) = mailbox.lock() {
                 mailbox.duration_ms = duration_ms;
             }
@@ -378,9 +375,14 @@ impl LiveCard {
                 let Some(pipe_now) = opened else {
                     let open_path = path.clone();
                     let at = playhead;
+                    // A copy per open: the spawn below moves what it captures,
+                    // and this loop opens the pipe again on every jump.
+                    let open_facts = facts;
                     let fresh = cx
                         .background_executor()
-                        .spawn(async move { FramePipe::open(&open_path, at, CARD_MAX_WIDTH) })
+                        .spawn(async move {
+                            FramePipe::open(&open_path, at, CARD_MAX_WIDTH, &open_facts)
+                        })
                         .await;
                     match fresh {
                         Some(fresh) => pipe = Some(fresh),

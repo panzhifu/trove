@@ -20,7 +20,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use gpui_kit::*;
-use trove_core::media::video::{self, AudioPipe};
+use trove_core::media::video::AudioPipe;
 
 use super::video::IDLE_POLL;
 
@@ -92,10 +92,12 @@ impl AudioEngine {
     /// Build the engine for `path` and start feeding it. The engine's
     /// lifetime is the playback's: it is dropped with the preview panel that
     /// created it, not with a window.
-    pub(super) fn spawn(path: PathBuf, cx: &mut App) -> Option<Entity<Self>> {
-        if !video::has_audio_track(&path) {
-            return None;
-        }
+    ///
+    /// Whether the file carries an audio stream at all is the caller's call —
+    /// answering it is an `ffprobe` round trip, and the video preview pays for
+    /// it on a background thread while the poster is on screen. An engine on a
+    /// silent file would just feed nothing.
+    pub(super) fn spawn(path: PathBuf, cx: &mut App) -> Entity<Self> {
         let engine = cx.new(|_| Self {
             path,
             shared: Arc::new(Mutex::new(EngineShared {
@@ -111,7 +113,7 @@ impl AudioEngine {
             alive: Arc::new(AtomicBool::new(true)),
         });
         engine.update(cx, |engine, cx| engine.start(cx));
-        Some(engine)
+        engine
     }
 
     /// The clock the video loops follow. Handing out the `Arc` lets them

@@ -20,6 +20,7 @@ use crate::library::LibraryController;
 use crate::panels::WorkspacePanel;
 use crate::panels::workspace::MainPreview;
 use crate::panels::workspace::title_controls;
+use crate::panels::workspace::{confirm_destruction, purge_warning};
 use trove_core::media::edit::ImageEdit;
 
 impl DockPanel for WorkspacePanel {
@@ -141,7 +142,28 @@ impl DockPanel for WorkspacePanel {
                     CatalogIcon::Trash,
                     rust_i18n::t!("workspace.empty_all_tooltip").to_string(),
                 )
-                .on_click(cx.listener(|this, _, _, cx| this.empty_trash(cx)))
+                .on_click(cx.listener(|this, _, window, cx| {
+                    // The most destructive click in the app, and until now the
+                    // only irreversible one with nothing in front of it: it
+                    // deletes every trashed blob, and every linked source file
+                    // too when that setting is on.
+                    let count = this
+                        .controller
+                        .read(cx)
+                        .library
+                        .stats()
+                        .map(|stats| stats.trashed as usize)
+                        .unwrap_or(0);
+                    if count == 0 {
+                        this.empty_trash(cx);
+                        return;
+                    }
+                    let body = purge_warning(this.controller.read(cx), count);
+                    let this = cx.entity();
+                    confirm_destruction(window, cx, body, move |cx| {
+                        this.update(cx, |this, cx| this.empty_trash(cx));
+                    });
+                }))
             } else {
                 icon_button(
                     "clear-history",

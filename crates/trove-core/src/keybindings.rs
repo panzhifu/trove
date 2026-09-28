@@ -137,6 +137,15 @@ pub fn default_keybindings() -> Vec<KeyBindingConfig> {
             context: Some("VideoPreview"),
         },
         KeyBindingConfig {
+            // The player's own space bar, in the same context as `f` and for
+            // the same reason: it is live only while a video is on screen, so
+            // the grid's search box keeps its spaces. `QuickLook` binds space
+            // in `AssetGrid`, which is not rendered during a preview.
+            action: "TogglePlayback",
+            key: "space",
+            context: Some("VideoPreview"),
+        },
+        KeyBindingConfig {
             // The same letter while the stage is up, so `f` toggles — the
             // stage replaces the preview, so the enter binding is out of the
             // dispatch path there and the exit needs its own key.
@@ -201,6 +210,27 @@ mod tests {
             .expect("QuickLook must stay configurable");
         assert_eq!(binding.key, "space");
         assert_eq!(binding.context, Some("AssetGrid"));
+    }
+
+    #[test]
+    fn the_two_space_bindings_never_share_a_context() {
+        // One space lights up the tile the arrow keys are on, the other holds
+        // the video that replaced the grid. Bound in the same context they would
+        // both match wherever that context is on the focus path, and a preview
+        // that steals the grid's space is a grid you cannot quick-look.
+        let defaults = default_keybindings();
+        let spaces: Vec<(&str, Option<&str>)> = defaults
+            .iter()
+            .filter(|b| b.key == "space")
+            .map(|b| (b.action, b.context))
+            .collect();
+        assert_eq!(
+            spaces.as_slice(),
+            [
+                ("QuickLook", Some("AssetGrid")),
+                ("TogglePlayback", Some("VideoPreview"))
+            ]
+        );
     }
 
     #[test]
