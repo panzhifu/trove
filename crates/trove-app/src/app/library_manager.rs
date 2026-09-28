@@ -688,6 +688,28 @@ fn row_menu(
     })
 }
 
+/// Remove each directory that is there, stopping at the first one that refuses.
+///
+/// Absent counts as removed: a library that was created but never opened has no
+/// cache directory at all, and `remove_dir_all` reports that as `NotFound` --
+/// which must not read as "the delete failed", because it would leave the entry
+/// behind for a library that really was deleted.
+///
+/// `None` means every directory is gone. `Some` names the one that stopped the
+/// walk and why, which is the only thing the user can act on.
+fn clear_directories(
+    dirs: impl IntoIterator<Item = impl AsRef<std::path::Path>>,
+) -> Option<(std::path::PathBuf, std::io::Error)> {
+    for dir in dirs {
+        if dir.as_ref().exists()
+            && let Err(error) = std::fs::remove_dir_all(dir.as_ref())
+        {
+            return Some((dir.as_ref().to_path_buf(), error));
+        }
+    }
+    None
+}
+
 /// The inline editor that replaces a row while it is renamed — the
 /// collections panel's editor row, transplanted.
 fn inline_editor(editor: &Entity<InputState>) -> AnyElement {
@@ -728,16 +750,161 @@ fn open_delete_confirm(entry: LibraryEntry, window: &mut Window, cx: &mut App) {
                     .cancel_text(rust_i18n::t!("library_manager.cancel").to_string())
                     .show_cancel(true),
             )
-            .on_ok(move |_, _, cx| {
+            .on_ok(move |_, window, cx| {
+                // Deleting a library is two steps that fail at different points,
+                // and the two residuals are not equally bad. The order used to be
+                // entry-then-files, which meant a failed delete left a database
+                // and its backups on disk with no entry pointing at them and no
+                // message about it -- an orphan nobody can find. Files first, so a
+                // failure leaves the row exactly where it was: listed, openable,
+                // retryable from the same kebab menu.
+                let data = commit_entry.dir();
+                let cache = commit_entry.cache_dir();
+                if let Some((dir, error)) = clear_directories([&data, &cache]) {
+                    // One thing no ordering fixes is a delete that dies *partway*:
+                    // `remove_dir_all` unlinks as it walks, so by the time it
+                    // errors the database may already be gone while the directory
+                    // is not. That is checked rather than assumed, because it
+                    // changes what the entry should do -- a library with no
+                    // database cannot be opened, and leaving it listed would
+                    // promise something the row can no longer deliver.
+                    let database_gone = !data.join("library.db").exists();
+                    tracing::warn!(
+                        path = %dir.display(),
+                        %error,
+                        database_gone,
+                        "a library delete did not finish"
+                    );
+                    if database_gone {
+                        let mut config = AppConfig::load();
+                        settings_write::note(
+                            config.forget_library(&commit_entry.slug),
+                            "library forgotten",
+                        );
+                        window.push_notification(
+                            Notification::warning(
+                                rust_i18n::t!(
+                                    "library_manager.delete_incomplete",
+                                    name = commit_entry.name.clone(),
+                                    path = data.display().to_string(),
+                                    error = error.to_string(),
+                                )
+                                .to_string(),
+                            ),
+                            cx,
+                        );
+                    } else {
+                        window.push_notification(
+                            Notification::warning(
+                                rust_i18n::t!(
+                                    "library_manager.delete_failed",
+                                    name = commit_entry.name.clone(),
+                                    path = dir.display().to_string(),
+                                    error = error.to_string(),
+                                )
+                                .to_string(),
+                            ),
+                            cx,
+                        );
+                    }
+                    cx.refresh_windows();
+                    return true;
+                }
+
+                // The files are gone; the entry follows, and a failure to write
+                // that down is not a "nothing happened" case -- the row will come
+                // back after a restart pointing at directories that no longer
+                // exist, so it says that much rather than leaving the status bar
+                // alone to carry it.
                 let mut config = AppConfig::load();
-                settings_write::note(
-                    config.forget_library(&commit_entry.slug),
-                    "library forgotten",
-                );
-                let _ = std::fs::remove_dir_all(commit_entry.dir());
-                let _ = std::fs::remove_dir_all(commit_entry.cache_dir());
+                let outcome = config.forget_library(&commit_entry.slug);
+                if let Err(error) = &outcome {
+                    tracing::warn!(%error, "a deleted library's entry could not be removed");
+                    window.push_notification(
+                        Notification::warning(
+                            rust_i18n::t!(
+                                "library_manager.entry_left_behind",
+                                name = commit_entry.name.clone(),
+                                error = error.to_string(),
+                            )
+                            .to_string(),
+                        ),
+                        cx,
+                    );
+                }
+                settings_write::note(outcome, "library forgotten");
                 cx.refresh_windows();
                 true
             })
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::clear_directories;
+
+    fn unique_dir() -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("trove-libmgr-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// A library that was created but never opened has no cache directory, and
+    /// `remove_dir_all` reports that as `NotFound`. Reading that as a failure
+    /// would leave the entry of a genuinely deleted library behind, which is the
+    /// opposite of what the two-step order is for -- so absence is success.
+    #[test]
+    fn an_absent_directory_counts_as_removed() {
+        let missing =
+            std::env::temp_dir().join(format!("trove-libmgr-absent-{}", uuid::Uuid::new_v4()));
+        assert!(!missing.exists(), "the fixture must start absent");
+        assert!(
+            clear_directories([&missing]).is_none(),
+            "nothing to delete is not a failed delete"
+        );
+    }
+
+    /// The walk has to stop and name the path that refused it, because that path
+    /// is the whole message the user can act on.
+    ///
+    /// A regular file is the deterministic refusal: `remove_dir_all` will not
+    /// take one apart on any platform this ships on, so the test does not depend
+    /// on permissions, a busy disk, or who runs it.
+    #[test]
+    fn a_refusing_path_is_named_and_the_walk_stops_there() {
+        let dir = unique_dir();
+        let not_a_dir = dir.join("library.db");
+        std::fs::write(&not_a_dir, b"x").unwrap();
+        let sibling = dir.join("backups");
+        std::fs::create_dir_all(&sibling).unwrap();
+
+        let (stopped, error) =
+            clear_directories([&not_a_dir, &sibling]).expect("a file is not a directory");
+        assert_eq!(stopped, not_a_dir, "the report names what refused");
+        assert!(
+            !error.to_string().is_empty(),
+            "and carries the reason the log line needs"
+        );
+        assert!(
+            sibling.exists(),
+            "the walk stopped where it said rather than finishing silently"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Both directories gone and nothing reported -- the normal path, and the one
+    /// that lets the entry be written away after it.
+    #[test]
+    fn two_real_directories_both_go_away() {
+        let dir = unique_dir();
+        let data = dir.join("library");
+        let cache = dir.join("cache");
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::write(data.join("library.db"), b"x").unwrap();
+        std::fs::create_dir_all(&cache).unwrap();
+
+        assert!(clear_directories([&data, &cache]).is_none());
+        assert!(!data.exists() && !cache.exists(), "both are gone");
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }
