@@ -20,6 +20,41 @@ pub enum Origin {
     Linked,
 }
 
+/// Where an asset's bytes live.
+///
+/// The library has these states whether the type names them or not, and naming
+/// them is the whole point: `origin` and `rel_path` are two independent columns,
+/// so "stored with no path" and "linked with no path" were both writable, and
+/// every reader had to remember which of them meant what. `Library::asset_file`
+/// and `media::thumb::blob_path` turned the second one into a plain `None`,
+/// which is a wrong answer wearing the right clothes — it looks exactly like a
+/// file the user moved.
+///
+/// Read it with [`Asset::location`], change it with [`Asset::set_location`].
+/// Those two are the only public way through the underlying columns and the
+/// `extra.source_path` key, which is what keeps the pairs consistent without
+/// asking every caller to re-derive them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AssetLocation {
+    /// The library holds the file, content-addressed under its root.
+    Stored { rel_path: String },
+    /// A record a metadata restore created before its blob arrived: name, tags,
+    /// rating and dates are real, the file is not. Import turns it into
+    /// [`AssetLocation::Stored`] the moment the matching content hash lands, and
+    /// orphan cleanup ignores it until then — that ignore rule is a *state*, not
+    /// a missing value, which is why it has a variant.
+    Placeholder,
+    /// The file stays where the user put it, outside the library. What a normal
+    /// import produces; the path was recorded at import time.
+    Linked { source_path: String },
+    /// A `linked` row with no recorded path. Only [`Asset::location`] can hand
+    /// this back — `media::import` always records a path — so reaching it means
+    /// a database written by something other than the current importer. There is
+    /// no file to open and no restore will bring one, which is the difference
+    /// between this and [`AssetLocation::Placeholder`].
+    Unrecorded,
+}
+
 /// Coarse asset classification, derived from the mime type and overridable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -198,6 +233,64 @@ impl Asset {
             .unwrap_or(&self.file_name)
             .to_string()
     }
+
+    /// Where this asset's bytes live, as the four states the library actually
+    /// has rather than as two columns that happen to be filled a certain way.
+    ///
+    /// Total by design: a stored record with no path is a
+    /// [`AssetLocation::Placeholder`], and a linked record with no path is
+    /// [`AssetLocation::Unrecorded`]. Neither can fail, because a decoder that
+    /// returned `Option` would push the "what did this mean?" decision onto
+    /// every caller — which is the bug this replaces.
+    pub fn location(&self) -> AssetLocation {
+        match self.origin {
+            Origin::Stored => match &self.rel_path {
+                Some(rel_path) => AssetLocation::Stored {
+                    rel_path: rel_path.clone(),
+                },
+                None => AssetLocation::Placeholder,
+            },
+            Origin::Linked => match &self.facts.source_path {
+                Some(source_path) => AssetLocation::Linked {
+                    source_path: source_path.clone(),
+                },
+                None => AssetLocation::Unrecorded,
+            },
+        }
+    }
+
+    /// Point this record at `location`, writing the `origin` and `rel_path`
+    /// columns and the `extra.source_path` key that state implies.
+    ///
+    /// A linked state clears `rel_path` and a stored one clears the recorded
+    /// path from the *location* it hands back, but switching *away* from linked
+    /// deliberately leaves any old `source_path` key in `extra`: deleting a fact
+    /// no reader asked us to delete is a data change, and this round's promise
+    /// is that behaviour does not move. The key is only ever read under
+    /// [`AssetLocation::Linked`], so the stale copy cannot be mistaken for the
+    /// live one.
+    pub fn set_location(&mut self, location: AssetLocation) {
+        match location {
+            AssetLocation::Stored { rel_path } => {
+                self.origin = Origin::Stored;
+                self.rel_path = Some(rel_path);
+            }
+            AssetLocation::Placeholder => {
+                self.origin = Origin::Stored;
+                self.rel_path = None;
+            }
+            AssetLocation::Linked { source_path } => {
+                self.origin = Origin::Linked;
+                self.rel_path = None;
+                self.facts.source_path = Some(source_path);
+            }
+            AssetLocation::Unrecorded => {
+                self.origin = Origin::Linked;
+                self.rel_path = None;
+                self.facts.source_path = None;
+            }
+        }
+    }
 }
 
 /// Input describing a new asset, before the importer fills media facts.
@@ -329,5 +422,202 @@ mod aspect_tests {
                 pair[1]
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::Value as Json;
+    use std::collections::BTreeSet;
+    use uuid::Uuid;
+
+    /// A record with every field set to something other than its default.
+    ///
+    /// The pinning below only catches a dropped field if that field would come
+    /// back empty and therefore look unchanged, so a fixture of defaults proves
+    /// nothing.
+    fn full_asset() -> Asset {
+        let stamp = chrono::DateTime::parse_from_rfc3339("2026-01-02T03:04:05Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let mut facts = AssetFacts::default();
+        facts.photo.make = Some("Nikon".into());
+        facts.photo.iso = Some(400);
+        facts
+            .unknown
+            .insert("pinned".into(), Json::String("value".into()));
+        Asset {
+            id: Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap(),
+            origin: Origin::Stored,
+            rel_path: Some("media/00/pinned.png".into()),
+            file_name: "pinned.png".into(),
+            ext: "png".into(),
+            mime: "image/png".into(),
+            size_bytes: 4096,
+            content_hash: Some("b".repeat(64)),
+            kind: AssetKind::Image,
+            width: Some(800),
+            height: Some(600),
+            duration_ms: Some(1200),
+            captured_at: Some(stamp),
+            title: Some("A title".into()),
+            description: Some("A description".into()),
+            rating: Some(4),
+            is_favorite: true,
+            source_url: Some("https://example.test/pinned".into()),
+            usage_status: UsageStatus::Used,
+            commercial_use: Some(true),
+            facts,
+            created_at: stamp,
+            updated_at: stamp,
+            trashed_at: Some(stamp),
+        }
+    }
+
+    /// The keys the v2 export and archive format is made of, by name.
+    ///
+    /// Written out rather than derived, so a field added to `Asset` without a
+    /// matching line in the writer shows up as a failing assertion here instead
+    /// of as an export that quietly lost something.
+    const WIRE_KEYS: [&str; 24] = [
+        "captured_at",
+        "commercial_use",
+        "content_hash",
+        "created_at",
+        "description",
+        "duration_ms",
+        "ext",
+        "extra",
+        "file_name",
+        "height",
+        "id",
+        "is_favorite",
+        "kind",
+        "mime",
+        "origin",
+        "rating",
+        "rel_path",
+        "size_bytes",
+        "source_url",
+        "title",
+        "trashed_at",
+        "updated_at",
+        "usage_status",
+        "width",
+    ];
+
+    fn keys_of(asset: &Asset) -> BTreeSet<String> {
+        serde_json::to_value(asset)
+            .unwrap()
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect()
+    }
+
+    /// Every key the format has, for each of the four location states.
+    #[test]
+    fn the_exported_key_set_is_the_v2_shape_whatever_the_location() {
+        let expected: BTreeSet<String> = WIRE_KEYS.iter().map(|k| (*k).to_string()).collect();
+        for location in [
+            AssetLocation::Stored {
+                rel_path: "media/00/pinned.png".into(),
+            },
+            AssetLocation::Placeholder,
+            AssetLocation::Linked {
+                source_path: "/tmp/pinned.png".into(),
+            },
+            AssetLocation::Unrecorded,
+        ] {
+            let mut asset = full_asset();
+            asset.set_location(location);
+            assert_eq!(keys_of(&asset), expected, "the key set moved");
+        }
+    }
+
+    /// Where each state puts its path: `origin` + `rel_path` at the top level,
+    /// a linked path inside `extra` — because the schema's indexed `source_path`
+    /// column is generated from that JSON key, so moving the key would move the
+    /// index with it.
+    #[test]
+    fn each_state_writes_its_path_where_the_format_already_keeps_it() {
+        let cases = [
+            (
+                AssetLocation::Stored {
+                    rel_path: "media/00/pinned.png".into(),
+                },
+                "stored",
+                Json::String("media/00/pinned.png".into()),
+                None,
+            ),
+            (AssetLocation::Placeholder, "stored", Json::Null, None),
+            (
+                AssetLocation::Linked {
+                    source_path: "/tmp/pinned.png".into(),
+                },
+                "linked",
+                Json::Null,
+                Some("/tmp/pinned.png"),
+            ),
+            (AssetLocation::Unrecorded, "linked", Json::Null, None),
+        ];
+        for (location, origin, rel_path, source) in cases {
+            let mut asset = full_asset();
+            asset.set_location(location);
+            let value = serde_json::to_value(&asset).unwrap();
+            assert_eq!(value["origin"], Json::String(origin.into()));
+            assert_eq!(value["rel_path"], rel_path);
+            match source {
+                Some(path) => assert_eq!(value["extra"]["source_path"], Json::String(path.into())),
+                None => assert!(
+                    value["extra"].get("source_path").is_none(),
+                    "a state with no path must not write one"
+                ),
+            }
+        }
+    }
+
+    /// The strongest form of "the type changed, the format did not": a record
+    /// with every field set goes through its own JSON and comes back identical.
+    /// A field that stops being written, or stops being read, fails here — and
+    /// `full_asset` is why this catches anything at all.
+    #[test]
+    fn a_full_record_survives_its_own_json() {
+        let asset = full_asset();
+        let back: Asset = serde_json::from_value(serde_json::to_value(&asset).unwrap()).unwrap();
+        assert_eq!(back, asset);
+    }
+
+    /// `location` and `set_location` agree on the three states a writer can
+    /// produce. `Unrecorded` is deliberately not in that list: it is what the
+    /// reader invents when a row is missing its path, and setting it is a way to
+    /// repair such a row, not a state import produces.
+    #[test]
+    fn the_states_a_writer_can_produce_round_trip_through_the_columns() {
+        for location in [
+            AssetLocation::Stored {
+                rel_path: "media/00/pinned.png".into(),
+            },
+            AssetLocation::Placeholder,
+            AssetLocation::Linked {
+                source_path: "/tmp/pinned.png".into(),
+            },
+        ] {
+            let mut asset = full_asset();
+            asset.set_location(location.clone());
+            assert_eq!(
+                asset.location(),
+                location,
+                "state did not survive the write"
+            );
+        }
+        // And the row nobody writes is still readable rather than fatal.
+        let mut asset = full_asset();
+        asset.origin = Origin::Linked;
+        asset.rel_path = None;
+        asset.facts.source_path = None;
+        assert_eq!(asset.location(), AssetLocation::Unrecorded);
     }
 }
