@@ -25,7 +25,7 @@ use uuid::Uuid;
 use super::metadata;
 use super::pipeline::{self, StageIo};
 use crate::error::{Error, Result};
-use crate::model::{Asset, AssetKind, Origin, UsageStatus, now};
+use crate::model::{Asset, AssetKind, AssetLocation, Origin, UsageStatus, now};
 use crate::store::{Store, assets, collections};
 use rusqlite::Connection;
 
@@ -419,7 +419,7 @@ pub fn commit_staged(
         // A placeholder record (metadata restore without media) becomes a
         // full asset the moment its content lands in the library. Linked
         // records keep pointing at their original location.
-        if existing.rel_path.is_none() && existing.origin == Origin::Stored {
+        if existing.location() == AssetLocation::Placeholder {
             assets::set_rel_path(conn, existing.id, &staged.rel_path)?;
         }
         for cid in &targets {

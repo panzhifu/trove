@@ -8,6 +8,7 @@ use uuid::Uuid;
 use crate::error::Result;
 use crate::history::undo::{self, Op, OpAction, OpDesc, SharedUndoStack};
 use crate::media;
+use crate::model::AssetLocation;
 use crate::services::collect;
 use crate::store::{Store, assets, batch, collections, rows, smart, smart_collections, tags};
 
@@ -574,9 +575,18 @@ impl Library {
     /// record is missing or the file no longer exists.
     pub fn asset_file(&self, id: Uuid) -> Option<std::path::PathBuf> {
         let asset = assets::get(self.store.conn(), id).ok().flatten()?;
-        let path = match asset.origin {
-            crate::model::Origin::Linked => std::path::PathBuf::from(asset.facts.source_path?),
-            crate::model::Origin::Stored => self.root.join(asset.rel_path?),
+        let path = match asset.location() {
+            crate::model::AssetLocation::Stored { rel_path } => self.root.join(rel_path),
+            crate::model::AssetLocation::Linked { source_path } => {
+                std::path::PathBuf::from(source_path)
+            }
+            // `None` here means "there is no file to hand over", which is true
+            // of both remaining states — but it is true for two different
+            // reasons, and callers that want to say which one read
+            // `asset.location()` themselves rather than guessing from this.
+            crate::model::AssetLocation::Placeholder | crate::model::AssetLocation::Unrecorded => {
+                return None;
+            }
         };
         path.is_file().then_some(path)
     }
@@ -1241,8 +1251,10 @@ impl Library {
         let mut files = 0u64;
         let mut bytes = 0u64;
         for asset in &live.items {
-            let Some(rel) = &asset.rel_path else { continue };
-            let src = self.root.join(rel);
+            let AssetLocation::Stored { rel_path: rel } = asset.location() else {
+                continue;
+            };
+            let src = self.root.join(&rel);
             if !src.is_file() {
                 continue;
             }
@@ -1420,7 +1432,7 @@ impl Library {
     pub fn relink_asset(&self, asset_id: Uuid, new_path: &Path) -> Result<()> {
         let conn = self.store.conn();
         let asset = assets::get(conn, asset_id)?.ok_or(crate::Error::NotFound("asset"))?;
-        if asset.origin != crate::model::Origin::Linked || asset.rel_path.is_some() {
+        if !asset.location().is_linked() {
             return Err(crate::Error::Validation(
                 "relink requires a linked asset".into(),
             ));
@@ -1502,16 +1514,17 @@ impl Library {
         if asset.trashed_at.is_some() || asset.kind != crate::model::AssetKind::Image {
             return Ok(false);
         }
-        if asset.origin == crate::model::Origin::Linked {
+        let location = asset.location();
+        if location.is_linked() {
             return self.edit_linked_in_place(&asset, edits, jpeg_quality);
         }
-        if asset.rel_path.is_none() {
+        // A placeholder has no bytes to edit; it is not an error, it is the
+        // state where the user has not re-imported the file yet.
+        let AssetLocation::Stored { rel_path } = location else {
             return Ok(false);
-        }
+        };
 
-        let source = self
-            .root
-            .join(asset.rel_path.as_deref().unwrap_or_default());
+        let source = self.root.join(rel_path);
         let out = media::edit::apply(&source, edits, jpeg_quality)?;
 
         // Park the re-encoded bytes where blob::stage expects a source, then
@@ -1542,11 +1555,12 @@ impl Library {
         edits: &[media::edit::ImageEdit],
         jpeg_quality: u8,
     ) -> Result<bool> {
-        let Some(source) = asset.facts.source_path.as_ref().map(PathBuf::from) else {
+        let AssetLocation::Linked { source_path } = asset.location() else {
             // No reachable original (moved, or never recorded): skip the
             // asset — relinking is the fix, not an error toast.
             return Ok(false);
         };
+        let source = PathBuf::from(source_path);
         let out = media::edit::apply(&source, edits, jpeg_quality)?;
         let hash = media::hash::hash_bytes(&out.bytes);
         if asset
@@ -1614,7 +1628,10 @@ impl Library {
     ) -> Result<()> {
         let staged = media::blob::stage(new_file, self.root(), &asset.ext)?;
         let old_hash = asset.content_hash.clone().unwrap_or_default();
-        let old_rel = asset.rel_path.clone();
+        let old_rel = match asset.location() {
+            AssetLocation::Stored { rel_path } => Some(rel_path),
+            _ => None,
+        };
         if staged.content_hash.eq_ignore_ascii_case(&old_hash) {
             // The edits produced byte-identical content: the blob in place
             // is already correct.
@@ -1665,11 +1682,10 @@ impl Library {
                 report.skipped += 1;
                 continue;
             }
-            let target = match asset.origin {
-                crate::model::Origin::Stored => {
-                    asset.rel_path.as_ref().map(|rel| self.root.join(rel))
-                }
-                crate::model::Origin::Linked => asset.facts.source_path.as_ref().map(PathBuf::from),
+            let target = match asset.location() {
+                AssetLocation::Stored { rel_path } => Some(self.root.join(rel_path)),
+                AssetLocation::Linked { source_path } => Some(PathBuf::from(source_path)),
+                AssetLocation::Placeholder | AssetLocation::Unrecorded => None,
             };
             let Some(target) = target else {
                 report.skipped += 1;
@@ -2281,13 +2297,15 @@ impl Library {
                 let Some(asset) = assets::get(tx, *id)? else {
                     continue;
                 };
-                if asset.origin == crate::model::Origin::Linked
-                    && let Some(source) = asset.facts.source_path.as_deref()
-                {
-                    sources_tx.push(PathBuf::from(source));
+                let location = asset.location();
+                if let AssetLocation::Linked { source_path } = &location {
+                    sources_tx.push(PathBuf::from(source_path));
                 }
                 let hash = asset.content_hash.clone();
-                let rel = asset.rel_path.clone();
+                let rel = match &location {
+                    AssetLocation::Stored { rel_path } => Some(rel_path.clone()),
+                    _ => None,
+                };
                 assets::delete(tx, *id)?;
                 if let Some(hash) = &hash
                     && !derived_tx.contains(hash)

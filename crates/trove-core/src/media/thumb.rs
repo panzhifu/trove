@@ -9,7 +9,7 @@ use image::GenericImageView;
 
 use crate::config::{AppConfig, AudioCardStyle};
 use crate::media::waveform;
-use crate::model::{Asset, AssetKind, Origin};
+use crate::model::{Asset, AssetKind, AssetLocation};
 
 /// Longest edge of generated thumbnails, in pixels.
 pub const THUMB_MAX: u32 = 512;
@@ -65,9 +65,14 @@ pub fn ensure(root: &Path, sha: &str, kind: AssetKind, blob_path: &Path) -> Opti
 /// The blob a cache entry is derived from: a linked file lives where it was
 /// imported from, a stored one under the library's `media/`.
 pub fn blob_path(data_root: &Path, asset: &Asset) -> Option<PathBuf> {
-    match asset.origin {
-        Origin::Linked => Some(PathBuf::from(asset.facts.source_path.clone()?)),
-        Origin::Stored => Some(data_root.join(asset.rel_path.as_deref()?)),
+    match asset.location() {
+        AssetLocation::Stored { rel_path } => Some(data_root.join(rel_path)),
+        AssetLocation::Linked { source_path } => Some(PathBuf::from(source_path)),
+        // A placeholder has no blob yet and an unrecorded link has no path to
+        // read. Both answer "no file", which is all a thumbnail cache can do
+        // with either — but they are different reasons, and the match says so
+        // instead of letting two `?` collapse them into one.
+        AssetLocation::Placeholder | AssetLocation::Unrecorded => None,
     }
 }
 

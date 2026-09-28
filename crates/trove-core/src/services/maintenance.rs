@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use crate::error::Result;
 use crate::library::Library;
 use crate::media::thumb;
-use crate::model::{AssetKind, AssetQuery};
+use crate::model::{AssetKind, AssetLocation, AssetQuery};
 use crate::store::assets;
 use uuid::Uuid;
 
@@ -327,7 +327,12 @@ pub fn clean_orphans(lib: &Library) -> Result<OrphanReport> {
         },
     )?;
     for asset in live.items {
-        let Some(rel) = asset.rel_path else { continue };
+        // Only a blob under the library's own root can be checked for here: a
+        // linked file lives wherever the user keeps it, which a media-library
+        // integrity pass has no business trashing on a missing-file judgement.
+        let AssetLocation::Stored { rel_path: rel } = asset.location() else {
+            continue;
+        };
         if !root.join(&rel).is_file() && assets::set_trashed(conn, asset.id, true)? {
             report.files_trashed += 1;
         }
@@ -447,8 +452,10 @@ pub fn plan_integrity(lib: &Library) -> Result<IntegrityPlan> {
             },
         )?;
         for asset in list.items {
-            let (Some(sha), Some(rel)) = (asset.content_hash.clone(), asset.rel_path.clone())
-            else {
+            let Some(sha) = asset.content_hash.clone() else {
+                continue;
+            };
+            let AssetLocation::Stored { rel_path: rel } = asset.location() else {
                 continue;
             };
             plan.items

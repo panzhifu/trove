@@ -55,6 +55,19 @@ pub enum AssetLocation {
     Unrecorded,
 }
 
+impl AssetLocation {
+    /// Whether the file lives outside the library rather than in its `media/`.
+    ///
+    /// [`AssetLocation::Unrecorded`] counts, and that is the point: a linked
+    /// record that lost its path is not a stored asset, and reconnecting it is
+    /// exactly the repair `Library::relink_asset` offers. Treating it as stored
+    /// instead would ask the caller to write a blob path onto a record whose
+    /// file was never the library's to hold.
+    pub fn is_linked(&self) -> bool {
+        matches!(self, Self::Linked { .. } | Self::Unrecorded)
+    }
+}
+
 /// Coarse asset classification, derived from the mime type and overridable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
