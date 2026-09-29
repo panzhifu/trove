@@ -10,7 +10,7 @@
 <br>
 
 <p align="center">
-  <img src="docs/screenshots/main-window.png" alt="Trove 主窗口" width="900"/>
+  <img src="design/main-window.png" alt="Trove 主窗口" width="900"/>
 </p>
 
 <p align="center"><i>对齐缩略图网格 · 停靠布局 · 3D 模型视口 · 视觉搜索 —— 全都跑在本地，数据永不上传</i></p>
@@ -25,8 +25,6 @@ cargo run -p trove-app
 ```
 
 > 需要 [Rust 工具链](https://www.rust-lang.org/tools/install)。首次启动打开**欢迎界面**：左边列出已有的素材库，右边给它起个名字就能开始。素材库由 Trove 按系统约定存放，不必（也不能）自己挑目录。
-
-[Trove 文档索引](docs/README.md)
 
 ---
 
@@ -242,7 +240,7 @@ cargo run -p trove-app
 
 **当前测试基线：`trove-core` 650 + `trove-app` 61 全部通过；`cargo fmt --check` 干净；clippy 全工作区 0 告警。** `trove-app` 含 3 个真机 GPU 冒烟测试（EDL 眼罩光照、meshlet 剔除、按点云类别着色），无显卡的机器自动跳过；WGSL 与 uniform 布局的对齐另由 naga 在普通测试里静态校验，所以无头 runner 也挡得住着色器和 Rust 结构体错位。
 
-各模块的实现细节按主题整理在 [docs/README.md](docs/README.md) 索引里。
+各模块的实现细节按主题整理在开发机的 `docs/` 目录里，该目录只在本地维护，不进仓库。
 
 ---
 

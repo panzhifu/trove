@@ -10,7 +10,7 @@
 <br>
 
 <p align="center">
-  <img src="docs/screenshots/main-window.png" alt="Trove main window" width="900"/>
+  <img src="design/main-window.png" alt="Trove main window" width="900"/>
 </p>
 
 <p align="center"><i>Justified grid · dock layout · 3D model viewport · visual search — all local, data never leaves your machine</i></p>
@@ -27,8 +27,6 @@ cargo run -p trove-app
 > Needs the [Rust toolchain](https://www.rust-lang.org/tools/install). The first launch opens a **welcome window**: the libraries that already exist on the left, a name field on the right to start one. Libraries live where the platform expects them — there is no folder to pick.
 
 This README summarizes what ships. The **[Chinese README](./README.md)** is the canonical, most up-to-date document.
-
-[docs/](docs/README.md)
 
 ---
 
@@ -158,7 +156,7 @@ cargo run -p trove-app
 
 **Baseline: `trove-core` 650 + `trove-app` 61 all pass; `cargo fmt --check` clean; clippy 0 warnings workspace-wide.** Three real-GPU smoke tests live in `trove-app` (eye-dome lighting, meshlet culling, painting a cloud by its classification) and skip automatically on headless machines; separately, naga validates the WGSL against the Rust uniform layout inside ordinary tests, so a shader/struct mismatch is caught even without a display.
 
-Per-module implementation notes are indexed in [docs/README.md](docs/README.md).
+Per-module implementation notes live in a local `docs/` folder on the development machine; that folder is not tracked in this repository.
 
 ---
 

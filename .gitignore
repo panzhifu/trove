@@ -26,6 +26,9 @@ bench-data/
 # 只供本地查阅借鉴，体积大且非本项目源码，不进仓库。
 reference/
 
+# 开发文档（按主题整理的实现笔记与截图），只在开发机上维护，不进仓库。
+docs/
+
 # 各 crate 内相对路径 TMPDIR 产生的测试临时目录（正确用法是绝对路径 TMPDIR）
 crates/*/target/
 
