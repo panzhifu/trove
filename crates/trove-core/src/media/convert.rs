@@ -6,7 +6,7 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
-use image::{GenericImageView, ImageDecoder};
+use image::{GenericImageView, ImageDecoder, ImageEncoder};
 use uuid::Uuid;
 
 use crate::media::{probe, thumb};
@@ -140,7 +140,8 @@ pub fn convert_item(
 
 /// Convert a single file to `out`. The write is atomic (temp file + rename).
 fn convert_into(source: &Path, out: &Path, opts: &ConvertOptions) -> Result<PathBuf, String> {
-    let mut image = decode_oriented(source)?;
+    let (image, profile) = decode_oriented(source)?;
+    let mut image = image;
     if let Some(max) = opts.max_dimension {
         image = downscale(image, max);
     }
@@ -156,21 +157,57 @@ fn convert_into(source: &Path, out: &Path, opts: &ConvertOptions) -> Result<Path
     let ext = opts.format.ext();
     let tmp = out.with_extension(format!("tmp.{ext}"));
     let write = || -> Result<(), String> {
-        if opts.format.supports_quality() {
-            let file = std::fs::File::create(&tmp).map_err(|e| e.to_string())?;
-            let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(
-                file,
-                opts.quality.clamp(1, 100),
-            );
-            encoder
-                .encode_image(&image)
-                .map_err(|e| format!("encode: {e}"))?;
-        } else {
-            image
+        match opts.format {
+            // The encoders with an ICC hook get the source's profile back;
+            // a conversion is not supposed to silently repaint the file.
+            ConvertFormat::Jpeg => {
+                let file = std::fs::File::create(&tmp).map_err(|e| e.to_string())?;
+                let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(
+                    file,
+                    opts.quality.clamp(1, 100),
+                );
+                if let Some(profile) = &profile {
+                    let _ = encoder.set_icc_profile(profile.clone());
+                }
+                encoder
+                    .encode_image(&image)
+                    .map_err(|e| format!("encode: {e}"))
+            }
+            ConvertFormat::Png => {
+                let file = std::fs::File::create(&tmp).map_err(|e| e.to_string())?;
+                let mut encoder = image::codecs::png::PngEncoder::new(file);
+                if let Some(profile) = &profile {
+                    let _ = encoder.set_icc_profile(profile.clone());
+                }
+                image
+                    .write_with_encoder(encoder)
+                    .map_err(|e| format!("encode: {e}"))
+            }
+            ConvertFormat::Tiff => {
+                let file = std::fs::File::create(&tmp).map_err(|e| e.to_string())?;
+                let mut encoder = image::codecs::tiff::TiffEncoder::new(file);
+                if let Some(profile) = &profile {
+                    let _ = encoder.set_icc_profile(profile.clone());
+                }
+                image
+                    .write_with_encoder(encoder)
+                    .map_err(|e| format!("encode: {e}"))
+            }
+            ConvertFormat::WebP => {
+                let file = std::fs::File::create(&tmp).map_err(|e| e.to_string())?;
+                let mut encoder = image::codecs::webp::WebPEncoder::new_lossless(file);
+                if let Some(profile) = &profile {
+                    let _ = encoder.set_icc_profile(profile.clone());
+                }
+                image
+                    .write_with_encoder(encoder)
+                    .map_err(|e| format!("encode: {e}"))
+            }
+            // BMP has no profile convention; the generic writer is exact.
+            ConvertFormat::Bmp => image
                 .save_with_format(&tmp, opts.format.image_format())
-                .map_err(|e| format!("encode: {e}"))?;
+                .map_err(|e| format!("encode: {e}")),
         }
-        Ok(())
     };
     match write() {
         Ok(()) => {
@@ -187,10 +224,15 @@ fn convert_into(source: &Path, out: &Path, opts: &ConvertOptions) -> Result<Path
     }
 }
 
-/// Decode an image with EXIF orientation applied. Vector/composite formats
-/// (SVG, PSD) and RAW (already oriented by the develop pipeline) go through
-/// the thumbnail decoder.
-fn decode_oriented(path: &Path) -> Result<image::DynamicImage, String> {
+/// Decode an image with EXIF orientation applied, plus the profile bytes the
+/// file carries. Vector/composite formats (SVG, PSD) and RAW (already
+/// oriented by the develop pipeline, and already sRGB) go through the
+/// thumbnail decoder with no profile channel.
+///
+/// Float containers (EXR, Radiance HDR) get the display transform here too:
+/// scene-linear fed straight to a JPEG encoder is a near-black file — the
+/// same bug the thumbnail path fixes in `hdr::tonemap`.
+fn decode_oriented(path: &Path) -> Result<(image::DynamicImage, Option<Vec<u8>>), String> {
     let ext = path
         .extension()
         .and_then(|e| e.to_str())
@@ -199,7 +241,9 @@ fn decode_oriented(path: &Path) -> Result<image::DynamicImage, String> {
     let special =
         matches!(ext.as_str(), "svg" | "psd" | "heic" | "heif") || probe::is_raw_ext(&ext);
     if special {
-        return thumb::decode_image(path).ok_or_else(|| "not a decodable image".into());
+        return thumb::decode_image(path)
+            .map(|image| (image, None))
+            .ok_or_else(|| "not a decodable image".into());
     }
     let reader = image::ImageReader::open(path)
         .and_then(|r| r.with_guessed_format())
@@ -208,10 +252,12 @@ fn decode_oriented(path: &Path) -> Result<image::DynamicImage, String> {
     let orientation = decoder
         .orientation()
         .unwrap_or(image::metadata::Orientation::NoTransforms);
+    let profile = crate::media::color_profile::from_decoder(&mut decoder);
     let mut image =
         image::DynamicImage::from_decoder(decoder).map_err(|e| format!("decode: {e}"))?;
     image.apply_orientation(orientation);
-    Ok(image)
+    let image = crate::media::hdr::tonemap(image, 0.0);
+    Ok((image, profile))
 }
 
 /// Cap the longest edge at `max`, preserving the aspect ratio. Never
@@ -309,6 +355,36 @@ mod tests {
             quality: 85,
             max_dimension,
         }
+    }
+
+    /// A conversion keeps the source's colour claim: the profile rides the
+    /// decode and is re-embedded by the PNG encoder.
+    #[test]
+    fn convert_carries_the_icc_profile_across_formats() {
+        use image::ImageDecoder as _;
+        use image::ImageEncoder as _;
+        let dir = temp_dir("icc");
+        let profile = crate::media::color_profile::test_icc::linear_profile();
+        let src = dir.join("profiled.jpg");
+        let mut encoder =
+            image::codecs::jpeg::JpegEncoder::new(std::fs::File::create(&src).unwrap());
+        encoder.set_icc_profile(profile.clone()).unwrap();
+        image::RgbImage::from_fn(8, 2, |x, _| image::Rgb([(x * 16) as u8, 0x80, 0x40]))
+            .write_with_encoder(encoder)
+            .unwrap();
+
+        let out = convert_into(&src, &dir.join("out.png"), &opts(ConvertFormat::Png, None))
+            .expect("conversion succeeds");
+        let mut decoder = image::ImageReader::open(&out)
+            .unwrap()
+            .into_decoder()
+            .unwrap();
+        assert_eq!(
+            decoder.icc_profile().unwrap().as_deref(),
+            Some(profile.as_slice()),
+            "the profile travelled into the converted file"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

@@ -183,6 +183,9 @@ pub struct Decoded {
     /// decode came from the thumbnail cache instead of the original (see
     /// [`DecodeStage`]), in which case the probe's header reading stands.
     pub dims: Option<(u32, u32)>,
+    /// The colour space the original file claims, when its container says so.
+    /// Recorded into the visual facts by [`MineStage`].
+    pub color_space: Option<String>,
 }
 
 /// The state of one file as it flows through the pipeline.
@@ -664,18 +667,24 @@ impl Stage for DecodeStage {
         }
         let blob = io.blob_path();
         let cached = thumb::cached(&io.cache_root, &io.content_hash);
-        let (pixels, from_cache) = match cached {
+        // A cache hit means the pixels are the small thumbnail — and, ever
+        // since colour management landed, already folded into sRGB. The
+        // original's colour-space claim is still recorded, via a header-only
+        // read; a decode of the original carries it for free. Pre-management
+        // cache entries keep their pixels (the rebuild job rewrites them),
+        // and their recorded space is honest about the file, not the pixels.
+        let (pixels, from_cache, color_space) = match cached {
             Some(thumb_path) => match thumb::decode_image(&thumb_path) {
-                Some(small) => (small, true),
+                Some(small) => (small, true, super::color_profile::description_of(&blob)),
                 // A corrupt cache entry is not fatal: fall through to the
                 // original, which the thumbnail stage will rewrite.
-                None => match thumb::decode_image(&blob) {
-                    Some(full) => (full, false),
+                None => match thumb::decode_image_tracked(&blob) {
+                    Some(decoded) => (decoded.image, false, decoded.color_space),
                     None => return Ok(()),
                 },
             },
-            None => match thumb::decode_image(&blob) {
-                Some(full) => (full, false),
+            None => match thumb::decode_image_tracked(&blob) {
+                Some(decoded) => (decoded.image, false, decoded.color_space),
                 None => return Ok(()),
             },
         };
@@ -706,7 +715,12 @@ impl Stage for DecodeStage {
             io.height = Some(h);
         }
 
-        io.artifacts.put(Decoded { small, rgb, dims });
+        io.artifacts.put(Decoded {
+            small,
+            rgb,
+            dims,
+            color_space,
+        });
         Ok(())
     }
 }
@@ -782,6 +796,13 @@ impl Stage for MineStage {
         };
         if io.mined.duration_ms.is_none() {
             io.mined.duration_ms = io.duration_ms;
+        }
+        // The colour-space claim rides the shared decode; a file whose
+        // container names no profile records nothing (it *is* taken as sRGB).
+        if let Some(decoded) = io.artifacts.get::<Decoded>()
+            && let Some(space) = &decoded.color_space
+        {
+            io.mined.facts.visual.color_space = Some(space.clone());
         }
         Ok(())
     }

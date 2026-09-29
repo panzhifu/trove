@@ -69,6 +69,8 @@ pinyin = "0.10"
 # verification and the Crockford Base32 codec for the pasted key text.
 ed25519-dalek = { workspace = true }
 data-encoding = { workspace = true }
+# The ICC transform engine for the thumbnail's "fold into sRGB" step.
+qcms = { workspace = true }
 
 [dev-dependencies]
 # Only to *write* a fixture: the tests need a real OpenEXR file to prove the

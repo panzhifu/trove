@@ -18,7 +18,7 @@
 use std::io::Cursor;
 use std::path::Path;
 
-use image::GenericImageView;
+use image::{GenericImageView, ImageEncoder};
 
 use crate::error::{Error, Result};
 
@@ -65,6 +65,13 @@ pub fn apply(input: &Path, edits: &[ImageEdit], jpeg_quality: u8) -> Result<Edit
     let (format, mime) = output_format(&ext)
         .ok_or_else(|| Error::Validation(format!("cannot re-encode .{ext} images in place")))?;
 
+    // The file's colour claim travels with the pixels: rotate/flip/crop do
+    // not change pixel semantics, so a re-encode that dropped the ICC
+    // profile would quietly repaint the file. Re-embed where the format's
+    // encoder has the hook (JPEG/PNG/TIFF; BMP and GIF have no convention
+    // for one, and the generic writer for the rest has none either).
+    let profile = crate::media::color_profile::profile_of_file(input);
+
     let mut img =
         image::open(input).map_err(|e| Error::Validation(format!("decode failed: {e}")))?;
     for edit in edits {
@@ -73,16 +80,34 @@ pub fn apply(input: &Path, edits: &[ImageEdit], jpeg_quality: u8) -> Result<Edit
     let (width, height) = img.dimensions();
 
     let mut out = Cursor::new(Vec::new());
-    let encode_result = if format == image::ImageFormat::Jpeg {
+    let encode_result = match format {
         // The generic writer has no quality knob; JPEG needs the explicit
         // encoder or every edit re-compresses at the default (75).
-        let encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(
-            &mut out,
-            jpeg_quality.clamp(1, 100),
-        );
-        img.write_with_encoder(encoder)
-    } else {
-        img.write_to(&mut out, format)
+        image::ImageFormat::Jpeg => {
+            let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(
+                &mut out,
+                jpeg_quality.clamp(1, 100),
+            );
+            if let Some(profile) = &profile {
+                let _ = encoder.set_icc_profile(profile.clone());
+            }
+            img.write_with_encoder(encoder)
+        }
+        image::ImageFormat::Png => {
+            let mut encoder = image::codecs::png::PngEncoder::new(&mut out);
+            if let Some(profile) = &profile {
+                let _ = encoder.set_icc_profile(profile.clone());
+            }
+            img.write_with_encoder(encoder)
+        }
+        image::ImageFormat::Tiff => {
+            let mut encoder = image::codecs::tiff::TiffEncoder::new(&mut out);
+            if let Some(profile) = &profile {
+                let _ = encoder.set_icc_profile(profile.clone());
+            }
+            img.write_with_encoder(encoder)
+        }
+        _ => img.write_to(&mut out, format),
     };
     encode_result.map_err(|e| Error::Validation(format!("encode failed: {e}")))?;
     Ok(EditOutput {
@@ -172,6 +197,34 @@ mod tests {
         img.save_with_format(&path, image::ImageFormat::Png)
             .unwrap();
         path
+    }
+
+    /// An edit must not strip the file's colour claim: the ICC profile
+    /// that rode in on the source rides out on the re-encode.
+    #[test]
+    fn edits_preserve_the_embedded_icc_profile() {
+        use image::ImageDecoder as _;
+        let dir = std::env::temp_dir().join(format!("trove-edit-icc-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let profile = crate::media::color_profile::test_icc::linear_profile();
+        let input = dir.join("profiled.png");
+        let mut encoder =
+            image::codecs::png::PngEncoder::new(std::fs::File::create(&input).unwrap());
+        encoder.set_icc_profile(profile.clone()).unwrap();
+        gradient_image().write_with_encoder(encoder).unwrap();
+
+        let out = apply(&input, &[ImageEdit::Rotate90], 90).unwrap();
+        let mut decoded = image::ImageReader::new(std::io::Cursor::new(&out.bytes))
+            .with_guessed_format()
+            .unwrap()
+            .into_decoder()
+            .unwrap();
+        assert_eq!(
+            decoded.icc_profile().unwrap().as_deref(),
+            Some(profile.as_slice()),
+            "the profile survived the re-encode byte for byte"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

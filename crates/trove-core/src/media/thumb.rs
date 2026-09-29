@@ -52,6 +52,9 @@ pub fn ensure(root: &Path, sha: &str, kind: AssetKind, blob_path: &Path) -> Opti
         // has one inside, and the rest can be recognised by their shape. Neither
         // is built here — see `write_audio_cover`.
         AssetKind::Audio => write_audio_cover(root, sha, blob_path, &out),
+        // A PDF is a Document the text arm must not catch (it is not text),
+        // and its first page is worth a card whenever a rasterizer exists.
+        _ if blob_ext(blob_path) == "pdf" => write_pdf_thumb(blob_path, &out),
         // Text is a family by extension rather than by kind: `.txt` is a
         // `Document` and `.rs` is `Other`, and both have characters worth
         // drawing. Everything else keeps its kind icon.
@@ -98,6 +101,7 @@ pub fn regenerate(root: &Path, sha: &str, kind: AssetKind, blob_path: &Path) -> 
         AssetKind::Font => write_font_card(blob_path, &out),
         AssetKind::Model => write_model_card(blob_path, &out),
         AssetKind::Audio => rebuild_audio_cover(root, sha, blob_path, &out),
+        _ if blob_ext(blob_path) == "pdf" => write_pdf_thumb(blob_path, &out),
         _ if crate::media::text::is_text_ext(&blob_ext(blob_path)) => {
             write_text_card(blob_path, &out)
         }
@@ -489,23 +493,130 @@ fn write_video_thumb(blob_path: &Path, out: &Path) -> Option<PathBuf> {
     Some(out.to_path_buf())
 }
 
+/// Rasterize a PDF's first page into the cache entry with an external
+/// rasterizer — the same opt-in dependency the video poster is: a machine
+/// with none of the three tools keeps the kind icon, and a user-initiated
+/// rebuild picks the tool up the day one appears. The page comes back as an
+/// ordinary bitmap and rides the shared downscale/encode path, so a PDF
+/// card differs from an image card nowhere else in the app.
+fn write_pdf_thumb(blob_path: &Path, out: &Path) -> Option<PathBuf> {
+    let page = pdf_first_page(blob_path)?;
+    let parent = out.parent()?;
+    std::fs::create_dir_all(parent).ok()?;
+    write_downscaled(&downscale(&page), out)
+}
+
+/// The external PDF rasterizers, in preference order. Poppler ships with
+/// almost every desktop Linux; `mutool` and `gs` cover the rest. Each is
+/// asked for page one as a bitmap on stdout; what container that is, is the
+/// tool's business — `image::load_from_memory` sniffs it, so a tool that
+/// surprises us simply fails over to the next candidate.
+const PDF_RASTERIZERS: [&str; 3] = ["pdftoppm", "mutool", "gs"];
+
+/// Whether any of the [`PDF_RASTERIZERS`] can be spawned at all. The import
+/// path itself just tries them in order and moves on; this gate exists for
+/// the maintenance planner, which must not promise rebuilds that no tool can
+/// deliver, and for tests. Spawnability is the whole question — a bare `-v`
+/// exits nonzero on some of these, and that still means "installed".
+pub fn pdf_rasterizer_available() -> bool {
+    PDF_RASTERIZERS
+        .iter()
+        .any(|tool| std::process::Command::new(tool).arg("-v").output().is_ok())
+}
+
+fn pdf_first_page(blob_path: &Path) -> Option<image::DynamicImage> {
+    // One slot per running rasterizer, same deal as the video poster: a
+    // batch import must not start one subprocess per staging thread.
+    let _slot = super::proc::slot();
+    for tool in PDF_RASTERIZERS {
+        let mut command = std::process::Command::new(tool);
+        match tool {
+            // `-scale-to 1024` fits the long edge at twice the card's 512,
+            // so the shared downscale halves a supersampled page instead of
+            // shipping the rasterizer's own 1:1 pixels.
+            "pdftoppm" => {
+                command
+                    .args([
+                        "-png",
+                        "-singlefile",
+                        "-f",
+                        "1",
+                        "-l",
+                        "1",
+                        "-scale-to",
+                        "1024",
+                    ])
+                    .arg(blob_path);
+            }
+            // `-o -` writes stdout; 96 dpi turns a 612×792pt letter page
+            // into an 816×1056 bitmap, the same ~2× headroom.
+            "mutool" => {
+                command.args(["draw", "-o", "-", "-r", "96"]).arg(blob_path);
+            }
+            // `-q` keeps the banner out of the bitmap stream — without it
+            // Ghostscript prints its version *into* stdout ahead of the PNG.
+            _ => {
+                command
+                    .args([
+                        "-q",
+                        "-dSAFER",
+                        "-dBATCH",
+                        "-dNOPAUSE",
+                        "-sDEVICE=png16m",
+                        "-r96",
+                        "-dFirstPage=1",
+                        "-dLastPage=1",
+                        "-sOutputFile=-",
+                    ])
+                    .arg(blob_path);
+            }
+        }
+        let Ok(output) = super::proc::output_with_timeout(command) else {
+            continue;
+        };
+        if !output.status.success() || output.stdout.is_empty() {
+            continue;
+        }
+        if let Ok(page) = image::load_from_memory(&output.stdout) {
+            return Some(page);
+        }
+    }
+    None
+}
+
 /// Decode an image blob: the `image` crate handles raster formats; SVG is
 /// rendered via resvg and PSD composites via the psd crate (both store
 /// vector/layer data the raster decoder cannot read).
 pub fn decode_image(blob_path: &Path) -> Option<image::DynamicImage> {
+    decode_image_tracked(blob_path).map(|decoded| decoded.image)
+}
+
+/// A decode plus the colour-space name the file itself declared, for
+/// callers that record it (the import pipeline's facts).
+pub struct DecodedImage {
+    pub image: image::DynamicImage,
+    /// The ICC profile's own name, when the container carries one. `None`
+    /// means the pixels are taken as sRGB — the SVG/PSD/HEIC/JXL/RAW
+    /// decoders expose no profile channel.
+    pub color_space: Option<String>,
+}
+
+/// [`decode_image`] with the colour-space claim attached.
+pub fn decode_image_tracked(blob_path: &Path) -> Option<DecodedImage> {
     let ext = blob_path
         .extension()
         .and_then(|e| e.to_str())
         .map(|e| e.to_ascii_lowercase())
         .unwrap_or_default();
-    match ext.as_str() {
-        "svg" => render_svg(blob_path),
-        "psd" => render_psd(blob_path),
-        "heic" | "heif" | "avif" => crate::media::probe::heif_to_image(blob_path),
-        "jxl" => render_jxl(blob_path),
-        _ if crate::media::probe::is_raw_ext(&ext) => render_raw(blob_path),
-        _ => decode_raster(blob_path),
-    }
+    let (image, color_space) = match ext.as_str() {
+        "svg" => (render_svg(blob_path)?, None),
+        "psd" => (render_psd(blob_path)?, None),
+        "heic" | "heif" | "avif" => (crate::media::probe::heif_to_image(blob_path)?, None),
+        "jxl" => (render_jxl(blob_path)?, None),
+        _ if crate::media::probe::is_raw_ext(&ext) => (render_raw(blob_path)?, None),
+        _ => decode_raster(blob_path)?,
+    };
+    Some(DecodedImage { image, color_space })
 }
 
 /// Decode an ordinary raster (JPEG/PNG/WebP/TIFF/…) with the EXIF
@@ -513,19 +624,33 @@ pub fn decode_image(blob_path: &Path) -> Option<image::DynamicImage> {
 /// so a portrait phone photo would keep lying on its side — thumbnails and
 /// palettes would both be wrong (the RAW path applies orientation via
 /// rawler in [`render_raw`]; this is the same fix for the plain formats).
-fn decode_raster(path: &Path) -> Option<image::DynamicImage> {
+///
+/// The embedded ICC profile, when there is one, is folded into sRGB here:
+/// the thumbnail is what every consumer displays, so this one transform is
+/// the whole of Trove's colour management (see `color_profile` and
+/// docs/COLOR-MANAGEMENT.md). It runs before the tonemap — a float buffer
+/// is scene-linear by definition and has no profile to speak of.
+fn decode_raster(path: &Path) -> Option<(image::DynamicImage, Option<String>)> {
     use image::{ImageDecoder, ImageReader};
     let mut decoder = ImageReader::open(path).ok()?.into_decoder().ok()?;
     let orientation = decoder
         .orientation()
         .unwrap_or(image::metadata::Orientation::NoTransforms);
+    let profile = crate::media::color_profile::from_decoder(&mut decoder);
     let mut image = image::DynamicImage::from_decoder(decoder).ok()?;
     image.apply_orientation(orientation);
+    let color_space = profile
+        .as_ref()
+        .and_then(|p| crate::media::color_profile::space_of(p).label());
+    if let Some(profile) = profile {
+        image = crate::media::color_profile::to_srgb(image, &profile);
+    }
     // Scene-linear buffers (EXR, Radiance HDR) come back as floats, and a float
     // handed to a JPEG encoder is a near-black square: the display transform is
     // what makes those files cards at all. Everything already encoded passes
     // through untouched.
-    Some(crate::media::hdr::tonemap(image, 0.0))
+    let image = crate::media::hdr::tonemap(image, 0.0);
+    Some((image, color_space))
 }
 
 /// Decode a JPEG-XL file through `jxl-oxide` (pure Rust; the `image`
@@ -1272,6 +1397,76 @@ mod tests {
 
         let out = ensure(&dir, "a".repeat(64).as_str(), AssetKind::Video, &video);
         assert!(out.is_some_and(|p| p.is_file()));
+    }
+
+    /// End-to-end first-page rasterization, skipped when none of the external
+    /// PDF rasterizers is installed. The fixture is a hand-assembled one-page
+    /// PDF — a single blue rectangle — so no binary rides in the repository
+    /// and no PDF writer enters the dependency tree.
+    #[test]
+    fn pdf_thumb_rasterized_when_a_rasterizer_is_present() {
+        if !pdf_rasterizer_available() {
+            eprintln!("skipping: no pdftoppm/mutool/gs on PATH");
+            return;
+        }
+        let dir = temp_dir_named("pdfthumb");
+        let pdf = sample_pdf(&dir);
+
+        let out = ensure(&dir, &"b".repeat(64), AssetKind::Document, &pdf)
+            .expect("a PDF with a rasterizer on PATH gets a card");
+        let image = image::open(&out).unwrap().to_rgb8();
+        let (w, h) = image.dimensions();
+        assert_eq!(w.max(h), THUMB_MAX, "the page is downscaled like any image");
+
+        // The page is a blue rectangle on white. Counting pixels that are
+        // blue specifically — neither the white ground nor a black failure
+        // frame — proves the page's own drawing made it through.
+        let blue = image
+            .pixels()
+            .filter(|p| p.0[2] > 150 && (p.0[2] as i32) > (p.0[0] as i32) + 60)
+            .count();
+        assert!(
+            blue * 20 > (w * h) as usize,
+            "expected the fixture's rectangle (~72% of the page) on the card, got {blue}"
+        );
+
+        // The rebuild path shares the arm and must clear it too.
+        assert!(regenerate(&dir, &"b".repeat(64), AssetKind::Document, &pdf).is_some());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A one-page PDF whose only content is one filled rectangle, assembled
+    /// byte by byte — xref offsets included — so the rasterizers parse it
+    /// without exercising their lenient-recovery paths.
+    fn sample_pdf(dir: &std::path::Path) -> std::path::PathBuf {
+        let path = dir.join("page.pdf");
+        let content = "0.1 0.3 0.8 rg\n10 10 180 80 re f\n";
+        let objects = [
+            "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n".to_string(),
+            "2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n".to_string(),
+            "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 100] /Contents 4 0 R >>\nendobj\n"
+                .to_string(),
+            format!(
+                "4 0 obj\n<< /Length {} >>\nstream\n{content}endstream\nendobj\n",
+                content.len()
+            ),
+        ];
+        let mut pdf = b"%PDF-1.4\n".to_vec();
+        let mut offsets = [0usize; 4];
+        for (i, obj) in objects.iter().enumerate() {
+            offsets[i] = pdf.len();
+            pdf.extend_from_slice(obj.as_bytes());
+        }
+        let start = pdf.len();
+        pdf.extend_from_slice(b"xref\n0 5\n0000000000 65535 f \n");
+        for off in offsets {
+            pdf.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+        }
+        pdf.extend_from_slice(b"trailer\n<< /Size 5 /Root 1 0 R >>\nstartxref\n");
+        pdf.extend_from_slice(format!("{start}\n%%EOF\n").as_bytes());
+        std::fs::write(&path, &pdf).expect("pdf written");
+        path
     }
 
     /// A tiny solid PNG — the source the two codec tests below encode from.

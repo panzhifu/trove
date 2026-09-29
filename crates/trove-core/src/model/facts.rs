@@ -58,10 +58,20 @@ pub struct VisualFacts {
     /// Compact color-histogram encoding (`media::search::ColorHistogram`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub visual_color_hist: Option<String>,
+    /// The colour space the file itself claims — its ICC profile's own
+    /// name, when the container carries one. Absent means the pixels were
+    /// taken as sRGB (no profile, or a decoder without a profile channel).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color_space: Option<String>,
 }
 
 /// Font-table facts mined at import. Keys keep their historical `font_`
 /// prefixes; the struct is named for the kind.
+///
+/// `facts_rev` marks which extractor revision filled the group: fields have
+/// been added over time, and a row mined by the old extractor must look
+/// *old* even though its `font_family` is present, or the re-mine would
+/// never reach it (see `services::maintenance::remine_complete`).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct FontFacts {
     #[serde(
@@ -94,7 +104,85 @@ pub struct FontFacts {
         skip_serializing_if = "Option::is_none"
     )]
     pub glyphs: Option<u32>,
+    /// Name ids 4 / 5 / 8 / 0: the file's own record of what it is.
+    #[serde(
+        rename = "font_full_name",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub full_name: Option<String>,
+    #[serde(
+        rename = "font_version",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub version: Option<String>,
+    #[serde(
+        rename = "font_manufacturer",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub manufacturer: Option<String>,
+    #[serde(
+        rename = "font_copyright",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub copyright: Option<String>,
+    /// OS/2 `usWidthClass`, 1–9 (1 UltraCondensed … 9 UltraExpanded).
+    #[serde(
+        rename = "font_width_class",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub width_class: Option<u16>,
+    /// `head.unitsPerEm`: the design grid everything else is measured in.
+    #[serde(
+        rename = "font_units_per_em",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub units_per_em: Option<u16>,
+    /// OS/2 `fsSelection` bold bit — a claim about the file, as opposed to
+    /// `weight`, which is the number.
+    #[serde(rename = "font_bold", default, skip_serializing_if = "Option::is_none")]
+    pub bold: Option<bool>,
+    /// CJK languages the OS/2 code-page bits declare (`ja` `ko` `zh-Hans`
+    /// `zh-Hant` tokens); empty sets serialize as absent.
+    #[serde(
+        rename = "font_languages_declared",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub languages_declared: Option<Vec<String>>,
+    /// The one language the file's own evidence names, if any — `latin`
+    /// included, `None` when the evidence ties and we refuse to guess.
+    #[serde(
+        rename = "font_language",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub language: Option<String>,
+    /// The `wght` axis of a variable font as `min–max` (`100–900`); static
+    /// fonts carry none.
+    #[serde(
+        rename = "font_variable_weight",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub variable_weight: Option<String>,
+    /// Which extractor revision filled this group; bump when fields change
+    /// meaning or appear so the re-mine knows to revisit old rows.
+    #[serde(
+        rename = "font_facts_rev",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub facts_rev: Option<u8>,
 }
+
+/// The current [`FontFacts`] extractor revision.
+pub const FONT_FACTS_REV: u8 = 1;
 
 /// Embedded tag metadata (audio/video), as opposed to the user-set
 /// `Asset.title`. The key `title` predates the typing and stays.

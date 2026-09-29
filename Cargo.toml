@@ -160,6 +160,13 @@ resvg = "0.46"
 psd = "0.3"
 rawler = "0.8"
 
+# Colour management: the one ICC CMM in the graph, used by the thumbnail
+# decode to fold non-sRGB profiles into sRGB (see `media/color_profile.rs`).
+# Pure Rust (Mozilla's qcms) — the alternative, lcms2, would add a C build
+# dependency, and Serpent's OCIO route is a Node-ecosystem shape with no
+# Rust analogue worth chasing for a thumbnail pipeline.
+qcms = "0.3"
+
 # JPEG-XL decode. Pinned to the version rawler already pulls in so the graph
 # keeps a single copy; the `image` feature hands us an `image::ImageDecoder`.
 jxl-oxide = { version = "0.12", features = ["image"] }

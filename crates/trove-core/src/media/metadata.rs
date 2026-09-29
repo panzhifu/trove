@@ -75,9 +75,13 @@ fn mine_impl(
 
 // -- font ---------------------------------------------------------------------
 
-/// Read font facts (family, style, weight) from the name/OS2 tables via
-/// ttf-parser. Covers ttf/otf/ttc (first face) and woff; woff2 would need a
-/// Brotli decoder and stays metadata-less.
+/// Read font facts from the name/OS2/head/cmap/fvar tables via ttf-parser.
+/// Covers ttf/otf/ttc (first face) and woff; woff2 would need a Brotli
+/// decoder and stays metadata-less.
+///
+/// Everything below the v0 five (family/style/weight/italic/glyphs) rides
+/// the forward-compatible facts JSON and carries `FONT_FACTS_REV` so the
+/// re-mine can tell "mined now" from "mined before the fields existed".
 fn mine_font(path: &Path) -> Option<MinedMetadata> {
     let data = std::fs::read(path).ok()?;
     let face = ttf_parser::Face::parse(&data, 0).ok()?;
@@ -100,7 +104,107 @@ fn mine_font(path: &Path) -> Option<MinedMetadata> {
         font.italic = Some(true);
     }
     font.glyphs = Some(face.number_of_glyphs() as u32);
+
+    font.full_name = face_name(&face, ttf_parser::name_id::FULL_NAME);
+    font.version = face_name(&face, ttf_parser::name_id::VERSION);
+    font.manufacturer = face_name(&face, ttf_parser::name_id::MANUFACTURER);
+    font.copyright = face_name(&face, ttf_parser::name_id::COPYRIGHT_NOTICE);
+    font.bold = Some(face.is_bold());
+    font.width_class = Some(face.width().to_number());
+    font.units_per_em = Some(face.units_per_em());
+    font.variable_weight = wght_axis(&face);
+
+    let resolution = super::font_language::resolve(&language_evidence(&face));
+    if !resolution.declared.is_empty() {
+        font.languages_declared = Some(
+            resolution
+                .declared
+                .iter()
+                .map(|lang| lang.token().to_string())
+                .collect(),
+        );
+    }
+    font.language = resolution.resolved.map(|lang| lang.token().to_string());
+    font.facts_rev = Some(crate::model::FONT_FACTS_REV);
     Some(m)
+}
+
+/// The `wght` axis of a variable font as `min–max` (rounding the 16.16
+/// fixed values); `None` for a static font.
+fn wght_axis(face: &ttf_parser::Face) -> Option<String> {
+    let axis = face
+        .variation_axes()
+        .into_iter()
+        .find(|axis| axis.tag == ttf_parser::Tag::from_bytes(b"wght"))?;
+    let min = axis.min_value.round() as i32;
+    let max = axis.max_value.round() as i32;
+    if min >= max {
+        Some(format!("{min}"))
+    } else {
+        Some(format!("{min}–{max}"))
+    }
+}
+
+/// `ulCodePageRange1/2`, read raw from the OS/2 table. ttf-parser's typed
+/// API does not expose these two words, and the spec fixes their place:
+/// version at offset 0, the pair at 78/82. A v0 table has neither — that is
+/// the "declares nothing" case the language decision treats as such.
+fn os2_code_page_range(face: &ttf_parser::Face) -> Option<(u32, u32)> {
+    let record = face
+        .raw_face()
+        .table_records
+        .into_iter()
+        .find(|table| table.tag == ttf_parser::Tag::from_bytes(b"OS/2"))?;
+    let data = face.raw_face().data;
+    let start = record.offset as usize;
+    let end = start.checked_add(record.length as usize)?;
+    if data.len() < end || end < 86 || u16::from_be_bytes([data[start], data[start + 1]]) == 0 {
+        return None;
+    }
+    let table = &data[start..end];
+    Some((
+        u32::from_be_bytes(table[78..82].try_into().ok()?),
+        u32::from_be_bytes(table[82..86].try_into().ok()?),
+    ))
+}
+
+/// Whether any cmap subtable maps `c`. Coverage feeds the Latin fallback
+/// and nothing else — see the module comment on `font_language` for why it
+/// must never vote on a CJK language.
+fn cmap_covers(face: &ttf_parser::Face, c: char) -> bool {
+    face.tables()
+        .cmap
+        .into_iter()
+        .flat_map(|cmap| cmap.subtables)
+        .any(|sub| sub.glyph_index(c as u32).is_some())
+}
+
+/// The Windows LCIDs whose name-table records name a font's locale; anything
+/// else (Mac records use their own language codes) contributes no vote.
+const ENGLISH_LOCALES: [u16; 2] = [0x0409, 0x0809];
+
+fn language_evidence(face: &ttf_parser::Face) -> super::font_language::Evidence {
+    let mut evidence = super::font_language::Evidence::default();
+    for record in face.names() {
+        let Some(text) = record.to_string() else {
+            continue;
+        };
+        if record.platform_id == ttf_parser::PlatformId::Windows {
+            evidence.name_locales.push(record.language_id);
+            match record.name_id {
+                ttf_parser::name_id::FAMILY
+                | ttf_parser::name_id::TYPOGRAPHIC_FAMILY
+                | ttf_parser::name_id::FULL_NAME => evidence.family_names.push(text.clone()),
+                _ => {}
+            }
+        }
+        if !ENGLISH_LOCALES.contains(&record.language_id) {
+            evidence.localized_names.push(text);
+        }
+    }
+    evidence.covers_latin = cmap_covers(face, 'A');
+    evidence.code_page_range = os2_code_page_range(face);
+    evidence
 }
 
 /// The family (and optional subfamily) recorded in a font file's name
@@ -592,13 +696,22 @@ mod tests {
         let face = find_system_font();
         let Some(path) = face else { return };
         let m = mine(&path, AssetKind::Font, &path);
+        let font = &m.facts.font;
         assert!(
-            m.facts
-                .font
-                .family
-                .as_deref()
-                .is_some_and(|s| !s.is_empty()),
+            font.family.as_deref().is_some_and(|s| !s.is_empty()),
             "family missing for {}",
+            path.display()
+        );
+        // The v1 group: every face has a units-per-em, a width class and a
+        // bold bit, so absence here means the extraction arm was skipped,
+        // not that the font lacks the table.
+        assert_eq!(font.facts_rev, Some(crate::model::FONT_FACTS_REV));
+        assert!(font.units_per_em.is_some(), "units_per_em missing");
+        assert!(font.width_class.is_some(), "width_class missing");
+        assert!(font.bold.is_some(), "bold flag missing");
+        assert!(
+            font.version.is_some() || font.manufacturer.is_some(),
+            "a face with neither a version nor a manufacturer name is rare enough to flag: {}",
             path.display()
         );
     }

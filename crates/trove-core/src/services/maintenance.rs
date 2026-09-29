@@ -36,7 +36,14 @@ fn remine_complete(asset: &crate::model::Asset, kind: AssetKind) -> bool {
         AssetKind::Audio => {
             asset.facts.audio.sample_rate.is_some() || asset.facts.audio.channels.is_some()
         }
-        AssetKind::Font => asset.facts.font.family.is_some(),
+        // `family` alone was the v0 font miner's whole harvest, so it cannot
+        // distinguish "mined by the current extractor" from "mined before
+        // the extended fields existed" — the revision marker does. A font
+        // with no family name still stays an honest per-sweep miss.
+        AssetKind::Font => {
+            asset.facts.font.family.is_some()
+                && asset.facts.font.facts_rev >= Some(crate::model::FONT_FACTS_REV)
+        }
         _ => true,
     }
 }
@@ -143,7 +150,9 @@ pub fn run_remine_plan(db_path: &Path, plan: ReminePlan) -> RemineReport {
                 facts.media = mined.facts.media;
                 facts.audio = mined.facts.audio;
             }
-            // ttf-parser: family, style, weight, glyph count.
+            // ttf-parser: the whole font group, replaced wholesale — the
+            // revision marker on the group is what makes this re-mine reach
+            // rows the older, narrower extractor left behind.
             AssetKind::Font => facts.font = mined.facts.font,
             _ => {}
         }
@@ -201,6 +210,9 @@ pub fn plan_thumbnail_rebuild(lib: &Library, force: bool) -> Result<ThumbPlan> {
     let cache = lib.cache();
 
     let mut plan = ThumbPlan::default();
+    // One rasterizer probe per plan, not per PDF: spawning the candidates is
+    // the cheapest part of this job, but still not per-asset cheap.
+    let pdf_has_card = thumb::pdf_rasterizer_available();
     for kind in [
         AssetKind::Image,
         AssetKind::Font,
@@ -217,13 +229,16 @@ pub fn plan_thumbnail_rebuild(lib: &Library, force: bool) -> Result<ThumbPlan> {
             },
         )?;
         for asset in assets.items {
-            // `Document` and `Other` are only in scope for their text members:
-            // a PDF or an archive has no card to rebuild, and counting them
-            // would promise work that does not exist. Text straddles the two
-            // kinds because `.txt` was a document before this app could read it
-            // and `.rs` never was one.
+            // `Other` is only in scope for its text members: an archive has
+            // no card to rebuild, and counting it would promise work that
+            // does not exist. Text straddles the two kinds because `.txt`
+            // was a document before this app could read it and `.rs` never
+            // was one. A PDF is in scope exactly while a rasterizer is
+            // installed — the same opt-in the import path itself works
+            // under, so an unprovisioned machine keeps promising nothing.
             if matches!(kind, AssetKind::Document | AssetKind::Other)
                 && !crate::media::text::is_text_ext(&asset.ext)
+                && !(kind == AssetKind::Document && asset.ext == "pdf" && pdf_has_card)
             {
                 continue;
             }
@@ -1014,5 +1029,104 @@ mod tests {
             "force re-reads it regardless"
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A font row shaped like the old extractor left it — family present,
+    /// no revision marker — is reached by an *unforced* pass and comes back
+    /// with the v1 fields filled. Hermetic when the system has no fonts.
+    #[test]
+    fn remine_reaches_fonts_the_old_extractor_left_behind() {
+        let Some(face) = find_system_font() else {
+            eprintln!("skipping: no ttf/otf under /usr/share/fonts");
+            return;
+        };
+        let (lib, root) = temp_lib("remine3");
+        let src = root.join("face.ttf");
+        std::fs::copy(&face, &src).unwrap();
+        lib.import_into_store(std::slice::from_ref(&src), None)
+            .unwrap();
+
+        let conn = lib.store().conn();
+        let asset = crate::store::assets::query(
+            conn,
+            &AssetQuery {
+                kind: Some(AssetKind::Font),
+                ..AssetQuery::live()
+            },
+        )
+        .unwrap()
+        .items
+        .pop()
+        .expect("the font asset imported");
+        // Roll the row back to what a pre-v1 miner wrote.
+        let legacy = crate::model::FontFacts {
+            family: Some("Legacy Import".to_string()),
+            ..Default::default()
+        };
+        let mut facts = asset.facts.clone();
+        facts.font = legacy;
+        crate::store::assets::update(
+            conn,
+            asset.id,
+            &crate::model::AssetPatch {
+                facts: Some(facts),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let plan = plan_remine(&lib, false).unwrap();
+        assert_eq!(plan.items.len(), 1, "a pre-v1 font row is reached unforced");
+        let report = run_remine_plan(&root.join("library.db"), plan);
+        assert_eq!(report.scanned, 1);
+
+        let after = crate::store::assets::get(conn, asset.id).unwrap().unwrap();
+        assert_eq!(
+            after.facts.font.facts_rev,
+            Some(crate::model::FONT_FACTS_REV),
+            "the re-mine stamped the current revision"
+        );
+        assert!(
+            after.facts.font.units_per_em.is_some(),
+            "v1 fields filled from the same file"
+        );
+        assert_ne!(
+            after.facts.font.family.as_deref(),
+            Some("Legacy Import"),
+            "family was re-read, not preserved"
+        );
+
+        // The row now looks current: a further unforced pass skips it.
+        assert_eq!(plan_remine(&lib, false).unwrap().items.len(), 0);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A system face for font tests; `None` keeps the test hermetic.
+    fn find_system_font() -> Option<std::path::PathBuf> {
+        fn walk(dir: &Path, depth: usize) -> Option<std::path::PathBuf> {
+            if depth > 4 {
+                return None;
+            }
+            let entries = std::fs::read_dir(dir).ok()?;
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir()
+                    && let Some(found) = walk(&path, depth + 1)
+                {
+                    return Some(found);
+                }
+                let is_face = path
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .is_some_and(|e| matches!(e, "ttf" | "otf"));
+                if is_face {
+                    return Some(path);
+                }
+            }
+            None
+        }
+        ["/usr/share/fonts", "/usr/local/share/fonts"]
+            .iter()
+            .find_map(|root| walk(std::path::Path::new(root), 0))
     }
 }

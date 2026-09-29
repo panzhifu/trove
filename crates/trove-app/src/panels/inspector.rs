@@ -389,14 +389,7 @@ impl Render for InspectorPanel {
         let rating = asset.rating;
         let added = asset.created_at.format("%Y-%m-%d %H:%M").to_string();
         let mime = asset.mime.clone();
-        let font = &asset.facts.font;
-        let (font_family, font_style, font_weight, font_glyphs, font_italic) = (
-            font.family.clone(),
-            font.style.clone(),
-            font.weight,
-            font.glyphs,
-            font.italic.unwrap_or(false),
-        );
+        let font_facts = asset.facts.font.clone();
         // Workflow state + license clearance, edited from the workspace
         // context menu; the inspector displays them read-only.
         let status_text = match asset.usage_status {
@@ -581,6 +574,13 @@ impl Render for InspectorPanel {
                 this.child(property_row(cx, "inspector.audio_format", line))
             })
             .child(property_row(cx, "inspector.dimensions", dims))
+            // The colour space the file itself names (its ICC profile's
+            // description). Absent for files that carry no profile — those
+            // are displayed as sRGB by assumption, and recording nothing is
+            // more honest than recording a guess.
+            .when_some(asset.facts.visual.color_space.clone(), |this, space| {
+                this.child(property_row(cx, "inspector.color_space", space))
+            })
             // The EXIF the import stage already mined into the asset row. Each
             // of these is optional on its own, so a screenshot or a re-saved
             // JPEG shows none of them — and a camera file shows the whole set
@@ -774,11 +774,7 @@ impl Render for InspectorPanel {
         if kind == AssetKind::Font {
             let font_content = self.font_section(
                 cx,
-                font_family,
-                font_style,
-                font_weight,
-                font_glyphs,
-                font_italic,
+                font_facts,
                 font_blob.as_deref(),
                 asset.content_hash.as_deref().map(str::to_string),
             );
@@ -917,25 +913,24 @@ impl InspectorPanel {
 
     /// Font facts + a live specimen. The blob is registered with the text
     /// system once per family (registration is process-global); until that
-    /// succeeds the section shows only the metadata lines.
-    #[allow(clippy::too_many_arguments)]
+    /// succeeds the section shows only the metadata lines. Everything shown
+    /// is what the file itself recorded — name table, OS/2 bits, fvar axis —
+    /// nothing here is user-set, so a row is absent rather than empty when
+    /// the file does not carry it.
     fn font_section(
         &mut self,
         cx: &mut Context<Self>,
-        family: Option<String>,
-        style: Option<String>,
-        weight: Option<u16>,
-        glyphs: Option<u32>,
-        italic: bool,
+        facts: trove_core::model::FontFacts,
         blob: Option<&std::path::Path>,
         hash: Option<String>,
     ) -> Div {
-        let registered = family
+        let registered = facts
+            .family
             .as_ref()
             .is_some_and(|f| self.ensure_font_registered(f, blob, cx));
 
         let mut section = v_flex().gap_1();
-        if let (Some(family), true) = (&family, registered) {
+        if let (Some(family), true) = (&facts.family, registered) {
             section = section.child(
                 crate::panels::common::font_live_preview(family, cx)
                     .h(px(48.))
@@ -943,7 +938,7 @@ impl InspectorPanel {
                     .rounded(cx.theme().radius),
             );
         }
-        if let Some(family) = &family {
+        if let Some(family) = &facts.family {
             section = section.child(
                 div()
                     .text_sm()
@@ -952,22 +947,68 @@ impl InspectorPanel {
                     .child(family.clone()),
             );
         }
+        // One meta line for the shape of the face: subfamily, the OS/2 bold
+        // claim (the weight number beside it may already say Bold, so no
+        // dupes), the weight itself, the italic claim, the width class.
         let mut meta: Vec<String> = Vec::new();
-        if let Some(style) = &style {
+        if let Some(style) = &facts.style {
             meta.push(style.clone());
         }
-        if let Some(weight) = weight {
+        if facts.bold == Some(true) && !meta.iter().any(|s| s.eq_ignore_ascii_case("bold")) {
+            meta.push("Bold".to_string());
+        }
+        if let Some(weight) = facts.weight {
             meta.push(weight.to_string());
         }
-        if italic {
+        if facts.italic == Some(true) {
             meta.push(rust_i18n::t!("inspector.italic").to_string());
         }
-        if let Some(glyphs) = glyphs {
-            meta.push(format!("{glyphs} glyphs"));
+        if let Some(width) = facts.width_class {
+            meta.push(width_class_name(width).to_string());
         }
         if !meta.is_empty() {
             section = section.child(muted_label(meta.join(" · "), cx));
         }
+
+        let mut rows = v_flex().gap_1();
+        if let Some(version) = &facts.version {
+            rows = rows.child(property_row(cx, "inspector.font_version", version.clone()));
+        }
+        if let Some(manufacturer) = &facts.manufacturer {
+            rows = rows.child(property_row(
+                cx,
+                "inspector.font_manufacturer",
+                manufacturer.clone(),
+            ));
+        }
+        if let Some(language) = language_line(&facts) {
+            rows = rows.child(property_row(cx, "inspector.font_languages", language));
+        }
+        if let Some(variable) = &facts.variable_weight {
+            rows = rows.child(property_row(
+                cx,
+                "inspector.font_variable",
+                variable.clone(),
+            ));
+        }
+        if let Some(glyphs) = facts.glyphs {
+            rows = rows.child(property_row(
+                cx,
+                "inspector.font_glyphs",
+                glyphs.to_string(),
+            ));
+        }
+        if let Some(upm) = facts.units_per_em {
+            rows = rows.child(property_row(cx, "inspector.font_upm", upm.to_string()));
+        }
+        if let Some(copyright) = &facts.copyright {
+            rows = rows.child(property_row(
+                cx,
+                "inspector.font_copyright",
+                copyright.clone(),
+            ));
+        }
+        section = section.child(rows);
 
         // System install: user-level fonts directory, hash-named copy. The
         // button state re-evaluates on the next render after the action.
@@ -1191,6 +1232,43 @@ fn exposure_line(photo: &trove_core::model::PhotoFacts) -> Option<String> {
 fn gps_line(photo: &trove_core::model::PhotoFacts) -> Option<String> {
     let (lat, lng) = (photo.gps_lat?, photo.gps_lng?);
     Some(format!("{lat:.4}, {lng:.4}"))
+}
+
+/// The OpenType `usWidthClass` names, 1–9. Left in English on purpose:
+/// these are the spec's own terms, the same words every font editor shows.
+fn width_class_name(width: u16) -> &'static str {
+    match width {
+        1 => "UltraCondensed",
+        2 => "ExtraCondensed",
+        3 => "Condensed",
+        4 => "SemiCondensed",
+        6 => "SemiExpanded",
+        7 => "Expanded",
+        8 => "ExtraExpanded",
+        9 => "UltraExpanded",
+        _ => "Normal",
+    }
+}
+
+/// The language row: the resolved token first, with the declared set in
+/// parentheses only when it adds information (Source Han Sans CN resolves
+/// to `zh-Hans` but declares `ja` too — worth seeing; a plain Latin face
+/// resolves to `latin` with nothing declared — not worth seeing).
+fn language_line(facts: &trove_core::model::FontFacts) -> Option<String> {
+    let declared = facts.languages_declared.as_deref().unwrap_or(&[]);
+    match facts.language.as_deref() {
+        Some(resolved) => {
+            let rest: Vec<_> = declared.iter().filter(|d| *d != resolved).collect();
+            if rest.is_empty() {
+                Some(resolved.to_string())
+            } else {
+                let names: Vec<&str> = rest.iter().map(|s| s.as_str()).collect();
+                Some(format!("{resolved} ({})", names.join(", ")))
+            }
+        }
+        None if !declared.is_empty() => Some(declared.join(", ")),
+        None => None,
+    }
 }
 
 fn property_row(cx: &Context<impl Render>, key: &'static str, value: String) -> Div {
