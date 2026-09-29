@@ -540,6 +540,17 @@ impl AssetPreviewPanel {
         }
     }
 
+    /// Step the previewed clip one frame back or forward and hold it there.
+    /// Video or animated image, whichever has the screen — the same two players
+    /// space bar already answers, and the same no-op when neither is live.
+    pub(crate) fn step_frame(&mut self, forward: bool, cx: &mut App) {
+        if let Some(video) = &self.video {
+            video.update(cx, |video, cx| video.step_frame(forward, cx));
+        } else if let Some(anim) = &self.anim {
+            anim.update(cx, |anim, cx| anim.step_frame(forward, cx));
+        }
+    }
+
     /// Save the frame under the video's playhead into the library. A no-op
     /// without a live player — see [`Self::has_video`].
     pub(crate) fn grab_frame(

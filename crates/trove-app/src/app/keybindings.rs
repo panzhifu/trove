@@ -145,6 +145,11 @@ pub(crate) fn register(cx: &mut App, config: &trove_core::config::AppConfig) {
     // `AssetGrid` is not on the focus path while a preview is up, and
     // `VideoPreview` is not on it while the grid is.
     bind!(TogglePlayback, Some(VIDEO_PREVIEW_CONTEXT));
+    // `,` / `.` step one frame on whichever player is on screen. Same context
+    // as space and `f`, and for the same reason: a bare character bound in
+    // `Workspace` would take that character away from the search box.
+    bind!(StepFrameBack, Some(VIDEO_PREVIEW_CONTEXT));
+    bind!(StepFrameForward, Some(VIDEO_PREVIEW_CONTEXT));
 
     // Plugin commands: declared by registered plugins, bound with each
     // command's default key or the user's override (an empty effective key
@@ -171,4 +176,72 @@ pub(crate) fn register(cx: &mut App, config: &trove_core::config::AppConfig) {
     bind!(Screenshot, None);
 
     cx.bind_keys(bindings);
+}
+
+#[cfg(test)]
+mod tests {
+    use gpui_kit::Keystroke;
+    use trove_core::keybindings::default_keybindings;
+
+    /// Every default binding must name its key the way the platform reports it.
+    ///
+    /// `Keystroke::parse` keeps any non-modifier component verbatim as the key
+    /// string, while gpui-linux translates each keysym through a table
+    /// (`platform.rs:1094-1160`): a key with no character arrives by name
+    /// (`escape`, `space`, `left`), and punctuation arrives **as the character**
+    /// (`Keysym::comma` → `","`, `Keysym::period` → `"."`). A keysym name written
+    /// where the character belongs still parses, still shows in Settings ▸
+    /// Shortcuts as though bound, and never fires — which is how `OpenSettings`
+    /// shipped with a dead `Ctrl+,`.
+    #[test]
+    fn every_default_binding_names_a_key_the_platform_can_emit() {
+        // The names gpui-linux hands back for keys without a character. The
+        // fallback for anything not listed is `keysym_get_name(…).to_lowercase()`,
+        // which is what `f5` is — accepted by the digit-shape rule below.
+        const NAMED: &[&str] = &[
+            "enter",
+            "escape",
+            "backspace",
+            "delete",
+            "tab",
+            "space",
+            "insert",
+            "home",
+            "end",
+            "pageup",
+            "pagedown",
+            "left",
+            "right",
+            "up",
+            "down",
+            "back",
+            "forward",
+            "cut",
+            "copy",
+            "paste",
+            "new",
+            "open",
+            "save",
+        ];
+        let mut offenders = Vec::new();
+        for binding in default_keybindings() {
+            if binding.key.is_empty() {
+                continue; // menu-only until the user binds a key
+            }
+            let key = binding.key;
+            let stroke = Keystroke::parse(key)
+                .unwrap_or_else(|_| panic!("{} binds an unparseable key: {key}", binding.action));
+            let key = stroke.key.as_str();
+            let named_function_key = key.strip_prefix('f').is_some_and(|digits| {
+                !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit())
+            });
+            if !(key.chars().count() == 1 || NAMED.contains(&key) || named_function_key) {
+                offenders.push((binding.action, binding.key));
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "these bindings name a keysym where the platform emits a character: {offenders:?}"
+        );
+    }
 }

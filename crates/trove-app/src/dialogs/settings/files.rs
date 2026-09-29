@@ -7,7 +7,10 @@
 use super::*;
 use crate::app::settings_write;
 use crate::components::controls::muted_label;
+use gpui_kit::component::WindowExt as _;
+use gpui_kit::component::button::ButtonVariant;
 use gpui_kit::component::chart::PieChart;
+use gpui_kit::component::dialog::DialogButtonProps;
 use trove_core::config::{AudioCardStyle, LibraryConfig};
 use trove_core::services::storage::{DirUsage, StorageReport};
 
@@ -389,6 +392,22 @@ fn deletion_group() -> SettingGroup {
         .title(rust_i18n::t!("settings.deletion").to_string())
         .item(
             SettingItem::new(
+                rust_i18n::t!("settings.purge_confirm").to_string(),
+                SettingField::switch(
+                    |_cx| !LibraryConfig::load(&library_dir()).skip_purge_confirm(),
+                    |enabled, cx| {
+                        let dir = library_dir();
+                        let mut config = LibraryConfig::load(&dir);
+                        config.skip_purge_confirm = Some(!enabled);
+                        settings_write::note(config.save(&dir), "library config");
+                        cx.refresh_windows();
+                    },
+                ),
+            )
+            .description(rust_i18n::t!("settings.purge_confirm_desc").to_string()),
+        )
+        .item(
+            SettingItem::new(
                 rust_i18n::t!("settings.purge_delete_sources").to_string(),
                 SettingField::switch(
                     |_cx| LibraryConfig::load(&library_dir()).purge_delete_sources(),
@@ -407,16 +426,26 @@ fn deletion_group() -> SettingGroup {
 
 // =============================== backups =====================================
 
-/// Maintenance ▸ Backups: snapshot the database on demand and reveal the
-/// snapshot folder. Auto-backups run at library open (daily throttle).
+/// Maintenance ▸ Backups: snapshot the database on demand, reveal the
+/// snapshot folder, and write one of them back. Auto-backups run at library
+/// open (daily throttle).
 fn backups_group(controller: &Entity<LibraryController>) -> SettingGroup {
-    let controller = controller.clone();
+    // Two rows, two captures: each render closure owns its handle.
+    let backup_controller = controller.clone();
+    let restore_controller = controller.clone();
     SettingGroup::new()
         .title(rust_i18n::t!("settings.backups").to_string())
         .item(SettingItem::new(
             rust_i18n::t!("settings.backup_now").to_string(),
-            SettingField::render(move |_, _, cx| backup_row(&controller, cx)),
+            SettingField::render(move |_, _, cx| backup_row(&backup_controller, cx)),
         ))
+        .item(
+            SettingItem::new(
+                rust_i18n::t!("settings.restore_from_backup").to_string(),
+                SettingField::render(move |_, _, cx| restore_row(&restore_controller, cx)),
+            )
+            .description(rust_i18n::t!("settings.restore_from_backup_desc").to_string()),
+        )
 }
 
 /// The backups row: snapshot count, a "back up now" button and a reveal
@@ -476,6 +505,190 @@ fn backup_row(controller: &Entity<LibraryController>, cx: &mut App) -> Div {
                     }
                 }),
         )
+}
+
+/// The file stem a snapshot carries, minus the `library-` prefix: the timestamp
+/// is the only part worth reading on a button, and the folder is already named
+/// by the row above it.
+fn snapshot_label(path: &std::path::Path) -> String {
+    match path
+        .file_stem()
+        .map(|stem| stem.to_string_lossy().to_string())
+    {
+        Some(stem) => stem.strip_prefix("library-").unwrap_or(&stem).to_string(),
+        None => path.display().to_string(),
+    }
+}
+
+/// The restore row: one button per snapshot, newest first — the newest is the
+/// one a user wants almost every time, and it lands at the left.
+fn restore_row(controller: &Entity<LibraryController>, cx: &mut App) -> Div {
+    let busy = controller.read(cx).busy;
+    let mut snapshots = controller.read(cx).library.list_backups();
+    snapshots.reverse();
+    if snapshots.is_empty() {
+        return h_flex().w_full().justify_end().child(muted_label(
+            rust_i18n::t!("settings.no_snapshots").to_string(),
+            cx,
+        ));
+    }
+    h_flex()
+        .w_full()
+        .justify_end()
+        .gap_1()
+        .flex_wrap()
+        .children(snapshots.into_iter().map(|path| {
+            let controller = controller.clone();
+            Button::new(format!("restore-{}", path.display()))
+                .ghost()
+                .xsmall()
+                .disabled(busy)
+                .label(snapshot_label(&path))
+                .on_click(move |_, window, cx| {
+                    confirm_restore(&controller, &path, window, cx);
+                })
+        }))
+}
+
+/// Restoring overwrites the library database, so it carries its own
+/// confirmation. It is deliberately *not* the purge confirmation: that one can
+/// be silenced once ("don't ask again" is about deleting assets), and a restore
+/// is a different decision — made rarely, and never by reflex.
+fn confirm_restore(
+    controller: &Entity<LibraryController>,
+    snapshot: &std::path::Path,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let controller = controller.clone();
+    let snapshot = snapshot.to_path_buf();
+    window.open_dialog(cx, move |dialog, _, _| {
+        let controller = controller.clone();
+        let snapshot = snapshot.clone();
+        dialog
+            .title(rust_i18n::t!("settings.restore_confirm_title").to_string())
+            .width(px(460.))
+            .close_button(false)
+            .child(
+                div().text_sm().p_1().child(
+                    rust_i18n::t!(
+                        "settings.restore_confirm_body",
+                        snapshot = snapshot_label(&snapshot)
+                    )
+                    .to_string(),
+                ),
+            )
+            .button_props(
+                DialogButtonProps::default()
+                    .ok_text(rust_i18n::t!("settings.restore_confirm_ok").to_string())
+                    .ok_variant(ButtonVariant::Danger)
+                    .show_cancel(true),
+            )
+            .on_ok(move |_, _, cx| {
+                restore_now(&controller, &snapshot, cx);
+                true
+            })
+    });
+}
+
+/// Point the resident watch service at the library the controller holds now.
+/// A no-op when the watch was never started (the setting is off), and the
+/// "already watching" guard upstream keeps a double call from doubling it.
+fn restart_watch(controller: &Entity<LibraryController>, cx: &mut App) {
+    if let Some(handle) = controller.read(cx).watch_handle {
+        crate::library::jobs::start_watch_service(controller, handle, cx);
+    }
+}
+
+/// Write a snapshot back over the database, then reopen the library.
+///
+/// The reopen is not cosmetic. `restore_backup` replaces pages through a
+/// connection of its own, so the handle the app is reading through still
+/// describes the rows that were just overwritten — and every bit of controller
+/// state computed against them (selection, filters, task list, duplicate
+/// clusters, the search plan) belongs to a database that no longer exists.
+/// `swap_library` drops the store and clears all of it, which is the same shape
+/// a library switch already has.
+fn restore_now(controller: &Entity<LibraryController>, snapshot: &std::path::Path, cx: &mut App) {
+    // The guard every maintenance button on this page uses: a running import is
+    // still writing to the store, and a restore beside it is two writers on one
+    // database with no order between them.
+    if !start_job(controller, cx) {
+        return;
+    }
+    // The watch task never touches the database itself, but its discoveries
+    // become the pump's imports, and `busy` only turns those away while the
+    // restore runs — a file discovered in the window between the overwrite and
+    // the reopen would be offered to the library that is being replaced. Cancel
+    // it first, the same cooperative cancel a library swap uses; the thread
+    // stops offering at its next checkpoint. Every way out of here restarts it.
+    controller.update(cx, |ctl, _| {
+        if let Some(watch) = ctl.watch_task.take() {
+            watch.manager.cancel(watch.task_id);
+        }
+    });
+    let (root, cache) = {
+        let ctl = controller.read(cx);
+        (
+            ctl.library.root().to_path_buf(),
+            ctl.library.cache().to_path_buf(),
+        )
+    };
+    let message = match controller.read(cx).library.restore_backup(snapshot) {
+        Err(error) => {
+            // Nothing was overwritten; the library as it stands is the one to
+            // watch again.
+            restart_watch(controller, cx);
+            rust_i18n::t!("settings.job_failed", error = error.to_string()).to_string()
+        }
+        Ok(before) => {
+            let label = snapshot_label(snapshot);
+            match controller.update(cx, |ctl, _| ctl.swap_library(root, cache)) {
+                Err(error) => {
+                    // The store still opens the library directory, and its rows
+                    // are now the snapshot's; keep the watch on it until the
+                    // user sorts the reopen out.
+                    restart_watch(controller, cx);
+                    rust_i18n::t!(
+                        "settings.restore_reopen_failed",
+                        error = error.to_string(),
+                        path = before.display().to_string()
+                    )
+                    .to_string()
+                }
+                Ok(()) => {
+                    // Thumbnails need nothing: they are addressed by content hash
+                    // and made on a miss. The text index is the opposite — it
+                    // holds documents for rows the restored database does not
+                    // have — so it is rebuilt from what is now on disk.
+                    let rebuilt = trove_core::services::maintenance::rebuild_search_index(
+                        &controller.read(cx).library,
+                    );
+                    // Point the watch at the reopened library, as any swap's
+                    // caller does.
+                    restart_watch(controller, cx);
+                    match rebuilt {
+                        Ok(count) => rust_i18n::t!(
+                            "settings.restore_done",
+                            snapshot = label,
+                            path = before.display().to_string(),
+                            count = count
+                        )
+                        .to_string(),
+                        // The records landed; only the index did not. Saying so is
+                        // the difference between "search is stale" and "restore
+                        // failed", and the row above can rebuild it by hand.
+                        Err(error) => rust_i18n::t!(
+                            "settings.restore_index_failed",
+                            error = error.to_string()
+                        )
+                        .to_string(),
+                    }
+                }
+            }
+        }
+    };
+    finish_job(controller, message, cx);
 }
 
 /// Mark the controller busy (unless a job is already running). Returns

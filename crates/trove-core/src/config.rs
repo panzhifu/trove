@@ -459,6 +459,12 @@ pub struct LibraryConfig {
     /// they keep it.
     #[serde(default)]
     pub purge_delete_sources: Option<bool>,
+    /// Whether the irreversible-delete confirmation is skipped. Opted into
+    /// from the confirmation itself ("don't ask again") and reversible from
+    /// the settings' deletion group; defaults to off, because a guard the
+    /// user never sees was the state before the gate existed.
+    #[serde(default)]
+    pub skip_purge_confirm: Option<bool>,
     /// Recent search queries for this library, newest first.
     ///
     /// Settled queries only — what the user committed by pressing Enter, never
@@ -512,6 +518,12 @@ impl LibraryConfig {
     /// default — see [`Self::purge_delete_sources`]).
     pub fn purge_delete_sources(&self) -> bool {
         self.purge_delete_sources.unwrap_or(false)
+    }
+
+    /// Whether the irreversible-delete confirmation is skipped (off by
+    /// default — see [`Self::skip_purge_confirm`]).
+    pub fn skip_purge_confirm(&self) -> bool {
+        self.skip_purge_confirm.unwrap_or(false)
     }
 
     /// Add a watched folder (deduplicated) and persist.
@@ -1508,6 +1520,51 @@ mod tests {
         let config = LibraryConfig::load(&dir);
         assert!(config.search_history.is_empty());
         assert_eq!(config.watched_folders.len(), 1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The irreversible-delete gate is on until the user switches it off, in
+    /// both directions that matter: a library written before the field existed
+    /// must still ask, and an opt-out must survive the restart — the two ways
+    /// it could silently become a gate that is not there, or one that comes
+    /// back after every launch.
+    #[test]
+    fn the_deletion_gate_asks_until_the_user_opts_out() {
+        let dir = std::env::temp_dir().join(format!("trove-purgegate-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // A library whose file predates the field: asking is the answer.
+        std::fs::write(
+            LibraryConfig::file(&dir),
+            r#"{"watched_folders":["/tmp/a"],"purge_delete_sources":true}"#,
+        )
+        .unwrap();
+        let config = LibraryConfig::load(&dir);
+        assert!(
+            !config.skip_purge_confirm(),
+            "absent means ask, not a silent delete"
+        );
+        assert!(
+            config.purge_delete_sources(),
+            "the field beside it is untouched"
+        );
+
+        // Opting out persists: the choice was made once, for this library.
+        let mut config = LibraryConfig::load(&dir);
+        config.skip_purge_confirm = Some(true);
+        config.save(&dir).unwrap();
+        assert!(
+            LibraryConfig::load(&dir).skip_purge_confirm(),
+            "the opt-out survives a reload"
+        );
+
+        // And the gate can be armed again — the settings' deletion group
+        // writes this same field, so switching off the skip is enough.
+        let mut config = LibraryConfig::load(&dir);
+        config.skip_purge_confirm = Some(false);
+        config.save(&dir).unwrap();
+        assert!(!LibraryConfig::load(&dir).skip_purge_confirm());
+
         std::fs::remove_dir_all(&dir).ok();
     }
 }

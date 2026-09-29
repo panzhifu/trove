@@ -75,17 +75,23 @@ impl Library {
             return Ok(0);
         }
         let desc = OpDesc::counted(OpAction::Rename, flips.len());
-        for flip in &flips {
-            assets::update(
-                conn,
-                flip.id,
-                &crate::model::AssetPatch {
-                    title: Some(flip.after.clone()),
-                    ..Default::default()
-                },
-            )?;
-        }
-        self.undo.record(Op::SetTitles { flips }, desc);
+        // The whole rename and its undo row are one transaction: a rename that
+        // stopped halfway through the batch would otherwise be recorded as one
+        // step undoable back to the start, while some of the rows still held
+        // their old titles.
+        undo::apply_atomic(conn, |tx| {
+            for flip in &flips {
+                assets::update(
+                    tx,
+                    flip.id,
+                    &crate::model::AssetPatch {
+                        title: Some(flip.after.clone()),
+                        ..Default::default()
+                    },
+                )?;
+            }
+            self.undo.record(tx, Op::SetTitles { flips }, &desc)
+        })?;
         Ok(count)
     }
 
@@ -184,20 +190,21 @@ impl Library {
                 after: favorite,
             });
         }
-        let changed = batch::set_favorite_many(conn, ids, favorite)?;
-        if changed > 0 {
-            self.undo.record(
-                Op::SetFavorite { flips },
-                OpDesc::counted(
-                    if favorite {
-                        OpAction::Favorite
-                    } else {
-                        OpAction::Unfavorite
-                    },
-                    ids.len(),
-                ),
-            );
-        }
+        let desc = OpDesc::counted(
+            if favorite {
+                OpAction::Favorite
+            } else {
+                OpAction::Unfavorite
+            },
+            ids.len(),
+        );
+        let changed = undo::apply_atomic(conn, |tx| {
+            let changed = batch::set_favorite_many(tx, ids, favorite)?;
+            if changed > 0 {
+                self.undo.record(tx, Op::SetFavorite { flips }, &desc)?;
+            }
+            Ok(changed)
+        })?;
         Ok(changed)
     }
 
@@ -207,22 +214,26 @@ impl Library {
         let conn = self.store.conn();
         let target = collections::get(conn, collection_id)?.map(|c| c.name);
         let members = collections::asset_ids(conn, collection_id)?;
-        let changed = batch::add_to_collection_many(conn, collection_id, ids)?;
         let added: Vec<Uuid> = ids
             .iter()
             .filter(|id| !members.contains(id))
             .copied()
             .collect();
         let desc = OpDesc::new(OpAction::AddedToCollection, target, added.len());
-        if !added.is_empty() {
-            self.undo.record(
-                Op::MembershipAdd {
-                    collection: collection_id,
-                    added,
-                },
-                desc,
-            );
-        }
+        let changed = undo::apply_atomic(conn, |tx| {
+            let changed = batch::add_to_collection_many(tx, collection_id, ids)?;
+            if !added.is_empty() {
+                self.undo.record(
+                    tx,
+                    Op::MembershipAdd {
+                        collection: collection_id,
+                        added,
+                    },
+                    &desc,
+                )?;
+            }
+            Ok(changed)
+        })?;
         Ok(changed)
     }
 
@@ -241,23 +252,28 @@ impl Library {
             .filter(|id| members.contains(id))
             .copied()
             .collect();
-        for id in &removed {
-            collections::remove_asset(
-                conn,
-                crate::model::CollectionId(collection_id),
-                crate::model::AssetId(*id),
-            )?;
-        }
         let count = removed.len();
-        if count > 0 {
-            self.undo.record(
-                Op::MembershipRemove {
-                    collection: collection_id,
-                    removed,
-                },
-                OpDesc::new(OpAction::RemovedFromCollection, target, count),
-            );
-        }
+        let desc = OpDesc::new(OpAction::RemovedFromCollection, target, count);
+        undo::apply_atomic(conn, |tx| {
+            for id in &removed {
+                collections::remove_asset(
+                    tx,
+                    crate::model::CollectionId(collection_id),
+                    crate::model::AssetId(*id),
+                )?;
+            }
+            if count > 0 {
+                self.undo.record(
+                    tx,
+                    Op::MembershipRemove {
+                        collection: collection_id,
+                        removed,
+                    },
+                    &desc,
+                )?;
+            }
+            Ok(())
+        })?;
         Ok(count)
     }
 
@@ -269,15 +285,19 @@ impl Library {
         let conn = self.store.conn();
         let asset = assets::get(conn, asset_id)?.ok_or(crate::Error::NotFound("asset"))?;
         let before = undo::restore_patch(&asset);
-        assets::update(conn, asset_id, patch)?;
-        self.undo.record(
-            Op::PatchAsset {
-                id: asset_id,
-                before: Box::new(before),
-                after: Box::new(patch.clone()),
-            },
-            OpDesc::new(OpAction::Edit, Some(asset.file_name), 1),
-        );
+        let desc = OpDesc::new(OpAction::Edit, Some(asset.file_name), 1);
+        undo::apply_atomic(conn, |tx| {
+            assets::update(tx, asset_id, patch)?;
+            self.undo.record(
+                tx,
+                Op::PatchAsset {
+                    id: asset_id,
+                    before: Box::new(before),
+                    after: Box::new(patch.clone()),
+                },
+                &desc,
+            )
+        })?;
         Ok(())
     }
 

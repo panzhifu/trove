@@ -16,6 +16,7 @@ use gpui_kit::base::{ElementExt as _, h_flex, v_flex};
 use gpui_kit::component::Sizable;
 use gpui_kit::component::WindowExt as _;
 use gpui_kit::component::button::{Button, ButtonVariant, ButtonVariants as _};
+use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::dialog::DialogButtonProps;
 use gpui_kit::component::dock::{BasePanel, PanelEvent};
 use gpui_kit::component::input::{Input, InputState};
@@ -44,7 +45,8 @@ use trove_core::model::{AssetKind, AssetSort, NewSmartCollection, Orientation};
 use uuid::Uuid;
 
 use crate::app::actions::{
-    ClearSelection, MoveDown, MoveLeft, MoveRight, MoveUp, OpenPreview, QuickLook, TogglePlayback,
+    ClearSelection, MoveDown, MoveLeft, MoveRight, MoveUp, OpenPreview, QuickLook, StepFrameBack,
+    StepFrameForward, TogglePlayback,
 };
 use crate::components::preview::{
     AssetPreviewEvent, AssetPreviewPanel, LiveCard, ModelViewport, ModelViewportEvent, VideoPlayer,
@@ -672,6 +674,16 @@ impl Render for WorkspacePanel {
                 // grid, so the two never both answer the same press.
                 if let Some(panel) = this.preview_asset_panel() {
                     panel.update(cx, |panel, cx| panel.toggle_playback(cx));
+                }
+            }))
+            .on_action(cx.listener(|this, _: &StepFrameBack, _, cx| {
+                if let Some(panel) = this.preview_asset_panel() {
+                    panel.update(cx, |panel, cx| panel.step_frame(false, cx));
+                }
+            }))
+            .on_action(cx.listener(|this, _: &StepFrameForward, _, cx| {
+                if let Some(panel) = this.preview_asset_panel() {
+                    panel.update(cx, |panel, cx| panel.step_frame(true, cx));
                 }
             }))
             .on_action(cx.listener(|this, _: &ClearSelection, window, cx| {
@@ -1303,30 +1315,80 @@ fn next_window(
 /// before overwriting a user's own file for a while. The `Rc` is that helper's
 /// reason, not a flourish: the dialog builder is `Fn` because gpui may build it
 /// again, while the action must run at most once.
+///
+/// The dialog carries a "don't ask again" checkbox: confirming with it ticked
+/// records the choice in the library config and every later delete — through
+/// any of the four doors — runs without asking. The setting lives in
+/// [`LibraryConfig`], next to the purge-reach switch it interacts with, and is
+/// reversible from the settings' deletion group; a gate that could only ever
+/// be switched off would be a trap.
 pub(crate) fn confirm_destruction(
+    controller: &Entity<LibraryController>,
     window: &mut Window,
     cx: &mut App,
     body: String,
     run: impl Fn(&mut App) + 'static,
 ) {
+    // Once the user has opted out, this gate is a pass-through: the warning
+    // below exists for the moment of decision, and that moment is over.
+    if trove_core::config::LibraryConfig::load(controller.read(cx).library.root())
+        .skip_purge_confirm()
+    {
+        run(cx);
+        return;
+    }
     let run = Rc::new(run);
+    let controller = controller.clone();
+    // The checkbox's state lives outside the dialog: the builder is `Fn`, so
+    // the value has to survive a rebuild, and `refresh_windows` on toggle
+    // makes the next build draw the new mark. `CellFlag` because this file
+    // already keeps `Cell` under that alias for the same reason.
+    let skip = Rc::new(CellFlag::new(false));
     window.open_dialog(cx, move |dialog, _, _| {
         let run = Rc::clone(&run);
         let body = body.clone();
+        let controller = controller.clone();
         dialog
             .title(rust_i18n::t!("workspace.delete_forever").to_string())
             .width(px(440.))
             .close_button(false)
-            .child(div().text_sm().p_1().child(body))
+            .child(
+                v_flex()
+                    .gap_2()
+                    .child(div().text_sm().p_1().child(body))
+                    .child(
+                        Checkbox::new("skip-purge-confirm")
+                            .label(rust_i18n::t!("workspace.purge_confirm_skip").to_string())
+                            .checked(skip.get())
+                            .on_click({
+                                let skip = Rc::clone(&skip);
+                                move |checked, _, cx| {
+                                    skip.set(*checked);
+                                    cx.refresh_windows();
+                                }
+                            }),
+                    ),
+            )
             .button_props(
                 DialogButtonProps::default()
                     .ok_text(rust_i18n::t!("workspace.purge_confirm_ok").to_string())
                     .ok_variant(ButtonVariant::Danger)
                     .show_cancel(true),
             )
-            .on_ok(move |_, _, cx| {
-                run(cx);
-                true
+            .on_ok({
+                let skip = Rc::clone(&skip);
+                move |_, _, cx| {
+                    if skip.get() {
+                        // Owned, not a borrow off `controller.read(cx)`: the
+                        // delete itself takes `&mut cx` two lines down.
+                        let dir = controller.read(cx).library.root().to_path_buf();
+                        let mut config = trove_core::config::LibraryConfig::load(&dir);
+                        config.skip_purge_confirm = Some(true);
+                        settings_write::note(config.save(&dir), "library config");
+                    }
+                    run(cx);
+                    true
+                }
             })
     });
 }
@@ -1373,19 +1435,22 @@ pub(crate) fn purge_gated(
         return;
     }
     let body = purge_warning(controller.read(cx), ids.len());
-    let controller = controller.clone();
-    confirm_destruction(window, cx, body, move |cx| {
-        controller.update(cx, |ctl, cx| {
-            if let Err(error) = ctl.library.purge_assets(&ids) {
-                ctl.notice = Some(
-                    rust_i18n::t!("workspace.purge_failed", error = error.to_string()).to_string(),
-                );
-            }
-            ctl.deselect(&ids);
-            ctl.selection_anchor = None;
-            ctl.generation += 1;
-            cx.notify();
-        });
+    confirm_destruction(controller, window, cx, body, {
+        let controller = controller.clone();
+        move |cx| {
+            controller.update(cx, |ctl, cx| {
+                if let Err(error) = ctl.library.purge_assets(&ids) {
+                    ctl.notice = Some(
+                        rust_i18n::t!("workspace.purge_failed", error = error.to_string())
+                            .to_string(),
+                    );
+                }
+                ctl.deselect(&ids);
+                ctl.selection_anchor = None;
+                ctl.generation += 1;
+                cx.notify();
+            });
+        }
     });
 }
 
@@ -1419,7 +1484,7 @@ pub(crate) fn trash_or_purge_gated(
         return;
     }
     let body = purge_warning(controller.read(cx), count);
-    confirm_destruction(window, cx, body, run);
+    confirm_destruction(controller, window, cx, body, run);
 }
 
 #[cfg(test)]

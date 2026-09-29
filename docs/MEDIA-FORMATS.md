@@ -28,7 +28,7 @@
 | PNG | image crate | ✅ | ✅ | 含透明度 |
 | JPEG | image crate | ✅ | ✅ | 标准解码 |
 | WebP | image crate | ✅ | ✅ | 含动画 |
-| AVIF | image crate | ✅ | ✅ | 需系统解码器 |
+| AVIF | image crate（经 `heif-dec` 转换） | ✅ | ✅ | 见 `probe.rs:345 heif_to_image`，与 HEIC/HEIF 共用同一管线 |
 | TIFF | image crate | ✅ | ✅ | 多页支持 |
 | BMP | image crate | ✅ | ✅ | 标准解码 |
 | ICO | image crate | ✅ | ✅ | Windows 图标 |
@@ -278,19 +278,22 @@ lofty 认 `.ogg` 但**不认 `.oga` 这个扩展名**（同一份字节改名就
 
 ### 支持的格式
 
-| 格式 | 播放 | 帧控制 | 缩略图 |
+| 格式 | 播放 | 播放控制 | 缩略图 |
 |------|------|--------|--------|
-| GIF | ✅ | ✅ | 静态首帧 |
-| 动态 WebP | ✅ | ✅ | 静态首帧 |
-| APNG | ✅ | ✅ | 静态首帧 |
+| GIF | ✅ | 暂停/倍速 | 静态首帧 |
+| 动态 WebP | ✅ | 暂停/倍速 | 静态首帧 |
+| APNG | ✅ | 暂停/倍速 | 静态首帧 |
 
 ### 动图功能
 
 | 功能 | 说明 |
 |------|------|
-| 逐帧播放 | 预览和检查器中播放 |
-| 帧控制 | 暂停/逐帧/速度 |
+| 播放 | 预览和检查器中按帧延时循环播放（`preview/anim.rs`，自有时钟驱动） |
+| 播放控制 | 暂停/播放、9 档倍速（0.25×–4×，与视频共用 `transport.rs`） |
+| 传输带 | 浮动控制条（`preview/chrome.rs`），自动隐藏 |
 | 静态缩略图 | 网格中保持静态 |
+
+> **未做**：逐帧步进（frame-by-frame stepping）与可拖定位的时间线 scrub。`media/anim.rs` 的 `FrameTimes::frame_at` / `ms_at` 已就绪，等传输带那一半接上。
 
 ---
 

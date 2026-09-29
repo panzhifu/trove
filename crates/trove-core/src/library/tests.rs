@@ -1749,3 +1749,216 @@ fn sequences_can_be_grouped_and_ungrouped_through_the_facade() {
 
     std::fs::remove_dir_all(&root).ok();
 }
+
+/// A library an earlier build left dirty must not open with the task panel
+/// claiming interrupted work that never existed.
+///
+/// `record_start` refuses a resident service's kind now, but the rows already on
+/// disk are the point: each one was left `running` by a quit that could not write
+/// its terminal row, so they surface on *every* open until something folds them
+/// away. That something runs inside `open`, before the read — which is what this
+/// test can fail on that the unit tests cannot: retire after the read and the
+/// stale row still reaches the panel.
+#[test]
+fn a_stale_service_row_is_retired_before_the_interrupted_read() {
+    let root = std::env::temp_dir().join(format!("trove-lib-retire-{}", Uuid::new_v4()));
+    let cache = root.join("cache");
+    let interrupted_kinds = |lib: &Library| -> Vec<String> {
+        lib.interrupted_tasks()
+            .iter()
+            .map(|entry| entry.kind.name().to_string())
+            .collect()
+    };
+
+    let lib = Library::open(&root, &cache).unwrap();
+    lib.store()
+        .conn()
+        .execute(
+            "INSERT INTO task_journal (task_id, kind, label, status, started_at) \
+             VALUES (?1, 'watch-scan', 'watch', 'running', 'then')",
+            [Uuid::new_v4().to_string()],
+        )
+        .unwrap();
+    drop(lib);
+
+    let lib = Library::open(&root, &cache).unwrap();
+    let stale = interrupted_kinds(&lib);
+    assert!(
+        stale.is_empty(),
+        "the resident service's leftover row read as interrupted work: {stale:?}"
+    );
+
+    // The half that stops this passing by switching the report off: a job of an
+    // ordinary kind, unfinished because the process really did die mid-work,
+    // must still be surfaced.
+    lib.store()
+        .conn()
+        .execute(
+            "INSERT INTO task_journal (task_id, kind, label, status, started_at) \
+             VALUES (?1, 'import', 'import 320 of 1200', 'running', 'then')",
+            [Uuid::new_v4().to_string()],
+        )
+        .unwrap();
+    drop(lib);
+
+    let lib = Library::open(&root, &cache).unwrap();
+    assert_eq!(
+        interrupted_kinds(&lib),
+        vec!["import".to_string()],
+        "a genuinely interrupted job is still reported"
+    );
+
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// A restore is a rescue, so the assertions are all about what comes back and
+/// what is kept: the snapshot's records, the overwritten state written as a
+/// snapshot of its own, and — because a snapshot carries only the database —
+/// files never touched. The reopened library has to re-index too: its text index
+/// was built over the rows the restore replaced.
+#[test]
+fn restoring_a_snapshot_puts_the_library_back_and_leaves_a_way_back() {
+    let (lib, root) = temp_library("restore-snapshot");
+    let cache = root.join("cache");
+    let inbox = root.join("incoming");
+    std::fs::create_dir_all(&inbox).unwrap();
+    let counted = |lib: &Library, where_: &str| -> i64 {
+        lib.store()
+            .conn()
+            .query_row(
+                &format!("SELECT COUNT(*) FROM assets {where_}"),
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+    };
+    let live = |lib: &Library| counted(lib, "WHERE trashed_at IS NULL");
+
+    let photo = write_source(&inbox, "kept.png", PNG_1X1);
+    let id = import_linked(&lib, &root, &photo);
+    assert_eq!(live(&lib), 1, "one live asset when the snapshot is taken");
+    let snapshot = lib.create_backup().unwrap();
+
+    // The change the snapshot cannot know about: the asset went to the trash.
+    lib.trash_assets(&[id]).unwrap();
+    assert_eq!(live(&lib), 0, "and it is not live any more");
+
+    let before = lib.restore_backup(&snapshot).unwrap();
+    assert!(
+        before.is_file() && before != snapshot,
+        "the state the restore replaced is kept as a snapshot of its own"
+    );
+    drop(lib);
+
+    let reopened = Library::open(&root, &cache).unwrap();
+    assert_eq!(
+        live(&reopened),
+        1,
+        "the trashed state went away with the overwritten database"
+    );
+    assert!(
+        photo.is_file(),
+        "a restore never touches files, so the record and its file are back together"
+    );
+    assert_eq!(
+        reopened.rebuild_text_index().unwrap(),
+        1,
+        "a rebuilt index describes the restored rows, not the overwritten ones"
+    );
+
+    // And the way back exists: that first-after-the-fact snapshot still holds the
+    // trashed row, so a restore that turned out to be the wrong choice is itself
+    // restorable.
+    let prior =
+        rusqlite::Connection::open_with_flags(&before, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .unwrap();
+    assert_eq!(
+        prior
+            .query_row(
+                "SELECT COUNT(*) FROM assets WHERE trashed_at IS NOT NULL",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+        1,
+        "the pre-restore snapshot kept the state it replaced"
+    );
+
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// The reason the history is a table: a mutation made in one session is taken
+/// back in the next one.
+#[test]
+fn an_undo_step_survives_reopening_the_library() {
+    let (lib, root) = temp_library("undo-reopen");
+    let cache = root.join("cache");
+    let inbox = root.join("incoming");
+    std::fs::create_dir_all(&inbox).unwrap();
+    let photo = write_source(&inbox, "photo.png", PNG_1X1);
+    let id = import_linked(&lib, &root, &photo);
+
+    lib.set_assets_favorite(&[id], true).unwrap();
+    assert_eq!(lib.undo_len(), 1, "one step, in this session");
+    drop(lib);
+
+    let lib = Library::open(&root, &cache).unwrap();
+    assert_eq!(
+        lib.undo_len(),
+        1,
+        "a fresh session reads the same history out of the database"
+    );
+    assert!(lib.undo().unwrap());
+    assert_eq!(lib.undo_len(), 0);
+    assert!(
+        !assets::get(lib.store().conn(), id)
+            .unwrap()
+            .unwrap()
+            .is_favorite,
+        "and it took the favorite flag back with it"
+    );
+    // Redo *is* available here — this session is the one that did the undo.
+    assert_eq!(lib.redo_len(), 1);
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// A mutation whose undo row cannot be written does not happen at all.
+///
+/// This is the reason the record call runs inside the mutation's transaction
+/// rather than after it. The alternative is not "undo is missing later" but a
+/// change that landed, cannot be taken back, and never said so — the same shape
+/// of silence this repo spent a whole round removing from journal and settings
+/// writes. The trigger stands in for any reason the insert can fail: a full
+/// disk, a bad page, a row the schema refuses.
+#[test]
+fn a_mutation_whose_undo_row_cannot_be_written_leaves_no_change() {
+    let (lib, root) = temp_library("undo-atomic");
+    let inbox = root.join("incoming");
+    std::fs::create_dir_all(&inbox).unwrap();
+    let photo = write_source(&inbox, "photo.png", PNG_1X1);
+    let id = import_linked(&lib, &root, &photo);
+
+    lib.store()
+        .conn()
+        .execute_batch(
+            "CREATE TRIGGER undo_log_refuses BEFORE INSERT ON undo_log
+             BEGIN SELECT RAISE(ABORT, 'the undo row is refused'); END;",
+        )
+        .unwrap();
+
+    let error = lib.set_assets_favorite(&[id], true).unwrap_err();
+    assert!(
+        error.to_string().contains("undo row is refused"),
+        "the refusal should reach the caller: {error}"
+    );
+    assert_eq!(lib.undo_len(), 0, "and nothing was recorded");
+    assert!(
+        !assets::get(lib.store().conn(), id)
+            .unwrap()
+            .unwrap()
+            .is_favorite,
+        "the favorite flag is exactly where it was"
+    );
+
+    std::fs::remove_dir_all(&root).ok();
+}

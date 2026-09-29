@@ -2,16 +2,32 @@
 //!
 //! Every recorded entry pairs an [`Op`] (enough before/after state to be
 //! applied and inverted without recreating history) with an [`OpDesc`], a
-//! human-facing description snapshot for the status bar. The stack lives
-//! inside [`crate::library::Library`] (a `RefCell`, so the facade keeps its
-//! `&self` signature) and is bounded — the oldest entries are evicted once
-//! `cap` is reached. It is deliberately not persisted: destructive
-//! operations that cannot be inverted — purge, empty trash, imports,
-//! deleting a tag or collection — are never recorded.
+//! human-facing description snapshot for the status bar.
+//!
+//! **The history is a table — `undo_log`, in the library's own database** — not
+//! a stack in RAM. One row per applied mutation, ordered by `seq`, with
+//! `undone_at` marking the rows that have since been undone. That single column
+//! replaces what used to be two `Vec`s: the newest applied row is the next undo,
+//! the newest undone row is the next redo. So a mutation recorded before a
+//! restart is still undoable after it, which is the point of the table.
+//!
+//! What does *not* cross a restart is the redo branch: [`UndoHistory::open_session`]
+//! drops the undone rows when a library is opened. Undoing something you decided
+//! against is a decision you can make again; silently re-applying a change you
+//! already backed out of, in a session that has no memory of why, is not
+//! something to hand back without asking.
+//!
+//! Destructive operations that cannot be inverted — purge, empty trash, imports,
+//! deleting a tag or collection — are never recorded, and neither is any
+//! operation whose undo would need a *file*: the twelve [`Op`] variants are all
+//! database state.
+//!
+//! Rows are dropped rather than guessed at. A row written by a newer build (an
+//! unknown `action` slug) or one whose payload no longer parses is deleted at
+//! open with a `tracing::warn!` naming its `seq` — the alternative is an undo
+//! that half-applies, or a library that fails to open because of its own history.
 
-use std::cell::RefCell;
-
-use rusqlite::Connection;
+use rusqlite::{Connection, params};
 use uuid::Uuid;
 
 use crate::error::Result;
@@ -68,6 +84,52 @@ impl OpAction {
             OpAction::RemovedFromCollection => "history.action.removed_from_collection",
         }
     }
+
+    /// The stable identifier written to `undo_log.action`.
+    ///
+    /// Separate from [`OpAction::key`] on purpose: that one is a translation
+    /// lookup key and renames with the UI, while this one is on disk in rows a
+    /// future build has to read. [`OpAction::from_slug`] is the only way back,
+    /// and a slug it does not recognise is a row this build cannot describe —
+    /// which is dropped at open rather than guessed at.
+    pub fn slug(self) -> &'static str {
+        match self {
+            OpAction::Edit => "edit",
+            OpAction::Trash => "trash",
+            OpAction::Restore => "restore",
+            OpAction::Favorite => "favorite",
+            OpAction::Unfavorite => "unfavorite",
+            OpAction::Rename => "rename",
+            OpAction::TagSet => "tag_set",
+            OpAction::TagRenamed => "tag_renamed",
+            OpAction::TagColored => "tag_colored",
+            OpAction::TagMoved => "tag_moved",
+            OpAction::CollectionRenamed => "collection_renamed",
+            OpAction::CollectionMoved => "collection_moved",
+            OpAction::AddedToCollection => "added_to_collection",
+            OpAction::RemovedFromCollection => "removed_from_collection",
+        }
+    }
+
+    pub fn from_slug(slug: &str) -> Option<Self> {
+        match slug {
+            "edit" => Some(OpAction::Edit),
+            "trash" => Some(OpAction::Trash),
+            "restore" => Some(OpAction::Restore),
+            "favorite" => Some(OpAction::Favorite),
+            "unfavorite" => Some(OpAction::Unfavorite),
+            "rename" => Some(OpAction::Rename),
+            "tag_set" => Some(OpAction::TagSet),
+            "tag_renamed" => Some(OpAction::TagRenamed),
+            "tag_colored" => Some(OpAction::TagColored),
+            "tag_moved" => Some(OpAction::TagMoved),
+            "collection_renamed" => Some(OpAction::CollectionRenamed),
+            "collection_moved" => Some(OpAction::CollectionMoved),
+            "added_to_collection" => Some(OpAction::AddedToCollection),
+            "removed_from_collection" => Some(OpAction::RemovedFromCollection),
+            _ => None,
+        }
+    }
 }
 
 /// Human-facing description of one recorded mutation, snapshotted at record
@@ -107,7 +169,7 @@ impl OpDesc {
 /// assets on the way in and a different set on the way back. Two parallel
 /// `Vec<(Uuid, T)>` allow exactly that: append to one, forget the other, and
 /// undo rewrites a row the forward half never touched — without an error.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Flip<T> {
     pub id: Uuid,
     pub before: T,
@@ -131,7 +193,12 @@ impl<T: Clone> Flip<T> {
 // ---------------------------------------------------------------------------
 
 /// One invertible metadata mutation.
-#[derive(Debug, Clone)]
+///
+/// Serialized into `undo_log.op` as JSON, so every payload type it names
+/// ([`AssetPatch`] and what that holds) is `Serialize`/`Deserialize` too. Field
+/// *names* are now on disk: renaming one leaves the old rows unparsable, and the
+/// open-time rule for those is drop, not guess.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum Op {
     /// Restore every editable column of one asset from the inverse patch
     /// (both patches are fully populated, so undo and redo are symmetric).
@@ -337,158 +404,270 @@ impl Op {
 // Stack
 // ---------------------------------------------------------------------------
 
-/// One history entry: the invertible operation plus its description.
-#[derive(Debug, Clone)]
-pub(crate) struct Recorded {
-    op: Op,
-    desc: OpDesc,
-}
+// ---------------------------------------------------------------------------
+// History
+// ---------------------------------------------------------------------------
 
-/// Two-stack undo/redo history. `redo` is cleared whenever a new op is
-/// recorded (standard linear-history semantics); the oldest entries are
-/// evicted once `cap` is reached.
-#[derive(Debug, Clone)]
-pub struct UndoStack {
-    undo: Vec<Recorded>,
-    redo: Vec<Recorded>,
+/// The library's mutation history, kept in its own `undo_log` table.
+///
+/// Stateless apart from the cap: every method reads and writes through the
+/// connection it is handed, which is also what lets [`UndoHistory::record`] run
+/// inside the mutation's transaction. Holding no state is the reason the history
+/// survives a restart — there is nothing in memory to lose.
+#[derive(Debug, Clone, Copy)]
+pub struct UndoHistory {
     cap: usize,
 }
 
-impl Default for UndoStack {
+impl Default for UndoHistory {
     fn default() -> Self {
         Self::with_cap(DEFAULT_UNDO_CAP)
     }
 }
 
-impl UndoStack {
+/// One row of `undo_log`, read back for undo and redo.
+struct Entry {
+    seq: i64,
+    op: Op,
+}
+
+impl UndoHistory {
     pub fn with_cap(cap: usize) -> Self {
-        Self {
-            undo: Vec::new(),
-            redo: Vec::new(),
-            cap: cap.max(1),
-        }
+        Self { cap: cap.max(1) }
     }
 
-    pub fn record(&mut self, op: Op, desc: OpDesc) {
-        if self.cap <= self.undo.len() {
-            self.undo.remove(0);
-        }
-        self.undo.push(Recorded { op, desc });
-        self.redo.clear();
-    }
-
-    /// Undo the most recent op. Returns `false` when the history is empty.
+    /// Record one mutation as the newest step of history.
     ///
-    /// The inverse applies inside its own transaction: if any step of it
-    /// fails, the database rolls back and the entry stays on the undo stack
-    /// where it can be retried — popping first (the old order) would have
-    /// dropped a half-applied op into neither stack, breaking the chain.
-    pub fn undo(&mut self, conn: &Connection) -> Result<bool> {
-        let Some(entry) = self.undo.last() else {
+    /// **Run this on the transaction that made the mutation**, not after it
+    /// committed: a change whose undo row did not land is a change that can
+    /// never be taken back, and nothing on screen would say so. The library's
+    /// mutation methods therefore open the transaction, apply, and record.
+    ///
+    /// Recording discards the undone rows first — the linear history the two
+    /// stacks used to keep by clearing `redo`, now expressed as one `DELETE`.
+    pub fn record(&self, conn: &Connection, op: Op, desc: &OpDesc) -> Result<()> {
+        conn.execute("DELETE FROM undo_log WHERE undone_at IS NOT NULL", [])?;
+        conn.execute(
+            "INSERT INTO undo_log (action, target, count, op, created_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                desc.action.slug(),
+                desc.target,
+                desc.count as i64,
+                serde_json::to_string(&op)?,
+                chrono::Utc::now().to_rfc3339(),
+            ],
+        )?;
+        self.prune(conn)
+    }
+
+    /// Apply the most recent step that is currently in effect, and mark it
+    /// undone. Returns `false` when nothing is left to undo.
+    ///
+    /// The inverse and the `undone_at` stamp share one transaction: an inverse
+    /// that fails halfway must leave the row in place so the user can retry it,
+    /// and an inverse that succeeds must not be undoable twice.
+    pub fn undo(&self, conn: &Connection) -> Result<bool> {
+        let Some(entry) = self.newest(conn, true)? else {
             return Ok(false);
         };
         let inverse = entry.op.inverse();
-        apply_atomic(conn, |tx| inverse.apply(tx))?;
-        let entry = self.undo.pop().expect("peeked above");
-        self.redo.push(entry);
+        apply_atomic(conn, |tx| {
+            inverse.apply(tx)?;
+            tx.execute(
+                "UPDATE undo_log SET undone_at = ?2 WHERE seq = ?1",
+                params![entry.seq, chrono::Utc::now().to_rfc3339()],
+            )?;
+            Ok(())
+        })?;
         Ok(true)
     }
 
-    /// Redo the most recently undone op. Returns `false` when empty. Atomic
-    /// for the same reason as [`UndoStack::undo`].
-    pub fn redo(&mut self, conn: &Connection) -> Result<bool> {
-        let Some(entry) = self.redo.last() else {
+    /// Re-apply the most recently undone step. Returns `false` when there is
+    /// none — which, since [`Self::open_session`] clears undone rows, means
+    /// nothing has been undone *in this session*.
+    pub fn redo(&self, conn: &Connection) -> Result<bool> {
+        let Some(entry) = self.newest(conn, false)? else {
             return Ok(false);
         };
         let forward = entry.op.clone();
-        apply_atomic(conn, |tx| forward.apply(tx))?;
-        let entry = self.redo.pop().expect("peeked above");
-        self.undo.push(entry);
+        apply_atomic(conn, |tx| {
+            forward.apply(tx)?;
+            tx.execute(
+                "UPDATE undo_log SET undone_at = NULL WHERE seq = ?1",
+                params![entry.seq],
+            )?;
+            Ok(())
+        })?;
         Ok(true)
     }
 
-    /// Undo up to `steps` entries in sequence, stopping early when the
-    /// history runs out or an application fails (already-applied steps stay
-    /// applied). Returns how many steps were undone.
-    pub fn undo_steps(&mut self, steps: usize, conn: &Connection) -> Result<usize> {
+    /// Undo up to `steps` entries in sequence, stopping early when the history
+    /// runs out or a step fails (the ones already applied stay applied). Returns
+    /// how many were undone.
+    pub fn undo_steps(&self, steps: usize, conn: &Connection) -> Result<usize> {
         let mut done = 0;
-        for _ in 0..steps {
-            if !self.undo(conn)? {
-                break;
-            }
+        while done < steps && self.undo(conn)? {
             done += 1;
         }
         Ok(done)
     }
 
-    pub fn undo_len(&self) -> usize {
-        self.undo.len()
+    /// Prepare the history for a new session: drop the rows a previous session
+    /// left undone, and drop the rows this build cannot read.
+    ///
+    /// Called once at library open. Both deletions are the same shape of
+    /// decision — a row that cannot be *described* cannot be offered, and a row
+    /// that is already inverted belongs to a decision the user has taken back —
+    /// but only the second one is a loss, so it is the one that is logged.
+    pub fn open_session(&self, conn: &Connection) -> Result<()> {
+        let dropped = conn.execute("DELETE FROM undo_log WHERE undone_at IS NOT NULL", [])?;
+        if dropped > 0 {
+            tracing::debug!(
+                dropped,
+                "undo history: steps undone before this session were not carried over"
+            );
+        }
+        self.readable_rows(conn)?;
+        Ok(())
     }
 
-    pub fn redo_len(&self) -> usize {
-        self.redo.len()
+    /// Steps available to undo, and the newest `n` of their descriptions.
+    pub fn undo_len(&self, conn: &Connection) -> usize {
+        self.count(conn, true).unwrap_or(0)
     }
 
-    /// Descriptions of the last `n` undoable entries, most recent first.
-    pub fn undo_entries(&self, n: usize) -> Vec<OpDesc> {
-        self.undo
-            .iter()
-            .rev()
-            .take(n)
-            .map(|e| e.desc.clone())
-            .collect()
+    /// Steps available to redo — undone this session, see [`Self::redo`].
+    pub fn redo_len(&self, conn: &Connection) -> usize {
+        self.count(conn, false).unwrap_or(0)
     }
 
-    /// Descriptions of the last `n` redoable entries, next-first.
-    pub fn redo_entries(&self, n: usize) -> Vec<OpDesc> {
-        self.redo
-            .iter()
-            .rev()
-            .take(n)
-            .map(|e| e.desc.clone())
-            .collect()
-    }
-}
-
-/// Shared history cell embedded in `Library`.
-#[derive(Debug, Clone)]
-pub(crate) struct SharedUndoStack(RefCell<UndoStack>);
-
-impl SharedUndoStack {
-    pub fn with_cap(cap: usize) -> Self {
-        Self(RefCell::new(UndoStack::with_cap(cap)))
+    pub fn undo_entries(&self, conn: &Connection, n: usize) -> Vec<OpDesc> {
+        self.descriptions(conn, n, true).unwrap_or_default()
     }
 
-    pub fn record(&self, op: Op, desc: OpDesc) {
-        self.0.borrow_mut().record(op, desc);
+    pub fn redo_entries(&self, conn: &Connection, n: usize) -> Vec<OpDesc> {
+        self.descriptions(conn, n, false).unwrap_or_default()
     }
 
-    pub fn undo(&self, conn: &Connection) -> Result<bool> {
-        self.0.borrow_mut().undo(conn)
+    /// The next row to act on, decoded.
+    ///
+    /// The two sides read in opposite orders, and that is the whole difference
+    /// between a history and a stack of leftovers. Undo takes the **newest** row
+    /// still in effect; redo takes the **oldest** undone one, because undo walked
+    /// backwards through `seq` and redo has to walk the same steps forwards —
+    /// newest-first there would re-apply the last undo before the one before it
+    /// and leave the database in a state that never existed.
+    fn newest(&self, conn: &Connection, applied: bool) -> Result<Option<Entry>> {
+        let (side, order) = if applied {
+            ("IS NULL", "DESC")
+        } else {
+            ("IS NOT NULL", "ASC")
+        };
+        let mut stmt = conn.prepare(&format!(
+            "SELECT seq, op FROM undo_log WHERE undone_at {side} ORDER BY seq {order} LIMIT 1"
+        ))?;
+        let found: Option<(i64, String)> = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .next()
+            .and_then(|r| r.ok());
+        let Some((seq, blob)) = found else {
+            return Ok(None);
+        };
+        match serde_json::from_str::<Op>(&blob) {
+            Ok(op) => Ok(Some(Entry { seq, op })),
+            Err(error) => {
+                // `open_session` clears unreadable rows, so reaching here means
+                // the table changed underneath this session. Leaving the row is
+                // the honest answer: deleting it would take undo history away
+                // from a user who is watching the panel.
+                Err(crate::Error::Validation(format!(
+                    "undo step {seq} does not parse: {error}"
+                )))
+            }
+        }
     }
 
-    pub fn redo(&self, conn: &Connection) -> Result<bool> {
-        self.0.borrow_mut().redo(conn)
+    fn count(&self, conn: &Connection, applied: bool) -> Result<usize> {
+        let side = if applied { "IS NULL" } else { "IS NOT NULL" };
+        let n: i64 = conn.query_row(
+            &format!("SELECT COUNT(*) FROM undo_log WHERE undone_at {side}"),
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(n as usize)
     }
 
-    pub fn undo_len(&self) -> usize {
-        self.0.borrow().undo_len()
+    fn descriptions(&self, conn: &Connection, n: usize, applied: bool) -> Result<Vec<OpDesc>> {
+        // Undo entries are newest-first (what happened most recently is the line
+        // at the top); redo entries are next-first, so the list reads in the
+        // order the keys will replay them — see [`UndoHistory::newest`].
+        let (side, order) = if applied {
+            ("IS NULL", "DESC")
+        } else {
+            ("IS NOT NULL", "ASC")
+        };
+        let mut stmt = conn.prepare(&format!(
+            "SELECT action, target, count FROM undo_log WHERE undone_at {side} \
+             ORDER BY seq {order} LIMIT ?1"
+        ))?;
+        let rows = stmt.query_map([n as i64], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })?;
+        // Newest first, which is the order the status bar lists them in.
+        let mut out = Vec::new();
+        for row in rows {
+            let (slug, target, count) = row?;
+            // Unreachable after `open_session` cleaned house, and the query has
+            // to return *something* for the row: describe it by its count under
+            // the most generic verb rather than dropping it silently, so the
+            // number in the header still matches the list.
+            let action = OpAction::from_slug(&slug).unwrap_or(OpAction::Edit);
+            out.push(OpDesc::new(action, target, count as usize));
+        }
+        Ok(out)
     }
 
-    pub fn redo_len(&self) -> usize {
-        self.0.borrow().redo_len()
+    /// Delete everything unreadable, then keep only the newest `cap` rows.
+    fn readable_rows(&self, conn: &Connection) -> Result<()> {
+        let mut stmt = conn.prepare("SELECT seq, action, op FROM undo_log ORDER BY seq ASC")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        let mut dead: Vec<i64> = Vec::new();
+        for row in rows {
+            let (seq, slug, blob) = row?;
+            let parses = serde_json::from_str::<Op>(&blob).is_ok();
+            if !parses || OpAction::from_slug(&slug).is_none() {
+                dead.push(seq);
+            }
+        }
+        drop(stmt);
+        for seq in &dead {
+            tracing::warn!(
+                seq,
+                "undo history: dropping a step this build cannot read (a newer library, or a changed Op shape)"
+            );
+            conn.execute("DELETE FROM undo_log WHERE seq = ?1", params![seq])?;
+        }
+        Ok(())
     }
 
-    pub fn undo_steps(&self, steps: usize, conn: &Connection) -> Result<usize> {
-        self.0.borrow_mut().undo_steps(steps, conn)
-    }
-
-    pub fn undo_entries(&self, n: usize) -> Vec<OpDesc> {
-        self.0.borrow().undo_entries(n)
-    }
-
-    pub fn redo_entries(&self, n: usize) -> Vec<OpDesc> {
-        self.0.borrow().redo_entries(n)
+    fn prune(&self, conn: &Connection) -> Result<()> {
+        conn.execute(
+            "DELETE FROM undo_log WHERE seq NOT IN \
+             (SELECT seq FROM undo_log ORDER BY seq DESC LIMIT ?1)",
+            params![self.cap as i64],
+        )?;
+        Ok(())
     }
 }
 
@@ -511,18 +690,31 @@ pub(crate) fn restore_patch(asset: &crate::model::Asset) -> AssetPatch {
 /// Apply one database step atomically: the closure runs inside a
 /// transaction that commits on success and rolls back on error, so a
 /// half-applied op can never leak into the store.
-fn apply_atomic(conn: &Connection, step: impl FnOnce(&Connection) -> Result<()>) -> Result<()> {
-    // `unchecked_transaction`: the store hands out shared connections behind
-    // a RefCell, so the checked `&mut`-based API is not reachable here. There
-    // is no outer transaction on these paths to conflict with.
+/// Run one database step inside a transaction of its own: commit on success,
+/// roll back on error, and hand the caller's value out on the success path only.
+///
+/// The generic is what lets a mutation method return what the store reported
+/// (`changed`, a count) while the undo row rides in the same transaction — the
+/// pair is the contract, and a step that returns before its row does would make
+/// an un-recorded mutation look exactly like a recorded one.
+pub(crate) fn apply_atomic<T>(
+    conn: &Connection,
+    step: impl FnOnce(&Connection) -> Result<T>,
+) -> Result<T> {
+    // `unchecked_transaction`: the store hands out a shared `&Connection`, so
+    // the checked `&mut`-based API is not reachable here. There is no outer
+    // transaction on these paths to conflict with — the mutation methods that
+    // wrap themselves in this helper do their recording inside the closure.
     let tx = conn.unchecked_transaction()?;
-    match step(&tx) {
-        Ok(()) => tx.commit().map_err(crate::error::Error::from),
+    let value = match step(&tx) {
+        Ok(value) => value,
         Err(error) => {
             let _ = tx.rollback();
-            Err(error)
+            return Err(error);
         }
-    }
+    };
+    tx.commit().map_err(crate::error::Error::from)?;
+    Ok(value)
 }
 
 #[cfg(test)]
@@ -574,7 +766,7 @@ mod tests {
     fn a_failing_undo_stays_on_the_stack_unchanged() {
         let store = Store::in_memory().unwrap();
         let conn = store.conn();
-        let mut stack = UndoStack::default();
+        let stack = UndoHistory::default();
 
         let tag = NewTag {
             name: "a".into(),
@@ -584,14 +776,17 @@ mod tests {
         let created = tags::create(conn, &tag).unwrap().id;
         // Forward, recorded the way the library records it: a → x.
         tags::rename(conn, created, "x").unwrap();
-        stack.record(
-            Op::TagRename {
-                id: created,
-                before: "a".into(),
-                after: "x".into(),
-            },
-            OpDesc::new(OpAction::TagRenamed, Some("a".into()), 1),
-        );
+        stack
+            .record(
+                conn,
+                Op::TagRename {
+                    id: created,
+                    before: "a".into(),
+                    after: "x".into(),
+                },
+                &OpDesc::new(OpAction::TagRenamed, Some("a".into()), 1),
+            )
+            .unwrap();
         // Then someone else takes the name "a" again.
         tags::create(
             conn,
@@ -604,8 +799,8 @@ mod tests {
         .unwrap();
 
         assert!(stack.undo(conn).is_err(), "the rename back must conflict");
-        assert_eq!(stack.undo_len(), 1, "the entry is retriable, not lost");
-        assert_eq!(stack.redo_len(), 0);
+        assert_eq!(stack.undo_len(conn), 1, "the entry is retriable, not lost");
+        assert_eq!(stack.redo_len(conn), 0);
         // And the store shows no half of it: the tag is still "x".
         let tags = tags::list(conn).unwrap();
         assert_eq!(tags.iter().filter(|t| t.name == "x").count(), 1);
@@ -615,7 +810,7 @@ mod tests {
     fn undo_redo_roundtrips_patch_favorite_and_tags() {
         let store = Store::in_memory().unwrap();
         let conn = store.conn();
-        let mut stack = UndoStack::default();
+        let stack = UndoHistory::default();
 
         let mut a = sample_asset("a.png", AssetKind::Image);
         assets::insert(conn, &a).unwrap();
@@ -626,17 +821,20 @@ mod tests {
             title: Some(Some("hello".into())),
             ..Default::default()
         };
-        stack.record(
-            Op::PatchAsset {
-                id: a.id,
-                before: Box::new(restore_patch(&a)),
-                after: Box::new(patch),
-            },
-            OpDesc::counted(OpAction::Edit, 1),
-        );
+        stack
+            .record(
+                conn,
+                Op::PatchAsset {
+                    id: a.id,
+                    before: Box::new(restore_patch(&a)),
+                    after: Box::new(patch),
+                },
+                &OpDesc::counted(OpAction::Edit, 1),
+            )
+            .unwrap();
         stack.undo(conn).unwrap();
         assert_eq!(assets::get(conn, a.id).unwrap().unwrap().title, None);
-        assert_eq!(stack.undo_len(), 0);
+        assert_eq!(stack.undo_len(conn), 0);
         stack.redo(conn).unwrap();
         assert_eq!(
             assets::get(conn, a.id).unwrap().unwrap().title,
@@ -644,16 +842,19 @@ mod tests {
         );
 
         // Forward: favorite flip.
-        stack.record(
-            Op::SetFavorite {
-                flips: vec![Flip {
-                    id: a.id,
-                    before: false,
-                    after: true,
-                }],
-            },
-            OpDesc::counted(OpAction::Favorite, 1),
-        );
+        stack
+            .record(
+                conn,
+                Op::SetFavorite {
+                    flips: vec![Flip {
+                        id: a.id,
+                        before: false,
+                        after: true,
+                    }],
+                },
+                &OpDesc::counted(OpAction::Favorite, 1),
+            )
+            .unwrap();
         stack.undo(conn).unwrap();
         assert!(!assets::get(conn, a.id).unwrap().unwrap().is_favorite);
         stack.redo(conn).unwrap();
@@ -684,30 +885,36 @@ mod tests {
             crate::model::TagId(t1.id),
         )
         .unwrap();
-        stack.record(
-            Op::SetTags {
-                asset: a.id,
-                before: vec![t1.id],
-                after: vec![t2.id],
-            },
-            OpDesc::counted(OpAction::TagSet, 1),
-        );
+        stack
+            .record(
+                conn,
+                Op::SetTags {
+                    asset: a.id,
+                    before: vec![t1.id],
+                    after: vec![t2.id],
+                },
+                &OpDesc::counted(OpAction::TagSet, 1),
+            )
+            .unwrap();
         stack.undo(conn).unwrap();
         assert_eq!(tags::for_asset(conn, a.id).unwrap()[0].id, t1.id);
         stack.redo(conn).unwrap();
         assert_eq!(tags::for_asset(conn, a.id).unwrap()[0].id, t2.id);
 
         // Recording clears the redo branch (linear history).
-        stack.record(
-            Op::SetTags {
-                asset: a.id,
-                before: vec![t2.id],
-                after: vec![],
-            },
-            OpDesc::counted(OpAction::TagSet, 1),
-        );
-        assert_eq!(stack.redo_len(), 0);
-        assert_eq!(stack.undo_len(), 4);
+        stack
+            .record(
+                conn,
+                Op::SetTags {
+                    asset: a.id,
+                    before: vec![t2.id],
+                    after: vec![],
+                },
+                &OpDesc::counted(OpAction::TagSet, 1),
+            )
+            .unwrap();
+        assert_eq!(stack.redo_len(conn), 0);
+        assert_eq!(stack.undo_len(conn), 4);
     }
 
     /// A batch flip pairs every asset with *its own* before value, so undoing a
@@ -725,7 +932,7 @@ mod tests {
 
         let store = Store::in_memory().unwrap();
         let conn = store.conn();
-        let mut stack = UndoStack::default();
+        let stack = UndoHistory::default();
 
         // Two of three are already in the trash; the batch empties it.
         let a = {
@@ -765,7 +972,9 @@ mod tests {
         // Forward is the caller's move, recorded here so the stack describes
         // what actually happened to the library.
         op.clone().apply(conn).unwrap();
-        stack.record(op, OpDesc::counted(OpAction::Restore, 3));
+        stack
+            .record(conn, op, &OpDesc::counted(OpAction::Restore, 3))
+            .unwrap();
         assert!(
             !is_trashed(conn, a.id) && !is_trashed(conn, b.id) && !is_trashed(conn, c.id),
             "the forward half empties the trash"
@@ -789,7 +998,7 @@ mod tests {
     fn undo_redo_collection_membership_and_move() {
         let store = Store::in_memory().unwrap();
         let conn = store.conn();
-        let mut stack = UndoStack::default();
+        let stack = UndoHistory::default();
 
         let a = sample_asset("a.png", AssetKind::Image);
         assets::insert(conn, &a).unwrap();
@@ -819,7 +1028,9 @@ mod tests {
             added: vec![a.id],
         };
         op.apply(conn).unwrap();
-        stack.record(op, OpDesc::counted(OpAction::Edit, 1));
+        stack
+            .record(conn, op, &OpDesc::counted(OpAction::Edit, 1))
+            .unwrap();
         assert_eq!(collections::asset_ids(conn, c1.id).unwrap(), vec![a.id]);
         stack.undo(conn).unwrap();
         assert!(collections::asset_ids(conn, c1.id).unwrap().is_empty());
@@ -833,7 +1044,9 @@ mod tests {
             after: (Some(c1.id), 0),
         };
         op.apply(conn).unwrap();
-        stack.record(op, OpDesc::counted(OpAction::Edit, 1));
+        stack
+            .record(conn, op, &OpDesc::counted(OpAction::Edit, 1))
+            .unwrap();
         assert_eq!(
             collections::get(conn, c2.id).unwrap().unwrap().parent_id,
             Some(c1.id)
@@ -898,32 +1111,178 @@ mod tests {
         let a = sample_asset("a.png", AssetKind::Image);
         assets::insert(conn, &a).unwrap();
 
-        let mut stack = UndoStack::with_cap(3);
+        let stack = UndoHistory::with_cap(3);
         for i in 0..5 {
-            stack.record(
-                Op::SetFavorite {
-                    flips: vec![Flip {
-                        id: a.id,
-                        before: i % 2 == 0,
-                        after: i % 2 == 1,
-                    }],
-                },
-                OpDesc::new(OpAction::Favorite, Some(format!("f{i}.png")), 1),
-            );
+            stack
+                .record(
+                    conn,
+                    Op::SetFavorite {
+                        flips: vec![Flip {
+                            id: a.id,
+                            before: i % 2 == 0,
+                            after: i % 2 == 1,
+                        }],
+                    },
+                    &OpDesc::new(OpAction::Favorite, Some(format!("f{i}.png")), 1),
+                )
+                .unwrap();
         }
         // Only the newest three survive the cap.
-        assert_eq!(stack.undo_len(), 3);
-        let entries = stack.undo_entries(3);
+        assert_eq!(stack.undo_len(conn), 3);
+        let entries = stack.undo_entries(conn, 3);
         assert_eq!(entries[0].target.as_deref(), Some("f4.png"));
         assert_eq!(entries[2].target.as_deref(), Some("f2.png"));
 
         // Undoing flips favorite twice and the redo side describes next-first.
         assert_eq!(stack.undo_steps(2, conn).unwrap(), 2);
-        assert_eq!(stack.redo_len(), 2);
-        assert_eq!(stack.redo_entries(2)[0].target.as_deref(), Some("f3.png"));
+        assert_eq!(stack.redo_len(conn), 2);
+        assert_eq!(
+            stack.redo_entries(conn, 2)[0].target.as_deref(),
+            Some("f3.png")
+        );
 
         // undo_steps stops at the empty stack instead of erroring.
         assert_eq!(stack.undo_steps(10, conn).unwrap(), 1);
-        assert_eq!(stack.undo_len(), 0);
+        assert_eq!(stack.undo_len(conn), 0);
+    }
+
+    /// A new step throws the undone ones away.
+    ///
+    /// This is the `redo.clear()` of the two-stack history, and it is still the
+    /// right rule now that the history is a table: branching history would let a
+    /// redo land *beside* a later change rather than before it, and the database
+    /// would end up in a state that never happened.
+    #[test]
+    fn a_new_step_discards_the_undone_ones() {
+        let store = Store::in_memory().unwrap();
+        let conn = store.conn();
+        let tag = tags::create(
+            conn,
+            &NewTag {
+                name: "keep".into(),
+                color: None,
+                parent_id: None,
+            },
+        )
+        .unwrap()
+        .id;
+        let stack = UndoHistory::default();
+        let rename = |before: &str, after: &str| Op::TagRename {
+            id: tag,
+            before: before.into(),
+            after: after.into(),
+        };
+        let desc = OpDesc::new(OpAction::TagRenamed, Some("keep".into()), 1);
+
+        stack.record(conn, rename("a", "b"), &desc).unwrap();
+        stack.record(conn, rename("b", "c"), &desc).unwrap();
+        assert!(stack.undo(conn).unwrap(), "the newest step is undoable");
+        assert_eq!(stack.redo_len(conn), 1);
+
+        // Recording past an undone step closes that branch.
+        stack.record(conn, rename("c", "d"), &desc).unwrap();
+        assert_eq!(stack.redo_len(conn), 0, "the redo side is gone");
+        assert_eq!(stack.undo_len(conn), 2);
+    }
+
+    /// What a restart carries over, and what it deliberately does not.
+    #[test]
+    fn a_restart_carries_undo_but_not_redo() {
+        let store = Store::in_memory().unwrap();
+        let conn = store.conn();
+        let tag = tags::create(
+            conn,
+            &NewTag {
+                name: "one".into(),
+                color: None,
+                parent_id: None,
+            },
+        )
+        .unwrap()
+        .id;
+        let stack = UndoHistory::default();
+        let desc = OpDesc::new(OpAction::TagRenamed, Some("one".into()), 1);
+        stack
+            .record(
+                conn,
+                Op::TagRename {
+                    id: tag,
+                    before: "one".into(),
+                    after: "two".into(),
+                },
+                &desc,
+            )
+            .unwrap();
+        tags::rename(conn, tag, "two").unwrap();
+        assert!(stack.undo(conn).unwrap());
+        assert_eq!(stack.redo_len(conn), 1, "undoable in this session");
+
+        // "Reopening" is a fresh history object over the same rows, then the
+        // open-time pass.
+        let stack = UndoHistory::default();
+        stack.open_session(conn).unwrap();
+        assert_eq!(stack.undo_len(conn), 0, "the applied side is empty again");
+        assert_eq!(
+            stack.redo_len(conn),
+            0,
+            "a step the previous session backed out of is not offered back"
+        );
+        // And the database says the same: the tag is back to its own name.
+        assert_eq!(tags::get(conn, tag).unwrap().unwrap().name, "one");
+    }
+
+    /// A row this build cannot read is dropped at open, loudly, and the rest of
+    /// the history survives.
+    ///
+    /// Two ways to get there and one rule for both: the `action` slug is not one
+    /// this build knows (a row written by a newer Trove), or `op` is not a `Op`
+    /// any more. Guessing either one means applying a mutation nobody described —
+    /// and the alternative, refusing to open, would make the history table able to
+    /// brick a library.
+    #[test]
+    fn an_unreadable_step_is_dropped_at_open_rather_than_guessed() {
+        let store = Store::in_memory().unwrap();
+        let conn = store.conn();
+        let tag = tags::create(
+            conn,
+            &NewTag {
+                name: "fine".into(),
+                color: None,
+                parent_id: None,
+            },
+        )
+        .unwrap()
+        .id;
+        let desc = OpDesc::new(OpAction::TagRenamed, Some("fine".into()), 1);
+        let good = Op::TagRename {
+            id: tag,
+            before: "fine".into(),
+            after: "better".into(),
+        };
+        UndoHistory::default().record(conn, good, &desc).unwrap();
+        for (action, op) in [
+            ("renamed_by_a_future_build", "{\"x\":1}"),
+            ("edit", "not even json"),
+        ] {
+            conn.execute(
+                "INSERT INTO undo_log (action, target, count, op, created_at) \
+                 VALUES (?1, NULL, 1, ?2, 'then')",
+                params![action, op],
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            crate::store::rows::query_count(conn, "SELECT COUNT(*) FROM undo_log", vec![]).unwrap(),
+            3
+        );
+
+        UndoHistory::default().open_session(conn).unwrap();
+        let left = UndoHistory::default();
+        assert_eq!(left.undo_len(conn), 1, "the readable step is still there");
+        assert_eq!(
+            left.undo_entries(conn, 5)[0].action,
+            OpAction::TagRenamed,
+            "and it is still described by its own action"
+        );
     }
 }

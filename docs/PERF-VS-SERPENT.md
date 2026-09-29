@@ -55,7 +55,7 @@ JSON 键逐一对齐。
 | GPU | Intel Iris Xe（核显，桌面合成走它）+ RTX 3050 Mobile |
 | 内核 / 桌面 | Arch，7.2.7-zen，niri（Wayland） |
 | 运行时 | rustc / cargo 1.98.0；Electron 43 自带 Node 24.18.0 |
-| Trove 构建 | `cargo build --release`（`strip = true`，`lto = "thin"`） |
+| Trove 构建 | `cargo build --release`（`strip = true`，`lto = true` + `codegen-units = 1`，即 fat LTO） |
 
 1. **每个数字是「1 次预热 + N 次计时」的中位数，min/max 一起给**（查询层 N=5，Serpent 侧重复
    3 轮）。这台机器的文件系统是 btrfs，`examples/import_bench.rs` 的模块注释早就写明单次测量
@@ -194,7 +194,7 @@ Serpent 的 152.1 → 626.0（×4.1），领先从 2.76× 缩到 1.57×。这一
 
 | | |
 |---|---|
-| Trove | `trove-app` 80.3 MiB 单一可执行文件（`strip`、thin LTO，运行时链接 15 个系统库，语言包由 `rust_i18n::i18n!` 编译期内嵌）+ `trove` CLI 34.1 MiB |
+| Trove | `trove-app` 80.3 MiB 单一可执行文件（`strip`、fat LTO（`lto = true` + `codegen-units = 1`），运行时链接 15 个系统库，语言包由 `rust_i18n::i18n!` 编译期内嵌）+ `trove` CLI 34.1 MiB |
 | Serpent | Electron 运行时 312 MiB + 构建产物 31.1 MiB（`.vite/build` 8.1 + `.vite/renderer` 23.0）+ 原生模块 ≈ 36.4 MiB（better-sqlite3 18、sharp-libvips 18、sharp 0.4）+ ufbx 1.7 + fonts 0.7 ≈ **383 MiB**，不含安装器与账号侧另取的 ffmpeg 二进制 |
 
 两边都是 `du` 的 MiB 口径。体积比 4.8×，注意 Serpent 那侧含整个 Chromium；它的 Windows

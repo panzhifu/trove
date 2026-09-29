@@ -128,6 +128,19 @@ impl TaskKind {
             TaskKind::Custom(name) => Cow::Borrowed(name),
         }
     }
+
+    /// A resident service rather than a job with an end.
+    ///
+    /// The folder watcher loops until it is cooperatively cancelled, so it only
+    /// ever stops by a library swap — quitting the process does not run its
+    /// wind-down. Recording its start would therefore leave a `running` row
+    /// behind on every launch, and the next process would report it as work cut
+    /// off mid-flight: the task panel's warning strip and a status bar that
+    /// never reads "idle" again. A service has no work to be cut off, so it is
+    /// not journalled.
+    pub fn is_resident(&self) -> bool {
+        matches!(self, TaskKind::WatchScan)
+    }
 }
 
 /// Lifecycle status of a registered job.

@@ -670,6 +670,70 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// v23 → v24 added the undo history. The step is pure DDL, so what is worth
+    /// testing is that a library written before it can still *use* one after it:
+    /// a history that cannot be recorded is a feature silently turned off.
+    #[test]
+    fn a_v23_library_gains_the_undo_log_and_keeps_its_rows() {
+        let dir = std::env::temp_dir().join(format!("trove-schema-v23-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("library.db");
+        let asset = sample_asset("kept.png", AssetKind::Image);
+
+        {
+            let store = Store::open(&path).unwrap();
+            assets::insert(store.conn(), &asset).unwrap();
+        }
+
+        // Rewind: v24 added exactly one table and one index.
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .execute_batch(
+                "DROP TABLE IF EXISTS undo_log;
+                 DROP INDEX IF EXISTS undo_log_side;
+                 PRAGMA user_version = 23;",
+            )
+            .unwrap();
+
+        let store = Store::open(&path).unwrap();
+        assert_eq!(
+            store.user_version().unwrap(),
+            schema::SCHEMA_VERSION,
+            "the step ran and the walk continued to the current shape"
+        );
+        let history = crate::history::undo::UndoHistory::default();
+        assert_eq!(
+            history.undo_len(store.conn()),
+            0,
+            "an empty history and an unusable one are different things"
+        );
+        history
+            .record(
+                store.conn(),
+                crate::history::undo::Op::TagRename {
+                    id: Uuid::new_v4(),
+                    before: "a".into(),
+                    after: "b".into(),
+                },
+                &crate::history::undo::OpDesc::new(
+                    crate::history::undo::OpAction::TagRenamed,
+                    Some("a".into()),
+                    1,
+                ),
+            )
+            .unwrap();
+        assert_eq!(
+            history.undo_len(store.conn()),
+            1,
+            "and it can be written to"
+        );
+        assert!(
+            assets::get(store.conn(), asset.id).unwrap().is_some(),
+            "the upgrade is additive: existing rows survive"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// v22 → v23 narrows a column that was already open, so it has two promises:
     /// the library it walks forward loses the value that cannot be a rating any
     /// more, and the guards it gains refuse that value from then on -- while every

@@ -2,9 +2,12 @@
 //! interrupted work after a restart and track retry history.
 //!
 //! The journal is written by the [`TaskManager`](crate::tasks::TaskManager) on
-//! every task lifecycle transition (start, complete, fail, retry). On library
-//! open, [`load_interrupted`] reads the tasks that were running or paused when
-//! the previous process died, and [`Library::interrupted_tasks`]
+//! every task lifecycle transition (start, complete, fail, retry) — except for
+//! a [`resident`](crate::tasks::TaskKind::is_resident) service, which is never
+//! recorded at all. On library open, [`retire_resident_runs`] first folds the
+//! rows an earlier build left behind for such a service, then
+//! [`load_interrupted`] reads the tasks that were running or paused when the
+//! previous process died, and [`Library::interrupted_tasks`]
 //! (crate::library::Library) hands them to the task panel.
 //!
 //! What that is *not* is a resume. A row records the kind, label and progress
@@ -36,6 +39,14 @@ pub struct JournalEntry {
 }
 
 /// Record a task start.
+///
+/// A [`TaskKind::is_resident`] service is not recorded, and the reason is the
+/// journal's own contract: a row means "this was running when a process ended,
+/// say so on the next open". A resident service never ends on its own — quitting
+/// the app does not run its wind-down — so recording it would answer that
+/// promise with a lie once per launch. Every later write for such a task is an
+/// `UPDATE ... WHERE task_id`, so skipping the insert leaves them all to match
+/// nothing rather than to resurrect the row.
 pub fn record_start(
     conn: &rusqlite::Connection,
     task_id: TaskId,
@@ -43,6 +54,9 @@ pub fn record_start(
     label: &str,
     max_retries: u8,
 ) -> Result<()> {
+    if kind.is_resident() {
+        return Ok(());
+    }
     conn.execute(
         "INSERT OR REPLACE INTO task_journal \
          (task_id, kind, label, status, done, total, retry_count, max_retries, started_at) \
@@ -128,6 +142,42 @@ pub fn load_interrupted(conn: &rusqlite::Connection) -> Result<Vec<JournalEntry>
         entries.push(row?);
     }
     Ok(entries)
+}
+
+/// Fold the unfinished rows a previous process left behind for a resident
+/// service, returning how many rows it took out of the interrupted set.
+///
+/// [`record_start`] refuses such rows now, but a library opened by an earlier
+/// build has them — one per launch, each reported as work cut off mid-flight.
+/// The kind is read back through [`str_to_kind`] and asked, rather than matched
+/// in SQL, so this follows [`TaskKind::is_resident`] instead of repeating its
+/// list: a second resident kind is retired the day it is added.
+pub fn retire_resident_runs(conn: &rusqlite::Connection) -> Result<usize> {
+    let mut stmt = conn
+        .prepare("SELECT DISTINCT kind FROM task_journal WHERE status IN ('running', 'paused')")?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+    let mut unfinished = Vec::new();
+    for row in rows {
+        unfinished.push(row?);
+    }
+    drop(stmt);
+
+    let mut retired = 0;
+    for kind in unfinished {
+        if !str_to_kind(&kind).is_resident() {
+            continue;
+        }
+        retired += conn.execute(
+            "UPDATE task_journal SET status = ?2, finished_at = ?3 \
+             WHERE status IN ('running', 'paused') AND kind = ?1",
+            params![
+                kind,
+                status_to_str(TaskStatus::Cancelled),
+                chrono::Utc::now().to_rfc3339(),
+            ],
+        )?;
+    }
+    Ok(retired)
 }
 
 /// Serialize a task kind for journal storage. Built-in kinds use their stable
@@ -287,6 +337,78 @@ mod tests {
                 .any(|e| e.kind
                     == TaskKind::Custom(std::borrow::Cow::Borrowed("from-a-future-build"))),
             "an unrecognised kind was dropped instead of surfaced"
+        );
+    }
+
+    /// A resident service is never recorded, because no quit writes its terminal
+    /// row: a start that was journalled would read as interrupted work on every
+    /// later open, one more per launch. The exclusion is per kind — a job of an
+    /// ordinary kind beside it is still recorded — and the service's later
+    /// writes must not resurrect the row they never created.
+    #[test]
+    fn a_resident_service_is_never_recorded() {
+        let store = Store::in_memory().unwrap();
+        let conn = store.conn();
+        let service = crate::model::new_id();
+
+        record_start(conn, service, &TaskKind::WatchScan, "watch", 0).unwrap();
+        assert!(
+            load_interrupted(conn).unwrap().is_empty(),
+            "the watch service left nothing behind"
+        );
+        record_status(conn, service, TaskStatus::Cancelled, 0, 0, None, None).unwrap();
+        record_retry(conn, service).unwrap();
+
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM task_journal", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            0,
+            "not even a row the terminal writes could have updated"
+        );
+
+        let job = crate::model::new_id();
+        record_start(conn, job, &TaskKind::Import, "import", 0).unwrap();
+        assert_eq!(
+            load_interrupted(conn).unwrap().len(),
+            1,
+            "an ordinary job is still journalled"
+        );
+    }
+
+    /// The cleanup for a library an earlier build already left dirty: the
+    /// service rows no process could close are folded out of the interrupted
+    /// set, while a genuinely unfinished import is left to be reported — and a
+    /// settled row of either kind is not touched at all.
+    #[test]
+    fn legacy_service_rows_are_retired_and_a_real_job_still_shows() {
+        let store = Store::in_memory().unwrap();
+        let conn = store.conn();
+        let insert = |kind: &str, status: &str| {
+            conn.execute(
+                "INSERT INTO task_journal (task_id, kind, label, status, started_at) \
+                 VALUES (?1, ?2, ?3, ?4, 'then')",
+                params![crate::model::new_id().to_string(), kind, "x", status],
+            )
+            .unwrap();
+        };
+        insert("watch-scan", "running");
+        insert("watch-scan", "paused");
+        insert("watch-scan", "completed");
+        insert("import", "running");
+
+        assert_eq!(
+            retire_resident_runs(conn).unwrap(),
+            2,
+            "both unfinished service rows, and no others"
+        );
+        let found = load_interrupted(conn).unwrap();
+        assert_eq!(found.len(), 1, "only the import is interrupted work");
+        assert_eq!(found[0].kind, TaskKind::Import);
+        assert_eq!(
+            retire_resident_runs(conn).unwrap(),
+            0,
+            "a second open finds nothing left to retire"
         );
     }
 }

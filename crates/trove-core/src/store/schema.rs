@@ -52,7 +52,7 @@
 /// existence was written by a build whose chain ended there, and that shape
 /// is the pre-`asset_embeddings` subset of the one below — which is the only
 /// sense in which a version number means anything.
-pub const SCHEMA_VERSION: i64 = 23;
+pub const SCHEMA_VERSION: i64 = 24;
 
 /// One upgrade step: the DDL that takes a library from `from` to `to`, and the
 /// data that DDL cannot move.
@@ -132,7 +132,37 @@ pub const UPGRADES: &[Upgrade] = &[
         sql: UPGRADE_22_TO_23,
         data: Some(fold_zero_ratings),
     },
+    Upgrade {
+        from: 23,
+        to: 24,
+        sql: UPGRADE_23_TO_24,
+        data: None,
+    },
 ];
+
+/// v23 → v24: give the undo history a table of its own.
+///
+/// Until this step the history was two `Vec`s inside `Library`: every mutation a
+/// user had made was undoable until they closed the app, and the cap that made
+/// that bounded was the memory it lived in. The step is pure DDL and the new
+/// table is empty afterwards — nothing done before this build can be taken back,
+/// because nothing done before it recorded what to take back.
+const UPGRADE_23_TO_24: &str = r#"
+    CREATE TABLE IF NOT EXISTS undo_log (
+        seq        INTEGER PRIMARY KEY AUTOINCREMENT,
+        action     TEXT NOT NULL,
+        target     TEXT,
+        count      INTEGER NOT NULL DEFAULT 1,
+        op         TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        undone_at  TEXT
+    );
+
+    -- The two reads this table exists for: the newest row with `undone_at` NULL
+    -- (what Ctrl+Z takes next) and the newest one with it set (what
+    -- Ctrl+Shift+Z puts back). Both are this index, prefix-matched, newest-last.
+    CREATE INDEX IF NOT EXISTS undo_log_side ON undo_log(undone_at, seq);
+"#;
 
 /// v22 → v23: put the star rating's domain in the database.
 ///
@@ -731,4 +761,19 @@ pub const SCHEMA: &str = r#"
         started_at   TEXT NOT NULL,
         finished_at  TEXT
     );
+    -- The undo history: one row per invertible metadata mutation, so the history
+    -- survives restarting. `undone_at` is the undo/redo boundary — NULL means the
+    -- mutation is in effect, and the newest such row is the next thing to take
+    -- back. `op` holds `history::undo::Op` as JSON, which is what puts that
+    -- enum's field names on disk. See [`UPGRADE_23_TO_24`].
+    CREATE TABLE IF NOT EXISTS undo_log (
+        seq        INTEGER PRIMARY KEY AUTOINCREMENT,
+        action     TEXT NOT NULL,
+        target     TEXT,
+        count      INTEGER NOT NULL DEFAULT 1,
+        op         TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        undone_at  TEXT
+    );
+    CREATE INDEX IF NOT EXISTS undo_log_side ON undo_log(undone_at, seq);
 "#;

@@ -19,17 +19,27 @@
 //! to find out, and each frame is scheduled against the wall clock rather than
 //! sleeping a fixed span after every tick — otherwise each millisecond spent
 //! notifying is added to the next frame's delay, which reads as judder.
+//!
+//! The transport bar carries a timeline whose length is **one cycle** of the
+//! animation ([`trove_core::media::anim::FrameTimes::duration_ms`], the sum of
+//! its frame delays). It is not "how much is left", because an animation has no
+//! left: the bar fills, the picture wraps to frame 0, and the bar starts again.
+//! Dragging it is the point — every frame is already decoded, so the picture
+//! answers the pointer immediately and the clock is held off until the release.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use gpui_kit::base::{ElementExt as _, h_flex};
+use gpui_kit::component::slider::{Slider, SliderEvent, SliderState};
 use gpui_kit::component::{ActiveTheme as _, Size};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use trove_core::media::anim::FrameTimes;
+
+use crate::components::controls::muted_label;
 
 use super::chrome::{self, Chrome};
 use super::{AssetPreviewData, AssetPreviewPanel, transport};
@@ -134,8 +144,13 @@ fn prepare(path: &std::path::Path) -> Option<(Vec<Arc<RenderImage>>, FrameTimes)
 /// What the loop reads each tick, kept off the entity so an `App` borrow can
 /// never stall the clock.
 struct Shared {
+    /// The *effective* gate: the loop advances only when the user wants
+    /// playback and no timeline drag is in progress. The entity writes it from
+    /// [`AnimatedPlayer::publish_controls`], so a drag can never fight the clock.
     playing: bool,
     speed: f32,
+    /// A seek the loop has not served yet, in milliseconds of one cycle.
+    seek_to: Option<u64>,
 }
 
 /// A playing animated image: prepared frames, a current index, and the loop
@@ -146,6 +161,10 @@ pub(crate) struct AnimatedPlayer {
     /// The frame on screen. Mirrored from the loop so rendering reads a field
     /// rather than locking.
     frame: usize,
+    /// The frame table, kept a second time for the UI side: a drag must resolve
+    /// "which frame is this millisecond" without the loop's help, and the loop
+    /// owns the copy it paces itself with.
+    timing: FrameTimes,
     shared: Arc<Mutex<Shared>>,
     /// Cleared on drop so the loop exits with the panel.
     alive: Arc<AtomicBool>,
@@ -153,6 +172,38 @@ pub(crate) struct AnimatedPlayer {
     chrome: Chrome,
     /// The player's own box, so the bar reveals at the picture's bottom edge.
     chrome_bounds: Entity<Bounds<Pixels>>,
+    /// Whether the user wants it moving. Kept beside [`Shared::playing`]
+    /// because the button must show this, not the effective gate: a drag
+    /// suspends the clock without pausing the picture's intent.
+    playing: bool,
+    /// Playback rate, mirrored into [`Shared`] on every change.
+    speed: f32,
+    /// A timeline drag is in progress: the thumb follows the pointer and the
+    /// loop's playhead is ignored until release.
+    seeking: bool,
+    /// Playhead in milliseconds of one cycle.
+    position_ms: f64,
+    /// The timeline itself, and the last value mirrored into its thumb. The
+    /// state is user-draggable, so re-pushing an unchanged position each frame
+    /// would yank the thumb back mid-drag.
+    slider: Entity<SliderState>,
+    synced_position: f32,
+    /// Held so the slider's subscription lives with the player.
+    _subscription: Subscription,
+}
+
+/// Where a drag on the timeline asks to land, in milliseconds of one cycle.
+///
+/// The slider's own range is `0..=duration_ms`, but a drag is a `f32` arriving
+/// from a pointer: it must not become an absurd `as u64` cast. A NaN cannot be
+/// clamped — `f32::clamp` answers NaN with NaN — so it lands at the start; a
+/// negative is the start too, and anything past the end (an infinite drag
+/// among them) is the end of the cycle.
+fn seek_target_ms(value: f32, duration_ms: u64) -> u64 {
+    if value.is_nan() {
+        return 0;
+    }
+    (value.clamp(0., duration_ms as f32) as f64).round() as u64
 }
 
 /// How long frame `index` is shown, or nothing for an index off the end.
@@ -171,19 +222,74 @@ impl AnimatedPlayer {
     /// Take already-decoded frames and start playing them.
     fn start(frames: Vec<Arc<RenderImage>>, timing: FrameTimes, cx: &mut App) -> Entity<Self> {
         let frame_count = timing.frames();
+        let duration_ms = timing.duration_ms();
         let shared = Arc::new(Mutex::new(Shared {
             playing: true,
             speed: 1.0,
+            seek_to: None,
         }));
         let alive = Arc::new(AtomicBool::new(true));
         let chrome_bounds = cx.new(|_| Bounds::default());
-        let entity = cx.new(|_| Self {
-            frames,
-            frame: 0,
-            shared: Arc::clone(&shared),
-            alive: Arc::clone(&alive),
-            chrome: Chrome::new(),
-            chrome_bounds,
+        let slider = cx.new(|_| {
+            SliderState::new()
+                .min(0.)
+                // A file whose frames all declare zero delay is a cycle of no
+                // length; a slider with an empty range has nothing to drag.
+                .max(duration_ms.max(1) as f32)
+                .default_value(0.)
+        });
+        // Annotated rather than inferred: the subscriber *is* the entity being
+        // built here, so without this the model type is still unknown at the
+        // `subscribe` line, which sits above the value that decides it.
+        let entity = cx.new(|cx: &mut Context<Self>| {
+            // The timeline. Held on the entity: a dropped subscription would
+            // leave the bar draggable and mute.
+            let subscription =
+                cx.subscribe(&slider, move |this, _slider, event: &SliderEvent, cx| {
+                    let dragged = match event {
+                        SliderEvent::Change(value) | SliderEvent::Release(value) => value.start(),
+                    };
+                    let target = seek_target_ms(dragged, duration_ms);
+                    match event {
+                        // Every frame is already decoded, so a drag shows its target
+                        // at once instead of waiting for the clock — and the clock is
+                        // held off for the length of the drag, or the two would fight
+                        // over the picture and the thumb.
+                        SliderEvent::Change(_) => {
+                            this.seeking = true;
+                            this.frame = this.timing.frame_at(target);
+                            // Must be pushed here, not just on release: the loop
+                            // reads its gate, and without this it keeps advancing
+                            // the picture against the pointer.
+                            this.publish_controls();
+                        }
+                        SliderEvent::Release(_) => {
+                            this.seeking = false;
+                            if let Ok(mut shared) = this.shared.lock() {
+                                shared.seek_to = Some(target);
+                            }
+                            this.publish_controls();
+                        }
+                    }
+                    this.position_ms = target as f64;
+                    cx.notify();
+                });
+            Self {
+                frames,
+                frame: 0,
+                timing: timing.clone(),
+                shared: Arc::clone(&shared),
+                alive: Arc::clone(&alive),
+                chrome: Chrome::new(),
+                chrome_bounds,
+                playing: true,
+                speed: 1.0,
+                seeking: false,
+                position_ms: 0.,
+                slider,
+                synced_position: -1.,
+                _subscription: subscription,
+            }
         });
         chrome::watch(entity.downgrade(), cx, Self::chrome_mut);
 
@@ -207,10 +313,33 @@ impl AnimatedPlayer {
                 if !loop_alive.load(Ordering::Relaxed) {
                     break;
                 }
-                let (playing, speed) = match loop_shared.lock() {
-                    Ok(shared) => (shared.playing, shared.speed),
+                let (playing, speed, seek) = match loop_shared.lock() {
+                    Ok(mut shared) => (shared.playing, shared.speed, shared.seek_to.take()),
                     Err(_) => break,
                 };
+                if let Some(ms) = seek {
+                    // Served whether or not the picture is playing: someone who
+                    // dragged while paused and let go must resume from the frame
+                    // they chose, not from where the clock left off. The playhead
+                    // is *not* rewritten here: the drag (or the frame step) put
+                    // the millisecond it asked for on the entity, and snapping it
+                    // to the frame's own start would drag the label backwards
+                    // under a pointer that released mid-frame. The next natural
+                    // advance names the frame start again.
+                    index = timing.frame_at(ms);
+                    remaining = None;
+                    due = Instant::now() + frame_delay(&timing, index, speed);
+                    if weak
+                        .update(cx, |this, cx| {
+                            this.frame = index;
+                            cx.notify();
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                    continue;
+                }
                 if !playing {
                     remaining.get_or_insert_with(|| due.saturating_duration_since(Instant::now()));
                     cx.background_executor().timer(PAUSED_POLL).await;
@@ -245,6 +374,12 @@ impl AnimatedPlayer {
                 if weak
                     .update(cx, |this, cx| {
                         this.frame = index;
+                        // The playhead names the frame actually on screen, and
+                        // wraps with it: one bar is one cycle of the animation.
+                        // A drag owns the value instead, until it is released.
+                        if !this.seeking {
+                            this.position_ms = timing.ms_at(index) as f64;
+                        }
                         cx.notify();
                     })
                     .is_err()
@@ -257,28 +392,65 @@ impl AnimatedPlayer {
         entity
     }
 
-    /// Whether the loop is advancing, and how fast.
-    fn playback(&self) -> (bool, f32) {
-        self.shared
-            .lock()
-            .map(|shared| (shared.playing, shared.speed))
-            .unwrap_or((false, 1.0))
-    }
-
     /// Toggle play/pause. The loop picks it up on its next look.
     pub(crate) fn toggle_playing(&mut self, cx: &mut Context<Self>) {
-        if let Ok(mut shared) = self.shared.lock() {
-            shared.playing = !shared.playing;
-        }
+        self.playing = !self.playing;
+        self.publish_controls();
         cx.notify();
     }
 
     /// The playback rate; re-paces the frame delays.
     fn set_speed(&mut self, speed: f32, cx: &mut Context<Self>) {
-        if let Ok(mut shared) = self.shared.lock() {
-            shared.speed = speed;
-        }
+        self.speed = speed;
+        self.publish_controls();
         cx.notify();
+    }
+
+    /// `,` / `.`: one frame back or forward, and hold it there — the same
+    /// contract as the video player's.
+    ///
+    /// Written as a seek rather than a nudge of the loop's cursor: the entity
+    /// mirrors the frame on screen, so the neighbour's start time is known
+    /// without consulting the clock, and the loop already knows how to land on a
+    /// millisecond. Pausing first is what makes a step readable — the frame
+    /// arrives and stays. Both directions wrap, because a six-frame GIF is as
+    /// steerable as a six-hundred-frame one.
+    ///
+    /// The new frame is shown here rather than left to the loop: every frame is
+    /// already decoded, and waiting up to `PAUSED_POLL` per press would make the
+    /// key impossible to mash.
+    pub(crate) fn step_frame(&mut self, forward: bool, cx: &mut Context<Self>) {
+        let count = self.timing.frames();
+        if count == 0 {
+            return;
+        }
+        let current = self.frame.min(count - 1);
+        let target = if forward {
+            (current + 1) % count
+        } else {
+            (current + count - 1) % count
+        };
+        self.frame = target;
+        self.playing = false;
+        // The playhead is ours to move now — the loop serves the seek without
+        // touching it (a drag's millisecond must not be snapped either), so a
+        // stepped-to frame names itself from here, not from the last tick.
+        let at = self.timing.ms_at(target);
+        self.position_ms = at as f64;
+        if let Ok(mut shared) = self.shared.lock() {
+            shared.seek_to = Some(at);
+        }
+        self.publish_controls();
+        cx.notify();
+    }
+
+    /// Push the UI's intent into the loop's gate. A timeline drag counts as
+    /// paused, so the clock cannot move the picture out from under the thumb.
+    fn publish_controls(&self) {
+        if let Ok(mut shared) = self.shared.lock() {
+            shared.playing = self.playing && !self.seeking;
+            shared.speed = self.speed;
+        }
     }
 
     /// The chrome accessor the shared auto-hide watcher drives.
@@ -323,10 +495,21 @@ impl Drop for AnimatedPlayer {
 }
 
 impl Render for AnimatedPlayer {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let frame = self.frame.min(self.frames.len().saturating_sub(1));
         let source = ImageSource::Render(Arc::clone(&self.frames[frame]));
-        let (playing, speed) = self.playback();
+        let (playing, speed) = (self.playing, self.speed);
+        let duration_ms = self.timing.duration_ms() as f64;
+        let position_ms = self.position_ms;
+        // Mirror the playhead into the thumb, but never during a drag: the loop
+        // notifies on every frame, so the value would be reset under the pointer
+        // and the drag would never take.
+        if !self.seeking && (position_ms as f32 - self.synced_position).abs() >= 0.5 {
+            self.synced_position = position_ms as f32;
+            self.slider.update(cx, |slider, cx| {
+                slider.set_value(position_ms as f32, window, cx)
+            });
+        }
         let bar = h_flex()
             .absolute()
             .bottom_0()
@@ -341,6 +524,17 @@ impl Render for AnimatedPlayer {
                 Size::Small,
                 &cx.entity(),
                 Self::toggle_playing,
+            ))
+            // One bar, one cycle: it fills over the animation's own length and
+            // starts again where the picture starts again.
+            .child(div().flex_1().child(Slider::new(&self.slider).horizontal()))
+            .child(muted_label(
+                format!(
+                    "{} / {}",
+                    transport::time(position_ms),
+                    transport::time(duration_ms)
+                ),
+                cx,
             ))
             .child(transport::speed_button(
                 speed,
@@ -378,9 +572,35 @@ mod tests {
     // attribute macro of its own, and taking it with the rest of the parent's
     // scope turns every `#[test]` in here into a recursion error.
     use super::prepare;
+    use super::seek_target_ms;
     use gpui_kit::{DevicePixels, RenderImage, size};
     use std::sync::Arc;
     use trove_core::media::anim::FrameTimes;
+
+    /// What a drag on the timeline asks for.
+    ///
+    /// The slider is built with `0..=duration_ms`, so the range itself is not
+    /// what is worth pinning: the two cases a pointer can still produce are a
+    /// value past the end and a non-finite one. The second is the one that fails
+    /// quietly — `f32 as u64` turns a NaN into 0, and `f32::clamp` answers NaN
+    /// with NaN, so a NaN is refused by hand while everything else clamps.
+    #[test]
+    fn a_timeline_drag_resolves_to_a_millisecond_inside_the_cycle() {
+        assert_eq!(seek_target_ms(0., 320), 0);
+        assert_eq!(seek_target_ms(150.4, 320), 150);
+        assert_eq!(seek_target_ms(-8., 320), 0, "a negative drag is the start");
+        assert_eq!(
+            seek_target_ms(9_000., 320),
+            320,
+            "and a long one is the end of the cycle"
+        );
+        assert_eq!(seek_target_ms(f32::NAN, 320), 0, "a NaN must not move it");
+        assert_eq!(
+            seek_target_ms(f32::INFINITY, 320),
+            320,
+            "an infinite drag is the end, not the start"
+        );
+    }
 
     /// Write a real animated GIF: one 8×8 frame per delay, each a distinct red.
     ///

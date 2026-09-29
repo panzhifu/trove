@@ -58,15 +58,16 @@ impl Library {
             .iter()
             .map(|t| t.id)
             .collect();
-        tags::set_for_asset(conn, asset_id, tag_ids)?;
-        self.undo.record(
-            Op::SetTags {
-                asset: asset_id,
-                before,
-                after: tag_ids.to_vec(),
-            },
-            OpDesc::new(OpAction::TagSet, target, 1),
-        );
+        let op = Op::SetTags {
+            asset: asset_id,
+            before,
+            after: tag_ids.to_vec(),
+        };
+        let desc = OpDesc::new(OpAction::TagSet, target, 1);
+        undo::apply_atomic(conn, |tx| {
+            tags::set_for_asset(tx, asset_id, tag_ids)?;
+            self.undo.record(tx, op, &desc)
+        })?;
         Ok(())
     }
 
@@ -105,15 +106,16 @@ impl Library {
         let conn = self.store.conn();
         let tag = tags::get(conn, tag_id)?.ok_or(crate::Error::NotFound("tag"))?;
         let before = tag.parent_id;
-        tags::move_to(conn, tag_id, parent)?;
-        self.undo.record(
-            Op::TagParent {
-                id: tag_id,
-                before,
-                after: parent,
-            },
-            OpDesc::new(OpAction::TagMoved, Some(tag.name), 1),
-        );
+        let op = Op::TagParent {
+            id: tag_id,
+            before,
+            after: parent,
+        };
+        let desc = OpDesc::new(OpAction::TagMoved, Some(tag.name), 1);
+        undo::apply_atomic(conn, |tx| {
+            tags::move_to(tx, tag_id, parent)?;
+            self.undo.record(tx, op, &desc)
+        })?;
         Ok(())
     }
 
@@ -140,15 +142,22 @@ impl Library {
                 }
                 before.iter().copied().filter(|id| *id != tag_id).collect()
             };
-            tags::set_for_asset(conn, *asset_id, &after)?;
-            self.undo.record(
-                Op::SetTags {
-                    asset: *asset_id,
-                    before,
-                    after,
-                },
-                OpDesc::new(OpAction::TagSet, target, 1),
-            );
+            // The write needs the same list the row will hold, and the row owns
+            // it — so the group is cloned rather than borrowed twice.
+            let write = after.clone();
+            let op = Op::SetTags {
+                asset: *asset_id,
+                before,
+                after,
+            };
+            let desc = OpDesc::new(OpAction::TagSet, target, 1);
+            // One transaction per asset: a batch that dies halfway leaves the
+            // earlier assets consistent and undoable, instead of one rolled-back
+            // statement in the middle of a multi-asset write.
+            undo::apply_atomic(conn, |tx| {
+                tags::set_for_asset(tx, *asset_id, &write)?;
+                self.undo.record(tx, op, &desc)
+            })?;
         }
         Ok(())
     }
@@ -158,15 +167,15 @@ impl Library {
         let conn = self.store.conn();
         let tag = tags::get(conn, tag_id)?.ok_or(crate::Error::NotFound("tag"))?;
         let desc = OpDesc::new(OpAction::TagRenamed, Some(tag.name.clone()), 1);
-        tags::rename(conn, tag_id, name)?;
-        self.undo.record(
-            Op::TagRename {
-                id: tag_id,
-                before: tag.name,
-                after: name.to_string(),
-            },
-            desc,
-        );
+        let op = Op::TagRename {
+            id: tag_id,
+            before: tag.name,
+            after: name.to_string(),
+        };
+        undo::apply_atomic(conn, |tx| {
+            tags::rename(tx, tag_id, name)?;
+            self.undo.record(tx, op, &desc)
+        })?;
         Ok(())
     }
 
@@ -174,15 +183,16 @@ impl Library {
     pub fn set_tag_color(&self, tag_id: Uuid, color: Option<&str>) -> Result<()> {
         let conn = self.store.conn();
         let tag = tags::get(conn, tag_id)?.ok_or(crate::Error::NotFound("tag"))?;
-        tags::set_color(conn, tag_id, color)?;
-        self.undo.record(
-            Op::TagColor {
-                id: tag_id,
-                before: tag.color,
-                after: color.map(|c| c.to_string()),
-            },
-            OpDesc::new(OpAction::TagColored, Some(tag.name), 1),
-        );
+        let op = Op::TagColor {
+            id: tag_id,
+            before: tag.color,
+            after: color.map(|c| c.to_string()),
+        };
+        let desc = OpDesc::new(OpAction::TagColored, Some(tag.name), 1);
+        undo::apply_atomic(conn, |tx| {
+            tags::set_color(tx, tag_id, color)?;
+            self.undo.record(tx, op, &desc)
+        })?;
         Ok(())
     }
 
@@ -309,15 +319,15 @@ impl Library {
             Some(collection.name.clone()),
             1,
         );
-        collections::rename(conn, collection_id, name)?;
-        self.undo.record(
-            Op::CollectionRename {
-                id: collection_id,
-                before: collection.name,
-                after: name.to_string(),
-            },
-            desc,
-        );
+        let op = Op::CollectionRename {
+            id: collection_id,
+            before: collection.name,
+            after: name.to_string(),
+        };
+        undo::apply_atomic(conn, |tx| {
+            collections::rename(tx, collection_id, name)?;
+            self.undo.record(tx, op, &desc)
+        })?;
         Ok(())
     }
 
@@ -332,15 +342,16 @@ impl Library {
         let conn = self.store.conn();
         let c =
             collections::get(conn, collection_id)?.ok_or(crate::Error::NotFound("collection"))?;
-        collections::move_to(conn, collection_id, new_parent, position)?;
-        self.undo.record(
-            Op::CollectionMove {
-                id: collection_id,
-                before: (c.parent_id, c.position),
-                after: (new_parent, position),
-            },
-            OpDesc::new(OpAction::CollectionMoved, Some(c.name), 1),
-        );
+        let op = Op::CollectionMove {
+            id: collection_id,
+            before: (c.parent_id, c.position),
+            after: (new_parent, position),
+        };
+        let desc = OpDesc::new(OpAction::CollectionMoved, Some(c.name), 1);
+        undo::apply_atomic(conn, |tx| {
+            collections::move_to(tx, collection_id, new_parent, position)?;
+            self.undo.record(tx, op, &desc)
+        })?;
         Ok(())
     }
 
@@ -368,22 +379,22 @@ impl Library {
     }
 
     pub fn undo_len(&self) -> usize {
-        self.undo.undo_len()
+        self.undo.undo_len(self.store.conn())
     }
 
     pub fn redo_len(&self) -> usize {
-        self.undo.redo_len()
+        self.undo.redo_len(self.store.conn())
     }
 
     /// Descriptions of the last `n` undoable operations, most recent first
     /// (status bar).
     pub fn undo_entries(&self, n: usize) -> Vec<OpDesc> {
-        self.undo.undo_entries(n)
+        self.undo.undo_entries(self.store.conn(), n)
     }
 
     /// Descriptions of the last `n` redoable operations, next-first.
     pub fn redo_entries(&self, n: usize) -> Vec<OpDesc> {
-        self.undo.redo_entries(n)
+        self.undo.redo_entries(self.store.conn(), n)
     }
 
     /// Undo up to `steps` operations in sequence; returns how many were
@@ -405,20 +416,25 @@ impl Library {
                 after: trashed,
             });
         }
-        let changed = batch::set_trashed_many(conn, ids, trashed)?;
-        if changed > 0 {
-            self.undo.record(
-                Op::SetTrashed { flips },
-                OpDesc::counted(
-                    if trashed {
-                        OpAction::Trash
-                    } else {
-                        OpAction::Restore
-                    },
-                    ids.len(),
-                ),
-            );
-        }
+        let op = Op::SetTrashed { flips };
+        let desc = OpDesc::counted(
+            if trashed {
+                OpAction::Trash
+            } else {
+                OpAction::Restore
+            },
+            ids.len(),
+        );
+        // Nothing is recorded when the write changed no rows: an undo step that
+        // would put the database back exactly as it was is noise in the panel,
+        // and the empty case is why `if changed > 0` used to be here.
+        let changed = undo::apply_atomic(conn, |tx| {
+            let changed = batch::set_trashed_many(tx, ids, trashed)?;
+            if changed > 0 {
+                self.undo.record(tx, op, &desc)?;
+            }
+            Ok(changed)
+        })?;
         Ok(changed)
     }
 }

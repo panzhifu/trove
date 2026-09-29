@@ -96,8 +96,13 @@ pub fn default_keybindings() -> Vec<KeyBindingConfig> {
             context: None,
         },
         KeyBindingConfig {
+            // The character, not the keysym name: gpui-linux maps `Keysym::comma`
+            // to `","` (`platform.rs:1108`), so `"ctrl-comma"` parsed, displayed in
+            // Settings ▸ Shortcuts, and never matched a press. The app-side test
+            // `every_default_binding_names_a_key_the_platform_can_emit` pins the
+            // rule for every entry in this table.
             action: "OpenSettings",
-            key: "ctrl-comma",
+            key: "ctrl-,",
             context: None,
         },
         KeyBindingConfig {
@@ -152,6 +157,28 @@ pub fn default_keybindings() -> Vec<KeyBindingConfig> {
             action: "ExitVideoFullscreen",
             key: "f",
             context: Some("VideoFullscreen"),
+        },
+        KeyBindingConfig {
+            // `,` steps one frame back on the previewed clip — the editing
+            // convention (Premiere, DaVinci), and the pair is free here. Bound
+            // in the preview's own context, so the character is live only while
+            // a clip covers the grid and the search box keeps its typing.
+            //
+            // The key is written as the character, not the keysym name:
+            // gpui-linux maps `Keysym::comma` to `","` and `Keysym::period` to
+            // `"."` (`platform.rs:1108-1109`), and `Keystroke::parse` keeps any
+            // non-modifier component verbatim as the key — so `"comma"` would
+            // parse, display, and never match a press.
+            action: "StepFrameBack",
+            key: ",",
+            context: Some("VideoPreview"),
+        },
+        KeyBindingConfig {
+            // `.` steps one frame forward, and holds: the point is to look at
+            // the frame you landed on, not to watch it pass.
+            action: "StepFrameForward",
+            key: ".",
+            context: Some("VideoPreview"),
         },
     ]
 }

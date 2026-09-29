@@ -476,7 +476,12 @@ impl NewAsset {
 }
 
 /// Patch describing a partial update to an asset.
-#[derive(Debug, Clone, Default)]
+///
+/// Serialized as [`AssetPatchWire`], never as itself: the field names below end up
+/// in `undo_log.op` either way, but the *shape* has to change to survive JSON —
+/// see [`Field`].
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(from = "AssetPatchWire", into = "AssetPatchWire")]
 pub struct AssetPatch {
     pub title: Option<Option<String>>,
     pub description: Option<Option<String>>,
@@ -491,6 +496,88 @@ pub struct AssetPatch {
     pub commercial_use: Option<Option<bool>>,
     /// Replace the whole [`AssetFacts`] when `Some`.
     pub facts: Option<AssetFacts>,
+}
+
+/// One nullable column, spelled so that "leave it alone" and "set it to NULL"
+/// survive a trip through JSON.
+///
+/// [`AssetPatch`] tells those two apart with `Option<Option<T>>`, which is exact
+/// in Rust and lossy in `serde_json`: both spellings serialize to `null`, so an
+/// undo row that meant *clear this column* read back as *do not touch it*. That is
+/// not a corner case — a fully-populated restore patch (what undo stores) has
+/// `Some(None)` in every nullable column that was empty, so without this an undone
+/// metadata edit leaves stale values exactly where it should have erased them.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+enum Field<T> {
+    /// Leave the column as it is.
+    Keep,
+    /// Set the column to NULL.
+    Clear,
+    /// Set the column to this value.
+    Set(T),
+}
+
+fn to_field<T: Clone>(value: &Option<Option<T>>) -> Field<T> {
+    match value {
+        None => Field::Keep,
+        Some(None) => Field::Clear,
+        Some(Some(v)) => Field::Set(v.clone()),
+    }
+}
+
+fn from_field<T>(value: Field<T>) -> Option<Option<T>> {
+    match value {
+        Field::Keep => None,
+        Field::Clear => Some(None),
+        Field::Set(v) => Some(Some(v)),
+    }
+}
+
+/// The on-disk form of [`AssetPatch`]: the columns a patch may set, with the
+/// never-null ones as plain `Option` and the nullable ones as [`Field`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct AssetPatchWire {
+    title: Field<String>,
+    description: Field<String>,
+    kind: Option<AssetKind>,
+    rating: Field<Rating>,
+    is_favorite: Option<bool>,
+    source_url: Field<String>,
+    usage_status: Option<UsageStatus>,
+    commercial_use: Field<bool>,
+    facts: Option<AssetFacts>,
+}
+
+impl From<AssetPatch> for AssetPatchWire {
+    fn from(p: AssetPatch) -> Self {
+        Self {
+            title: to_field(&p.title),
+            description: to_field(&p.description),
+            kind: p.kind,
+            rating: to_field(&p.rating),
+            is_favorite: p.is_favorite,
+            source_url: to_field(&p.source_url),
+            usage_status: p.usage_status,
+            commercial_use: to_field(&p.commercial_use),
+            facts: p.facts,
+        }
+    }
+}
+
+impl From<AssetPatchWire> for AssetPatch {
+    fn from(w: AssetPatchWire) -> Self {
+        Self {
+            title: from_field(w.title),
+            description: from_field(w.description),
+            kind: w.kind,
+            rating: from_field(w.rating),
+            is_favorite: w.is_favorite,
+            source_url: from_field(w.source_url),
+            usage_status: w.usage_status,
+            commercial_use: from_field(w.commercial_use),
+            facts: w.facts,
+        }
+    }
 }
 
 impl AssetPatch {

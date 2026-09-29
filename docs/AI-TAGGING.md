@@ -24,14 +24,14 @@
 
 ## ChatProvider Trait
 
-`crates/trove-core/src/ai/chat.rs`
+`crates/trove-core/src/ai/analysis.rs`（原 `ai/chat.rs` + `ai/tagging.rs` 已于 2026-09-24 重构合并）
 
 ```rust
 pub trait ChatProvider: Send + Sync {
     /// 模型标识,随每个模型产出的标签一起存,便于日后辨认是谁干的活。
     fn id(&self) -> &str;
 
-    /// 回答一次提问。回复是自由文本,解析归调用方(见 tagging)。
+    /// 回答一次提问。回复是自由文本,解析归调用方(见 analysis)。
     fn complete(&self, request: &ChatRequest<'_>) -> Result<String>;
 }
 
@@ -71,7 +71,7 @@ pub struct ChatRequest<'a> {
 
 ## 提示词构造
 
-`crates/trove-core/src/ai/tagging.rs`
+`crates/trove-core/src/ai/analysis.rs`（原 `ai/tagging.rs` 已合并至此）
 
 ### system prompt(每次运行一次)
 
@@ -117,7 +117,7 @@ already tagged: 旅行
 
 ## 任务执行
 
-`crates/trove-core/src/tasks/autotag.rs`,骨架照 `tasks/embed.rs`,三处不同:
+`crates/trove-core/src/tasks/ai_analysis.rs`（原 `tasks/autotag.rs` 已改名），骨架照 `tasks/embed.rs`，三处不同:
 
 | 点 | embedding 回填 | 自动打标签 |
 |---|---|---|
@@ -163,7 +163,7 @@ fingerprint = BLAKE3(model ‖ prompt_version ‖ max_new_tags ‖ language ‖ 
 
 ## 撤销
 
-`trove autotag --undo`(或 `Library::start_auto_tag_undo`)。
+`trove analyze --undo`(或 `Library::start_ai_analysis_undo`)。
 
 库自带的 undo 栈是**内存里的**、属于填它的那个进程,后台任务指望不上;所以靠素材上的记录。撤销的动作:按记录摘除标签 → 清掉 `facts["ai_tags"]`(于是下次运行会重新打)→ 报告**被这次撤销清空的**标签。
 
@@ -196,15 +196,15 @@ fingerprint = BLAKE3(model ‖ prompt_version ‖ max_new_tags ‖ language ‖ 
 ## 命令行
 
 ```sh
-trove autotag --dry-run              # 只数有多少要处理,不发请求、不写库
-trove autotag                        # 按库里的配置跑
-trove autotag --limit 50             # 先试 50 个
-trove autotag --no-images            # 纯文本端点,省掉那次「被拒」
-trove autotag --max-new-tags 0       # 只复用现有标签,一个都不新建
-trove autotag --parent-tag 参考      # 新词挂到别的父标签下
-trove autotag --language zh-CN       # 标签语言
-trove autotag --force --limit 1      # 忽略指纹重打一个
-trove autotag --undo                 # 把历次自动打的标签全部摘掉
+trove analyze --dry-run             # 只数有多少要处理,不发请求、不写库
+trove analyze                       # 按库里的配置跑
+trove analyze --limit 50            # 先试 50 个
+trove analyze --no-images           # 纯文本端点,省掉那次「被拒」
+trove analyze --max-new-tags 0      # 只复用现有标签,一个都不新建
+trove analyze --parent-tag 参考     # 新词挂到别的父标签下
+trove analyze --language zh-CN      # 标签语言
+trove analyze --force --limit 1     # 忽略指纹重打一个
+trove analyze --undo                # 把历次自动打的标签全部摘掉
 ```
 
 输出的 JSON 含 `planned` / `tagged` / `unchanged` / `skipped` / `failed` / `created_tags` / `images_rejected`。
@@ -215,14 +215,14 @@ trove autotag --undo                 # 把历次自动打的标签全部摘掉
 
 | 文件 | 内容 |
 |------|------|
-| `crates/trove-core/src/ai/chat.rs` | `ChatProvider` trait、`OpenAIChat`、响应与 data URI 解析 |
-| `crates/trove-core/src/ai/tagging.rs` | 资产摘要、system prompt、标签解析与归一化 |
+| `crates/trove-core/src/ai/analysis.rs` | `ChatProvider` trait、资产摘要、system prompt、标签解析与归一化、响应解析 |
 | `crates/trove-core/src/ai/http.rs` | 两个 provider 共用的 HTTP 小工具(读体、错误解包、截断) |
-| `crates/trove-core/src/tasks/autotag.rs` | 引擎:候选、指纹、并发提问、写标签、撤销 |
+| `crates/trove-core/src/ai/vendor/` | 供应商适配器 (`openai.rs`、`anthropic.rs`、`gemini.rs`、`dashscope.rs`) |
+| `crates/trove-core/src/tasks/ai_analysis.rs` | 引擎:候选、指纹、并发提问、写标签、撤销 |
 | `crates/trove-core/src/config.rs` | `ChatConfig` |
-| `crates/trove-core/src/library.rs` | `start_auto_tag` / `start_auto_tag_undo` / `auto_tag_options` |
-| `crates/trove-cli/src/write.rs` | `trove autotag` |
-| `crates/trove-core/src/crate::tasks` | `TaskKind::AutoTag`(与其它任务一样互斥、可取消、有进度) |
+| `crates/trove-core/src/library/` | `start_ai_analysis` / `start_ai_analysis_undo` / `auto_tag_options` |
+| `crates/trove-cli/src/write.rs` | `trove analyze` |
+| `crates/trove-core/src/tasks/` | `TaskKind::AutoTag`(与其它任务一样互斥、可取消、有进度) |
 
 ---
 

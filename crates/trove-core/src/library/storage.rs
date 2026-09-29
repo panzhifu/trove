@@ -15,6 +15,15 @@ impl Library {
         crate::services::backup::list_backups(&self.root)
     }
 
+    /// Write `snapshot` back over this library's database, and return the
+    /// snapshot taken of the state being replaced (so the restore itself is
+    /// undoable). A snapshot holds records only — files under the library root
+    /// that a later delete removed do not come back, and the text index has to
+    /// be rebuilt against the restored rows. See [`crate::services::backup`].
+    pub fn restore_backup(&self, snapshot: &std::path::Path) -> Result<std::path::PathBuf> {
+        crate::services::backup::restore_backup(&self.root, snapshot, self.store.conn())
+    }
+
     /// Library statistics for the settings dashboard.
     pub fn stats(&self) -> Result<crate::store::stats::LibraryStats> {
         crate::store::stats::library_stats(self.store.conn())
@@ -81,7 +90,7 @@ impl Library {
             store,
             root,
             cache,
-            undo: SharedUndoStack::with_cap(crate::history::undo::DEFAULT_UNDO_CAP),
+            undo: UndoHistory::with_cap(crate::history::undo::DEFAULT_UNDO_CAP),
             tasks: std::sync::Arc::new(crate::tasks::TaskManager::new()),
             interrupted: Vec::new(),
             vector_index: std::cell::RefCell::new(None),

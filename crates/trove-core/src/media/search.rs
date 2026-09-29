@@ -1,8 +1,8 @@
-//! Visual similarity search: perceptual hashing (pHash) and color matching.
+//! Visual similarity search: difference hashing (dHash) and color matching.
 //!
 //! Two signals compose "search by image":
 //!   1. Color palette similarity (cosine distance over quantized RGB buckets)
-//!   2. Perceptual hash hamming distance (DCT-based pHash, 64-bit)
+//!   2. Difference hash hamming distance (9×8 dHash, 64-bit)
 //!
 //! The combined score ranks results. Both signals are cheap to compute at
 //! import time and cheap to query at search time (no ML model needed).
@@ -147,16 +147,16 @@ impl ColorHistogram {
 }
 
 // ---------------------------------------------------------------------------
-// Perceptual hash (DCT-based pHash, 64-bit)
+// Difference hash (dHash, 9×8, 64-bit)
 // ---------------------------------------------------------------------------
 
-/// A 64-bit perceptual hash. Hamming distance measures visual similarity:
+/// A 64-bit difference hash. Hamming distance measures visual similarity:
 /// 0 = identical, <10 = very similar, >20 = likely unrelated.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PHash(pub u64);
 
 impl PHash {
-    /// Compute pHash from a pre-decoded grayscale image (9×8 or larger).
+    /// Compute dHash from a pre-decoded grayscale image (9×8 or larger).
     pub fn from_gray(image: &image::GrayImage) -> Self {
         let hash = if image.width() >= 9 && image.height() >= 8 {
             let small = image::imageops::resize(image, 9, 8, image::imageops::FilterType::Triangle);
@@ -167,7 +167,7 @@ impl PHash {
         Self(hash)
     }
 
-    /// Compute pHash from an image file. Returns a zero hash for undecodable files.
+    /// Compute dHash from an image file. Returns a zero hash for undecodable files.
     pub fn from_image(path: &Path) -> Self {
         match crate::media::hdr::open_for_display(path) {
             Ok(img) => {

@@ -159,8 +159,9 @@ impl DockPanel for WorkspacePanel {
                         return;
                     }
                     let body = purge_warning(this.controller.read(cx), count);
+                    let controller = this.controller.clone();
                     let this = cx.entity();
-                    confirm_destruction(window, cx, body, move |cx| {
+                    confirm_destruction(&controller, window, cx, body, move |cx| {
                         this.update(cx, |this, cx| this.empty_trash(cx));
                     });
                 }))

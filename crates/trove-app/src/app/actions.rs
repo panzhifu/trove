@@ -54,6 +54,10 @@ gpui_kit::actions!(
         // Space on a previewed video or audio file: hold the soundtrack, or
         // pick it back up where it stopped.
         TogglePlayback,
+        // `,` and `.` step one frame back / forward on the previewed clip —
+        // video or animated image — and leave it holding that frame.
+        StepFrameBack,
+        StepFrameForward,
         // -- Cancel ----------------------------------------------------------
         // Escape, globally: an inline editor closes, a fullscreen stage
         // steps down, an overlay dismisses. Handled by whichever view on the

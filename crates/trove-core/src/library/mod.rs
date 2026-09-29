@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
 use crate::error::Result;
-use crate::history::undo::{self, Flip, Op, OpAction, OpDesc, SharedUndoStack};
+use crate::history::undo::{self, Flip, Op, OpAction, OpDesc, UndoHistory};
 use crate::media;
 use crate::model::{AssetLocation, AssetQuery, Placement};
 use crate::services::collect;
@@ -233,7 +233,7 @@ pub struct Library {
     cache: PathBuf,
     /// Undo/redo operation history for invertible metadata mutations (see
     /// [`crate::history`]). Bounded; the cap comes from the app config.
-    undo: SharedUndoStack,
+    undo: UndoHistory,
     /// Background jobs (imports, maintenance, preview work) owned by this
     /// library; see [`crate::tasks`]. Cheap to share: `Arc` inside.
     tasks: std::sync::Arc<crate::tasks::TaskManager>,
@@ -339,6 +339,24 @@ impl Library {
             journal_conn
                 .execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=2000;")
                 .ok();
+            // Retire before reading: an earlier build journalled the resident
+            // watch service, whose terminal row no quit ever writes, so every
+            // launch it opened left one more `running` row that
+            // `load_interrupted` below reports as interrupted work. The write
+            // failure is logged rather than swallowed — if it does not land,
+            // those false positives are back on screen and this is the only
+            // place that knows why.
+            match crate::store::task_journal::retire_resident_runs(&journal_conn) {
+                Ok(0) => {}
+                Ok(retired) => tracing::info!(
+                    retired,
+                    "retired journal rows left `running` by the resident watch service"
+                ),
+                Err(error) => tracing::warn!(
+                    %error,
+                    "could not retire the resident services' journal rows; they will read as interrupted"
+                ),
+            }
             // Read before handing the connection to the manager: work that was
             // running when this process died is surfaced (see
             // `Library::interrupted_tasks`) before anything new is recorded.
@@ -353,12 +371,25 @@ impl Library {
             store,
             root,
             cache,
-            undo: SharedUndoStack::with_cap(config.undo_cap()),
+            undo: UndoHistory::with_cap(config.undo_cap()),
             tasks: std::sync::Arc::new(tasks),
             interrupted,
             text_index,
             vector_index: std::cell::RefCell::new(None),
         };
+        // "Opening" the history is two cleanups: the steps a previous session
+        // undid and walked away from (redo deliberately does not cross a
+        // restart), and any row this build cannot read. Failing here does not
+        // fail the open — it means the history stays as it is on disk, and the
+        // rows this build cannot apply are then refused one at a time by
+        // `UndoHistory::newest` rather than silently vanishing from a panel the
+        // user may already be looking at.
+        if let Err(error) = lib.undo.open_session(lib.store.conn()) {
+            tracing::warn!(
+                %error,
+                "undo history could not be prepared; leaving it untouched"
+            );
+        }
         let assets =
             rows::query_count(lib.store.conn(), "SELECT COUNT(*) FROM assets", vec![]).unwrap_or(0);
         crate::metrics::set_library_open(assets.max(0) as u64);
