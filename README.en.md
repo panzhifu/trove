@@ -4,7 +4,7 @@
 
 <p align="center">
   <a href="./README.md">中文（主要文档）</a> ·
-  <a href="./LICENSE">MIT</a>
+  <a href="./LICENSE">BUSL-1.1</a>
 </p>
 
 <br>
@@ -164,7 +164,19 @@ Per-module implementation notes are indexed in [docs/README.md](docs/README.md).
 
 ## License
 
-[MIT](./LICENSE)
+Released under [BUSL-1.1](./LICENSE) (Business Source License 1.1):
+
+- The source is open to view, modify, redistribute, and use freely for
+  **non-production purposes**;
+- Production or commercial use — offering Trove or a derivative of it as a
+  paid product or paid service — requires a commercial license from the
+  Licensor (see the repository for contact);
+- Each version converts automatically to
+  [Apache-2.0](https://www.apache.org/licenses/LICENSE-2.0) four years after
+  its publication (the Change Date);
+- From 2026-09-29, the entire repository — historical versions included — is
+  republished under BUSL-1.1, and the previous MIT releases have been taken
+  down; MIT copies obtained before that date remain governed by MIT.
 
 [gpui-kit]: https://github.com/panzhifu/gpui-kit
 [rusqlite]: https://github.com/rusqlite/rusqlite

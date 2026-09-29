@@ -4,7 +4,7 @@
 
 <p align="center">
   <a href="./README.en.md">English</a> ·
-  <a href="./LICENSE">MIT</a>
+  <a href="./LICENSE">BUSL-1.1</a>
 </p>
 
 <br>
@@ -248,7 +248,12 @@ cargo run -p trove-app
 
 ## 许可证
 
-[MIT](./LICENSE)
+以 [BUSL-1.1](./LICENSE)（Business Source License 1.1）发布：
+
+- 源码公开，可自由查看、修改、再分发，以及**非生产用途**的使用；
+- 生产/商业用途（将 Trove 或其衍生作品作为付费产品或付费服务提供）需要商业授权，联系方式见仓库；
+- 每个版本在发布满四年（Change Date）后自动转为 [Apache-2.0](https://www.apache.org/licenses/LICENSE-2.0)；
+- 2026-09-29 起，本仓库全部代码（含历史版本）以 BUSL-1.1 重新发布，此前的 MIT 发行版已全部下架；在该日期之前已取得的 MIT 副本仍按 MIT 执行。
 
 [gpui-kit]: https://github.com/panzhifu/gpui-kit
 [rusqlite]: https://github.com/rusqlite/rusqlite
