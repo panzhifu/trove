@@ -57,7 +57,15 @@ use crate::store::assets;
 /// match pinyin within that specific surface.
 /// 5: added audio_words / audio_tri fields so `audio:` qualifier has a
 /// dedicated index surface for sample rate, channels, bit depth, bitrate.
-const INDEX_VERSION: u32 = 5;
+/// 6: the jieba tokenizer no longer indexes whitespace. jieba-rs emits the
+/// separators it splits on as tokens of their own (the Python
+/// implementation filters them, jieba-rs deliberately keeps them), while the
+/// query side never names one — `build_query` splits on whitespace and
+/// `phrase_query_on` trims its tokens. In a v5 index a space token therefore
+/// sat between every adjacent word pair, `PhraseQuery` could never fire
+/// across one, and quoted phrases were carried by the gram fallback alone.
+/// Positions change, so old indexes rebuild.
+const INDEX_VERSION: u32 = 6;
 /// Heap budget for the index writer, in bytes.
 const WRITER_HEAP: usize = 32 * 1024 * 1024;
 /// How many ranked candidates one text lookup may contribute before the
@@ -119,6 +127,19 @@ impl Tokenizer for JiebaTokenizer {
             let Some(first) = word.chars().next() else {
                 continue;
             };
+            // jieba-rs also hands back the separators it split on — whitespace
+            // arrives as a token of its own (the Python implementation filters
+            // it, jieba-rs deliberately keeps it). The query side never names
+            // one: the box splits on whitespace and `phrase_query_on` trims its
+            // tokens. An indexed space would be a position no query can reach
+            // that still sits between every adjacent word pair — exactly the
+            // position `PhraseQuery` needs to be contiguous — so a quoted
+            // phrase could only ever be answered by the gram fallback's grace.
+            // Whitespace is not content on either side; skipping it here is
+            // what lets the positional leg do its job.
+            if word.trim().is_empty() {
+                continue;
+            }
             let Some(rel) = text[cursor.min(text.len())..].find(word) else {
                 continue;
             };
@@ -1853,6 +1874,181 @@ mod tests {
         let hits = ids_of_expr(&idx, "\"summer 2024\"");
         assert_eq!(hits.len(), 1, "{hits:?}");
         assert_eq!(hits[0], "bbbb0000-0000-0000-0000-000000000001");
+    }
+
+    /// A metadata qualifier answers on its own surface and nowhere else. The
+    /// decoy carries the very same tokens in its description, so the
+    /// unqualified term finds both — and the qualified one only the facts.
+    /// This is the v3 fact surface (camera, artist, album, font), which
+    /// `extract_fact_texts` fills from the asset's mined metadata.
+    #[test]
+    fn a_camera_qualifier_answers_only_the_camera_surface() {
+        let idx = TextIndex::in_ram().unwrap();
+        let camera = "cccc0000-0000-0000-0000-000000000001";
+        let decoy = "cccc0000-0000-0000-0000-000000000002";
+        let artist = "cccc0000-0000-0000-0000-000000000003";
+        let album = "cccc0000-0000-0000-0000-000000000004";
+        let font = "cccc0000-0000-0000-0000-000000000005";
+        {
+            let writer = idx.writer().unwrap();
+            idx.index_asset_text(
+                &writer,
+                camera,
+                "canon-eos.png",
+                None,
+                None,
+                "",
+                &FactTexts {
+                    camera: "Canon EOS R5 ISO 400 f/2.8 1/60s".into(),
+                    ..Default::default()
+                },
+            );
+            idx.index_asset_text(
+                &writer,
+                decoy,
+                "decoy.png",
+                None,
+                Some("canon ryuichi async inter"),
+                "",
+                &FactTexts::default(),
+            );
+            idx.index_asset_text(
+                &writer,
+                artist,
+                "artist.png",
+                None,
+                None,
+                "",
+                &FactTexts {
+                    artist: "Ryuichi Sakamoto".into(),
+                    ..Default::default()
+                },
+            );
+            idx.index_asset_text(
+                &writer,
+                album,
+                "album.png",
+                None,
+                None,
+                "",
+                &FactTexts {
+                    album: "Async".into(),
+                    ..Default::default()
+                },
+            );
+            idx.index_asset_text(
+                &writer,
+                font,
+                "font.png",
+                None,
+                None,
+                "",
+                &FactTexts {
+                    font: "Inter Bold 400".into(),
+                    ..Default::default()
+                },
+            );
+            drop(writer);
+        }
+        idx.commit().unwrap();
+
+        let ids = |query: &str| ids_of_expr(&idx, query);
+        assert_eq!(ids("camera:canon"), vec![camera.to_string()]);
+        assert_eq!(ids("make:canon"), vec![camera.to_string()], "alias");
+        assert_eq!(ids("model:r5"), vec![camera.to_string()], "alias");
+        assert_eq!(ids("camera:iso"), vec![camera.to_string()]);
+        assert_eq!(ids("artist:ryuichi"), vec![artist.to_string()]);
+        assert_eq!(ids("artist:sakamoto"), vec![artist.to_string()]);
+        assert_eq!(ids("album:async"), vec![album.to_string()]);
+        assert_eq!(ids("font:inter"), vec![font.to_string()]);
+        assert_eq!(ids("family:inter"), vec![font.to_string()], "alias");
+        // Unqualified, the token is found wherever it lives — the facts
+        // surface included, and the description of the decoy beside it.
+        let mut both = ids("canon");
+        both.sort();
+        assert_eq!(both, vec![camera.to_string(), decoy.to_string()]);
+        let mut both = ids("ryuichi");
+        both.sort();
+        assert_eq!(both, vec![decoy.to_string(), artist.to_string()]);
+        let mut both = ids("async");
+        both.sort();
+        assert_eq!(both, vec![decoy.to_string(), album.to_string()]);
+        let mut both = ids("inter");
+        both.sort();
+        assert_eq!(both, vec![decoy.to_string(), font.to_string()]);
+        // A fact token nothing else carries is found by the plain term:
+        // the composite facts surface is one of the unqualified surfaces.
+        assert_eq!(ids("iso"), vec![camera.to_string()]);
+    }
+
+    /// Field-scoped pinyin: `tag:mao` answers from the tags' own pinyin
+    /// field, and the same syllable in a file name does not answer a tag ask
+    /// — nor the reverse. That is the v4 split: before it, pinyin lived only
+    /// on the four surfaces concatenated, so a qualified ask either missed
+    /// entirely or could be answered by the wrong surface.
+    #[test]
+    fn a_qualified_pinyin_stays_on_its_own_surface() {
+        let idx = TextIndex::in_ram().unwrap();
+        let named = "bbbb0000-0000-0000-0000-000000000001";
+        let tagged = "bbbb0000-0000-0000-0000-000000000002";
+        let catnamed = "bbbb0000-0000-0000-0000-000000000003";
+        let titled = "bbbb0000-0000-0000-0000-000000000004";
+        {
+            let writer = idx.writer().unwrap();
+            idx.index_asset_text(
+                &writer,
+                named,
+                "照片.png",
+                None,
+                None,
+                "",
+                &FactTexts::default(),
+            );
+            idx.index_asset_text(
+                &writer,
+                tagged,
+                "b.png",
+                None,
+                None,
+                "猫",
+                &FactTexts::default(),
+            );
+            idx.index_asset_text(
+                &writer,
+                catnamed,
+                "猫.png",
+                None,
+                None,
+                "",
+                &FactTexts::default(),
+            );
+            idx.index_asset_text(
+                &writer,
+                titled,
+                "c.png",
+                Some("海边"),
+                None,
+                "",
+                &FactTexts::default(),
+            );
+            drop(writer);
+        }
+        idx.commit().unwrap();
+
+        let ids = |query: &str| ids_of_expr(&idx, query);
+        // `tag:mao` answers from the tags' pinyin alone: the file name that
+        // carries the very same syllable must not answer a tag ask.
+        assert_eq!(ids("tag:mao"), vec![tagged.to_string()]);
+        assert_eq!(ids("name:mao"), vec![catnamed.to_string()]);
+        assert_eq!(ids("name:zhao"), vec![named.to_string()]);
+        assert_eq!(ids("name:pian"), vec![named.to_string()]);
+        assert_eq!(ids("title:hai"), vec![titled.to_string()]);
+        // …and the converse: the title's pinyin does not answer a tag ask.
+        assert!(ids("tag:hai").is_empty(), "{:?}", ids("tag:hai"));
+        // Unqualified, the syllable is found on every surface that carries it.
+        let mut both = ids("mao");
+        both.sort();
+        assert_eq!(both, vec![tagged.to_string(), catnamed.to_string()]);
     }
 
     /// A pool that comes back exactly full is gathered again, wider, when
