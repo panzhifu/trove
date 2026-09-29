@@ -49,9 +49,8 @@ pub const LICENSE_KEYS: &[(u8, [u8; 32])] = &[(KEY_ID_1, PUBLIC_KEY_1)];
 
 /// The issuing key with id [`KEY_ID_1`], printed by `trove-issuer init`.
 const PUBLIC_KEY_1: [u8; 32] = [
-    0x51, 0x58, 0x03, 0xe2, 0x59, 0x0a, 0x54, 0x9c, 0x15, 0xca, 0x91, 0xc3, 0xa3, 0xc1, 0x3f,
-    0x28, 0x28, 0x65, 0xad, 0xf2, 0x1b, 0x47, 0xad, 0xf3, 0x7e, 0xce, 0xed, 0xfe, 0x77, 0xc5,
-    0x15, 0xe2,
+    0x51, 0x58, 0x03, 0xe2, 0x59, 0x0a, 0x54, 0x9c, 0x15, 0xca, 0x91, 0xc3, 0xa3, 0xc1, 0x3f, 0x28,
+    0x28, 0x65, 0xad, 0xf2, 0x1b, 0x47, 0xad, 0xf3, 0x7e, 0xce, 0xed, 0xfe, 0x77, 0xc5, 0x15, 0xe2,
 ];
 
 /// Payload 21 bytes + signature 64 bytes.
@@ -68,7 +67,8 @@ const EPOCH: NaiveDate = match NaiveDate::from_ymd_opt(1970, 1, 1) {
 static CROCKFORD: LazyLock<data_encoding::Encoding> = LazyLock::new(|| {
     let mut spec = Specification::new();
     spec.symbols = "0123456789ABCDEFGHJKMNPQRSTVWXYZ".to_string();
-    spec.encoding().expect("the Crockford specification is valid")
+    spec.encoding()
+        .expect("the Crockford specification is valid")
 });
 
 /// What a verified key says.
@@ -228,7 +228,10 @@ pub fn blob_from_parts(payload: &[u8; PAYLOAD_LEN], signature: &[u8; 64]) -> [u8
 /// folded — `O`→`0`, `I`/`L`→`1` — before a strict decode.
 fn decode(key_text: &str) -> Result<[u8; BLOB_LEN], LicenseError> {
     let upper = key_text.to_uppercase();
-    let stripped: String = upper.chars().filter(|c| !matches!(c, '-' | ' ' | '\t')).collect();
+    let stripped: String = upper
+        .chars()
+        .filter(|c| !matches!(c, '-' | ' ' | '\t'))
+        .collect();
     let body = stripped.strip_prefix("TROVE").unwrap_or(&stripped);
     let folded: String = body
         .chars()
@@ -310,8 +313,9 @@ mod tests {
         assert_ne!(mangled, key);
         let license = verify_with_key(&mangled, KEY_ID_1, &verifying.to_bytes(), None).unwrap();
         assert_eq!(license.serial, 7);
-        assert!(verify_with_key(&key[..key.len() - 1], KEY_ID_1, &verifying.to_bytes(), None)
-            .is_err());
+        assert!(
+            verify_with_key(&key[..key.len() - 1], KEY_ID_1, &verifying.to_bytes(), None).is_err()
+        );
     }
 
     /// A flipped character anywhere fails closed, and so does a key from a
@@ -334,7 +338,12 @@ mod tests {
         let mut foreign = payload_for(1, PERPETUAL);
         foreign[0] = 0x02; // another product
         assert_eq!(
-            verify_with_key(&signed_key(&foreign, &signing), KEY_ID_1, &verifying.to_bytes(), None),
+            verify_with_key(
+                &signed_key(&foreign, &signing),
+                KEY_ID_1,
+                &verifying.to_bytes(),
+                None
+            ),
             Err(LicenseError::Signature)
         );
 
@@ -384,8 +393,13 @@ mod tests {
 
         let perpetual = signed_key(&payload_for(4, PERPETUAL), &signing);
         assert!(
-            verify_with_key(&perpetual, KEY_ID_1, &vk, Some(date_from_days(65_000).unwrap()))
-                .is_ok()
+            verify_with_key(
+                &perpetual,
+                KEY_ID_1,
+                &vk,
+                Some(date_from_days(65_000).unwrap())
+            )
+            .is_ok()
         );
     }
 
@@ -408,6 +422,10 @@ mod tests {
         };
         let license = verify(&key, None).expect("the issued key verifies end to end");
         assert_eq!(license.edition, EDITION_STANDARD);
-        println!("e2e: serial {}, licensee {}", license.serial, license.licensee_hex());
+        println!(
+            "e2e: serial {}, licensee {}",
+            license.serial,
+            license.licensee_hex()
+        );
     }
 }

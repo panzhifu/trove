@@ -133,7 +133,9 @@ impl LicenseGate {
 mod tests {
     use super::*;
     use ed25519_dalek::{Signer as _, SigningKey};
-    use trove_core::license::{blob_from_parts, format_blob, EDITION_STANDARD, KEY_ID_1, PRODUCT_TROVE};
+    use trove_core::license::{
+        EDITION_STANDARD, KEY_ID_1, PRODUCT_TROVE, blob_from_parts, format_blob,
+    };
 
     /// `activate` verifies before it writes: a key signed by some other
     /// keypair — the common forgery, and the everyday typo — is refused and
@@ -172,11 +174,18 @@ mod tests {
 
         let until = chrono::NaiveDate::from_ymd_opt(2027, 9, 29).unwrap();
         assert_eq!(
-            classify(Err(LicenseError::UpdatesExpired { until, build: until })),
+            classify(Err(LicenseError::UpdatesExpired {
+                until,
+                build: until
+            })),
             LicenseStatus::Expired { until }
         );
 
-        for failure in [LicenseError::Encoding, LicenseError::Signature, LicenseError::Payload] {
+        for failure in [
+            LicenseError::Encoding,
+            LicenseError::Signature,
+            LicenseError::Payload,
+        ] {
             assert!(matches!(
                 classify(Err(failure)),
                 LicenseStatus::NotActivated
@@ -196,7 +205,10 @@ mod tests {
         };
         assert!(free.permits_import(0));
         assert!(free.permits_import((FREE_ASSET_CAP - 1) as u64));
-        assert!(!free.permits_import(FREE_ASSET_CAP as u64), "the library is full");
+        assert!(
+            !free.permits_import(FREE_ASSET_CAP as u64),
+            "the library is full"
+        );
         assert!(!free.permits_import(FREE_ASSET_CAP as u64 + 7));
 
         let licensed = LicenseGate {

@@ -7,10 +7,10 @@
 use super::*;
 use crate::app::settings_write;
 use crate::components::controls::muted_label;
+use gpui_kit::component::WindowExt as _;
 use gpui_kit::component::dialog::DialogButtonProps;
 use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::component::notification::Notification;
-use gpui_kit::component::WindowExt as _;
 use trove_core::services::update::{self, UpdateState};
 
 /// Sentinel value for the "follow the system language" choice, which the
@@ -159,7 +159,6 @@ fn version_row(cx: &mut App) -> Div {
     column
 }
 
-
 // ================================ license ====================================
 
 /// About ▸ License: the offline activation state, and the way into it.
@@ -271,8 +270,8 @@ fn license_actions(_cx: &mut App) -> Div {
                 }),
         ),
         crate::license::LicenseStatus::NotActivated
-        | crate::license::LicenseStatus::Expired { .. } => {
-            row.child(
+        | crate::license::LicenseStatus::Expired { .. } => row
+            .child(
                 Button::new("license-how-to-get")
                     .ghost()
                     .small()
@@ -285,8 +284,7 @@ fn license_actions(_cx: &mut App) -> Div {
                     .small()
                     .label(rust_i18n::t!("settings.license_activate").to_string())
                     .on_click(|_, window, cx| open_activation_dialog(window, cx)),
-            )
-        }
+            ),
     }
 }
 

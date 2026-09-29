@@ -33,7 +33,10 @@ fn main() {
     // staleness is harmless for that purpose; std's epoch seconds through
     // civil-from-days, because a build dependency just to format a date
     // could re-resolve the lockfile (see the crate comment above).
-    println!("cargo:rustc-env=TROVE_BUILD_DATE={}", civil_from_days(now_days()));
+    println!(
+        "cargo:rustc-env=TROVE_BUILD_DATE={}",
+        civil_from_days(now_days())
+    );
 
     let out = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR is set by cargo"));
     let mut generated = String::from(

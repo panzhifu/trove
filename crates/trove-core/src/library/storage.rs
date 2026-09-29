@@ -36,7 +36,10 @@ impl Library {
     pub fn asset_count(&self) -> u64 {
         crate::store::rows::query_count(
             self.store.conn(),
-            &format!("SELECT COUNT(*) FROM assets WHERE {}", crate::store::LIVE_ROWS),
+            &format!(
+                "SELECT COUNT(*) FROM assets WHERE {}",
+                crate::store::LIVE_ROWS
+            ),
             vec![],
         )
         .unwrap_or(0)

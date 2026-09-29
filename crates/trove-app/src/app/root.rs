@@ -773,7 +773,8 @@ impl AppView {
                                     // the outcome would have been a no-op too.
                                     match jobs::collect_inbox_app(&ctl, window, cx) {
                                         jobs::InboxDrain::Started | jobs::InboxDrain::Idle => {}
-                                        jobs::InboxDrain::Refused | jobs::InboxDrain::CapReached => {
+                                        jobs::InboxDrain::Refused
+                                        | jobs::InboxDrain::CapReached => {
                                             window.push_notification(
                                                 Notification::info(
                                                     rust_i18n::t!(

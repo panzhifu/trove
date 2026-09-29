@@ -1972,12 +1972,14 @@ fn asset_count_measures_live_rows() {
     assert_eq!(lib.asset_count(), 0);
 
     let one = write_source(&root, "one.png", PNG_1X1);
-    lib.import_into_store(std::slice::from_ref(&one), None).unwrap();
+    lib.import_into_store(std::slice::from_ref(&one), None)
+        .unwrap();
     assert_eq!(lib.asset_count(), 1);
 
     // Different bytes, or the store's content dedup collapses the pair.
     let two = write_source(&root, "two.png", b"a different picture");
-    lib.import_into_store(std::slice::from_ref(&two), None).unwrap();
+    lib.import_into_store(std::slice::from_ref(&two), None)
+        .unwrap();
     assert_eq!(lib.asset_count(), 2);
 
     let first = assets::query(lib.store().conn(), &AssetQuery::live())
