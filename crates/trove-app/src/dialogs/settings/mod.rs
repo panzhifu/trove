@@ -395,7 +395,7 @@ impl SettingsView {
 }
 
 impl Render for SettingsView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // Pages are rebuilt per render so a live language switch (via
         // `refresh_windows`) re-localizes every title.
         let stats = self.stats.clone();
@@ -430,6 +430,15 @@ impl Render for SettingsView {
             .into_iter()
             .fold(settings, |settings, page| settings.page(page));
 
+        // Dialogs and toasts are layers the window's root view has to draw
+        // itself: without these children a `window.open_dialog` (the license
+        // activation box, the snapshot-restore confirmation) exists in state
+        // but never paints, and a `push_notification` shows nothing — which
+        // reads as "the button does nothing". The main window and the library
+        // manager both render these; the settings window must too.
+        let dialog_layer = Root::render_dialog_layer(window, cx);
+        let notification_layer = Root::render_notification_layer(window, cx);
+
         // Client-side decorations are forced app-wide, so this window draws
         // its own (title + gpui-kit's min/max/close controls).
         v_flex()
@@ -446,5 +455,7 @@ impl Render for SettingsView {
                 ),
             )
             .child(settings)
+            .children(dialog_layer)
+            .children(notification_layer)
     }
 }

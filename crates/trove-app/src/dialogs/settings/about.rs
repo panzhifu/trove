@@ -277,11 +277,7 @@ fn license_actions(_cx: &mut App) -> Div {
                     .ghost()
                     .small()
                     .label(rust_i18n::t!("settings.license_how_to_get").to_string())
-                    .on_click(|_, _, _| {
-                        let _ = trove_core::services::open_external::open_url(
-                            crate::license::PURCHASE_URL,
-                        );
-                    }),
+                    .on_click(|_, window, cx| open_license_info_dialog(window, cx)),
             )
             .child(
                 Button::new("license-activate")
@@ -363,6 +359,55 @@ fn open_activation_dialog(window: &mut Window, cx: &mut App) {
                         false
                     }
                 }
+            })
+    });
+}
+
+/// The "how to get a key" door: what the free tier is, what a license buys,
+/// and where to go next.
+///
+/// It does not jump straight to a storefront because there is not one to jump
+/// to yet — and because a bare link told the user nothing about what they were
+/// buying. The dialog spells out the terms the key actually encodes (a
+/// per-library cap lifted, one year of updates, everything already received
+/// keeps working), then offers the purchase page and a human address for the
+/// purchase that goes wrong.
+fn open_license_info_dialog(window: &mut Window, cx: &mut App) {
+    window.open_dialog(cx, |dialog, _, cx| {
+        dialog
+            .title(rust_i18n::t!("settings.license_get_title").to_string())
+            .width(px(560.))
+            .close_button(false)
+            .child(
+                v_flex()
+                    .gap_2()
+                    .p_1()
+                    .child(
+                        div().text_sm().text_color(cx.theme().foreground).child(
+                            rust_i18n::t!(
+                                "settings.license_get_body",
+                                cap = crate::license::FREE_ASSET_CAP
+                            )
+                            .to_string(),
+                        ),
+                    )
+                    .child(muted_label(
+                        rust_i18n::t!(
+                            "settings.license_get_contact",
+                            email = crate::license::CONTACT_EMAIL
+                        )
+                        .to_string(),
+                        cx,
+                    )),
+            )
+            .button_props(
+                DialogButtonProps::default()
+                    .ok_text(rust_i18n::t!("settings.license_get_buy").to_string())
+                    .show_cancel(true),
+            )
+            .on_ok(|_, _, _| {
+                let _ = trove_core::services::open_external::open_url(crate::license::PURCHASE_URL);
+                true
             })
     });
 }

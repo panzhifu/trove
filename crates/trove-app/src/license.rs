@@ -13,10 +13,17 @@
 use chrono::NaiveDate;
 use trove_core::license::{self, License, LicenseError};
 
-/// Where the settings page's "how to get a license" button sends people. The
-/// LICENSE notice points commercial inquiries at this repository; aim it at
-/// the store page once one exists.
+/// Where the license-info dialog's "buy" button sends people. Aim this at the
+/// store listing once one exists (the plan is an Afdian/Mianbaoduo listing for
+/// domestic buyers); the repository is only a placeholder until then, so a
+/// click there does not strand anyone on a page that cannot sell them a key.
 pub const PURCHASE_URL: &str = "https://github.com/panzhifu/trove";
+
+/// Support address shown in the license-info dialog. Buying is asynchronous
+/// (pay, then a key arrives by mail), so there has to be a human on the other
+/// end for the sale that goes sideways — a wrong address, a lost key, a
+/// renewal.
+pub const CONTACT_EMAIL: &str = "noke601508@outlook.com";
 
 /// How many assets one library holds on the free tier. Deliberately a
 /// constant: tuning the funnel is a one-line change away, and the honest
