@@ -15,6 +15,9 @@ smallvec = { workspace = true }
 serde_json = { workspace = true }
 uuid = { workspace = true }
 rust-i18n = { workspace = true }
+# The license module's dates: build date, update-coverage end. Already
+# compiled in the graph via trove-core; this adds no crates.
+chrono = { workspace = true }
 # Parses plugins' own language files at startup. toml 0.8 already rides in
 # the graph via rust-i18n's loader, so this adds no compiled crates.
 toml = "0.8"
@@ -36,3 +39,6 @@ naga = { version = "29", features = ["wgsl-in"] }
 # GIF encoder has no per-frame API, so the crate that reads an animated GIF
 # cannot produce one. Already in the graph at this version via `image`.
 gif = "0.13"
+# Signs a throwaway key for the license-activation refusal test: the test
+# proves a foreign signature is rejected before anything is stored.
+ed25519-dalek = { workspace = true }

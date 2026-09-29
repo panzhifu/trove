@@ -148,6 +148,12 @@ pub struct AppConfig {
     /// next release after it is announced as usual.
     #[serde(default)]
     pub skipped_version: Option<String>,
+    /// The activated license key, stored verbatim (the signed `TROVE-…`
+    /// string). Verified against the built-in public key before it is trusted
+    /// — a corrupted or foreign entry reads as "not activated", never as a
+    /// crash — see [`crate::license`].
+    #[serde(default)]
+    pub license: Option<String>,
     /// Plugin names switched off by the user (see [`crate::plugins`]). Read
     /// once per process — the import pipeline snapshots its stages on first
     /// import — so a toggle takes effect on the next launch.

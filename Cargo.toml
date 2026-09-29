@@ -71,6 +71,15 @@ thiserror = "2"
 uuid = { version = "1", features = ["v4", "serde"] }
 dirs = "5"
 
+# Offline license keys: Ed25519 signatures over a 21-byte payload, spelled in
+# Crockford Base32 so a pasted key survives case, dashes and confusable
+# characters. `ed25519-dalek` verifies against a public key baked into the
+# binary; the signing key never leaves the private issuer tool that shares
+# this module's byte layout. `data-encoding` supplies the Base32 codec with a
+# custom (Crockford) alphabet.
+ed25519-dalek = "2"
+data-encoding = "2"
+
 # Logging. `tracing` is the facade in both crates; `trove-app` installs the
 # single global subscriber (stderr + a file under the config dir, filtered
 # by RUST_LOG). tracing-subscriber already rides in the graph via gpui-pre

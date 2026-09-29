@@ -65,6 +65,10 @@ jieba-rs = "0.7"
 # either (markup5ever pins it), so upgrading only adds phf_codegen 0.13 as a
 # second copy. Revisit once html5ever moves to phf 0.13.
 pinyin = "0.10"
+# Offline license keys (see the note in the workspace manifest): signature
+# verification and the Crockford Base32 codec for the pasted key text.
+ed25519-dalek = { workspace = true }
+data-encoding = { workspace = true }
 
 [dev-dependencies]
 # Only to *write* a fixture: the tests need a real OpenEXR file to prove the

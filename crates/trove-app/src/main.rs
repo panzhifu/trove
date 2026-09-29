@@ -28,6 +28,7 @@ mod components;
 mod dialogs;
 mod fonts;
 mod library;
+mod license;
 mod panels;
 mod plugins;
 

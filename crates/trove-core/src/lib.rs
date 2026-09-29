@@ -8,6 +8,7 @@ pub mod history;
 pub mod keybindings;
 pub mod layout;
 pub mod library;
+pub mod license;
 pub mod logging;
 pub mod media;
 pub mod metrics;
