@@ -244,13 +244,26 @@ fn license_actions(_cx: &mut App) -> Div {
                 }),
         ),
         crate::license::LicenseStatus::NotActivated
-        | crate::license::LicenseStatus::Expired { .. } => row.child(
-            Button::new("license-activate")
-                .outline()
-                .small()
-                .label(rust_i18n::t!("settings.license_activate").to_string())
-                .on_click(|_, window, cx| open_activation_dialog(window, cx)),
-        ),
+        | crate::license::LicenseStatus::Expired { .. } => {
+            row.child(
+                Button::new("license-how-to-get")
+                    .ghost()
+                    .small()
+                    .label(rust_i18n::t!("settings.license_how_to_get").to_string())
+                    .on_click(|_, _, _| {
+                        let _ = trove_core::services::open_external::open_url(
+                            crate::license::PURCHASE_URL,
+                        );
+                    }),
+            )
+            .child(
+                Button::new("license-activate")
+                    .outline()
+                    .small()
+                    .label(rust_i18n::t!("settings.license_activate").to_string())
+                    .on_click(|_, window, cx| open_activation_dialog(window, cx)),
+            )
+        }
     }
 }
 
@@ -258,11 +271,16 @@ fn license_actions(_cx: &mut App) -> Div {
 /// button verifies before it closes — a bad key keeps the dialog up with an
 /// explanation, so nothing retyped on a second try.
 fn open_activation_dialog(window: &mut Window, cx: &mut App) {
-    window.open_dialog(cx, |dialog, window, cx| {
-        let key_input = cx.new(|cx| {
-            InputState::new(window, cx)
-                .placeholder(rust_i18n::t!("settings.license_key_placeholder").to_string())
-        });
+    // The input entity lives *outside* the builder: the dialog's content
+    // closure re-runs per frame, and an entity created inside would be
+    // rebuilt under every keystroke — no focus, no typing (the same shape
+    // prompt_import_url and the tag dialogs already use).
+    let key_input = cx.new(|cx| {
+        InputState::new(window, cx)
+            .placeholder(rust_i18n::t!("settings.license_key_placeholder").to_string())
+    });
+    window.open_dialog(cx, move |dialog, _, cx| {
+        let key_input = key_input.clone();
         dialog
             .title(rust_i18n::t!("settings.license_dialog_title").to_string())
             .width(px(520.))

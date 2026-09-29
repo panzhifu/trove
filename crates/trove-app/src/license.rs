@@ -13,6 +13,11 @@
 use chrono::NaiveDate;
 use trove_core::license::{self, License, LicenseError};
 
+/// Where the settings page's "how to get a license" button sends people. The
+/// LICENSE notice points commercial inquiries at this repository; aim it at
+/// the store page once one exists.
+pub const PURCHASE_URL: &str = "https://github.com/panzhifu/trove";
+
 use crate::app::settings_write;
 
 /// The running build's release date, stamped by `build.rs`. `None` means the

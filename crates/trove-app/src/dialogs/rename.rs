@@ -33,18 +33,24 @@ impl RenameDialog {
             return;
         }
         let controller = controller.clone();
-        window.open_dialog(cx, move |dialog, window, cx| {
-            let pattern = cx.new(|cx| {
-                InputState::new(window, cx)
-                    .placeholder(rust_i18n::t!("rename.pattern_hint").to_string())
-            });
-            let start = cx.new(|cx| InputState::new(window, cx).placeholder("1"));
-            let draft = cx.new(|_| RenameDraft {
-                pattern: pattern.clone(),
-                start: start.clone(),
-                selection: selection.clone(),
-                controller: controller.clone(),
-            });
+        // The inputs and the draft live outside the builder: the dialog's
+        // content closure re-runs per frame, and an entity created inside
+        // would be rebuilt under every keystroke — no focus, no typing (the
+        // shape prompt_import_url and the tag dialogs already use).
+        let pattern = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder(rust_i18n::t!("rename.pattern_hint").to_string())
+        });
+        let start = cx.new(|cx| InputState::new(window, cx).placeholder("1"));
+        let draft = cx.new(|_| RenameDraft {
+            pattern: pattern.clone(),
+            start: start.clone(),
+            selection: selection.clone(),
+            controller: controller.clone(),
+        });
+        window.open_dialog(cx, move |dialog, _, cx| {
+            let pattern = pattern.clone();
+            let start = start.clone();
             let draft_ok = draft.clone();
             dialog
                 .title(rust_i18n::t!("rename.title").to_string())
