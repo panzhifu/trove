@@ -133,7 +133,13 @@ fn watch_signals(
                         let outcome = handle.update(cx, |_view, window, cx| {
                             collect_inbox_app(&controller, window, cx)
                         });
-                        inbox_pending = matches!(outcome, Ok(InboxDrain::Refused));
+                        // `CapReached` keeps the retry loop alive too: the
+                        // files stay pending until activation or deletion
+                        // reopens the free tier's door.
+                        inbox_pending = matches!(
+                            outcome,
+                            Ok(InboxDrain::Refused) | Ok(InboxDrain::CapReached)
+                        );
                     }
                     Ok(WatchSignal::Files(files)) => pending.extend(files),
                     Err(std::sync::mpsc::TryRecvError::Empty) => break,
@@ -154,7 +160,7 @@ fn watch_signals(
                     }
                     collect_inbox_app(&controller, window, cx)
                 });
-                if !matches!(outcome, Ok(InboxDrain::Refused)) {
+                if !matches!(outcome, Ok(InboxDrain::Refused | InboxDrain::CapReached)) {
                     inbox_pending = false;
                 }
             }

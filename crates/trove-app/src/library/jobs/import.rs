@@ -114,6 +114,32 @@ pub fn import_paths_app_into(
     )
 }
 
+/// The free tier's import gate: `true` when this install is not licensed and
+/// the open library already holds [`crate::license::FREE_ASSET_CAP`] live
+/// assets. The caller decides how loudly to say so.
+fn cap_refused(library: &trove_core::library::Library) -> bool {
+    !crate::license::LicenseGate::for_current().permits_import(library.asset_count())
+}
+
+/// Put the refusal on the controller's notice — the same status line every
+/// import outcome speaks through. Whoever dropped the files is watching, and
+/// pointing at the decision is the conversion moment. The write is guarded on
+/// equality, so a background pump ticking over a full library does not repaint
+/// the UI every interval; existing assets are never touched by the gate.
+fn set_cap_notice(controller: &Entity<LibraryController>, cx: &mut App) {
+    controller.update(cx, |ctl, cx| {
+        let message = rust_i18n::t!(
+            "workspace.import_cap_reached",
+            cap = crate::license::FREE_ASSET_CAP
+        )
+        .to_string();
+        if ctl.notice.as_deref() != Some(message.as_str()) {
+            ctl.notice = Some(message);
+            cx.notify();
+        }
+    });
+}
+
 /// The shared importer entry: snapshot everything the job needs from the
 /// controller, then hand off.
 fn start_paths_import(
@@ -125,6 +151,19 @@ fn start_paths_import(
     cx: &mut App,
 ) -> bool {
     if paths.is_empty() {
+        return false;
+    }
+
+    // The free tier's import gate. One shared check covers every door that
+    // funnels through here — buttons, file drops, clipboard pastes, capture,
+    // conversion — so a library past its cap simply refuses new imports
+    // while everything already inside stays fully usable.
+    let refused_by_cap = {
+        let ctl = controller.read(cx);
+        cap_refused(&ctl.library)
+    };
+    if refused_by_cap {
+        set_cap_notice(controller, cx);
         return false;
     }
 
@@ -187,6 +226,10 @@ pub enum InboxDrain {
     Refused,
     /// Nothing was waiting, or the library already holds every waiting file.
     Idle,
+    /// The free tier's cap: the waiting files stay in the inbox until the
+    /// license is activated or space frees up. The pump treats this like
+    /// `Refused` — retry on a later tick — without shouting every time.
+    CapReached,
 }
 
 /// Drain the collect-service inbox: import every waiting file (unfiled,
@@ -208,6 +251,11 @@ pub fn collect_inbox_app(
         return InboxDrain::Idle;
     }
 
+    // The gate runs only when files are actually waiting: an idle tick over
+    // a full library must not shout. `CapReached` (not `Idle`) keeps the
+    // pump's retry loop alive, so the batch lands on its own once the
+    // license is activated or space frees up.
+    let cap_reached;
     let (manager, options, total) = {
         let ctl = controller.read(cx);
         if ctl.is_importing() {
@@ -218,6 +266,7 @@ pub fn collect_inbox_app(
             tracing::debug!("collect inbox: nothing waiting that the library lacks");
             return InboxDrain::Idle;
         }
+        cap_reached = cap_refused(&ctl.library);
         let total = items.len();
         let options = ImportOptions {
             data_root: ctl.library.root().to_path_buf(),
@@ -229,6 +278,10 @@ pub fn collect_inbox_app(
         };
         (ctl.library.tasks().clone(), options, total)
     };
+    if cap_reached {
+        set_cap_notice(controller, cx);
+        return InboxDrain::CapReached;
+    }
 
     if start_import_job(
         controller,

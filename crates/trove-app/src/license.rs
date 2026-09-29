@@ -18,6 +18,12 @@ use trove_core::license::{self, License, LicenseError};
 /// the store page once one exists.
 pub const PURCHASE_URL: &str = "https://github.com/panzhifu/trove";
 
+/// How many assets one library holds on the free tier. Deliberately a
+/// constant: tuning the funnel is a one-line change away, and the honest
+/// framing is per library ("免费版每库 N 条") rather than an enforceable
+/// global quota.
+pub const FREE_ASSET_CAP: usize = 500;
+
 use crate::app::settings_write;
 
 /// The running build's release date, stamped by `build.rs`. `None` means the
@@ -89,6 +95,33 @@ pub fn deactivate() {
     }
 }
 
+/// The import gate: what every import door consults before starting a job.
+///
+/// An active license removes the cap entirely. An expired or absent one
+/// leaves the cap on — and per the standing policy, neither state ever
+/// touches what is already in the library: past the cap, new imports are
+/// refused while browsing, editing, deleting and exporting stay free.
+pub struct LicenseGate {
+    licensed: bool,
+    cap: usize,
+}
+
+impl LicenseGate {
+    /// The gate as the running installation sees it right now.
+    pub fn for_current() -> Self {
+        Self {
+            licensed: matches!(current(), LicenseStatus::Active(_)),
+            cap: FREE_ASSET_CAP,
+        }
+    }
+
+    /// Whether an import may start given the library's current asset count.
+    /// At exactly the cap the answer is no — the library is full.
+    pub fn permits_import(&self, asset_count: u64) -> bool {
+        self.licensed || (asset_count as usize) < self.cap
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -142,5 +175,28 @@ mod tests {
                 LicenseStatus::NotActivated
             ));
         }
+    }
+
+    /// The gate's decision matrix: below the cap an unlicensed install
+    /// imports, at exactly the cap it refuses (the library is full), past it
+    /// too — and an active license ignores the cap entirely. The count side
+    /// (`Library::asset_count`) is tested against a real store in trove-core.
+    #[test]
+    fn the_free_cap_refuses_imports_only_at_and_past_the_cap() {
+        let free = LicenseGate {
+            licensed: false,
+            cap: FREE_ASSET_CAP,
+        };
+        assert!(free.permits_import(0));
+        assert!(free.permits_import((FREE_ASSET_CAP - 1) as u64));
+        assert!(!free.permits_import(FREE_ASSET_CAP as u64), "the library is full");
+        assert!(!free.permits_import(FREE_ASSET_CAP as u64 + 7));
+
+        let licensed = LicenseGate {
+            licensed: true,
+            cap: FREE_ASSET_CAP,
+        };
+        assert!(licensed.permits_import(FREE_ASSET_CAP as u64));
+        assert!(licensed.permits_import(u64::MAX));
     }
 }

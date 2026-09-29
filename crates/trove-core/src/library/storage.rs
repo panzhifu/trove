@@ -29,6 +29,20 @@ impl Library {
         crate::store::stats::library_stats(self.store.conn())
     }
 
+    /// How many live assets the library currently holds — the number the
+    /// license gate measures against its free-tier cap. Trashed rows do not
+    /// count (emptying the trash reopens the door), and one indexed COUNT(*)
+    /// is cheap enough to read at import time rather than cache and drift.
+    pub fn asset_count(&self) -> u64 {
+        crate::store::rows::query_count(
+            self.store.conn(),
+            &format!("SELECT COUNT(*) FROM assets WHERE {}", crate::store::LIVE_ROWS),
+            vec![],
+        )
+        .unwrap_or(0)
+        .max(0) as u64
+    }
+
     pub(super) fn reconcile_search_index(&self) -> Result<()> {
         let conn = self.store.conn();
         let assets_total = rows::query_count(conn, "SELECT COUNT(*) FROM assets", vec![])?;

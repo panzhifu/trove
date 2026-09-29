@@ -57,7 +57,7 @@ pub(super) fn about_page(controller: &Entity<LibraryController>) -> SettingPage 
                     ),
                 )),
         )
-        .group(license_group())
+        .group(license_group(&controller))
         .group(language_group(controller))
 }
 
@@ -170,8 +170,9 @@ fn version_row(cx: &mut App) -> Div {
 /// door open: renewal is the same dialog as first activation, and the
 /// covered builds keep working either way. Nothing here can lock the
 /// library.
-fn license_group() -> SettingGroup {
-    SettingGroup::new()
+fn license_group(controller: &Entity<LibraryController>) -> SettingGroup {
+    let status = crate::license::current();
+    let mut group = SettingGroup::new()
         .title(rust_i18n::t!("settings.license").to_string())
         .item(
             SettingItem::new(
@@ -179,7 +180,33 @@ fn license_group() -> SettingGroup {
                 SettingField::render(|_, _, cx| license_actions(cx)),
             )
             .description(license_summary()),
-        )
+        );
+
+    // The free tier's meter, next to the decision that clears it. Rendered
+    // live off the open library, like every other row on this page; an
+    // activated install has no cap, so the row would only be noise.
+    if !matches!(status, crate::license::LicenseStatus::Active(_)) {
+        let controller = controller.clone();
+        group = group.item(
+            SettingItem::new(
+                rust_i18n::t!("settings.license_usage").to_string(),
+                SettingField::render(move |_, _, cx| {
+                    let count = controller.read(cx).library.asset_count();
+                    muted_label(
+                        rust_i18n::t!(
+                            "settings.license_usage_value",
+                            count = count,
+                            cap = crate::license::FREE_ASSET_CAP
+                        )
+                        .to_string(),
+                        cx,
+                    )
+                }),
+            )
+            .description(rust_i18n::t!("settings.license_usage_desc").to_string()),
+        );
+    }
+    group
 }
 
 /// One line of prose describing the current state — the SettingItem's
