@@ -30,7 +30,23 @@ pub const MAX_STOPS: f32 = 10.0;
 /// [`image::open`] so a high-dynamic-range file cannot quietly contribute a
 /// near-black hash or a one-colour palette.
 pub fn open_for_display(path: &Path) -> ImageResult<DynamicImage> {
-    image::open(path).map(|image| tonemap(image, 0.0))
+    open_for_display_at(path, 0.0)
+}
+
+/// [`open_for_display`] at an explicit exposure: the same display transform
+/// with `stops` of gain over the default. This is what the preview's exposure
+/// control calls on every committed slider value — a full float re-decode of
+/// the original, which is why the control commits on release and decodes off
+/// the UI thread rather than continuously.
+pub fn open_for_display_at(path: &Path, stops: f32) -> ImageResult<DynamicImage> {
+    image::open(path).map(|image| tonemap(image, stops))
+}
+
+/// Whether `ext` decodes into a scene-linear float buffer — the only inputs
+/// [`tonemap`] actually transforms. Every other image comes back from it
+/// untouched, so the exposure control has nothing to offer them.
+pub fn is_scene_linear_ext(ext: &str) -> bool {
+    matches!(ext, "exr" | "hdr")
 }
 
 /// Fold a decoded image into 8-bit display values at `stops` over the default
@@ -277,6 +293,19 @@ mod tests {
         assert!(image::open(&card).is_ok(), "the card is a readable JPEG");
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The exposure control is offered exactly where the transform answers:
+    /// the two float containers. An encoded image would show the slider but
+    /// the picture would never move — the lie the list exists to prevent.
+    #[test]
+    fn only_the_float_containers_offer_exposure() {
+        for ext in ["exr", "hdr"] {
+            assert!(is_scene_linear_ext(ext), "{ext} maps");
+        }
+        for ext in ["png", "jpg", "tga", "tif", "webp", "exrs", ""] {
+            assert!(!is_scene_linear_ext(ext), "{ext} must not map");
+        }
     }
 
     /// A TGA gets its size from a branch that names the format, because the

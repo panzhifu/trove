@@ -19,9 +19,17 @@ use trove_core::model::AssetKind;
 
 use super::{AssetPreviewData, fallback};
 
-/// Full-size still for the main area: animated source when the file can
-/// play frames, thumbnail otherwise, kind icon when there is neither.
+/// Full-size still for the main area: the exposure-mapped render when the
+/// preview's exposure control has produced one, animated source when the file
+/// can play frames, thumbnail otherwise, kind icon when there is neither.
 pub(super) fn still(data: &AssetPreviewData) -> AnyElement {
+    if let Some(source) = &data.exposed {
+        return img(source.clone())
+            .max_h_full()
+            .max_w_full()
+            .object_fit(ObjectFit::Contain)
+            .into_any_element();
+    }
     if let Some(source) = &data.animated {
         return img(source.clone())
             .max_h_full()
@@ -89,4 +97,22 @@ pub(super) fn compact(data: &AssetPreviewData, cx: &App) -> AnyElement {
             .into_any_element(),
         None => fallback::icon_card(data.kind, cx),
     }
+}
+
+/// Decode the original at `stops` and hand it over as a render image — one
+/// full float decode of the original folded through the display transform.
+/// This is the cost the exposure control's "commit on release" exists for:
+/// a 4K render pass is tens of megabytes of pixels and hundreds of megabytes
+/// of float samples on the way, so it runs on a background thread and the
+/// stage keeps the previous picture until this lands.
+///
+/// The frame comes out BGRA, the layout gpui's renderer expects — the same
+/// swap the animated decoder in `panels::common` does.
+pub(super) fn decode_exposed(path: &std::path::Path, stops: f32) -> Option<gpui_kit::RenderImage> {
+    let image = trove_core::media::hdr::open_for_display_at(path, stops).ok()?;
+    let mut frame = image::Frame::new(image.to_rgba8());
+    for pixel in frame.buffer_mut().as_chunks_mut::<4>().0 {
+        pixel.swap(0, 2);
+    }
+    Some(gpui_kit::RenderImage::new([frame]))
 }

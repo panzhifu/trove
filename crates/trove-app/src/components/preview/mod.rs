@@ -38,9 +38,11 @@ mod video;
 pub(crate) use model::{ModelViewport, ModelViewportEvent};
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use gpui_kit::base::{ElementExt as _, v_flex};
 use gpui_kit::component::ActiveTheme;
+use gpui_kit::component::slider::{SliderEvent, SliderState};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use uuid::Uuid;
@@ -206,6 +208,12 @@ pub(crate) struct AssetPreviewData {
     pub(crate) poster: Option<PathBuf>,
     /// Full-size original: the library blob, or the linked source.
     pub(crate) original: Option<PathBuf>,
+    /// The exposure-mapped render of [`Self::original`], when the preview's
+    /// exposure control has produced one. Session state attached by the panel
+    /// rather than something the record resolves — a scene-linear file shows
+    /// its thumbnail until the user moves the slider, and shows it again the
+    /// moment the slider returns to zero.
+    pub(crate) exposed: Option<gpui_kit::ImageSource>,
     /// Animated image source (GIF / animated WebP / APNG) when the original
     /// file can play frames.
     pub(crate) animated: Option<gpui_kit::ImageSource>,
@@ -337,6 +345,7 @@ impl AssetPreviewData {
             thumb,
             poster,
             original,
+            exposed: None,
             animated,
             font_family: asset.facts.font.family.clone(),
             dimensions: asset.width.zip(asset.height),
@@ -448,6 +457,22 @@ pub(crate) struct AssetPreviewPanel {
     /// refuses falls back to its thumbnail still, which only zooms when the
     /// asset carries dimensions).
     font_live: bool,
+    /// The committed exposure, in stops, behind [`AssetPreviewData::exposed`].
+    /// `0.0` means "no exposure applied" and no render exists; any other value
+    /// means a decode was asked for (or finished) at this exact value.
+    stops: f32,
+    /// The exposure rail, owned here so the toolbar's popover can render it
+    /// and this panel receives its releases.
+    exposure: Entity<SliderState>,
+    /// Every render the exposure control has produced this session, kept
+    /// alive so `release` can hand them back to the window — gpui's sprite
+    /// atlas never evicts on its own, and each committed slider value decodes
+    /// a fresh full-size image.
+    exposure_images: Vec<Arc<gpui_kit::RenderImage>>,
+    /// Bumps on every exposure request; a decode that lands after a newer
+    /// request (the user moved the slider again mid-decode) is dropped instead
+    /// of overwriting the newer answer.
+    exposure_generation: u64,
     /// Pan/zoom of the flat stage — the still or the specimen.
     pan: PanZoom,
     /// Measured content-viewport size; the fit base for the zoom math.
@@ -556,20 +581,43 @@ impl AssetPreviewPanel {
         let font_live =
             data.kind == trove_core::model::AssetKind::Font && font::specimen_available(&data, cx);
         let viewport = cx.new(|_| size(px(0.), px(0.)));
-        let panel = cx.new(|_| Self {
-            data,
-            video,
-            video_loading,
-            anim: None,
-            anim_loading,
-            sequence,
-            audio,
-            text,
-            font_live,
-            pan: PanZoom::new(),
-            viewport,
-            drag_from: Point::default(),
-            dragging: false,
+        // The exposure rail: built per preview (it resets with the asset) and
+        // subscribed here, so a release lands straight on this panel. Change
+        // events are deliberately ignored — the picture only follows on
+        // release, because every committed value is a full float re-decode.
+        let exposure = cx.new(|_| {
+            SliderState::new()
+                .min(trove_core::media::hdr::MIN_STOPS)
+                .max(trove_core::media::hdr::MAX_STOPS)
+                .step(0.5)
+                .default_value(0.)
+        });
+        let panel = cx.new(|cx| {
+            cx.subscribe(&exposure, |this: &mut Self, _, event: &SliderEvent, cx| {
+                if let SliderEvent::Release(value) = event {
+                    this.set_exposure(value.start(), cx);
+                }
+            })
+            .detach();
+            Self {
+                data,
+                video,
+                video_loading,
+                anim: None,
+                anim_loading,
+                sequence,
+                audio,
+                text,
+                font_live,
+                stops: 0.0,
+                exposure,
+                exposure_images: Vec::new(),
+                exposure_generation: 0,
+                pan: PanZoom::new(),
+                viewport,
+                drag_from: Point::default(),
+                dragging: false,
+            }
         });
         if video_loading {
             video::load_player(panel.clone(), cx);
@@ -648,6 +696,79 @@ impl AssetPreviewPanel {
         self.video.is_some() || self.anim.is_some()
     }
 
+    /// Whether this preview carries the exposure control at all: a
+    /// scene-linear float source (EXR / Radiance HDR) whose original is
+    /// reachable. Everything else comes out of the tonemap untouched, so a
+    /// slider would be decoration.
+    pub(crate) fn exposure_supported(&self) -> bool {
+        self.data
+            .original
+            .as_deref()
+            .and_then(|path| path.extension())
+            .is_some_and(|ext| trove_core::media::hdr::is_scene_linear_ext(&ext.to_string_lossy()))
+    }
+
+    /// The committed exposure, in stops. `0.0` is "as authored" — the
+    /// thumbnail's own transform, and the state the rail returns to.
+    pub(crate) fn stops(&self) -> f32 {
+        self.stops
+    }
+
+    /// The exposure rail, for the toolbar's popover to render.
+    pub(crate) fn exposure_slider(&self) -> &Entity<SliderState> {
+        &self.exposure
+    }
+
+    /// Commit an exposure: re-decode the original at `stops` off this thread
+    /// and swap the result onto the stage when it lands. Zero clears instead
+    /// of decoding — the thumbnail already *is* the 0-stops render. The
+    /// generation counter drops a late decode from a superseded value rather
+    /// than letting it overwrite the newer answer.
+    ///
+    /// This is the whole cost of the control, on purpose: `tonemap` needs the
+    /// float samples, so each committed value re-decodes the original — the
+    /// alternative (keeping the float buffer resident) is hundreds of
+    /// megabytes per preview, and the picture following the thumb while
+    /// dragging would multiply that by every step. Commit on release, one
+    /// decode per release.
+    fn set_exposure(&mut self, stops: f32, cx: &mut Context<Self>) {
+        let stops = stops.clamp(
+            trove_core::media::hdr::MIN_STOPS,
+            trove_core::media::hdr::MAX_STOPS,
+        );
+        if stops == self.stops {
+            return;
+        }
+        self.stops = stops;
+        self.exposure_generation += 1;
+        if stops == 0.0 {
+            self.data.exposed = None;
+            cx.notify();
+            return;
+        }
+        let Some(path) = self.data.original.clone() else {
+            return;
+        };
+        let generation = self.exposure_generation;
+        cx.spawn(async move |this, cx| {
+            let decoded = cx
+                .background_executor()
+                .spawn(async move { image::decode_exposed(&path, stops) })
+                .await;
+            this.update(cx, |this, cx| {
+                if this.exposure_generation == generation
+                    && let Some(render) = decoded
+                {
+                    let render = Arc::new(render);
+                    this.exposure_images.push(render.clone());
+                    this.data.exposed = Some(render.into());
+                }
+                cx.notify();
+            })
+        })
+        .detach();
+    }
+
     /// Space bar: hold whatever is playing, or pick it back up.
     pub(crate) fn toggle_playback(&mut self, cx: &mut App) {
         if let Some(video) = &self.video {
@@ -696,6 +817,11 @@ impl AssetPreviewPanel {
         // so it has more to hand back than the video one does.
         if let Some(anim) = &self.anim {
             anim.update(cx, |anim, _| anim.release(window));
+        }
+        // The exposure control holds one atlas entry per committed slider
+        // value — each was a fresh full-size decode.
+        for render in self.exposure_images.drain(..) {
+            let _ = window.drop_image(render);
         }
     }
 
@@ -810,7 +936,13 @@ impl AssetPreviewPanel {
             let scale = w / tw;
             font::specimen_scaled(&self.data, w, h, ts * scale, cx)
         } else {
-            let source: Option<gpui_kit::ImageSource> = if self.pan.zoom > 1.05 {
+            let source: Option<gpui_kit::ImageSource> = if let Some(exposed) = &self.data.exposed {
+                // The exposure render IS the original, already through the
+                // display transform: beyond 1:1 it carries the detail too, so
+                // it wins at every zoom and the raw original (which would
+                // silently drop the exposure) never takes over.
+                Some(exposed.clone())
+            } else if self.pan.zoom > 1.05 {
                 self.data
                     .animated
                     .clone()

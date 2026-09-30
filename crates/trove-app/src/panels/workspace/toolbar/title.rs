@@ -5,11 +5,13 @@
 //! search) and preview (asset name + close button) — switched on whether
 //! a main-area preview is open.
 
-use gpui_kit::base::h_flex;
+use gpui_kit::base::{h_flex, v_flex};
 use gpui_kit::component::ActiveTheme as _;
+use gpui_kit::component::Selectable as _;
 use gpui_kit::component::button::{Button, ButtonVariant, ButtonVariants as _};
 use gpui_kit::component::dialog::DialogButtonProps;
 use gpui_kit::component::dock::{Panel as DockPanel, PanelControl};
+use gpui_kit::component::popover::Popover;
 use gpui_kit::component::slider::Slider;
 use gpui_kit::component::{IconName, Sizable as _, WindowExt as _};
 use gpui_kit::*;
@@ -324,6 +326,52 @@ fn preview_toolbar(
         );
     }
 
+    // The exposure rail, for a scene-linear source (EXR / Radiance HDR). A
+    // view control, not an edit — nothing is written, so the edit blockers
+    // above don't apply. Committing a value re-decodes the original through
+    // the display transform off the UI thread; the stage swaps the render in
+    // when it lands. The trigger stays highlighted while the exposure is not
+    // the file's own default.
+    if preview.read(cx).exposure_supported() {
+        let stops = preview.read(cx).stops();
+        let slider = preview.read(cx).exposure_slider().clone();
+        bar = bar.child(
+            Popover::new("preview-exposure")
+                .w(px(240.))
+                .trigger(
+                    Button::new("preview-exposure-trigger")
+                        .ghost()
+                        .xsmall()
+                        .icon(ToolIcon::Sun)
+                        .selected(stops != 0.0)
+                        .tooltip(rust_i18n::t!("viewport.exposure").to_string()),
+                )
+                .child(
+                    v_flex()
+                        .p_2()
+                        .gap_1()
+                        .child(
+                            h_flex()
+                                .justify_between()
+                                .items_center()
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(cx.theme().muted_foreground)
+                                        .child(rust_i18n::t!("viewport.exposure").to_string()),
+                                )
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(cx.theme().foreground)
+                                        .child(format_stops(stops)),
+                                ),
+                        )
+                        .child(Slider::new(&slider)),
+                ),
+        );
+    }
+
     // A video paused on a frame can hand that frame to the library as an asset
     // of its own. The button belongs to the live player rather than to the
     // asset: with no ffmpeg there is no player, and a still of the poster this
@@ -355,6 +403,17 @@ fn preview_toolbar(
             this.dismiss_preview(window, cx);
         })),
     )
+}
+
+/// The exposure readout: one decimal, with an explicit sign whenever the
+/// slider sits off the file's own default — the sign is what makes "+1.5"
+/// read as "brighter" rather than as a temperature.
+fn format_stops(stops: f32) -> String {
+    if stops == 0.0 {
+        "0.0".to_string()
+    } else {
+        format!("{stops:+.1}")
+    }
 }
 
 /// The write-back confirmation for a linked asset: editing overwrites the
@@ -399,4 +458,19 @@ fn confirm_write_back(
                 true
             })
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::format_stops;
+
+    /// The sign is the whole point of the readout: a value off the file's own
+    /// default says which way the picture moved, while zero stays unsigned —
+    /// "+0.0" would read like something was applied when nothing was.
+    #[test]
+    fn the_exposure_readout_signs_the_nonzero_stops() {
+        assert_eq!(format_stops(0.0), "0.0");
+        assert_eq!(format_stops(1.5), "+1.5");
+        assert_eq!(format_stops(-2.0), "-2.0");
+    }
 }
