@@ -13,6 +13,7 @@ mod capture;
 pub mod library_manager;
 mod root;
 pub(crate) mod settings_write;
+pub mod single_instance;
 mod status_bar;
 mod task_panel;
 mod tray;

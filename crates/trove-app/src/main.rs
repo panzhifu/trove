@@ -35,6 +35,13 @@ mod plugins;
 use app::AppView;
 
 fn main() {
+    // One instance per user, before anything else opens a library: a second
+    // process exits here instead of racing the first one's writer lock, watch
+    // tasks and tray. Logging comes after, so the duplicate's stderr line is
+    // the only output it ever produces.
+    if crate::app::single_instance::acquire().is_none() {
+        return;
+    }
     // Logging first: everything after this point can emit events.
     trove_core::logging::init(trove_core::logging::LoggingOptions::app());
     // One read serves the whole boot: the language the interface opens in,
