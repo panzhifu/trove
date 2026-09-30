@@ -14,6 +14,7 @@ use std::cell::Cell;
 use std::rc::Rc;
 
 use gpui_kit::base::{h_flex, v_flex};
+use gpui_kit::component::Selectable as _;
 use gpui_kit::component::Sizable;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
@@ -33,6 +34,10 @@ pub struct SearchBox {
     /// Controlled popover visibility. Shared via `Rc<Cell<bool>>` because
     /// the ✕ handler runs with a popover context, not `Context<Self>`.
     open: Rc<Cell<bool>>,
+    /// Whether the syntax reference is showing under the pill. Plain state:
+    /// only this component's own handlers flip it, and they all run with a
+    /// `Context<Self>`.
+    help: bool,
     /// This library's settled queries, newest first. Read once at open and
     /// updated here whenever one is committed: this component is the only
     /// writer, so re-reading `library.json` on every repaint — the box
@@ -77,6 +82,7 @@ impl SearchBox {
             controller,
             input,
             open: Rc::new(Cell::new(false)),
+            help: false,
             history,
         }
     }
@@ -144,7 +150,15 @@ impl Render for SearchBox {
                 let this = this.clone();
                 move |is_open: &bool, _, cx| {
                     open.set(*is_open);
-                    this.update(cx, |_, cx| cx.notify());
+                    // A fresh open starts clean: the syntax reference is a
+                    // per-look thing, not something to still be reading after
+                    // the popover has been away.
+                    this.update(cx, |this, cx| {
+                        if !*is_open && this.help {
+                            this.help = false;
+                        }
+                        cx.notify();
+                    });
                 }
             })
             // The pill-shaped input IS the surface: strip the popover's own
@@ -167,10 +181,11 @@ impl Render for SearchBox {
                 let open = open.clone();
                 let this = this.clone();
                 let history = self.history.clone();
+                let help = self.help;
                 move |_, _, cx| {
                     // The pill keeps its own border and shadow; the recall list
-                    // is a separate block under it rather than more controls
-                    // crammed into the pill.
+                    // and the syntax reference are separate blocks under it
+                    // rather than more controls crammed into the pill.
                     let pill = h_flex()
                         .w_full()
                         .h_7()
@@ -183,6 +198,25 @@ impl Render for SearchBox {
                         .gap_1()
                         .shadow_sm()
                         .child(Input::new(&input).appearance(false).small().w_full())
+                        .child(
+                            // The syntax reference: what the box understands,
+                            // one toggle away while the box has focus.
+                            icon_button(
+                                "search-syntax-help",
+                                IconName::Info,
+                                rust_i18n::t!("workspace.search_help_title").to_string(),
+                            )
+                            .selected(help)
+                            .on_click({
+                                let this = this.clone();
+                                move |_, _, cx| {
+                                    this.update(cx, |this, cx| {
+                                        this.help = !this.help;
+                                        cx.notify();
+                                    });
+                                }
+                            }),
+                        )
                         .child(
                             // Always visible: with text it clears + closes,
                             // when empty it just dismisses the popover.
@@ -209,6 +243,7 @@ impl Render for SearchBox {
                         .w(px(260.))
                         .gap_1()
                         .child(pill)
+                        .when(help, |column| column.child(syntax_panel(cx)))
                         .when(!history.is_empty(), |column| {
                             column.child(history_list(&history, &this, &input, cx))
                         })
@@ -325,6 +360,78 @@ fn history_list(
         .into_any_element()
 }
 
+/// What one syntax row shows: the literal to type, and the locale key naming
+/// what it does. The literals are the parser's own shapes — a row that lied
+/// here would be a query the box refuses.
+const SYNTAX_ROWS: [(&str, &str); 8] = [
+    ("word1 word2", "workspace.search_help_and"),
+    ("word1 | word2", "workspace.search_help_or"),
+    ("-word", "workspace.search_help_exclude"),
+    ("\"two words\"", "workspace.search_help_phrase"),
+    (
+        "name: title: desc: tag: body:",
+        "workspace.search_help_fields",
+    ),
+    (
+        "camera: make: artist: album: font: color:",
+        "workspace.search_help_meta",
+    ),
+    (
+        "audio: sample_rate: channels: bit_depth: bitrate:",
+        "workspace.search_help_audio",
+    ),
+    (
+        "ext: kind: path: rating: fav:",
+        "workspace.search_help_filters",
+    ),
+];
+
+/// The syntax reference: one row per shape the parser understands, the token
+/// over the description so a long qualifier list wraps without hiding what
+/// to type. Bounded and scrollable for the same reason the history list is —
+/// the popover sits over the grid it is searching.
+fn syntax_panel(cx: &App) -> AnyElement {
+    let rows = SYNTAX_ROWS
+        .iter()
+        .map(|(token, key)| {
+            v_flex()
+                .w_full()
+                .gap_0p5()
+                .px_3()
+                .py_0p5()
+                .child(div().text_xs().text_color(cx.theme().primary).child(*token))
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(rust_i18n::t!(*key).to_string()),
+                )
+        })
+        .collect::<Vec<_>>();
+
+    v_flex()
+        .w_full()
+        .rounded_md()
+        .border_1()
+        .border_color(cx.theme().border)
+        .bg(cx.theme().background)
+        .shadow_sm()
+        .child(
+            div()
+                .w_full()
+                .px_3()
+                .pt_2()
+                .pb_1()
+                .text_xs()
+                .text_color(cx.theme().muted_foreground)
+                .child(rust_i18n::t!("workspace.search_help_title").to_string()),
+        )
+        .child(crate::components::scrollbar::vertical(
+            v_flex().w_full().max_h(px(220.)).children(rows),
+        ))
+        .into_any_element()
+}
+
 #[cfg(test)]
 mod tests {
     use super::shorten_query;
@@ -348,5 +455,21 @@ mod tests {
         let cut = shorten_query(&cjk);
         assert_eq!(cut.chars().count(), 41, "cut landed mid-codepoint");
         assert!(cut.starts_with(&"描述".repeat(20)));
+    }
+
+    /// Every row the panel shows must resolve to real copy in the current
+    /// locale. `rust_i18n` answers a missing key with the key itself, so a
+    /// typo'd key in [`SYNTAX_ROWS`] would render the token as its own
+    /// description — and this test would be the only thing that noticed.
+    #[test]
+    fn every_syntax_row_resolves_to_copy() {
+        use super::SYNTAX_ROWS;
+        for (_, key) in SYNTAX_ROWS {
+            let text = rust_i18n::t!(key).to_string();
+            assert_ne!(text, *key, "{key} has no copy in this locale");
+            assert!(!text.is_empty());
+        }
+        let title = rust_i18n::t!("workspace.search_help_title").to_string();
+        assert_ne!(title, "workspace.search_help_title");
     }
 }
