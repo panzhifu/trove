@@ -222,7 +222,7 @@ pub(crate) struct AssetPreviewData {
     /// Complete decoder facts mined at import, when the row carries them.
     /// `Some` means the player can spawn the instant the panel opens — no
     /// probe between the click and the picture; `None` (rows imported before
-    /// the facts existed) falls back to probing while the poster stands in.
+    /// the facts existed) falls back to probing while the still stands in.
     pub(crate) video_facts: Option<trove_core::media::video::VideoStreamFacts>,
 }
 
@@ -470,35 +470,28 @@ impl AssetPreviewPanel {
         let video = if video_loading {
             match data.video_facts.take() {
                 // Full facts from the import row: the player spawns now — the
-                // click goes straight to a decoding player, with the poster
-                // only standing in for the one ffmpeg start-up it takes to
-                // produce the first frame.
+                // click goes straight to a decoding player, the stage blank
+                // and sized by the stream's geometry for the one ffmpeg
+                // start-up it takes to produce the first frame.
                 Some(facts) => match data.original.clone() {
-                    // The player spawns now — the click goes straight to a
-                    // decoding player, with the poster only standing in for
-                    // the one ffmpeg start-up it takes to produce the first
-                    // frame.
                     Some(original) => {
                         let audio = facts
                             .has_audio
                             .then(|| soundtrack::AudioEngine::spawn(original.clone(), cx));
-                        Some(VideoPlayer::spawn(
-                            original,
-                            facts,
-                            data.thumb.clone(),
-                            audio,
-                            None,
-                            cx,
-                        ))
+                        let player = VideoPlayer::spawn(original, facts, audio, None, cx);
+                        // The player is live, so the probe path below must not
+                        // run: re-probing would replace this player and spawn a
+                        // second audio engine for nothing — the facts already
+                        // came from the import row.
+                        video_loading = false;
+                        Some(player)
                     }
                     // No file behind the record: fall back to the probe path,
-                    // whose refusal notice names the cause.
-                    None => {
-                        video_loading = true;
-                        None
-                    }
+                    // whose refusal notice names the cause. `video_loading`
+                    // stays true here, which is what runs that path below.
+                    None => None,
                 },
-                // Rows from before the facts existed: the poster stands in
+                // Rows from before the facts existed: the still stands in
                 // while one ffprobe answers, exactly as before — the existing
                 // post-construction load_player call owns that path.
                 None => None,

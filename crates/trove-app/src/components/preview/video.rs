@@ -6,10 +6,15 @@
 //! main-area host spawns it exactly once at open (never per render)
 //! through [`load_player`]. That call does the probing on a background thread
 //! and hands the player over once ffmpeg has answered; until it does the host
-//! keeps showing the still, and the player itself opens on the library
-//! thumbnail instead of an empty box. No ffmpeg, or a file that cannot be
-//! probed, leaves the still standing — the same picture [`cover`] shows in the
+//! keeps showing the still. No ffmpeg, or a file that cannot be probed,
+//! leaves the still standing — the same picture [`cover`] shows in the
 //! inspector.
+//!
+//! There is no poster inside the player: entering the preview goes straight
+//! to the picture, which means the stage is blank (sized by the stream's own
+//! geometry) for the one ffmpeg start-up it takes to produce the first frame.
+//! A row that carries the facts mined at import skips the probe entirely —
+//! the player spawns the instant the panel opens.
 //!
 //! Audio rides a second ffmpeg pipe (signed 16-bit stereo at 44.1 kHz) into
 //! rodio — owned by [`AudioEngine`] rather than by this player, so the
@@ -94,14 +99,11 @@ const PRESENT_POLL: Duration = Duration::from_millis(4);
 ///
 /// Nothing here may block the UI thread: the availability check, the stream
 /// probe and the audio-track check all shell out, and the probe waits on a
-/// subprocess slot an import burst can be holding. The panel keeps its poster
+/// subprocess slot an import burst can be holding. The panel keeps its still
 /// up while this runs, so the wait costs a late picture rather than a frozen
 /// window.
 pub(super) fn load_player(panel: Entity<AssetPreviewPanel>, cx: &mut App) {
-    let (path, poster) = {
-        let this = panel.read(cx);
-        (this.data.original.clone(), this.data.thumb.clone())
-    };
+    let path = panel.read(cx).data.original.clone();
     // Held weakly: a preview dismissed while the probe is still running must
     // not be kept alive by this task, and must not grow a player that paints in
     // no window — whose frame would then never reach `release` to leave gpui's
@@ -125,8 +127,8 @@ pub(super) fn load_player(panel: Entity<AssetPreviewPanel>, cx: &mut App) {
             })
             .await;
         let _ = panel.update(cx, move |this, cx| {
-            // Settled either way: a video that cannot be probed is a poster for
-            // good, and the panel owns that poster from here.
+            // Settled either way: a video that cannot be probed is a still for
+            // good, and the panel owns that still from here.
             this.video_loading = false;
             let Some((path, facts)) = probed else {
                 cx.notify();
@@ -142,7 +144,7 @@ pub(super) fn load_player(panel: Entity<AssetPreviewPanel>, cx: &mut App) {
             // the same box instead of the picture's intrinsic pixels.
             let stage_area = this.video_stage_area(cx);
             this.video = Some(VideoPlayer::spawn(
-                path, facts, poster, audio, stage_area, cx,
+                path, facts, audio, stage_area, cx,
             ));
             cx.notify();
         });
@@ -272,10 +274,6 @@ struct PlaybackShared {
 pub(crate) struct VideoPlayer {
     path: PathBuf,
     facts: VideoStreamFacts,
-    /// The library thumbnail, standing in until the first frame decodes.
-    /// Without it the stage is an empty box for the length of one ffmpeg
-    /// startup, which reads as the preview failing to open.
-    poster: Option<PathBuf>,
     /// The decode task's controls and mailbox — see [`PlaybackShared`].
     shared: Arc<Mutex<PlaybackShared>>,
     /// Cleared when this entity drops: how the decode task learns to stop
@@ -352,12 +350,11 @@ impl VideoPlayer {
     pub(super) fn spawn(
         path: PathBuf,
         facts: VideoStreamFacts,
-        poster: Option<PathBuf>,
         audio: Option<Entity<AudioEngine>>,
         stage_area: Option<(f32, f32)>,
         cx: &mut App,
     ) -> Entity<Self> {
-        let entity = cx.new(|cx| Self::with_facts(path, facts, poster, audio, stage_area, cx));
+        let entity = cx.new(|cx| Self::with_facts(path, facts, audio, stage_area, cx));
         chrome::watch(entity.downgrade(), cx, Self::chrome_mut);
         entity
     }
@@ -365,7 +362,6 @@ impl VideoPlayer {
     fn with_facts(
         path: PathBuf,
         facts: VideoStreamFacts,
-        poster: Option<PathBuf>,
         audio: Option<Entity<AudioEngine>>,
         stage_area: Option<(f32, f32)>,
         cx: &mut Context<Self>,
@@ -459,8 +455,8 @@ impl VideoPlayer {
         let mut this = Self {
             path,
             facts,
-            poster,
-            // A fresh player starts black on the first decoded frame.
+            // A fresh player starts blank: the first decoded frame paints the
+            // stage, sized by the stream's own geometry meanwhile.
             shown: None,
             playing: true,
             position_ms: 0.0,
@@ -886,17 +882,14 @@ impl VideoPlayer {
         (self.path.clone(), self.position_ms.max(0.) as u64)
     }
 
-    /// The frame element: the current frame, the poster while the decoder is
-    /// still starting, or an empty box when there is neither.
+    /// The frame element: the current frame, or an empty box while the
+    /// decoder is starting.
     ///
     /// The box comes from [`Self::stage_base`] — the stream's own geometry
-    /// fitted into the stage — rather than from whichever picture happens to
-    /// be in hand. gpui lays an `img` out at its intrinsic pixels whenever the
-    /// style leaves the size auto, and the poster is capped at the thumbnail's
-    /// 512 on its long edge while a decoded frame is capped at
-    /// [`trove_core::media::video::DEFAULT_MAX_WIDTH`]'s 720, so a box sized by
-    /// the picture grew by forty percent the instant playback started. The
-    /// poster and the frames now swap in place.
+    /// fitted into the stage — rather than from gpui's intrinsic-pixel layout,
+    /// which an `img` falls back to wherever the style leaves the size auto.
+    /// Sizing by the stream is what keeps the swap from the blank stage to
+    /// the first frame invisible: both states occupy the same box.
     ///
     /// The stage is seeded with the area the still was drawn in (see
     /// [`Self::spawn`]), so the first frame after the player takes over is
@@ -907,8 +900,7 @@ impl VideoPlayer {
         let source = self
             .shown
             .as_ref()
-            .map(|frame| ImageSource::Render(frame.clone()))
-            .or_else(|| self.poster.clone().map(ImageSource::from));
+            .map(|frame| ImageSource::Render(frame.clone()));
         // Contain, not Fill: the decoded frame's height is rounded down to an
         // even number by the scaler, so it is a hair off the stream's own
         // aspect, and a stretched frame is worse than a hairline of letterbox.
@@ -959,7 +951,6 @@ impl VideoPlayer {
             .shown
             .as_ref()
             .map(|frame| ImageSource::Render(frame.clone()))
-            .or_else(|| self.poster.clone().map(ImageSource::from))
         {
             // The box already carries the stream's aspect, so Fill and Contain
             // agree; Fill spares gpui a second fit decision.
