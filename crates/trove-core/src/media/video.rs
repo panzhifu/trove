@@ -209,12 +209,13 @@ fn probe_with_mp4(path: &Path) -> Option<VideoStreamFacts> {
     Some(VideoStreamFacts {
         width: facts.width,
         height: facts.height,
-        fps: FALLBACK_FPS as u32,
+        fps: if facts.fps > 0 {
+            facts.fps
+        } else {
+            FALLBACK_FPS as u32
+        },
         duration_ms: facts.duration_ms.unwrap_or(0),
-        // The no-ffprobe world already acted as "silent" (`has_audio_track`
-        // failed with the rest of ffprobe), so `false` here is the existing
-        // behavior stated plainly, not a new blindness.
-        has_audio: false,
+        has_audio: facts.has_audio,
     })
 }
 
@@ -600,6 +601,73 @@ mod tests {
             has_audio: false,
         };
         assert_eq!(facts.frame_ms(), 40);
+    }
+
+    /// The mp4 header read — the no-ffprobe fallback, and the path the
+    /// import pipeline prefers — reports the same playback facts: a real
+    /// frame rate and whether the container carries audio.
+    #[test]
+    fn mp4_header_probe_reports_fps_and_audio() {
+        if !ffmpeg_available() {
+            eprintln!("skipping: ffmpeg not on PATH");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("trove-video-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let loud = dir.join("loud.mp4");
+        let status = Command::new("ffmpeg")
+            .args([
+                "-v",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=size=320x240:rate=30:duration=1",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=440:duration=1",
+                "-pix_fmt",
+                "yuv420p",
+                "-c:a",
+                "aac",
+                "-shortest",
+            ])
+            .arg(&loud)
+            .status()
+            .expect("ffmpeg runs");
+        assert!(status.success());
+        let facts = crate::media::probe::video_facts(&loud).expect("mp4 header reads");
+        assert!(
+            facts.fps >= 29 && facts.fps <= 31,
+            "real fps, not the fallback: {}",
+            facts.fps
+        );
+        assert!(facts.has_audio);
+
+        let silent = dir.join("silent.mp4");
+        let status = Command::new("ffmpeg")
+            .args([
+                "-v",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=size=320x240:rate=30:duration=1",
+                "-pix_fmt",
+                "yuv420p",
+            ])
+            .arg(&silent)
+            .status()
+            .expect("ffmpeg runs");
+        assert!(status.success());
+        let facts = crate::media::probe::video_facts(&silent).expect("mp4 header reads");
+        assert!(!facts.has_audio);
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// One ffprobe pass answers both questions the preview asks: the video

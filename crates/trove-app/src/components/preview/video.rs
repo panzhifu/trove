@@ -349,7 +349,7 @@ impl Drop for VideoPlayer {
 impl VideoPlayer {
     /// Build a player for a file the caller has already probed — see
     /// [`load_player`], which does the probe off the UI thread.
-    fn spawn(
+    pub(super) fn spawn(
         path: PathBuf,
         facts: VideoStreamFacts,
         poster: Option<PathBuf>,
@@ -996,10 +996,18 @@ impl VideoPlayer {
             let stage = self.stage.read(cx);
             (f32::from(stage.width), f32::from(stage.height))
         };
-        super::fit_box(
-            (self.facts.width as f32, self.facts.height as f32),
-            (vw, vh),
-        )
+        // Before the first layout pass the measured stage is 0×0 (the
+        // immediate-spawn path has no still to pre-measure from) — answering
+        // a 0×0 fit would paint the first decoded frames at zero size, so the
+        // caller falls back to fitting the full stage instead.
+        (vw > 0.0 && vh > 0.0)
+            .then(|| {
+                super::fit_box(
+                    (self.facts.width as f32, self.facts.height as f32),
+                    (vw, vh),
+                )
+            })
+            .flatten()
     }
 
     /// Wheel over the picture: zoom toward the cursor, like every preview.

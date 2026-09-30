@@ -33,7 +33,8 @@ pub use collection::{Collection, NewCollection, NewSmartCollection, SmartCollect
 pub use content_hash::{ContentHash, HEX_LEN};
 pub use embedding::{EmbeddingSpace, MAX_DIM, NewEmbedding, VectorMatch, normalized};
 pub use facts::{
-    AssetFacts, AudioFacts, FONT_FACTS_REV, FontFacts, MediaTagsFacts, PhotoFacts, VisualFacts,
+    AssetFacts, AudioFacts, FONT_FACTS_REV, FontFacts, MediaTagsFacts, PhotoFacts, VideoFacts,
+    VisualFacts,
 };
 pub use id::{AssetId, CollectionId, TagId};
 pub use query::{AssetQuery, AssetSort, Page, QueryCondition, TrashPool};

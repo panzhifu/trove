@@ -619,20 +619,53 @@ impl Stage for ProbeStage {
             // (mkv, webm, avi, flv, mpeg-ts) needs `ffprobe`, which is why that
             // path takes a process slot.
             AssetKind::Video => {
-                if let Some(f) = probe::video_facts(&io.blob_path()) {
-                    io.width = Some(f.width);
-                    io.height = Some(f.height);
-                    io.duration_ms = f.duration_ms;
-                } else if let Some(f) = video::probe(&io.blob_path()) {
-                    io.width = Some(f.width);
-                    io.height = Some(f.height);
-                    io.duration_ms = (f.duration_ms > 0).then_some(f.duration_ms);
+                // fps and audio presence ride along to the mine stage: the
+                // preview starts its decoder straight from these, and a
+                // probe at preview time is exactly the latency this removes.
+                let probed = probe::video_facts(&io.blob_path()).map(|f| {
+                    (
+                        f.width,
+                        f.height,
+                        f.duration_ms,
+                        VideoProbed {
+                            fps: f.fps,
+                            has_audio: f.has_audio,
+                        },
+                    )
+                });
+                let probed = match probed {
+                    Some((w, h, d, probed)) => {
+                        io.width = Some(w);
+                        io.height = Some(h);
+                        io.duration_ms = d;
+                        Some(probed)
+                    }
+                    None => video::probe(&io.blob_path()).map(|f| {
+                        io.width = Some(f.width);
+                        io.height = Some(f.height);
+                        io.duration_ms = (f.duration_ms > 0).then_some(f.duration_ms);
+                        VideoProbed {
+                            fps: f.fps,
+                            has_audio: f.has_audio,
+                        }
+                    }),
+                };
+                if let Some(probed) = probed {
+                    io.artifacts.put(probed);
                 }
             }
             _ => {}
         }
         Ok(())
     }
+}
+
+/// The playback facts a video's probe found, on their way to the asset's
+/// `extra` JSON so the preview can start a decoder without probing again.
+#[derive(Debug, Clone)]
+pub(crate) struct VideoProbed {
+    pub fps: u32,
+    pub has_audio: bool,
 }
 
 /// The one decode. Images only; everything else is a no-op here.
@@ -803,6 +836,12 @@ impl Stage for MineStage {
             && let Some(space) = &decoded.color_space
         {
             io.mined.facts.visual.color_space = Some(space.clone());
+        }
+        // Video playback facts ride the probe: the preview starts its decoder
+        // straight from these instead of probing the file again.
+        if let Some(probed) = io.artifacts.get::<VideoProbed>() {
+            io.mined.facts.video.fps = Some(probed.fps);
+            io.mined.facts.video.has_audio = Some(probed.has_audio);
         }
         Ok(())
     }

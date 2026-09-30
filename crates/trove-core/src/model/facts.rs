@@ -41,6 +41,22 @@ pub struct PhotoFacts {
     pub gps_lng: Option<f64>,
 }
 
+/// Playback facts for video assets, mined from the container at import: what
+/// the preview needs to start a decoder *without* a probe round trip. Both
+/// keys are absent on rows imported before the group existed — the preview
+/// then falls back to probing the file, exactly as it always did.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct VideoFacts {
+    #[serde(rename = "video_fps", default, skip_serializing_if = "Option::is_none")]
+    pub fps: Option<u32>,
+    #[serde(
+        rename = "video_has_audio",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub has_audio: Option<bool>,
+}
+
 /// Derived image appearance facts: the mined palette and the visual search
 /// signature (computed in background after import, backfillable via
 /// maintenance).
@@ -228,6 +244,8 @@ pub struct AudioFacts {
 pub struct AssetFacts {
     #[serde(flatten)]
     pub photo: PhotoFacts,
+    #[serde(flatten)]
+    pub video: VideoFacts,
     #[serde(flatten)]
     pub visual: VisualFacts,
     #[serde(flatten)]

@@ -255,6 +255,12 @@ pub struct VideoFacts {
     pub width: u32,
     pub height: u32,
     pub duration_ms: Option<u64>,
+    /// Average frame rate of the video track, rounded — the pacing input the
+    /// preview's decoder needs, read straight off the header so a preview
+    /// never has to probe for it.
+    pub fps: u32,
+    /// Whether the container carries an audio track.
+    pub has_audio: bool,
 }
 
 pub fn video_facts(path: &std::path::Path) -> Option<VideoFacts> {
@@ -264,11 +270,17 @@ pub fn video_facts(path: &std::path::Path) -> Option<VideoFacts> {
 
     let mut width = 0u32;
     let mut height = 0u32;
+    let mut fps = 0u32;
+    let mut has_audio = false;
     for track in reader.tracks().values() {
-        if matches!(track.track_type(), Ok(mp4::TrackType::Video)) {
-            width = track.width() as u32;
-            height = track.height() as u32;
-            break;
+        match track.track_type() {
+            Ok(mp4::TrackType::Video) if width == 0 => {
+                width = track.width() as u32;
+                height = track.height() as u32;
+                fps = (track.frame_rate().round() as u32).clamp(1, 240);
+            }
+            Ok(mp4::TrackType::Audio) => has_audio = true,
+            _ => {}
         }
     }
     if width == 0 || height == 0 {
@@ -282,6 +294,8 @@ pub fn video_facts(path: &std::path::Path) -> Option<VideoFacts> {
     Some(VideoFacts {
         width,
         height,
+        fps,
+        has_audio,
         duration_ms,
     })
 }

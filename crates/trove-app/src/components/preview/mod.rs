@@ -219,6 +219,11 @@ pub(crate) struct AssetPreviewData {
     /// sequence player walks. `None` for a standalone asset and for every
     /// context that cannot resolve paths (the inspector renders stills).
     pub(crate) sequence: Option<SequenceInfo>,
+    /// Complete decoder facts mined at import, when the row carries them.
+    /// `Some` means the player can spawn the instant the panel opens — no
+    /// probe between the click and the picture; `None` (rows imported before
+    /// the facts existed) falls back to probing while the poster stands in.
+    pub(crate) video_facts: Option<trove_core::media::video::VideoStreamFacts>,
 }
 
 /// A frame run the preview can play: the run's frame rate and every frame's
@@ -254,6 +259,23 @@ impl AssetPreviewData {
                     frames,
                 });
             }
+        }
+        // Video: the import already probed the container, so a complete fact
+        // set may be sitting on the row — the player starts without asking
+        // ffprobe anything. Any missing piece (rows from before the facts
+        // existed) drops back to the probe path.
+        if data.kind == trove_core::model::AssetKind::Video
+            && let Some((width, height)) = asset.width.zip(asset.height)
+            && let Some(fps) = asset.facts.video.fps
+            && let Some(has_audio) = asset.facts.video.has_audio
+        {
+            data.video_facts = Some(trove_core::media::video::VideoStreamFacts {
+                width,
+                height,
+                fps,
+                duration_ms: asset.duration_ms.unwrap_or(0),
+                has_audio,
+            });
         }
         Some(data)
     }
@@ -309,6 +331,7 @@ impl AssetPreviewData {
                 .as_deref()
                 .map(|sha| (cache_root.to_path_buf(), sha.to_string())),
             sequence: None,
+            video_facts: None,
         }
     }
 
@@ -443,7 +466,46 @@ impl AssetPreviewPanel {
         // import burst can be holding, so it runs off this thread and the panel
         // opens on the still until it lands; an undecodable file (or no ffmpeg)
         // just keeps the still.
-        let video_loading = data.kind == trove_core::model::AssetKind::Video;
+        let mut video_loading = data.kind == trove_core::model::AssetKind::Video;
+        let video = if video_loading {
+            match data.video_facts.take() {
+                // Full facts from the import row: the player spawns now — the
+                // click goes straight to a decoding player, with the poster
+                // only standing in for the one ffmpeg start-up it takes to
+                // produce the first frame.
+                Some(facts) => match data.original.clone() {
+                    // The player spawns now — the click goes straight to a
+                    // decoding player, with the poster only standing in for
+                    // the one ffmpeg start-up it takes to produce the first
+                    // frame.
+                    Some(original) => {
+                        let audio = facts
+                            .has_audio
+                            .then(|| soundtrack::AudioEngine::spawn(original.clone(), cx));
+                        Some(VideoPlayer::spawn(
+                            original,
+                            facts,
+                            data.thumb.clone(),
+                            audio,
+                            None,
+                            cx,
+                        ))
+                    }
+                    // No file behind the record: fall back to the probe path,
+                    // whose refusal notice names the cause.
+                    None => {
+                        video_loading = true;
+                        None
+                    }
+                },
+                // Rows from before the facts existed: the poster stands in
+                // while one ffprobe answers, exactly as before — the existing
+                // post-construction load_player call owns that path.
+                None => None,
+            }
+        } else {
+            None
+        };
         // A frame run spawns its player here, once, exactly like the other
         // live players; a standalone asset never sees one.
         let sequence = if data.kind == trove_core::model::AssetKind::Image {
@@ -486,7 +548,7 @@ impl AssetPreviewPanel {
         let viewport = cx.new(|_| size(px(0.), px(0.)));
         let panel = cx.new(|_| Self {
             data,
-            video: None,
+            video,
             video_loading,
             anim: None,
             anim_loading,

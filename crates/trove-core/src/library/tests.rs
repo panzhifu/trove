@@ -2046,3 +2046,68 @@ fn the_retention_sweep_purges_only_expired_trash() {
 
     std::fs::remove_dir_all(&root).ok();
 }
+
+/// A video import mines the playback facts the preview starts its decoder
+/// from — fps and audio presence ride the container probe into the asset's
+/// facts, so entering the preview never has to probe. Skipped without
+/// ffmpeg/ffprobe.
+#[test]
+fn a_video_import_mines_the_playback_facts() {
+    let ffprobe = |tool: &str| {
+        std::process::Command::new(tool)
+            .arg("-version")
+            .output()
+            .is_ok()
+    };
+    if !ffprobe("ffmpeg") || !ffprobe("ffprobe") {
+        eprintln!("skipping: ffmpeg/ffprobe not on PATH");
+        return;
+    }
+    let (lib, root) = temp_library("videofacts");
+    let src = root.join("clip.mp4");
+    let status = std::process::Command::new("ffmpeg")
+        .args([
+            "-v",
+            "error",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc=size=320x240:rate=30:duration=1",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:duration=1",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "aac",
+            "-shortest",
+        ])
+        .arg(&src)
+        .status()
+        .expect("ffmpeg runs");
+    assert!(status.success());
+    lib.import_into_store(std::slice::from_ref(&src), None)
+        .unwrap();
+
+    let conn = lib.store().conn();
+    let asset = crate::store::assets::query(
+        conn,
+        &crate::model::AssetQuery {
+            kind: Some(crate::model::AssetKind::Video),
+            ..crate::model::AssetQuery::live()
+        },
+    )
+    .unwrap()
+    .items
+    .pop()
+    .expect("the video asset imported");
+
+    assert!(asset.facts.video.fps.is_some(), "fps mined for the preview");
+    assert_eq!(asset.facts.video.has_audio, Some(true));
+    assert!(asset.width.is_some() && asset.height.is_some());
+    assert!(asset.duration_ms.is_some());
+
+    std::fs::remove_dir_all(&root).ok();
+}
