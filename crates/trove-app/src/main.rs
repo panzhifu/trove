@@ -32,14 +32,19 @@ mod license;
 mod panels;
 mod plugins;
 
-use app::AppView;
+// Resolve the boot's collaborators by name, so `main` reads as a list of
+// startup steps rather than a grid of qualified paths.
+use app::{AppView, LibraryManagerView};
+use app::{i18n, keybindings, single_instance, theme, title_bar};
+use assets::TroveAssets;
+use components::scrollbar;
 
 fn main() {
     // One instance per user, before anything else opens a library: a second
     // process exits here instead of racing the first one's writer lock, watch
     // tasks and tray. Logging comes after, so the duplicate's stderr line is
     // the only output it ever produces.
-    if crate::app::single_instance::acquire().is_none() {
+    if single_instance::acquire().is_none() {
         return;
     }
     // Logging first: everything after this point can emit events.
@@ -48,36 +53,36 @@ fn main() {
     // the keybindings the actions register with, and whether a library
     // exists at all — decided here, before anything can have changed it.
     let config = trove_core::config::AppConfig::load();
-    app::i18n::init_from_config(&config);
+    i18n::init_from_config(&config);
     gpui_kit::application()
-        .with_assets(assets::TroveAssets)
+        .with_assets(TroveAssets)
         .run(move |cx| {
             gpui_kit::init(cx);
             // Themes before the first paint: the registry has to know every
             // theme before `apply_from_settings` picks one per mode.
-            crate::app::theme::register_builtin_themes(cx);
+            theme::register_builtin_themes(cx);
             // User themes last: they may redefine a bundled name.
-            crate::app::theme::register_user_themes(cx);
-            crate::app::theme::apply_from_settings(None, cx);
-            crate::components::scrollbar::init(cx);
+            theme::register_user_themes(cx);
+            theme::apply_from_settings(None, cx);
+            scrollbar::init(cx);
 
             // Menus are owned by the title bar module — it renders them, so it
             // also defines and registers them.
-            crate::app::title_bar::apply_menus(cx);
+            title_bar::apply_menus(cx);
 
             // Plugins last but before any window: the pipeline registry must
             // be complete before the first import builds it.
-            crate::plugins::init(cx);
+            plugins::init(cx);
 
             // The boot's single config read, from before the event loop
             // opened, still serves here.
-            app::keybindings::register(cx, &config);
+            keybindings::register(cx, &config);
             let has_library = !config.libraries.is_empty();
 
             cx.spawn(async move |cx| {
                 let options = cx.update(|cx| gpui_kit::WindowOptions {
                     window_bounds: Some(WindowBounds::centered(size(px(1024.), px(720.)), cx)),
-                    ..crate::app::title_bar::window_options()
+                    ..title_bar::window_options()
                 });
                 if let Err(error) = cx.open_window(options, |window, cx| {
                     // With no library there is nothing to open, so the asset
@@ -85,7 +90,7 @@ fn main() {
                     // Both branches return the same `Root` type, so the
                     // window's root is decided here and nowhere else.
                     if !has_library {
-                        let view = cx.new(|cx| app::LibraryManagerView::new(window, cx));
+                        let view = cx.new(|cx| LibraryManagerView::new(window, cx));
                         cx.new(|cx| Root::new(view, window, cx))
                     } else {
                         let view = cx.new(|cx| AppView::new(window, cx));
