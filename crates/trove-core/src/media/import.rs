@@ -424,6 +424,13 @@ pub fn commit_staged(
         if existing.location() == AssetLocation::Placeholder {
             assets::set_rel_path(conn, existing.id, &staged.rel_path)?;
         }
+        // The reuse has already paid for a full re-parse, so it may as well
+        // repair: the row keeps its identity and gains whatever this probe
+        // found that it was missing — a row whose facts never landed (an
+        // ffprobe that failed once at import, a row from before the video
+        // facts were mined) comes out of the reuse fully described, and the
+        // preview takes its no-probe fast path again.
+        backfill_reused(conn, &existing, staged)?;
         for cid in &targets {
             collections::add_asset(
                 conn,
@@ -505,6 +512,31 @@ pub fn commit_staged(
     })
 }
 
+/// Merge what this import freshly probed into the record being reused,
+/// writing only where the row is missing something. The freshly probed value
+/// never demotes one the record already holds: the reuse is a repair, not a
+/// re-litigation of facts the row answers already.
+fn backfill_reused(conn: &Connection, existing: &Asset, staged: &StagedFile) -> Result<()> {
+    let mut facts = existing.facts.clone();
+    let mut video = std::mem::take(&mut facts.video);
+    video.fps = video.fps.or(staged.mined.facts.video.fps);
+    video.has_audio = video.has_audio.or(staged.mined.facts.video.has_audio);
+    facts.video = video;
+
+    let width = existing.width.or(staged.width);
+    let height = existing.height.or(staged.height);
+    let duration_ms = existing.duration_ms.or(staged.mined.duration_ms);
+
+    if facts != existing.facts
+        || width != existing.width
+        || height != existing.height
+        || duration_ms != existing.duration_ms
+    {
+        assets::backfill_mined(conn, existing.id, &facts, width, height, duration_ms)?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -524,6 +556,54 @@ mod tests {
         let root = std::env::temp_dir().join(format!("trove-import-{name}-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&root).unwrap();
         root
+    }
+
+    /// A reuse is a repair: the folded-in row keeps its identity and gains
+    /// what the fresh probe found that it was missing, without demoting
+    /// anything it already had.
+    #[test]
+    fn a_reuse_backfills_what_the_row_was_missing() {
+        let root = temp_root("backfill");
+        let cache = root.join("cache");
+        let store = Store::in_memory().unwrap();
+
+        let src = root.join("clip.png");
+        std::fs::write(&src, PNG_1X1).unwrap();
+
+        let no_cancel = AtomicBool::new(false);
+        let mut staged = stage_all(&root, &cache, &[src], ImportStorage::Link, &no_cancel);
+        let mut file = staged.swap_remove(0).unwrap();
+        // A PNG mines no playback facts; plant them the way a video's probe
+        // would leave them, so the merge has something to carry over.
+        file.mined.facts.video.fps = Some(30);
+        file.mined.facts.video.has_audio = Some(true);
+
+        // The record being reused predates the facts: no geometry columns,
+        // no mined facts at all.
+        let mut old = crate::model::test_asset(&file.file_name, AssetKind::Image, Uuid::new_v4());
+        old.content_hash = Some(ContentHash::from_hasher(file.content_hash.clone()));
+        old.width = None;
+        old.height = None;
+        old.facts = crate::model::AssetFacts::default();
+        assets::insert(store.conn(), &old).unwrap();
+
+        let report = commit_staged_all(store.conn(), None, vec![Ok(file)]);
+        assert_eq!(report.imported_count(), 1);
+        assert!(report.imported[0].reused);
+
+        let row = assets::get(store.conn(), old.id).unwrap().unwrap();
+        assert_eq!(row.id, old.id, "the record keeps its identity");
+        assert_eq!(row.width, Some(1));
+        assert_eq!(row.height, Some(1));
+        assert_eq!(row.facts.video.fps, Some(30));
+        assert_eq!(row.facts.video.has_audio, Some(true));
+        assert_eq!(
+            assets::query(store.conn(), &AssetQuery::live()).unwrap().items.len(),
+            1,
+            "the reuse folds in; it does not grow a second record"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]

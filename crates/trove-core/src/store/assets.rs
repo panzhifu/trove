@@ -452,6 +452,37 @@ pub fn update_facts(conn: &Connection, id: Uuid, facts: &AssetFacts) -> Result<(
     Ok(())
 }
 
+/// Fold a fresh probe of the *same content* into a record the importer is
+/// reusing (the dedup path — see `media::import::commit_staged`). The facts
+/// JSON is replaced wholesale (the caller merged the sub-fields); the
+/// geometry and duration columns are filled only where NULL, so a repeat
+/// never demotes a value the record already has.
+pub fn backfill_mined(
+    conn: &Connection,
+    id: Uuid,
+    facts: &AssetFacts,
+    width: Option<u32>,
+    height: Option<u32>,
+    duration_ms: Option<u64>,
+) -> Result<()> {
+    let json = serde_json::to_string(facts)
+        .map_err(|e| crate::Error::Db(format!("serialize extra: {e}")))?;
+    rows::execute(
+        conn,
+        "UPDATE assets SET extra = ?1, \
+         width = COALESCE(width, ?2), height = COALESCE(height, ?3), \
+         duration_ms = COALESCE(duration_ms, ?4) WHERE id = ?5",
+        vec![
+            json.into(),
+            rows::bind_opt_int(width.map(i64::from)),
+            rows::bind_opt_int(height.map(i64::from)),
+            rows::bind_opt_int(duration_ms.map(|d| d as i64)),
+            rows::uuid(id).into(),
+        ],
+    )?;
+    Ok(())
+}
+
 /// Overwrite an asset's relative blob path (used to link a placeholder
 /// record from a metadata restore to a freshly staged blob).
 pub fn set_rel_path(conn: &Connection, id: Uuid, rel_path: &str) -> Result<()> {

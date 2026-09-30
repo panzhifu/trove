@@ -13,6 +13,10 @@
 //! 3. **The commit** — the row is deduped against live assets by content
 //!    hash, which is what makes gate 2's answer final.
 //!
+//! This gate serves the watched folder only: a user import skips it so a
+//! repeat offer always reaches the pipeline, where the commit's dedup can
+//! fold it into its record and repair whatever facts the row was missing.
+//!
 //! The gates are ordered so that the *cheap* and the *exact* check are not
 //! competitors: this gate only ever drops a file it can prove is already
 //! there, and everything it lets through is still deduped properly.

@@ -8,8 +8,10 @@
 //! progress events and the final [`ImportOutcome`].
 //!
 //! The order is the point: the *cheap* gates run before the expensive ones.
-//! The pre-check ([`crate::media::precheck`]) drops what the library already
-//! holds for the price of a `stat` per path; what survives it is staged, and
+//! The watched folder's pre-check ([`crate::media::precheck`]) drops what the
+//! library already holds for the price of a `stat` per path (a user import
+//! skips that gate, so a record missing its facts can be repaired by
+//! re-importing); what survives it is staged, and
 //! the staging pipeline's hash stage applies its own two layers of memory
 //! before reading a byte (see `media::pipeline::HashStage`).
 //!
@@ -313,17 +315,17 @@ pub fn run(
     };
 
     // The cheap dedup pre-check: drop what the library already holds before
-    // any file is read. It is worth running for *every* source, not just the
-    // inbox — a dropped folder is usually a folder that was dropped before,
-    // and a watch root re-offers whatever the embedder never acknowledged.
-    // What a kept file costs from here on is a stat and a hash-map lookup;
-    // what a dropped one would have cost is a full read.
+    // any file is read. Watched-folder sweeps only — they re-offer the whole
+    // of their history on every wake-up, so a repeat there costs a `stat` and
+    // a hash-map lookup instead of a full read. A user import skips this gate
+    // on purpose: offering a file by hand must reach the pipeline, or a
+    // record missing its mined facts could never be repaired by re-importing.
     //
     // Nothing is committed on the strength of this gate: it only ever *drops*
     // a path it can prove is already in the library (see
     // [`crate::media::precheck`]), and everything it lets through is still
     // deduplicated by content hash at commit time.
-    {
+    if matches!(options.source, ImportSource::CollectInbox { .. }) {
         let held = crate::media::precheck::Held::load(&conn);
         let before = paths.len();
         let (rest, dropped) = held.partition(&paths, &options.cache_root);
@@ -921,12 +923,12 @@ mod tests {
         assert_eq!(all.items.len(), 1, "no duplicate row appeared");
     }
 
-    /// The pre-check runs for *every* source, not only the inbox: a folder
-    /// dropped a second time is a `stat` per file and nothing else. The first
-    /// run's staging is what fills the hash cache, which is why the second
-    /// run can answer without reading anything.
+    /// A folder dropped a second time re-parses — the pre-check is the
+    /// watched folder's gate, not the user's — and the commit folds every
+    /// file back into the record it already has. The user pays a full read
+    /// for the repeat; what they never get is a second row per file.
     #[test]
-    fn a_second_drop_of_the_same_folder_is_not_staged_again() {
+    fn a_second_drop_of_the_same_folder_folds_into_its_records() {
         let root = Temp::new("task-redrop");
         let src = root.path().join("src");
         fs::create_dir_all(&src).unwrap();
@@ -952,13 +954,23 @@ mod tests {
         assert_eq!(first.report.already_imported, 0);
 
         let second = run(&options, &JobContext::for_tests(false)).unwrap();
-        assert_eq!(second.report.imported_count(), 0);
         assert_eq!(
-            second.report.already_imported, 4,
-            "recognised by name and size without being read: {:?}",
+            second.report.imported_count(),
+            4,
+            "re-parsed, not skipped at the door: {:?}",
             second.report
         );
+        assert_eq!(second.report.already_imported, 0);
         assert!(second.report.skipped.is_empty());
+        assert!(
+            second.report.imported.iter().all(|item| item.reused),
+            "every repeat folds into the record it already has: {:?}",
+            second.report
+        );
+
+        let store = crate::store::Store::open(&options.db_path()).unwrap();
+        let all = assets::query(store.conn(), &crate::model::AssetQuery::live()).unwrap();
+        assert_eq!(all.items.len(), 4, "no duplicate rows appeared");
     }
 
     /// A file that changed since the last import is *not* waved through by the
