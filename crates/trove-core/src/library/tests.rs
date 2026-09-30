@@ -1991,3 +1991,58 @@ fn asset_count_measures_live_rows() {
 
     std::fs::remove_dir_all(&root).ok();
 }
+
+/// The retention sweep purges exactly the trashed rows older than the
+/// window — backdated ones go, fresh ones and live ones stay, and zero days
+/// means the caller disabled the sweep entirely.
+#[test]
+fn the_retention_sweep_purges_only_expired_trash() {
+    let (lib, root) = temp_library("retention");
+    let expired_src = root.join("expired.png");
+    let fresh_src = root.join("fresh.png");
+    // Distinct pixels, not distinct names: content-addressed dedup would
+    // collapse two identical files into one asset.
+    image::RgbImage::new(2, 1)
+        .save_with_format(&expired_src, image::ImageFormat::Png)
+        .unwrap();
+    image::RgbImage::new(1, 2)
+        .save_with_format(&fresh_src, image::ImageFormat::Png)
+        .unwrap();
+    lib.import_into_store(&[expired_src, fresh_src], None)
+        .unwrap();
+    let conn = lib.store().conn();
+    let all = assets::query(conn, &AssetQuery::live()).unwrap().items;
+    assert_eq!(all.len(), 2);
+    let (expired, fresh) = (&all[0], &all[1]);
+    assets::set_trashed(conn, expired.id, true).unwrap();
+    assets::set_trashed(conn, fresh.id, true).unwrap();
+    // Backdate the first one past every window.
+    let old = (chrono::Utc::now() - chrono::Duration::days(90)).to_rfc3339();
+    crate::store::rows::execute(
+        conn,
+        "UPDATE assets SET trashed_at = ?1 WHERE id = ?2",
+        vec![
+            crate::store::rows::bind_opt_ts(Some(
+                chrono::DateTime::parse_from_rfc3339(&old)
+                    .unwrap()
+                    .with_timezone(&chrono::Utc),
+            )),
+            crate::store::rows::uuid(expired.id).into(),
+        ],
+    )
+    .unwrap();
+
+    assert_eq!(lib.purge_expired_trash(30).unwrap(), 1);
+    assert!(
+        assets::get(conn, expired.id).unwrap().is_none(),
+        "expired row purged"
+    );
+    assert!(
+        assets::get(conn, fresh.id).unwrap().is_some(),
+        "fresh row stays"
+    );
+    // Live rows are never touched, whatever their age would say.
+    assert_eq!(lib.purge_expired_trash(0).unwrap(), 0);
+
+    std::fs::remove_dir_all(&root).ok();
+}
