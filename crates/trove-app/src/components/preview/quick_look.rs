@@ -286,47 +286,76 @@ impl LiveCard {
         let duration_ms = duration_ms.unwrap_or(0);
         if kind == AssetKind::Audio {
             // No picture to advance, so the card stays the card and only the
-            // sound arrives. A file with no audio stream to feed it leaves
-            // nothing to do, which is the same card the pointer found.
-            let audio = video::has_audio_track(&path).then(|| AudioEngine::spawn(path, cx));
-            if let Some(audio) = &audio {
-                audio.update(cx, |audio, _| audio.set_playing(true));
-            }
-            self.live = audio.map(|audio| Live {
+            // sound arrives. The stream check and the engine both run on a
+            // background task: `has_audio_track` is an ffprobe, and the space
+            // bar must not wait on a subprocess. The card appears at once and
+            // comes back down if the file has no stream to feed it.
+            self.live = Some(Live {
                 id,
                 frame: None,
                 ratio: 0.,
                 duration_ms,
-                audio: Some(audio),
+                audio: None,
                 mailbox: None,
                 alive: None,
                 looked: false,
             });
+            self.start_audio(id, path, cx);
             cx.notify();
-            return;
-        }
-        if !video::ffmpeg_available() {
             return;
         }
         let mailbox = Arc::new(Mutex::new(Mailbox::default()));
         let alive = Arc::new(AtomicBool::new(true));
-        let audio = video::has_audio_track(&path).then(|| AudioEngine::spawn(path.clone(), cx));
-        if let Some(audio) = &audio {
-            audio.update(cx, |audio, _| audio.set_playing(true));
-        }
         self.live = Some(Live {
             id,
             frame: None,
             ratio: 0.,
             duration_ms,
-            audio,
+            audio: None,
             mailbox: Some(mailbox.clone()),
             alive: Some(alive.clone()),
             looked: false,
         });
-        self.decode(mailbox, alive, path, cx);
+        // The availability check, the stream probe and the soundtrack all run
+        // on the decode task below: each shells out, and the space bar must
+        // not wait on a subprocess.
+        self.decode(id, mailbox, alive, path, cx);
         self.present(id, cx);
         cx.notify();
+    }
+
+    /// Start the soundtrack for an audio-only card, off the UI thread. The
+    /// card is already live when this runs, so a file with no audio stream
+    /// takes it back down rather than never showing one.
+    fn start_audio(&self, id: Uuid, path: PathBuf, cx: &mut Context<Self>) {
+        let entity = cx.entity();
+        cx.spawn(async move |_, cx| {
+            let playable = {
+                let path = path.clone();
+                cx.background_executor()
+                    .spawn(
+                        async move { video::ffmpeg_available() && video::has_audio_track(&path) },
+                    )
+                    .await
+            };
+            entity.update(cx, |this, cx| {
+                if !playable {
+                    if this.live.as_ref().is_some_and(|live| live.id == id) {
+                        this.stop();
+                        cx.notify();
+                    }
+                    return;
+                }
+                let Some(live) = this.live.as_mut().filter(|live| live.id == id) else {
+                    return;
+                };
+                let audio = AudioEngine::spawn(path, cx);
+                audio.update(cx, |audio, _| audio.set_playing(true));
+                live.audio = Some(audio);
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     /// The decode loop: probe once, then hand frames to the mailbox, jump when
@@ -334,6 +363,7 @@ impl LiveCard {
     /// a card on its last frame.
     fn decode(
         &self,
+        id: Uuid,
         mailbox: Arc<Mutex<Mailbox>>,
         alive: Arc<AtomicBool>,
         path: PathBuf,
@@ -341,6 +371,22 @@ impl LiveCard {
     ) {
         let entity = cx.entity();
         cx.spawn(async move |_, cx| {
+            // Availability first: the probe and the pipe both need ffmpeg, and
+            // this used to run on the space bar's own thread. Off it now, so a
+            // machine without ffmpeg costs a stopped card instead of a stall.
+            let available = cx
+                .background_executor()
+                .spawn(async move { video::ffmpeg_available() })
+                .await;
+            if !available {
+                entity.update(cx, |this, cx| {
+                    if this.live.as_ref().is_some_and(|live| live.id == id) {
+                        this.stop();
+                        cx.notify();
+                    }
+                });
+                return;
+            }
             let facts = {
                 let path = path.clone();
                 cx.background_executor()
@@ -350,11 +396,27 @@ impl LiveCard {
             // Undecodable: the card stays a card.
             let Some(facts) = facts else {
                 entity.update(cx, |this, cx| {
-                    this.stop();
-                    cx.notify();
+                    if this.live.as_ref().is_some_and(|live| live.id == id) {
+                        this.stop();
+                        cx.notify();
+                    }
                 });
                 return;
             };
+            // The soundtrack starts off the same probe: its `has_audio` is the
+            // stream check the space bar used to run itself.
+            if facts.has_audio {
+                let audio_path = path.clone();
+                entity.update(cx, |this, cx| {
+                    let Some(live) = this.live.as_mut().filter(|live| live.id == id) else {
+                        return;
+                    };
+                    let audio = AudioEngine::spawn(audio_path, cx);
+                    audio.update(cx, |audio, _| audio.set_playing(true));
+                    live.audio = Some(audio);
+                    cx.notify();
+                });
+            }
             let (duration_ms, frame_ms) = (facts.duration_ms, facts.frame_ms());
             if let Ok(mut mailbox) = mailbox.lock() {
                 mailbox.duration_ms = duration_ms;
