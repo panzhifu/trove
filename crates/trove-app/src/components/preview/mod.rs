@@ -26,6 +26,7 @@ mod gpu3d;
 mod image;
 pub(crate) mod model;
 mod quick_look;
+mod sequence;
 mod soundtrack;
 mod text;
 mod transport;
@@ -214,6 +215,18 @@ pub(crate) struct AssetPreviewData {
     /// bound its timeline; the video player gets its own duration from the
     /// decode probe, so only audio reads this today.
     pub(crate) duration_ms: Option<u64>,
+    /// The frame run this asset belongs to, resolved to file paths — what the
+    /// sequence player walks. `None` for a standalone asset and for every
+    /// context that cannot resolve paths (the inspector renders stills).
+    pub(crate) sequence: Option<SequenceInfo>,
+}
+
+/// A frame run the preview can play: the run's frame rate and every frame's
+/// own file, in display order.
+#[derive(Clone)]
+pub(crate) struct SequenceInfo {
+    pub(crate) fps: f64,
+    pub(crate) frames: Vec<PathBuf>,
 }
 
 impl AssetPreviewData {
@@ -223,7 +236,26 @@ impl AssetPreviewData {
         let library_root = controller.library.root().to_path_buf();
         let cache_root = controller.library.cache().to_path_buf();
         let asset = controller.library.asset(id).ok().flatten()?;
-        Some(Self::from_asset(&asset, &library_root, &cache_root))
+        let mut data = Self::from_asset(&asset, &library_root, &cache_root);
+        // A frame run is playable only when the library can name every
+        // frame's file; a run with missing files plays the ones it can name,
+        // and fewer than two is no run at all.
+        if data.is_image
+            && let Ok(Some(membership)) = controller.library.sequence_of(id)
+        {
+            let frames: Vec<PathBuf> = membership
+                .frames
+                .iter()
+                .filter_map(|frame_id| controller.library.asset_file(*frame_id))
+                .collect();
+            if frames.len() >= 2 {
+                data.sequence = Some(SequenceInfo {
+                    fps: membership.fps(),
+                    frames,
+                });
+            }
+        }
+        Some(data)
     }
 
     /// Build from a record the caller already holds (the inspector renders
@@ -276,6 +308,7 @@ impl AssetPreviewData {
                 .content_hash
                 .as_deref()
                 .map(|sha| (cache_root.to_path_buf(), sha.to_string())),
+            sequence: None,
         }
     }
 
@@ -354,6 +387,8 @@ pub(crate) struct AssetPreviewPanel {
     video: Option<Entity<VideoPlayer>>,
     /// The animated-picture player, when the asset is one. See [`anim`].
     anim: Option<Entity<anim::AnimatedPlayer>>,
+    /// The sequence player, when the asset is a frame of a run. See [`sequence`].
+    sequence: Option<Entity<sequence::SequencePlayer>>,
     /// An animated picture whose player has not arrived yet. Decoding every
     /// frame is real work, so it happens off this thread and the panel opens on
     /// the still until it lands; this is what tells that still apart from a
@@ -402,13 +437,22 @@ impl AssetPreviewPanel {
 
     /// Open the panel for preview inputs the caller already resolved (a
     /// virtual system font, for instance).
-    pub(crate) fn spawn_with_data(data: AssetPreviewData, cx: &mut App) -> Entity<Self> {
+    pub(crate) fn spawn_with_data(mut data: AssetPreviewData, cx: &mut App) -> Entity<Self> {
         // The live player is spawned once, here — never per render. Probing the
         // stream is an `ffprobe` round trip that waits on a subprocess slot an
         // import burst can be holding, so it runs off this thread and the panel
         // opens on the still until it lands; an undecodable file (or no ffmpeg)
         // just keeps the still.
         let video_loading = data.kind == trove_core::model::AssetKind::Video;
+        // A frame run spawns its player here, once, exactly like the other
+        // live players; a standalone asset never sees one.
+        let sequence = if data.kind == trove_core::model::AssetKind::Image {
+            data.sequence
+                .take()
+                .map(|info| sequence::SequencePlayer::spawn(info.frames, info.fps, cx))
+        } else {
+            None
+        };
         // An animated picture is decoded once, off this thread, and advanced on
         // a clock this panel owns. gpui can animate a GIF itself, but only while
         // the window is active and only when something else happens to repaint
@@ -446,6 +490,7 @@ impl AssetPreviewPanel {
             video_loading,
             anim: None,
             anim_loading,
+            sequence,
             audio,
             text,
             font_live,
@@ -750,9 +795,14 @@ impl Render for AssetPreviewPanel {
             // needs a window the moment it first builds a line layout.
             (None, None, Some(viewer)) => viewer.clone().into_any_element(),
             (None, None, None) => {
+                // The sequence player stages its own picture, ahead of even
+                // the animated one: a frame of a run previews as the run.
+                if let Some(player) = &self.sequence {
+                    player.clone().into_any_element()
+                }
                 // The animated player stages its own picture, so it takes the
                 // stage before the zoom does — see `zoomable`.
-                if let Some(player) = &self.anim {
+                else if let Some(player) = &self.anim {
                     player.clone().into_any_element()
                 } else if self.video_loading || self.anim_loading {
                     image::still_filling(&self.data)

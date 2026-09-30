@@ -403,15 +403,84 @@ pub(super) fn start_import_job(
             JobStep::Progress { done, total } => {
                 ctl.import_progress(*done as usize, *total as usize);
             }
-            JobStep::Completed(outcome) => ctl.finish_import(
-                outcome.report.imported_count(),
-                outcome.report.skipped_count(),
-            ),
+            JobStep::Completed(outcome) => {
+                ctl.finish_import(
+                    outcome.report.imported_count(),
+                    outcome.report.skipped_count(),
+                );
+                let groups = detect_sequences_after_import(ctl, &outcome.report);
+                if groups > 0 {
+                    ctl.generation += 1;
+                    ctl.notice = Some(
+                        rust_i18n::t!("notice.sequence_detected", groups = groups).to_string(),
+                    );
+                }
+            }
             JobStep::Aborted => ctl.finish_import(0, 0),
         },
         cx,
     );
     true
+}
+
+/// Frame runs among what this import just brought in, created as sequences.
+///
+/// Runs are detected over the newly imported files only — the same directory
+/// and prefix rules [`trove_core::media::sequence::detect`] applies — and a
+/// frame that already belongs to a run stays where it is, so re-importing a
+/// folder over a watch root never splits an existing sequence into fragments.
+/// This is the auto side of the "manual first" sequencing decision: grouping
+/// is non-destructive and dissolvable in one click, the notice names what was
+/// made, and the common case (a folder of frames dropped in whole) needs no
+/// second dialog.
+fn detect_sequences_after_import(
+    ctl: &mut LibraryController,
+    report: &trove_core::media::import::ImportReport,
+) -> usize {
+    use std::collections::HashMap;
+
+    let imported: Vec<(uuid::Uuid, PathBuf)> = report
+        .imported
+        .iter()
+        .filter(|item| item.kind == trove_core::model::AssetKind::Image)
+        .filter_map(|item| {
+            let path = ctl.library.asset_file(item.asset_id)?;
+            Some((item.asset_id, path))
+        })
+        .collect();
+    if imported.len() < trove_core::media::sequence::MIN_FRAMES {
+        return 0;
+    }
+    let groups =
+        trove_core::media::sequence::detect(imported.iter().map(|(_, path)| path.as_path()));
+    let by_path: HashMap<&PathBuf, uuid::Uuid> =
+        imported.iter().map(|(id, path)| (path, *id)).collect();
+    let mut created = 0;
+    for group in groups {
+        let ids: Vec<uuid::Uuid> = group
+            .frames
+            .iter()
+            .filter_map(|frame| by_path.get(&frame.path).copied())
+            .collect();
+        if ids.len() < trove_core::media::sequence::MIN_FRAMES {
+            continue;
+        }
+        let fresh: Vec<uuid::Uuid> = ids
+            .into_iter()
+            .filter(|id| ctl.library.sequence_of(*id).ok().flatten().is_none())
+            .collect();
+        if fresh.len() < trove_core::media::sequence::MIN_FRAMES {
+            continue;
+        }
+        if ctl
+            .library
+            .create_sequence(&fresh, trove_core::media::sequence::DEFAULT_FPS)
+            .is_ok()
+        {
+            created += 1;
+        }
+    }
+    created
 }
 
 /// The completion toast: success when everything landed, a warning listing
