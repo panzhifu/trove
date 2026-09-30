@@ -204,17 +204,13 @@ pub(super) fn build_cell_element(
 
     // Drag the cell out of the window: promote the in-app drag to a native
     // file drag handed to the OS (droppable into editors, chats, file
-    // managers). The real file is handed over: the blob for stored assets
-    // (the receiver sees the content-hash name), the linked original for
-    // linked ones. Must be registered AFTER on_drag with the same payload type.
+    // managers). The whole selection goes, exactly what the in-app drag above
+    // carries: one real file per asset, the blob for stored assets (the
+    // receiver sees the content-hash name), the linked original for linked
+    // ones. Must be registered AFTER on_drag with the same payload type.
     let base = base.external_drag_payload({
         let controller = controller.clone();
-        move |_: &AssetsDrag, _, cx| {
-            let path = controller.read(cx).library.asset_file(id);
-            path.map(|path| {
-                gpui_kit::ExternalDragPayload::Files(gpui_kit::FileDragPaths::new([(path, false)]))
-            })
-        }
+        move |drag: &AssetsDrag, _, cx| external_files(controller.read(cx), drag)
     });
 
     let ctl_menu = controller.clone();
@@ -499,17 +495,13 @@ pub(super) fn build_list_row_element(
 
     // Drag the cell out of the window: promote the in-app drag to a native
     // file drag handed to the OS (droppable into editors, chats, file
-    // managers). The real file is handed over: the blob for stored assets
-    // (the receiver sees the content-hash name), the linked original for
-    // linked ones. Must be registered AFTER on_drag with the same payload type.
+    // managers). The whole selection goes, exactly what the in-app drag above
+    // carries: one real file per asset, the blob for stored assets (the
+    // receiver sees the content-hash name), the linked original for linked
+    // ones. Must be registered AFTER on_drag with the same payload type.
     let base = base.external_drag_payload({
         let controller = controller.clone();
-        move |_: &AssetsDrag, _, cx| {
-            let path = controller.read(cx).library.asset_file(id);
-            path.map(|path| {
-                gpui_kit::ExternalDragPayload::Files(gpui_kit::FileDragPaths::new([(path, false)]))
-            })
-        }
+        move |drag: &AssetsDrag, _, cx| external_files(controller.read(cx), drag)
     });
 
     let ctl_menu = controller.clone();
@@ -521,6 +513,26 @@ pub(super) fn build_list_row_element(
 
 // asset_context_menu, open_image_search and AssetsDragPreview moved to
 // workspace_context_menu.rs / workspace_search.rs
+
+/// The native drag payload for a selection leaving the window: one real file
+/// per asset, in the selection's own order, skipping assets the library cannot
+/// produce a file for. `None` when nothing resolves — no file, no native drag
+/// (the drag stays in-app, where it already previews the selection's count).
+///
+/// The resolver runs once per drag gesture, when the pointer leaves the
+/// viewport, so the per-asset file resolution is a one-shot cost, not a
+/// per-frame one.
+fn external_files(
+    controller: &LibraryController,
+    drag: &AssetsDrag,
+) -> Option<gpui_kit::ExternalDragPayload> {
+    let files = controller.library.asset_files(&drag.0);
+    (!files.is_empty()).then(|| {
+        gpui_kit::ExternalDragPayload::Files(gpui_kit::FileDragPaths::new(
+            files.into_iter().map(|path| (path, false)),
+        ))
+    })
+}
 
 /// The file a `Model` asset's geometry lives in, with the name to show for it.
 ///

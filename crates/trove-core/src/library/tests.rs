@@ -109,6 +109,71 @@ fn relink_asset_repoints_a_moved_file() {
     std::fs::remove_dir_all(&outside).ok();
 }
 
+/// A selection dragged out of the window answers in the caller's order, and
+/// whatever has no file to hand over — a linked original that left the disk,
+/// an id the library does not know — is skipped rather than offered as a dead
+/// entry.
+#[test]
+fn asset_files_answers_a_selection_in_order_skipping_the_fileless() {
+    use crate::media::import::{ImportStorage, commit_staged_all, stage_all};
+
+    let (lib, root) = temp_library("asset-files");
+    let outside = std::env::temp_dir().join(format!("trove-asset-files-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&outside).unwrap();
+
+    // One stored record (content copied into the library's own storage) and
+    // one linked record (the file stays where it is). Different content, so
+    // the second import cannot fold onto the first.
+    let linked_src = write_source(&outside, "linked.png", PNG_1X1);
+    let stored_src = write_source(&outside, "stored.txt", b"stored content");
+    lib.import_into_store(std::slice::from_ref(&stored_src), None)
+        .unwrap();
+    let staged = stage_all(
+        &root,
+        &root.join("cache"),
+        std::slice::from_ref(&linked_src),
+        ImportStorage::Link,
+        &std::sync::atomic::AtomicBool::new(false),
+    );
+    let linked_report = commit_staged_all(lib.store().conn(), None, staged);
+    assert_eq!(linked_report.imported_count(), 1, "linked import");
+
+    let conn = lib.store().conn();
+    let all = assets::query(conn, &AssetQuery::live()).unwrap();
+    assert_eq!(all.items.len(), 2);
+    let linked_id = all
+        .items
+        .iter()
+        .find(|a| a.location().is_linked())
+        .expect("linked import")
+        .id;
+    let stored_id = all
+        .items
+        .iter()
+        .find(|a| !a.location().is_linked())
+        .expect("stored import")
+        .id;
+    let stored_blob = lib
+        .root()
+        .join(stored_rel(&assets::get(conn, stored_id).unwrap().unwrap()));
+
+    // The order is the caller's, not the library's.
+    assert_eq!(
+        lib.asset_files(&[linked_id, stored_id]),
+        vec![linked_src.clone(), stored_blob.clone()]
+    );
+
+    std::fs::remove_file(&linked_src).unwrap();
+    assert_eq!(
+        lib.asset_files(&[linked_id, stored_id, Uuid::new_v4()]),
+        vec![stored_blob]
+    );
+    assert!(lib.asset_files(&[]).is_empty());
+
+    std::fs::remove_dir_all(&root).ok();
+    std::fs::remove_dir_all(&outside).ok();
+}
+
 #[test]
 fn auto_import_groups_into_collections() {
     // Imports go directly to "All Assets" without creating collections.

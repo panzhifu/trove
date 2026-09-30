@@ -598,7 +598,10 @@ mod tests {
         assert_eq!(row.facts.video.fps, Some(30));
         assert_eq!(row.facts.video.has_audio, Some(true));
         assert_eq!(
-            assets::query(store.conn(), &AssetQuery::live()).unwrap().items.len(),
+            assets::query(store.conn(), &AssetQuery::live())
+                .unwrap()
+                .items
+                .len(),
             1,
             "the reuse folds in; it does not grow a second record"
         );

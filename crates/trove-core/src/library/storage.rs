@@ -262,6 +262,15 @@ impl Library {
         path.is_file().then_some(path)
     }
 
+    /// Files for a whole selection, in the given order: [`Self::asset_file`]
+    /// per id, skipping the ones with no file to hand over — a missing record,
+    /// a placeholder, a linked original that has left the disk. The order is
+    /// the caller's, so a selection dragged out of the window reaches the OS
+    /// in the order it was made.
+    pub fn asset_files(&self, ids: &[Uuid]) -> Vec<std::path::PathBuf> {
+        ids.iter().filter_map(|id| self.asset_file(*id)).collect()
+    }
+
     /// The subset of `paths` the library does not hold yet.
     ///
     /// Keyed on file name plus size — the same loose rule the collect import
