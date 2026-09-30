@@ -197,6 +197,13 @@ pub(crate) struct AssetPreviewData {
     /// rather than hiding them; a silently missing toolbar reads as a bug.
     pub(crate) edit_blocker: Option<&'static str>,
     pub(crate) thumb: Option<PathBuf>,
+    /// A video's own first frame, extracted at import and cached beside the
+    /// thumbnail. The player stands it in until ffmpeg produces the real
+    /// first frame; because it *is* that frame, the swap is invisible. `None`
+    /// for every other kind, and for videos imported before posters existed —
+    /// there the player falls back to `thumb`, which hides the wait too at
+    /// the cost of one content jump.
+    pub(crate) poster: Option<PathBuf>,
     /// Full-size original: the library blob, or the linked source.
     pub(crate) original: Option<PathBuf>,
     /// Animated image source (GIF / animated WebP / APNG) when the original
@@ -293,6 +300,13 @@ impl AssetPreviewData {
             .as_deref()
             .map(|hash| trove_core::media::thumb::abs_path(cache_root, hash))
             .filter(|p| p.is_file());
+        // The video's first-frame poster, when the import cache holds one.
+        // Read on the same query as the thumbnail — both are keyed by the
+        // content hash, so nothing here costs a second lookup.
+        let poster = asset
+            .content_hash
+            .as_deref()
+            .and_then(|hash| trove_core::media::thumb::cached_poster(cache_root, hash));
         // Where the record's own bytes are: the library blob, or the linked
         // original. `blob_path` is that rule in one place rather than a fifth
         // copy of it here -- five callers had each re-derived it, and a rule
@@ -321,6 +335,7 @@ impl AssetPreviewData {
                 None
             },
             thumb,
+            poster,
             original,
             animated,
             font_family: asset.facts.font.family.clone(),
@@ -469,16 +484,18 @@ impl AssetPreviewPanel {
         let mut video_loading = data.kind == trove_core::model::AssetKind::Video;
         let video = if video_loading {
             match data.video_facts.take() {
-                // Full facts from the import row: the player spawns now — the
-                // click goes straight to a decoding player, the stage blank
-                // and sized by the stream's geometry for the one ffmpeg
-                // start-up it takes to produce the first frame.
+                // Full facts from the import row: the player spawns now, on
+                // its first-frame poster, and skips the probe entirely.
                 Some(facts) => match data.original.clone() {
                     Some(original) => {
                         let audio = facts
                             .has_audio
                             .then(|| soundtrack::AudioEngine::spawn(original.clone(), cx));
-                        let player = VideoPlayer::spawn(original, facts, audio, None, cx);
+                        // The first-frame poster hides the decoder's start-up;
+                        // a library that predates posters falls back to the
+                        // one-second thumbnail.
+                        let poster = data.poster.clone().or_else(|| data.thumb.clone());
+                        let player = VideoPlayer::spawn(original, facts, poster, audio, None, cx);
                         // The player is live, so the probe path below must not
                         // run: re-probing would replace this player and spawn a
                         // second audio engine for nothing — the facts already

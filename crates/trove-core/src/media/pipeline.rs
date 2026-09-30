@@ -787,12 +787,18 @@ impl Stage for ThumbStage {
         let out = thumb::abs_path(&io.cache_root, &io.content_hash);
         if out.is_file() {
             io.thumb = Some(out);
-            return Ok(());
+        } else {
+            io.thumb = match io.artifacts.get::<Decoded>() {
+                Some(decoded) => thumb::write_downscaled(&decoded.small, &out),
+                None => thumb::ensure(&io.cache_root, &io.content_hash, io.kind, &io.blob_path()),
+            };
         }
-        io.thumb = match io.artifacts.get::<Decoded>() {
-            Some(decoded) => thumb::write_downscaled(&decoded.small, &out),
-            None => thumb::ensure(&io.cache_root, &io.content_hash, io.kind, &io.blob_path()),
-        };
+        // A video also gets its first-frame poster, which the preview stands in
+        // with until ffmpeg decodes the real first frame. Written here — and on
+        // a thumbnail cache hit too, so re-importing a library that predates
+        // posters fills them in. Best effort: a missing poster only costs the
+        // preview its stand-in, and the player falls back to the thumbnail.
+        let _ = thumb::ensure_poster(&io.cache_root, &io.content_hash, io.kind, &io.blob_path());
         Ok(())
     }
 }

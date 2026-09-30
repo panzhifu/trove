@@ -249,8 +249,13 @@ pub fn plan_thumbnail_rebuild(lib: &Library, force: bool) -> Result<ThumbPlan> {
                 plan.missing_blobs += 1;
                 continue;
             };
-            // Skip existing thumbnails unless a full rewrite was requested.
-            if !force && thumb::abs_path(cache, &sha).is_file() {
+            // Skip existing thumbnails unless a full rewrite was requested. A
+            // video also carries a first-frame poster; a missing one is a gap
+            // even when its thumbnail is fine, so a library that predates
+            // posters fills them in on an ordinary rebuild.
+            let thumbed = thumb::abs_path(cache, &sha).is_file();
+            let postered = kind != AssetKind::Video || thumb::cached_poster(cache, &sha).is_some();
+            if !force && thumbed && postered {
                 continue;
             }
             plan.items.push((blob, sha.to_string(), kind));

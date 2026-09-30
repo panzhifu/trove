@@ -1,7 +1,8 @@
 //! Thumbnail cache: small JPEG previews generated beside the blobs.
 //!
-//! Layout mirrors the blob buckets: `thumbs/<sha[:2]>/<sha>.jpg`. A thumbnail
-//! is derived purely from content, so it is safe to delete and regenerate.
+//! Layout mirrors the blob buckets: `thumbs/<sha[:2]>/<sha>.jpg`, with a
+//! video's first-frame poster beside it as `<sha>.poster.jpg`. Both are
+//! derived purely from content, so they are safe to delete and regenerate.
 
 use std::path::{Path, PathBuf};
 
@@ -25,11 +26,33 @@ pub fn abs_path(root: &Path, sha: &str) -> PathBuf {
     root.join(rel_path(sha))
 }
 
+/// Relative path of a video's first-frame poster for `sha`, e.g.
+/// `thumbs/ab/<sha>.poster.jpg`. It sits beside the thumbnail because it is
+/// the same kind of derived artifact, differing only in which frame it holds:
+/// the poster is frame zero, which is what the player's first decoded frame
+/// is, so standing it in hides the decoder's start-up.
+pub fn poster_rel_path(sha: &str) -> String {
+    let (a, b) = sha.split_at(2);
+    format!("thumbs/{a}/{b}.poster.jpg")
+}
+
+/// Absolute path of the first-frame poster for `sha` inside a library root.
+pub fn poster_abs_path(root: &Path, sha: &str) -> PathBuf {
+    root.join(poster_rel_path(sha))
+}
+
+/// The cached first-frame poster for `sha`, when one has been generated.
+pub fn cached_poster(root: &Path, sha: &str) -> Option<PathBuf> {
+    let path = poster_abs_path(root, sha);
+    path.is_file().then_some(path)
+}
+
 /// Remove the thumbnail and its kindred derived files for `sha`. Deleting an
 /// asset takes its derived data with it — the cache regenerates whatever a
 /// remaining record still needs.
 pub fn remove_derived(root: &Path, sha: &str) {
     let _ = std::fs::remove_file(abs_path(root, sha));
+    let _ = std::fs::remove_file(poster_abs_path(root, sha));
     let _ = std::fs::remove_file(crate::media::waveform::abs_path(root, sha));
 }
 
@@ -97,7 +120,13 @@ pub fn regenerate(root: &Path, sha: &str, kind: AssetKind, blob_path: &Path) -> 
     let out = abs_path(root, sha);
     match kind {
         AssetKind::Image => write_thumb(blob_path, &out),
-        AssetKind::Video => write_video_thumb(blob_path, &out),
+        AssetKind::Video => {
+            let thumb = write_video_thumb(blob_path, &out);
+            // The player's stand-in rides the same rebuild: a library rebuilt
+            // after posters existed gains the first frame with it.
+            let _ = write_video_frame(blob_path, &poster_abs_path(root, sha), "0");
+            thumb
+        }
         AssetKind::Font => write_font_card(blob_path, &out),
         AssetKind::Model => write_model_card(blob_path, &out),
         AssetKind::Audio => rebuild_audio_cover(root, sha, blob_path, &out),
@@ -107,6 +136,25 @@ pub fn regenerate(root: &Path, sha: &str, kind: AssetKind, blob_path: &Path) -> 
         }
         _ => None,
     }
+}
+
+/// Ensure a video's first-frame poster exists and return its path. Every
+/// other kind answers `None`: no other kind has a timeline whose first frame
+/// could differ from its card, so a poster would only duplicate the
+/// thumbnail.
+///
+/// Like [`ensure`], a missing or failed poster is not an error — it only
+/// costs the preview its stand-in, and the player falls back to the
+/// thumbnail.
+pub fn ensure_poster(root: &Path, sha: &str, kind: AssetKind, blob_path: &Path) -> Option<PathBuf> {
+    if kind != AssetKind::Video {
+        return None;
+    }
+    let out = poster_abs_path(root, sha);
+    if out.is_file() {
+        return Some(out);
+    }
+    write_video_frame(blob_path, &out, "0")
 }
 
 /// Lower-case extension of a blob, without the dot.
@@ -461,10 +509,20 @@ fn write_model_card(blob_path: &Path, out: &Path) -> Option<PathBuf> {
     }
 }
 
-/// Grab a poster frame from a video with the system `ffmpeg` (opt-in
-/// dependency: when it is not on PATH the video simply keeps its icon). The
-/// frame is written as JPEG directly by ffmpeg, then moved into place.
+/// Grab the grid thumbnail's frame from a video with the system `ffmpeg`
+/// (opt-in dependency: when it is not on PATH the video simply keeps its
+/// icon), one second in.
 fn write_video_thumb(blob_path: &Path, out: &Path) -> Option<PathBuf> {
+    // One second in: past the black or fade-in frames that open many clips,
+    // which is the frame a grid card wants to show.
+    write_video_frame(blob_path, out, "1")
+}
+
+/// Extract the frame at `seek` seconds and write it as a JPEG with the system
+/// `ffmpeg`. The frame is written by ffmpeg, then moved into place. Shared by
+/// the grid thumbnail (one second in) and the player's first-frame poster
+/// (zero), which differ only in that timestamp.
+fn write_video_frame(blob_path: &Path, out: &Path, seek: &str) -> Option<PathBuf> {
     let parent = out.parent()?;
     std::fs::create_dir_all(parent).ok()?;
     // Must keep a known extension (ffmpeg picks the muxer from it): the
@@ -475,7 +533,7 @@ fn write_video_thumb(blob_path: &Path, out: &Path) -> Option<PathBuf> {
     let _slot = super::proc::slot();
     let mut command = std::process::Command::new("ffmpeg");
     command
-        .args(["-y", "-loglevel", "error", "-ss", "1", "-i"])
+        .args(["-y", "-loglevel", "error", "-ss", seek, "-i"])
         .arg(blob_path)
         .args([
             "-frames:v",
@@ -1402,6 +1460,54 @@ mod tests {
 
         let out = ensure(&dir, "a".repeat(64).as_str(), AssetKind::Video, &video);
         assert!(out.is_some_and(|p| p.is_file()));
+    }
+
+    /// The player's first-frame poster is extracted beside the thumbnail and
+    /// lives and dies with the rest of the derived cache. Skipped when the
+    /// optional ffmpeg dependency is not installed.
+    #[test]
+    fn video_poster_extracted_when_ffmpeg_present() {
+        if !ffmpeg_available() {
+            eprintln!("skipping: ffmpeg not on PATH");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("trove-poster-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let video = dir.join("clip.mp4");
+        let status = std::process::Command::new("ffmpeg")
+            .args([
+                "-y",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=red:size=64x48:rate=1:duration=2",
+            ])
+            .arg(&video)
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        let sha = "b".repeat(64);
+        let poster = ensure_poster(&dir, &sha, AssetKind::Video, &video)
+            .expect("a video should get a first-frame poster");
+        assert!(poster.is_file());
+        assert!(
+            poster.to_string_lossy().ends_with(".poster.jpg"),
+            "the poster sits beside the thumbnail: {}",
+            poster.display()
+        );
+        assert!(cached_poster(&dir, &sha).is_some(), "the poster is cached");
+
+        // Only videos have one: another kind must not pay for the extra pass.
+        assert!(ensure_poster(&dir, &sha, AssetKind::Image, &video).is_none());
+
+        remove_derived(&dir, &sha);
+        assert!(
+            cached_poster(&dir, &sha).is_none(),
+            "the poster goes with the asset"
+        );
     }
 
     /// End-to-end first-page rasterization, skipped when none of the external
