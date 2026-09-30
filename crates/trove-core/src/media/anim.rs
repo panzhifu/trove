@@ -38,6 +38,12 @@ pub struct FrameTimes {
     delays_ms: Vec<u32>,
 }
 
+/// The display floor every major browser applies to animation frames, and
+/// Serpent with them: a delay under [`BROWSER_MIN_DELAY_MS`] plays at
+/// [`BROWSER_FLOOR_MS`] instead. See [`FrameTimes::from_delays`].
+const BROWSER_MIN_DELAY_MS: u32 = 20;
+const BROWSER_FLOOR_MS: u32 = 100;
+
 impl FrameTimes {
     /// The empty table: nothing to play.
     pub fn empty() -> Self {
@@ -46,22 +52,37 @@ impl FrameTimes {
 
     /// Build the timeline from per-frame delays.
     ///
-    /// A zero delay is kept as zero rather than clamped. Some encoders emit one
-    /// for a frame meant to be composited and immediately overwritten, and
-    /// inventing a floor here would move every later frame's start and make the
-    /// bar disagree with the picture. A zero-delay frame simply shares the
-    /// instant of the frame before it, which [`FrameTimes::frame_at`] resolves to the last
-    /// frame starting at or before the requested time.
+    /// Delays under two centiseconds play at [`BROWSER_FLOOR_MS`]: the big
+    /// browsers standardized that floor decades ago, most GIFs were authored
+    /// while watching a browser, and Serpent applies the same rule — so an
+    /// asset library playing the same old file 5–10× faster than every viewer
+    /// its author ever used is not being more spec-correct, it is showing a
+    /// different animation. This deliberately reverses an earlier position
+    /// (keep zero delays so compositing frames stay invisible); that position
+    /// had its own good argument, but the glitchy 100 ms-per-frame look it
+    /// avoids is exactly what the author saw and what everyone else shows.
     pub fn from_delays(delays_ms: Vec<u32>) -> Self {
-        let mut starts = Vec::with_capacity(delays_ms.len());
+        // The clamped delays are what the timeline stores: starts, duration
+        // and the playback readout are then one truth instead of two.
+        let shown: Vec<u32> = delays_ms
+            .iter()
+            .map(|d| {
+                if *d < BROWSER_MIN_DELAY_MS {
+                    BROWSER_FLOOR_MS
+                } else {
+                    *d
+                }
+            })
+            .collect();
+        let mut starts = Vec::with_capacity(shown.len());
         let mut at = 0u64;
-        for delay in &delays_ms {
+        for delay in &shown {
             starts.push(at);
             at = at.saturating_add(u64::from(*delay));
         }
         Self {
             starts_ms: starts,
-            delays_ms,
+            delays_ms: shown,
         }
     }
 
@@ -307,21 +328,20 @@ mod tests {
 
     /// A zero-delay frame shares the previous instant, and the round trip is
     /// what a player must still get right — it is also why the delay is not
-    /// silently clamped to a made-up floor.
+    /// Sub-20 ms delays — the classic "loop as fast as you like" encodings of
+    /// old GIFs — play at the browser floor, which is the whole point of the
+    /// clamp: the same file must not play 5–10× faster here than in the
+    /// browser it was authored against.
     #[test]
-    fn a_zero_delay_frame_shares_its_predecessors_instant() {
+    fn sub_twenty_ms_delays_play_at_the_browser_floor() {
         let t = FrameTimes::from_delays(vec![100, 0, 100]);
-        assert_eq!(t.duration_ms(), 200);
+        assert_eq!(t.duration_ms(), 300);
         assert_eq!(t.ms_at(1), 100);
-        assert_eq!(t.ms_at(2), 100);
-        // A zero-duration frame is never the one selected: its successor
-        // starts at the same instant and wins the tie, which is right — a frame
-        // shown for 0 ms is not on screen at any moment.
-        assert_eq!(t.frame_at(99), 0);
-        assert_eq!(t.frame_at(100), 2, "the tie resolves to the latest start");
-        assert_eq!(t.frame_at(101), 2);
-        // Frame 1 is unreachable by time, exactly as it should be: it is on
-        // screen for no duration at all.
+        assert_eq!(t.ms_at(2), 200);
+        assert_eq!(t.frame_at(250), 2);
+        // One centisecond (10 ms) is under the floor too; two (20 ms) is not.
+        let edge = FrameTimes::from_delays(vec![10, 19, 20, 21]);
+        assert_eq!(edge.duration_ms(), 100 + 100 + 20 + 21);
     }
 
     #[test]
