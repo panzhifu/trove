@@ -153,6 +153,20 @@ pub struct AppView {
 }
 
 impl AppView {
+    /// Re-start an interrupted embedding backfill: the same entry point the
+    /// retry button uses, driven at startup by the journal's interrupted
+    /// record instead of a click. The starter re-derives its own inputs and
+    /// refuses (with a notice) when the embedding provider is no longer
+    /// configured, so a stale journal entry cannot force a doomed run.
+    fn auto_resume_backfill(
+        &mut self,
+        controller: &Entity<LibraryController>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        crate::library::jobs::start_embedding_backfill_app(controller, window, cx);
+    }
+
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         // Follow the OS light/dark switch while it runs (the startup apply
         // happened before this window existed).
@@ -160,7 +174,28 @@ impl AppView {
             crate::app::theme::apply_from_settings(Some(window), cx);
         });
         let library = open_library_at_startup();
+        // Interrupted sweep jobs (embedding backfill — checkpointed, idempotent,
+        // and a spend the user already opted into) resume on their own instead
+        // of waiting for a manual retry; per-asset AI jobs stay manual, because
+        // silently continuing those re-spends money without a new ask. The
+        // check reads the library before the controller takes ownership of it.
+        let resume_backfill = library
+            .interrupted_tasks()
+            .iter()
+            .any(|entry| entry.kind == trove_core::tasks::TaskKind::EmbeddingBackfill)
+            && !library
+                .tasks()
+                .is_running(&trove_core::tasks::TaskKind::EmbeddingBackfill);
         let controller = cx.new(|_cx| LibraryController::new(library));
+        if resume_backfill {
+            let weak = controller.downgrade();
+            cx.defer_in(window, move |this, window, cx| {
+                let Some(controller) = weak.upgrade() else {
+                    return;
+                };
+                this.auto_resume_backfill(&controller, window, cx);
+            });
+        }
         // This window is now the running session: the library manager's
         // library switch swaps its library through this handle.
         cx.set_global(crate::app::root::SessionState(Some(controller.downgrade())));
