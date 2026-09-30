@@ -2176,3 +2176,166 @@ fn a_video_import_mines_the_playback_facts() {
 
     std::fs::remove_dir_all(&root).ok();
 }
+
+// ============================================================================
+// Tag merge + bulk delete
+// ============================================================================
+
+fn tag_id_named(lib: &Library, name: &str) -> uuid::Uuid {
+    lib.list_tags()
+        .unwrap()
+        .into_iter()
+        .find(|t| t.name == name)
+        .unwrap_or_else(|| panic!("tag {name} missing"))
+        .id
+}
+
+/// Renaming a tag onto an existing name is a merge: the named tag stays, the
+/// renamed one is gone, and an asset carrying both keeps a single relation.
+/// The merge is undoable — the undo puts the source row and its relations
+/// back under the old id, and the redo merges again.
+#[test]
+fn a_rename_onto_an_existing_name_merges_and_undoes() {
+    let (lib, root) = temp_library("tag-merge");
+    for name in ["one.txt", "two.txt", "three.txt"] {
+        let dir = std::env::temp_dir().join(format!("trove-tag-merge-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join(name);
+        std::fs::write(&file, format!("content of {name}")).unwrap();
+        lib.import_into_store(std::slice::from_ref(&file), None)
+            .unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+    let conn = lib.store().conn();
+    let all = assets::query(conn, &AssetQuery::live()).unwrap().items;
+    let (a, b, c) = (all[0].id, all[1].id, all[2].id);
+
+    lib.create_tag("风光", None).unwrap();
+    lib.create_tag("风景", None).unwrap();
+    let scenery = tag_id_named(&lib, "风景");
+    lib.tag_assets(&[a, b], tag_id_named(&lib, "风光"), true)
+        .unwrap();
+    lib.tag_assets(&[b, c], scenery, true).unwrap();
+
+    // The rename lands on an existing name, so it merges.
+    lib.rename_tag(tag_id_named(&lib, "风光"), "风景").unwrap();
+    let names: Vec<String> = lib
+        .list_tags()
+        .unwrap()
+        .into_iter()
+        .map(|t| t.name)
+        .collect();
+    assert_eq!(names, vec!["风景".to_string()], "the source tag is gone");
+    let carried = |id| {
+        tags::for_asset(conn, id)
+            .unwrap()
+            .into_iter()
+            .map(|t| t.name)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(carried(a), vec!["风景".to_string()]);
+    assert_eq!(
+        carried(b).len(),
+        1,
+        "an asset that had both tags keeps one relation"
+    );
+    assert_eq!(carried(c), vec!["风景".to_string()]);
+
+    // Undo: the source row comes back under its old id with its relations.
+    let merged_id = tag_id_named(&lib, "风景"); // target unchanged
+    lib.undo().unwrap();
+    assert_eq!(lib.list_tags().unwrap().len(), 2);
+    assert_eq!(
+        tags::for_asset(conn, a).unwrap()[0].id,
+        tag_id_named(&lib, "风光"),
+        "the restored row keeps the id the relations remember"
+    );
+    assert_eq!(carried(b).len(), 2, "the both-tags asset has both back");
+    // Redo: merged again.
+    lib.redo().unwrap();
+    assert_eq!(lib.list_tags().unwrap().len(), 1);
+    assert_eq!(carried(a), vec!["风景".to_string()]);
+    assert_eq!(tags::get(conn, merged_id).unwrap().unwrap().name, "风景");
+
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// The merge refuses what it cannot answer for: itself, a missing side, and
+/// a tag whose children would be orphaned by the re-point.
+#[test]
+fn a_merge_refuses_what_it_cannot_answer_for() {
+    let (lib, root) = temp_library("tag-merge-refuse");
+    lib.create_tag("parent", None).unwrap();
+    lib.create_tag("child", lib.tag_by_name("parent").unwrap().map(|t| t.id))
+        .unwrap();
+    lib.create_tag("other", None).unwrap();
+    let parent = tag_id_named(&lib, "parent");
+    let child = tag_id_named(&lib, "child");
+    let other = tag_id_named(&lib, "other");
+
+    assert!(lib.merge_tags(parent, parent).is_err(), "into itself");
+    assert!(
+        lib.merge_tags(parent, Uuid::new_v4()).is_err(),
+        "target does not exist"
+    );
+    assert!(
+        lib.merge_tags(parent, other).is_err(),
+        "a tag with children refuses"
+    );
+    // The leaf still merges.
+    lib.merge_tags(child, other).unwrap();
+    assert_eq!(lib.list_tags().unwrap().len(), 2);
+
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// A batch delete takes each tag and its relations, leaves the rest alone,
+/// and reports how many rows went.
+#[test]
+fn delete_many_takes_each_tag_and_its_relations() {
+    let (lib, root) = temp_library("tag-delete-many");
+    let dir = std::env::temp_dir().join(format!("trove-tag-delete-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("a.txt");
+    std::fs::write(&file, "content").unwrap();
+    lib.import_into_store(std::slice::from_ref(&file), None)
+        .unwrap();
+    std::fs::remove_dir_all(&dir).ok();
+    let conn = lib.store().conn();
+    let asset = assets::query(conn, &AssetQuery::live()).unwrap().items[0].id;
+
+    for name in ["gone-a", "gone-b", "stays"] {
+        lib.create_tag(name, None).unwrap();
+    }
+    let gone_a = tag_id_named(&lib, "gone-a");
+    let gone_b = tag_id_named(&lib, "gone-b");
+    let stays = tag_id_named(&lib, "stays");
+    lib.tag_assets(std::slice::from_ref(&asset), gone_a, true)
+        .unwrap();
+
+    let deleted = lib
+        .delete_tags_many(&[gone_a, gone_b, Uuid::new_v4()])
+        .unwrap();
+    assert_eq!(deleted, 2, "the unknown id deletes nothing");
+    let names: Vec<String> = lib
+        .list_tags()
+        .unwrap()
+        .into_iter()
+        .map(|t| t.name)
+        .collect();
+    assert_eq!(names, vec!["stays".to_string()]);
+    assert!(tags::for_asset(conn, asset).unwrap().is_empty());
+
+    // A subtree delete goes through the same door: parent and child both go.
+    lib.create_tag("parent", None).unwrap();
+    lib.create_tag("sub", lib.tag_by_name("parent").unwrap().map(|t| t.id))
+        .unwrap();
+    let parent = tag_id_named(&lib, "parent");
+    let ids = lib.tag_subtree_ids(parent).unwrap();
+    assert_eq!(ids.len(), 2);
+    lib.delete_tags_many(&ids).unwrap();
+    assert_eq!(lib.list_tags().unwrap().len(), 1);
+    assert_eq!(tags::get(conn, stays).unwrap().unwrap().name, "stays");
+
+    std::fs::remove_dir_all(&root).ok();
+}

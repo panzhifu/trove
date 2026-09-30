@@ -269,6 +269,103 @@ pub fn delete(conn: &Connection, tag_id: Uuid) -> Result<()> {
     Ok(())
 }
 
+/// Delete several tags at once. Each goes exactly as [`delete`] does —
+/// membership rows cascade, the outbox triggers keep the index current — the
+/// batch is one call so a panel or a script never loops the single-tag path
+/// itself. Returns how many of the ids actually deleted a row.
+pub fn delete_many(conn: &Connection, tag_ids: &[Uuid]) -> Result<u64> {
+    let mut deleted = 0u64;
+    for tag_id in tag_ids {
+        deleted += rows::execute(
+            conn,
+            "DELETE FROM tags WHERE id = ?1",
+            vec![rows::uuid(*tag_id).into()],
+        )?;
+    }
+    Ok(deleted)
+}
+
+/// Every asset carrying `tag_id`, in no particular order — what [`merge`]
+/// re-points, and what its undo entry hands back.
+pub fn asset_ids(conn: &Connection, tag_id: Uuid) -> Result<Vec<Uuid>> {
+    rows::query_map(
+        conn,
+        "SELECT asset_id FROM asset_tag WHERE tag_id = ?1",
+        vec![rows::uuid(tag_id).into()],
+        |row| req_uuid(row, 0),
+    )
+}
+
+/// Merge `source` into `target`: every asset tagged `source` becomes tagged
+/// `target` instead — an asset carrying both simply drops the source row —
+/// and `source` is deleted. The tag row is only a handle over relations, so
+/// the whole operation is re-pointing them; the outbox triggers on the
+/// membership rows keep the search index current.
+///
+/// Refuses what it cannot answer for rather than guessing: a tag into
+/// itself, either side missing, or a `source` with children — a child's name
+/// reads as a path under its parent, and re-homing the row would leave every
+/// name pointing at a parent it no longer has. Move or delete the children
+/// first.
+pub fn merge(conn: &Connection, source: Uuid, target: Uuid) -> Result<()> {
+    if source == target {
+        return Err(Error::Validation(
+            "a tag cannot be merged into itself".into(),
+        ));
+    }
+    get(conn, source)?.ok_or(Error::NotFound("source tag"))?;
+    if get(conn, target)?.is_none() {
+        return Err(Error::NotFound("target tag"));
+    }
+    let children = rows::query_count(
+        conn,
+        "SELECT COUNT(*) FROM tags WHERE parent_id = ?1",
+        vec![rows::uuid(source).into()],
+    )?;
+    if children > 0 {
+        return Err(Error::Validation(
+            "cannot merge a tag that has child tags — move or delete them first".into(),
+        ));
+    }
+    // Re-point, then drop the source relations, then the tag itself. The
+    // ignore on the insert is what folds an asset carrying both tags down to
+    // one relation.
+    rows::execute(
+        conn,
+        "INSERT OR IGNORE INTO asset_tag (asset_id, tag_id) \
+         SELECT asset_id, ?1 FROM asset_tag WHERE tag_id = ?2",
+        vec![rows::uuid(target).into(), rows::uuid(source).into()],
+    )?;
+    rows::execute(
+        conn,
+        "DELETE FROM asset_tag WHERE tag_id = ?1",
+        vec![rows::uuid(source).into()],
+    )?;
+    delete(conn, source)
+}
+
+/// Re-create a tag row a merge removed, under the id its relations remember.
+/// Undo-only, and verbatim on purpose — id, name, color, timestamps, parent —
+/// so the id an undo entry's asset list points at is the id that comes back.
+/// A tag with the same name re-created in the meantime hits the unique
+/// constraint and fails the undo, which is the honest answer.
+pub fn restore(conn: &Connection, tag: &Tag) -> Result<()> {
+    rows::execute(
+        conn,
+        "INSERT INTO tags (id, name, color, created_at, parent_id) VALUES (?1, ?2, ?3, ?4, ?5)",
+        vec![
+            rows::uuid(tag.id).into(),
+            tag.name.clone().into(),
+            rows::bind_opt_str(tag.color.as_deref()),
+            rows::ts(tag.created_at).into(),
+            tag.parent_id
+                .map(|u| rows::uuid(u).into())
+                .unwrap_or(rusqlite::types::Value::Null),
+        ],
+    )?;
+    Ok(())
+}
+
 /// Rename a tag. Tag names are part of the search index, so every asset
 /// carrying the tag is re-synced afterwards. Renaming onto an existing
 /// (case-insensitive) name hits the unique constraint and fails.

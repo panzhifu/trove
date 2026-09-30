@@ -58,6 +58,7 @@ pub enum OpAction {
     TagRenamed,
     TagColored,
     TagMoved,
+    TagMerged,
     CollectionRenamed,
     CollectionMoved,
     AddedToCollection,
@@ -68,20 +69,21 @@ impl OpAction {
     /// The i18n key the UI renders this action with.
     pub fn key(self) -> &'static str {
         match self {
-            OpAction::Edit => "history.action.edit",
-            OpAction::Trash => "history.action.trash",
-            OpAction::Restore => "history.action.restore",
-            OpAction::Favorite => "history.action.favorite",
-            OpAction::Unfavorite => "history.action.unfavorite",
-            OpAction::Rename => "history.action.rename",
-            OpAction::TagSet => "history.action.tag_set",
-            OpAction::TagRenamed => "history.action.tag_renamed",
-            OpAction::TagColored => "history.action.tag_colored",
-            OpAction::TagMoved => "history.action.tag_moved",
-            OpAction::CollectionRenamed => "history.action.collection_renamed",
-            OpAction::CollectionMoved => "history.action.collection_moved",
-            OpAction::AddedToCollection => "history.action.added_to_collection",
-            OpAction::RemovedFromCollection => "history.action.removed_from_collection",
+            OpAction::Edit => "history.edit",
+            OpAction::Trash => "history.trash",
+            OpAction::Restore => "history.restore",
+            OpAction::Favorite => "history.favorite",
+            OpAction::Unfavorite => "history.unfavorite",
+            OpAction::Rename => "history.rename",
+            OpAction::TagSet => "history.tag_set",
+            OpAction::TagRenamed => "history.tag_renamed",
+            OpAction::TagColored => "history.tag_colored",
+            OpAction::TagMoved => "history.tag_moved",
+            OpAction::TagMerged => "history.tag_merged",
+            OpAction::CollectionRenamed => "history.collection_renamed",
+            OpAction::CollectionMoved => "history.collection_moved",
+            OpAction::AddedToCollection => "history.added_to_collection",
+            OpAction::RemovedFromCollection => "history.removed_from_collection",
         }
     }
 
@@ -104,6 +106,7 @@ impl OpAction {
             OpAction::TagRenamed => "tag_renamed",
             OpAction::TagColored => "tag_colored",
             OpAction::TagMoved => "tag_moved",
+            OpAction::TagMerged => "tag_merged",
             OpAction::CollectionRenamed => "collection_renamed",
             OpAction::CollectionMoved => "collection_moved",
             OpAction::AddedToCollection => "added_to_collection",
@@ -123,6 +126,7 @@ impl OpAction {
             "tag_renamed" => Some(OpAction::TagRenamed),
             "tag_colored" => Some(OpAction::TagColored),
             "tag_moved" => Some(OpAction::TagMoved),
+            "tag_merged" => Some(OpAction::TagMerged),
             "collection_renamed" => Some(OpAction::CollectionRenamed),
             "collection_moved" => Some(OpAction::CollectionMoved),
             "added_to_collection" => Some(OpAction::AddedToCollection),
@@ -235,6 +239,22 @@ pub enum Op {
         before: Option<Uuid>,
         after: Option<Uuid>,
     },
+    /// A tag merged into another: its relations moved to the target and its
+    /// row deleted. The source row travels whole — id, name, color,
+    /// timestamps, parent — so the undo can put back the very id the
+    /// re-pointed relations remember.
+    TagMerge {
+        source: crate::model::Tag,
+        target: Uuid,
+        assets: Vec<Uuid>,
+    },
+    /// The merge undone: the source row back under its old id, its assets
+    /// re-attached. Never recorded; it exists as the merge's inverse.
+    TagUnmerge {
+        source: crate::model::Tag,
+        target: Uuid,
+        assets: Vec<Uuid>,
+    },
     CollectionRename {
         id: Uuid,
         before: String,
@@ -301,6 +321,19 @@ impl Op {
             }
             Op::TagParent { id, after, .. } => {
                 tags::move_to(conn, *id, *after)?;
+            }
+            Op::TagMerge { source, target, .. } => {
+                tags::merge(conn, source.id, *target)?;
+            }
+            Op::TagUnmerge { source, assets, .. } => {
+                tags::restore(conn, source)?;
+                for id in assets {
+                    tags::add_to_asset(
+                        conn,
+                        crate::model::AssetId(*id),
+                        crate::model::TagId(source.id),
+                    )?;
+                }
             }
             Op::CollectionRename { id, after, .. } => {
                 collections::rename(conn, *id, after)?;
@@ -374,6 +407,24 @@ impl Op {
                 id: *id,
                 before: *after,
                 after: *before,
+            },
+            Op::TagMerge {
+                source,
+                target,
+                assets,
+            } => Op::TagUnmerge {
+                source: source.clone(),
+                target: *target,
+                assets: assets.clone(),
+            },
+            Op::TagUnmerge {
+                source,
+                target,
+                assets,
+            } => Op::TagMerge {
+                source: source.clone(),
+                target: *target,
+                assets: assets.clone(),
             },
             Op::CollectionRename { id, before, after } => Op::CollectionRename {
                 id: *id,

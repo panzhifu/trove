@@ -3,7 +3,8 @@
 
 use gpui_kit::base::{h_flex, v_flex};
 use gpui_kit::component::WindowExt as _;
-use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::button::{Button, ButtonVariant, ButtonVariants as _};
+use gpui_kit::component::dialog::DialogButtonProps;
 use gpui_kit::component::dock::{BasePanel, Panel as DockPanel, PanelControl, PanelEvent};
 use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::component::menu::{ContextMenuExt as _, PopupMenu, PopupMenuItem};
@@ -337,13 +338,23 @@ fn render_tag_row(
         });
     let controller = controller.clone();
     row.context_menu(move |menu, _window, cx| {
-        tag_context_menu(menu, _window, cx, &controller, id, name_for_menu.clone())
+        tag_context_menu(
+            menu,
+            _window,
+            cx,
+            &controller,
+            id,
+            name_for_menu.clone(),
+            has_children,
+        )
     })
     .into_any_element()
 }
 
 /// Right-click menu for a tag row: filter, rename (inline dialog), color,
-/// delete.
+/// delete — plus, for a parent, deleting the whole subtree (the plain delete
+/// on a parent leaves the children re-rooted, which is rarely what the click
+/// meant).
 fn tag_context_menu(
     menu: PopupMenu,
     window: &mut Window,
@@ -351,6 +362,7 @@ fn tag_context_menu(
     controller: &Entity<LibraryController>,
     tag_id: Uuid,
     tag_name: String,
+    has_children: bool,
 ) -> PopupMenu {
     let ctl_filter = controller.clone();
     let ctl_del = controller.clone();
@@ -426,22 +438,47 @@ fn tag_context_menu(
             rust_i18n::t!("tags.color").to_string(),
             color_menu,
         ))
-        .separator()
-        .item(
-            PopupMenuItem::new(rust_i18n::t!("tags.delete_tag").to_string()).on_click(
-                move |_, _, cx| {
-                    ctl_del.update(cx, move |ctl, cx| {
-                        let outcome = ctl.library.delete_tag(tag_id);
-                        ctl.report_failed("deleting a tag", outcome);
-                        if ctl.active_tag == Some(tag_id) {
-                            ctl.select_tag(None);
-                        }
-                        ctl.generation += 1;
-                        cx.notify();
-                    });
+        .separator();
+    if has_children {
+        let ctl_sub = controller.clone();
+        let sub_name = tag_name.clone();
+        m = m.item(
+            PopupMenuItem::new(rust_i18n::t!("tags.delete_subtree").to_string()).on_click(
+                move |_, window, cx| {
+                    let ids = ctl_sub
+                        .read(cx)
+                        .library
+                        .tag_subtree_ids(tag_id)
+                        .unwrap_or_default();
+                    let children = ids.len().saturating_sub(1) as i64;
+                    open_subtree_confirm(
+                        window,
+                        cx,
+                        &ctl_sub,
+                        tag_id,
+                        sub_name.clone(),
+                        ids,
+                        children,
+                    );
                 },
             ),
         );
+    }
+    m = m.separator().item(
+        PopupMenuItem::new(rust_i18n::t!("tags.delete_tag").to_string()).on_click(
+            move |_, _, cx| {
+                ctl_del.update(cx, move |ctl, cx| {
+                    let outcome = ctl.library.delete_tag(tag_id);
+                    ctl.report_failed("deleting a tag", outcome);
+                    if ctl.active_tag == Some(tag_id) {
+                        ctl.select_tag(None);
+                    }
+                    ctl.generation += 1;
+                    cx.notify();
+                });
+            },
+        ),
+    );
     m
 }
 
@@ -515,18 +552,138 @@ fn open_rename_dialog(
             .on_ok({
                 let name_input = name_input.clone();
                 let ctl = ctl.clone();
-                move |_, _, cx| {
+                let current_name = current_name.clone();
+                move |_, window, cx| {
                     let name: String = name_input.read(cx).value().trim().to_string();
-                    if !name.is_empty() {
-                        ctl.update(cx, |ctl, cx| {
+                    if name.is_empty() {
+                        return true;
+                    }
+                    // Renaming onto an existing name means merge, so that is
+                    // asked once, with the numbers it changes, before the
+                    // rename path runs.
+                    let existing = ctl.read(cx).library.tag_by_name(&name).ok().flatten();
+                    match existing {
+                        Some(existing) if existing.id != tag_id => {
+                            let count = ctl.read(cx).library.tag_asset_count(tag_id).unwrap_or(0);
+                            open_merge_confirm(
+                                window,
+                                cx,
+                                &ctl,
+                                tag_id,
+                                current_name.clone(),
+                                existing.id,
+                                existing.name,
+                                count as i64,
+                            );
+                        }
+                        _ => ctl.update(cx, |ctl, cx| {
                             let outcome = ctl.library.rename_tag(tag_id, &name);
                             ctl.report_failed("renaming a tag", outcome);
                             ctl.generation += 1;
                             cx.notify();
-                        });
+                        }),
                     }
                     true
                 }
+            })
+    });
+}
+
+/// Confirm a rename-turned-merge: every asset carrying `source_id` is about
+/// to carry `target_id` instead. The merge is undoable, so this names the
+/// consequence rather than warning off an irrecoverable act.
+#[allow(clippy::too_many_arguments)]
+fn open_merge_confirm(
+    window: &mut Window,
+    cx: &mut App,
+    controller: &Entity<LibraryController>,
+    source_id: Uuid,
+    source_name: String,
+    target_id: Uuid,
+    target_name: String,
+    count: i64,
+) {
+    let ctl = controller.clone();
+    window.open_dialog(cx, move |dialog, _, _| {
+        let ctl = ctl.clone();
+        let source = source_name.clone();
+        let target = target_name.clone();
+        dialog
+            .title(rust_i18n::t!("tags.merge_confirm_title").to_string())
+            .width(px(420.))
+            .child(
+                div().text_sm().p_1().child(
+                    rust_i18n::t!(
+                        "tags.merge_confirm_body",
+                        source = source,
+                        target = target,
+                        count = count
+                    )
+                    .to_string(),
+                ),
+            )
+            .on_ok(move |_, _, cx| {
+                ctl.update(cx, |ctl, cx| {
+                    let outcome = ctl.library.merge_tags(source_id, target_id);
+                    ctl.report_failed("merging a tag", outcome);
+                    if ctl.active_tag == Some(source_id) {
+                        ctl.select_tag(None);
+                    }
+                    ctl.generation += 1;
+                    cx.notify();
+                });
+                true
+            })
+    });
+}
+
+/// Confirm a subtree delete: `ids` (the tag and everything under it) go with
+/// every asset relation, and nothing comes back — the store has no tag-undo,
+/// which is why this is a gate and not a notice.
+fn open_subtree_confirm(
+    window: &mut Window,
+    cx: &mut App,
+    controller: &Entity<LibraryController>,
+    tag_id: Uuid,
+    tag_name: String,
+    ids: Vec<Uuid>,
+    children: i64,
+) {
+    let ctl = controller.clone();
+    // `Rc`: the dialog builder is `Fn` (it may be rebuilt), so the id list
+    // has to be shared into the ok handler rather than moved through it.
+    let ids = std::rc::Rc::new(ids);
+    window.open_dialog(cx, move |dialog, _, _| {
+        let ctl = ctl.clone();
+        let ids = std::rc::Rc::clone(&ids);
+        let name = tag_name.clone();
+        dialog
+            .title(rust_i18n::t!("tags.subtree_confirm_title").to_string())
+            .width(px(420.))
+            .close_button(false)
+            .child(
+                div().text_sm().p_1().child(
+                    rust_i18n::t!("tags.subtree_confirm_body", name = name, count = children)
+                        .to_string(),
+                ),
+            )
+            .button_props(
+                DialogButtonProps::default()
+                    .ok_text(rust_i18n::t!("tags.delete_tag").to_string())
+                    .ok_variant(ButtonVariant::Danger)
+                    .show_cancel(true),
+            )
+            .on_ok(move |_, _, cx| {
+                ctl.update(cx, |ctl, cx| {
+                    let outcome = ctl.library.delete_tags_many(ids.as_slice());
+                    ctl.report_failed("deleting tags", outcome);
+                    if ids.contains(&tag_id) && ctl.active_tag.is_some() {
+                        ctl.select_tag(None);
+                    }
+                    ctl.generation += 1;
+                    cx.notify();
+                });
+                true
             })
     });
 }

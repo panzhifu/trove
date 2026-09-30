@@ -163,8 +163,19 @@ impl Library {
     }
 
     /// Rename a tag (search index re-synced), recording the previous name.
+    ///
+    /// Renaming onto an existing (case-insensitive) name is a **merge**, not
+    /// an error: the name the user typed is the tag that stays, and every
+    /// asset carrying the renamed one carries that tag instead — see
+    /// [`Self::merge_tags`]. That is the whole reason a duplicate name can
+    /// happen on purpose, and the caller confirms before asking for it.
     pub fn rename_tag(&self, tag_id: Uuid, name: &str) -> Result<()> {
         let conn = self.store.conn();
+        if let Some(existing) = tags::get_by_name(conn, name)?
+            && existing.id != tag_id
+        {
+            return self.merge_tags(tag_id, existing.id);
+        }
         let tag = tags::get(conn, tag_id)?.ok_or(crate::Error::NotFound("tag"))?;
         let desc = OpDesc::new(OpAction::TagRenamed, Some(tag.name.clone()), 1);
         let op = Op::TagRename {
@@ -177,6 +188,47 @@ impl Library {
             self.undo.record(tx, op, &desc)
         })?;
         Ok(())
+    }
+
+    /// Merge `source` into `target`: every asset tagged `source` is tagged
+    /// `target` instead, and `source` goes away. Undoable — the entry carries
+    /// the source row whole and the asset list it comes back to, so the undo
+    /// puts back the very relations the merge re-pointed.
+    pub fn merge_tags(&self, source: Uuid, target: Uuid) -> Result<()> {
+        let conn = self.store.conn();
+        let source_tag = tags::get(conn, source)?.ok_or(crate::Error::NotFound("source tag"))?;
+        let assets = tags::asset_ids(conn, source)?;
+        let op = Op::TagMerge {
+            source: source_tag.clone(),
+            target,
+            assets,
+        };
+        let desc = OpDesc::new(OpAction::TagMerged, Some(source_tag.name), 1);
+        undo::apply_atomic(conn, |tx| {
+            tags::merge(tx, source, target)?;
+            self.undo.record(tx, op, &desc)
+        })?;
+        Ok(())
+    }
+
+    /// Delete several tags at once. Same contract as [`Self::delete_tag`]:
+    /// the memberships go with the rows and this is not undoable — the
+    /// confirmation in front of it is the only guard.
+    pub fn delete_tags_many(&self, tag_ids: &[Uuid]) -> Result<u64> {
+        tags::delete_many(self.store.conn(), tag_ids)
+    }
+
+    /// The tag carrying this exact (case-insensitive) name, for callers that
+    /// need to know a rename would merge before asking.
+    pub fn tag_by_name(&self, name: &str) -> Result<Option<crate::model::Tag>> {
+        tags::get_by_name(self.store.conn(), name)
+    }
+
+    /// How many assets carry the tag (its subtree, matching the panel's
+    /// counts). A leaf's number is what a merge would move; the store refuses
+    /// a parent, so the number is only read for leaves.
+    pub fn tag_asset_count(&self, tag_id: Uuid) -> Result<u64> {
+        tags::count_assets(self.store.conn(), tag_id)
     }
 
     /// Set (or clear) a tag's display color, recording the previous value.
