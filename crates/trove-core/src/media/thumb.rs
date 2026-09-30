@@ -613,6 +613,11 @@ pub fn decode_image_tracked(blob_path: &Path) -> Option<DecodedImage> {
         "psd" => (render_psd(blob_path)?, None),
         "heic" | "heif" | "avif" => (crate::media::probe::heif_to_image(blob_path)?, None),
         "jxl" => (render_jxl(blob_path)?, None),
+        // A PDF-compatible `.ai` draws exactly like the PDF it is (probe
+        // sniffs the header before this arm is ever reached); a legacy
+        // PostScript one simply fails over to no image, like any PDF the
+        // rasterizers cannot read.
+        "ai" => (pdf_first_page(blob_path)?, None),
         _ if crate::media::probe::is_raw_ext(&ext) => (render_raw(blob_path)?, None),
         _ => decode_raster(blob_path)?,
     };
@@ -1432,6 +1437,32 @@ mod tests {
 
         // The rebuild path shares the arm and must clear it too.
         assert!(regenerate(&dir, &"b".repeat(64), AssetKind::Document, &pdf).is_some());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A PDF-compatible `.ai` is the same picture under a different name:
+    /// probe sniffs it into the Image kind, and the thumbnail arm routes it
+    /// through the identical rasterizer chain.
+    #[test]
+    fn an_ai_file_cards_like_the_pdf_it_is() {
+        if !pdf_rasterizer_available() {
+            eprintln!("skipping: no pdftoppm/mutool/gs on PATH");
+            return;
+        }
+        let dir = temp_dir_named("aithumb");
+        let ai = dir.join("logo.ai");
+        std::fs::copy(sample_pdf(&dir), &ai).unwrap();
+
+        let out = ensure(&dir, &"c".repeat(64), AssetKind::Image, &ai)
+            .expect("a PDF-compatible .ai gets a card");
+        let image = image::open(&out).unwrap().to_rgb8();
+        assert_eq!(image.dimensions().0.max(image.dimensions().1), THUMB_MAX);
+        let blue = image
+            .pixels()
+            .filter(|p| p.0[2] > 150 && (p.0[2] as i32) > (p.0[0] as i32) + 60)
+            .count();
+        assert!(blue * 20 > (image.width() * image.height()) as usize);
 
         std::fs::remove_dir_all(&dir).ok();
     }

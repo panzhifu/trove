@@ -239,7 +239,7 @@ fn decode_oriented(path: &Path) -> Result<(image::DynamicImage, Option<Vec<u8>>)
         .map(|e| e.to_ascii_lowercase())
         .unwrap_or_default();
     let special =
-        matches!(ext.as_str(), "svg" | "psd" | "heic" | "heif") || probe::is_raw_ext(&ext);
+        matches!(ext.as_str(), "svg" | "psd" | "heic" | "heif" | "ai") || probe::is_raw_ext(&ext);
     if special {
         return thumb::decode_image(path)
             .map(|image| (image, None))

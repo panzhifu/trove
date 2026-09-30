@@ -599,7 +599,7 @@ impl Stage for ProbeStage {
     }
 
     fn run(&self, io: &mut StageIo) -> Result<()> {
-        let p = probe::probe(&io.ext);
+        let p = probe::probe_for(&io.ext, &io.blob_path());
         io.kind = p.kind;
         io.mime = p.mime;
         match p.kind {

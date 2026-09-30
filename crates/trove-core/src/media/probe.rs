@@ -166,6 +166,9 @@ pub fn probe(ext: &str) -> Probe {
         "aiff" | "aif" => "audio/aiff",
         "aifc" => "audio/x-aifc",
         "pdf" => "application/pdf",
+        // Legacy PostScript `.ai`; a PDF-compatible one is promoted to
+        // `application/pdf` by the sniff in [`probe_for`].
+        "ai" => "application/postscript",
         "doc" => "application/msword",
         "docx" => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
         "xls" => "application/vnd.ms-excel",
@@ -200,6 +203,49 @@ pub fn probe(ext: &str) -> Probe {
     }
     .to_string();
     Probe { kind, mime }
+}
+
+/// The probe the import pipeline runs: extension first, with the one
+/// content-dependent classification (`.ai`) sniffing the file itself.
+pub fn probe_for(ext: &str, path: &std::path::Path) -> Probe {
+    if ext == "ai" {
+        return probe_ai(path);
+    }
+    probe(ext)
+}
+
+/// `.ai` is a two-generation format. AI 9 and later save a PDF-compatible
+/// stream — the `%PDF-` header sits within the first KiB, the PDF spec's own
+/// tolerance for a preamble — and those are pictures as far as this library
+/// is concerned: the same external rasterizer chain that draws PDF first
+/// pages draws theirs, and every image consumer (palette, visual search, AI)
+/// follows. Legacy PostScript `.ai` (AI 8 and older, `%!PS-Adobe-`) has no
+/// rasterizer here, so it keeps `Other` and its kind icon.
+pub fn probe_ai(path: &std::path::Path) -> Probe {
+    if ai_sniffs_as_pdf(path) {
+        Probe {
+            kind: AssetKind::Image,
+            mime: "application/pdf".to_string(),
+        }
+    } else {
+        Probe {
+            kind: AssetKind::Other,
+            mime: "application/postscript".to_string(),
+        }
+    }
+}
+
+/// Whether `%PDF-` appears in the file's first KiB.
+fn ai_sniffs_as_pdf(path: &std::path::Path) -> bool {
+    use std::io::Read as _;
+    let mut head = [0u8; 1024];
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return false;
+    };
+    let Ok(read) = file.read(&mut head) else {
+        return false;
+    };
+    head[..read].windows(5).any(|window| window == b"%PDF-")
 }
 
 /// Container-level facts of an MP4-family file (mp4 / m4v / m4a / mov),
@@ -249,6 +295,10 @@ pub fn video_facts(path: &std::path::Path) -> Option<VideoFacts> {
 /// decode stage is about to produce exactly those pixels.
 pub fn dimensions_need_full_decode(ext: &str) -> bool {
     is_raw_ext(ext) || matches!(ext, "heif" | "heic" | "avif")
+        // A PDF-compatible `.ai` has no image header at all; its dimensions
+        // are whatever the first-page raster says, which the decode stage
+        // produces anyway.
+        || ext == "ai"
 }
 
 /// Read the pixel dimensions of a raster image by decoding only its header.
@@ -417,6 +467,48 @@ pub(crate) fn heif_to_image(path: &std::path::Path) -> Option<image::DynamicImag
 
 #[cfg(test)]
 mod tests {
+
+    /// `.ai` classifies by content, not by name: a PDF-compatible stream is
+    /// an image (mime says what the bytes actually are), legacy PostScript
+    /// stays Other with the honest PostScript mime, and the pure extension
+    /// probe stays conservative — no file, no promotion.
+    #[test]
+    fn ai_files_classify_by_content() {
+        let dir = std::env::temp_dir().join(format!("trove-probe-ai-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let pdf = dir.join("modern.ai");
+        std::fs::write(
+            &pdf,
+            b"%PDF-1.7\n\xe2\x80\xa3\xc3\xa2\xc3\xa3 (Illustrator)\n1 0 obj\n",
+        )
+        .unwrap();
+        let promoted = probe_ai(&pdf);
+        assert_eq!(promoted.kind, AssetKind::Image);
+        assert_eq!(promoted.mime, "application/pdf");
+        assert_eq!(probe_for("ai", &pdf), promoted);
+
+        let legacy = dir.join("legacy.ai");
+        std::fs::write(
+            &legacy,
+            b"%!PS-Adobe-3.0\n%%Creator: Adobe Illustrator(R) 8.0\n",
+        )
+        .unwrap();
+        let kept = probe_ai(&legacy);
+        assert_eq!(kept.kind, AssetKind::Other);
+        assert_eq!(kept.mime, "application/postscript");
+
+        // The pure extension map cannot sniff, so it stays conservative —
+        // and the file being unreadable degrades to the same answer.
+        assert_eq!(probe("ai").kind, AssetKind::Other);
+        assert_eq!(
+            probe_for("ai", &dir.join("missing.ai")).kind,
+            AssetKind::Other
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     use super::*;
 
     /// A header that reports no pixels is an unknown size, never a 1×1 one.
