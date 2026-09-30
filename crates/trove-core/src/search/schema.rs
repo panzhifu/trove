@@ -42,6 +42,15 @@ pub(super) struct Fields {
     pub(super) font_tri: Field,
     pub(super) audio_w: Field,
     pub(super) audio_tri: Field,
+    /// A text file's own beginning (see `text::MAX_INDEX_BYTES`) — the one
+    /// surface that lives in the file rather than the store row.
+    pub(super) body_w: Field,
+    pub(super) body_tri: Field,
+    /// The colour space a file's ICC profile claims: `color_words` holds the
+    /// profile's own name, `color_tri` a compact form (letters/digits only,
+    /// lower-cased) so `color:AdobeRGB` can match a name containing spaces.
+    pub(super) color_w: Field,
+    pub(super) color_tri: Field,
 }
 
 impl Fields {
@@ -63,6 +72,7 @@ impl Fields {
                 self.desc_w,
                 self.tags_w,
                 self.facts_w,
+                self.body_w,
             ],
             Name => vec![self.name_w],
             Title => vec![self.title_w],
@@ -74,6 +84,8 @@ impl Fields {
             Album => vec![self.album_w],
             Font => vec![self.font_w],
             Audio => vec![self.audio_w],
+            Body => vec![self.body_w],
+            ColorSpace => vec![self.color_w],
         }
     }
 
@@ -88,6 +100,7 @@ impl Fields {
                 self.desc_tri,
                 self.tags_tri,
                 self.facts_tri,
+                self.body_tri,
             ],
             Name => vec![self.name_tri],
             Title => vec![self.title_tri],
@@ -99,6 +112,8 @@ impl Fields {
             Album => vec![self.album_tri],
             Font => vec![self.font_tri],
             Audio => vec![self.audio_tri],
+            Body => vec![self.body_tri],
+            ColorSpace => vec![self.color_tri],
         }
     }
 
@@ -116,7 +131,7 @@ impl Fields {
             Title => Some(self.title_pinyin),
             Description => Some(self.desc_pinyin),
             Tags => Some(self.tags_pinyin),
-            All | Facts | Camera | Artist | Album | Font | Audio => None,
+            All | Facts | Camera | Artist | Album | Font | Audio | Body | ColorSpace => None,
         }
     }
 }
@@ -174,6 +189,10 @@ impl super::TextIndex {
             "album_words",
             "font_words",
             "audio_words",
+            // The body carries phrases too ("error 404" inside a log); the
+            // colour name likewise ("adobe rgb" as one quoted phrase).
+            "body_words",
+            "color_words",
         ] {
             builder.add_text_field(name, indexed_text_with_positions(TOK_JIEBA));
         }
@@ -183,6 +202,8 @@ impl super::TextIndex {
             "album_tri",
             "font_tri",
             "audio_tri",
+            "body_tri",
+            "color_tri",
         ] {
             builder.add_text_field(name, indexed_text(TOK_TRI));
         }

@@ -29,6 +29,7 @@ fn bench_uncapped_gather() {
             None,
             "",
             &FactTexts::default(),
+            "",
         );
     }
     drop(writer);
@@ -95,6 +96,7 @@ fn a_filtered_search_finds_the_match_that_ranked_past_the_fast_path() {
             a.description.as_deref(),
             "",
             &FactTexts::default(),
+            "",
         );
         strong.push(a.id);
     }
@@ -113,6 +115,7 @@ fn a_filtered_search_finds_the_match_that_ranked_past_the_fast_path() {
         last.description.as_deref(),
         "",
         &FactTexts::default(),
+        "",
     );
     drop(writer);
     idx.commit().unwrap();
@@ -156,6 +159,7 @@ fn in_ram_roundtrip() {
         None,
         "",
         &FactTexts::default(),
+        "",
     );
     idx.commit().unwrap();
     assert_eq!(idx.num_docs(), 1);
@@ -208,7 +212,16 @@ fn sample_index() -> TextIndex {
     {
         let writer = idx.writer().unwrap();
         for (id, name, title, desc, tags) in cases {
-            idx.index_asset_text(&writer, id, name, title, desc, tags, &FactTexts::default());
+            idx.index_asset_text(
+                &writer,
+                id,
+                name,
+                title,
+                desc,
+                tags,
+                &FactTexts::default(),
+                "",
+            );
         }
         // The writer must be released before the reader may see the commit.
         drop(writer);
@@ -361,6 +374,7 @@ fn a_quoted_phrase_finds_the_substring_it_describes() {
             None,
             "",
             &FactTexts::default(),
+            "",
         );
         idx.index_asset_text(
             &writer,
@@ -370,6 +384,7 @@ fn a_quoted_phrase_finds_the_substring_it_describes() {
             None,
             "",
             &FactTexts::default(),
+            "",
         );
         drop(writer);
     }
@@ -408,6 +423,7 @@ fn a_camera_qualifier_answers_only_the_camera_surface() {
                 camera: "Canon EOS R5 ISO 400 f/2.8 1/60s".into(),
                 ..Default::default()
             },
+            "",
         );
         idx.index_asset_text(
             &writer,
@@ -417,6 +433,7 @@ fn a_camera_qualifier_answers_only_the_camera_surface() {
             Some("canon ryuichi async inter"),
             "",
             &FactTexts::default(),
+            "",
         );
         idx.index_asset_text(
             &writer,
@@ -429,6 +446,7 @@ fn a_camera_qualifier_answers_only_the_camera_surface() {
                 artist: "Ryuichi Sakamoto".into(),
                 ..Default::default()
             },
+            "",
         );
         idx.index_asset_text(
             &writer,
@@ -441,6 +459,7 @@ fn a_camera_qualifier_answers_only_the_camera_surface() {
                 album: "Async".into(),
                 ..Default::default()
             },
+            "",
         );
         idx.index_asset_text(
             &writer,
@@ -453,6 +472,7 @@ fn a_camera_qualifier_answers_only_the_camera_surface() {
                 font: "Inter Bold 400".into(),
                 ..Default::default()
             },
+            "",
         );
         drop(writer);
     }
@@ -509,6 +529,7 @@ fn a_qualified_pinyin_stays_on_its_own_surface() {
             None,
             "",
             &FactTexts::default(),
+            "",
         );
         idx.index_asset_text(
             &writer,
@@ -518,6 +539,7 @@ fn a_qualified_pinyin_stays_on_its_own_surface() {
             None,
             "猫",
             &FactTexts::default(),
+            "",
         );
         idx.index_asset_text(
             &writer,
@@ -527,6 +549,7 @@ fn a_qualified_pinyin_stays_on_its_own_surface() {
             None,
             "",
             &FactTexts::default(),
+            "",
         );
         idx.index_asset_text(
             &writer,
@@ -536,6 +559,7 @@ fn a_qualified_pinyin_stays_on_its_own_surface() {
             None,
             "",
             &FactTexts::default(),
+            "",
         );
         drop(writer);
     }
@@ -581,6 +605,7 @@ fn a_saturated_pool_is_gathered_wider_only_when_it_will_be_filtered() {
                 None,
                 "",
                 &FactTexts::default(),
+                "",
             );
         }
         drop(writer);
@@ -670,4 +695,117 @@ fn directory_entries(dir: &std::path::Path) -> Vec<String> {
         .collect();
     names.sort();
     names
+}
+
+/// The colour qualifier answers on three roads at once: the compact form
+/// rides the trigram surface (`color:adobergb` against a name with spaces in
+/// it), the profile's own words ride the word surface, and a quoted phrase
+/// works because the colour words field carries positions. Unqualified text
+/// deliberately does not reach the colour surfaces — `color:` is how you ask.
+#[test]
+fn a_color_qualifier_matches_word_gram_and_phrase() {
+    let idx = TextIndex::in_ram().unwrap();
+    {
+        let writer = idx.writer().unwrap();
+        idx.index_asset_text(
+            &writer,
+            "cccc0000-0000-0000-0000-000000000001",
+            "wide.png",
+            None,
+            None,
+            "",
+            &super::facts::FactTexts {
+                color: "Adobe RGB (1998)".into(),
+                ..Default::default()
+            },
+            "",
+        );
+        drop(writer);
+    }
+    idx.commit().unwrap();
+
+    assert_eq!(
+        ids_of_expr(&idx, "color:adobergb"),
+        vec!["cccc0000-0000-0000-0000-000000000001"],
+        "the compact form matches across the name's spaces"
+    );
+    assert_eq!(
+        ids_of_expr(&idx, "color:adobe"),
+        vec!["cccc0000-0000-0000-0000-000000000001"],
+    );
+    assert_eq!(
+        ids_of_expr(&idx, "color:\"adobe rgb\""),
+        vec!["cccc0000-0000-0000-0000-000000000001"],
+    );
+    // A negative case has to sit beyond fuzzy reach: `color:srgb` would
+    // legitimately hit the RGB words above through the same edit-distance
+    // typo tolerance every word surface enjoys.
+    assert!(ids_of_expr(&idx, "color:zebra").is_empty());
+    assert!(
+        ids_of(&idx, "adobergb").is_empty(),
+        "technical metadata stays out of the unqualified surfaces"
+    );
+}
+
+/// The body surface's end-to-end road: a real library, a real `.md` file,
+/// the real drain (which is what passes the library root down to the
+/// indexer), and a search that finds the file by what it *says* — the
+/// unqualified path for knowledge-base queries, the `body:`/`content:`
+/// qualifiers for scoped ones, a quoted phrase for word order. The 64 KiB
+/// cap is asserted the honest way: a term past it does not match.
+#[test]
+fn a_text_body_is_indexed_from_the_file() {
+    let root = std::env::temp_dir().join(format!(
+        "trove-index-body-{}",
+        crate::model::new_id().simple()
+    ));
+    let lib = crate::library::Library::open(&root, root.join("cache")).unwrap();
+    let src = root.join("notes.md");
+    std::fs::write(
+        &src,
+        b"# Lab notes\nThe quantum flux capacitor needs calibrating. The quick brown fox escapes.\n",
+    )
+    .unwrap();
+    lib.import_into_store(std::slice::from_ref(&src), None)
+        .unwrap();
+    lib.drain_search_queue().unwrap();
+
+    let idx = lib.text_index();
+    assert_eq!(
+        ids_of(idx, "quantum").len(),
+        1,
+        "an unqualified term reaches the body"
+    );
+    assert_eq!(
+        ids_of_expr(idx, "body:calibrating"),
+        ids_of_expr(idx, "content:calibrating"),
+        "the two spellings name the same surface"
+    );
+    assert_eq!(ids_of_expr(idx, "body:calibrating").len(), 1);
+    assert_eq!(
+        ids_of_expr(idx, "body:\"quick brown\"").len(),
+        1,
+        "phrases match positions inside the body"
+    );
+    assert!(ids_of_expr(idx, "body:missingword").is_empty());
+
+    // Past the cap: a 65 KiB file whose last line holds a unique word.
+    let big = root.join("big.log");
+    let mut body = "word ".repeat(14_000);
+    body.push_str("tailmarkerword\n");
+    std::fs::write(&big, body.as_bytes()).unwrap();
+    lib.import_into_store(std::slice::from_ref(&big), None)
+        .unwrap();
+    lib.drain_search_queue().unwrap();
+    assert!(
+        ids_of(idx, "tailmarkerword").is_empty(),
+        "a term beyond the 64 KiB index cap must not be promised"
+    );
+    assert_eq!(
+        ids_of(idx, "word").len(),
+        1,
+        "the beginning stays searchable"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
 }

@@ -517,7 +517,7 @@ mod tests {
         assets::insert(conn, &doc).unwrap();
 
         let idx = crate::search::TextIndex::in_ram().unwrap();
-        idx.index_asset(conn, img.id).unwrap();
+        idx.index_asset_in(conn, img.id, None).unwrap();
         idx.commit().unwrap();
 
         // contains: only the asset whose indexed text hits the query.

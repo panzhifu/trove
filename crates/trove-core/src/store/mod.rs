@@ -1970,7 +1970,7 @@ mod tests {
             )
             .unwrap();
             for a in page.items {
-                idx.index_asset(store.conn(), a.id).unwrap();
+                idx.index_asset_in(store.conn(), a.id, None).unwrap();
             }
         }
         idx.commit().unwrap();
@@ -2584,7 +2584,7 @@ mod tests {
             crate::model::TagId(tag.id),
         )
         .unwrap();
-        crate::search::drain(conn, &idx).unwrap();
+        crate::search::drain(conn, &idx, None).unwrap();
         let hits = search_page(&store, &idx, "landscape", None);
         assert_eq!(hits.total, 1);
         assert_eq!(hits.items[0].id, photo.id);
@@ -2598,19 +2598,19 @@ mod tests {
             crate::model::TagId(tag.id),
         )
         .unwrap();
-        crate::search::drain(conn, &idx).unwrap();
+        crate::search::drain(conn, &idx, None).unwrap();
         let page = search_page(&store, &idx, "landscape", None);
         assert_eq!(page.total, 0);
 
         // Batch replace carries every new tag name.
         tags::set_for_asset(conn, photo.id, &[tag.id, other.id]).unwrap();
-        crate::search::drain(conn, &idx).unwrap();
+        crate::search::drain(conn, &idx, None).unwrap();
         let page = search_page(&store, &idx, "landscape night", None);
         assert_eq!(page.total, 1);
 
         // Deleting a tag removes it from every indexed asset.
         tags::delete(conn, other.id).unwrap();
-        crate::search::drain(conn, &idx).unwrap();
+        crate::search::drain(conn, &idx, None).unwrap();
         let page = search_page(&store, &idx, "night", None);
         assert_eq!(page.total, 0);
         let page = search_page(&store, &idx, "landscape", None);
@@ -3198,7 +3198,7 @@ mod tests {
         let renamed = tags::get(conn, tag.id).unwrap().unwrap();
         assert_eq!(renamed.name, "coastline");
         // The outbox picked the rename up; the index follows in both directions.
-        crate::search::drain(conn, &idx).unwrap();
+        crate::search::drain(conn, &idx, None).unwrap();
         let page = search_page(&store, &idx, "coastline", None);
         assert_eq!(page.total, 1);
         let page = search_page(&store, &idx, "beach", None);

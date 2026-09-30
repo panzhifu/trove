@@ -53,7 +53,12 @@ mod tests;
 /// sat between every adjacent word pair, `PhraseQuery` could never fire
 /// across one, and quoted phrases were carried by the gram fallback alone.
 /// Positions change, so old indexes rebuild.
-const INDEX_VERSION: u32 = 6;
+/// 7: text bodies are indexed (`body_words` / `body_tri` — the file's own
+/// beginning, so a `.md` note is findable by what it says) and the colour
+/// space gained dedicated surfaces (`color_words` for the profile's own
+/// name, `color_tri` for a compact form so `color:AdobeRGB` can match).
+/// Fields change, so old indexes rebuild.
+const INDEX_VERSION: u32 = 7;
 /// Heap budget for the index writer, in bytes.
 const WRITER_HEAP: usize = 32 * 1024 * 1024;
 /// How many ranked candidates one text lookup may contribute before the

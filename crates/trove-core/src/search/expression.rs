@@ -83,6 +83,10 @@ pub enum Target {
     Font,
     /// Audio technical specs (sample rate, channels, bit depth, bitrate).
     Audio,
+    /// A text file's own beginning, indexed from the file itself.
+    Body,
+    /// The colour space a file's ICC profile claims (`color:`).
+    ColorSpace,
 }
 
 /// One search term: a span of text that must (or must not) match one target.
@@ -273,6 +277,10 @@ const FIELD_TARGETS: &[(&str, Target)] = &[
     ("channels", Target::Audio),
     ("bit_depth", Target::Audio),
     ("bitrate", Target::Audio),
+    ("body", Target::Body),
+    ("content", Target::Body),
+    ("color", Target::ColorSpace),
+    ("colorspace", Target::ColorSpace),
 ];
 
 fn field_target(field: &str) -> Option<Target> {

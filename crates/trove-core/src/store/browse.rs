@@ -657,7 +657,7 @@ mod tests {
         }
         let idx = crate::search::TextIndex::in_ram().unwrap();
         for asset in [&png, &jpg, &clip] {
-            idx.index_asset(conn, asset.id).unwrap();
+            idx.index_asset_in(conn, asset.id, None).unwrap();
         }
         idx.commit().unwrap();
 
@@ -777,8 +777,8 @@ mod tests {
         assets::insert(conn, &beach).unwrap();
 
         let idx = crate::search::TextIndex::in_ram().unwrap();
-        idx.index_asset(conn, shot.id).unwrap();
-        idx.index_asset(conn, beach.id).unwrap();
+        idx.index_asset_in(conn, shot.id, None).unwrap();
+        idx.index_asset_in(conn, beach.id, None).unwrap();
         idx.commit().unwrap();
 
         // Only `beach` carries a vector, and it points straight at the query
@@ -864,8 +864,8 @@ mod tests {
         assets::insert(conn, &beach).unwrap();
 
         let idx = crate::search::TextIndex::in_ram().unwrap();
-        idx.index_asset(conn, shot.id).unwrap();
-        idx.index_asset(conn, beach.id).unwrap();
+        idx.index_asset_in(conn, shot.id, None).unwrap();
+        idx.index_asset_in(conn, beach.id, None).unwrap();
         idx.commit().unwrap();
 
         // The vector points at `beach` only.
@@ -1125,7 +1125,7 @@ mod tests {
         for ix in 0..3 {
             let asset = test_asset(&format!("sunset{ix}.png"), AssetKind::Image, Uuid::new_v4());
             assets::insert(conn, &asset).unwrap();
-            idx.index_asset(conn, asset.id).unwrap();
+            idx.index_asset_in(conn, asset.id, None).unwrap();
             seeded.push(asset.id);
         }
         idx.commit().unwrap();
@@ -1142,7 +1142,7 @@ mod tests {
         // A fourth match arrives after the freeze.
         let late = test_asset("sunset3.png", AssetKind::Image, Uuid::new_v4());
         assets::insert(conn, &late).unwrap();
-        idx.index_asset(conn, late.id).unwrap();
+        idx.index_asset_in(conn, late.id, None).unwrap();
         idx.commit().unwrap();
 
         let first = session.page(conn, &idx, 0, Some(2)).unwrap();
@@ -1204,7 +1204,7 @@ mod tests {
         assets::insert(conn, &doc).unwrap();
 
         let idx = crate::search::TextIndex::in_ram().unwrap();
-        idx.index_asset(conn, img.id).unwrap();
+        idx.index_asset_in(conn, img.id, None).unwrap();
         idx.commit().unwrap();
         let ctx = |mutate: &dyn Fn(&mut BrowseContext)| {
             let mut c = BrowseContext::default();
@@ -1426,7 +1426,7 @@ mod tests {
                 .unwrap_or((None, None));
             assets::insert(conn, &a).unwrap();
             ids.insert(name.to_string(), a.id);
-            idx.index_asset(conn, a.id).unwrap();
+            idx.index_asset_in(conn, a.id, None).unwrap();
         }
         idx.commit().unwrap();
 
@@ -1519,7 +1519,7 @@ mod tests {
                 .unwrap_or((None, None));
             assets::insert(conn, &a).unwrap();
             ids.insert(name.to_string(), a.id);
-            idx.index_asset(conn, a.id).unwrap();
+            idx.index_asset_in(conn, a.id, None).unwrap();
         }
         idx.commit().unwrap();
         let expected =

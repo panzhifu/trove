@@ -17,6 +17,20 @@ pub(super) struct FactTexts {
     pub(super) font: String,
     pub(super) audio: String,
     pub(super) embedded_title: String,
+    /// The colour space the file's ICC profile claims, as the profile names
+    /// it (`Adobe RGB (1998)`); empty when no profile was recorded.
+    pub(super) color: String,
+}
+
+/// The matching form of a colour-space name: letters and digits only, lower
+/// cased — `Adobe RGB (1998)` becomes `adobergb1998`. The trigram surface
+/// indexes this, because the raw name's spaces would otherwise make
+/// `color:AdobeRGB` unmatchable by construction.
+pub(super) fn color_compact(name: &str) -> String {
+    name.chars()
+        .filter(|c| c.is_alphanumeric())
+        .flat_map(|c| c.to_lowercase())
+        .collect()
 }
 
 impl FactTexts {
@@ -30,6 +44,7 @@ impl FactTexts {
             self.font.as_str(),
             self.audio.as_str(),
             self.embedded_title.as_str(),
+            self.color.as_str(),
         ]
         .iter()
         .copied()
@@ -114,6 +129,7 @@ pub(super) fn extract_fact_texts(facts: &AssetFacts, source_url: Option<&str>) -
     };
 
     let embedded_title = facts.media.embedded_title.clone().unwrap_or_default();
+    let color = facts.visual.color_space.clone().unwrap_or_default();
 
     FactTexts {
         camera: camera_parts.join(" "),
@@ -122,6 +138,7 @@ pub(super) fn extract_fact_texts(facts: &AssetFacts, source_url: Option<&str>) -
         font: font_parts.join(" "),
         audio: audio_parts.join(" "),
         embedded_title,
+        color,
     }
 }
 

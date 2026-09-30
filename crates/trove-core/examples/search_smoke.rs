@@ -311,7 +311,7 @@ fn micro(n: usize) {
     let t = Instant::now();
     for id in asset_ids(conn) {
         lib.text_index()
-            .index_asset(conn, Uuid::parse_str(&id).unwrap())
+            .index_asset_in(conn, Uuid::parse_str(&id).unwrap(), Some(root.as_path()))
             .unwrap();
     }
     lib.text_index().commit().unwrap();
@@ -327,7 +327,7 @@ fn micro(n: usize) {
         let lib = Library::open(&root, root.join("cache")).unwrap();
         insert_tx(&lib, n);
         let t = Instant::now();
-        drain_row_by_row(&raw_conn(&lib.db_path()), lib.text_index()).unwrap();
+        drain_row_by_row(&raw_conn(&lib.db_path()), lib.text_index(), None).unwrap();
         line("drain [before, per-row DELETE]", t.elapsed());
         assert_eq!(queue_len(&raw_conn(&lib.db_path())), 0);
         before_docs = Some(lib.text_index().num_docs());
@@ -340,7 +340,7 @@ fn micro(n: usize) {
     let lib = Library::open(&root, root.join("cache")).unwrap();
     insert_tx(&lib, n);
     let t = Instant::now();
-    trove_core::search::drain(&raw_conn(&lib.db_path()), lib.text_index()).unwrap();
+    trove_core::search::drain(&raw_conn(&lib.db_path()), lib.text_index(), None).unwrap();
     line("drain [after, batched DELETE]", t.elapsed());
     assert_eq!(queue_len(&raw_conn(&lib.db_path())), 0);
     let docs = lib.text_index().num_docs();
@@ -358,7 +358,7 @@ fn micro(n: usize) {
         let lib = Library::open(&root, root.join("cache")).unwrap();
         insert_tx(&lib, n);
         let t = Instant::now();
-        drain_batched(&raw_conn(&lib.db_path()), lib.text_index(), batch).unwrap();
+        drain_batched(&raw_conn(&lib.db_path()), lib.text_index(), batch, None).unwrap();
         line(&format!("drain, batch={batch}"), t.elapsed());
         assert_eq!(queue_len(&raw_conn(&lib.db_path())), 0);
         assert_eq!(lib.text_index().num_docs(), docs);
@@ -440,6 +440,7 @@ fn drain_batched(
     conn: &rusqlite::Connection,
     index: &trove_core::search::TextIndex,
     batch: usize,
+    root: Option<&std::path::Path>,
 ) -> trove_core::error::Result<()> {
     loop {
         let pending: Vec<(i64, String, bool)> = {
@@ -473,7 +474,7 @@ fn drain_batched(
             if *deleted {
                 index.remove_asset(id).unwrap();
             } else {
-                index.index_asset(conn, id)?;
+                index.index_asset_in(conn, id, root)?;
             }
         }
         index.commit()?;
@@ -499,6 +500,7 @@ fn drain_batched(
 fn drain_row_by_row(
     conn: &rusqlite::Connection,
     index: &trove_core::search::TextIndex,
+    root: Option<&std::path::Path>,
 ) -> trove_core::error::Result<()> {
     loop {
         let pending: Vec<(String, bool)> = {
@@ -521,7 +523,7 @@ fn drain_row_by_row(
             if *deleted {
                 index.remove_asset(id).unwrap();
             } else {
-                index.index_asset(conn, id)?;
+                index.index_asset_in(conn, id, root)?;
             }
         }
         for (id, _) in &pending {

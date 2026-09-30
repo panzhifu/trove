@@ -2,6 +2,7 @@
 //! the index, and this is what moves them.
 
 use std::collections::HashMap;
+use std::path::Path;
 
 use rusqlite::Connection;
 use rusqlite::types::Value;
@@ -50,7 +51,10 @@ pub fn pending_count(conn: &Connection) -> Result<u64> {
 }
 
 /// Flush the `search_queue` outbox into the index: upsert rows whose assets
-/// still exist, drop documents for purged ones. Cheap when the queue is empty
+/// still exist, drop documents for purged ones. `root` (the library root,
+/// passed by the desktop app) additionally unlocks indexing text bodies from
+/// the files themselves; `None` (tests, read-only handles that drain nothing
+/// anyway) indexes from the rows alone. Cheap when the queue is empty
 /// (one small SELECT), so every search can afford to call it. Lives on the
 /// store connection, so both [`crate::library::Library`] and tests drive it.
 ///
@@ -66,7 +70,7 @@ pub fn pending_count(conn: &Connection) -> Result<u64> {
 /// and the next drain redoes them (indexing is idempotent, and
 /// [`TextIndex::index_asset`] also drops a doc whose row has vanished). The
 /// converse order would lose index updates silently.
-pub fn drain(conn: &Connection, index: &TextIndex) -> Result<()> {
+pub fn drain(conn: &Connection, index: &TextIndex, root: Option<&Path>) -> Result<()> {
     // A read-only handle owns no writer, so it cannot move rows out of the
     // outbox. Leaving them queued is the point: the next writable open (the
     // app, or a CLI command that got the lock) drains the same backlog.
@@ -110,7 +114,7 @@ pub fn drain(conn: &Connection, index: &TextIndex) -> Result<()> {
             if *deleted {
                 index.remove_asset(*id)?;
             } else {
-                index.index_asset(conn, *id)?;
+                index.index_asset_in(conn, *id, root)?;
             }
         }
         index.commit()?;

@@ -76,7 +76,7 @@ impl Library {
     /// whose assets still exist, drop documents for purged ones. Cheap when
     /// the queue is empty (one small SELECT); batches of 500 per commit.
     pub fn drain_search_queue(&self) -> Result<()> {
-        crate::search::drain(self.store.conn(), &self.text_index)
+        crate::search::drain(self.store.conn(), &self.text_index, Some(&self.root))
     }
 
     /// Rebuild the text index from scratch: wipe the documents, re-enqueue

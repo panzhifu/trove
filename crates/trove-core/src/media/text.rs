@@ -23,6 +23,14 @@ use std::path::Path;
 /// How much of a text file the viewer loads, in bytes.
 pub const MAX_VIEW_BYTES: usize = 1024 * 1024;
 
+/// How much of a text file the search index reads, in bytes. The two budgets
+/// differ on purpose: the index exists to *find* a file, the viewer to *read*
+/// it, and 64 KiB covers the overwhelming majority of notes, configs and
+/// shaders while keeping the trigram field a fraction of the size a MiB of
+/// grams would be. A file past the cap is findable by its beginning — the
+/// same honest truncation the viewer states.
+pub const MAX_INDEX_BYTES: usize = 64 * 1024;
+
 /// How many characters a card shows. Enough to recognise a file by its opening
 /// lines, few enough that the card is a picture and not a page.
 pub const CARD_SNIPPET_CHARS: usize = 360;

@@ -13,6 +13,8 @@ use tantivy::{Index, IndexReader, IndexWriter, TantivyDocument, Term};
 use uuid::Uuid;
 
 use crate::error::{Error, Result};
+use crate::media::text;
+use crate::media::thumb;
 use crate::store::assets;
 
 use super::facts::{FactTexts, extract_fact_texts};
@@ -218,6 +220,10 @@ impl TextIndex {
             font_tri: field("font_tri"),
             audio_w: field("audio_words"),
             audio_tri: field("audio_tri"),
+            body_w: field("body_words"),
+            body_tri: field("body_tri"),
+            color_w: field("color_words"),
+            color_tri: field("color_tri"),
         };
         let reader = index.reader().expect("index reader");
         Self {
@@ -235,6 +241,17 @@ impl TextIndex {
     /// cascade fires while the asset itself is being deleted), and the row is
     /// the only authority on whether the asset exists.
     pub fn index_asset(&self, conn: &Connection, asset_id: Uuid) -> Result<()> {
+        self.index_asset_in(conn, asset_id, None)
+    }
+
+    /// [`index_asset`] with the library root, which unlocks the one surface
+    /// that lives in a file rather than the row: a text asset's body.
+    pub fn index_asset_in(
+        &self,
+        conn: &Connection,
+        asset_id: Uuid,
+        root: Option<&Path>,
+    ) -> Result<()> {
         let writer = self.writer()?;
         let Some(a) = assets::get(conn, asset_id)? else {
             self.remove_asset_with(&writer, asset_id);
@@ -242,6 +259,7 @@ impl TextIndex {
         };
         let tags = assets::tags_for_index(conn, asset_id)?;
         let facts = extract_fact_texts(&a.facts, a.source_url.as_deref());
+        let body = text_body(&a, root);
         self.index_asset_text(
             &writer,
             &asset_id.to_string(),
@@ -250,6 +268,7 @@ impl TextIndex {
             a.description.as_deref(),
             &tags,
             &facts,
+            &body,
         );
         Ok(())
     }
@@ -271,6 +290,7 @@ impl TextIndex {
         description: Option<&str>,
         tags: &str,
         facts: &FactTexts,
+        body: &str,
     ) {
         let facts_composite = facts.composite();
         let searchable = format!(
@@ -339,6 +359,18 @@ impl TextIndex {
             doc.add_text(self.f.audio_w, &facts.audio);
             doc.add_text(self.f.audio_tri, &facts.audio);
         }
+        // The colour space: the profile's own name on the word surface, the
+        // compact form on the gram surface — see `color_compact`.
+        if !facts.color.is_empty() {
+            doc.add_text(self.f.color_w, &facts.color);
+            doc.add_text(self.f.color_tri, super::facts::color_compact(&facts.color));
+        }
+        // The text body, when the asset has a readable file: what a `.md`
+        // note *says* becomes searchable, not just what it is called.
+        if !body.is_empty() {
+            doc.add_text(self.f.body_w, body);
+            doc.add_text(self.f.body_tri, body);
+        }
         doc.add_text(self.f.pinyin, &pinyin);
         doc.add_text(self.f.abbr, &abbr);
 
@@ -389,4 +421,24 @@ impl TextIndex {
     pub fn num_docs(&self) -> u64 {
         self.reader.searcher().num_docs()
     }
+}
+
+/// A text-family asset's indexed body: the file's own beginning, decoded by
+/// the same encoding ladder the viewer uses. Everything that can go wrong
+/// here (no root, unresolvable blob, missing file, undecodable bytes)
+/// degrades to an empty body — the asset stays indexed by its name and
+/// facts, which is what every caller before this feature ever saw.
+fn text_body(asset: &crate::model::Asset, root: Option<&Path>) -> String {
+    let Some(root) = root else {
+        return String::new();
+    };
+    if !text::is_text_ext(&asset.ext) {
+        return String::new();
+    }
+    let Some(blob) = thumb::blob_path(root, asset) else {
+        return String::new();
+    };
+    text::read(&blob, text::MAX_INDEX_BYTES)
+        .map(|c| c.text)
+        .unwrap_or_default()
 }
