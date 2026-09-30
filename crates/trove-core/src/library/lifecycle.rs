@@ -34,6 +34,33 @@ impl Library {
         Ok(self.purge_assets_against(&ids, inbox)?.purged)
     }
 
+    /// Purge every trashed asset older than `days`, the open-time sweep behind
+    /// the retention setting. Zero days means the caller disabled the sweep
+    /// and never reaches here. Returns the number removed.
+    ///
+    /// `trashed_at` values all go through the same `to_rfc3339` serialization
+    /// (UTC, same suffix shape), so a lexicographic comparison against a
+    /// cutoff rendered the same way is an honest date comparison.
+    pub fn purge_expired_trash(&self, days: u32) -> Result<u64> {
+        if days == 0 {
+            return Ok(0);
+        }
+        let cutoff = (chrono::Utc::now() - chrono::Duration::days(i64::from(days))).to_rfc3339();
+        let ids: Vec<Uuid> = crate::store::rows::query_map(
+            self.store.conn(),
+            "SELECT id FROM assets \
+             WHERE trashed_at IS NOT NULL AND trashed_at < ?1",
+            vec![rusqlite::types::Value::Text(cutoff)],
+            |row| crate::store::rows::req_uuid(row, 0),
+        )?;
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        Ok(self
+            .purge_assets_against(&ids, &collect::inbox_dir())?
+            .purged)
+    }
+
     // -- batch asset mutations ------------------------------------------------
     //
     // Every method here records an invertible `undo::Op` (see [`crate::undo`]).

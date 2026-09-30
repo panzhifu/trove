@@ -450,6 +450,10 @@ impl LibraryEntry {
 
 /// Preferences belonging to a single library, persisted as `library.json` in
 /// the library directory. Everything else is global (see [`AppConfig`]).
+/// The retention window a library gets when the user never touched the
+/// setting: 30 days, what the reference implementations use.
+pub const DEFAULT_TRASH_RETENTION_DAYS: u32 = 30;
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct LibraryConfig {
     /// Folders watched for new files; anything that appears under them is
@@ -471,6 +475,12 @@ pub struct LibraryConfig {
     /// user never sees was the state before the gate existed.
     #[serde(default)]
     pub skip_purge_confirm: Option<bool>,
+    /// How many days a trashed asset stays in the trash before the open-time
+    /// sweep purges it. `None` means "unset" and reads as the default (30);
+    /// `Some(0)` disables the sweep — the trash keeps everything until it is
+    /// emptied by hand. See [`LibraryConfig::trash_retention`].
+    #[serde(default)]
+    pub trash_retention_days: Option<u32>,
     /// Recent search queries for this library, newest first.
     ///
     /// Settled queries only — what the user committed by pressing Enter, never
@@ -568,6 +578,19 @@ impl LibraryConfig {
     ///   bound in a file that is rewritten whole.
     ///
     /// Returns whether anything changed, so the caller can skip a rewrite (and
+    /// The retention window the sweep should apply: `None` disables it. The
+    /// unset state reads as the default, because a trash that quietly keeps
+    /// everything forever was the behavior before the sweep existed, and a
+    /// setting the user never touched should not change that out from under
+    /// them — 30 days matches the reference implementations.
+    pub fn trash_retention(&self) -> Option<u32> {
+        match self.trash_retention_days {
+            Some(0) => None,
+            Some(days) => Some(days),
+            None => Some(DEFAULT_TRASH_RETENTION_DAYS),
+        }
+    }
+
     /// a repaint) when the query was already at the front.
     pub fn remember_query(&mut self, library_dir: &std::path::Path, query: &str) -> Result<bool> {
         let trimmed = query.trim();

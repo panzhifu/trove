@@ -392,6 +392,33 @@ fn deletion_group() -> SettingGroup {
         .title(rust_i18n::t!("settings.deletion").to_string())
         .item(
             SettingItem::new(
+                rust_i18n::t!("settings.trash_retention").to_string(),
+                SettingField::dropdown(
+                    trash_retention_options(),
+                    |_cx| {
+                        let days = LibraryConfig::load(&library_dir()).trash_retention();
+                        SharedString::from(match days {
+                            None => "off",
+                            Some(d) => Box::leak(d.to_string().into_boxed_str()),
+                        })
+                    },
+                    |value, cx| {
+                        let dir = library_dir();
+                        let mut config = LibraryConfig::load(&dir);
+                        config.trash_retention_days = Some(if value.as_ref() == "off" {
+                            0
+                        } else {
+                            value.parse().unwrap_or(30)
+                        });
+                        settings_write::note(config.save(&dir), "library config");
+                        cx.refresh_windows();
+                    },
+                ),
+            )
+            .description(rust_i18n::t!("settings.trash_retention_desc").to_string()),
+        )
+        .item(
+            SettingItem::new(
                 rust_i18n::t!("settings.purge_confirm").to_string(),
                 SettingField::switch(
                     |_cx| !LibraryConfig::load(&library_dir()).skip_purge_confirm(),
@@ -1205,6 +1232,26 @@ fn watch_folders_group() -> SettingGroup {
 /// The open library's data directory — where its `library.json` lives.
 fn library_dir() -> PathBuf {
     AppConfig::load().active_entry().dir()
+}
+
+/// The retention dropdown: stored ids are the day numbers (`"off"` disables)
+/// so the read/write closures share one vocabulary with the config.
+fn trash_retention_options() -> Vec<(SharedString, SharedString)> {
+    [
+        ("off", "settings.trash_retention_off"),
+        ("7", "settings.trash_retention_7"),
+        ("14", "settings.trash_retention_14"),
+        ("30", "settings.trash_retention_30"),
+        ("90", "settings.trash_retention_90"),
+    ]
+    .into_iter()
+    .map(|(id, key)| {
+        (
+            SharedString::from(id),
+            SharedString::from(rust_i18n::t!(key).to_string()),
+        )
+    })
+    .collect()
 }
 
 /// One watched-folder row: stop watching.

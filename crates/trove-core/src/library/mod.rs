@@ -277,6 +277,15 @@ impl Library {
         // Daily safety snapshot (24h throttle, rolling 10 files). Best-effort:
         // a failed backup never blocks opening the library.
         crate::services::backup::maybe_auto_backup(&lib.root, lib.store.conn());
+        // Trash retention sweep, the other piece of open-time housekeeping —
+        // and equally best-effort: a failed purge is logged and retried on the
+        // next open, never a reason the library would not open.
+        let retention = crate::config::LibraryConfig::load(&lib.root).trash_retention();
+        if let Some(days) = retention
+            && let Err(error) = lib.purge_expired_trash(days)
+        {
+            tracing::warn!(%error, days, "trash retention sweep failed");
+        }
         Ok(lib)
     }
 
