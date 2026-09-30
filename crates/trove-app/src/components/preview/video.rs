@@ -121,20 +121,22 @@ pub(super) fn load_player(panel: Entity<AssetPreviewPanel>, cx: &mut App) {
                     return None;
                 }
                 let facts = video::probe(&path)?;
-                Some((path.clone(), facts, video::has_audio_track(&path)))
+                Some((path.clone(), facts))
             })
             .await;
         let _ = panel.update(cx, move |this, cx| {
             // Settled either way: a video that cannot be probed is a poster for
             // good, and the panel owns that poster from here.
             this.video_loading = false;
-            let Some((path, facts, has_audio)) = probed else {
+            let Some((path, facts)) = probed else {
                 cx.notify();
                 return;
             };
             // One engine per playback, owned by the panel: windows come and go
             // without touching the soundtrack.
-            let audio = has_audio.then(|| AudioEngine::spawn(path.clone(), cx));
+            let audio = facts
+                .has_audio
+                .then(|| AudioEngine::spawn(path.clone(), cx));
             // The still the panel is standing in with fills the content area,
             // so seed the stage with that same area: the first frame occupies
             // the same box instead of the picture's intrinsic pixels.

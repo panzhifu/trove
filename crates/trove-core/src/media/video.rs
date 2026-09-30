@@ -62,6 +62,12 @@ pub struct VideoStreamFacts {
     pub fps: u32,
     /// Duration in milliseconds; `0` when the container does not say.
     pub duration_ms: u64,
+    /// Whether the container carries an audio stream. ffprobe reports it in
+    /// the same pass as the video facts — the preview used to pay a second
+    /// full round trip for exactly this bit. The no-ffprobe fallback does
+    /// not know, and says `false`, which is what that world already acted
+    /// on (silent video, no volume controls).
+    pub has_audio: bool,
 }
 
 impl VideoStreamFacts {
@@ -130,14 +136,17 @@ fn probe_with_ffprobe(path: &Path) -> Option<VideoStreamFacts> {
     // subprocess slot — see [`super::proc`].
     let _slot = super::proc::slot();
     let mut command = Command::new("ffprobe");
+    // One pass answers everything the preview needs: the video stream's
+    // geometry and rate, the container duration, and whether an audio
+    // stream exists at all. Splitting the audio question into its own
+    // ffprobe cost the preview a second full process round trip before the
+    // first frame could be scheduled.
     command
         .args([
             "-v",
             "error",
-            "-select_streams",
-            "v:0",
             "-show_entries",
-            "stream=width,height,r_frame_rate:format=duration",
+            "stream=codec_type,width,height,r_frame_rate:format=duration",
             "-of",
             "json",
         ])
@@ -149,9 +158,22 @@ fn probe_with_ffprobe(path: &Path) -> Option<VideoStreamFacts> {
     }
 
     let json: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
-    let stream = json.get("streams")?.get(0)?;
+    let streams = json.get("streams")?.as_array()?;
+    // The video stream is the one carrying geometry; `codec_type` names the
+    // audio stream. Both selectors survive a build whose ffprobe omits
+    // `codec_type` — geometry finds the video, and "more than the video
+    // stream exists" would over-report audio by exactly the case the format
+    // never has (a video container's non-video non-audio streams are
+    // subtitles and attachments, which ffprobe still types).
+    let stream = streams
+        .iter()
+        .find(|s| s.get("width").is_some())
+        .or_else(|| streams.first())?;
     let width = stream.get("width")?.as_u64()? as u32;
     let height = stream.get("height")?.as_u64()? as u32;
+    let has_audio = streams
+        .iter()
+        .any(|s| s.get("codec_type").and_then(|v| v.as_str()) == Some("audio"));
     if width == 0 || height == 0 {
         return None;
     }
@@ -177,6 +199,7 @@ fn probe_with_ffprobe(path: &Path) -> Option<VideoStreamFacts> {
         height,
         fps,
         duration_ms,
+        has_audio,
     })
 }
 
@@ -188,6 +211,10 @@ fn probe_with_mp4(path: &Path) -> Option<VideoStreamFacts> {
         height: facts.height,
         fps: FALLBACK_FPS as u32,
         duration_ms: facts.duration_ms.unwrap_or(0),
+        // The no-ffprobe world already acted as "silent" (`has_audio_track`
+        // failed with the rest of ffprobe), so `false` here is the existing
+        // behavior stated plainly, not a new blindness.
+        has_audio: false,
     })
 }
 
@@ -570,8 +597,73 @@ mod tests {
             height: 480,
             fps: 25,
             duration_ms: 1000,
+            has_audio: false,
         };
         assert_eq!(facts.frame_ms(), 40);
+    }
+
+    /// One ffprobe pass answers both questions the preview asks: the video
+    /// stream's facts *and* whether an audio stream exists. The with-audio
+    /// clip and the silent clip pin the merged report from both sides —
+    /// this is the round trip the preview no longer pays twice.
+    #[test]
+    fn probe_reports_audio_presence_in_the_same_pass() {
+        if !ffmpeg_available() || !ffprobe_available() {
+            eprintln!("skipping: ffmpeg/ffprobe not on PATH");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("trove-video-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let loud = dir.join("loud.mp4");
+        let status = Command::new("ffmpeg")
+            .args([
+                "-v",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=size=320x240:rate=10:duration=1",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=440:duration=1",
+                "-pix_fmt",
+                "yuv420p",
+                "-c:a",
+                "aac",
+                "-shortest",
+            ])
+            .arg(&loud)
+            .status()
+            .expect("ffmpeg runs");
+        assert!(status.success());
+        let facts = probe(&loud).expect("probes");
+        assert!(facts.has_audio, "the merged probe reports the audio stream");
+        assert!(facts.width > 0 && facts.duration_ms > 0);
+
+        let silent = dir.join("silent.mp4");
+        let status = Command::new("ffmpeg")
+            .args([
+                "-v",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=size=320x240:rate=10:duration=1",
+                "-pix_fmt",
+                "yuv420p",
+            ])
+            .arg(&silent)
+            .status()
+            .expect("ffmpeg runs");
+        assert!(status.success());
+        let facts = probe(&silent).expect("probes");
+        assert!(!facts.has_audio, "a silent clip says so");
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// End-to-end: generate a tiny clip *with audio*, then stream PCM out of
