@@ -1489,6 +1489,16 @@ mod tests {
             !plan.iter().any(|step| step.contains("SCAN assets")),
             "the count walked the library instead of the memberships: {plan:?}"
         );
+        // The probe side is index-only: the partial predicate answers
+        // `trashed_at` from `idx_assets_live_id` itself, so counting members
+        // never fetches a table row. Measured on the 100 000-asset parity
+        // mirror: 12 ms probing the PK and fetching each member's row, 4 ms
+        // probing the narrow index. `ANALYZE` is what makes the planner see it
+        // — see `a_live_page_is_read_in_index_order` for the same dependency.
+        assert!(
+            plan.iter().any(|step| step.contains("idx_assets_live_id")),
+            "the count should probe the live-id index instead of fetching rows: {plan:?}"
+        );
         assert_eq!(assets::count(store.conn(), &q).unwrap(), 600);
 
         // A trashed member leaves the count exactly as it leaves the listing —
@@ -1512,6 +1522,118 @@ mod tests {
             ..AssetQuery::live()
         };
         assert_eq!(assets::count(store.conn(), &rated).unwrap(), 1);
+    }
+
+    /// The aspect projection is a whole-listing read whose payload is two
+    /// integers, so it must be an index-only scan: every row fetched for a
+    /// column the index does not hold is a *random* fetch, because `id` is a
+    /// UUID and index order is not rowid order. Measured on the 100 000-asset
+    /// parity mirror: 128 ms warm through the narrow created-at index, 11 ms
+    /// with the geometry riding in it. Statistics are part of the assertion,
+    /// as in [`a_live_page_is_read_in_index_order`].
+    #[test]
+    fn the_aspect_projection_is_an_index_only_scan() {
+        let store = Store::in_memory().unwrap();
+        let sized = |name: &str, w: Option<u32>, h: Option<u32>| {
+            let id = Uuid::new_v4();
+            Asset::from_seed(AssetSeed {
+                id,
+                location: AssetLocation::Stored {
+                    rel_path: format!("media/{name}"),
+                },
+                file_name: name.to_string(),
+                ext: "png".into(),
+                mime: "image/png".into(),
+                size_bytes: 128,
+                content_hash: None,
+                kind: AssetKind::Image,
+                width: w,
+                height: h,
+                duration_ms: None,
+                captured_at: None,
+                title: None,
+                description: None,
+                rating: None,
+                is_favorite: false,
+                source_url: None,
+                usage_status: UsageStatus::Unused,
+                commercial_use: None,
+                facts: Default::default(),
+                created_at: now(),
+                updated_at: now(),
+                placement: Placement::Live,
+            })
+        };
+        for i in 0..2000 {
+            let asset = sized(&format!("a{i:05}.png"), Some(800 + i as u32), Some(600));
+            assets::insert(store.conn(), &asset).unwrap();
+        }
+        // Geometry that was never mined stays in the listing as absent facts —
+        // the caller decides the fallback shape, the store does not invent one.
+        assets::insert(store.conn(), &sized("unknown.png", None, None)).unwrap();
+        store.ensure_statistics().unwrap();
+
+        // The plan of the exact statement `aspects` runs: the created-at index
+        // supplies the order (no temp B-tree) — and because it carries the
+        // geometry columns, the table is never touched. SQLite labels a
+        // partial-index scan "USING INDEX" even when it is covering (the label
+        // is the same one a row-fetching scan would earn), so covering-ness is
+        // pinned where it is actually written: the index definition below must
+        // still hold `width, height`. A plan falling back to a temp B-tree or
+        // another index fails by name.
+        let plan = store
+            .conn()
+            .prepare("EXPLAIN QUERY PLAN SELECT id, width, height FROM assets \
+                      WHERE trashed_at IS NULL ORDER BY created_at DESC, id ASC")
+            .and_then(|mut stmt| {
+                let rows = stmt.query_map([], |r| r.get::<_, String>(3))?;
+                Ok(rows.filter_map(|r| r.ok()).collect::<Vec<_>>().join("; "))
+            })
+            .unwrap();
+        assert!(
+            plan.contains("USING INDEX idx_assets_live_created"),
+            "the projection should scan the created-at index, got {plan}"
+        );
+        assert!(
+            !plan.contains("TEMP B-TREE"),
+            "the index supplies the order, got {plan}"
+        );
+        let index_sql: String = store
+            .conn()
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE name = 'idx_assets_live_created'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            index_sql.contains("width") && index_sql.contains("height"),
+            "the created-at index must carry the geometry columns for the \
+             projection to be index-only: {index_sql:?}"
+        );
+
+        // And it answers with exactly what the listing would: same rows, same
+        // order, same geometry — a projection that disagreed with its listing
+        // would lay out one thing and display another.
+        let q = AssetQuery {
+            sort_desc: true,
+            ..AssetQuery::live()
+        };
+        let aspects = assets::aspects(store.conn(), &q).unwrap();
+        let listed = assets::query(store.conn(), &q).unwrap();
+        assert_eq!(aspects.len(), listed.items.len());
+        for (a, asset) in aspects.iter().zip(listed.items.iter()) {
+            assert_eq!(a.id, asset.id);
+            assert_eq!(a.width, asset.width);
+            assert_eq!(a.height, asset.height);
+        }
+
+        // A trashed row leaves the projection exactly as it leaves the listing.
+        let trashed = listed.items[0].id;
+        assets::set_trashed(store.conn(), trashed, true).unwrap();
+        let aspects = assets::aspects(store.conn(), &q).unwrap();
+        assert_eq!(aspects.len(), listed.items.len() - 1);
+        assert!(aspects.iter().all(|a| a.id != trashed));
     }
 
     /// The plan is the product here, so it is what gets asserted.
@@ -1636,13 +1758,14 @@ mod tests {
             names,
             [
                 "idx_assets_live_created",
+                "idx_assets_live_id",
                 "idx_assets_live_kind_created",
                 "idx_assets_live_name",
                 "idx_assets_live_rating",
                 "idx_assets_live_size",
                 "idx_assets_source_path",
             ],
-            "these six partial indexes are what the live listings are priced against"
+            "these seven partial indexes are what the live listings are priced against"
         );
     }
 

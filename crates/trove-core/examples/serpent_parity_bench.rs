@@ -263,7 +263,7 @@ fn run_query(
     let text = lib.text_index();
     let total = count_rows(&lib);
 
-    let (folder_leaf, folder_root) = folder_prefixes(fixture);
+    let (folder_leaf, folder_root) = folder_prefixes(conn);
     let collection_id = collections::list(conn)
         .ok()
         .and_then(|v| v.first().map(|c| c.id));
@@ -331,6 +331,18 @@ fn run_query(
         }
     });
     if let Some(cid) = collection_id {
+        // The label the aggregate prints for this row is the real size of the
+        // collection the switch measures, not a number remembered from an
+        // earlier fixture: `collections::list` picks the first collection, and
+        // which one that is changed under a once-hardcoded label.
+        let members: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM asset_collection WHERE collection_id = ?1",
+                [cid.to_string()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        insert(json, "collectionMembers", members as f64);
         measure(&mut report, "collectionSwitchMs", rounds, || {
             run(conn, text, &browse(|c| c.collection = Some(cid)));
         });
@@ -431,36 +443,36 @@ fn run_query(
         collections::list(conn).unwrap();
     });
     // Serpent's `layoutOnly` is one call returning the geometry of the whole
-    // listing, so this gathers every aspect — paged, because the store caps one
-    // window — and then runs the same justify pass the grid does.
+    // listing. Trove's answer to that call is [`assets::aspects`] — the narrow
+    // projection that reads id/width/height and nothing else, index-only over
+    // `idx_assets_live_aspect` — followed by the same justify pass the grid
+    // runs. It used to be measured by paging whole `Asset`s out of the store
+    // (24 columns and an `extra` JSON parse per row, for two integers): 435 ms
+    // on this library against the projection's ~15 ms.
     measure(&mut report, "layoutOnlyMs", rounds, || {
-        let mut aspects = Vec::with_capacity(total);
-        let mut offset = 0u64;
-        while offset < total as u64 {
-            let page = browse(|c| c.offset = offset)
-                .run_without_count(conn, text, Some(assets::MAX_PAGE), None)
-                .unwrap();
-            if page.items.is_empty() {
-                break;
-            }
-            offset += page.items.len() as u64;
-            for asset in &page.items {
-                aspects.push(match (asset.width, asset.height) {
-                    (Some(w), Some(h)) if h > 0 => w as f32 / h as f32,
-                    _ => 1.0,
-                });
-            }
-        }
+        let aspects: Vec<f32> = assets::aspects(
+            conn,
+            &AssetQuery {
+                sort_desc: true,
+                ..AssetQuery::live()
+            },
+        )
+        .unwrap()
+        .into_iter()
+        .map(|a| match (a.width, a.height) {
+            (Some(w), Some(h)) if h > 0 => w as f32 / h as f32,
+            _ => 1.0,
+        })
+        .collect();
         let rows = justify_layout(&aspects, CONTENT_WIDTH);
         black_box(rows.iter().map(|row| row.height).sum::<f32>());
     });
-    // The floor under the row above: the same geometry pass reading only what
-    // geometry needs. `layoutOnlyMs` pages the whole library through the store,
-    // so it pays a full `Asset` per row — `extra` deserialized into `AssetFacts`
-    // included — for two integers. One statement and two columns is what the
-    // pass actually costs; the gap between the two is row materialisation, not
-    // layout, and the app never pays it because it fetches a 200-row window at a
-    // time (`workspace::next_window`) rather than the whole listing.
+    // The floor under the row above: the same statement hand-written, so the
+    // gap between the two is the store's own read path (where-building,
+    // statement caching) and not data. The app pays neither — it lays out
+    // windows it already holds (`workspace::next_window`), not a whole
+    // listing; this row exists because Serpent's bench asks the one-shot
+    // question and the answer has to be honest about what it costs.
     measure(&mut report, "layoutGeometryFloorMs", rounds, || {
         let mut aspects = Vec::with_capacity(total);
         {
@@ -1042,12 +1054,26 @@ fn parse_time(raw: &str) -> DateTime<Utc> {
 /// writes `Assets/Root-nn/Child-nn/asset-nnnnn.ext`, so a leaf is one folder's
 /// own assets and a root is that folder plus its ten children — the same
 /// non-recursive / recursive pair Serpent's bench asks for.
-fn folder_prefixes(fixture: &Path) -> (String, String) {
-    let base = fixture.join("Assets");
-    let leaf = walk_first_file(&base)
-        .and_then(|p| p.parent().map(|d| d.display().to_string()))
-        .unwrap_or_else(|| base.display().to_string());
-    (leaf, base.join("Root-00").display().to_string())
+/// The two folder prefixes the folder-switch rows measure, read from the
+/// library's own `source_path` values. The fixture argument's spelling is not
+/// ground truth: a mirror built from a relative path holds relative paths, and
+/// an absolute prefix against them matches nothing — the row then measures an
+/// empty listing and reads as a triumph (the 0.05 ms of the 2026-09-30 run).
+/// One real path names one real leaf folder, and its parent the root above it.
+fn folder_prefixes(conn: &Connection) -> (String, String) {
+    let sample: String = conn
+        .query_row(
+            "SELECT source_path FROM assets \
+             WHERE trashed_at IS NULL AND source_path IS NOT NULL \
+             ORDER BY source_path LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+        .expect("a live asset with a source path");
+    let file = std::path::Path::new(&sample);
+    let leaf = file.parent().expect("a folder above the file");
+    let root = leaf.parent().expect("a folder above the leaf");
+    (leaf.display().to_string(), root.display().to_string())
 }
 
 fn count_rows(lib: &Library) -> usize {
@@ -1099,25 +1125,6 @@ fn pairs(src: &Connection, sql: &str) -> Vec<(String, String)> {
 fn round(value: f64, digits: i32) -> f64 {
     let p = 10f64.powi(digits);
     (value * p).round() / p
-}
-
-fn walk_first_file(dir: &Path) -> Option<PathBuf> {
-    let mut stack = vec![dir.to_path_buf()];
-    while let Some(d) = stack.pop() {
-        let Ok(entries) = std::fs::read_dir(&d) else {
-            continue;
-        };
-        let mut paths: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
-        paths.sort();
-        for path in paths {
-            if path.is_dir() {
-                stack.push(path);
-            } else if path.is_file() {
-                return Some(path);
-            }
-        }
-    }
-    None
 }
 
 fn walk_count(dir: &Path) -> usize {

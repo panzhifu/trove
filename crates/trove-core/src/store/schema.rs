@@ -19,14 +19,16 @@
 //! come back — with the rule that a step must be applicable from a shape that
 //! matches the version on record.
 //!
-//! That is where this file stands now: [`UPGRADES`] holds nine steps, because
+//! That is where this file stands now: [`UPGRADES`] holds ten steps, because
 //! every one of them landed while the version before it was already in the
 //! field — v14 → v15 for the `ai_analysis` cache, v15 → v16 for a container's
 //! appearance, v16 → v17 for the 3D viewport's look, v17 → v18 for the ordered
 //! live-listing indexes, v18 → v19 for image sequences, v19 → v20 for the
 //! indexed source path, v20 → v21 for the task journal, v21 → v22 to take the
-//! `ai_analysis` cache back out again, and v22 → v23 to put the star rating's
-//! domain in the database. Everything not on the list is still refused by name.
+//! `ai_analysis` cache back out again, v22 → v23 to put the star rating's
+//! domain in the database, and v24 → v25 for the two narrow reads that walk
+//! the listing order — the collection count and the aspect projection.
+//! Everything not on the list is still refused by name.
 //!
 //! v23 is also the first step this schema has run that *moves data toward a
 //! narrower rule* rather than only adding to the shape: `0` was a legal rating
@@ -52,7 +54,7 @@
 /// existence was written by a build whose chain ended there, and that shape
 /// is the pre-`asset_embeddings` subset of the one below — which is the only
 /// sense in which a version number means anything.
-pub const SCHEMA_VERSION: i64 = 24;
+pub const SCHEMA_VERSION: i64 = 25;
 
 /// One upgrade step: the DDL that takes a library from `from` to `to`, and the
 /// data that DDL cannot move.
@@ -138,7 +140,62 @@ pub const UPGRADES: &[Upgrade] = &[
         sql: UPGRADE_23_TO_24,
         data: None,
     },
+    Upgrade {
+        from: 24,
+        to: 25,
+        sql: UPGRADE_24_TO_25,
+        data: Some(analyze_statistics),
+    },
 ];
+
+/// v24 → v25: the two reads that walk the listing order but want almost
+/// nothing from each row.
+///
+/// Both pay the same tax before this step: `idx_assets_live_created` orders
+/// well and carries nothing, so a read through it that needs a column the
+/// index does not hold fetches the row — and the fetch is *random*, because
+/// `id` is a UUID, so index order and rowid order have nothing to do with
+/// each other. One fetch per row, 100 000 rows:
+///
+/// - The collection count probes one asset per member (the junction-driven
+///   shape `assets::count_statement` documents) and needs only `trashed_at`,
+///   which a partial predicate already answers. `idx_assets_live_id` makes the
+///   probe index-only — a junction scan plus one narrow B-tree descent per
+///   member instead of a fetch of a 2.4 KB row. On the 100 000-asset parity
+///   mirror the count went 12 ms → 4 ms; the browse it sits under, 18.3 ms.
+///   The count's SQL names the index (`INDEXED BY`) for the live pool, because
+///   at smaller sizes the planner keeps the PK probe and pays the fetches —
+///   the same reasoning `source_folders` documents for its hint.
+/// - The aspect projection (`assets::aspects`) reads `width`/`height` for a
+///   whole listing so it can be laid out. Through the narrow created-at index
+///   that scan cost 128 ms warm; carrying the two columns in the index itself,
+///   11 ms — the scan never touches the table.
+///
+/// The projection's columns ride the *shared* listing index rather than a
+/// covering one of their own, and that is a measured decision, not a tidy one:
+/// a separate `idx_assets_live_aspect` was built and the planner would not take
+/// it — without statistics it planned `idx_assets_trashed` plus a temp B-tree
+/// sort (76 ms), and *with* statistics it still kept the narrower
+/// `idx_assets_live_created` and its 128 ms of random fetches, because SQLite
+/// prices a narrower index cheaper and does not model the fetches. Extended,
+/// the same index is the covering answer and is chosen on its own — no hint,
+/// one index fewer, and the ordered page read keeps its plan and its name.
+/// The rebuild is the upgrade's one-time cost (~0.2 s at 100 000 assets).
+///
+/// `ANALYZE` runs as the data step for the reason [`UPGRADE_17_TO_18`] and
+/// [`UPGRADE_19_TO_20`] give: an index without statistics sits unused.
+///
+/// Size is the price: ~4 MB per 100 000 live assets for `idx_assets_live_id`,
+/// and eight bytes per row on the created-at index. The writes that maintain
+/// them are inserts and trash transitions — nothing an `UPDATE` touches is in
+/// either key.
+const UPGRADE_24_TO_25: &str = r#"
+    DROP INDEX idx_assets_live_created;
+    CREATE INDEX idx_assets_live_created
+        ON assets(created_at DESC, id ASC, width, height) WHERE trashed_at IS NULL;
+    CREATE INDEX IF NOT EXISTS idx_assets_live_id
+        ON assets(id) WHERE trashed_at IS NULL;
+"#;
 
 /// v23 → v24: give the undo history a table of its own.
 ///
@@ -534,8 +591,11 @@ pub const SCHEMA: &str = r#"
     -- The ordered live listings, and the reason a page of a big library costs
     -- 2 ms rather than 188. Same five shapes [`UPGRADE_17_TO_18`] creates; see
     -- that comment for why each carries `id` second and `trashed_at` as a
-    -- partial-index predicate.
-    CREATE INDEX idx_assets_live_created ON assets(created_at DESC, id ASC)
+    -- partial-index predicate. The created-at index also carries the geometry
+    -- columns: the aspect projection reads them for a whole listing in this
+    -- order, and an index that holds them makes that read index-only (see
+    -- UPGRADE_24_TO_25 for why a separate covering index lost to this one).
+    CREATE INDEX idx_assets_live_created ON assets(created_at DESC, id ASC, width, height)
         WHERE trashed_at IS NULL;
     CREATE INDEX idx_assets_live_name ON assets(file_name COLLATE NOCASE DESC, id ASC)
         WHERE trashed_at IS NULL;
@@ -545,6 +605,11 @@ pub const SCHEMA: &str = r#"
         WHERE trashed_at IS NULL;
     CREATE INDEX idx_assets_live_kind_created ON assets(kind, created_at DESC, id ASC)
         WHERE trashed_at IS NULL;
+
+    -- The collection count's per-member probe: a narrow partial index that
+    -- answers "is this asset live" without fetching its row. See
+    -- UPGRADE_24_TO_25.
+    CREATE INDEX idx_assets_live_id ON assets(id) WHERE trashed_at IS NULL;
 
     -- The folder filter and the folders panel, which both ask about
     -- `source_path`. `COLLATE NOCASE` is load-bearing rather than cosmetic:

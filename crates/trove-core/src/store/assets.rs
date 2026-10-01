@@ -307,10 +307,23 @@ pub(super) fn count_statement(conn: &Connection, q: &AssetQuery) -> Result<(Stri
         let (rest, args) = where_fragment(conn, &members, WhereMode::Rejecting, 1)?;
         let mut params = vec![Value::Text(rows::uuid(collection_id))];
         params.extend(args);
+        // The pool term goes back to its plain spelling here. Rejecting wraps
+        // it as `+trashed_at IS NULL`, and that `+` is exactly what stops
+        // `idx_assets_live_id` applying: SQLite proves a partial index usable
+        // only against the exact text the index is defined with (`LIVE_ROWS`,
+        // see the constant), and the wrapped spelling fails the proof, so every
+        // member pays a row fetch again — 12 ms against 4 ms on the
+        // 100 000-asset parity mirror. What the plain spelling could cost is
+        // the planner flipping to drive from the live index across the join,
+        // and `CROSS JOIN` pins that away: SQLite reads it as "this join order,
+        // no reordering", so the membership side stays the driver that
+        // Rejecting was chosen for, and the probe side is free to take the
+        // narrow index.
+        let rest = rest.replace(&format!("+{LIVE_ROWS}"), LIVE_ROWS);
         return Ok((
             format!(
                 "SELECT COUNT(*) FROM asset_collection ac \
-                 JOIN assets ON assets.id = ac.asset_id \
+                 CROSS JOIN assets ON assets.id = ac.asset_id \
                  WHERE ac.collection_id = ?1 AND {rest}"
             ),
             params,
@@ -352,7 +365,21 @@ fn query_items(
     where_sql: String,
     mut args: Vec<Value>,
 ) -> Result<Vec<Asset>> {
-    let mut sql = format!("SELECT {COLS} FROM assets {where_sql}");
+    let mut sql = format!("SELECT {COLS} FROM assets {where_sql} ORDER BY {}", order_clause(q));
+    if let Some(limit) = limit {
+        sql.push_str(" LIMIT ? OFFSET ?");
+        args.push(Value::Integer(limit as i64));
+        args.push(Value::Integer(q.offset as i64));
+    }
+
+    // As in [`by_ids`]: a listing is allowed to come back short rather than empty.
+    rows::query_map_skipping_unreadable(conn, &sql, args, asset_from_row)
+}
+
+/// The listing's `ORDER BY` body — the sort column, its direction, and the
+/// `id` tiebreaker that keeps two pages of one browse stable. Shared by the
+/// row read and the aspect projection so the two cannot disagree about order.
+fn order_clause(q: &AssetQuery) -> String {
     let order_col = match q.sort {
         crate::model::AssetSort::CreatedAt => "created_at",
         crate::model::AssetSort::UpdatedAt => "updated_at",
@@ -367,15 +394,46 @@ fn query_items(
         crate::model::AssetSort::Color => "json_extract(extra, '$.dominant_color')",
     };
     let dir = if q.sort_desc { "DESC" } else { "ASC" };
-    sql.push_str(&format!(" ORDER BY {order_col} {dir}, id ASC"));
-    if let Some(limit) = limit {
-        sql.push_str(" LIMIT ? OFFSET ?");
-        args.push(Value::Integer(limit as i64));
-        args.push(Value::Integer(q.offset as i64));
-    }
+    format!("{order_col} {dir}, id ASC")
+}
 
-    // As in [`by_ids`]: a listing is allowed to come back short rather than empty.
-    rows::query_map_skipping_unreadable(conn, &sql, args, asset_from_row)
+/// One row's display geometry: which asset, and the shape its cell draws.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AssetAspect {
+    pub id: Uuid,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+}
+
+/// The listing `q` describes — every matching row, in listing order — as
+/// geometry.
+///
+/// The grid lays out windows it already holds in memory; a whole-listing
+/// layout (the parity bench's one-shot row, a scrollbar ruler, an export
+/// contact sheet) wants the shapes of rows it has *not* fetched, and fetching
+/// whole `Asset`s to divide two integers is the difference between 435 ms and
+/// ~15 ms on a 100 000-asset library: per row it unmarshals 24 columns and
+/// parses the `extra` JSON into [`AssetFacts`] for two of them. This reads
+/// `id`, `width`, `height` and nothing else, so the default live browse plans
+/// as an index-only scan of `idx_assets_live_created`, which carries the
+/// order *and* the two columns (`schema`'s `UPGRADE_24_TO_25`). A plan guard
+/// pins that choice: `the_aspect_projection_is_an_index_only_scan`.
+///
+/// Free text is not part of `q`, as in [`query`]. The paging fields are
+/// ignored — a layout is the whole listing or it is wrong.
+pub fn aspects(conn: &Connection, q: &AssetQuery) -> Result<Vec<AssetAspect>> {
+    let (where_sql, args) = build_where(conn, q, WhereMode::Driving)?;
+    let sql = format!(
+        "SELECT id, width, height FROM assets {where_sql} ORDER BY {}",
+        order_clause(q)
+    );
+    rows::query_map_skipping_unreadable(conn, &sql, args, |row| {
+        Ok(AssetAspect {
+            id: rows::req_uuid(row, 0)?,
+            width: row.get(1)?,
+            height: row.get(2)?,
+        })
+    })
 }
 
 /// Apply a partial patch. `None` fields leave the column untouched.

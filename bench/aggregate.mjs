@@ -29,11 +29,11 @@ const PAIRS = [
   ['openLibraryMs', 'openLibraryMs', '打开库（冷）', '两边都是冷打开同一个库数据库'],
   ['allBrowseFirstPageMs', 'allBrowseFirstPageMs', '默认浏览首页 50 行', '两边都含精确总数'],
   ['deepOffsetPageMs', 'deepOffsetPageMs', '深翻页 offset 10000', ''],
-  ['collectionSwitchMs', 'collectionSwitchMs', '切进合集（1184 成员）', ''],
+  ['collectionSwitchMs', 'collectionSwitchMs', '切进合集', '成员数实读自 Trove 镜像（collections::list 取第一个合集）'],
   ['folderSwitchMs', 'folderSwitchMs', '切进文件夹（一层）', 'Serpent 走 managed_folder_id 外键；Trove 走 source_path 生成列上的前缀索引'],
   ['collectionRecursiveSwitchMs', 'folderSwitchRecursiveMs', '递归一层子树', '松配对：Serpent 是递归合集，Trove 侧栏没有递归合集，取子树文件夹'],
   ['searchFixedTokenMs', 'searchFixedTokenMs', '全文检索高频词 asset', '同一词、同一批行'],
-  ['layoutOnlyMs', 'layoutOnlyMs', '整表瀑布流几何', ''],
+  ['layoutOnlyMs', 'layoutOnlyMs', '整表瀑布流几何', '两边各一次给出整表几何；Trove 走 store 窄投影（只读 id/width/height）+ 同一 justify'],
   ['sortNameAscMs', 'sortNameAscMs', '按名称排序', ''],
   ['sortCreatedAtDescMs', 'sortCreatedAtDescMs', '按创建时间倒序', ''],
   ['sortModifiedDescMs', 'sortUpdatedAtDescMs', '按修改时间倒序', ''],
@@ -144,12 +144,18 @@ for (const fixture of fixtures) {
     const s = src.has(sKey) ? src.get(sKey) : serpent.get(sKey);
     const t = trove.has(tKey) ? trove.get(tKey) : null;
     const ratio = s !== null && t !== null && t > 0 ? (s / t).toFixed(2) + '×' : '—';
-    lines.push(`| ${label} | ${f(s)} | ${f(t)} | ${ratio} | ${note} |`);
+    // The one label that is data rather than wording: which collection the
+    // switch actually measured, reported by the bench that measured it.
+    const rowLabel =
+      tKey === 'collectionSwitchMs' && trove.get('collectionMembers') != null
+        ? `${label}（${trove.get('collectionMembers')} 成员）`
+        : label;
+    lines.push(`| ${rowLabel} | ${f(s)} | ${f(t)} | ${ratio} | ${note} |`);
   }
   const paired = new Set(PAIRS.flatMap(([a, b]) => [a, b]));
   const extra = (map, name) => {
     const keys = [...map.keys()]
-      .filter((k) => !paired.has(k) && !k.endsWith('Min') && !k.endsWith('Max') && !['_repeat', 'assets', 'targetAssets', 'liveAssets', 'mirrorDbBytes'].includes(k))
+      .filter((k) => !paired.has(k) && !k.endsWith('Min') && !k.endsWith('Max') && !['_repeat', 'assets', 'targetAssets', 'liveAssets', 'mirrorDbBytes', 'collectionMembers'].includes(k))
       .sort();
     if (keys.length) lines.push('', `${name}（对方无对应项）: ` + keys.map((k) => `${k}=${f(map.get(k))}`).join(' · '));
   };
