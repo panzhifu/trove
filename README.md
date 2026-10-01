@@ -36,6 +36,20 @@
 
 ## 🚀 快速开始
 
+从 [Releases](https://github.com/panzhifu/trove/releases/latest) 下载对应平台的安装包（桌面应用与 `trove` 命令行都在里面）：
+
+| 平台 | 下载 | 安装 |
+|---|---|---|
+| Debian / Ubuntu | `trove_<版本>_amd64.deb` | `sudo apt install ./trove_*_amd64.deb`（Ubuntu 24.04+ / Debian 13+） |
+| Fedora / openSUSE | `trove-<版本>-1.x86_64.rpm` | `sudo dnf install ./trove-*.rpm` |
+| Windows | `Trove-<版本>-Setup.exe` | 向导式安装，含开始菜单与卸载器 |
+| macOS（Apple Silicon / Intel） | `Trove-<版本>-aarch64.dmg` / `Trove-<版本>-x86_64.dmg` | 拖入 Applications；未签名，首次打开**右键 →「打开」**，或 `xattr -cr /Applications/Trove.app` |
+| 其他 / 便携 | `trove-<版本>-<target>.tar.gz` / `.zip` | 解压即用的裸二进制（GUI + CLI），无桌面集成 |
+
+> 视频预览、HEIC/AVIF 解码与 PDF 缩略图依赖外部工具（`ffmpeg`、`heif-dec`、`pdftoppm`/`mutool`/`gs` 任一）。deb/rpm 已把它们列为推荐依赖；缺失时对应功能优雅降级，其余功能不受影响。
+
+从源码构建：
+
 ```sh
 git clone https://github.com/panzhifu/trove.git && cd trove
 cargo run -p trove-app

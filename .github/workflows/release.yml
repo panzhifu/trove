@@ -4,13 +4,16 @@ on:
   push:
     tags:
       - "v*.*.*"
+  # Dry run without a tag: derives the version from Cargo.toml and runs the
+  # full packaging pipeline (no release is created — the release job is
+  # tag-gated below).
+  workflow_dispatch:
 
 permissions:
   contents: write
 
 env:
   CARGO_TERM_COLOR: always
-  APP_NAME: trove
 
 jobs:
   build:
@@ -22,30 +25,51 @@ jobs:
           # macOS (Apple Silicon)
           - target: aarch64-apple-darwin
             os: macos-14
-            asset_name: trove-aarch64-apple-darwin
-            archive_ext: zip
+            artifact: trove-aarch64-apple-darwin
           # macOS (Intel)
           - target: x86_64-apple-darwin
             os: macos-14
-            asset_name: trove-x86_64-apple-darwin
-            archive_ext: zip
+            artifact: trove-x86_64-apple-darwin
           # Linux (x86_64). Built on 24.04, not 22.04: xcap -> libspa needs
           # pipewire headers >= 0.3.65 (see the Ubuntu step below), and jammy's
           # 0.3.48 cannot compile the crate. Consequence: this artifact needs
-          # glibc >= 2.39, i.e. Ubuntu 24.04+ / Debian 13+ at runtime.
+          # glibc >= 2.39, i.e. Ubuntu 24.04+ / Debian 13+ at runtime — which
+          # is exactly what the .deb declares and the .rpm requires.
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-24.04
-            asset_name: trove-x86_64-unknown-linux-gnu
-            archive_ext: tar.gz
+            artifact: trove-x86_64-unknown-linux-gnu
           # Windows (x86_64)
           - target: x86_64-pc-windows-msvc
             os: windows-2022
-            asset_name: trove-x86_64-pc-windows-msvc
-            archive_ext: zip
+            artifact: trove-x86_64-pc-windows-msvc
 
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+
+      # One version, one source: the workspace Cargo.toml. On a tag push it
+      # must match the tag — the in-app updater (services/update.rs) compares
+      # the tag against this number, so a mismatch ships a release that
+      # nags every user forever. Artifact filenames carry the same version.
+      - name: Derive version
+        shell: bash
+        run: |
+          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
+            echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
+          else
+            ver=$(grep -m1 '^version = ' Cargo.toml | sed 's/.*"\(.*\)"/\1/')
+            echo "VERSION=$ver" >> "$GITHUB_ENV"
+          fi
+
+      - name: Verify tag matches the workspace version
+        if: github.ref_type == 'tag'
+        shell: bash
+        run: |
+          ws=$(grep -m1 '^version = ' Cargo.toml | sed 's/.*"\(.*\)"/\1/')
+          if [[ "${GITHUB_REF_NAME#v}" != "$ws" ]]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match Cargo.toml version $ws — they must move together (the updater compares them)."
+            exit 1
+          fi
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -94,38 +118,86 @@ jobs:
             libasound2-dev libwayland-dev libdrm-dev libzstd-dev \
             libgbm-dev libpipewire-0.3-dev
 
-      - name: Build release binary
-        run: cargo build --release --target ${{ matrix.target }} -p trove-app
+      # Both binaries: the GUI (trove-app) and the CLI (trove) — every package
+      # and archive below ships both; they share one library on disk.
+      - name: Build release binaries
+        run: cargo build --release --target ${{ matrix.target }} -p trove-app -p trove-cli
 
+      # ---------------------------------------------------------------- macOS
       - name: Package (zip)
-        if: matrix.archive_ext == 'zip'
+        if: runner.os == 'macOS'
         shell: bash
         run: |
           cd target/${{ matrix.target }}/release
-          if [[ "${{ matrix.target }}" == *windows* ]]; then
-            7z a ../../../${{ matrix.asset_name }}.zip trove-app.exe
-          else
-            zip -r ../../../${{ matrix.asset_name }}.zip trove-app
-          fi
-          cd -
+          zip -r ../../../trove-${{ env.VERSION }}-${{ matrix.target }}.zip trove-app trove
 
+      - name: Package (dmg)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: packaging/macos/make-bundle.sh "$VERSION" "target/${{ matrix.target }}/release"
+
+      # ---------------------------------------------------------------- Linux
       - name: Package (tar.gz)
-        if: matrix.archive_ext == 'tar.gz'
+        if: runner.os == 'Linux'
         run: |
           cd target/${{ matrix.target }}/release
-          tar czf ../../../${{ matrix.asset_name }}.tar.gz trove-app
-          cd -
+          tar czf ../../../trove-${{ env.VERSION }}-${{ matrix.target }}.tar.gz trove-app trove
 
-      - name: Upload artifact
+      - name: Package (deb)
+        if: runner.os == 'Linux'
+        run: packaging/linux/build-deb.sh "$VERSION" "target/${{ matrix.target }}/release"
+
+      - name: Package (rpm)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get install -y rpm
+          packaging/linux/build-rpm.sh "$VERSION" "target/${{ matrix.target }}/release"
+
+      # -------------------------------------------------------------- Windows
+      - name: Package (zip)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          cd target/${{ matrix.target }}/release
+          7z a ../../../trove-${{ env.VERSION }}-${{ matrix.target }}.zip trove-app.exe trove.exe
+
+      - name: Package (installer)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          choco install innosetup -y
+          # The zh-CN wizard language is in Inno's "unofficial" set: absent
+          # from the compiler's default install, present in the upstream
+          # repo. If this download ever fails the installer still builds —
+          # the .iss script only references the file when it exists.
+          curl -fsSL --retry 3 \
+            "https://raw.githubusercontent.com/jrsoftware/issrc/main/Files/Languages/Unofficial/ChineseSimplified.isl" \
+            -o packaging/windows/ChineseSimplified.isl
+          # Double slashes on the switches: ISCC is driven from bash here,
+          # where a single leading slash gets mangled into a path.
+          "/c/Program Files (x86)/Inno Setup 6/ISCC.exe" \
+            //DAppVersion="$VERSION" \
+            //DBindir="$(cygpath -m "$PWD/target/${{ matrix.target }}/release")" \
+            //O. packaging/windows/trove.iss
+
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.asset_name }}
-          path: ${{ matrix.asset_name }}.${{ matrix.archive_ext }}
+          name: ${{ matrix.artifact }}
+          path: |
+            trove-${{ env.VERSION }}-*.zip
+            trove-${{ env.VERSION }}-*.tar.gz
+            trove_${{ env.VERSION }}_*.deb
+            trove-${{ env.VERSION }}-1.*.rpm
+            Trove-${{ env.VERSION }}-*.dmg
+            Trove-${{ env.VERSION }}-Setup.exe
+          if-no-files-found: error
           retention-days: 1
 
   release:
     name: Create Release & Upload Assets
     needs: build
+    if: github.ref_type == 'tag'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -143,7 +215,7 @@ jobs:
           name: "Trove ${{ github.ref_name }}"
           draft: false
           prerelease: ${{ contains(github.ref_name, 'alpha') || contains(github.ref_name, 'beta') || contains(github.ref_name, 'rc') }}
-          files: artifacts/**/*.{zip,tar.gz}
+          files: artifacts/**/*.{zip,tar.gz,deb,rpm,exe,dmg}
           generate_release_notes: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

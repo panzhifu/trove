@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Filled in by make-bundle.sh, which seds @VERSION@ into both version keys and
+  copies this file to Trove.app/Contents/Info.plist. CFBundleExecutable must
+  stay trove-app — the same name the Linux desktop file and the Windows
+  installer ship, and the name release.yml builds.
+-->
+<plist version="1.0">
+<dict>
+	<key>CFBundleName</key>
+	<string>Trove</string>
+	<key>CFBundleDisplayName</key>
+	<string>Trove</string>
+	<key>CFBundleIdentifier</key>
+	<string>io.github.panzhifu.trove</string>
+	<key>CFBundleExecutable</key>
+	<string>trove-app</string>
+	<key>CFBundleIconFile</key>
+	<string>trove</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>@VERSION@</string>
+	<key>CFBundleVersion</key>
+	<string>@VERSION@</string>
+	<!-- Untested claim below this floor; the macos-14 SDK is what release.yml
+	     builds with, and no code path is known to need newer than 11. -->
+	<key>LSMinimumSystemVersion</key>
+	<string>11.0</string>
+	<key>NSHighResolutionCapable</key>
+	<true/>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>en</string>
+</dict>
+</plist>

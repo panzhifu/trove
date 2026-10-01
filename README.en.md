@@ -36,6 +36,20 @@
 
 ## 🚀 Quick start
 
+Grab an installer from [Releases](https://github.com/panzhifu/trove/releases/latest) — every package ships the desktop app **and** the `trove` CLI:
+
+| Platform | Download | Install |
+|---|---|---|
+| Debian / Ubuntu | `trove_<version>_amd64.deb` | `sudo apt install ./trove_*_amd64.deb` (Ubuntu 24.04+ / Debian 13+) |
+| Fedora / openSUSE | `trove-<version>-1.x86_64.rpm` | `sudo dnf install ./trove-*.rpm` |
+| Windows | `Trove-<version>-Setup.exe` | Guided installer with a Start-menu entry and an uninstaller |
+| macOS (Apple Silicon / Intel) | `Trove-<version>-aarch64.dmg` / `Trove-<version>-x86_64.dmg` | Drag to Applications; unsigned — first launch **right-click → Open**, or `xattr -cr /Applications/Trove.app` |
+| Other / portable | `trove-<version>-<target>.tar.gz` / `.zip` | Bare binaries (GUI + CLI), no desktop integration |
+
+> Video preview, HEIC/AVIF decoding and PDF thumbnails rely on external tools (`ffmpeg`, `heif-dec`, any of `pdftoppm`/`mutool`/`gs`). The deb/rpm list them as recommended dependencies; when absent the affected features degrade gracefully and everything else keeps working.
+
+Build from source:
+
 ```sh
 git clone https://github.com/panzhifu/trove.git && cd trove
 cargo run -p trove-app
