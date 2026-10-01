@@ -166,6 +166,15 @@ jobs:
         shell: bash
         run: |
           choco install innosetup -y
+          # Simplified Chinese is not among the languages the compiler
+          # bundles. Download it from the upstream repo, pinned to a commit
+          # so the URL cannot rot; a failed download degrades the wizard to
+          # English instead of failing the release — the .iss references the
+          # file only when it exists.
+          curl -fsSL --retry 3 \
+            "https://raw.githubusercontent.com/jrsoftware/issrc/7e5c6b38693caac3d921da632763c5038625ccd9/Files/Languages/ChineseSimplified.isl" \
+            -o packaging/windows/ChineseSimplified.isl \
+            || echo "::warning::ChineseSimplified.isl unavailable - building an English-only installer"
           # Single slashes + MSYS2_ARG_CONV_EXCL: ISCC wants /D and /O, and
           # the runner's bash rewrites a leading slash into a Git-install
           # path unless argument conversion is off — the doubled-slash trick

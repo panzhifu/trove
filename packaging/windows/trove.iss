@@ -46,11 +46,17 @@ ArchitecturesInstallIn64BitMode=x64compatible
 UninstallDisplayIcon={app}\trove-app.exe
 
 [Languages]
-; Simplified Chinese ships with Inno Setup 6.3+ as an official language
-; (compiler:Languages\ChineseSimplified.isl) — no download, no fallback
-; logic; choco's innosetup is well past 6.3.
+; Simplified Chinese is *not* among the languages the compiler bundles —
+; the third v0.5.2 run proved that the hard way (Inno 6.7.1 has no
+; Languages\ChineseSimplified.isl on disk). release.yml downloads the file
+; from the upstream repo, pinned to a commit so the URL cannot rot; a
+; failed download degrades the wizard to English instead of failing the
+; release, which is why this is a preprocessor guard and not a hard
+; reference.
 Name: "english"; MessagesFile: "compiler:Default.isl"
-Name: "chinese"; MessagesFile: "compiler:Languages\ChineseSimplified.isl"
+#if FileExists(AddBackslash(SourcePath) + "ChineseSimplified.isl")
+Name: "chinese"; MessagesFile: "ChineseSimplified.isl"
+#endif
 
 [Tasks]
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; \
