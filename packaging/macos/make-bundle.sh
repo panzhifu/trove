@@ -72,6 +72,16 @@ iconutil -c icns "$iconset" -o "$app/Contents/Resources/trove.icns"
 codesign --force --deep --sign - "$app"
 
 # UDZO = compressed read-only image, the shape a download wants.
-arch=$(uname -m | sed 's/^arm64$/aarch64/')
+#
+# The image is named for the *binaries'* architecture, read from the bin-dir
+# the workflow passes — never from `uname -m`: a cross-compiled x86_64 job
+# runs on an arm64 runner, and host-derived naming shipped two different
+# builds under one name on the release page (the v0.5.2 fourth run's one
+# surviving aarch64.dmg was whoever uploaded last).
+case "$bindir" in
+    *aarch64*) arch=aarch64 ;;
+    *x86_64*) arch=x86_64 ;;
+    *) arch=$(uname -m | sed 's/^arm64$/aarch64/') ;;
+esac
 hdiutil create -volname "Trove $version" -srcfolder "$app" \
     -ov -format UDZO "Trove-$version-$arch.dmg"
