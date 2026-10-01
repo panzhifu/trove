@@ -166,12 +166,14 @@ jobs:
         shell: bash
         run: |
           choco install innosetup -y
-          # Double slashes on the switches: ISCC is driven from bash here,
-          # where a single leading slash gets mangled into a path.
-          "/c/Program Files (x86)/Inno Setup 6/ISCC.exe" \
-            //DAppVersion="$VERSION" \
-            //DBindir="$(cygpath -m "$PWD/target/${{ matrix.target }}/release")" \
-            //O. packaging/windows/trove.iss
+          # Single slashes + MSYS2_ARG_CONV_EXCL: ISCC wants /D and /O, and
+          # the runner's bash rewrites a leading slash into a Git-install
+          # path unless argument conversion is off — the doubled-slash trick
+          # gets ISCC "Unknown option: //DBindir=…" instead.
+          MSYS2_ARG_CONV_EXCL="*" "/c/Program Files (x86)/Inno Setup 6/ISCC.exe" \
+            /DAppVersion="$VERSION" \
+            /DBindir="$(cygpath -m "$PWD/target/${{ matrix.target }}/release")" \
+            /O. packaging/windows/trove.iss
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4

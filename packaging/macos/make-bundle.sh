@@ -61,14 +61,15 @@ cp "$root/design/icon/trove-256.png" "$iconset/icon_128x128@2x.png"
 cp "$root/design/icon/trove-256.png" "$iconset/icon_256x256.png"
 iconutil -c icns "$iconset" -o "$app/Contents/Resources/trove.icns"
 
-# One path per invocation: codesign takes a single target, and the bundle's
-# seal covers nested code only if every nested executable was signed first —
-# a multi-path call silently signs nothing past the first, which is exactly
-# what "code object is not signed at all / In subcomponent" on the v0.5.2
-# release run was.
-codesign --force --sign - "$app/Contents/MacOS/trove-app"
-codesign --force --sign - "$app/Contents/MacOS/trove"
-codesign --force --sign - "$app"
+# One pass with --deep: the bundle holds a second executable beside its main
+# one (the CLI), and a manual sign-inner-then-outer order — which is what the
+# first two release runs tried — still had the x86_64 job's seal refuse the
+# freshly signed sibling with "code object is not signed at all / In
+# subcomponent" while the arm64 job signed the identical script fine. --deep
+# signs nested code bottom-up in the same pass as the outer seal, which is
+# the shape that survives a cross-arch signing host. --force because a
+# rebuild can land a binary that already carries an ad-hoc signature.
+codesign --force --deep --sign - "$app"
 
 # UDZO = compressed read-only image, the shape a download wants.
 arch=$(uname -m | sed 's/^arm64$/aarch64/')

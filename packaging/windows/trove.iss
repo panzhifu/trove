@@ -1,12 +1,11 @@
 ; Inno Setup 6 script — builds Trove-<version>-Setup.exe from the
 ; already-built exes; it compiles nothing. CI invokes it as
 ;
-;   ISCC.exe //DAppVersion=<version> //DBindir=<release-dir> //O<outdir> packaging/windows/trove.iss
+;   MSYS2_ARG_CONV_EXCL="*" ISCC.exe /DAppVersion=<version> /DBindir=<release-dir> /O<outdir> packaging/windows/trove.iss
 ;
-; (double slashes because the runner drives ISCC from bash, where a single
-; slash gets mangled into a path). Locally, iscc resolves relative paths
-; against this script's directory, so the default Bindir below works from a
-; checkout.
+; (the env var keeps the runner's bash from rewriting the slash switches
+; into paths). Locally, iscc resolves relative paths against this script's
+; directory, so the default Bindir below works from a checkout.
 
 #define AppName "Trove"
 #define AppPublisher "panzhifu"
