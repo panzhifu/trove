@@ -166,13 +166,6 @@ jobs:
         shell: bash
         run: |
           choco install innosetup -y
-          # The zh-CN wizard language is in Inno's "unofficial" set: absent
-          # from the compiler's default install, present in the upstream
-          # repo. If this download ever fails the installer still builds —
-          # the .iss script only references the file when it exists.
-          curl -fsSL --retry 3 \
-            "https://raw.githubusercontent.com/jrsoftware/issrc/main/Files/Languages/Unofficial/ChineseSimplified.isl" \
-            -o packaging/windows/ChineseSimplified.isl
           # Double slashes on the switches: ISCC is driven from bash here,
           # where a single leading slash gets mangled into a path.
           "/c/Program Files (x86)/Inno Setup 6/ISCC.exe" \

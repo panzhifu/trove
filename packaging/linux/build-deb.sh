@@ -53,6 +53,7 @@ done
 # A package without a copyright file makes no claim about redistribution.
 install -Dm644 "$root/LICENSE" "$stage/usr/share/doc/trove/copyright"
 
+mkdir -p "$stage/DEBIAN"
 # Recommends, not Depends: every external tool degrades gracefully — without
 # ffmpeg video keeps its kind icon and loses playback, without heif-dec the
 # HEIC/AVIF formats do, without a PDF rasterizer PDFs do. The alternatives

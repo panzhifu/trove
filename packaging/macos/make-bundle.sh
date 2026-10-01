@@ -61,8 +61,13 @@ cp "$root/design/icon/trove-256.png" "$iconset/icon_128x128@2x.png"
 cp "$root/design/icon/trove-256.png" "$iconset/icon_256x256.png"
 iconutil -c icns "$iconset" -o "$app/Contents/Resources/trove.icns"
 
-codesign --force --sign - \
-    "$app/Contents/MacOS/trove-app" "$app/Contents/MacOS/trove"
+# One path per invocation: codesign takes a single target, and the bundle's
+# seal covers nested code only if every nested executable was signed first —
+# a multi-path call silently signs nothing past the first, which is exactly
+# what "code object is not signed at all / In subcomponent" on the v0.5.2
+# release run was.
+codesign --force --sign - "$app/Contents/MacOS/trove-app"
+codesign --force --sign - "$app/Contents/MacOS/trove"
 codesign --force --sign - "$app"
 
 # UDZO = compressed read-only image, the shape a download wants.

@@ -7,12 +7,6 @@
 ; slash gets mangled into a path). Locally, iscc resolves relative paths
 ; against this script's directory, so the default Bindir below works from a
 ; checkout.
-;
-; The Simplified Chinese wizard page activates only when
-; ChineseSimplified.isl sits next to this script: Inno's installer ships a
-; fixed set of languages and zh-CN is in its "unofficial" set, so release.yml
-; downloads the file from the jrsoftware repo before compiling. Missing file
-; degrades to an English-only wizard rather than a failed release.
 
 #define AppName "Trove"
 #define AppPublisher "panzhifu"
@@ -53,10 +47,11 @@ ArchitecturesInstallIn64BitMode=x64compatible
 UninstallDisplayIcon={app}\trove-app.exe
 
 [Languages]
+; Simplified Chinese ships with Inno Setup 6.3+ as an official language
+; (compiler:Languages\ChineseSimplified.isl) — no download, no fallback
+; logic; choco's innosetup is well past 6.3.
 Name: "english"; MessagesFile: "compiler:Default.isl"
-#if FileExists(AddBackslash(SourcePath) + "ChineseSimplified.isl")
-Name: "chinese"; MessagesFile: "ChineseSimplified.isl"
-#endif
+Name: "chinese"; MessagesFile: "compiler:Languages\ChineseSimplified.isl"
 
 [Tasks]
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; \
