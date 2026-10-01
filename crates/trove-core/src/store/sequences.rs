@@ -92,6 +92,84 @@ pub fn hidden_beside_guarded(conn: &Connection, id_column: &str) -> Result<Strin
     })
 }
 
+/// What a grid card needs to cycle through its run.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SequenceCardFrames {
+    /// The asset the grid shows as the card — the run's position-0 frame.
+    pub primary_id: Uuid,
+    fps: f64,
+    /// Every frame's content hash in display order, the address the thumbnail
+    /// cache is keyed by. The primary's own hash is among them (position 0 is
+    /// the card), and a frame without a hash — one that was never mined — has
+    /// none to give.
+    pub hashes: Vec<String>,
+}
+
+impl SequenceCardFrames {
+    /// Frames per second, for the card cycle's clock.
+    pub fn fps(&self) -> f64 {
+        self.fps
+    }
+}
+
+/// Every sequence as its grid card sees it, in one query for the whole library.
+///
+/// The card carousel asks per *listing*, never per card, and the sequence
+/// tables are tiny next to the assets they point at — one join over both is
+/// cheaper than a [`membership`](fn@membership) round trip per visible row.
+/// Runs whose primary is trashed are skipped: their card lives in the trash,
+/// where nothing cycles, and a trashed member drops out of the frame list the
+/// same way it drops out of the player's.
+pub fn card_frames(conn: &Connection) -> Result<Vec<SequenceCardFrames>> {
+    let rows: Vec<(String, f64, Option<String>)> = rows::query_map(
+        conn,
+        "SELECT s.primary_asset_id, s.fps, a.content_hash \
+         FROM asset_sequences s \
+         JOIN asset_sequence_frames f ON f.sequence_id = s.id \
+         JOIN assets a ON a.id = f.asset_id \
+         WHERE a.trashed_at IS NULL \
+           AND EXISTS (SELECT 1 FROM assets p \
+                       WHERE p.id = s.primary_asset_id AND p.trashed_at IS NULL) \
+         ORDER BY s.id, f.position",
+        vec![],
+        |row| {
+            Ok((
+                rows::req_str(row, 0)?,
+                row.get::<_, f64>(1)?,
+                rows::opt_str(row, 2)?,
+            ))
+        },
+    )?;
+
+    // Rows arrive ordered by run then position, so appending as they come
+    // builds each frame list in display order; the first row of a run also
+    // fixes that run's place in the output.
+    let mut order: Vec<Uuid> = Vec::new();
+    let mut runs: std::collections::HashMap<Uuid, (f64, Vec<String>)> =
+        std::collections::HashMap::new();
+    for (primary, fps, hash) in rows {
+        let primary = rows::parse_uuid(&primary)?;
+        let entry = runs.entry(primary).or_insert_with(|| {
+            order.push(primary);
+            (fps, Vec::new())
+        });
+        if let Some(hash) = hash {
+            entry.1.push(hash);
+        }
+    }
+    Ok(order
+        .into_iter()
+        .map(|primary| {
+            let (fps, hashes) = runs.remove(&primary).expect("the order came from it");
+            SequenceCardFrames {
+                primary_id: primary,
+                fps,
+                hashes,
+            }
+        })
+        .collect())
+}
+
 /// What a frame belongs to, as the surfaces that show it need it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Membership {
@@ -548,5 +626,62 @@ mod tests {
 
         std::fs::remove_dir_all(&dir).ok();
         std::fs::remove_dir_all(&other).ok();
+    }
+
+    /// The card carousel's data shape: one row per run, the primary's id
+    /// fronting every frame's hash in display order. A trashed member drops
+    /// out of the frame list, and a run whose primary is trashed drops out
+    /// whole — its card lives in the trash, where nothing cycles.
+    #[test]
+    fn card_frames_answer_per_run_in_display_order() {
+        let store = store("cards");
+        let conn = store.conn();
+        let dir = std::env::temp_dir().join(format!("trove-seq-src-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let ids: Vec<Uuid> = (1..=4).map(|_| Uuid::new_v4()).collect();
+        for (index, (id, name)) in ids
+            .iter()
+            .zip((1..=4).map(|i| format!("shot{i:04}.exr")))
+            .enumerate()
+        {
+            let mut asset = frame(&dir, &name, *id);
+            // Distinct hashes, so the display order the query returns is
+            // observable rather than inferred from one repeated value.
+            asset.content_hash = Some(crate::model::ContentHash::from_hasher(format!(
+                "{:064}",
+                index + 1
+            )));
+            insert(conn, &asset);
+        }
+        create(conn, &ids, 12.0).expect("a sequence");
+
+        let cards = card_frames(conn).unwrap();
+        assert_eq!(cards.len(), 1, "one run, one card: {cards:?}");
+        let card = &cards[0];
+        assert_eq!(card.primary_id, ids[0], "position 0 is the card");
+        assert_eq!(card.fps(), 12.0);
+        let hash = |i: usize| {
+            crate::model::ContentHash::from_hasher(format!("{i:064}"))
+                .as_str()
+                .to_string()
+        };
+        let expected: Vec<String> = (1..=4).map(hash).collect();
+        assert_eq!(card.hashes, expected, "display order");
+
+        // A trashed member leaves the frame list exactly as it leaves the
+        // player's: the cycle simply has one frame fewer.
+        assets::set_trashed(conn, ids[3], true).unwrap();
+        let cards = card_frames(conn).unwrap();
+        assert_eq!(cards[0].hashes.len(), 3, "the trashed frame is gone");
+
+        // And a trashed primary takes its whole card with it.
+        assets::set_trashed(conn, ids[0], true).unwrap();
+        assert!(
+            card_frames(conn).unwrap().is_empty(),
+            "no card lives in the trash"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

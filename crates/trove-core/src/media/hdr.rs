@@ -42,6 +42,128 @@ pub fn open_for_display_at(path: &Path, stops: f32) -> ImageResult<DynamicImage>
     image::open(path).map(|image| tonemap(image, stops))
 }
 
+/// One part of an EXR file, as the part selector lists it.
+///
+/// "Part" is the OpenEXR term for a whole image inside one file — a render's
+/// beauty pass plus its AOVs, one `beauty` and one `depth` and so on. The
+/// `image` crate's decoder picks whichever part it likes and offers no
+/// selection, so anything beyond default-view decoding goes through the
+/// `exr` crate directly (it is in the graph as the decoder behind the
+/// feature anyway).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExrPartInfo {
+    /// The part's own name, or an empty string for an unnamed single part.
+    pub name: String,
+    pub width: u32,
+    pub height: u32,
+    /// Channel count of the part — a beauty pass carries 3 (RGB) or 4 (RGBA),
+    /// a depth pass 1.
+    pub channels: usize,
+    /// Deep parts carry no flat pixels this decode path can produce; the
+    /// selector only offers the flat ones.
+    pub displayable: bool,
+}
+
+/// Enumerate an EXR file's parts from its headers — a header read, no pixels.
+///
+/// Empty for anything that is not an `.exr`: Radiance HDR and TGA have no
+/// concept of parts, and callers gate on the extension anyway.
+pub fn exr_parts(path: &Path) -> ImageResult<Vec<ExrPartInfo>> {
+    if path
+        .extension()
+        .is_none_or(|ext| !ext.eq_ignore_ascii_case("exr"))
+    {
+        return Ok(Vec::new());
+    }
+    let file = std::fs::File::open(path)?;
+    let reader = exr::block::read(file, false).map_err(map_exr_error)?;
+    Ok(reader
+        .headers()
+        .iter()
+        .map(|header| ExrPartInfo {
+            name: header
+                .own_attributes
+                .layer_name
+                .as_ref()
+                .map(ToString::to_string)
+                .unwrap_or_default(),
+            width: header.layer_size.width() as u32,
+            height: header.layer_size.height() as u32,
+            channels: header.channels.list.len(),
+            displayable: !header.deep,
+        })
+        .collect())
+}
+
+/// [`open_for_display_at`] for one specific part of an EXR file.
+///
+/// The decode goes through the `exr` crate's all-flat-layers reader, which
+/// accepts any channel layout — a depth AOV (one `Z` channel) renders as
+/// grayscale, an RGBA part as colour — where `image`'s decoder would refuse
+/// the file outright the moment any part fails its RGB expectation. Parts
+/// with deep data are the one thing this path cannot produce; such a file
+/// errors here and the caller falls back to the default view. Part indices
+/// match [`exr_parts`] positions, and `part` 0 through this function is
+/// *this* decoder's first flat layer — not necessarily what
+/// [`open_for_display_at`] picks, whose part choice is `image`'s own.
+pub fn open_for_display_part(path: &Path, stops: f32, part: usize) -> ImageResult<DynamicImage> {
+    let image = exr::prelude::read_all_flat_layers_from_file(path).map_err(map_exr_error)?;
+    let layer = image.layer_data.get(part).ok_or_else(|| {
+        image::ImageError::IoError(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("EXR part {part} does not exist in {}", path.display()),
+        ))
+    })?;
+    let (width, height) = (layer.size.width() as u32, layer.size.height() as u32);
+    let channels = &layer.channel_data.list;
+
+    // Sample lookup by name, case-insensitive — the spec fixes the names but
+    // real files have been seen with lowercase. A missing R/G/B composition
+    // falls back to the first channel as grayscale, which is what a depth
+    // pass is for the eye anyway.
+    let sample = |name: &str| {
+        channels
+            .iter()
+            .find(|c| c.name.to_string().eq_ignore_ascii_case(name))
+            .map(|c| &c.sample_data)
+    };
+    let pick = |s: &exr::image::FlatSamples, i: usize| match s {
+        exr::image::FlatSamples::F16(v) => v.get(i).map(|x| x.to_f32()).unwrap_or(0.0),
+        exr::image::FlatSamples::F32(v) => v.get(i).copied().unwrap_or(0.0),
+        exr::image::FlatSamples::U32(v) => v.get(i).map(|x| *x as f32).unwrap_or(0.0),
+    };
+    let (r, g, b) = match (sample("R"), sample("G"), sample("B")) {
+        (Some(r), Some(g), Some(b)) => (r, g, b),
+        _ => {
+            let first = channels.first().ok_or_else(|| {
+                image::ImageError::IoError(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("EXR part {part} of {} carries no channels", path.display()),
+                ))
+            })?;
+            let s = &first.sample_data;
+            (s, s, s)
+        }
+    };
+    let alpha = sample("A");
+
+    let mut buffer = ImageBuffer::<image::Rgba<f32>, Vec<f32>>::new(width, height);
+    for (i, pixel) in buffer.pixels_mut().enumerate() {
+        let a = alpha.map(|s| pick(s, i)).unwrap_or(1.0);
+        *pixel = image::Rgba([pick(r, i), pick(g, i), pick(b, i), a]);
+    }
+    Ok(tonemap(DynamicImage::ImageRgba32F(buffer), stops))
+}
+
+/// The `exr` crate's errors arrive as `ImageError`s the same way `image`'s
+/// own OpenEXR decoder reports them, so callers need no second error shape.
+fn map_exr_error(error: exr::error::Error) -> image::ImageError {
+    image::ImageError::Decoding(image::error::DecodingError::new(
+        image::error::ImageFormatHint::Exact(image::ImageFormat::OpenExr),
+        error,
+    ))
+}
+
 /// Whether `ext` decodes into a scene-linear float buffer — the only inputs
 /// [`tonemap`] actually transforms. Every other image comes back from it
 /// untouched, so the exposure control has nothing to offer them.
@@ -291,6 +413,62 @@ mod tests {
             .expect("the card is written");
         assert!(card.is_file());
         assert!(image::open(&card).is_ok(), "the card is a readable JPEG");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The part selector's claims, end to end: a multi-part file names its
+    /// parts, and each named part decodes to its own picture. The fixture is
+    /// written through the `exr` crate's layer API — two named RGB parts, one
+    /// black and one white, so a wrong selection cannot pass by accident.
+    #[test]
+    fn an_exr_part_selector_names_and_decodes_parts() {
+        let dir = scratch("exr-parts");
+        let path = dir.join("multipart.exr");
+
+        let layer = |name: &str, v: f32| {
+            exr::image::Layer::new(
+                exr::math::Vec2(2usize, 1usize),
+                exr::meta::header::LayerAttributes::named(name),
+                exr::image::Encoding::default(),
+                exr::image::SpecificChannels::rgb(move |_: exr::math::Vec2<usize>| (v, v, v)),
+            )
+        };
+        use exr::prelude::WritableImage;
+        exr::image::Image::from_layers(
+            exr::meta::header::ImageAttributes::new(exr::meta::attribute::IntegerBounds::new(
+                (0i32, 0i32),
+                (2usize, 1usize),
+            )),
+            vec![layer("beauty", 0.0), layer("key", 1.0)],
+        )
+        .write()
+        .to_file(&path)
+        .expect("the multi-part fixture writes");
+
+        let parts = exr_parts(&path).expect("headers read");
+        assert_eq!(parts.len(), 2, "both parts are listed: {parts:?}");
+        assert_eq!(parts[0].name, "beauty");
+        assert_eq!(parts[1].name, "key");
+        assert_eq!((parts[0].width, parts[0].height), (2, 1));
+        assert_eq!(parts[0].channels, 3);
+        assert!(
+            parts.iter().all(|p| p.displayable),
+            "both are flat: {parts:?}"
+        );
+
+        let dark = open_for_display_part(&path, 0.0, 0).expect("part 0 decodes");
+        let lit = open_for_display_part(&path, 0.0, 1).expect("part 1 decodes");
+        assert_eq!(dark.to_rgba8().get_pixel(0, 0)[0], 0, "beauty stays black");
+        assert!(
+            lit.to_rgba8().get_pixel(0, 0)[0] > 200,
+            "the key pass lands near white: {}",
+            lit.to_rgba8().get_pixel(0, 0)[0]
+        );
+        assert!(
+            open_for_display_part(&path, 0.0, 2).is_err(),
+            "a part index past the file is refused, not wrapped"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }

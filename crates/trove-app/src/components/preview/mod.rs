@@ -473,6 +473,14 @@ pub(crate) struct AssetPreviewPanel {
     /// request (the user moved the slider again mid-decode) is dropped instead
     /// of overwriting the newer answer.
     exposure_generation: u64,
+    /// The EXR part list, probed off-thread when a scene-linear preview
+    /// opens. `None` until that probe lands, and empty for anything but an
+    /// `.exr` — Radiance HDR and TGA have no parts to choose between.
+    exr_parts: Option<Vec<trove_core::media::hdr::ExrPartInfo>>,
+    /// The committed part selection, indexing [`Self::exr_parts`]. Zero is
+    /// the file's first flat part; anything else re-decodes the original
+    /// through the part decoder exactly as an exposure change does.
+    part: usize,
     /// Pan/zoom of the flat stage — the still or the specimen.
     pan: PanZoom,
     /// Measured content-viewport size; the fit base for the zoom math.
@@ -580,6 +588,12 @@ impl AssetPreviewPanel {
         // recorded dimensions.
         let font_live =
             data.kind == trove_core::model::AssetKind::Font && font::specimen_available(&data, cx);
+        // The part probe runs only for an `.exr` original: everything else has
+        // no parts, and the selector stays hidden without reading a header.
+        let parts_probe = data.original.clone().filter(|path| {
+            path.extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("exr"))
+        });
         let viewport = cx.new(|_| size(px(0.), px(0.)));
         // The exposure rail: built per preview (it resets with the asset) and
         // subscribed here, so a release lands straight on this panel. Change
@@ -613,6 +627,8 @@ impl AssetPreviewPanel {
                 exposure,
                 exposure_images: Vec::new(),
                 exposure_generation: 0,
+                exr_parts: None,
+                part: 0,
                 pan: PanZoom::new(),
                 viewport,
                 drag_from: Point::default(),
@@ -624,6 +640,25 @@ impl AssetPreviewPanel {
         }
         if anim_loading {
             anim::load_player(panel.clone(), cx);
+        }
+        // The part probe: a header read on a scene-linear original, run off
+        // this thread like every other file IO. Held weakly, exactly like the
+        // player probes — a preview dismissed before the headers land must not
+        // be kept alive by this task.
+        if let Some(original) = parts_probe {
+            let panel = panel.downgrade();
+            cx.spawn(async move |cx| {
+                let parts = cx
+                    .background_executor()
+                    .spawn(async move {
+                        trove_core::media::hdr::exr_parts(&original).unwrap_or_default()
+                    })
+                    .await;
+                if let Some(panel) = panel.upgrade() {
+                    panel.update(cx, |panel, cx| panel.set_parts(parts, cx));
+                }
+            })
+            .detach();
         }
         panel
     }
@@ -740,8 +775,29 @@ impl AssetPreviewPanel {
             return;
         }
         self.stops = stops;
+        self.refresh_stage(cx);
+    }
+
+    /// Commit a part selection: the same re-decode an exposure change costs,
+    /// and the same generation guard. Zero is the file's first flat part —
+    /// unlike the exposure's zero, it still decodes, because the thumbnail on
+    /// the stage was rendered from a part `image` picked and the selector's
+    /// zero has no reason to agree with it.
+    pub(crate) fn set_part(&mut self, part: usize, cx: &mut Context<Self>) {
+        if part == self.part {
+            return;
+        }
+        self.part = part;
+        self.refresh_stage(cx);
+    }
+
+    /// The one decode path both controls share: stage a fresh full-size render
+    /// of the original at the committed stops and part, or clear the stage
+    /// back to the thumbnail when the answer is "the file as authored" —
+    /// which is exposure zero *and* the decoder's own part pick.
+    fn refresh_stage(&mut self, cx: &mut Context<Self>) {
         self.exposure_generation += 1;
-        if stops == 0.0 {
+        if self.stops == 0.0 && self.part == 0 {
             self.data.exposed = None;
             cx.notify();
             return;
@@ -750,10 +806,12 @@ impl AssetPreviewPanel {
             return;
         };
         let generation = self.exposure_generation;
+        let part = self.part;
+        let stops = self.stops;
         cx.spawn(async move |this, cx| {
             let decoded = cx
                 .background_executor()
-                .spawn(async move { image::decode_exposed(&path, stops) })
+                .spawn(async move { image::decode_exposed(&path, stops, part) })
                 .await;
             this.update(cx, |this, cx| {
                 if this.exposure_generation == generation
@@ -767,6 +825,29 @@ impl AssetPreviewPanel {
             })
         })
         .detach();
+    }
+
+    /// Land the part list the probe gathered. Empty means "nothing to
+    /// choose" — the toolbar's selector stays hidden.
+    fn set_parts(
+        &mut self,
+        parts: Vec<trove_core::media::hdr::ExrPartInfo>,
+        cx: &mut Context<Self>,
+    ) {
+        self.exr_parts = Some(parts);
+        cx.notify();
+    }
+
+    /// The part list, once the probe has landed; `None` while it has not and
+    /// for every non-EXR source. The toolbar renders the selector only for a
+    /// landed list with more than one entry.
+    pub(crate) fn exr_parts(&self) -> Option<&[trove_core::media::hdr::ExrPartInfo]> {
+        self.exr_parts.as_deref()
+    }
+
+    /// The committed part selection, for the selector's highlight.
+    pub(crate) fn part(&self) -> usize {
+        self.part
     }
 
     /// Space bar: hold whatever is playing, or pick it back up.

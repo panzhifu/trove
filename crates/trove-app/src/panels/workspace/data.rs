@@ -8,6 +8,7 @@ use super::*;
 use std::collections::HashMap;
 use std::ops::Range;
 use std::path::Path;
+use std::sync::Arc;
 use trove_core::model::{Asset, Rating};
 use trove_core::search::{expression::Target, highlight::Lexicon};
 use trove_core::store::facets::FacetCounts;
@@ -48,6 +49,10 @@ pub(super) struct Cell {
     /// Font assets so cells can render the sample text in the actual font.
     pub(super) font_family: Option<String>,
     pub(super) font_blob: Option<PathBuf>,
+    /// Sequence cycle inputs for a card that fronts a run with at least two
+    /// displayable frames — the carousel's data, frozen per layout epoch like
+    /// the thumbnail it alternates with. `None` for every ordinary asset.
+    pub(super) sequence: Option<Arc<super::carousel::SequenceCardThumbs>>,
 }
 
 impl Cell {
@@ -211,6 +216,8 @@ impl WorkspacePanel {
         // repaint of the grid.
         let quick_look = cx.new(|_| LiveCard::new());
         cx.observe(&quick_look, |_, _, cx| cx.notify()).detach();
+        let carousel = cx.new(|_| carousel::SequenceCarousel::new());
+        cx.observe(&carousel, |_, _, cx| cx.notify()).detach();
         let search_box = cx.new(|cx| SearchBox::new(window, cx, controller.clone()));
         let available_width = cx.new(|_| px(0.));
         let list_state = ListState::new(0, ListAlignment::Top, px(LIST_OVERDRAW_PX));
@@ -266,6 +273,7 @@ impl WorkspacePanel {
             grid_focus: cx.focus_handle(),
             controller,
             quick_look,
+            carousel,
             search_box,
             color_picker,
             pending_color_search: None,
@@ -426,6 +434,7 @@ impl WorkspacePanel {
                         (session, page, facets)
                     })
             });
+        let cards = sequence_cards(&key.cache_root, &ctl.library);
         if let Err(error) = drained {
             tracing::warn!(%error, "search outbox drain failed before a browse refresh");
             let msg =
@@ -437,7 +446,7 @@ impl WorkspacePanel {
                 let (total, truncated) = (page.total as usize, page.truncated);
                 (
                     total,
-                    cells_for(key, &page.items),
+                    cells_for(key, &page.items, &cards),
                     truncated,
                     Some(session),
                     facets,
@@ -479,7 +488,14 @@ impl WorkspacePanel {
         match page {
             Ok(page) => {
                 let empty = page.items.is_empty();
-                (cells_for(key, &page.items), empty)
+                (
+                    cells_for(
+                        key,
+                        &page.items,
+                        &sequence_cards(&key.cache_root, &ctl.library),
+                    ),
+                    empty,
+                )
             }
             Err(error) => {
                 self.report_view_error(cx, error);
@@ -521,11 +537,18 @@ impl WorkspacePanel {
             .as_ref()
             .map(|results| results.hits.iter().cloned().collect())
             .unwrap_or_default();
+        let cards = sequence_cards(&key.cache_root, &self.controller.read(cx).library);
         let cells: Vec<Cell> = slice
             .iter()
             .filter_map(|id| by_id.get(id))
             .map(|a| {
-                let mut cell = cell_from_asset(&key.library_root, &key.cache_root, a, &marks);
+                let mut cell = cell_from_asset(
+                    &key.library_root,
+                    &key.cache_root,
+                    a,
+                    &marks,
+                    cards.get(&a.id),
+                );
                 cell.score = scores.get(&a.id).copied();
                 cell
             })
@@ -566,20 +589,71 @@ pub(super) fn total_identity(key: &DataKey) -> DataKey {
 /// One listing window → the cells that paint it. Trash is already decided by
 /// the query, so the filter here is a belt on top of braces: a row that came
 /// back trashed while the view is live would otherwise be listed.
-fn cells_for(key: &DataKey, list: &[Asset]) -> Vec<Cell> {
+fn cells_for(
+    key: &DataKey,
+    list: &[Asset],
+    cards: &HashMap<Uuid, Arc<super::carousel::SequenceCardThumbs>>,
+) -> Vec<Cell> {
     // Parsed once for the window, not once per row: the same grammar the
     // ranking ran on is what says which bytes to mark, so the two cannot
     // disagree about what the user asked for.
     let marks = Lexicon::from_query(&key.search);
     list.iter()
         .filter(|a| key.in_trash || !a.placement().is_trashed())
-        .map(|a| cell_from_asset(&key.library_root, &key.cache_root, a, &marks))
+        .map(|a| {
+            cell_from_asset(
+                &key.library_root,
+                &key.cache_root,
+                a,
+                &marks,
+                cards.get(&a.id),
+            )
+        })
+        .collect()
+}
+
+/// The grid's sequence cards, resolved once per data pass: primary asset id →
+/// the run's fps plus each member's thumbnail. One library query over tiny
+/// tables; the per-frame work is one `stat` per member to confirm the
+/// thumbnail file is on disk, the same check every cell's thumbnail already
+/// pays. A run with fewer than two displayable frames is no carousel.
+fn sequence_cards(
+    cache_root: &Path,
+    library: &trove_core::library::Library,
+) -> HashMap<Uuid, Arc<super::carousel::SequenceCardThumbs>> {
+    library
+        .sequence_cards()
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|card| {
+            let thumbs: Vec<PathBuf> = card
+                .hashes
+                .iter()
+                .map(|hash| trove_core::media::thumb::abs_path(cache_root, hash))
+                .filter(|p| p.is_file())
+                .collect();
+            (card.hashes.len() >= 2 && thumbs.len() >= 2).then(|| {
+                (
+                    card.primary_id,
+                    Arc::new(super::carousel::SequenceCardThumbs {
+                        fps: card.fps(),
+                        thumbs,
+                    }),
+                )
+            })
+        })
         .collect()
 }
 
 /// One store record → one paintable cell. Shared by the browse query pass
 /// and the visual-search pass so both grids render identically.
-fn cell_from_asset(library_root: &Path, cache_root: &Path, a: &Asset, marks: &Lexicon) -> Cell {
+fn cell_from_asset(
+    library_root: &Path,
+    cache_root: &Path,
+    a: &Asset,
+    marks: &Lexicon,
+    sequence: Option<&Arc<super::carousel::SequenceCardThumbs>>,
+) -> Cell {
     let thumb = a
         .content_hash
         .as_deref()
@@ -597,6 +671,7 @@ fn cell_from_asset(library_root: &Path, cache_root: &Path, a: &Asset, marks: &Le
     let name_marks = marks.ranges_in(ROW_TARGETS, &name);
     Cell {
         id: a.id,
+        sequence: sequence.cloned(),
         kind: a.kind,
         thumb,
         width: a.width,

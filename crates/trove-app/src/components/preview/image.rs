@@ -106,10 +106,21 @@ pub(super) fn compact(data: &AssetPreviewData, cx: &App) -> AnyElement {
 /// of float samples on the way, so it runs on a background thread and the
 /// stage keeps the previous picture until this lands.
 ///
+/// `part` selects the EXR part when the original is a multi-part file; a
+/// decode the part decoder refuses (a part carrying deep data, an index past
+/// the file) falls back to `image`'s own default pick rather than leaving the
+/// stage stuck on the previous picture.
+///
 /// The frame comes out BGRA, the layout gpui's renderer expects — the same
 /// swap the animated decoder in `panels::common` does.
-pub(super) fn decode_exposed(path: &std::path::Path, stops: f32) -> Option<gpui_kit::RenderImage> {
-    let image = trove_core::media::hdr::open_for_display_at(path, stops).ok()?;
+pub(super) fn decode_exposed(
+    path: &std::path::Path,
+    stops: f32,
+    part: usize,
+) -> Option<gpui_kit::RenderImage> {
+    let image = trove_core::media::hdr::open_for_display_part(path, stops, part)
+        .or_else(|_| trove_core::media::hdr::open_for_display_at(path, stops))
+        .ok()?;
     let mut frame = image::Frame::new(image.to_rgba8());
     for pixel in frame.buffer_mut().as_chunks_mut::<4>().0 {
         pixel.swap(0, 2);

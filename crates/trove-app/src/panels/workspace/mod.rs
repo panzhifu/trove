@@ -59,6 +59,7 @@ use self::context_menu::{AssetsDragPreview, asset_context_menu};
 
 use crate::panels::common::{AssetsDrag, display_name, kind_icon, observe_controller};
 
+mod carousel;
 mod cells;
 mod data;
 mod interactions;
@@ -148,6 +149,9 @@ pub struct WorkspacePanel {
     /// the controller because a card's repaint must not wake every panel that
     /// observes the library.
     quick_look: Entity<LiveCard>,
+    /// The one sequence card cycling under the pointer, if any. Same shape as
+    /// the quick look: panel-owned, observed, read per cell at paint time.
+    carousel: Entity<carousel::SequenceCarousel>,
     /// Self-contained floating search (trigger + popover + input).
     search_box: Entity<SearchBox>,
     /// Framework colour picker state; the element owns its own popover, so
@@ -1120,6 +1124,8 @@ impl Render for WorkspacePanel {
         // The live card is read per cell at paint time, so the closure that
         // builds rows needs the entity rather than the panel.
         let quick_look = self.quick_look.clone();
+        // The carousel is read per cell at paint time, like the live card.
+        let carousel = self.carousel.clone();
         let toolbar_controller = controller.clone();
         // Clicking a tile focuses the tiles, not the panel: that is what puts
         // the keypress inside the grid's own context.
@@ -1181,6 +1187,7 @@ impl Render for WorkspacePanel {
                                 &controller,
                                 &grid_focus,
                                 &quick_look,
+                                &carousel,
                                 cell,
                                 *w,
                                 height,
@@ -1540,6 +1547,7 @@ mod tests {
             day: day.to_string(),
             font_family: None,
             font_blob: None,
+            sequence: None,
         }
     }
 

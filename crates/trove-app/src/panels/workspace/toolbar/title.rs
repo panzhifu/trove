@@ -372,6 +372,50 @@ fn preview_toolbar(
         );
     }
 
+    // The EXR part selector, for a multi-part file. Same view-control shape
+    // as the exposure rail: nothing is written, the parts are probed off
+    // thread, and the selector appears only once the list has landed with
+    // more than one entry — a single-part file would be a menu that chooses
+    // nothing. One committed click re-decodes the original through the part
+    // decoder, exactly as one committed slider value does.
+    if let Some(parts) = preview.read(cx).exr_parts().filter(|parts| parts.len() > 1) {
+        let part = preview.read(cx).part();
+        let preview_entity = preview.clone();
+        let list = parts
+            .iter()
+            .enumerate()
+            .map(|(index, info)| {
+                let preview_entity = preview_entity.clone();
+                let label = if info.name.is_empty() {
+                    rust_i18n::t!("viewport.exr_part_unnamed", n = index + 1).to_string()
+                } else {
+                    info.name.clone()
+                };
+                Button::new(("preview-exr-part", index))
+                    .ghost()
+                    .xsmall()
+                    .label(label)
+                    .selected(index == part)
+                    .on_click(move |_, _, cx| {
+                        preview_entity.update(cx, |this, cx| this.set_part(index, cx));
+                    })
+            })
+            .collect::<Vec<_>>();
+        bar = bar.child(
+            Popover::new("preview-exr-parts")
+                .w(px(240.))
+                .trigger(
+                    Button::new("preview-exr-parts-trigger")
+                        .ghost()
+                        .xsmall()
+                        .icon(ToolIcon::GalleryVerticalEnd)
+                        .selected(part != 0)
+                        .tooltip(rust_i18n::t!("viewport.exr_parts").to_string()),
+                )
+                .child(v_flex().p_2().gap_1().children(list)),
+        );
+    }
+
     // A video paused on a frame can hand that frame to the library as an asset
     // of its own. The button belongs to the live player rather than to the
     // asset: with no ffmpeg there is no player, and a still of the poster this

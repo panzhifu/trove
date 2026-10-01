@@ -26,11 +26,13 @@ const LOUPE_PRIORITY: usize = 5;
 /// the exact pixel size the row layout assigned to it. Selection is read live
 /// from the controller. Clicking focuses the tiles so the grid keyboard
 /// navigation (arrows / Delete / Enter) and the space bar apply.
+#[allow(clippy::too_many_arguments)] // the cell's collaborators are already entities; a struct would only re-name them
 pub(super) fn build_cell_element(
     cx: &mut App,
     controller: &Entity<LibraryController>,
     focus_handle: &FocusHandle,
     quick_look: &Entity<LiveCard>,
+    carousel: &Entity<carousel::SequenceCarousel>,
     cell: &Cell,
     w: f32,
     h: f32,
@@ -45,6 +47,10 @@ pub(super) fn build_cell_element(
     let picture = is_live.then(|| quick_look.read(cx).picture(id)).flatten();
     let playhead = is_live.then(|| quick_look.read(cx).playhead(id)).flatten();
     let looked = quick_look.read(cx).looked(id);
+    // The sequence card's cycle, when the pointer has it going. Same
+    // paint-time borrow as the live card: the frozen row cannot know which
+    // frame the carousel has reached, and must not rebuild to find out.
+    let cycling = carousel.read(cx).frame_for(id);
 
     // Fonts render live — the sample text set in the font itself, one row —
     // with the static specimen card as fallback (unparseable font / no
@@ -73,7 +79,11 @@ pub(super) fn build_cell_element(
             .object_fit(gpui_kit::ObjectFit::Contain)
             .into_any_element()
     } else {
-        match &thumb {
+        // The carousel frame, when this card is cycling; the frozen thumbnail
+        // the rest of the time. Same `img(path)` either way — gpui decodes
+        // whichever file is on screen.
+        let shown = cycling.or(thumb);
+        match &shown {
             Some(path) => img(path.clone())
                 .size_full()
                 .object_fit(gpui_kit::ObjectFit::Contain)
@@ -125,6 +135,23 @@ pub(super) fn build_cell_element(
             }
         })
         .id(format!("cell-{id}"))
+        // A sequence card cycles while the pointer sits on it and freezes
+        // where it was when the pointer left — the hover is the whole
+        // on-switch, which is why there is no setting: nothing moves unless
+        // a pointer is standing on it, the same budget the quick look keeps.
+        .when_some(cell.sequence.clone(), {
+            let carousel = carousel.clone();
+            move |cell, card| {
+                let carousel = carousel.clone();
+                cell.on_hover(move |hovered: &bool, _, cx| {
+                    if *hovered {
+                        carousel.update(cx, |this, cx| this.begin(id, card.clone(), cx));
+                    } else {
+                        carousel.update(cx, |this, cx| this.end(id, cx));
+                    }
+                })
+            }
+        })
         .child(preview)
         .when_some(playhead, |cell, ratio| {
             // The card's own progress bar: a live video has no transport,

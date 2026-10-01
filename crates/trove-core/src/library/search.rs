@@ -197,6 +197,15 @@ impl Library {
         crate::store::sequences::membership(self.store.conn(), asset_id)
     }
 
+    /// Every sequence as its grid card sees it: the primary asset's id, the
+    /// frame rate and every frame's content hash in display order. One query
+    /// for the whole library — the sequence tables are tiny next to the
+    /// assets they point at, and a per-card read would be one to two
+    /// statements per visible row.
+    pub fn sequence_cards(&self) -> Result<Vec<crate::store::sequences::SequenceCardFrames>> {
+        crate::store::sequences::card_frames(self.store.conn())
+    }
+
     // -- AI analysis ---------------------------------------------------------
 
     /// Start a multimodal analysis run on a background thread: every live

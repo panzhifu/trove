@@ -71,13 +71,15 @@ ed25519-dalek = { workspace = true }
 data-encoding = { workspace = true }
 # The ICC transform engine for the thumbnail's "fold into sRGB" step.
 qcms = { workspace = true }
+# The OpenEXR part decoder. `image`'s `exr` feature reads EXR but offers no
+# part/layer selection (`first_valid_layer()` is hard-wired), and the part
+# selector needs exactly that — so the crate is a dependency in its own
+# right, not only a fixture writer. Already in the graph at this version
+# (the `image/exr` feature pulls it in), so this costs no download and no
+# second copy.
+exr = "1"
 
 [dev-dependencies]
-# Only to *write* a fixture: the tests need a real OpenEXR file to prove the
-# decode path is wired, and `image` can read EXR but not produce one. Already in
-# the graph at this version (the `image/exr` feature pulls it in), so this costs
-# no download and no second copy.
-exr = "1"
 # Same reasoning as `exr` above, and the same shape of problem: `image`'s GIF
 # encoder can write a still but exposes no per-frame API, so a test that needs a
 # real animated GIF with known delays has to write one with `gif` directly.
