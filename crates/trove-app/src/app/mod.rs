@@ -21,6 +21,7 @@ mod tray;
 pub use library_manager::LibraryManagerView;
 pub use root::AppView;
 pub(crate) use root::run_update_check;
+pub(crate) use root::start_update_download;
 // The screenshot picker overlay hands a highlighted window back here, since
 // it is the main window that has to run the capture. Both the overlay and
 // this entry point are Linux-only: the picker freezes a compositor frame and

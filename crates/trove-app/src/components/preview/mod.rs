@@ -502,13 +502,22 @@ impl AssetPreviewPanel {
         id: Uuid,
         cx: &mut App,
     ) -> Option<Entity<Self>> {
+        // The library handle clones out before the borrow ends: the text
+        // viewer's save target needs it, and `spawn_with_data` runs without
+        // the controller (the two library reads never alias `cx`).
+        let library = controller.read(cx).library.clone();
         let data = AssetPreviewData::load(controller.read(cx), id)?;
-        Some(Self::spawn_with_data(data, cx))
+        Some(Self::spawn_with_data(data, Some(library), cx))
     }
 
     /// Open the panel for preview inputs the caller already resolved (a
-    /// virtual system font, for instance).
-    pub(crate) fn spawn_with_data(mut data: AssetPreviewData, cx: &mut App) -> Entity<Self> {
+    /// virtual system font, for instance) — and no library behind it, so
+    /// nothing there writes.
+    pub(crate) fn spawn_with_data(
+        mut data: AssetPreviewData,
+        library: Option<trove_core::library::Library>,
+        cx: &mut App,
+    ) -> Entity<Self> {
         // The live player is spawned once, here — never per render. Probing the
         // stream is an `ffprobe` round trip that waits on a subprocess slot an
         // import burst can be holding, so it runs off this thread and the panel
@@ -579,7 +588,7 @@ impl AssetPreviewPanel {
         // text family straddles `Document` and `Other` today. `None` (no file
         // behind the asset) leaves the still, as every other live surface does.
         let text = if text::is_text(&data) {
-            text::spawn_viewer(&data, cx)
+            text::spawn_viewer(&data, library, cx)
         } else {
             None
         };

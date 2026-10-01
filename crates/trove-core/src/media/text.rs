@@ -93,6 +93,11 @@ pub struct TextContent {
     pub text: String,
     /// The encoding that was actually used, as a label for the inspector.
     pub encoding: &'static str,
+    /// Whether the read consumed a byte-order mark (UTF-8 or UTF-16). The
+    /// mark is stripped from [`text`](Self::text) before anyone sees it, so
+    /// a caller that writes the buffer back needs this to produce the same
+    /// file the user had rather than one quietly missing its mark.
+    pub bom: bool,
     /// Whether the file is bigger than the cap, so this is only its beginning.
     /// A caller that can write the file back must refuse while this is set.
     pub truncated: bool,
@@ -165,17 +170,18 @@ pub fn read_for_viewer(path: &Path) -> Option<TextContent> {
 /// Run a buffer through the ladder: BOM, UTF-16 parity, binary test, strict
 /// UTF-8, then a statistical guess over legacy code pages.
 pub fn decode(bytes: &[u8], truncated: bool, bytes_read: usize, total_bytes: u64) -> TextContent {
-    let finish = |text: String, encoding: &'static str, binary: bool| TextContent {
+    let finish = |text: String, encoding: &'static str, bom: bool, binary: bool| TextContent {
         line_count: line_count(&text),
         text,
         encoding,
+        bom,
         binary,
         truncated,
         bytes_read,
         total_bytes,
     };
     if bytes.is_empty() {
-        return finish(String::new(), "utf-8", false);
+        return finish(String::new(), "utf-8", false, false);
     }
     // 1. A byte-order mark is the file telling us what it is.
     if let Some((width, label)) = bom(bytes) {
@@ -188,32 +194,87 @@ pub fn decode(bytes: &[u8], truncated: bool, bytes_read: usize, total_bytes: u64
                 String::from_utf8_lossy(body).into_owned()
             }
         };
-        return finish(text, label, false);
+        return finish(text, label, true, false);
     }
     // 2. No mark: the NUL pattern still says UTF-16, because ASCII-range text in
     // UTF-16 alternates real bytes with zero bytes in a way no other encoding
     // does.
     if let Some(little) = utf16_by_parity(bytes) {
         let label = if little { "utf-16le" } else { "utf-16be" };
-        return finish(decode_utf16(bytes, little), label, false);
+        return finish(decode_utf16(bytes, little), label, false, false);
     }
     // 3. Scattered NULs mean this is not text at all, whatever it is called.
     // UTF-32 lands here too: its marks are excluded above precisely because it
     // is not supported, and half of every UTF-32 character is a NUL.
     if looks_binary(bytes) {
-        return finish(String::new(), "utf-8", true);
+        return finish(String::new(), "utf-8", false, true);
     }
     // 4. Strict UTF-8, which a modern file almost always is. A cap that landed
     // mid-character must not demote a UTF-8 file to "legacy guess", so the
     // incomplete tail is trimmed rather than the whole buffer rejected.
     if let Ok(text) = std::str::from_utf8(trim_incomplete_utf8(bytes)) {
-        return finish(text.to_string(), "utf-8", false);
+        return finish(text.to_string(), "utf-8", false, false);
     }
     // 5. Legacy codepage: guess, then decode. The fallback is Windows-1252,
     // which cannot fail — every byte maps to a character — so the file is always
     // at least readable, and its real encoding is what the inspector reports.
     let (text, label) = detect_legacy(bytes);
-    finish(text, label, false)
+    finish(text, label, false, false)
+}
+
+/// Encode a (possibly edited) buffer back into the file's own bytes.
+///
+/// The write side of [`decode`]: the same ladder that named the encoding at
+/// read time is what the save uses, so a Windows-1252 file stays Windows-1252
+/// and a UTF-16 file keeps its parity — round-tripping through UTF-8 is how a
+/// silent transcode sneaks in. A mark the read consumed is written back when
+/// `bom` says it was there. Refuses, rather than substituting `?`, when a
+/// character has no form in the file's encoding: an honest save is either the
+/// user's characters or no save at all.
+pub fn encode_for_write(text: &str, encoding: &str, bom: bool) -> Result<Vec<u8>, crate::Error> {
+    let lower = encoding.to_ascii_lowercase();
+    // UTF-16 by hand: the read side decodes it from its own parity tell, so
+    // the write side answers with plain units in the named endianness and a
+    // mark only when the read consumed one — no encoder whose BOM habits
+    // need remembering.
+    let (bytes, had_errors) = match lower.as_str() {
+        "utf-16le" => {
+            let mut v = Vec::with_capacity(text.len() * 2 + 2);
+            if bom {
+                v.extend_from_slice(&[0xff, 0xfe]);
+            }
+            for unit in text.encode_utf16() {
+                v.extend_from_slice(&unit.to_le_bytes());
+            }
+            (v, false)
+        }
+        "utf-16be" => {
+            let mut v = Vec::with_capacity(text.len() * 2 + 2);
+            if bom {
+                v.extend_from_slice(&[0xfe, 0xff]);
+            }
+            for unit in text.encode_utf16() {
+                v.extend_from_slice(&unit.to_be_bytes());
+            }
+            (v, false)
+        }
+        _ => {
+            let enc =
+                encoding_rs::Encoding::for_label(encoding.as_bytes()).unwrap_or(encoding_rs::UTF_8);
+            let (v, _, errors) = enc.encode(text);
+            let mut v = v.into_owned();
+            if bom && !v.starts_with(&[0xef, 0xbb, 0xbf]) {
+                v.splice(0..0, [0xef, 0xbb, 0xbf]);
+            }
+            (v, errors)
+        }
+    };
+    if had_errors {
+        return Err(crate::Error::Validation(format!(
+            "the text has characters the file's {encoding} encoding cannot represent"
+        )));
+    }
+    Ok(bytes)
 }
 
 /// The byte-order marks this ladder respects, as `(bytes to skip, label)`.
@@ -380,6 +441,40 @@ mod tests {
 
     fn decoded(bytes: &[u8]) -> TextContent {
         decode(bytes, false, bytes.len(), bytes.len() as u64)
+    }
+
+    /// The write side of the ladder: whatever the read named is what the
+    /// save writes, marks included — and a character the file's encoding
+    /// cannot hold is a refusal, not a silent `?`.
+    #[test]
+    fn an_encode_round_trips_the_read() {
+        // Plain UTF-8, no mark.
+        let content = decoded("hello, 世界".as_bytes());
+        assert!(!content.bom);
+        let bytes = encode_for_write(&content.text, content.encoding, content.bom).unwrap();
+        assert_eq!(bytes, "hello, 世界".as_bytes());
+
+        // A mark the read consumed comes back: the saved file is the file
+        // the user had, not one quietly missing its mark.
+        let mut marked_bytes = vec![0xef, 0xbb, 0xbf];
+        marked_bytes.extend_from_slice(b"body");
+        let marked = decoded(&marked_bytes);
+        assert!(marked.bom);
+        assert_eq!(marked.text, "body");
+        let bytes = encode_for_write(&marked.text, marked.encoding, marked.bom).unwrap();
+        assert_eq!(bytes, marked_bytes);
+
+        // UTF-16 keeps both its parity and its mark.
+        let content = decoded(&[0xff, 0xfe, b'a', 0, b'b', 0]);
+        assert_eq!((content.encoding, content.bom), ("utf-16le", true));
+        let bytes = encode_for_write(&content.text, content.encoding, content.bom).unwrap();
+        assert_eq!(bytes, [0xff, 0xfe, b'a', 0, b'b', 0]);
+
+        // A legacy codepage stays that codepage, and a character it cannot
+        // represent is a refusal.
+        let bytes = encode_for_write("café", "windows-1252", false).unwrap();
+        assert_eq!(bytes, [b'c', b'a', b'f', 0xe9]);
+        assert!(encode_for_write("no 😀 here", "windows-1252", false).is_err());
     }
 
     #[test]

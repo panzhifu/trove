@@ -1475,6 +1475,111 @@ fn batch_edit_writes_a_linked_file_back_in_place() {
     std::fs::remove_dir_all(&home).ok();
 }
 
+/// A linked text asset saves back over its source: the file gets the new
+/// characters, the record follows the content, and a second save of the
+/// same text is a no-op. A file that moved underneath the viewer between
+/// read and save refuses — the compare-and-swap working — and a stored
+/// asset refuses outright, because "saving" over a content-addressed blob
+/// would leave the record's hash pointing at content the file no longer has.
+#[test]
+fn a_text_save_writes_the_linked_source_conflicts_on_change_and_refuses_a_stored_asset() {
+    let (lib, _root) = temp_library("text-save");
+    let home = std::env::temp_dir().join(format!("trove-text-src-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&home).unwrap();
+    let src = home.join("kept.md");
+    std::fs::write(&src, b"first draft").unwrap();
+
+    let report = lib.link_files(std::slice::from_ref(&src), None).unwrap();
+    let id = report.imported[0].asset_id;
+    let conn = lib.store().conn();
+    let before = assets::get(conn, id).unwrap().unwrap();
+    let expected_mtime = std::fs::metadata(&src).unwrap().modified().unwrap();
+    let expected_size = std::fs::metadata(&src).unwrap().len();
+
+    let outcome = lib
+        .save_linked_text(
+            id,
+            "second draft, edited",
+            "utf-8",
+            false,
+            expected_mtime,
+            expected_size,
+        )
+        .unwrap();
+    assert_eq!(outcome, crate::library::lifecycle::TextSaveOutcome::Written);
+    assert_eq!(std::fs::read(&src).unwrap(), b"second draft, edited");
+    let after = assets::get(conn, id).unwrap().unwrap();
+    let new_hash = after.content_hash.clone().unwrap();
+    assert_ne!(new_hash, before.content_hash.clone().unwrap());
+    assert_eq!(
+        new_hash.as_str(),
+        crate::media::hash::hash_bytes(b"second draft, edited"),
+        "the record describes the file that now exists"
+    );
+    assert_eq!(after.size_bytes, "second draft, edited".len() as u64);
+    // The same text again: the encoded buffer is byte-identical, so the
+    // save is a no-op rather than a fresh mtime on the file.
+    let outcome = lib
+        .save_linked_text(
+            id,
+            "second draft, edited",
+            "utf-8",
+            false,
+            std::fs::metadata(&src).unwrap().modified().unwrap(),
+            std::fs::metadata(&src).unwrap().len(),
+        )
+        .unwrap();
+    assert_eq!(
+        outcome,
+        crate::library::lifecycle::TextSaveOutcome::Unchanged
+    );
+
+    // The file changed under the viewer (an outside editor wrote it): the
+    // stale read's save is refused, and the file keeps the other editor's
+    // bytes.
+    std::fs::write(&src, b"an outside editor was here").unwrap();
+    let outcome = lib
+        .save_linked_text(
+            id,
+            "second draft, edited",
+            "utf-8",
+            false,
+            expected_mtime,
+            expected_size,
+        )
+        .unwrap();
+    assert_eq!(
+        outcome,
+        crate::library::lifecycle::TextSaveOutcome::Conflict
+    );
+    assert_eq!(std::fs::read(&src).unwrap(), b"an outside editor was here");
+
+    // A stored asset has no writable source: its bytes are a blob the
+    // record's hash names, not the user's file.
+    let stored_src = home.join("copied.txt");
+    std::fs::write(&stored_src, b"library copy").unwrap();
+    let report = lib
+        .import_into_store(std::slice::from_ref(&stored_src), None)
+        .unwrap();
+    let stored_id = report.imported[0].asset_id;
+    let outcome = lib
+        .save_linked_text(
+            stored_id,
+            "nope",
+            "utf-8",
+            false,
+            expected_mtime,
+            expected_size,
+        )
+        .unwrap();
+    assert_eq!(
+        outcome,
+        crate::library::lifecycle::TextSaveOutcome::NotWritable
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+}
+
 /// A linked asset whose recorded source path is *gone* is a per-asset
 /// failure, not a silent skip: the user asked for this edit, so the
 /// report must say it did not happen. (Relinking is the fix.)

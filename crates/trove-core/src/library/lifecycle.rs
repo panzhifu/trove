@@ -4,6 +4,25 @@
 
 use super::*;
 
+/// What a text save did — an enum rather than a `bool` pair because the app
+/// shows a different message for every arm and the arms are not errors:
+/// a [`Conflict`](Self::Conflict) is the CAS working, not a failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TextSaveOutcome {
+    /// The bytes were written and the record now describes them.
+    Written,
+    /// The encoded buffer is byte-identical to what the record holds —
+    /// nothing to write, nothing to re-hash.
+    Unchanged,
+    /// The file's mtime or size moved under the viewer between its read and
+    /// the save. Nothing was written; reloading the file is the fix.
+    Conflict,
+    /// This asset has no writable source: it is stored (its bytes live in a
+    /// content-addressed blob, where "saving" means re-importing, not
+    /// editing in place), trashed, or its linked file is not on disk.
+    NotWritable,
+}
+
 impl Library {
     /// Permanently delete one asset. The database row (and its collection /
     /// tag memberships) is removed; the blob file and thumbnail are deleted
@@ -517,6 +536,99 @@ impl Library {
         }
         media::thumb::regenerate(self.cache(), &hash, asset.kind, &source);
         Ok(true)
+    }
+
+    /// Write an edited text buffer back over a *linked* asset's source file.
+    ///
+    /// The write-back twin of [`Self::batch_edit_images`]'s linked arm, with
+    /// one guard the image edit does not need: the viewer holds a whole-file
+    /// read from an earlier moment, so the save is a compare-and-swap on the
+    /// file's `mtime` and size as the read observed them — if anything else
+    /// touched the file since, the answer is [`TextSaveOutcome::Conflict`]
+    /// and nothing is written. (The image edit re-derives its bytes from the
+    /// file at save time, so it needs no such guard; the text viewer's bytes
+    /// are stale by construction the moment they arrive.)
+    ///
+    /// A stored asset answers [`TextSaveOutcome::NotWritable`] rather than
+    /// the write: its bytes live in a content-addressed blob, and overwriting
+    /// a blob in place would leave the record's hash pointing at content the
+    /// file no longer has. Relinking the original is the honest path.
+    ///
+    /// On a write the record follows the content exactly as the image edit
+    /// does — hash and size recomputed, the old thumbnail removed once
+    /// nothing references it, a fresh one generated from the new bytes — and
+    /// the row update trips the search trigger, so the indexed body tracks
+    /// the file the same way it does on import.
+    pub fn save_linked_text(
+        &self,
+        id: Uuid,
+        text: &str,
+        encoding: &str,
+        bom: bool,
+        expected_mtime: std::time::SystemTime,
+        expected_size: u64,
+    ) -> Result<TextSaveOutcome> {
+        let conn = self.store.conn();
+        let Some(asset) = assets::get(conn, id)? else {
+            return Ok(TextSaveOutcome::NotWritable);
+        };
+        if asset.placement().is_trashed() {
+            return Ok(TextSaveOutcome::NotWritable);
+        }
+        let AssetLocation::Linked { source_path } = asset.location() else {
+            return Ok(TextSaveOutcome::NotWritable);
+        };
+        let source = PathBuf::from(source_path);
+        let Ok(stat) = std::fs::metadata(&source) else {
+            // The linked original is gone: relinking is the fix, not a save.
+            return Ok(TextSaveOutcome::NotWritable);
+        };
+        match stat.modified() {
+            Ok(mtime) if mtime == expected_mtime && stat.len() == expected_size => {}
+            _ => return Ok(TextSaveOutcome::Conflict),
+        }
+
+        let bytes = media::text::encode_for_write(text, encoding, bom)?;
+        let hash = media::hash::hash_bytes(&bytes);
+        if asset
+            .content_hash
+            .as_deref()
+            .is_some_and(|old| old.eq_ignore_ascii_case(&hash))
+        {
+            return Ok(TextSaveOutcome::Unchanged);
+        }
+
+        // Atomic replace, the same shape the image edit uses: the bytes land
+        // on a hidden sibling first and a rename moves them over the
+        // original, so a crash mid-write costs at most the previous content,
+        // never a truncated file.
+        let tmp = source.with_file_name(format!(
+            ".{}.trove-text-{}",
+            source
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("file"),
+            uuid::Uuid::new_v4().simple()
+        ));
+        let write = (|| -> Result<()> {
+            std::fs::write(&tmp, &bytes)?;
+            std::fs::rename(&tmp, &source)?;
+            Ok(())
+        })();
+        if let Err(error) = write {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(error);
+        }
+
+        let old_hash = asset.content_hash.clone();
+        assets::set_linked_media_columns(conn, asset.id, &hash, bytes.len() as u64, None, None)?;
+        if let Some(old_hash) = old_hash.as_deref()
+            && assets::count_by_content_hash(conn, old_hash)? == 0
+        {
+            media::thumb::remove_derived(self.cache(), old_hash);
+        }
+        media::thumb::regenerate(self.cache(), &hash, asset.kind, &source);
+        Ok(TextSaveOutcome::Written)
     }
 
     /// Swap an asset's media content for the (already transformed) file at

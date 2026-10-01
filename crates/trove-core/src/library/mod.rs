@@ -414,5 +414,7 @@ mod organize;
 mod search;
 mod storage;
 
+pub use lifecycle::TextSaveOutcome;
+
 #[cfg(test)]
 mod tests;

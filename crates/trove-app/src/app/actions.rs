@@ -40,6 +40,16 @@ gpui_kit::actions!(
         // -- Help menu -----------------------------------------------------
         About,
         CheckUpdates,
+        // -- macOS app-menu conventions --------------------------------------
+        // The actions exist on every platform (they are plain gpui ones);
+        // only their *placement* is macOS-specific: About / Settings / Hide /
+        // Quit belong to the app menu and Minimize / Zoom to a Window menu
+        // (see `build_menus`). The cmd-q / cmd-h / cmd-m chords ride with
+        // them, bound in `keybindings::register`.
+        Quit,
+        HideApp,
+        MinimizeWindow,
+        ZoomWindow,
         // -- Grid navigation (WorkspacePanel only) --------------------------
         MoveLeft,
         MoveRight,

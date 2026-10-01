@@ -1,11 +1,16 @@
 //! Update check: ask GitHub for the newest release tag and compare it with
-//! the version the running binary was built from.
+//! the version the running binary was built from — and, since the release
+//! grew real installers (see `packaging/`), a download-and-stage half that
+//! fetches this platform's artifact.
 //!
-//! Read-only by design. Trove ships as a plain archive on three platforms, so
-//! the upgrade step belongs to whoever put the binary there — a package
-//! manager on Linux, the user unpacking the next archive elsewhere. All this
-//! module does is answer "is there something newer?" and hand back a link;
-//! it never downloads or replaces anything.
+//! The split between the two halves is deliberate. The *check* is read-only:
+//! it answers "is there something newer?" and hands back a link. The
+//! *download* exists only where the user asked for it (a click), writes
+//! nothing but a file under the state directory's `updates/`, and replaces
+//! nothing — the artifact is handed to the OS's own installer (`Setup.exe`,
+//! the mounted DMG, the deb handler) and that program owns the upgrade. This
+//! module still never touches the running binary or anything a package
+//! manager put on disk.
 //!
 //! The probe is a `HEAD` on `…/releases/latest` with redirects turned off:
 //! GitHub answers `302` and puts the tag in the `location` header, so a check
@@ -210,6 +215,237 @@ fn is_prerelease(tag: &str) -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// Download & stage
+// ---------------------------------------------------------------------------
+
+/// What the staged download is doing. Kept next to [`UpdateState`] and read
+/// per render by the same surfaces, for the same reason: one answer, every
+/// window, no re-asking.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DownloadState {
+    /// Nothing downloaded in this process (or nothing is in flight).
+    Idle,
+    /// Bytes are landing. `total` is `0` until the response's
+    /// content-length is known; the UI shows percent only then.
+    Downloading { received: u64, total: u64 },
+    /// The artifact is complete under the state directory's `updates/`,
+    /// hashed as it streamed. Ready for [`open_staged`].
+    Staged {
+        version: String,
+        path: std::path::PathBuf,
+        /// BLAKE3 of the staged bytes — the same digest every content hash
+        /// in the library uses, recorded here (and in the log) so what
+        /// landed can be identified later. It is a fingerprint, not a
+        /// verification: the release publishes no checksum sidecar to
+        /// compare it against, so transport integrity rests on TLS and the
+        /// hash on the record.
+        hash: String,
+    },
+    /// The download could not complete. Kept for the About row; never a
+    /// popup.
+    Failed { error: String },
+}
+
+static DOWNLOAD_STATE: LazyLock<Mutex<DownloadState>> =
+    LazyLock::new(|| Mutex::new(DownloadState::Idle));
+
+/// The outcome of the most recent download attempt.
+pub fn download_state() -> DownloadState {
+    DOWNLOAD_STATE
+        .lock()
+        .map(|slot| slot.clone())
+        .unwrap_or(DownloadState::Idle)
+}
+
+/// Publish a new download outcome.
+pub fn set_download_state(next: DownloadState) {
+    if let Ok(mut slot) = DOWNLOAD_STATE.lock() {
+        *slot = next;
+    }
+}
+
+/// The user asked to stop the in-flight download. Checked between chunks;
+/// the partial `.part` file is removed and the state goes back to
+/// [`DownloadState::Idle`]. Reset by the next [`download_and_stage`].
+pub fn cancel_download() {
+    CANCELLED.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+static CANCELLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The release asset this build can install, by the exact name the release
+/// workflow publishes (`release.yml`'s glob), or `None` where the release
+/// ships nothing this platform can use — the archive targets stay on the
+/// "open the releases page" path.
+///
+/// The mapping lives on the platform at *runtime* (`std::env::consts`), not
+/// in `#[cfg]`, so the whole table is testable on every host.
+pub fn installer_asset(version: &str) -> Option<String> {
+    asset_name_for(version, std::env::consts::OS, std::env::consts::ARCH)
+}
+
+/// The pure form of [`installer_asset`]: the names `packaging/` and
+/// `release.yml` publish, keyed on OS and arch.
+fn asset_name_for(version: &str, os: &str, arch: &str) -> Option<String> {
+    match (os, arch) {
+        // Inno Setup's wizard (PrivilegesRequired=admin, UAC included).
+        ("windows", "x86_64") => Some(format!("Trove-{version}-Setup.exe")),
+        // hdiutil UDZO images, named for the binaries' architecture.
+        ("macos", "aarch64") => Some(format!("Trove-{version}-aarch64.dmg")),
+        ("macos", "x86_64") => Some(format!("Trove-{version}-x86_64.dmg")),
+        // The deb is the primary Linux artifact (its Depends line carries
+        // the glibc floor documented in packaging/README.md); rpm users and
+        // tar.gz unpackers keep the releases page.
+        ("linux", "x86_64") => Some(format!("trove_{version}_amd64.deb")),
+        _ => None,
+    }
+}
+
+/// The URL the artifact downloads from: the release's `download/v<tag>`
+/// prefix plus the exact asset name. Built from [`REPO`], like the release
+/// page, so a hostile check response cannot point the download anywhere
+/// else.
+pub fn download_url(version: &str) -> Option<String> {
+    let asset = installer_asset(version)?;
+    Some(format!(
+        "https://github.com/{REPO}/releases/download/v{version}/{asset}"
+    ))
+}
+
+/// Where staged artifacts land: the state directory's `updates/`. The state
+/// directory (not data, not cache) because a staged installer is neither a
+/// document the user owns nor a derived artifact that can be rebuilt on
+/// demand — it is a one-shot hand-off, and its loss costs one download.
+pub fn updates_dir() -> std::path::PathBuf {
+    crate::paths::state_dir().join("updates")
+}
+
+/// Where `version`'s artifact sits once staged, and whether it is there.
+pub fn staged_path(version: &str) -> Option<std::path::PathBuf> {
+    let path = updates_dir().join(installer_asset(version)?);
+    path.is_file().then_some(path)
+}
+
+/// Download this platform's artifact for `version` into
+/// [`updates_dir`], publish progress into [`DownloadState`], and stage it.
+///
+/// Streaming, not `read_to_end`: an installer is tens of megabytes, the
+/// state is updated as it goes, and a cancel is honoured between chunks
+/// rather than after the fact. The bytes land on a `.part` sibling first and
+/// a rename moves them into place, so a crash or a cancel costs at most the
+/// partial file, never a half-written installer that looks finished.
+///
+/// Runs on the caller's executor — `ureq` is `Send`, the state is a mutex,
+/// nothing here touches a window.
+pub fn download_and_stage(version: &str) -> Result<std::path::PathBuf, Error> {
+    CANCELLED.store(false, std::sync::atomic::Ordering::Relaxed);
+    let Some(url) = download_url(version) else {
+        return Err(Error::Network(
+            "this build has no downloadable installer; use the releases page".into(),
+        ));
+    };
+    let asset = installer_asset(version).expect("the URL exists only when the asset does");
+    let dir = crate::paths::ensure(&updates_dir())?;
+    let dest = dir.join(&asset);
+    let part = dir.join(format!("{asset}.part"));
+
+    set_download_state(DownloadState::Downloading {
+        received: 0,
+        total: 0,
+    });
+    let run = (|| -> Result<(std::path::PathBuf, String), Error> {
+        // No global timeout — a tens-of-megabytes stream would die of it.
+        // Each phase gets its own: connect once, response headers once,
+        // and a per-read ceiling that only trips when the stream actually
+        // stops moving.
+        let config = ureq::config::Config::builder()
+            .timeout_connect(Some(TIMEOUT))
+            .timeout_recv_response(Some(TIMEOUT))
+            .timeout_recv_body(Some(Duration::from_secs(30)))
+            .user_agent(concat!("trove/", env!("CARGO_PKG_VERSION")))
+            .build();
+        let response = ureq::Agent::new_with_config(config)
+            .get(&url)
+            .call()
+            .map_err(|error| Error::Network(format!("download failed: {error}")))?;
+        let total = response
+            .headers()
+            .get("content-length")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(0);
+        use std::io::{Read as _, Write as _};
+        let mut reader = response.into_body().into_reader();
+        let mut hasher = blake3::Hasher::new();
+        let mut file = std::fs::File::create(&part)?;
+        let mut buf = vec![0u8; 64 * 1024];
+        let (mut received, mut reported): (u64, u64) = (0, 0);
+        loop {
+            if CANCELLED.load(std::sync::atomic::Ordering::Relaxed) {
+                let _ = std::fs::remove_file(&part);
+                return Err(Error::Network("download cancelled".into()));
+            }
+            let n = reader.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            hasher.update(&buf[..n]);
+            file.write_all(&buf[..n])?;
+            received += n as u64;
+            // Lock churn, bounded: the About row polls per frame, but a
+            // mutex tick per 64 KiB chunk buys nothing over one per 256 KiB.
+            if received - reported >= 256 * 1024 {
+                reported = received;
+                set_download_state(DownloadState::Downloading { received, total });
+            }
+        }
+        file.flush()?;
+        if total != 0 && received != total {
+            let _ = std::fs::remove_file(&part);
+            return Err(Error::Network(format!(
+                "download truncated: {received} of {total} bytes"
+            )));
+        }
+        let hash = crate::media::hash::hex(hasher.finalize().as_bytes());
+        std::fs::rename(&part, &dest)?;
+        Ok((dest, hash))
+    })();
+
+    match run {
+        Ok((path, hash)) => {
+            tracing::info!(%version, %hash, bytes = path.metadata().map(|m| m.len()).unwrap_or(0), "update staged");
+            set_download_state(DownloadState::Staged {
+                version: version.to_string(),
+                path: path.clone(),
+                hash,
+            });
+            Ok(path)
+        }
+        Err(error) => {
+            set_download_state(DownloadState::Failed {
+                error: error.to_string(),
+            });
+            Err(error)
+        }
+    }
+}
+
+/// Hand the staged artifact to the OS's own handler: `Setup.exe` launches
+/// its wizard, the DMG mounts into Finder, the deb opens the package
+/// installer. Whatever happens next belongs to that program and the user —
+/// this module's part ends here.
+///
+/// The caller decides whether to quit the app afterwards (Windows: yes —
+/// Inno refuses to overwrite a running binary; macOS and Linux: no, nothing
+/// about the open step conflicts with the running app).
+pub fn open_staged(version: &str) -> Result<(), Error> {
+    let Some(path) = staged_path(version) else {
+        return Err(Error::NotFound("staged update"));
+    };
+    crate::services::open_external::open(&path, crate::services::open_external::OpenTarget::Default)
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -282,6 +518,55 @@ mod tests {
         let tag = "0.5.0-rc.1";
         assert!(is_prerelease(tag));
         assert!(is_newer("0.4.2", tag));
+    }
+
+    /// The artifact table, against the names `release.yml` uploads. Every
+    /// combination is listed here, including the `None`s: a platform the
+    /// release ships nothing for must fall back to the releases page, not
+    /// to a guessed filename.
+    #[test]
+    fn the_installer_table_matches_the_release_glob() {
+        assert_eq!(
+            asset_name_for("0.5.2", "windows", "x86_64").as_deref(),
+            Some("Trove-0.5.2-Setup.exe")
+        );
+        assert_eq!(asset_name_for("0.5.2", "windows", "aarch64"), None);
+        assert_eq!(
+            asset_name_for("0.5.2", "macos", "aarch64").as_deref(),
+            Some("Trove-0.5.2-aarch64.dmg")
+        );
+        assert_eq!(
+            asset_name_for("0.5.2", "macos", "x86_64").as_deref(),
+            Some("Trove-0.5.2-x86_64.dmg")
+        );
+        assert_eq!(
+            asset_name_for("0.5.2", "linux", "x86_64").as_deref(),
+            Some("trove_0.5.2_amd64.deb")
+        );
+        assert_eq!(asset_name_for("0.5.2", "linux", "aarch64"), None);
+        assert_eq!(asset_name_for("0.5.2", "freebsd", "x86_64"), None);
+    }
+
+    /// The download URL is the release's `download/v<tag>` prefix plus the
+    /// asset name — and there is no URL where there is no asset.
+    #[test]
+    fn the_download_url_points_at_the_release_asset() {
+        assert_eq!(
+            download_url_for_test("0.5.2", "windows", "x86_64").as_deref(),
+            Some(
+                "https://github.com/panzhifu/trove/releases/download/v0.5.2/Trove-0.5.2-Setup.exe"
+            )
+        );
+        assert_eq!(download_url_for_test("0.5.2", "linux", "aarch64"), None);
+    }
+
+    /// The pure table behind `download_url`, callable without depending on
+    /// this host's platform.
+    fn download_url_for_test(version: &str, os: &str, arch: &str) -> Option<String> {
+        let asset = asset_name_for(version, os, arch)?;
+        Some(format!(
+            "https://github.com/{REPO}/releases/download/v{version}/{asset}"
+        ))
     }
 
     /// The one test that talks to GitHub: it pins the assumption the whole

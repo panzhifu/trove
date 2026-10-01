@@ -78,6 +78,42 @@ pub(crate) fn run_update_check(cx: &mut App) {
     spawn_update_check(cx, std::time::Duration::ZERO);
 }
 
+/// The About page's Download button: stage this platform's installer under
+/// the state directory, progress and all. Two tasks — the download itself on
+/// the background executor, and a ticker that repaints the windows while
+/// bytes land, because the row re-reads the state per frame but frames only
+/// happen when something asks for one.
+pub(crate) fn start_update_download(version: String, cx: &mut App) {
+    cx.spawn(async move |cx| {
+        let result = cx
+            .background_executor()
+            .spawn(async move { update::download_and_stage(&version) })
+            .await;
+        // The state carries the same failure for the row to show; this line
+        // is for the log.
+        if let Err(error) = &result {
+            tracing::warn!(%error, "update download failed");
+        }
+        cx.update(|cx| cx.refresh_windows());
+    })
+    .detach();
+    cx.spawn(async move |cx| {
+        loop {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(400))
+                .await;
+            if !matches!(
+                update::download_state(),
+                update::DownloadState::Downloading { .. }
+            ) {
+                break;
+            }
+            cx.update(|cx| cx.refresh_windows());
+        }
+    })
+    .detach();
+}
+
 /// The release worth telling the user about, or `None`.
 ///
 /// The status bar and the About dialog both ask on every frame, so the config
@@ -1147,6 +1183,22 @@ impl Render for AppView {
             }))
             .on_action(cx.listener(|_, _: &CheckUpdates, _, cx| {
                 run_update_check(cx);
+            }))
+            // The app-menu furniture. On macOS these arrive from the app and
+            // Window menus (and the platform chords cmd-q / cmd-h / cmd-m);
+            // elsewhere nothing dispatches them until a menu or a future
+            // binding does, so the handlers are unconditional.
+            .on_action(cx.listener(|_, _: &Quit, _, cx| {
+                cx.quit();
+            }))
+            .on_action(cx.listener(|_, _: &HideApp, _, cx| {
+                cx.hide();
+            }))
+            .on_action(cx.listener(|_, _: &MinimizeWindow, window, _| {
+                window.minimize_window();
+            }))
+            .on_action(cx.listener(|_, _: &ZoomWindow, window, _| {
+                window.zoom_window();
             }))
             .child(self.title_bar.clone())
             .child(div().flex_1().min_h_0().child(self.dock.clone()))

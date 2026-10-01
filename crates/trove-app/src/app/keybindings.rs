@@ -151,6 +151,18 @@ pub(crate) fn register(cx: &mut App, config: &trove_core::config::AppConfig) {
     bind!(StepFrameBack, Some(VIDEO_PREVIEW_CONTEXT));
     bind!(StepFrameForward, Some(VIDEO_PREVIEW_CONTEXT));
 
+    // The macOS app-menu chords: quit / hide / minimize are the platform's
+    // own furniture (the app and Window menus above announce them), so they
+    // sit outside the user's table exactly like Escape and the paste chord —
+    // and outside it on purpose: no `ctrl-q` on Windows or Linux, where
+    // quitting is the window's close button. `cfg!` so the mac branch still
+    // typechecks on this side of the compiler.
+    if cfg!(target_os = "macos") {
+        bindings.push(KeyBinding::new("cmd-q", Quit, None));
+        bindings.push(KeyBinding::new("cmd-h", HideApp, None));
+        bindings.push(KeyBinding::new("cmd-m", MinimizeWindow, None));
+    }
+
     // Plugin commands: declared by registered plugins, bound with each
     // command's default key or the user's override (an empty effective key
     // means "not on the keyboard yet" — the command still dispatches from

@@ -507,6 +507,80 @@ fn a_camera_qualifier_answers_only_the_camera_surface() {
     assert_eq!(ids("iso"), vec![camera.to_string()]);
 }
 
+/// The v5 audio surface: the technical specs answer from the audio facts
+/// field alone (`audio:` is the umbrella, `sample_rate:` / `channels:` /
+/// `bit_depth:` / `bitrate:` are the scoped aliases), and the same tokens
+/// in a description do not answer a qualified ask — while unqualified,
+/// "48000" finds the audio asset through the composite facts surface.
+/// The artist field rides on the same mined record but keeps its own
+/// surface: an `audio:` ask does not read it.
+#[test]
+fn an_audio_qualifier_answers_only_the_audio_surface() {
+    let idx = TextIndex::in_ram().unwrap();
+    let audio = "eeee0000-0000-0000-0000-000000000001";
+    let decoy = "eeee0000-0000-0000-0000-000000000002";
+    {
+        let writer = idx.writer().unwrap();
+        idx.index_asset_text(
+            &writer,
+            audio,
+            "take-04.wav",
+            None,
+            None,
+            "",
+            &FactTexts {
+                artist: "Ryuichi Sakamoto".into(),
+                audio: "48000 Hz 2c 24bit 320kbps".into(),
+                ..Default::default()
+            },
+            "",
+        );
+        idx.index_asset_text(
+            &writer,
+            decoy,
+            "decoy.png",
+            None,
+            Some("a 48000 Hz 2c 24bit 320kbps fantasy, specs quoted in prose"),
+            "",
+            &FactTexts::default(),
+            "",
+        );
+        drop(writer);
+    }
+    idx.commit().unwrap();
+
+    let ids = |query: &str| ids_of_expr(&idx, query);
+    assert_eq!(ids("audio:48000"), vec![audio.to_string()]);
+    assert_eq!(ids("sample_rate:48000"), vec![audio.to_string()], "alias");
+    assert_eq!(ids("channels:2c"), vec![audio.to_string()]);
+    assert_eq!(
+        ids("bit_depth:24"),
+        vec![audio.to_string()],
+        "word-start prefix of 24bit"
+    );
+    assert_eq!(ids("bit_depth:24bit"), vec![audio.to_string()]);
+    assert_eq!(
+        ids("bitrate:320"),
+        vec![audio.to_string()],
+        "word-start prefix of 320kbps"
+    );
+    // The specs are quoted verbatim in the decoy's description; a scoped
+    // ask still refuses it.
+    assert!(ids("audio:48000").iter().all(|id| id != decoy));
+    // The artist rides the same mined record but answers on its own
+    // surface only — the audio surface does not see it.
+    assert_eq!(ids("artist:ryuichi"), vec![audio.to_string()]);
+    assert!(
+        ids("audio:ryuichi").is_empty(),
+        "audio: does not read the artist surface"
+    );
+    // Unqualified, the spec token finds both — the composite facts
+    // surface and the description beside it.
+    let mut both = ids("48000");
+    both.sort();
+    assert_eq!(both, vec![audio.to_string(), decoy.to_string()]);
+}
+
 /// Field-scoped pinyin: `tag:mao` answers from the tags' own pinyin
 /// field, and the same syllable in a file name does not answer a tag ask
 /// — nor the reverse. That is the v4 split: before it, pinyin lived only

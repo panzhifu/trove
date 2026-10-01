@@ -69,10 +69,35 @@ pub fn apply_menus(cx: &mut App) {
 }
 
 fn build_menus() -> Vec<Menu> {
-    vec![
-        Menu {
-            name: rust_i18n::t!("app.file").into_owned().into(),
+    // The macOS convention moves the platform furniture into an app menu
+    // (the first one) and a Window menu: About / Settings / Hide / Quit up
+    // top, Minimize / Zoom below, and the cmd-q / cmd-h / cmd-m chords ride
+    // with those items. Windows and Linux keep the shape they have —
+    // Settings under File, About under Help, quit via the window's close
+    // button — so the only mac-only items are the two mac-only menus.
+    // `cfg!` (not `#[cfg]`) on purpose: the mac branches must still typecheck
+    // on this side of the compiler.
+    let mac = cfg!(target_os = "macos");
+    let mut menus = Vec::new();
+    if mac {
+        menus.push(Menu {
+            name: "Trove".into(),
             items: vec![
+                MenuItem::action(rust_i18n::t!("app.about").to_string(), About),
+                MenuItem::separator(),
+                MenuItem::action(rust_i18n::t!("app.settings").to_string(), OpenSettings),
+                MenuItem::separator(),
+                MenuItem::action(rust_i18n::t!("app.hide").to_string(), HideApp),
+                MenuItem::separator(),
+                MenuItem::action(rust_i18n::t!("app.quit").to_string(), Quit),
+            ],
+            disabled: false,
+        });
+    }
+    menus.push(Menu {
+        name: rust_i18n::t!("app.file").into_owned().into(),
+        items: {
+            let mut items = vec![
                 MenuItem::action(
                     rust_i18n::t!("app.manage_libraries").to_string(),
                     ManageLibraries,
@@ -101,63 +126,92 @@ fn build_menus() -> Vec<Menu> {
                     ExportMediaPackage,
                 ),
                 MenuItem::action(rust_i18n::t!("xmp.menu").to_string(), ExportXmp),
-                MenuItem::separator(),
-                MenuItem::action(rust_i18n::t!("app.settings").to_string(), OpenSettings),
-            ],
-            disabled: false,
+            ];
+            // Settings' home on macOS is the app menu above; a second entry
+            // here would be a menu that answers twice.
+            if !mac {
+                items.push(MenuItem::separator());
+                items.push(MenuItem::action(
+                    rust_i18n::t!("app.settings").to_string(),
+                    OpenSettings,
+                ));
+            }
+            items
         },
-        Menu {
-            name: rust_i18n::t!("app.edit").into_owned().into(),
+        disabled: false,
+    });
+    menus.push(Menu {
+        name: rust_i18n::t!("app.edit").into_owned().into(),
+        items: vec![
+            MenuItem::action(rust_i18n::t!("app.select_all").to_string(), SelectAll),
+            MenuItem::action(
+                rust_i18n::t!("app.clear_selection").to_string(),
+                ClearSelection,
+            ),
+            MenuItem::separator(),
+            MenuItem::action(
+                rust_i18n::t!("app.move_to_trash").to_string(),
+                TrashSelected,
+            ),
+            MenuItem::separator(),
+            MenuItem::action(rust_i18n::t!("app.undo").to_string(), Undo),
+            MenuItem::action(rust_i18n::t!("app.redo").to_string(), Redo),
+            MenuItem::separator(),
+            MenuItem::action(rust_i18n::t!("app.paste_import").to_string(), PasteImport),
+            MenuItem::action(rust_i18n::t!("app.copy_image").to_string(), CopyImage),
+            MenuItem::action(
+                rust_i18n::t!("workspace.batch_rename").to_string(),
+                BatchRename,
+            ),
+            MenuItem::action(
+                rust_i18n::t!("workspace.batch_convert").to_string(),
+                BatchConvert,
+            ),
+            MenuItem::action(rust_i18n::t!("edit.menu").to_string(), BatchEdit),
+            MenuItem::action(rust_i18n::t!("autotag.menu").to_string(), AutoTag),
+        ],
+        disabled: false,
+    });
+    menus.push(Menu {
+        name: rust_i18n::t!("app.view").into_owned().into(),
+        items: vec![
+            MenuItem::action(rust_i18n::t!("app.all_assets").to_string(), ShowAllAssets),
+            MenuItem::action(rust_i18n::t!("app.trash").to_string(), ShowTrash),
+            MenuItem::separator(),
+            MenuItem::action(rust_i18n::t!("app.refresh").to_string(), RefreshLibrary),
+        ],
+        disabled: false,
+    });
+    if mac {
+        menus.push(Menu {
+            name: rust_i18n::t!("app.window").into_owned().into(),
             items: vec![
-                MenuItem::action(rust_i18n::t!("app.select_all").to_string(), SelectAll),
-                MenuItem::action(
-                    rust_i18n::t!("app.clear_selection").to_string(),
-                    ClearSelection,
-                ),
-                MenuItem::separator(),
-                MenuItem::action(
-                    rust_i18n::t!("app.move_to_trash").to_string(),
-                    TrashSelected,
-                ),
-                MenuItem::separator(),
-                MenuItem::action(rust_i18n::t!("app.undo").to_string(), Undo),
-                MenuItem::action(rust_i18n::t!("app.redo").to_string(), Redo),
-                MenuItem::separator(),
-                MenuItem::action(rust_i18n::t!("app.paste_import").to_string(), PasteImport),
-                MenuItem::action(rust_i18n::t!("app.copy_image").to_string(), CopyImage),
-                MenuItem::action(
-                    rust_i18n::t!("workspace.batch_rename").to_string(),
-                    BatchRename,
-                ),
-                MenuItem::action(
-                    rust_i18n::t!("workspace.batch_convert").to_string(),
-                    BatchConvert,
-                ),
-                MenuItem::action(rust_i18n::t!("edit.menu").to_string(), BatchEdit),
-                MenuItem::action(rust_i18n::t!("autotag.menu").to_string(), AutoTag),
+                MenuItem::action(rust_i18n::t!("app.minimize").to_string(), MinimizeWindow),
+                MenuItem::action(rust_i18n::t!("app.zoom").to_string(), ZoomWindow),
             ],
             disabled: false,
+        });
+    }
+    menus.push(Menu {
+        name: rust_i18n::t!("app.help").into_owned().into(),
+        items: {
+            let mut items = vec![MenuItem::action(
+                rust_i18n::t!("app.check_updates").to_string(),
+                CheckUpdates,
+            )];
+            // About's home on macOS is the app menu above.
+            if !mac {
+                items.push(MenuItem::separator());
+                items.push(MenuItem::action(
+                    rust_i18n::t!("app.about").to_string(),
+                    About,
+                ));
+            }
+            items
         },
-        Menu {
-            name: rust_i18n::t!("app.view").into_owned().into(),
-            items: vec![
-                MenuItem::action(rust_i18n::t!("app.all_assets").to_string(), ShowAllAssets),
-                MenuItem::action(rust_i18n::t!("app.trash").to_string(), ShowTrash),
-                MenuItem::separator(),
-                MenuItem::action(rust_i18n::t!("app.refresh").to_string(), RefreshLibrary),
-            ],
-            disabled: false,
-        },
-        Menu {
-            name: rust_i18n::t!("app.help").into_owned().into(),
-            items: vec![
-                MenuItem::action(rust_i18n::t!("app.check_updates").to_string(), CheckUpdates),
-                MenuItem::separator(),
-                MenuItem::action(rust_i18n::t!("app.about").to_string(), About),
-            ],
-            disabled: false,
-        },
-    ]
+        disabled: false,
+    });
+    menus
 }
 
 // ============================================================================

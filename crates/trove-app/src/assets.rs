@@ -38,6 +38,8 @@ icon_assets!(
         FlipHorizontal2,
         FlipVertical2,
         Pencil,
+        // The text viewer's save: the editor's buffer over the linked source.
+        Save,
         Trash,
         Eraser,
         Sparkles,

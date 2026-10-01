@@ -87,30 +87,33 @@ mod tests {
         assert_eq!(effective(Some("zh-TW")), "zh-CN");
     }
 
-    /// Every catalog must carry the same keys as English — within a recorded
-    /// allowance.
+    /// Every catalog must carry exactly the same keys as English.
     ///
     /// `t!` resolves at runtime, so a key present in `en.toml` and missing
     /// elsewhere does not fail the build; the interface silently shows the raw
     /// key instead. That is how a settings section added in English only would
-    /// stay invisible: seven catalogs currently carry ~63 fewer keys than
-    /// English, all of them the AI / search-tier pages.
+    /// stay invisible — which is what happened once: the seven non-English
+    /// catalogs had drifted to ~63 keys behind English, all of them the AI /
+    /// search-tier pages, until 2026-10-01 closed the gap and the allowance
+    /// went to zero.
     ///
-    /// So this is a ratchet rather than an equality. Adding a key to `en.toml`
-    /// without translating it fails the test; translating one forces the
-    /// recorded number down, so the table only ever shrinks. `zh-CN` is already
-    /// at parity and holds there.
+    /// So this is an equality with memory. Adding a key to `en.toml` without
+    /// translating it fails the test here; the per-language rows below stay in
+    /// the table (instead of one shared `0`) so a future breach names the
+    /// language that slipped.
     #[test]
     fn catalogs_do_not_drift_further_from_english() {
-        /// (missing, extra) relative to `en.toml`, as measured 2026-09-23.
+        /// (missing, extra) relative to `en.toml`. Full parity since
+        /// 2026-10-01; a non-zero row here means a key was added (or renamed)
+        /// without its translations.
         const ALLOWED: [(&str, usize, usize); 8] = [
-            ("de", 64, 2),
-            ("es", 63, 1),
-            ("fr", 63, 1),
-            ("ja", 63, 1),
-            ("ko", 63, 1),
-            ("pt", 63, 1),
-            ("ru", 63, 1),
+            ("de", 0, 0),
+            ("es", 0, 0),
+            ("fr", 0, 0),
+            ("ja", 0, 0),
+            ("ko", 0, 0),
+            ("pt", 0, 0),
+            ("ru", 0, 0),
             ("zh-CN", 0, 0),
         ];
 

@@ -155,6 +155,105 @@ fn version_row(cx: &mut App) -> Div {
                         }),
                 ),
         );
+
+        // A download is offered only where the release ships an installer
+        // this build can use (the names `packaging/` publishes); archive
+        // targets keep the releases-page path above. The state is re-read
+        // per render and the download task repaints while it runs, so this
+        // row is live.
+        if update::installer_asset(&version).is_some() {
+            let mut row = h_flex().w_full().justify_end().gap_2();
+            match update::download_state() {
+                update::DownloadState::Downloading { received, total } => {
+                    let percent = match (total > 0).then(|| received * 100 / total) {
+                        Some(percent) => format!("{percent}%"),
+                        None => "…".into(),
+                    };
+                    row = row
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(
+                                    rust_i18n::t!("settings.update_downloading", percent = percent)
+                                        .to_string(),
+                                ),
+                        )
+                        .child(
+                            Button::new("update-cancel")
+                                .ghost()
+                                .small()
+                                .label(rust_i18n::t!("settings.update_cancel").to_string())
+                                .on_click(|_, _, cx| {
+                                    update::cancel_download();
+                                    cx.refresh_windows();
+                                }),
+                        );
+                }
+                update::DownloadState::Staged { .. } => {
+                    row = row
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().info)
+                                .child(rust_i18n::t!("settings.update_downloaded").to_string()),
+                        )
+                        .child(
+                            Button::new("update-install")
+                                .outline()
+                                .small()
+                                .label(rust_i18n::t!("settings.update_install").to_string())
+                                .on_click({
+                                    let version = version.clone();
+                                    move |_, _, cx| match update::open_staged(&version) {
+                                        Ok(()) => {
+                                            // Inno refuses to overwrite a running
+                                            // binary: on Windows the wizard is the
+                                            // next thing that happens, so this
+                                            // process bows out. macOS and Linux
+                                            // hand the file to Finder / the package
+                                            // installer and stay.
+                                            if cfg!(target_os = "windows") {
+                                                cx.quit();
+                                            }
+                                        }
+                                        Err(error) => {
+                                            update::set_download_state(
+                                                update::DownloadState::Failed {
+                                                    error: error.to_string(),
+                                                },
+                                            );
+                                            cx.refresh_windows();
+                                        }
+                                    }
+                                }),
+                        );
+                }
+                otherwise => {
+                    if let update::DownloadState::Failed { error } = otherwise {
+                        row = row.child(
+                            div().text_xs().text_color(cx.theme().warning).child(
+                                rust_i18n::t!("settings.update_download_failed", error = error)
+                                    .to_string(),
+                            ),
+                        );
+                    }
+                    row = row.child(
+                        Button::new("update-download")
+                            .outline()
+                            .small()
+                            .label(rust_i18n::t!("settings.update_download").to_string())
+                            .on_click({
+                                let version = version.clone();
+                                move |_, _, cx| {
+                                    crate::app::start_update_download(version.clone(), cx);
+                                }
+                            }),
+                    );
+                }
+            }
+            column = column.child(row);
+        }
     }
     column
 }
