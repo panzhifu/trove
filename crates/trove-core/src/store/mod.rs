@@ -1583,8 +1583,10 @@ mod tests {
         // another index fails by name.
         let plan = store
             .conn()
-            .prepare("EXPLAIN QUERY PLAN SELECT id, width, height FROM assets \
-                      WHERE trashed_at IS NULL ORDER BY created_at DESC, id ASC")
+            .prepare(
+                "EXPLAIN QUERY PLAN SELECT id, width, height FROM assets \
+                      WHERE trashed_at IS NULL ORDER BY created_at DESC, id ASC",
+            )
             .and_then(|mut stmt| {
                 let rows = stmt.query_map([], |r| r.get::<_, String>(3))?;
                 Ok(rows.filter_map(|r| r.ok()).collect::<Vec<_>>().join("; "))

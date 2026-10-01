@@ -365,7 +365,10 @@ fn query_items(
     where_sql: String,
     mut args: Vec<Value>,
 ) -> Result<Vec<Asset>> {
-    let mut sql = format!("SELECT {COLS} FROM assets {where_sql} ORDER BY {}", order_clause(q));
+    let mut sql = format!(
+        "SELECT {COLS} FROM assets {where_sql} ORDER BY {}",
+        order_clause(q)
+    );
     if let Some(limit) = limit {
         sql.push_str(" LIMIT ? OFFSET ?");
         args.push(Value::Integer(limit as i64));
