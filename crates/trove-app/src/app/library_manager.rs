@@ -32,7 +32,6 @@ use super::settings_write;
 use crate::app::actions::RunPluginCommand;
 use crate::components::scrollbar;
 use trove_core::config::{AppConfig, LibraryEntry};
-use trove_core::paths;
 
 /// The app logo, decoded once per process. gpui's `RenderImage` wants BGRA
 /// bytes, so the PNG's channels are swapped the same way the screenshot
@@ -264,25 +263,53 @@ impl LibraryManagerView {
         cx.notify();
     }
 
-    /// The full-backup archive: the software configuration and every
-    /// library's data in one zip. The heavy work runs on the background
-    /// executor; the toast reports the outcome either way.
-    fn export_backup(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let suggested = trove_core::services::archive::backup_file_name();
-        let rx = cx.prompt_for_new_path(&paths::data_dir(), Some(suggested.as_str()));
+    /// The repository package for one row's library: records, its own media,
+    /// and copies of the linked files, in one `.trove` file. The heavy work
+    /// runs on the background executor — the writer snapshots the database
+    /// itself, so an open library is safe — and the toast reports the
+    /// outcome either way.
+    fn export_repository(
+        &mut self,
+        entry: LibraryEntry,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let suggested = trove_core::services::repo_package::package_file_name(&entry.name);
+        let rx = cx.prompt_for_new_path(&entry.dir(), Some(suggested.as_str()));
         let handle = window.window_handle();
         cx.spawn(async move |_, cx| {
             if let Ok(Ok(Some(path))) = rx.await {
+                // The save dialog has no extension filter; the format's
+                // extension is the app's to enforce.
+                let path = match path.extension().and_then(|e| e.to_str()) {
+                    Some(e) if e.eq_ignore_ascii_case("trove") => path,
+                    _ => path.with_extension("trove"),
+                };
+                let dir = entry.dir();
+                let name = entry.name.clone();
                 let outcome = cx
                     .background_executor()
-                    .spawn(async move { trove_core::services::archive::create_full_backup(&path) })
+                    .spawn(async move {
+                        trove_core::services::repo_package::export_library_package(
+                            &dir, &name, &path,
+                        )
+                    })
                     .await;
                 let _ = handle.update(cx, |_, window, cx| {
                     let note = match outcome {
-                        Ok(report) => Notification::success(
+                        Ok(report) if report.linked_missing == 0 => Notification::success(
                             rust_i18n::t!(
-                                "app.backup_done",
-                                path = report.path.display().to_string()
+                                "app.export_repository_done",
+                                path = report.path.display().to_string(),
+                                files = report.files
+                            )
+                            .to_string(),
+                        ),
+                        Ok(report) => Notification::warning(
+                            rust_i18n::t!(
+                                "app.export_repository_missing",
+                                path = report.path.display().to_string(),
+                                count = report.linked_missing
                             )
                             .to_string(),
                         ),
@@ -641,9 +668,10 @@ fn library_row(
 }
 
 /// One row's kebab: the commands that act on this library. The export item
-/// writes the full-backup archive — the whole install, not just this row's
-/// library. Delete confirms through a dialog naming what goes, so an
-/// irreversible act never happens from a menu slip.
+/// writes this row's library as one `.trove` repository package — records,
+/// its own media, and copies of the linked files. Delete confirms through a
+/// dialog naming what goes, so an irreversible act never happens from a menu
+/// slip.
 fn row_menu(
     view: &Entity<LibraryManagerView>,
     entry: LibraryEntry,
@@ -651,7 +679,8 @@ fn row_menu(
 ) -> impl IntoElement {
     let menu_entry = entry.clone();
     let menu_view = view.clone();
-    let export_view = view.clone();
+    let repo_view = view.clone();
+    let repo_entry = entry.clone();
     Button::new(SharedString::from(format!(
         "manager-row-menu-{}",
         entry.slug
@@ -664,14 +693,16 @@ fn row_menu(
         let rename_entry = menu_entry.clone();
         let rename_view = menu_view.clone();
         let delete_entry = menu_entry.clone();
-        let export_view = export_view.clone();
+        let repo_entry = repo_entry.clone();
+        let repo_view = repo_view.clone();
         menu.min_w(px(140.))
             .item(
-                PopupMenuItem::new(rust_i18n::t!("library_manager.backup").to_string()).on_click(
-                    move |_, window, cx| {
-                        export_view.update(cx, |this, cx| this.export_backup(window, cx));
-                    },
-                ),
+                PopupMenuItem::new(rust_i18n::t!("library_manager.export_repository").to_string())
+                    .on_click(move |_, window, cx| {
+                        repo_view.update(cx, |this, cx| {
+                            this.export_repository(repo_entry.clone(), window, cx)
+                        });
+                    }),
             )
             .item(
                 PopupMenuItem::new(rust_i18n::t!("library_manager.rename").to_string()).on_click(

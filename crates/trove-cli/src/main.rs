@@ -16,6 +16,7 @@
 mod cli;
 mod ctx;
 mod read;
+mod repo;
 mod write;
 
 use clap::Parser;
@@ -50,9 +51,12 @@ fn dispatch(args: &Cli) -> Result<(), CliError> {
     let rendered = match &args.command {
         // Commands that read configuration only. They must not need a usable
         // library: "which library is broken" is exactly the question they
-        // answer.
+        // answer. `repo` joins them because its two halves touch no existing
+        // library — export snapshots the database from the directory, import
+        // creates one that did not exist.
         Command::Libraries => read::libraries()?,
         Command::Paths => read::paths(args)?,
+        Command::Repo(repo) => repo::dispatch(repo, args, &style)?,
 
         command => {
             let env = Env::open(args)?;
@@ -76,7 +80,7 @@ fn dispatch(args: &Cli) -> Result<(), CliError> {
                 Command::Collection(collection) => write::collection(&env, collection)?,
                 Command::Index(index) => write::index(&env, index)?,
                 Command::Sequence(sequence) => write::sequence(&env, sequence)?,
-                Command::Libraries | Command::Paths => {
+                Command::Libraries | Command::Paths | Command::Repo(_) => {
                     unreachable!("handled above, before a library is opened")
                 }
             }

@@ -162,6 +162,10 @@ pub enum Command {
     /// Group assets into an image sequence, and undo the grouping.
     #[command(subcommand)]
     Sequence(SequenceCommand),
+
+    /// Export one library as a single `.trove` file, or install one back.
+    #[command(subcommand)]
+    Repo(RepoCommand),
 }
 
 // ---------------------------------------------------------------------------
@@ -202,6 +206,50 @@ pub enum SequenceCommand {
         /// Frames per second, 1…240.
         #[arg(value_name = "FPS")]
         fps: f64,
+    },
+}
+
+// ---------------------------------------------------------------------------
+// `trove repo …`
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Subcommand)]
+pub enum RepoCommand {
+    /// Export one library to a single `.trove` file.
+    ///
+    /// The package holds the records (a consistent database snapshot, safe
+    /// to take while the desktop app has the library open), the library's
+    /// own media, and a copy of every linked file whose source is on disk —
+    /// so it opens somewhere else with nothing missing. A linked file whose
+    /// source is not found is counted in the result, not packed. `--library`
+    /// picks the library.
+    Export {
+        /// Destination file. Default: `<library-name>-<timestamp>.trove` in
+        /// the working directory; any other extension is replaced.
+        #[arg(short, long, value_name = "FILE")]
+        out: Option<PathBuf>,
+    },
+
+    /// Install a `.trove` file as a new library.
+    ///
+    /// Records and media are unpacked into a fresh entry of the library
+    /// registry. A linked file whose original still exists at its recorded
+    /// path stays linked; one that does not is restored from the copy inside
+    /// the package and becomes part of the library. A failure leaves the
+    /// registry as it was.
+    Import {
+        /// The package to install.
+        #[arg(value_name = "FILE")]
+        archive: PathBuf,
+
+        /// Name for the new library. Default: the name recorded in the
+        /// package.
+        #[arg(long, value_name = "NAME")]
+        name: Option<String>,
+
+        /// Make the imported library the active one.
+        #[arg(long)]
+        activate: bool,
     },
 }
 

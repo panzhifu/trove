@@ -26,9 +26,8 @@ use crate::app::{capture, status_bar};
 use crate::library::jobs;
 use crate::library::{LibraryController, SelectionSource};
 use crate::panels::{ExplorerPanel, FoldersPanel, InspectorPanel, TagsPanel, WorkspacePanel};
-use trove_core::config::AppConfig;
+use trove_core::config::{AppConfig, LibraryEntry};
 use trove_core::library::Library;
-use trove_core::paths;
 use trove_core::services::update;
 use uuid::Uuid;
 
@@ -136,6 +135,41 @@ pub(crate) fn pending_update() -> Option<(String, String)> {
 pub(crate) struct SessionState(pub(crate) Option<gpui::WeakEntity<LibraryController>>);
 
 impl gpui_kit::Global for SessionState {}
+
+/// Marker for the keyed repository-package toast: the standing
+/// "exporting…"/"importing…" note is replaced by the outcome instead of
+/// stacking one toast per step.
+pub struct RepositoryNotice;
+
+/// Hand the session's main window over to `entry` — the library manager's
+/// hot-swap path, from inside the main window itself. Returns whether the
+/// swap happened: a refused switch (an import mid-flight, a library that
+/// will not open) leaves the current one open.
+fn swap_session_to(cx: &mut App, entry: &LibraryEntry) -> bool {
+    let Some(controller) = cx
+        .try_global::<SessionState>()
+        .and_then(|state| state.0.as_ref().and_then(|weak| weak.upgrade()))
+    else {
+        return false;
+    };
+    controller.update(cx, |ctl, cx| {
+        let swapped = ctl
+            .swap_library(entry.dir(), entry.cache_dir())
+            .and_then(|()| AppConfig::load().set_active_library(&entry.slug))
+            .is_ok();
+        if swapped {
+            // The old watch task scanned for the previous library;
+            // restart the resident watch on the new one.
+            if let Some(handle) = ctl.watch_handle {
+                let entity = cx.entity();
+                crate::library::jobs::start_watch_service(&entity, handle, cx);
+            }
+            ctl.generation += 1;
+            cx.notify();
+        }
+        swapped
+    })
+}
 
 /// Root view: owns the controller and hosts the dock area, plus a drop
 /// surface that imports any dropped files into the current collection.
@@ -657,70 +691,6 @@ impl AppView {
         cx.notify();
     }
 
-    /// File ▸ Export library… : save-dialog, then write the metadata catalog
-    /// as pretty JSON (`Library::export_metadata`). Library is not `Send`, so
-    /// serialization happens on the main thread inside the window callback.
-    fn prompt_export(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let ctl = self.controller.clone();
-        let handle = window.window_handle();
-        let dir = ctl.read(cx).library.root().to_path_buf();
-        let rx = cx.prompt_for_new_path(&dir, Some("trove-export.json"));
-        cx.spawn(async move |_, cx| {
-            if let Ok(Ok(Some(path))) = rx.await {
-                let _ = handle.update(cx, |_, window, cx| {
-                    let outcome = ctl
-                        .update(cx, |ctl, _| ctl.library.export_metadata())
-                        .and_then(|json| std::fs::write(&path, json).map_err(|e| e.into()));
-                    let note = match outcome {
-                        Ok(()) => Notification::success(
-                            rust_i18n::t!("app.export_done", path = path.display().to_string())
-                                .to_string(),
-                        ),
-                        Err(e) => Notification::warning(
-                            rust_i18n::t!("app.export_failed", error = e.to_string()).to_string(),
-                        ),
-                    };
-                    window.push_notification(note, cx);
-                });
-            }
-        })
-        .detach();
-    }
-
-    /// File ▸ Export backup archive… : save-dialog, then write the full
-    /// backup — the software configuration plus every library's data — as one
-    /// zip. The archive build runs on the background executor: a media store
-    /// can be gigabytes, and none of it needs the main thread.
-    fn prompt_export_backup(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let suggested = trove_core::services::archive::backup_file_name();
-        let rx = cx.prompt_for_new_path(&paths::data_dir(), Some(suggested.as_str()));
-        let handle = window.window_handle();
-        cx.spawn(async move |_, cx| {
-            if let Ok(Ok(Some(path))) = rx.await {
-                let outcome = cx
-                    .background_executor()
-                    .spawn(async move { trove_core::services::archive::create_full_backup(&path) })
-                    .await;
-                let _ = handle.update(cx, |_, window, cx| {
-                    let note = match outcome {
-                        Ok(report) => Notification::success(
-                            rust_i18n::t!(
-                                "app.backup_done",
-                                path = report.path.display().to_string()
-                            )
-                            .to_string(),
-                        ),
-                        Err(e) => Notification::warning(
-                            rust_i18n::t!("app.export_failed", error = e.to_string()).to_string(),
-                        ),
-                    };
-                    window.push_notification(note, cx);
-                });
-            }
-        })
-        .detach();
-    }
-
     /// File ▸ Import files… : system file picker, then background import.
     fn prompt_import(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let ctl = self.controller.clone();
@@ -737,65 +707,6 @@ impl AppView {
             {
                 let _ = handle.update(cx, |_view, window, cx| {
                     jobs::import_paths_app(&ctl, paths, window, cx);
-                });
-            }
-        })
-        .detach();
-    }
-
-    /// File ▸ Import library… : pick a Trove export JSON and restore its
-    /// metadata into the open library (content matches link, the rest
-    /// become placeholders that self-heal on re-import).
-    fn prompt_import_library(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let ctl = self.controller.clone();
-        let handle = window.window_handle();
-        let rx = cx.prompt_for_paths(PathPromptOptions {
-            files: true,
-            directories: false,
-            multiple: false,
-            prompt: Some(
-                rust_i18n::t!("app.import_library_prompt")
-                    .into_owned()
-                    .into(),
-            ),
-        });
-        cx.spawn(async move |_, cx| {
-            if let Ok(Ok(Some(paths))) = rx.await
-                && let Some(path) = paths.first()
-            {
-                let note = match std::fs::read_to_string(path) {
-                    Ok(text) => {
-                        let result = handle
-                            .update(cx, |_, _, cx| ctl.read(cx).library.import_metadata(&text));
-                        match result {
-                            Ok(Ok(report)) => {
-                                ctl.update(cx, |ctl, cx| {
-                                    ctl.generation += 1;
-                                    cx.notify();
-                                });
-                                Notification::success(
-                                    rust_i18n::t!(
-                                        "app.import_library_done",
-                                        assets = report.assets_linked + report.assets_placeholder,
-                                        collections = report.collections,
-                                        tags = report.tags,
-                                        smart = report.smart_collections,
-                                        skipped = report.skipped
-                                    )
-                                    .to_string(),
-                                )
-                            }
-                            _ => Notification::warning(
-                                rust_i18n::t!("app.import_library_failed").to_string(),
-                            ),
-                        }
-                    }
-                    Err(_) => Notification::warning(
-                        rust_i18n::t!("app.import_library_failed").to_string(),
-                    ),
-                };
-                let _ = handle.update(cx, |_view, window, cx| {
-                    window.push_notification(note, cx);
                 });
             }
         })
@@ -877,55 +788,192 @@ impl AppView {
         });
     }
 
-    /// File ▸ Export media package… : pick a destination directory, then
-    /// write a portable package (trove-export.json + media/ blobs).
-    fn prompt_export_media_package(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let ctl = self.controller.clone();
+    /// File ▸ Export repository file… : save-dialog, then write the active
+    /// library — records, its own media, and copies of the linked files — as
+    /// one `.trove` package. The build runs on the background executor: the
+    /// package writer snapshots the database itself, so the open library is
+    /// never touched from off the main thread. A keyed toast stands in while
+    /// the package builds and the outcome replaces it — a library with
+    /// gigabytes of linked files should not export in silence.
+    fn prompt_export_repository(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let entry = AppConfig::load().active_entry();
+        let suggested = trove_core::services::repo_package::package_file_name(&entry.name);
+        let rx = cx.prompt_for_new_path(&entry.dir(), Some(suggested.as_str()));
+        let handle = window.window_handle();
+        cx.spawn(async move |_, cx| {
+            if let Ok(Ok(Some(path))) = rx.await {
+                // The save dialog has no extension filter, so the format's
+                // extension is the app's to enforce: whatever the dialog
+                // came back with, the file the user chose ends in `.trove`.
+                let path = match path.extension().and_then(|e| e.to_str()) {
+                    Some(e) if e.eq_ignore_ascii_case("trove") => path,
+                    _ => path.with_extension("trove"),
+                };
+                let _ = handle.update(cx, |_, window, cx| {
+                    window.push_notification(
+                        Notification::info(
+                            rust_i18n::t!("app.export_repository_started").to_string(),
+                        )
+                        .id1::<RepositoryNotice>("repository-package"),
+                        cx,
+                    );
+                });
+                let outcome = cx
+                    .background_executor()
+                    .spawn(async move {
+                        trove_core::services::repo_package::export_library_package(
+                            &entry.dir(),
+                            &entry.name,
+                            &path,
+                        )
+                    })
+                    .await;
+                let _ = handle.update(cx, |_, window, cx| {
+                    let note = match outcome {
+                        Ok(report) if report.linked_missing == 0 => Notification::success(
+                            rust_i18n::t!(
+                                "app.export_repository_done",
+                                path = report.path.display().to_string(),
+                                files = report.files
+                            )
+                            .to_string(),
+                        ),
+                        Ok(report) => Notification::warning(
+                            rust_i18n::t!(
+                                "app.export_repository_missing",
+                                path = report.path.display().to_string(),
+                                count = report.linked_missing
+                            )
+                            .to_string(),
+                        ),
+                        Err(e) => Notification::warning(
+                            rust_i18n::t!("app.export_failed", error = e.to_string()).to_string(),
+                        ),
+                    }
+                    .id1::<RepositoryNotice>("repository-package");
+                    window.push_notification(note, cx);
+                });
+            }
+        })
+        .detach();
+    }
+
+    /// File ▸ Import repository file… : pick a `.trove` package, register a
+    /// library named after it, unpack it on the background executor, then
+    /// switch this window to the imported library. A failure rolls the
+    /// registration back — an entry pointing at half a package helps nobody.
+    fn prompt_import_repository(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let handle = window.window_handle();
         let rx = cx.prompt_for_paths(PathPromptOptions {
-            files: false,
-            directories: true,
+            files: true,
+            directories: false,
             multiple: false,
             prompt: Some(
-                rust_i18n::t!("app.export_media_package_prompt")
+                rust_i18n::t!("app.import_repository_prompt")
                     .into_owned()
                     .into(),
             ),
         });
         cx.spawn(async move |_, cx| {
             if let Ok(Ok(Some(paths))) = rx.await
-                && let Some(dir) = paths.first()
+                && let Some(archive) = paths.first()
             {
-                let result = handle.update(cx, |_, _, cx| {
-                    ctl.read(cx)
-                        .library
-                        .export_media_package(&dir.to_path_buf())
-                });
-                let note = match result {
-                    Ok(Ok(report)) => {
-                        ctl.update(cx, |ctl, cx| {
-                            ctl.generation += 1;
-                            cx.notify();
-                        });
-                        Notification::success(
-                            rust_i18n::t!(
-                                "app.export_media_package_done",
-                                files = report.files,
-                                path = report.path.display().to_string()
-                            )
-                            .to_string(),
-                        )
-                    }
-                    Ok(Err(e)) => Notification::warning(
-                        rust_i18n::t!("app.export_failed", error = e.to_string()).to_string(),
-                    ),
-                    Err(e) => Notification::warning(
-                        rust_i18n::t!("app.export_failed", error = e.to_string()).to_string(),
-                    ),
+                // Read the manifest first: the library name decides the
+                // registry entry, and the registry entry decides the
+                // directory the package unpacks into.
+                let read = {
+                    let archive = archive.clone();
+                    cx.background_executor()
+                        .spawn(async move {
+                            trove_core::services::repo_package::read_manifest(&archive)
+                        })
+                        .await
                 };
-                let _ = handle.update(cx, |_view, window, cx| {
-                    window.push_notification(note, cx);
+                let manifest = match read {
+                    Ok(manifest) => manifest,
+                    Err(_) => {
+                        let _ = handle.update(cx, |_, window, cx| {
+                            window.push_notification(
+                                Notification::warning(
+                                    rust_i18n::t!("app.import_repository_failed").to_string(),
+                                ),
+                                cx,
+                            );
+                        });
+                        return;
+                    }
+                };
+                let entry = {
+                    let name = manifest.library.name.clone();
+                    let mut config = AppConfig::load();
+                    config.add_library(&name).ok()
+                };
+                let Some(entry) = entry else {
+                    return;
+                };
+
+                let _ = handle.update(cx, |_, window, cx| {
+                    window.push_notification(
+                        Notification::info(
+                            rust_i18n::t!("app.import_repository_started").to_string(),
+                        )
+                        .id1::<RepositoryNotice>("repository-package"),
+                        cx,
+                    );
                 });
+
+                let archive = archive.clone();
+                let dest = entry.dir();
+                let outcome = cx
+                    .background_executor()
+                    .spawn(async move {
+                        trove_core::services::repo_package::install_library_package(
+                            &archive, &dest,
+                        )
+                    })
+                    .await;
+
+                match outcome {
+                    Ok(report) => {
+                        // Hand the window over to the imported library, the
+                        // same hot-swap the library manager's enter performs.
+                        let switched = handle
+                            .update(cx, |_, _, cx| swap_session_to(cx, &entry))
+                            .unwrap_or(false);
+                        let _ = handle.update(cx, |_, window, cx| {
+                            let note = Notification::success(
+                                rust_i18n::t!(
+                                    "app.import_repository_done",
+                                    name = report.library_name,
+                                    assets = report.assets_total,
+                                    materialized = report.materialized,
+                                    kept = report.kept_linked,
+                                    missing = report.missing
+                                )
+                                .to_string(),
+                            )
+                            .id1::<RepositoryNotice>("repository-package");
+                            window.push_notification(note, cx);
+                            if !switched {
+                                cx.refresh_windows();
+                            }
+                        });
+                    }
+                    Err(_) => {
+                        let mut config = AppConfig::load();
+                        let _ = config.forget_library(&entry.slug);
+                        let _ = std::fs::remove_dir_all(entry.dir());
+                        let _ = handle.update(cx, |_, window, cx| {
+                            window.push_notification(
+                                Notification::warning(
+                                    rust_i18n::t!("app.import_repository_failed").to_string(),
+                                )
+                                .id1::<RepositoryNotice>("repository-package"),
+                                cx,
+                            );
+                        });
+                    }
+                }
             }
         })
         .detach();
@@ -1067,17 +1115,11 @@ impl Render for AppView {
             .on_action(cx.listener(|_: &mut Self, _: &ManageLibraries, _, cx| {
                 crate::app::library_manager::open(cx);
             }))
-            .on_action(cx.listener(|this, _: &ExportLibrary, window, cx| {
-                this.prompt_export(window, cx);
+            .on_action(cx.listener(|this, _: &ExportRepository, window, cx| {
+                this.prompt_export_repository(window, cx);
             }))
-            .on_action(cx.listener(|this, _: &ExportBackup, window, cx| {
-                this.prompt_export_backup(window, cx);
-            }))
-            .on_action(cx.listener(|this, _: &ImportLibrary, window, cx| {
-                this.prompt_import_library(window, cx);
-            }))
-            .on_action(cx.listener(|this, _: &ExportMediaPackage, window, cx| {
-                this.prompt_export_media_package(window, cx);
+            .on_action(cx.listener(|this, _: &ImportRepository, window, cx| {
+                this.prompt_import_repository(window, cx);
             }))
             .on_action(cx.listener(|this, _: &OpenSettings, _, cx| {
                 crate::dialogs::settings::open(cx, this.controller.clone());

@@ -14,11 +14,9 @@ gpui_kit::actions!(
         ImportFiles,
         ImportUrl,
         Screenshot,
-        ExportLibrary,
-        ExportBackup,
-        ImportLibrary,
-        ExportMediaPackage,
         ExportXmp,
+        ExportRepository,
+        ImportRepository,
         FindDuplicates,
         OpenSettings,
         // -- Edit menu / grid shortcuts ------------------------------------

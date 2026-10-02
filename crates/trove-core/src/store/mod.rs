@@ -3428,67 +3428,6 @@ mod tests {
     }
 
     #[test]
-    fn export_metadata_roundtrip() {
-        use crate::store::{collections, smart_collections};
-        let store = Store::in_memory().unwrap();
-        let conn = store.conn();
-        let mut a = sample_asset("a.png", AssetKind::Image);
-        a.title = Some("sunset".into());
-        assets::insert(conn, &a).unwrap();
-        let coll = collections::create(
-            conn,
-            &NewCollection {
-                parent_id: None,
-                name: "trip".into(),
-                position: 0,
-            },
-        )
-        .unwrap();
-        collections::add_asset(
-            conn,
-            crate::model::CollectionId(coll.id),
-            crate::model::AssetId(a.id),
-        )
-        .unwrap();
-        let tag = tags::create(
-            conn,
-            &NewTag {
-                name: "beach".into(),
-                color: None,
-                parent_id: None,
-            },
-        )
-        .unwrap();
-        tags::add_to_asset(
-            conn,
-            crate::model::AssetId(a.id),
-            crate::model::TagId(tag.id),
-        )
-        .unwrap();
-        smart_collections::create(
-            conn,
-            &crate::model::NewSmartCollection {
-                parent_id: None,
-                name: "fav".into(),
-                query: smart_node(serde_json::json!({
-                    "op": "match", "field": "is_favorite", "value": true
-                })),
-                position: 0,
-            },
-        )
-        .unwrap();
-
-        let json = crate::library::export_metadata_from_store(&store).unwrap();
-        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(value["format"], "trove-export");
-        assert_eq!(value["asset_count"], 1);
-        assert_eq!(value["assets"][0]["title"], "sunset");
-        assert_eq!(value["collections"][0]["name"], "trip");
-        assert_eq!(value["tags"][0]["name"], "beach");
-        assert_eq!(value["smart_collections"][0]["name"], "fav");
-    }
-
-    #[test]
     fn view_history_records_prunes_and_hides_trashed() {
         use crate::store::view_history;
         let store = Store::in_memory().unwrap();

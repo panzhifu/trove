@@ -327,9 +327,9 @@ impl Library {
     }
 
     /// Import sources by **copying** them into the library's own store. Only
-    /// for content Trove owns and is about to delete or overwrite — the
-    /// extraction directory of a media package, above all. Linking a file that
-    /// is about to disappear would leave the asset pointing at nothing.
+    /// for content Trove owns and is about to delete or overwrite — a source
+    /// that is about to disappear, above all. Linking a file that is about to
+    /// vanish would leave the asset pointing at nothing.
     pub fn import_into_store(
         &self,
         sources: &[PathBuf],

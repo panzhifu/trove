@@ -555,6 +555,23 @@ pub fn set_rel_path(conn: &Connection, id: Uuid, rel_path: &str) -> Result<()> {
     Ok(())
 }
 
+/// Turn a linked record into a stored one pointing at `rel_path`.
+///
+/// The migration a repository-package import performs when a linked asset's
+/// original file is gone but the package carries a copy: the blob has been
+/// staged into the library's `media/` already, so the record only needs its
+/// `origin` flipped and its blob path written. The recorded `source_path`
+/// key survives as provenance — [`Asset::set_location`] deliberately never
+/// clears it, and this is the same transition spelled in SQL.
+pub fn set_stored_blob(conn: &Connection, id: Uuid, rel_path: &str) -> Result<()> {
+    rows::execute(
+        conn,
+        "UPDATE assets SET origin = 'stored', rel_path = ?1 WHERE id = ?2",
+        vec![Value::Text(rel_path.to_string()), rows::uuid(id).into()],
+    )?;
+    Ok(())
+}
+
 /// Point an asset at a new content-addressed blob after an in-place edit:
 /// new hash, path, size and dimensions, all in one statement. Identity
 /// columns (title, tags, collections, timestamps) are untouched — an edit

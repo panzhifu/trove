@@ -108,23 +108,18 @@ fn build_menus() -> Vec<Menu> {
                 MenuItem::action(rust_i18n::t!("app.screenshot").to_string(), Screenshot),
                 MenuItem::separator(),
                 MenuItem::action(
-                    rust_i18n::t!("app.export_library").to_string(),
-                    ExportLibrary,
+                    rust_i18n::t!("app.export_repository").to_string(),
+                    ExportRepository,
                 ),
                 MenuItem::action(
-                    rust_i18n::t!("app.import_library").to_string(),
-                    ImportLibrary,
+                    rust_i18n::t!("app.import_repository").to_string(),
+                    ImportRepository,
                 ),
                 MenuItem::action(
                     rust_i18n::t!("app.find_duplicates").to_string(),
                     FindDuplicates,
                 ),
                 MenuItem::separator(),
-                MenuItem::action(rust_i18n::t!("app.export_backup").to_string(), ExportBackup),
-                MenuItem::action(
-                    rust_i18n::t!("app.export_media_package").to_string(),
-                    ExportMediaPackage,
-                ),
                 MenuItem::action(rust_i18n::t!("xmp.menu").to_string(), ExportXmp),
             ];
             // Settings' home on macOS is the app menu above; a second entry
