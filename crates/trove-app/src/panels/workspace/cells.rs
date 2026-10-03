@@ -119,6 +119,13 @@ pub(super) fn build_cell_element(
             cx.theme().border
         })
         .overflow_hidden()
+        // An audio card is baked on trove-core's fixed paper, and its
+        // contained image floats over this cell's background — a theme
+        // surface there read as bands above and below the waveform. The
+        // cell takes the paper instead, and the bands disappear.
+        .when(kind == AssetKind::Audio, |cell| {
+            cell.bg(gpui::rgb(trove_core::media::CARD_PAPER_RGB))
+        })
         // `on_prepaint` belongs on the plain div, before the id (same contract
         // as the preview stage). The live tile measures itself so the larger view
         // has a box to hang off, and the first measurement of a tile asks for one
