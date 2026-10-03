@@ -27,6 +27,7 @@ pub mod proc;
 pub mod render3d;
 pub mod search;
 pub mod sequence;
+pub mod spectrum;
 pub mod text;
 pub mod thumb;
 pub mod video;

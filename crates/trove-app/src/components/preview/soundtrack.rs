@@ -21,6 +21,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use gpui_kit::*;
+use trove_core::media::spectrum::{SpectrumAnalyzer, BAND_COUNT};
 use trove_core::media::video::AudioPipe;
 use rodio::cpal::traits::{DeviceTrait as _, HostTrait as _};
 
@@ -160,6 +161,10 @@ pub(super) struct AudioEngine {
     /// level meter the waveform's bounce follows. Written by the task with
     /// every clock publication, read by the preview's ticker.
     level: Arc<AtomicU32>,
+    /// Spectrum of the chunk that is audible right now — [`BAND_COUNT`]
+    /// log-spaced band values, 0..1 — published by the same stroke as the
+    /// level and sampled by the ticker at animation pace.
+    spectrum: Arc<Mutex<Vec<f32>>>,
     alive: Arc<AtomicBool>,
 }
 
@@ -186,6 +191,7 @@ impl AudioEngine {
             clock: Arc::new(Mutex::new(None)),
             sink: Arc::new(Mutex::new(None)),
             level: Arc::new(AtomicU32::new(0.0f32.to_bits())),
+            spectrum: Arc::new(Mutex::new(vec![0.0; BAND_COUNT])),
             alive: Arc::new(AtomicBool::new(true)),
         });
         engine.update(cx, |engine, cx| engine.start(cx));
@@ -202,6 +208,13 @@ impl AudioEngine {
     /// the chunk sitting at the sink's front. Zero when nothing is playing.
     pub(super) fn level(&self) -> f32 {
         f32::from_bits(self.level.load(Ordering::Relaxed))
+    }
+
+    /// The audible chunk's spectrum, [`BAND_COUNT`] values 0..1. Cloned out:
+    /// the ticker samples it at animation pace, the task rewrites it at
+    /// chunk pace.
+    pub(super) fn spectrum(&self) -> Vec<f32> {
+        self.spectrum.lock().map(|s| s.clone()).unwrap_or_default()
     }
 
     /// Play or hold the soundtrack. Applied on the sink immediately: a pause
@@ -280,6 +293,7 @@ impl AudioEngine {
         let clock = self.clock.clone();
         let sink_slot = self.sink.clone();
         let level_slot = self.level.clone();
+        let spectrum_slot = self.spectrum.clone();
         let alive = self.alive.clone();
 
         cx.spawn(async move |_weak, cx| {
@@ -289,11 +303,12 @@ impl AudioEngine {
             let mut base_ms = 0.0f64;
             let mut appended: u64 = 0;
             let mut last_published: Option<(f64, Instant)> = None;
-            // RMS per chunk appended since the pipe started, indexed by the
-            // same count `appended` uses — the level meter reads them back
-            // out by how far the sink has drained. One f32 per 100 ms of
-            // audio is ~40 KB an hour; the restart clears it.
+            // Per-chunk analysis, indexed by the same count `appended` uses —
+            // the meter and the strip read them back out by how far the sink
+            // has drained. ~2 KB per second of audio; the restart clears it.
             let mut levels: Vec<f32> = Vec::new();
+            let mut spectra: Vec<Vec<f32>> = Vec::new();
+            let mut analyzer = SpectrumAnalyzer::new(44_100.0);
             let mut seen_generation = output.generation();
             let mut force_restart = false;
             loop {
@@ -348,6 +363,7 @@ impl AudioEngine {
                     appended = 0;
                     last_published = None;
                     levels.clear();
+                    spectra.clear();
                     // The pipe is restarting: no clock to sync against until
                     // the first chunk is queued again.
                     if let Ok(mut clock) = clock.lock() {
@@ -423,6 +439,13 @@ impl AudioEngine {
                         levels.get(audible).copied().unwrap_or(0.0).to_bits(),
                         Ordering::Relaxed,
                     );
+                    // The same chunk's spectrum, for the strip's bars.
+                    if let Ok(mut slot) = spectrum_slot.lock() {
+                        *slot = spectra
+                            .get(audible)
+                            .cloned()
+                            .unwrap_or_else(|| vec![0.0; BAND_COUNT]);
+                    }
                     // `len()` and `get_pos()` are read one after the other, so
                     // a chunk boundary landing between the two reads counts
                     // one chunk twice and reports the clock a whole chunk
@@ -483,6 +506,17 @@ impl AudioEngine {
                             let rms =
                                 (energy / samples.len().max(1) as f32).sqrt().min(1.0);
                             levels.push(rms);
+                            // Mono mix into the analyzer, before the buffer
+                            // is handed to the sink and consumed.
+                            let mono: Vec<i16> = samples
+                                .as_chunks::<2>()
+                                .0
+                                .iter()
+                                .map(|pair| {
+                                    ((i32::from(pair[0]) + i32::from(pair[1])) / 2) as i16
+                                })
+                                .collect();
+                            spectra.push(analyzer.bands(&mono));
                             s.append(rodio::buffer::SamplesBuffer::new(2, 44_100, samples));
                             appended += 1;
                         }

@@ -38,6 +38,9 @@ const WAVE_H: f32 = 96.0;
 /// edge-to-edge.
 const WAVE_MAX_W: f32 = 960.0;
 
+/// Height of the spectrum strip above the transport, in pixels.
+const SPECTRUM_H: f32 = 56.0;
+
 /// Thickness of the playhead drawn over the envelope.
 const PLAYHEAD_W: f32 = 2.0;
 
@@ -55,6 +58,11 @@ const ANIM_TICK: Duration = Duration::from_millis(33);
 /// 100 ms engine readings the bounce decays to ~0.6 — a springy fall that
 /// never quite reaches the floor before the next reading lands.
 const LEVEL_DECAY: f32 = 0.85;
+
+/// How far a spectrum bar falls per animation tick, in band value — a full
+/// bar takes ~0.65 s to hit the floor, the ballistics of a classic
+/// analyzer: bars leap with a new reading and rain down between them.
+const SPECTRUM_FALL: f32 = 0.05;
 
 /// Below this the display level counts as silent and the ticker drops back
 /// to its idle pace.
@@ -94,6 +102,10 @@ pub(super) struct AudioPlayer {
     /// per-tick decay, so the bounce falls off between readings instead of
     /// stepping. Zero when nothing is audible; the ticker owns the decay.
     level: f32,
+    /// The display spectrum — [`BAND_COUNT`] bars, 0..1, risen to the latest
+    /// engine reading at once and falling linearly between readings. The
+    /// decay lives here, on scalars; the paint below only draws this frame.
+    spectrum: Vec<f32>,
     /// The strip's left edge and width in window coordinates, recorded at
     /// prepaint — the strip is sized by the stage, not a constant, so a
     /// pointer position maps to a moment only through the measured box.
@@ -165,6 +177,7 @@ impl AudioPlayer {
             duration_ms,
             wave: Wave::Pending,
             level: 0.0,
+            spectrum: vec![0.0; trove_core::media::spectrum::BAND_COUNT],
             band_left: Rc::new(Cell::new(None)),
             band_width: Rc::new(Cell::new(None)),
             band_dragging: Rc::new(Cell::new(false)),
@@ -312,13 +325,14 @@ impl AudioPlayer {
                 // The entity is gone once the preview closes, which is the only
                 // reason this can fail. The clock handle comes out of the same
                 // update because a task's `AsyncApp` cannot `read` an entity.
-                let Ok((playing, seeking, clock, engine_level)) =
+                let Ok((playing, seeking, clock, engine_level, engine_spectrum)) =
                     weak.update(cx, |this, cx| {
                         (
                             this.transport.playing,
                             this.transport.seeking,
                             this.engine.read(cx).clock(),
                             this.engine.read(cx).level(),
+                            this.engine.read(cx).spectrum(),
                         )
                     })
                 else {
@@ -338,23 +352,44 @@ impl AudioPlayer {
                 // continuous.
                 let mut animate = false;
                 let _ = weak.update(cx, |this, cx| {
+                    let mut moving = false;
                     if let Some(ms) = advanced {
                         this.transport.position_ms = ms;
                         this.level = engine_level.max(this.level * LEVEL_DECAY).min(1.0);
-                        animate = true;
-                        cx.notify();
-                    } else if this.level > LEVEL_FLOOR {
-                        // Paused, seeking, or the clock not yet republished
-                        // after a restart: relax the bounce back to the
-                        // envelope.
-                        this.level *= LEVEL_DECAY;
-                        animate = true;
-                        cx.notify();
-                    } else if this.level != 0.0 {
-                        this.level = 0.0;
-                        animate = true; // one last repaint to settle
+                        // Spectrum ballistics: a bar leaps to a new reading
+                        // the moment it lands, and rains down linearly when
+                        // the next one is lower.
+                        for (bar, &target) in this.spectrum.iter_mut().zip(&engine_spectrum) {
+                            *bar = if target > *bar {
+                                target
+                            } else {
+                                (*bar - SPECTRUM_FALL).max(target)
+                            };
+                        }
+                        moving = true;
+                    } else {
+                        if this.level > LEVEL_FLOOR {
+                            // Paused, seeking, or the clock not yet
+                            // republished after a restart: relax the bounce
+                            // back to the envelope.
+                            this.level *= LEVEL_DECAY;
+                            moving = true;
+                        } else if this.level != 0.0 {
+                            this.level = 0.0;
+                            moving = true;
+                        }
+                        // Nothing audible: every bar falls to the floor.
+                        for bar in this.spectrum.iter_mut() {
+                            if *bar > 0.0 {
+                                *bar = (*bar - SPECTRUM_FALL).max(0.0);
+                                moving = true;
+                            }
+                        }
+                    }
+                    if moving {
                         cx.notify();
                     }
+                    animate = moving;
                 });
                 sleep = if animate { ANIM_TICK } else { TICK };
             }
@@ -525,6 +560,29 @@ impl Render for AudioPlayer {
                         )
                     }),
             )
+            // The live spectrum rides just above the transport, always on
+            // the stage — the strip answers "where in the song am I", the
+            // bars answer "what does the moment sound like". Same width
+            // rules as the envelope, so the two line up; at rest it reads
+            // as an idle analyzer rather than a hole.
+            .child({
+                let spectrum = self.spectrum.clone();
+                div()
+                    .w_full()
+                    .px_6()
+                    .pb_2()
+                    .child(
+                        div().w_full().max_w(px(WAVE_MAX_W)).h(px(SPECTRUM_H)).child(
+                            gpui::canvas(
+                                |_, _, _| {},
+                                move |bounds, _, window, _| {
+                                    paint_spectrum(bounds, &spectrum, accent, window);
+                                },
+                            )
+                            .size_full(),
+                        ),
+                    )
+            })
             .child(div().px_3().py_2().bg(cx.theme().popover).child(controls))
             .into_any_element()
     }
@@ -613,6 +671,42 @@ fn paint_wave(
                 },
             ),
             ink,
+        ));
+    }
+}
+
+/// The live spectrum strip: one bar per log-spaced band, rising from the
+/// strip's floor, brighter as it climbs. The ballistics live in the
+/// ticker — bars leap to a reading and rain down between them — so this
+/// only draws the current frame, the same split the waveform strip uses:
+/// scalars on the CPU, pixels on the GPU.
+fn paint_spectrum(bounds: Bounds<Pixels>, bands: &[f32], accent: Hsla, window: &mut Window) {
+    let left: f32 = bounds.origin.x.into();
+    let top: f32 = bounds.origin.y.into();
+    let width: f32 = bounds.size.width.into();
+    let height: f32 = bounds.size.height.into();
+    let slot = width / bands.len().max(1) as f32;
+    let bar_w = (slot * 0.7).max(1.0);
+    let bottom = top + height;
+    for (i, &value) in bands.iter().enumerate() {
+        let h = value * height;
+        if h < 0.5 {
+            // A band at the floor reads as silence, not as a baseline.
+            continue;
+        }
+        let x = left + i as f32 * slot + (slot - bar_w) / 2.0;
+        window.paint_quad(gpui::fill(
+            Bounds::from_corners(
+                Point {
+                    x: px(x),
+                    y: px(bottom - h),
+                },
+                Point {
+                    x: px(x + bar_w),
+                    y: px(bottom),
+                },
+            ),
+            accent.opacity(0.35 + 0.65 * value),
         ));
     }
 }
