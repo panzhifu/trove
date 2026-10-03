@@ -6,9 +6,7 @@
 
 use super::Library;
 use crate::media::thumb;
-use crate::model::{
-    AssetKind, AssetLocation, AssetQuery, NewCollection, NewSmartCollection, Rating,
-};
+use crate::model::{AssetKind, AssetQuery, NewCollection, NewSmartCollection, Rating};
 use crate::store::{assets, collections, tags};
 use std::path::{Path, PathBuf};
 use uuid::Uuid;

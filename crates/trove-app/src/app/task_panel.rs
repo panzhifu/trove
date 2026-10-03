@@ -79,8 +79,11 @@ pub fn task_panel(controller: &Entity<LibraryController>, cx: &App) -> AnyElemen
 fn task_kind_label(kind: &TaskKind) -> SharedString {
     match kind {
         TaskKind::Import | TaskKind::CollectInbox => "task.kind_import",
+        TaskKind::Migration => "task.kind_migration",
+        TaskKind::Export => "task.kind_export",
         TaskKind::EmbeddingBackfill | TaskKind::VisualBackfill => "task.kind_embedding",
         TaskKind::AiAnalysis | TaskKind::AutoTag => "task.kind_analysis",
+        TaskKind::Transcription => "task.kind_transcription",
         TaskKind::Maintenance => "task.kind_maintenance",
         TaskKind::WatchScan => "task.kind_watch",
         TaskKind::ModelPreview => "task.kind_model",

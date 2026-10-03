@@ -71,6 +71,7 @@ fn dispatch(args: &Cli) -> Result<(), CliError> {
                 Command::Folders => read::folders(&env)?,
                 Command::Doctor => read::doctor(&env)?,
                 Command::Import(import) => write::import(&env, import, &style)?,
+                Command::Migrate(migrate) => write::migrate(&env, migrate, &style)?,
                 Command::Analyze(analyze) => write::analyze(&env, analyze, &style)?,
                 Command::Set(set) => write::set(&env, set)?,
                 Command::Tag(tag) => write::tag(&env, tag)?,

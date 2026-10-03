@@ -83,6 +83,11 @@ pub(super) fn vendor_options() -> Vec<(SharedString, SharedString)> {
         (VendorId::Anthropic, "Anthropic"),
         (VendorId::Gemini, "Google Gemini"),
         (VendorId::DashScope, "Alibaba DashScope"),
+        (VendorId::Moonshot, "Moonshot Kimi"),
+        (VendorId::Zhipu, "Zhipu GLM"),
+        (VendorId::Volcengine, "Volcengine Ark (Doubao)"),
+        (VendorId::SiliconFlow, "SiliconFlow"),
+        (VendorId::DeepSeek, "DeepSeek"),
     ]
     .into_iter()
     .map(|(id, name)| (SharedString::from(id.as_str()), SharedString::from(name)))
@@ -395,7 +400,7 @@ impl SettingsView {
 }
 
 impl Render for SettingsView {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // Pages are rebuilt per render so a live language switch (via
         // `refresh_windows`) re-localizes every title.
         let stats = self.stats.clone();
@@ -430,14 +435,10 @@ impl Render for SettingsView {
             .into_iter()
             .fold(settings, |settings, page| settings.page(page));
 
-        // Dialogs and toasts are layers the window's root view has to draw
-        // itself: without these children a `window.open_dialog` (the license
-        // activation box, the snapshot-restore confirmation) exists in state
-        // but never paints, and a `push_notification` shows nothing — which
-        // reads as "the button does nothing". The main window and the library
-        // manager both render these; the settings window must too.
-        let dialog_layer = Root::render_dialog_layer(window, cx);
-        let notification_layer = Root::render_notification_layer(window, cx);
+        // Dialogs and toasts are mounted by the component layer's `WindowState`
+        // root plugin (registered by `gpui_kit::init`), which overlays them
+        // above this window's surface; the settings view no longer draws them
+        // as children.
 
         // Client-side decorations are forced app-wide, so this window draws
         // its own (title + gpui-kit's min/max/close controls).
@@ -455,7 +456,5 @@ impl Render for SettingsView {
                 ),
             )
             .child(settings)
-            .children(dialog_layer)
-            .children(notification_layer)
     }
 }

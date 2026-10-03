@@ -13,6 +13,7 @@ gpui_kit::actions!(
         ManageLibraries,
         ImportFiles,
         ImportUrl,
+        ImportFromApp,
         Screenshot,
         ExportXmp,
         ExportRepository,

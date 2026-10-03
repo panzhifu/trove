@@ -111,9 +111,7 @@ impl PackageManifest {
 pub fn read_manifest(archive: &Path) -> Result<PackageManifest> {
     let file = std::fs::File::open(archive)?;
     let mut zip = zip::ZipArchive::new(file).map_err(|_| not_a_package())?;
-    let mut entry = zip
-        .by_name("manifest.json")
-        .map_err(|_| not_a_package())?;
+    let mut entry = zip.by_name("manifest.json").map_err(|_| not_a_package())?;
     let manifest: PackageManifest = serde_json::from_reader(&mut entry)
         .map_err(|error| Error::Validation(format!("{}: {error}", not_a_package())))?;
     manifest.validate()?;
@@ -184,11 +182,7 @@ pub fn export_library_package(
     }
 }
 
-fn build_package(
-    library_dir: &Path,
-    library_name: &str,
-    dest: &Path,
-) -> Result<RepoExportReport> {
+fn build_package(library_dir: &Path, library_name: &str, dest: &Path) -> Result<RepoExportReport> {
     let snapshot = vacuum_snapshot(&library_dir.join("library.db"))?;
     let result = write_package(library_dir, library_name, dest, &snapshot);
     let _ = std::fs::remove_file(&snapshot);
@@ -475,11 +469,7 @@ fn linked_entry(rel: &Path) -> Option<(uuid::Uuid, String)> {
 /// Pass-one unpack: `library.db`, `library.json` and the `media/` tree land
 /// in the library directory, everything else waits. Returns whether the
 /// entry was written.
-fn unpack_entry(
-    entry: &mut zip::read::ZipFile<'_>,
-    rel: &Path,
-    dest_dir: &Path,
-) -> Result<bool> {
+fn unpack_entry(entry: &mut zip::read::ZipFile<'_>, rel: &Path, dest_dir: &Path) -> Result<bool> {
     let mut components = rel.components();
     let top = components.next().expect("enclosed_name is non-empty");
     let keep = match top.as_os_str().to_str() {
@@ -659,11 +649,11 @@ mod tests {
 
     /// One 1×1 PNG, the smallest file the importer will probe.
     const PNG_1X1: &[u8] = &[
-        0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48,
-        0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00,
-        0x00, 0x1F, 0x15, 0xC4, 0x89, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x44, 0x41, 0x54, 0x78,
-        0x9C, 0x63, 0x00, 0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0D, 0x0A, 0x2D, 0xB4, 0x00,
-        0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+        0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44,
+        0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1F,
+        0x15, 0xC4, 0x89, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9C, 0x63, 0x00,
+        0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0D, 0x0A, 0x2D, 0xB4, 0x00, 0x00, 0x00, 0x00, 0x49,
+        0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
     ];
 
     /// Two plain text files with distinct bytes — distinct, because two
@@ -676,10 +666,7 @@ mod tests {
     /// one trashed stored asset. The sources live in the sandbox's `sources/`
     /// directory — outside the library, where a user's linked files are.
     /// Returns the ids of the three records.
-    fn seed_library(
-        sandbox: &Sandbox,
-        slug: &str,
-    ) -> (uuid::Uuid, uuid::Uuid, uuid::Uuid) {
+    fn seed_library(sandbox: &Sandbox, slug: &str) -> (uuid::Uuid, uuid::Uuid, uuid::Uuid) {
         let root = sandbox.library_dir(slug);
         let sources = sandbox.sources_dir();
         std::fs::create_dir_all(&sources).unwrap();
@@ -692,12 +679,16 @@ mod tests {
 
         // Preferences on disk, so the package has one to carry.
         std::fs::write(root.join("library.json"), "{}").unwrap();
-        let lib = crate::library::Library::open(&root, &sandbox.cache_dir(slug)).unwrap();
+        let lib = crate::library::Library::open(&root, sandbox.cache_dir(slug)).unwrap();
         let stored = lib
             .import_into_store(std::slice::from_ref(&stored_src), None)
             .unwrap();
-        let linked = lib.link_files(&[linked_src.clone()], None).unwrap();
-        let gone = lib.link_files(&[gone_src.clone()], None).unwrap();
+        let linked = lib
+            .link_files(std::slice::from_ref(&linked_src), None)
+            .unwrap();
+        let gone = lib
+            .link_files(std::slice::from_ref(&gone_src), None)
+            .unwrap();
         std::fs::remove_file(&gone_src).unwrap();
 
         let stored_id = stored.imported[0].asset_id;
@@ -730,8 +721,7 @@ mod tests {
         seed_library(&sandbox, "work");
 
         let dest = sandbox.root.join("work.trove");
-        let report =
-            export_library_package(&dir, "Work", &dest).unwrap();
+        let report = export_library_package(&dir, "Work", &dest).unwrap();
         assert_eq!(report.path, dest);
         assert_eq!(report.linked_packed, 1, "one source present, one gone");
         assert_eq!(report.linked_missing, 1);
@@ -740,10 +730,15 @@ mod tests {
         let mut archive = zip::ZipArchive::new(file).unwrap();
         let names = entry_names(&mut archive);
         for expected in ["manifest.json", "library.db", "library.json"] {
-            assert!(names.iter().any(|n| n == expected), "missing {expected}: {names:?}");
+            assert!(
+                names.iter().any(|n| n == expected),
+                "missing {expected}: {names:?}"
+            );
         }
         assert!(
-            names.iter().any(|n| n.starts_with("media/") && n.ends_with(".png")),
+            names
+                .iter()
+                .any(|n| n.starts_with("media/") && n.ends_with(".png")),
             "the stored blob rides along: {names:?}"
         );
         assert!(
@@ -752,11 +747,8 @@ mod tests {
         );
 
         // The manifest names the library and the counts it was taken with.
-        let manifest: PackageManifest = serde_json::from_slice(&read_entry(
-            &mut archive,
-            "manifest.json",
-        ))
-        .unwrap();
+        let manifest: PackageManifest =
+            serde_json::from_slice(&read_entry(&mut archive, "manifest.json")).unwrap();
         manifest.validate().unwrap();
         assert_eq!(manifest.library.name, "Work");
         assert_eq!(manifest.library.slug, "work");
@@ -828,8 +820,7 @@ mod tests {
         );
         assert_eq!(report.missing, 1, "the source that was already gone");
 
-        let lib = crate::library::Library::open(&installed, &sandbox.cache_dir("imported"))
-            .unwrap();
+        let lib = crate::library::Library::open(&installed, sandbox.cache_dir("imported")).unwrap();
         let stored = lib.asset(stored_id).unwrap().unwrap();
         assert!(
             matches!(stored.location(), AssetLocation::Stored { .. }),
@@ -840,9 +831,15 @@ mod tests {
 
         let linked = lib.asset(linked_id).unwrap().unwrap();
         let AssetLocation::Stored { rel_path } = linked.location() else {
-            panic!("the packed source must come back stored: {:?}", linked.location());
+            panic!(
+                "the packed source must come back stored: {:?}",
+                linked.location()
+            );
         };
-        assert_eq!(std::fs::read(installed.join(&rel_path)).unwrap(), LINKED_BYTES);
+        assert_eq!(
+            std::fs::read(installed.join(&rel_path)).unwrap(),
+            LINKED_BYTES
+        );
 
         let gone = lib.asset(gone_id).unwrap().unwrap();
         assert!(
@@ -872,11 +869,13 @@ mod tests {
         assert_eq!(report.materialized, 0);
         assert_eq!(report.missing, 1, "the source that was gone before export");
 
-        let lib = crate::library::Library::open(&installed, &sandbox.cache_dir("imported"))
-            .unwrap();
+        let lib = crate::library::Library::open(&installed, sandbox.cache_dir("imported")).unwrap();
         let linked = lib.asset(linked_id).unwrap().unwrap();
         let AssetLocation::Linked { source_path } = linked.location() else {
-            panic!("the surviving source must stay linked: {:?}", linked.location());
+            panic!(
+                "the surviving source must stay linked: {:?}",
+                linked.location()
+            );
         };
         assert_eq!(std::fs::read(&source_path).unwrap(), LINKED_BYTES);
     }
@@ -901,8 +900,7 @@ mod tests {
             let mut zip = zip::ZipWriter::new(file);
             zip.start_file(
                 "manifest.json",
-                SimpleFileOptions::default()
-                    .compression_method(zip::CompressionMethod::Deflated),
+                SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated),
             )
             .unwrap();
             std::io::Write::write_all(

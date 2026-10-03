@@ -42,24 +42,11 @@ use crate::media::import::{self, ImportReport, ImportStorage};
 use crate::model::AssetPatch;
 use crate::store::assets;
 
-/// Files per transaction. Bigger batches amortize syncs further but widen
-/// the window between progress updates and hold write locks longer. The
-/// default is calibrated on a real terminal (see `docs/IMPORT-PIPELINE.md`
-/// §4); `TROVE_COMMIT_BATCH` overrides it the same way `TROVE_STAGE_THREADS`
-/// pins the pool width.
+/// Files per transaction — one definition, shared with the synchronous
+/// commit path (`media::import::commit_staged_all`).
 fn commit_batch() -> usize {
-    static BATCH: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *BATCH.get_or_init(|| {
-        std::env::var("TROVE_COMMIT_BATCH")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .filter(|v| (1..=4096).contains(v))
-            .unwrap_or(COMMIT_BATCH_DEFAULT)
-    })
+    import::commit_batch()
 }
-
-/// The calibrated default for [`commit_batch`].
-const COMMIT_BATCH_DEFAULT: usize = 64;
 
 /// How many files are staged before a round of commits.
 ///
@@ -121,6 +108,12 @@ pub struct ImportOptions {
     /// sources Trove owns and is about to delete.
     pub storage: ImportStorage,
     pub source: ImportSource,
+    /// Run the strict pre-gate (`precheck::partition_importable`) over a
+    /// user import: a file the library provably holds *completely* is
+    /// dropped before staging. On for plain drops and conversion output;
+    /// off for the migration job, whose re-run re-asserts the carried
+    /// metadata through the pipeline and must not lean on the gate.
+    pub pre_gate: bool,
 }
 
 impl ImportOptions {
@@ -339,6 +332,23 @@ pub fn run(
         );
     }
 
+    // The user import's own gate: drop what the library provably holds
+    // completely (hash-cache authoritative + a complete record), so a
+    // repeat drop costs a stat and a lookup instead of a full pipeline run.
+    // A record missing anything staging would produce keeps its repair path.
+    if options.pre_gate && matches!(options.source, ImportSource::Paths { .. }) {
+        let (rest, dropped) =
+            crate::media::precheck::partition_importable(&conn, &paths, &options.cache_root);
+        report.already_imported += dropped;
+        tracing::debug!(
+            offered = paths.len(),
+            dropped,
+            fresh = rest.len(),
+            "import pre-gate (complete records)"
+        );
+        paths = rest;
+    }
+
     let total = paths.len() as u64;
     ctx.set_total(total);
 
@@ -460,39 +470,12 @@ fn commit_chunk(
     let mut tx = conn
         .transaction()
         .map_err(|e| crate::error::Error::Db(format!("begin batch: {e}")))?;
-    let mut imported = Vec::new();
-    let mut skipped = Vec::new();
-    for item in chunk {
-        match item {
-            Ok(file) => {
-                let sp = tx
-                    .savepoint()
-                    .map_err(|e| crate::error::Error::Db(format!("savepoint: {e}")))?;
-                match import::commit_staged(&sp, into_collection, file) {
-                    Ok(imported_item) => {
-                        stamp_collect_source(&sp, sidecars, file, &imported_item);
-                        sp.commit()
-                            .map_err(|e| crate::error::Error::Db(format!("commit file: {e}")))?;
-                        imported.push(imported_item);
-                    }
-                    Err(e) => {
-                        // Dropped savepoint = rolled back file.
-                        skipped.push(import::ImportSkip {
-                            path: file.path.clone(),
-                            reason: e.to_string(),
-                        });
-                    }
-                }
-            }
-            Err(skip) => skipped.push(skip.clone()),
-        }
-    }
+    let post = |conn: &Connection, file: &import::StagedFile, item: &import::ImportItem| {
+        stamp_collect_source(conn, sidecars, file, item);
+    };
+    import::commit_batch_tx(&mut tx, chunk, into_collection, Some(&post), report)?;
     tx.commit()
         .map_err(|e| crate::error::Error::Db(format!("commit batch: {e}")))?;
-    // Only on a successful commit do the results enter the report — a failed
-    // commit rolls the batch back, so its files must not read as imported.
-    report.imported.extend(imported);
-    report.skipped.extend(skipped);
     Ok(())
 }
 
@@ -564,6 +547,7 @@ mod tests {
         let options = ImportOptions {
             data_root: root.path().to_path_buf(),
             cache_root: root.path().join("cache"),
+            pre_gate: true,
             storage: ImportStorage::Link,
             source: ImportSource::Paths {
                 paths,
@@ -600,6 +584,7 @@ mod tests {
         let options = ImportOptions {
             data_root: root.path().to_path_buf(),
             cache_root: root.path().join("cache"),
+            pre_gate: true,
             storage: ImportStorage::Link,
             source: ImportSource::Paths {
                 paths,
@@ -762,6 +747,7 @@ mod tests {
         let options = ImportOptions {
             data_root: root.path().to_path_buf(),
             cache_root: root.path().join("cache"),
+            pre_gate: true,
             storage: ImportStorage::Link,
             source: ImportSource::Paths {
                 paths: vec![src.clone()],
@@ -792,6 +778,7 @@ mod tests {
         let options = ImportOptions {
             data_root: root.path().to_path_buf(),
             cache_root: root.path().join("cache"),
+            pre_gate: true,
             storage: ImportStorage::Link,
             source: ImportSource::Paths {
                 paths,
@@ -820,6 +807,7 @@ mod tests {
         let options = ImportOptions {
             data_root: root.path().to_path_buf(),
             cache_root: root.path().join("cache"),
+            pre_gate: true,
             storage: ImportStorage::Link,
             source: ImportSource::CollectInbox {
                 items: vec![(file.clone(), Some(sidecar.clone()))],
@@ -891,6 +879,7 @@ mod tests {
         let options = ImportOptions {
             data_root: root.path().to_path_buf(),
             cache_root: root.path().join("cache"),
+            pre_gate: true,
             storage: ImportStorage::Link,
             source: ImportSource::Paths {
                 paths: vec![file.clone()],
@@ -905,6 +894,7 @@ mod tests {
         let options = ImportOptions {
             data_root: root.path().to_path_buf(),
             cache_root: root.path().join("cache"),
+            pre_gate: true,
             storage: ImportStorage::Link,
             source: ImportSource::CollectInbox {
                 items: vec![(file.clone(), None)],
@@ -923,10 +913,12 @@ mod tests {
         assert_eq!(all.items.len(), 1, "no duplicate row appeared");
     }
 
-    /// A folder dropped a second time re-parses — the pre-check is the
-    /// watched folder's gate, not the user's — and the commit folds every
-    /// file back into the record it already has. The user pays a full read
-    /// for the repeat; what they never get is a second row per file.
+    /// A folder dropped a second time is gated, not re-parsed: every file's
+    /// record is complete (the pipeline mined it, the thumbnail is cached,
+    /// the visual signature exists), so the strict pre-gate drops all of
+    /// them for the price of a stat and a lookup. What the user never gets
+    /// is a second row per file — that was true before the gate and is the
+    /// reason it can be this strict.
     #[test]
     fn a_second_drop_of_the_same_folder_folds_into_its_records() {
         let root = Temp::new("task-redrop");
@@ -942,6 +934,7 @@ mod tests {
         let options = ImportOptions {
             data_root: root.path().to_path_buf(),
             cache_root: root.path().join("cache"),
+            pre_gate: true,
             storage: ImportStorage::Link,
             source: ImportSource::Paths {
                 paths: vec![src.clone()],
@@ -954,23 +947,99 @@ mod tests {
         assert_eq!(first.report.already_imported, 0);
 
         let second = run(&options, &JobContext::for_tests(false)).unwrap();
+        assert_eq!(second.report.imported_count(), 0, "{:?}", second.report);
         assert_eq!(
-            second.report.imported_count(),
-            4,
-            "re-parsed, not skipped at the door: {:?}",
+            second.report.already_imported, 4,
+            "every file gated on its complete record: {:?}",
             second.report
         );
-        assert_eq!(second.report.already_imported, 0);
         assert!(second.report.skipped.is_empty());
-        assert!(
-            second.report.imported.iter().all(|item| item.reused),
-            "every repeat folds into the record it already has: {:?}",
-            second.report
-        );
 
         let store = crate::store::Store::open(&options.db_path()).unwrap();
         let all = assets::query(store.conn(), &crate::model::AssetQuery::live()).unwrap();
         assert_eq!(all.items.len(), 4, "no duplicate rows appeared");
+    }
+
+    /// The gate's one promise: a record missing anything the pipeline would
+    /// produce never gets gated. A hand-inserted row with no dimensions and
+    /// no visual signature — the shape of a row the repair story exists for
+    /// — reaches staging, folds into its record at the commit, and comes out
+    /// repaired.
+    #[test]
+    fn an_incomplete_record_keeps_its_repair_path_through_the_gate() {
+        use crate::media::hash;
+        use crate::model::{AssetKind, ContentHash, test_asset};
+
+        let root = Temp::new("task-gate-repair");
+        let src = root.path().join("src");
+        fs::create_dir_all(&src).unwrap();
+        let bytes: Vec<u8> = [PNG_1X1, b"gate"].concat();
+        let file = src.join("img.png");
+        fs::write(&file, &bytes).unwrap();
+        let hash = hash::hash_bytes(&bytes);
+
+        let db = root.path().join("library.db");
+        let store = crate::store::Store::open(&db).unwrap();
+        let mut asset = test_asset("img.png", AssetKind::Image, uuid::Uuid::new_v4());
+        asset.size_bytes = bytes.len() as u64;
+        asset.content_hash = Some(ContentHash::from_hasher(hash.clone()));
+        // No width, no height, no visual signature: incomplete by
+        // construction.
+        assets::insert(store.conn(), &asset).unwrap();
+        drop(store);
+
+        let options = ImportOptions {
+            data_root: root.path().to_path_buf(),
+            cache_root: root.path().join("cache"),
+            pre_gate: true,
+            storage: ImportStorage::Link,
+            source: ImportSource::Paths {
+                paths: vec![file.clone()],
+                into_collection: None,
+            },
+        };
+        let outcome = run(&options, &JobContext::for_tests(false)).unwrap();
+        assert_eq!(
+            outcome.report.imported_count(),
+            1,
+            "the incomplete record did not gate the file: {:?}",
+            outcome.report
+        );
+        assert!(outcome.report.imported[0].reused);
+
+        let store = crate::store::Store::open(&db).unwrap();
+        let all = assets::query(store.conn(), &crate::model::AssetQuery::live()).unwrap();
+        assert_eq!(
+            all.items.len(),
+            1,
+            "the record was repaired, not duplicated"
+        );
+        assert!(all.items[0].width.is_some(), "the dimensions came back");
+    }
+
+    /// A library with nothing in it gates nothing — the gate only ever
+    /// drops on proof, and an empty library has none to give.
+    #[test]
+    fn the_gate_never_drops_what_the_library_cannot_prove() {
+        let root = Temp::new("task-gate-empty");
+        let src = root.path().join("src");
+        fs::create_dir_all(&src).unwrap();
+        let file = src.join("img.png");
+        fs::write(&file, PNG_1X1).unwrap();
+
+        let options = ImportOptions {
+            data_root: root.path().to_path_buf(),
+            cache_root: root.path().join("cache"),
+            pre_gate: true,
+            storage: ImportStorage::Link,
+            source: ImportSource::Paths {
+                paths: vec![file],
+                into_collection: None,
+            },
+        };
+        let outcome = run(&options, &JobContext::for_tests(false)).unwrap();
+        assert_eq!(outcome.report.imported_count(), 1);
+        assert_eq!(outcome.report.already_imported, 0);
     }
 
     /// A file that changed since the last import is *not* waved through by the
@@ -988,6 +1057,7 @@ mod tests {
         let options = ImportOptions {
             data_root: root.path().to_path_buf(),
             cache_root: root.path().join("cache"),
+            pre_gate: true,
             storage: ImportStorage::Link,
             source: ImportSource::Paths {
                 paths: vec![file.clone()],

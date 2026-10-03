@@ -103,6 +103,19 @@ pub(crate) fn asset_context_menu(
             }),
         )
         .item(
+            PopupMenuItem::new(rust_i18n::t!("transcribe.menu").to_string()).on_click({
+                let controller = controller.clone();
+                move |_, window, cx| {
+                    crate::library::jobs::start_transcription_app(
+                        &controller,
+                        crate::library::jobs::TranscribeTarget::Selection,
+                        window,
+                        cx,
+                    );
+                }
+            }),
+        )
+        .item(
             PopupMenuItem::new(if favorite {
                 rust_i18n::t!("workspace.remove_from_favorites").to_string()
             } else {
@@ -174,6 +187,28 @@ pub(crate) fn asset_context_menu(
             open_with_menu,
         ));
         menu = menu.separator();
+    }
+    // Export: hand the originals — or converted copies — to a folder the
+    // user picks. Every kind is exportable (images and videos take format
+    // targets, the rest copies as-is), so the entry is unconditional
+    // outside the trash.
+    {
+        let ctl_export = controller.clone();
+        menu = menu
+            .item(
+                PopupMenuItem::new(rust_i18n::t!("workspace.export").to_string()).on_click(
+                    move |_, window, cx| {
+                        let ids = ctl_export.read(cx).action_targets(asset_id);
+                        crate::dialogs::export::ExportDialog::open(
+                            window,
+                            cx,
+                            ctl_export.clone(),
+                            ids,
+                        );
+                    },
+                ),
+            )
+            .separator();
     }
     // Fonts: system-level install / uninstall right from the grid, same
     // user-level mechanism as the Inspector button.

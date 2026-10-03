@@ -70,6 +70,12 @@ pub enum Retryable {
         request: trove_core::tasks::ai_analysis::AiAnalysisRunRequest,
         undo: bool,
     },
+    Export {
+        options: trove_core::tasks::export::ExportOptions,
+    },
+    Transcription {
+        request: trove_core::tasks::transcription::TranscribeRunRequest,
+    },
 }
 
 /// The kind of a [`Retryable`], used as its map key.
@@ -79,6 +85,8 @@ pub fn retryable_kind(retryable: &Retryable) -> trove_core::tasks::TaskKind {
         Retryable::Import { kind, .. } => kind.clone(),
         Retryable::Embedding => TaskKind::EmbeddingBackfill,
         Retryable::Analysis { .. } => TaskKind::AiAnalysis,
+        Retryable::Export { .. } => TaskKind::Export,
+        Retryable::Transcription { .. } => TaskKind::Transcription,
     }
 }
 
@@ -145,6 +153,34 @@ pub enum AnalysisProbe {
 }
 
 impl AnalysisProbe {
+    /// Whether a test is in flight (the settings button guards on this).
+    pub fn is_running(&self) -> bool {
+        matches!(self, Self::Running)
+    }
+}
+
+/// Outcome of the last transcription-endpoint connection test (Settings ▸ AI).
+///
+/// A sibling of [`AnalysisProbe`] rather than a reuse of it: the transcriber
+/// answers with words too, but from *audio*, and it is configured separately
+/// — the probe sends a synthesized second of silence, so an `Ok` reply is
+/// often empty, which is itself the proof the endpoint parsed the upload.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum TranscriptionProbe {
+    /// Never run, or cleared by a library swap.
+    #[default]
+    Idle,
+    /// A test is in flight — the button is disabled meanwhile.
+    Running,
+    /// The recogniser answered. `reply` may be empty: the probe uploads
+    /// silence, and an empty transcript from it is success, not failure.
+    Ok { reply: String },
+    /// Unreachable, refused, or misconfigured. The message is the reason the
+    /// user has to read: this surfaces without a log window.
+    Failed { message: String },
+}
+
+impl TranscriptionProbe {
     /// Whether a test is in flight (the settings button guards on this).
     pub fn is_running(&self) -> bool {
         matches!(self, Self::Running)
@@ -334,6 +370,7 @@ pub struct LibraryController {
     /// Same reasoning as [`Self::ai_probe`]: one call against a server the
     /// user typed in, answered inline on the page, no job slot taken.
     pub analysis_probe: AnalysisProbe,
+    pub transcription_probe: TranscriptionProbe,
     /// The embedding of the committed search term, when one has been fetched
     /// (`jobs::request_query_embedding_app` runs after Enter). The workspace
     /// hands it to the query, which fuses it into the text ranking for as
@@ -430,6 +467,7 @@ impl LibraryController {
             busy: false,
             ai_probe: AiProbe::Idle,
             analysis_probe: AnalysisProbe::Idle,
+            transcription_probe: TranscriptionProbe::Idle,
             query_vector: None,
             search_tiers: resolved_search_tiers(&config),
             ai_plan: None,
@@ -915,6 +953,7 @@ impl LibraryController {
         // is no longer open.
         self.ai_probe = AiProbe::Idle;
         self.analysis_probe = AnalysisProbe::Idle;
+        self.transcription_probe = TranscriptionProbe::Idle;
         // Same for the query embedding and the search plan: they were
         // computed against the previous library's model rows and index.
         self.query_vector = None;
@@ -1232,6 +1271,7 @@ mod tests {
         // Start a real import job the way the job bridge does, and register
         // it on the controller the same way.
         let options = trove_core::tasks::import::ImportOptions {
+            pre_gate: true,
             data_root: root.clone(),
             cache_root: root.join("cache"),
             storage: trove_core::media::import::ImportStorage::Link,

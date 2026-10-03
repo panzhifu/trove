@@ -22,6 +22,11 @@ pub enum StructuredOutputMode {
 }
 
 pub struct OpenAiAdapter {
+    /// Whose key and endpoint this adapter fronts. Several mainstream
+    /// vendors (Moonshot, Zhipu, Volcengine, SiliconFlow) speak this exact
+    /// wire shape, so they share the adapter and differ only here — the
+    /// identity the analysis markers are filed under alongside the model.
+    vendor: VendorId,
     base_url: String,
     api_key: String,
     model: String,
@@ -30,6 +35,13 @@ pub struct OpenAiAdapter {
 
 impl OpenAiAdapter {
     pub fn new(base_url: &str, api_key: &str, model: &str) -> Result<Self> {
+        Self::new_for(VendorId::OpenAI, base_url, api_key, model)
+    }
+
+    /// The same adapter fronting another OpenAI-compatible vendor: request
+    /// shape, image encoding and the structured-output fallbacks are
+    /// identical across those servers; only the identity differs.
+    pub fn new_for(vendor: VendorId, base_url: &str, api_key: &str, model: &str) -> Result<Self> {
         let base_url = base_url.trim().trim_end_matches('/').to_string();
         if base_url.is_empty() {
             return Err(Error::Validation("no base URL".into()));
@@ -44,6 +56,7 @@ impl OpenAiAdapter {
             return Err(Error::Validation("no model name".into()));
         }
         Ok(Self {
+            vendor,
             base_url,
             api_key: api_key.trim().to_string(),
             model: model.to_string(),
@@ -91,7 +104,7 @@ impl OpenAiAdapter {
                         "type": "object",
                         "additionalProperties": false,
                         "properties": {
-                            "description": { "type": ["string", "null"], "description": format!("Description in {language}, or null.") },
+                            "description": { "type": ["string", "null"], "description": format!("Short description in {language}; null only when there is nothing to describe.") },
                             "tags": { "type": "array", "items": { "type": "string" }, "description": format!("Keywords in {language}.") },
                             "rating": { "type": ["integer", "null"], "description": "Aesthetic score 1-5, or null." },
                         },
@@ -107,7 +120,7 @@ impl OpenAiAdapter {
 
 impl VendorAdapter for OpenAiAdapter {
     fn vendor(&self) -> VendorId {
-        VendorId::OpenAI
+        self.vendor
     }
 
     fn model_version(&self) -> &str {

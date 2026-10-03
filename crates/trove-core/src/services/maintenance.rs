@@ -31,7 +31,12 @@ pub struct RemineReport {
 /// those stay in every sweep and get re-read. Repeating a header read is the
 /// honest cost: a "backfilled" marker would have to claim knowledge the facts
 /// themselves do not carry.
-fn remine_complete(asset: &crate::model::Asset, kind: AssetKind) -> bool {
+/// Whether a record already carries everything the import pipeline's mine
+/// stage would produce for its kind. Audio and fonts carry the real
+/// predicate (the two miners that grew fields after launch); other kinds
+/// read as complete — the gate that borrows this function adds the
+/// media-shape checks (dimensions, thumbnail, visual signature) itself.
+pub(crate) fn remine_complete(asset: &crate::model::Asset, kind: AssetKind) -> bool {
     match kind {
         AssetKind::Audio => {
             asset.facts.audio.sample_rate.is_some() || asset.facts.audio.channels.is_some()

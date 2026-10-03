@@ -117,7 +117,7 @@ pub fn import_paths_app_into(
 /// The free tier's import gate: `true` when this install is not licensed and
 /// the open library already holds [`crate::license::FREE_ASSET_CAP`] live
 /// assets. The caller decides how loudly to say so.
-fn cap_refused(library: &trove_core::library::Library) -> bool {
+pub(super) fn cap_refused(library: &trove_core::library::Library) -> bool {
     !crate::license::LicenseGate::for_current().permits_import(library.asset_count())
 }
 
@@ -126,7 +126,7 @@ fn cap_refused(library: &trove_core::library::Library) -> bool {
 /// pointing at the decision is the conversion moment. The write is guarded on
 /// equality, so a background pump ticking over a full library does not repaint
 /// the UI every interval; existing assets are never touched by the gate.
-fn set_cap_notice(controller: &Entity<LibraryController>, cx: &mut App) {
+pub(super) fn set_cap_notice(controller: &Entity<LibraryController>, cx: &mut App) {
     controller.update(cx, |ctl, cx| {
         let message = rust_i18n::t!(
             "workspace.import_cap_reached",
@@ -191,6 +191,7 @@ fn start_paths_import(
             paths.len()
         };
         let options = ImportOptions {
+            pre_gate: true,
             data_root: ctl.library.root().to_path_buf(),
             cache_root: ctl.library.cache().to_path_buf(),
             storage,
@@ -269,6 +270,7 @@ pub fn collect_inbox_app(
         cap_reached = cap_refused(&ctl.library);
         let total = items.len();
         let options = ImportOptions {
+            pre_gate: true,
             data_root: ctl.library.root().to_path_buf(),
             cache_root: ctl.library.cache().to_path_buf(),
             // A collected file lives in the incoming directory, which is not a

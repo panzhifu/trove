@@ -219,6 +219,21 @@ pub(crate) struct AssetPreviewData {
     pub(crate) animated: Option<gpui_kit::ImageSource>,
     /// Family name probed at import, set only for fonts gpui can register.
     pub(crate) font_family: Option<String>,
+    /// The language the font file declares (`font_language` fact), parsed to
+    /// a preview language — the initial value of the viewer's language
+    /// picker. `None` when the file's evidence is inconclusive.
+    pub(crate) font_declared_language: Option<font::FontPreviewLanguage>,
+    /// The font file's `wght` axis as bounds, when it is variable — what the
+    /// weight picker offers and what the rendered weight clamps to.
+    pub(crate) font_variable_weight: Option<(u16, u16)>,
+    /// The face's own (default-instance) weight, the value the text system
+    /// renders without any patched registration.
+    pub(crate) font_base_weight: Option<u16>,
+    /// The font viewer's session state — the picked preview language and the
+    /// text it resolves to — attached by the preview panel exactly like
+    /// [`Self::exposed`]: resolved once per mutation, cloned on the paint
+    /// path. `None` until a live font preview attaches it.
+    pub(crate) font_preview: Option<font::FontPreviewState>,
     /// Media dimensions, for the inspector card's aspect-fit height.
     pub(crate) dimensions: Option<(u32, u32)>,
     /// Cache root plus content hash, which is everything the waveform cache
@@ -348,6 +363,20 @@ impl AssetPreviewData {
             exposed: None,
             animated,
             font_family: asset.facts.font.family.clone(),
+            font_declared_language: asset
+                .facts
+                .font
+                .language
+                .as_deref()
+                .and_then(font::FontPreviewLanguage::parse_declared),
+            font_variable_weight: asset
+                .facts
+                .font
+                .variable_weight
+                .as_deref()
+                .and_then(font::parse_variable_weight),
+            font_base_weight: asset.facts.font.weight,
+            font_preview: None,
             dimensions: asset.width.zip(asset.height),
             duration_ms: asset.duration_ms,
             wave_cache: asset
@@ -594,9 +623,18 @@ impl AssetPreviewPanel {
         };
         // A font whose specimen registers zooms the text itself; one that
         // falls back to its thumbnail still zooms only if that still has
-        // recorded dimensions.
+        // recorded dimensions. The live one also gets its viewer state here —
+        // language from the file's own declaration, text resolved once — so
+        // the paint path never reads the config.
         let font_live =
             data.kind == trove_core::model::AssetKind::Font && font::specimen_available(&data, cx);
+        if font_live {
+            data.font_preview = Some(font::FontPreviewState::initial(
+                data.font_declared_language,
+                data.font_variable_weight,
+                data.font_base_weight,
+            ));
+        }
         // The part probe runs only for an `.exr` original: everything else has
         // no parts, and the selector stays hidden without reading a header.
         let parts_probe = data.original.clone().filter(|path| {
@@ -690,6 +728,78 @@ impl AssetPreviewPanel {
             return false;
         }
         self.data.dimensions.is_some() || self.font_live
+    }
+
+    /// Switch the font specimen's preview language; the text re-resolves to
+    /// that language's own sample (or the user's saved words for it).
+    pub(crate) fn set_font_language(
+        &mut self,
+        language: font::FontPreviewLanguage,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(state) = &mut self.data.font_preview {
+            if state.language == language {
+                return;
+            }
+            *state = state.clone().switched(language);
+            cx.notify();
+        }
+    }
+
+    /// Store the user's sample words for the current preview language and
+    /// show them. Empty input means "back to the built-in sample".
+    pub(crate) fn set_font_custom_text(&mut self, text: String, cx: &mut Context<Self>) {
+        let Some(state) = &mut self.data.font_preview else {
+            return;
+        };
+        let mut config = trove_core::config::AppConfig::load();
+        config
+            .font_preview
+            .set_custom_text(state.language.as_str(), &text);
+        crate::app::settings_write::note(config.save(), "font preview text");
+        state.text = font::initial_text(state.language);
+        cx.notify();
+    }
+
+    /// Render the specimen at `weight`. For a variable font that means
+    /// registering the patched face first, so a refused registration keeps
+    /// the old weight instead of dropping the preview to its thumbnail;
+    /// for a static face the picker is hidden and this is never called.
+    pub(crate) fn set_font_weight(&mut self, weight: u16, cx: &mut Context<Self>) {
+        let Some(state) = &mut self.data.font_preview else {
+            return;
+        };
+        if state.weight == weight {
+            return;
+        }
+        let registered = self.data.font_family.as_deref().is_some_and(|family| {
+            crate::panels::common::ensure_font_at_weight(
+                family,
+                self.data.original.as_deref(),
+                weight,
+                cx,
+            )
+        });
+        if !registered {
+            return;
+        }
+        state.weight = weight;
+        cx.notify();
+    }
+
+    /// Drop the user's sample words for the current language: the built-in
+    /// sample takes the stage back.
+    pub(crate) fn reset_font_custom_text(&mut self, cx: &mut Context<Self>) {
+        let Some(state) = &mut self.data.font_preview else {
+            return;
+        };
+        let mut config = trove_core::config::AppConfig::load();
+        config
+            .font_preview
+            .set_custom_text(state.language.as_str(), "");
+        crate::app::settings_write::note(config.save(), "font preview text reset");
+        state.text = font::initial_text(state.language);
+        cx.notify();
     }
 
     /// The store record behind the preview, for the title-bar tools.
@@ -915,10 +1025,18 @@ impl AssetPreviewPanel {
         }
     }
 
-    /// Handle a scroll-wheel event: zoom toward the cursor, like the 3D
-    /// model viewport does.
+    /// Handle a scroll-wheel event. Over a live font specimen the wheel is
+    /// the *font size* — for text, sizing is zooming, and the block pans
+    /// when it outgrows the stage — so the zoom gesture never touches it.
+    /// Everything else zooms toward the cursor, like the 3D model viewport.
     fn handle_scroll_wheel(&mut self, event: &ScrollWheelEvent, cx: &mut Context<Self>) {
         if !self.zoomable() {
+            return;
+        }
+        if self.font_live {
+            if font::step_size(&mut self.data, event) {
+                cx.notify();
+            }
             return;
         }
         let (vw, vh) = self.viewport_size(cx);
@@ -950,9 +1068,11 @@ impl AssetPreviewPanel {
     fn fitted_base(&self, vw: f32, vh: f32) -> Option<(f32, f32)> {
         let area = ((vw - STAGE_PAD).max(60.0), (vh - STAGE_PAD).max(60.0));
         if self.font_live {
-            let (tw, th, _) = font::specimen_metrics();
-            let scale = (area.0 / tw).min(area.1 / th);
-            return Some((tw * scale, th * scale));
+            // Exact, not fitted: the size is the user's dial now, so an
+            // oversized specimen pans instead of shrinking back to fit.
+            // (`area` is unused on this branch; the tail needs it.)
+            let (tw, th, _) = font::metrics_for(&self.data);
+            return Some((tw, th));
         }
         let (iw, ih) = self.data.dimensions?;
         fit_box((iw as f32, ih as f32), area)
@@ -998,9 +1118,16 @@ impl AssetPreviewPanel {
         self.dragging = false;
     }
 
-    /// Double click: back to the fitted view, the 3D viewport's reset.
+    /// Double click: back to the fitted view, the 3D viewport's reset. A
+    /// live specimen also gives its font size back — the wheel's dial is
+    /// part of what "as authored" means for text.
     fn reset_zoom(&mut self, cx: &mut Context<Self>) {
         self.pan.reset();
+        if self.font_live
+            && let Some(state) = &mut self.data.font_preview
+        {
+            state.size = font::default_specimen_size();
+        }
         cx.notify();
     }
 
@@ -1022,7 +1149,7 @@ impl AssetPreviewPanel {
         let content: Option<AnyElement> = if self.font_live {
             // The specimen scales as a block: the base geometry times the
             // zoom, and the text size with it.
-            let (tw, _, ts) = font::specimen_metrics();
+            let (tw, _, ts) = font::metrics_for(&self.data);
             let scale = w / tw;
             font::specimen_scaled(&self.data, w, h, ts * scale, cx)
         } else {
@@ -1079,7 +1206,7 @@ impl AssetPreviewPanel {
 }
 
 impl Render for AssetPreviewPanel {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let content: AnyElement = match (&self.video, &self.audio, &self.text) {
             (Some(player), _, _) => player.clone().into_any_element(),
             // The audio transport renders itself, so gpui passes the window to
@@ -1100,7 +1227,10 @@ impl Render for AssetPreviewPanel {
                     player.clone().into_any_element()
                 } else if self.video_loading || self.anim_loading {
                     image::still_filling(&self.data)
-                } else if self.zoomable() && self.pan.zoom != 1.0 {
+                } else if self.zoomable() && (self.pan.zoom != 1.0 || self.font_live) {
+                    // A live specimen renders through the zoom math even at
+                    // zoom 1.0: its block may outgrow the stage at a large
+                    // font size, and the pan offsets live here.
                     self.zoomed_still(cx)
                 } else {
                     element(&self.data, PreviewContext::Main, cx)
@@ -1108,80 +1238,90 @@ impl Render for AssetPreviewPanel {
             }
         };
         let zoomable = self.zoomable();
-        v_flex().size_full().overflow_hidden().child(
-            // `on_prepaint` lives on the plain `Div`, before the element
-            // becomes `Stateful`; the id has to come after it (same contract
-            // as the model canvas).
-            div()
-                .flex_1()
-                .min_h_0()
-                .flex()
-                .flex_col()
-                .items_center()
-                .justify_center()
-                .overflow_hidden()
-                .p_4()
-                .cursor(if self.dragging {
-                    CursorStyle::ClosedHand
-                } else if zoomable {
-                    CursorStyle::OpenHand
-                } else {
-                    CursorStyle::Arrow
-                })
-                // Track the content viewport so the zoom has a fit base.
-                .on_prepaint({
-                    let viewport = self.viewport.clone();
-                    move |bounds: Bounds<Pixels>, _, cx| {
-                        viewport.update(cx, |size, cx| {
-                            if *size != bounds.size {
-                                *size = bounds.size;
-                                cx.notify();
-                            }
-                        });
+        // The stage div, hoisted: the font viewer appends its control strip
+        // under it — outside the pan/drag gestures, which own the stage and
+        // would otherwise fight the text input for clicks.
+        let stage = div()
+            .flex_1()
+            .min_h_0()
+            .flex()
+            .flex_col()
+            .items_center()
+            .justify_center()
+            .overflow_hidden()
+            .p_4()
+            .flex_1()
+            .min_h_0()
+            .flex()
+            .flex_col()
+            .items_center()
+            .justify_center()
+            .overflow_hidden()
+            .p_4()
+            .cursor(if self.dragging {
+                CursorStyle::ClosedHand
+            } else if zoomable {
+                CursorStyle::OpenHand
+            } else {
+                CursorStyle::Arrow
+            })
+            // Track the content viewport so the zoom has a fit base.
+            .on_prepaint({
+                let viewport = self.viewport.clone();
+                move |bounds: Bounds<Pixels>, _, cx| {
+                    viewport.update(cx, |size, cx| {
+                        if *size != bounds.size {
+                            *size = bounds.size;
+                            cx.notify();
+                        }
+                    });
+                }
+            })
+            .id("preview-stage")
+            // Wheel zoom toward the cursor, drag to pan, double click
+            // back to the fitted view — the model viewport's gestures.
+            .when(zoomable, |this| {
+                this.on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, _, cx| {
+                    this.handle_scroll_wheel(event, cx);
+                }))
+            })
+            .when(zoomable, |this| {
+                this.on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                        this.begin_pan(event.position);
+                        cx.notify();
+                    }),
+                )
+                .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
+                    this.update_pan(event.position, cx);
+                }))
+                .on_mouse_up(
+                    MouseButton::Left,
+                    cx.listener(|this, _: &MouseUpEvent, _, cx| {
+                        this.end_pan();
+                        cx.notify();
+                    }),
+                )
+                .on_mouse_up_out(
+                    MouseButton::Left,
+                    cx.listener(|this, _: &MouseUpEvent, _, cx| {
+                        this.end_pan();
+                        cx.notify();
+                    }),
+                )
+                .on_click(cx.listener(|this, event: &ClickEvent, _, cx| {
+                    if event.click_count() == 2 {
+                        this.reset_zoom(cx);
                     }
-                })
-                .id("preview-stage")
-                // Wheel zoom toward the cursor, drag to pan, double click
-                // back to the fitted view — the model viewport's gestures.
-                .when(zoomable, |this| {
-                    this.on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, _, cx| {
-                        this.handle_scroll_wheel(event, cx);
-                    }))
-                })
-                .when(zoomable, |this| {
-                    this.on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|this, event: &MouseDownEvent, _, cx| {
-                            this.begin_pan(event.position);
-                            cx.notify();
-                        }),
-                    )
-                    .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
-                        this.update_pan(event.position, cx);
-                    }))
-                    .on_mouse_up(
-                        MouseButton::Left,
-                        cx.listener(|this, _: &MouseUpEvent, _, cx| {
-                            this.end_pan();
-                            cx.notify();
-                        }),
-                    )
-                    .on_mouse_up_out(
-                        MouseButton::Left,
-                        cx.listener(|this, _: &MouseUpEvent, _, cx| {
-                            this.end_pan();
-                            cx.notify();
-                        }),
-                    )
-                    .on_click(cx.listener(
-                        |this, event: &ClickEvent, _, cx| {
-                            if event.click_count() == 2 {
-                                this.reset_zoom(cx);
-                            }
-                        },
-                    ))
-                })
-                .child(content),
-        )
+                }))
+            })
+            .child(content);
+
+        let mut root = v_flex().size_full().overflow_hidden().child(stage);
+        if self.font_live {
+            root = root.child(font::controls_bar(cx.entity(), window, cx));
+        }
+        root
     }
 }

@@ -139,6 +139,7 @@ fn run_ingest(
     let assets_dir = fixture.join("Assets");
 
     let options = ImportOptions {
+        pre_gate: true,
         data_root: root.clone(),
         cache_root: cache.clone(),
         storage: trove_core::media::import::ImportStorage::Link,

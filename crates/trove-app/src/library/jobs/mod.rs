@@ -12,8 +12,11 @@
 
 mod analysis;
 mod embedding;
+mod export;
 mod import;
+mod migrate;
 mod search;
+mod transcription;
 mod watch;
 mod xmp;
 
@@ -213,10 +216,16 @@ pub use self::{
         cancel_embedding_backfill_app, delete_embeddings_app, start_embedding_backfill_app,
         test_embedding_endpoint_app,
     },
+    export::start_export_job_app,
     import::{
         ImportTaskHandle, InboxDrain, collect_inbox_app, import_copied_app, import_paths_app,
     },
+    migrate::{start_migration_job_app, start_migration_standalone},
     search::{request_ai_plan_app, request_query_embedding_app},
+    transcription::{
+        TranscribeTarget, cancel_transcription_app, start_transcription_app,
+        test_transcription_endpoint_app,
+    },
     watch::{WatchTask, start_index_drain_service, start_watch_service},
     xmp::export_xmp_app,
 };

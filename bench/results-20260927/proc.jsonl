@@ -1,0 +1,12 @@
+{"label":"Trove","mapMs":608,"settleMs":660,"settled":true,"cpuMs":620,"cpuPerCorePct":11,"processes":1,"threads":50,"rssMb":295.2,"pssMb":260.1,"peakPssMb":260.1,"sampleWindowS":5.65,"dwellMs":5000}
+{"label":"Trove","mapMs":559,"settleMs":658,"settled":true,"cpuMs":610,"cpuPerCorePct":10.8,"processes":1,"threads":50,"rssMb":292.1,"pssMb":256.9,"peakPssMb":264,"sampleWindowS":5.65,"dwellMs":5000}
+{"label":"Trove","mapMs":558,"settleMs":660,"settled":true,"cpuMs":600,"cpuPerCorePct":10.6,"processes":1,"threads":51,"rssMb":293.1,"pssMb":257.9,"peakPssMb":260.7,"sampleWindowS":5.65,"dwellMs":5000}
+{"label":"TroveEmpty","mapMs":1107,"settleMs":1157,"settled":true,"cpuMs":440,"cpuPerCorePct":7.2,"processes":1,"threads":51,"rssMb":267.8,"pssMb":232.4,"peakPssMb":232.4,"sampleWindowS":6.15,"dwellMs":5000}
+{"label":"TroveEmpty","mapMs":559,"settleMs":607,"settled":true,"cpuMs":450,"cpuPerCorePct":8,"processes":1,"threads":50,"rssMb":267.7,"pssMb":232.4,"peakPssMb":232.4,"sampleWindowS":5.6,"dwellMs":5000}
+{"label":"TroveEmpty","mapMs":559,"settleMs":607,"settled":true,"cpuMs":450,"cpuPerCorePct":8,"processes":1,"threads":50,"rssMb":271.2,"pssMb":235.8,"peakPssMb":235.8,"sampleWindowS":5.6,"dwellMs":5000}
+{"label":"Serpent","mapMs":1445,"settleMs":3046,"settled":true,"cpuMs":2690,"cpuPerCorePct":33.2,"processes":8,"threads":84,"rssMb":910.1,"pssMb":576.7,"peakPssMb":778.5,"sampleWindowS":8.1,"dwellMs":5000}
+{"label":"Serpent","mapMs":1543,"settleMs":3042,"settled":true,"cpuMs":2810,"cpuPerCorePct":34.7,"processes":8,"threads":85,"rssMb":908.8,"pssMb":572.3,"peakPssMb":774.3,"sampleWindowS":8.1,"dwellMs":5000}
+{"label":"Serpent","mapMs":1549,"settleMs":3146,"settled":true,"cpuMs":2800,"cpuPerCorePct":34.1,"processes":8,"threads":84,"rssMb":907.2,"pssMb":572.3,"peakPssMb":781.6,"sampleWindowS":8.2,"dwellMs":5000}
+{"label":"SerpentEmpty","mapMs":1349,"settleMs":2638,"settled":true,"cpuMs":3000,"cpuPerCorePct":39.5,"processes":8,"threads":102,"rssMb":1005,"pssMb":589.1,"peakPssMb":611.7,"sampleWindowS":7.6,"dwellMs":5000}
+{"label":"SerpentEmpty","mapMs":1357,"settleMs":1936,"settled":true,"cpuMs":3010,"cpuPerCorePct":43.6,"processes":8,"threads":104,"rssMb":1008.4,"pssMb":590.6,"peakPssMb":609.1,"sampleWindowS":6.9,"dwellMs":5000}
+{"label":"SerpentEmpty","mapMs":1349,"settleMs":2243,"settled":true,"cpuMs":3250,"cpuPerCorePct":45.1,"processes":8,"threads":104,"rssMb":1013.8,"pssMb":594.7,"peakPssMb":608,"sampleWindowS":7.2,"dwellMs":5000}

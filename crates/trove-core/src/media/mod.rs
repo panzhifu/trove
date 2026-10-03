@@ -2,12 +2,14 @@
 //! the file import pipeline.
 
 pub mod anim;
+pub mod audio_prep;
 pub mod blob;
 pub mod chunked;
 pub mod color;
 pub mod color_profile;
 pub mod convert;
 pub mod edit;
+pub mod export;
 pub mod font_language;
 pub mod formats;
 pub mod gpu;

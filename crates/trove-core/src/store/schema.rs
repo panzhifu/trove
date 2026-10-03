@@ -54,7 +54,7 @@
 /// existence was written by a build whose chain ended there, and that shape
 /// is the pre-`asset_embeddings` subset of the one below — which is the only
 /// sense in which a version number means anything.
-pub const SCHEMA_VERSION: i64 = 25;
+pub const SCHEMA_VERSION: i64 = 26;
 
 /// One upgrade step: the DDL that takes a library from `from` to `to`, and the
 /// data that DDL cannot move.
@@ -146,6 +146,12 @@ pub const UPGRADES: &[Upgrade] = &[
         sql: UPGRADE_24_TO_25,
         data: Some(analyze_statistics),
     },
+    Upgrade {
+        from: 25,
+        to: 26,
+        sql: UPGRADE_25_TO_26,
+        data: None,
+    },
 ];
 
 /// v24 → v25: the two reads that walk the listing order but want almost
@@ -195,6 +201,16 @@ const UPGRADE_24_TO_25: &str = r#"
         ON assets(created_at DESC, id ASC, width, height) WHERE trashed_at IS NULL;
     CREATE INDEX IF NOT EXISTS idx_assets_live_id
         ON assets(id) WHERE trashed_at IS NULL;
+"#;
+
+/// v25 → v26: speech-to-text output lives beside the asset it describes.
+/// Additive and unindexed — the job writes it, the inspector and the index
+/// drain read it by id, and nothing sorts or filters on it. Unlike the
+/// `ai_analysis` table this column has a writer and readers from day one; the
+/// reason it is a column and not an `extra` key is size: a transcript runs to
+/// tens of kilobytes, and `extra` rides along in every listing query.
+const UPGRADE_25_TO_26: &str = r#"
+    ALTER TABLE assets ADD COLUMN transcript TEXT;
 "#;
 
 /// v23 → v24: give the undo history a table of its own.
@@ -576,7 +592,14 @@ pub const SCHEMA: &str = r#"
         -- it can never disagree with the JSON it comes from and it takes no
         -- space in the row — only [`idx_assets_source_path`] costs anything.
         -- Last in the table because an upgraded library gets it there.
-        source_path    TEXT GENERATED ALWAYS AS (json_extract(extra, '$.source_path')) VIRTUAL
+        source_path    TEXT GENERATED ALWAYS AS (json_extract(extra, '$.source_path')) VIRTUAL,
+        -- Speech-to-text output for audio/video assets, written by the
+        -- transcription job. Last in the table because an upgraded library
+        -- gets it there (ALTER TABLE appends); kept OUT of `assets::COLS`
+        -- deliberately — a transcript runs to tens of kilobytes, and loading
+        -- it on every grid row would bloat every listing. Read on demand via
+        -- `assets::transcript`, indexed at drain time into the body fields.
+        transcript     TEXT
     );
 
     CREATE INDEX idx_assets_trashed  ON assets(trashed_at);

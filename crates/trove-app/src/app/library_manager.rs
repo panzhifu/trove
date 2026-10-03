@@ -16,6 +16,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
+use gpui::PathPromptOptions;
 use gpui_kit::base::{h_flex, v_flex};
 use gpui_kit::component::WindowExt as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
@@ -26,6 +27,8 @@ use gpui_kit::component::notification::Notification;
 use gpui_kit::component::{ActiveTheme, IconName, Root, Sizable as _, TitleBar};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
+
+use crate::app::root::RepositoryNotice;
 
 use super::AppView;
 use super::settings_write;
@@ -263,6 +266,132 @@ impl LibraryManagerView {
         cx.notify();
     }
 
+    /// Import a `.trove` repository package as a new library: pick the file,
+    /// register a library named after the package, unpack in the background,
+    /// then offer the hand-over — the success toast carries an "enter"
+    /// button, since the manager window has no library of its own to swap.
+    fn import_repository(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let view = cx.entity();
+        let handle = window.window_handle();
+        let rx = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some(
+                rust_i18n::t!("app.import_repository_prompt")
+                    .into_owned()
+                    .into(),
+            ),
+        });
+        cx.spawn(async move |_, cx| {
+            if let Ok(Ok(Some(paths))) = rx.await
+                && let Some(archive) = paths.first()
+            {
+                let read = {
+                    let archive = archive.clone();
+                    cx.background_executor()
+                        .spawn(async move {
+                            trove_core::services::repo_package::read_manifest(&archive)
+                        })
+                        .await
+                };
+                let manifest = match read {
+                    Ok(manifest) => manifest,
+                    Err(_) => {
+                        let _ = handle.update(cx, |_, window, cx| {
+                            window.push_notification(
+                                Notification::warning(
+                                    rust_i18n::t!("app.import_repository_failed").to_string(),
+                                ),
+                                cx,
+                            );
+                        });
+                        return;
+                    }
+                };
+                let entry = {
+                    let name = manifest.library.name.clone();
+                    let mut config = AppConfig::load();
+                    config.add_library(&name).ok()
+                };
+                let Some(entry) = entry else {
+                    return;
+                };
+                let _ = handle.update(cx, |_, window, cx| {
+                    window.push_notification(
+                        Notification::info(
+                            rust_i18n::t!("app.import_repository_started").to_string(),
+                        )
+                        .id1::<RepositoryNotice>("repository-package"),
+                        cx,
+                    );
+                });
+                let archive = archive.clone();
+                let dest = entry.dir();
+                let outcome = cx
+                    .background_executor()
+                    .spawn(async move {
+                        trove_core::services::repo_package::install_library_package(&archive, &dest)
+                    })
+                    .await;
+                match outcome {
+                    Ok(report) => {
+                        // The action callback is an `Fn` (the toast may draw
+                        // the button more than once), so the captured view
+                        // and entry ride in `Rc`s and clone on click.
+                        let view = std::rc::Rc::new(view.clone());
+                        let entry = std::rc::Rc::new(entry);
+                        let _ = handle.update(cx, |_, window, cx| {
+                            window.push_notification(
+                                Notification::success(
+                                    rust_i18n::t!(
+                                        "library_manager.import_repository_done",
+                                        name = entry.name,
+                                        assets = report.assets_total
+                                    )
+                                    .to_string(),
+                                )
+                                .action({
+                                    let view = std::rc::Rc::clone(&view);
+                                    let entry = std::rc::Rc::clone(&entry);
+                                    move |_notification, _window, _cx| {
+                                        let view = std::rc::Rc::clone(&view);
+                                        let entry = std::rc::Rc::clone(&entry);
+                                        Button::new("enter-imported-library")
+                                            .primary()
+                                            .label(rust_i18n::t!("migrate.enter").to_string())
+                                            .on_click(move |_, window, cx| {
+                                                view.update(cx, |this, cx| {
+                                                    this.enter((*entry).clone(), window, cx);
+                                                });
+                                            })
+                                    }
+                                }),
+                                cx,
+                            );
+                            cx.refresh_windows();
+                        });
+                    }
+                    Err(_) => {
+                        let mut config = AppConfig::load();
+                        let _ = config.forget_library(&entry.slug);
+                        let _ = std::fs::remove_dir_all(entry.dir());
+                        let _ = handle.update(cx, |_, window, cx| {
+                            window.push_notification(
+                                Notification::warning(
+                                    rust_i18n::t!("app.import_repository_failed").to_string(),
+                                )
+                                .id1::<RepositoryNotice>("repository-package"),
+                                cx,
+                            );
+                        });
+                    }
+                }
+            }
+        })
+        .detach();
+    }
+
     /// The repository package for one row's library: records, its own media,
     /// and copies of the linked files, in one `.trove` file. The heavy work
     /// runs on the background executor — the writer snapshots the database
@@ -326,15 +455,11 @@ impl LibraryManagerView {
 }
 
 impl Render for LibraryManagerView {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let config = AppConfig::load();
         let libraries = config.libraries.clone();
         let active_slug = config.active_slug().to_string();
         let view = cx.entity();
-        // Toasts (backup results) and the delete dialog are layers the
-        // window's root view has to draw, same as the app root does.
-        let dialog_layer = gpui_kit::component::Root::render_dialog_layer(window, cx);
-        let notification_layer = gpui_kit::component::Root::render_notification_layer(window, cx);
 
         v_flex()
             .size_full()
@@ -365,8 +490,6 @@ impl Render for LibraryManagerView {
                     .child(self.sidebar(&libraries, &active_slug, view, cx))
                     .child(self.main_pane(cx)),
             )
-            .children(dialog_layer)
-            .children(notification_layer)
     }
 }
 
@@ -455,9 +578,10 @@ impl LibraryManagerView {
             )
     }
 
-    /// The card: the create row, with the language picker as the footer row.
-    /// There is no "open" row: entering a library is the sidebar's double
-    /// click, and the backup export lives in the sidebar rows' kebab menus.
+    /// The card: the create row, two import rows, and the language picker as
+    /// the footer row. There is no "open" row: entering a library is the
+    /// sidebar's double click, and the backup export lives in the sidebar
+    /// rows' kebab menus.
     fn action_card(&mut self, cx: &mut Context<Self>) -> Div {
         v_flex()
             .w_full()
@@ -466,6 +590,8 @@ impl LibraryManagerView {
             .border_color(cx.theme().border)
             .rounded(cx.theme().radius_lg)
             .child(self.create_row(cx))
+            .child(self.import_repository_row(cx))
+            .child(self.migrate_row(cx))
             .child(self.language_footer(cx))
     }
 
@@ -492,6 +618,39 @@ impl LibraryManagerView {
             .py_4()
             .child(text_el.child(text))
             .child(control)
+    }
+
+    /// Import a `.trove` repository package as a new library.
+    fn import_repository_row(&mut self, cx: &mut Context<Self>) -> Div {
+        self.card_row(
+            rust_i18n::t!("library_manager.import_repository").to_string(),
+            true,
+            Button::new("manager-import-repository")
+                .outline()
+                .label(rust_i18n::t!("library_manager.import_repository_button").to_string())
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.import_repository(window, cx);
+                }))
+                .into_any_element(),
+            cx,
+        )
+    }
+
+    /// Migrate from Eagle / Billfish: a fresh library is created from the
+    /// source folder and the job runs on its own.
+    fn migrate_row(&mut self, cx: &mut Context<Self>) -> Div {
+        self.card_row(
+            rust_i18n::t!("library_manager.import_migrate").to_string(),
+            true,
+            Button::new("manager-import-migrate")
+                .outline()
+                .label(rust_i18n::t!("library_manager.import_migrate_button").to_string())
+                .on_click(cx.listener(|_this, _, window, cx| {
+                    crate::dialogs::migrate::MigrateDialog::open(window, cx, None);
+                }))
+                .into_any_element(),
+            cx,
+        )
     }
 
     /// Create: the name field (optional — an empty name is auto-numbered)

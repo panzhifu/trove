@@ -1,25 +1,115 @@
 //! Tags panel: filter by tag. Click to toggle the filter, right-click for
-//! filter/delete.
+//! filter/delete. The "+" (and "New child tag") appends an inline editor row
+//! — the same in-list editor the collections panel uses — rather than
+//! opening a modal.
 
 use gpui_kit::base::{h_flex, v_flex};
 use gpui_kit::component::WindowExt as _;
 use gpui_kit::component::button::{Button, ButtonVariant, ButtonVariants as _};
 use gpui_kit::component::dialog::DialogButtonProps;
 use gpui_kit::component::dock::{BasePanel, Panel as DockPanel, PanelControl, PanelEvent};
-use gpui_kit::component::input::{Input, InputState};
+use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::menu::{ContextMenuExt as _, PopupMenu, PopupMenuItem};
-use gpui_kit::component::{ActiveTheme, Icon, IconName, Sizable as _};
+use gpui_kit::component::{ActiveTheme, Sizable as _};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
+use std::ops::Range;
+
 use uuid::Uuid;
 
-use crate::components::scrollbar;
+use crate::components::controls::muted_label;
+use crate::components::scrollbar::ScrollableElement as _;
 use crate::library::LibraryController;
 
-use super::common::{AssetsDrag, hex_to_rgb, observe_controller};
+use super::common::{AssetsDrag, hex_to_rgb, observe_controller, separator_label};
 
 // =========================== Tags panel ======================================
+
+/// What the tags panel's single inline editor is doing right now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TagEditor {
+    /// No editor row is shown.
+    Closed,
+    /// Adding a tag: `parent` is the tag it lands under, or `None` for a
+    /// root tag (the title-bar "+").
+    Adding { parent: Option<Uuid> },
+}
+
+/// One row of the tags list, flattened for the virtualized list.
+///
+/// Everything the panel shows — the frequent section (header + rows + a
+/// divider), the full tree, and the inline add editor — goes through this one
+/// row stream, because `uniform_list` renders a single flat sequence.
+struct TagRow {
+    kind: TagRowKind,
+    id: Uuid,
+    name: String,
+    color: Option<String>,
+    count: u64,
+    depth: usize,
+    has_children: bool,
+    active: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TagRowKind {
+    /// The "frequent tags" section header, drawn below the tree.
+    FrequentHeader,
+    Tag,
+    Editor,
+}
+
+impl TagRow {
+    fn header() -> Self {
+        Self {
+            kind: TagRowKind::FrequentHeader,
+            id: Uuid::nil(),
+            name: String::new(),
+            color: None,
+            count: 0,
+            depth: 0,
+            has_children: false,
+            active: false,
+        }
+    }
+
+    fn editor(depth: usize) -> Self {
+        Self {
+            kind: TagRowKind::Editor,
+            depth,
+            ..Self::header()
+        }
+    }
+
+    fn tag(
+        tag: &trove_core::model::Tag,
+        depth: usize,
+        count: u64,
+        has_children: bool,
+        active: Option<Uuid>,
+    ) -> Self {
+        Self {
+            kind: TagRowKind::Tag,
+            id: tag.id,
+            name: tag.name.clone(),
+            color: tag.color.clone(),
+            count,
+            depth,
+            has_children,
+            active: active == Some(tag.id),
+        }
+    }
+}
+
+/// One fixed height every row in the virtualized list shares (`uniform_list`
+/// requires it; the first row measured decides it).
+const TAG_ROW_H: f32 = 28.;
+
+/// Left padding of a top-level row; nested rows add one step per level — the
+/// same metrics the collections panel uses, so the two trees read alike.
+const TAG_ROW_PAD: f32 = 8.;
+const TAG_ROW_INDENT: f32 = 14.;
 
 pub struct TagsPanel {
     focus_handle: FocusHandle,
@@ -32,6 +122,13 @@ pub struct TagsPanel {
     /// `COUNT(DISTINCT …)` — which `render` must not run, because `render` runs
     /// every frame. Cached the same way `ExplorerPanel` caches its counts.
     tag_counts: Option<(u64, std::collections::HashMap<Uuid, u64>)>,
+    /// Reused inline editor for the add flow, mirroring `ExplorerPanel`'s.
+    editor_input: Entity<InputState>,
+    /// What the inline editor is doing; `Closed` hides the row.
+    editor: TagEditor,
+    /// Scroll position of the virtualized row list, kept on the panel so it
+    /// survives across renders.
+    scroll_handle: UniformListScrollHandle,
 }
 
 impl BasePanel for TagsPanel {
@@ -64,7 +161,7 @@ impl DockPanel for TagsPanel {
                 .tooltip(rust_i18n::t!("tags.add_tag").to_string())
                 .on_click(move |_, window, cx| {
                     entity.update(cx, |this, cx| {
-                        open_create_dialog(window, cx, &this.controller, None);
+                        this.begin_add(None, window, cx);
                     });
                 }),
         )
@@ -80,15 +177,228 @@ impl Focusable for TagsPanel {
 }
 
 impl TagsPanel {
-    pub fn new(cx: &mut Context<Self>, controller: Entity<LibraryController>) -> Self {
+    pub fn new(
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        controller: Entity<LibraryController>,
+    ) -> Self {
+        let editor_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder(rust_i18n::t!("explorer.name_placeholder").to_string())
+        });
         let this = Self {
             focus_handle: cx.focus_handle(),
             controller,
             collapsed: Default::default(),
             tag_counts: None,
+            editor_input,
+            editor: TagEditor::Closed,
+            scroll_handle: UniformListScrollHandle::default(),
         };
         observe_controller(cx, &this.controller);
+        this.subscribe_enter(window, cx);
         this
+    }
+
+    fn subscribe_enter(&self, window: &mut Window, cx: &mut Context<Self>) {
+        let editor = self.editor_input.clone();
+        cx.subscribe_in(&editor, window, |this, _, event, _window, cx| {
+            if matches!(event, InputEvent::PressEnter { .. }) {
+                this.submit_editor(cx);
+            }
+        })
+        .detach();
+    }
+
+    /// "+" clicked (or right-click → New child tag): open the inline editor,
+    /// cleared and focused, for a new tag under `parent`.
+    fn begin_add(&mut self, parent: Option<Uuid>, window: &mut Window, cx: &mut Context<Self>) {
+        self.editor_input.update(cx, |state, cx| {
+            state.set_value("", window, cx);
+        });
+        self.editor = TagEditor::Adding { parent };
+        let editor = self.editor_input.clone();
+        editor.update(cx, |state, cx| state.focus(window, cx));
+        cx.notify();
+    }
+
+    /// Esc in the inline editor: drop it without creating anything. The
+    /// input's own Escape handler propagates the key, so this fires only
+    /// while the editor holds focus inside this panel.
+    fn cancel_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.editor == TagEditor::Closed {
+            return;
+        }
+        self.editor = TagEditor::Closed;
+        self.editor_input
+            .update(cx, |state, cx| state.set_value("", window, cx));
+        cx.notify();
+    }
+
+    /// Enter in the inline editor: create the tag under its parent. The
+    /// library dedupes by name, so a repeat is a no-op rather than a second
+    /// row.
+    fn submit_editor(&mut self, cx: &mut Context<Self>) {
+        let TagEditor::Adding { parent } = self.editor else {
+            return;
+        };
+        let name = self.editor_input.read(cx).value().trim().to_string();
+        if name.is_empty() {
+            return;
+        }
+        self.controller.update(cx, |ctl, cx| {
+            let outcome = ctl.library.create_tag(&name, parent);
+            ctl.report_failed("creating a tag", outcome);
+            ctl.generation += 1;
+            cx.notify();
+        });
+        self.editor = TagEditor::Closed;
+    }
+
+    /// Fold or unfold a parent tag's children.
+    fn toggle_fold(&mut self, id: Uuid, cx: &mut Context<Self>) {
+        if !self.collapsed.remove(&id) {
+            self.collapsed.insert(id);
+        }
+        cx.notify();
+    }
+
+    /// Render one row of the virtualized list. Every arm must produce a row
+    /// of exactly [`TAG_ROW_H`], or the uniform list misplaces everything
+    /// below the offender.
+    fn render_row(&mut self, row: &TagRow, cx: &mut Context<Self>) -> AnyElement {
+        match row.kind {
+            // The section header sits in the same row stream as the rows, at
+            // the shared height, and uses the collections panel's separator
+            // style so the two sidebars match.
+            TagRowKind::FrequentHeader => div()
+                .h(px(TAG_ROW_H))
+                .w_full()
+                .px_2()
+                .flex()
+                .items_center()
+                .child(separator_label(
+                    cx,
+                    rust_i18n::t!("tags.frequent").to_string(),
+                ))
+                .into_any_element(),
+            TagRowKind::Editor => h_flex()
+                .h(px(TAG_ROW_H))
+                .w_full()
+                .pl(px(TAG_ROW_PAD + TAG_ROW_INDENT * row.depth as f32))
+                .pr_2()
+                .items_center()
+                .child(Input::new(&self.editor_input).small())
+                .into_any_element(),
+            TagRowKind::Tag => self.render_tag_row(row, cx),
+        }
+    }
+
+    /// One tag row (shared by the frequent section and the full tree).
+    ///
+    /// Interaction follows the app-wide tree contract: a single click selects
+    /// (here: toggles the tag filter), a double click folds or unfolds a
+    /// parent's subtree.
+    fn render_tag_row(&mut self, row: &TagRow, cx: &mut Context<Self>) -> AnyElement {
+        let id = row.id;
+        let has_children = row.has_children;
+        let color = row.color.clone();
+        let name = row.name.clone();
+        let name_for_menu = name.clone();
+        let controller = self.controller.clone();
+
+        let mut el = div()
+            .id(format!("tag-row-{id}"))
+            .h(px(TAG_ROW_H))
+            .w_full()
+            .cursor_pointer()
+            .px_2()
+            .rounded(cx.theme().radius)
+            // The row stretches to the panel edge; the indent is padding, not
+            // a margin, so the count keeps its column — the same scheme the
+            // collections panel uses.
+            .when(row.depth > 0, |el| {
+                el.pl(px(TAG_ROW_PAD + TAG_ROW_INDENT * row.depth as f32))
+            })
+            .when(row.active, |el| el.bg(cx.theme().secondary))
+            .on_click(cx.listener(move |this, ev: &ClickEvent, _window, cx| {
+                if has_children && ev.click_count() >= 2 {
+                    // Double click: fold/unfold the subtree.
+                    this.toggle_fold(id, cx);
+                } else {
+                    // Single click: toggle the filter on this tag.
+                    this.controller.update(cx, move |ctl, cx| {
+                        if ctl.active_tag == Some(id) {
+                            ctl.select_tag(None);
+                        } else {
+                            ctl.select_tag(Some(id));
+                        }
+                        cx.notify();
+                    });
+                }
+            }))
+            .child(
+                h_flex()
+                    .h_full()
+                    .w_full()
+                    .items_center()
+                    .gap_2()
+                    // The leading slot a collection row carries (its glyph),
+                    // here the tag's colour dot, so names line up across the
+                    // two sidebars whether or not the tag has a colour.
+                    .child(
+                        div()
+                            .flex_none()
+                            .size_4()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .when_some(color, |slot, hex| {
+                                let rgb = hex_to_rgb(&hex);
+                                slot.when_some(rgb, |slot, rgb| {
+                                    slot.child(div().size_2().rounded_full().bg(gpui::rgb(rgb)))
+                                })
+                            }),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .text_sm()
+                            .text_color(cx.theme().foreground)
+                            .child(name),
+                    )
+                    .child(muted_label(row.count.to_string(), cx)),
+            );
+
+        let ctl_tag = controller.clone();
+        el = el
+            .drag_over::<AssetsDrag>(|this, _, _, cx| this.bg(cx.theme().secondary))
+            .on_drop(move |payload: &AssetsDrag, _window, cx| {
+                ctl_tag.update(cx, move |ctl, cx| {
+                    let outcome = ctl.library.tag_assets(&payload.0, id, true);
+                    ctl.report_failed("tagging dropped assets", outcome);
+                    ctl.generation += 1;
+                    cx.notify();
+                });
+            });
+
+        // The panel itself, so "New child tag" can open its inline editor.
+        let panel = cx.entity();
+        el.context_menu(move |menu, window, cx| {
+            tag_context_menu(
+                menu,
+                window,
+                cx,
+                &panel,
+                &controller,
+                id,
+                name_for_menu.clone(),
+                has_children,
+            )
+        })
+        .into_any_element()
     }
 }
 
@@ -159,10 +469,15 @@ impl Render for TagsPanel {
         // Frequent tags: the highest rows by the same recursive count the
         // rows display, flat (no nesting, no fold chevrons). Hidden entirely
         // when nothing is tagged yet.
-        let controller = self.controller.clone();
-        let collapsed = &self.collapsed;
+        //
+        // Roots only: the section is flat, so a child tag shown here would
+        // read as a standalone tag beside the very parent it hangs under —
+        // exactly what the tree below already shows it as. The counts are
+        // recursive, so a parent carries its children's usage and nothing
+        // genuinely frequent is lost by the filter.
         let mut frequent: Vec<(&trove_core::model::Tag, u64)> = all_tags
             .iter()
+            .filter(|t| t.parent_id.is_none())
             .filter_map(|t| {
                 counts
                     .get(&t.id)
@@ -177,188 +492,102 @@ impl Render for TagsPanel {
         });
         frequent.truncate(FREQUENT_TAGS_LIMIT);
 
-        let mut list = v_flex().gap_0p5().w_full();
-        if !frequent.is_empty() {
-            list = list
-                .child(
-                    div()
-                        .px_2()
-                        .pt_1()
-                        .pb_0p5()
-                        .text_xs()
-                        .text_color(cx.theme().muted_foreground)
-                        .child(rust_i18n::t!("tags.frequent").to_string()),
-                )
-                .children(frequent.iter().map(|(tag, count)| {
-                    render_tag_row(&controller, tag, 0, *count, active, false, false, cx)
-                }))
-                .child(div().mt_1().border_t_1().border_color(cx.theme().border));
-        }
-        list = list.children(flat.into_iter().map(|(tag, depth)| {
+        // The inline add editor, when one is open. `Some(None)` is a new root
+        // tag (the title-bar "+"); `Some(Some(id))` a child of `id`.
+        let adding = match self.editor {
+            TagEditor::Adding { parent } => Some(parent),
+            TagEditor::Closed => None,
+        };
+
+        // Flatten everything the panel shows into one row stream — the full
+        // tree, the inline add editor, and the "frequent tags" section at the
+        // bottom — so a single virtualized list can render it. Every row
+        // shares `TAG_ROW_H`, which is what `uniform_list` requires (it
+        // measures the first row and positions the rest at that height).
+        //
+        // The section order matches the collections panel: the managed tree
+        // first, the derived shortcut section last.
+        let mut rows: Vec<TagRow> = Vec::new();
+        for (tag, depth) in &flat {
             let id = tag.id;
-            // Only parents with children get the fold chevron.
+            // A parent can be folded by a double click.
             let has_children = children_of.get(&id).is_some_and(|kids| !kids.is_empty());
-            let is_folded = collapsed.contains(&id);
             let count = counts.get(&id).copied().unwrap_or(0);
-            render_tag_row(
-                &controller,
-                tag,
-                depth,
-                count,
-                active,
-                has_children,
-                is_folded,
-                cx,
-            )
-        }));
+            rows.push(TagRow::tag(tag, *depth, count, has_children, active));
+            // A "New child tag" editor lands directly under its parent row,
+            // one indent step deeper.
+            if adding == Some(Some(id)) {
+                rows.push(TagRow::editor(*depth + 1));
+            }
+        }
+        // A root "+" editor lands after the last tree row.
+        if adding == Some(None) {
+            rows.push(TagRow::editor(0));
+        }
+
+        // The frequent section closes the panel, under its own header. Its
+        // rows are root tags, so they keep the real `has_children` — a double
+        // click folds the very subtree the tree above shows.
+        if !frequent.is_empty() {
+            rows.push(TagRow::header());
+            for (tag, count) in &frequent {
+                let has_children = children_of
+                    .get(&tag.id)
+                    .is_some_and(|kids| !kids.is_empty());
+                rows.push(TagRow::tag(tag, 0, *count, has_children, active));
+            }
+        }
+
+        // `rows` is moved into the render closure; the handle is cloned so the
+        // outer wrapper can keep one too.
+        let row_count = rows.len();
+        let scroll_handle = self.scroll_handle.clone();
+        let list = uniform_list(
+            "tags-rows",
+            row_count,
+            cx.processor(move |this, range: Range<usize>, _window, cx| {
+                range
+                    .map(|ix| this.render_row(&rows[ix], cx))
+                    .collect::<Vec<_>>()
+            }),
+        )
+        .track_scroll(&scroll_handle)
+        .size_full();
 
         v_flex()
             .size_full()
             .p_2()
             .gap_1()
-            .child(scrollbar::vertical(div().flex_1().min_h_0()).child(list))
+            .key_context("Tags")
+            .on_action(
+                cx.listener(|this, _: &crate::app::actions::Cancel, window, cx| {
+                    this.cancel_editor(window, cx);
+                }),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .child(list)
+                    .vertical_scrollbar(&scroll_handle),
+            )
     }
 }
 
 /// How many tags the "frequent" section shows at most.
 const FREQUENT_TAGS_LIMIT: usize = 8;
 
-/// One tag row, shared by the frequent section and the full tree. `depth`
-/// drives the indent; `has_children`/`is_folded` control the fold chevron
-/// (the frequent section passes `false`/`false` to stay flat).
-#[allow(clippy::too_many_arguments)]
-fn render_tag_row(
-    controller: &Entity<LibraryController>,
-    tag: &trove_core::model::Tag,
-    depth: usize,
-    count: u64,
-    active: Option<Uuid>,
-    has_children: bool,
-    is_folded: bool,
-    cx: &mut Context<TagsPanel>,
-) -> AnyElement {
-    let id = tag.id;
-    let color = tag.color.clone();
-    let name = tag.name.clone();
-    let name_for_menu = name.clone();
-    // The event closures below are 'static: hand them an owned handle.
-    let controller = controller.clone();
-    // The indent is padding, not margin: the row stretches to the panel
-    // edge (flex cross-axis), and a margin-left does not move a stretched
-    // row in Taffy — the same `ROW_PAD + ROW_INDENT * depth` scheme the
-    // explorer uses for its tree.
-    let ctl_click = controller.clone();
-    let mut row = div()
-        .id(format!("tag-row-{id}"))
-        .cursor_pointer()
-        .pl(px(8. + 14. * depth as f32))
-        .pr_2()
-        .py_1()
-        .rounded(cx.theme().radius)
-        .on_click(move |_ev: &ClickEvent, _window, cx| {
-            ctl_click.update(cx, move |ctl, cx| {
-                if ctl.active_tag == Some(id) {
-                    ctl.select_tag(None);
-                } else {
-                    ctl.select_tag(Some(id));
-                }
-                cx.notify();
-            });
-        })
-        .child(
-            h_flex()
-                .w_full()
-                .items_center()
-                .gap_1p5()
-                .when(has_children, |row| {
-                    row.child(
-                        div()
-                            .id(format!("tag-fold-{id}"))
-                            .cursor_pointer()
-                            .flex_none()
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                // Toggle membership: remove when folded,
-                                // insert when open.
-                                if !this.collapsed.remove(&id) {
-                                    this.collapsed.insert(id);
-                                }
-                                cx.notify();
-                            }))
-                            .child(
-                                Icon::new(if is_folded {
-                                    IconName::ChevronRight
-                                } else {
-                                    IconName::ChevronDown
-                                })
-                                .size_3()
-                                .text_color(cx.theme().muted_foreground),
-                            ),
-                    )
-                })
-                .when_some(color, |row, hex| {
-                    // Small color dot when the tag has one.
-                    let rgb = hex_to_rgb(&hex);
-                    row.child(
-                        div()
-                            .size_2()
-                            .rounded_full()
-                            .when_some(rgb, |dot, rgb| dot.bg(gpui::rgb(rgb))),
-                    )
-                })
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .truncate()
-                        .text_sm()
-                        .text_color(cx.theme().foreground)
-                        .child(name),
-                )
-                .child(
-                    div()
-                        .flex_none()
-                        .text_xs()
-                        .text_color(cx.theme().muted_foreground)
-                        .child(count.to_string()),
-                ),
-        );
-    if active == Some(id) {
-        row = row.bg(cx.theme().secondary);
-    }
-    let ctl_tag = controller.clone();
-    row = row
-        .drag_over::<AssetsDrag>(|this, _, _, cx| this.bg(cx.theme().secondary))
-        .on_drop(move |payload: &AssetsDrag, _window, cx| {
-            ctl_tag.update(cx, move |ctl, cx| {
-                let outcome = ctl.library.tag_assets(&payload.0, id, true);
-                ctl.report_failed("tagging dropped assets", outcome);
-                ctl.generation += 1;
-                cx.notify();
-            });
-        });
-    let controller = controller.clone();
-    row.context_menu(move |menu, _window, cx| {
-        tag_context_menu(
-            menu,
-            _window,
-            cx,
-            &controller,
-            id,
-            name_for_menu.clone(),
-            has_children,
-        )
-    })
-    .into_any_element()
-}
-
-/// Right-click menu for a tag row: filter, rename (inline dialog), color,
+/// Right-click menu for a tag row: filter, new child tag (inline editor),
+/// rename (inline dialog), color,
 /// delete — plus, for a parent, deleting the whole subtree (the plain delete
 /// on a parent leaves the children re-rooted, which is rarely what the click
 /// meant).
+#[allow(clippy::too_many_arguments)]
 fn tag_context_menu(
     menu: PopupMenu,
     window: &mut Window,
     cx: &mut Context<PopupMenu>,
+    panel: &Entity<TagsPanel>,
     controller: &Entity<LibraryController>,
     tag_id: Uuid,
     tag_name: String,
@@ -368,7 +597,7 @@ fn tag_context_menu(
     let ctl_del = controller.clone();
     let ctl_rename = controller.clone();
     let ctl_color = controller.clone();
-    let ctl_child = controller.clone();
+    let panel_child = panel.clone();
     let rename_name = tag_name.clone();
     let mut m = menu
         .min_w(px(160.))
@@ -389,7 +618,9 @@ fn tag_context_menu(
         .item(
             PopupMenuItem::new(rust_i18n::t!("tags.new_child_tag").to_string()).on_click(
                 move |_, window, cx| {
-                    open_create_dialog(window, cx, &ctl_child, Some(tag_id));
+                    panel_child.update(cx, |this, cx| {
+                        this.begin_add(Some(tag_id), window, cx);
+                    });
                 },
             ),
         )
@@ -487,48 +718,8 @@ const TAG_COLORS: [&str; 8] = [
     "#ef4444", "#f97316", "#eab308", "#22c55e", "#06b6d4", "#3b82f6", "#a855f7", "#ec4899",
 ];
 
-/// Create a tag via a small modal dialog (same flow as the rename one; the
-/// library deduplicates by name through `ensure_tag`).
-fn open_create_dialog(
-    window: &mut Window,
-    cx: &mut App,
-    controller: &Entity<LibraryController>,
-    parent: Option<Uuid>,
-) {
-    let name_input = cx.new(|cx| {
-        InputState::new(window, cx)
-            .placeholder(rust_i18n::t!("explorer.name_placeholder").to_string())
-    });
-    let ctl = controller.clone();
-    window.open_dialog(cx, move |dialog, _, _| {
-        dialog
-            .title(rust_i18n::t!("tags.create_tag").to_string())
-            .width(px(340.))
-            .child(Input::new(&name_input).small().appearance(true))
-            .on_ok({
-                let name_input = name_input.clone();
-                let ctl = ctl.clone();
-                move |_, _, cx| {
-                    let name: String = name_input.read(cx).value().trim().to_string();
-                    if !name.is_empty() {
-                        ctl.update(cx, |ctl, cx| {
-                            // Same name under a different parent is still the
-                            // same tag (names stay globally unique); the
-                            // library layer dedupes.
-                            let outcome = ctl.library.create_tag(&name, parent);
-                            ctl.report_failed("creating a tag", outcome);
-                            ctl.generation += 1;
-                            cx.notify();
-                        });
-                    }
-                    true
-                }
-            })
-    });
-}
-
-/// Rename a tag via a small modal dialog (the tags panel has no inline
-/// editor row like the explorer does).
+/// Rename a tag via a small modal dialog (renaming is a different act from
+/// the inline add the "+" and "New child tag" use).
 fn open_rename_dialog(
     window: &mut Window,
     cx: &mut App,

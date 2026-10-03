@@ -274,7 +274,7 @@ impl AppView {
         let explorer = cx.new(|cx| ExplorerPanel::new(window, cx, controller.clone()));
         let folders = cx.new(|cx| FoldersPanel::new(cx, controller.clone()));
         let workspace = cx.new(|cx| WorkspacePanel::new(window, cx, controller.clone()));
-        let tags = cx.new(|cx| TagsPanel::new(cx, controller.clone()));
+        let tags = cx.new(|cx| TagsPanel::new(window, cx, controller.clone()));
         let inspector = cx.new(|cx| InspectorPanel::new(window, cx, controller.clone()));
 
         // Status bar ← model renderer: the workspace panel watches its model
@@ -927,9 +927,7 @@ impl AppView {
                 let outcome = cx
                     .background_executor()
                     .spawn(async move {
-                        trove_core::services::repo_package::install_library_package(
-                            &archive, &dest,
-                        )
+                        trove_core::services::repo_package::install_library_package(&archive, &dest)
                     })
                     .await;
 
@@ -1044,12 +1042,10 @@ impl Render for AppView {
         // the dispatch path.
         let controller = self.controller.clone();
 
-        // The dialog/sheet/notification layers are rendered by the app root,
-        // not by `Root::render` itself: without these children, dialogs opened
-        // via `window.open_dialog` exist in state but never draw.
-        let dialog_layer = gpui_kit::component::Root::render_dialog_layer(window, cx);
-        let sheet_layer = gpui_kit::component::Root::render_sheet_layer(window, cx);
-        let notification_layer = gpui_kit::component::Root::render_notification_layer(window, cx);
+        // Dialog / sheet / notification layers are no longer children of the
+        // application view: since gpui-kit 0.7 the component layer mounts them
+        // through the `WindowState` root plugin (registered by `gpui_kit::init`),
+        // which renders its own overlay above the root surface.
 
         // The stage draws the preview's own player, so it needs that player
         // to exist. If the preview went away while the flag was still set —
@@ -1086,9 +1082,6 @@ impl Render for AppView {
                     this.leave_video_fullscreen(window, cx);
                 }))
                 .child(player)
-                .children(dialog_layer)
-                .children(sheet_layer)
-                .children(notification_layer)
                 .into_any_element();
         }
 
@@ -1152,6 +1145,13 @@ impl Render for AppView {
             }))
             .on_action(cx.listener(|this, _: &ImportUrl, window, cx| {
                 this.prompt_import_url(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ImportFromApp, window, cx| {
+                crate::dialogs::migrate::MigrateDialog::open(
+                    window,
+                    cx,
+                    Some(this.controller.clone()),
+                );
             }))
             .on_action(cx.listener(|this, _: &EnterVideoFullscreen, window, cx| {
                 this.enter_video_fullscreen(window, cx);
@@ -1249,9 +1249,6 @@ impl Render for AppView {
                 self.viewport_backend.clone(),
                 cx,
             ))
-            .children(dialog_layer)
-            .children(sheet_layer)
-            .children(notification_layer)
             .into_any_element()
     }
 }

@@ -195,6 +195,9 @@ fn kind_to_str(kind: &TaskKind) -> String {
         TaskKind::EmbeddingBackfill => "embedding-backfill".into(),
         TaskKind::AutoTag => "auto-tag".into(),
         TaskKind::AiAnalysis => "ai-analysis".into(),
+        TaskKind::Transcription => "transcribe".into(),
+        TaskKind::Migration => "migration".into(),
+        TaskKind::Export => "export".into(),
         TaskKind::Custom(name) => format!("plugin:{name}"),
     }
 }
@@ -212,6 +215,9 @@ fn str_to_kind(s: &str) -> TaskKind {
         "embedding-backfill" => TaskKind::EmbeddingBackfill,
         "auto-tag" => TaskKind::AutoTag,
         "ai-analysis" => TaskKind::AiAnalysis,
+        "transcribe" => TaskKind::Transcription,
+        "migration" => TaskKind::Migration,
+        "export" => TaskKind::Export,
         other => {
             // Custom kinds are stored as "plugin:<name>"; unknown slugs
             // without the prefix are still surfaced as Custom so the journal

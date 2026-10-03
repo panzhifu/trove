@@ -315,7 +315,14 @@ pub fn sanitize_title(title: &str) -> String {
 
 /// First available `base.ext` in `dest`, appending ` (2)`, ` (3)`, … when
 /// the name is taken by the folder or by an earlier item of the same batch.
-fn unique_path(dest: &Path, base: &str, ext: &str, used: &mut HashSet<String>) -> PathBuf {
+/// Shared with the export job, which names its non-converted outputs the
+/// same way.
+pub(crate) fn unique_path(
+    dest: &Path,
+    base: &str,
+    ext: &str,
+    used: &mut HashSet<String>,
+) -> PathBuf {
     let mut candidate = format!("{base}.{ext}");
     let mut n = 2;
     while used.contains(&candidate) || dest.join(&candidate).exists() {

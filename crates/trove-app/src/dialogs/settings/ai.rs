@@ -9,11 +9,112 @@
 //! needs — the endpoint, its coverage, generating it, deleting it — is on
 //! this page, in the order a user meets it.
 
+use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::setting::NumberFieldOptions;
 
 use super::*;
 use crate::app::settings_write;
-use crate::library::{AiProbe, AnalysisProbe};
+use crate::components::controls;
+use crate::library::{AiProbe, AnalysisProbe, TranscriptionProbe};
+
+/// A model field for an endpoint whose vendor decides which models make
+/// sense: the current vendor's known models sit one click away in a
+/// dropdown, beside a free-text input for everything the preset table does
+/// not cover — relay names, Volcengine `ep-…` endpoint ids, models newer
+/// than the table. Both controls write the same stored value; the input
+/// re-syncs when the dropdown (or another window) changes it behind its
+/// back, the same way the framework's own input fields do.
+fn model_field(
+    key: &'static str,
+    get_vendor: impl Fn() -> String + Clone + 'static,
+    get_model: impl Fn() -> String + Clone + 'static,
+    set_model: impl Fn(String, &mut App) + Clone + 'static,
+    presets_of: fn(trove_core::ai::vendor::VendorId) -> &'static [&'static str],
+) -> SettingField<SharedString> {
+    SettingField::<SharedString>::element(
+        move |_options: &gpui_kit::component::setting::RenderOptions,
+              window: &mut Window,
+              cx: &mut App| {
+            let vendor = (get_vendor)();
+            let presets: Vec<(SharedString, String)> = vendor
+                .parse::<trove_core::ai::vendor::VendorId>()
+                .map(|vendor| {
+                    presets_of(vendor)
+                        .iter()
+                        .map(|m| (SharedString::from(*m), m.to_string()))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let current = SharedString::from((get_model)());
+
+            struct State {
+                input: Entity<InputState>,
+                _subscription: gpui::Subscription,
+            }
+            let state_entity = window.use_keyed_state(SharedString::from(key), cx, {
+                let current = current.clone();
+                let set_model = set_model.clone();
+                move |window, cx| {
+                    let input = cx.new(|cx| {
+                        InputState::new(window, cx)
+                            .default_value(current.clone())
+                            .placeholder(rust_i18n::t!("settings.model_hint").to_string())
+                    });
+                    let subscription = cx.subscribe(&input, {
+                        move |_, input, event: &InputEvent, cx| {
+                            if let InputEvent::Change = event {
+                                (set_model)(input.read(cx).value().to_string(), cx);
+                            }
+                        }
+                    });
+                    State {
+                        input,
+                        _subscription: subscription,
+                    }
+                }
+            });
+
+            // A change from outside this box (the dropdown below, another
+            // settings window) reaches the input on the next repaint.
+            state_entity.update(cx, |state, cx| {
+                if state.input.read(cx).value() != current {
+                    state.input.update(cx, |input, cx| {
+                        input.set_value(current.clone(), window, cx);
+                    });
+                }
+            });
+            let state = state_entity.read(cx);
+
+            let label = if current.is_empty() {
+                rust_i18n::t!("settings.model_hint").to_string()
+            } else {
+                current.to_string()
+            };
+            let dropdown = controls::dropdown_button(
+                SharedString::from("settings-model-presets"),
+                label,
+                presets,
+                current.clone(),
+                {
+                    let set_model = set_model.clone();
+                    move |picked: SharedString, cx: &mut App| (set_model)(picked.to_string(), cx)
+                },
+                240.0,
+                Anchor::TopLeft,
+            );
+            h_flex()
+                .gap_2()
+                .child(dropdown)
+                .child(
+                    Input::new(&state.input)
+                        .small()
+                        .appearance(true)
+                        .w(px(260.)),
+                )
+                .into_any_element()
+        },
+    )
+}
 
 // ============================ config ========================================
 
@@ -56,6 +157,7 @@ pub(super) fn ai_page(controller: &Entity<LibraryController>, cx: &App) -> Setti
     };
     let probe = controller.read(cx).ai_probe.clone();
     let analysis_probe = controller.read(cx).analysis_probe.clone();
+    let transcription_probe = controller.read(cx).transcription_probe.clone();
 
     SettingPage::new(rust_i18n::t!("settings.ai").to_string())
         .icon(IconName::Bot)
@@ -65,6 +167,8 @@ pub(super) fn ai_page(controller: &Entity<LibraryController>, cx: &App) -> Setti
         .group(vector_group(controller, coverage))
         .group(analysis_group(controller, &analysis_probe))
         .group(analysis_run_group(controller))
+        .group(transcription_group(controller, &transcription_probe))
+        .group(transcription_run_group(controller))
 }
 
 // ============================ endpoint ======================================
@@ -332,9 +436,12 @@ fn analysis_group(controller: &Entity<LibraryController>, probe: &AnalysisProbe)
         ))
         .item(SettingItem::new(
             rust_i18n::t!("settings.chat_model").to_string(),
-            SettingField::input(
-                |_cx| SharedString::from(analysis_config().model.clone()),
-                |value, cx| save_analysis_config(|config| config.model = value.to_string(), cx),
+            model_field(
+                "analysis-model",
+                || analysis_config().vendor,
+                || analysis_config().model,
+                |value, cx| save_analysis_config(|config| config.model = value, cx),
+                trove_core::ai::vendor::VendorId::models,
             ),
         ))
         .item(
@@ -546,4 +653,231 @@ fn analysis_buttons(controller: &Entity<LibraryController>, cx: &mut App) -> Div
         .gap_2()
         .child(run)
         .child(undo)
+}
+
+// ============================ transcription ==================================
+
+/// The saved transcription config, or defaults when the feature has never
+/// been configured.
+fn transcription_config() -> trove_core::config::TranscriptionConfig {
+    AppConfig::load().ai_transcription.unwrap_or_default()
+}
+
+/// Persist one field change to the transcription config (`config.json`, like
+/// every other setting).
+fn save_transcription_config(
+    edit: impl FnOnce(&mut trove_core::config::TranscriptionConfig),
+    cx: &mut App,
+) {
+    let mut config = AppConfig::load();
+    edit(config.ai_transcription.get_or_insert_with(Default::default));
+    settings_write::note(config.save(), "AI settings");
+    cx.refresh_windows();
+}
+
+/// Model presets that speak the OpenAI transcription wire: OpenAI's own two
+/// generations and the SenseVoice endpoint SiliconFlow hosts. The input
+/// beside the dropdown takes everything else — Groq, self-hosted whisper
+/// servers, relays.
+const TRANSCRIBE_MODEL_PRESETS: &[&str] = &[
+    "whisper-1",
+    "gpt-4o-mini-transcribe",
+    "gpt-4o-transcribe",
+    "FunAudioLLM/SenseVoiceLarge",
+];
+
+/// The speech-to-text endpoint: where the audio goes, what it costs, and the
+/// one way to find out any of it was right — the probe row at the bottom,
+/// which uploads a second of synthesized silence.
+fn transcription_group(
+    controller: &Entity<LibraryController>,
+    probe: &TranscriptionProbe,
+) -> SettingGroup {
+    SettingGroup::new()
+        .title(rust_i18n::t!("settings.transcription_endpoint").to_string())
+        .item(SettingItem::new(
+            rust_i18n::t!("settings.ai_base_url").to_string(),
+            SettingField::input(
+                |_cx| SharedString::from(transcription_config().base_url.clone()),
+                |value, cx| {
+                    save_transcription_config(|config| config.base_url = value.to_string(), cx)
+                },
+            ),
+        ))
+        .item(SettingItem::new(
+            rust_i18n::t!("settings.ai_api_key").to_string(),
+            SettingField::input(
+                |_cx| SharedString::from(transcription_config().api_key.clone()),
+                |value, cx| {
+                    save_transcription_config(|config| config.api_key = value.to_string(), cx)
+                },
+            ),
+        ))
+        .item(SettingItem::new(
+            rust_i18n::t!("settings.transcription_model").to_string(),
+            SettingField::dropdown(
+                TRANSCRIBE_MODEL_PRESETS
+                    .iter()
+                    .map(|m| (SharedString::from(*m), SharedString::from(*m)))
+                    .collect(),
+                |_cx| SharedString::from(transcription_config().model.clone()),
+                |value, cx| {
+                    save_transcription_config(|config| config.model = value.to_string(), cx)
+                },
+            ),
+        ))
+        .item(
+            SettingItem::new(
+                rust_i18n::t!("settings.transcription_language").to_string(),
+                SettingField::input(
+                    |_cx| {
+                        SharedString::from(
+                            transcription_config().language.clone().unwrap_or_default(),
+                        )
+                    },
+                    |value, cx| {
+                        let value = value.trim().to_string();
+                        save_transcription_config(
+                            move |config| config.language = (!value.is_empty()).then_some(value),
+                            cx,
+                        )
+                    },
+                ),
+            )
+            .description(rust_i18n::t!("settings.transcription_language_desc").to_string()),
+        )
+        .item(
+            SettingItem::new(
+                rust_i18n::t!("settings.transcription_prompt").to_string(),
+                SettingField::input(
+                    |_cx| {
+                        SharedString::from(
+                            transcription_config().prompt.clone().unwrap_or_default(),
+                        )
+                    },
+                    |value, cx| {
+                        let value = value.trim().to_string();
+                        save_transcription_config(
+                            move |config| config.prompt = (!value.is_empty()).then_some(value),
+                            cx,
+                        )
+                    },
+                ),
+            )
+            .description(rust_i18n::t!("settings.transcription_prompt_desc").to_string()),
+        )
+        .item(
+            SettingItem::new(
+                rust_i18n::t!("settings.ai_probe").to_string(),
+                SettingField::render({
+                    let controller = controller.clone();
+                    let probe = probe.clone();
+                    move |_, _, cx| transcription_probe_row(&controller, &probe, cx)
+                }),
+            )
+            .description(rust_i18n::t!("settings.transcription_probe_desc").to_string()),
+        )
+}
+
+/// The connection-test row for the transcription endpoint. The probe uploads
+/// silence, so an empty reply is the *success* shape here — the row says so
+/// rather than showing a blank line.
+fn transcription_probe_row(
+    controller: &Entity<LibraryController>,
+    probe: &TranscriptionProbe,
+    cx: &mut App,
+) -> Div {
+    let (text, color) = match probe {
+        TranscriptionProbe::Idle => (
+            rust_i18n::t!("settings.ai_probe_idle").to_string(),
+            cx.theme().muted_foreground,
+        ),
+        TranscriptionProbe::Running => (
+            rust_i18n::t!("settings.ai_probe_running").to_string(),
+            cx.theme().muted_foreground,
+        ),
+        TranscriptionProbe::Ok { reply } if reply.is_empty() => (
+            rust_i18n::t!("settings.transcribe_probe_silence").to_string(),
+            cx.theme().success,
+        ),
+        TranscriptionProbe::Ok { reply } => (
+            rust_i18n::t!("settings.transcribe_probe_ok", reply = reply.as_str()).to_string(),
+            cx.theme().success,
+        ),
+        TranscriptionProbe::Failed { message } => (
+            rust_i18n::t!("settings.ai_probe_failed", error = message.as_str()).to_string(),
+            cx.theme().danger,
+        ),
+    };
+    let running = probe.is_running();
+    let controller = controller.clone();
+    h_flex()
+        .w_full()
+        .items_center()
+        .justify_end()
+        .gap_2()
+        .child(div().text_sm().text_color(color).child(text))
+        .child(
+            Button::new("transcription-probe")
+                .outline()
+                .small()
+                .disabled(running)
+                .label(rust_i18n::t!("settings.ai_probe_run").to_string())
+                .on_click(move |_, _, cx| {
+                    crate::library::jobs::test_transcription_endpoint_app(&controller, cx);
+                }),
+        )
+}
+
+/// The transcription run: a whole-library sweep with its cancel button.
+fn transcription_run_group(controller: &Entity<LibraryController>) -> SettingGroup {
+    SettingGroup::new()
+        .title(rust_i18n::t!("settings.transcription").to_string())
+        .item(
+            SettingItem::new(
+                rust_i18n::t!("settings.transcription_scope").to_string(),
+                SettingField::render({
+                    let controller = controller.clone();
+                    move |_, _, cx| transcription_buttons(&controller, cx)
+                }),
+            )
+            .description(rust_i18n::t!("settings.transcription_scope_desc").to_string()),
+        )
+}
+
+/// Run / cancel for the whole-library transcription sweep. Rebuilt per paint
+/// like the analysis buttons, for the same reason.
+fn transcription_buttons(controller: &Entity<LibraryController>, cx: &mut App) -> Div {
+    let running = controller
+        .read(cx)
+        .library
+        .tasks()
+        .is_active(&trove_core::tasks::TaskKind::Transcription);
+
+    let run = if running {
+        let controller = controller.clone();
+        Button::new("transcription-cancel")
+            .outline()
+            .small()
+            .label(rust_i18n::t!("settings.ai_cancel").to_string())
+            .on_click(move |_, _, cx| {
+                crate::library::jobs::cancel_transcription_app(&controller, cx);
+            })
+    } else {
+        let controller = controller.clone();
+        Button::new("transcription-run")
+            .outline()
+            .small()
+            .label(rust_i18n::t!("settings.transcription_run").to_string())
+            .on_click(move |_, window, cx| {
+                crate::library::jobs::start_transcription_app(
+                    &controller,
+                    crate::library::jobs::TranscribeTarget::WholeLibrary,
+                    window,
+                    cx,
+                );
+            })
+    };
+
+    h_flex().w_full().justify_end().gap_2().child(run)
 }

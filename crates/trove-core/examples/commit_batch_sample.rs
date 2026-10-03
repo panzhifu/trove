@@ -56,6 +56,7 @@ fn main() {
     std::fs::create_dir_all(&root).unwrap();
 
     let options = ImportOptions {
+        pre_gate: true,
         data_root: root.clone(),
         cache_root: root.join("cache"),
         storage: trove_core::media::import::ImportStorage::Link,

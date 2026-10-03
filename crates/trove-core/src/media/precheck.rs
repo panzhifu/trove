@@ -13,9 +13,14 @@
 //! 3. **The commit** — the row is deduped against live assets by content
 //!    hash, which is what makes gate 2's answer final.
 //!
-//! This gate serves the watched folder only: a user import skips it so a
-//! repeat offer always reaches the pipeline, where the commit's dedup can
-//! fold it into its record and repair whatever facts the row was missing.
+//! The held gate serves the watched folder and the collect inbox. A user
+//! import runs the second gate in this module — [`partition_importable`] —
+//! which is *stricter*: it drops a file only when the hash cache proves its
+//! content **and** the record holding that content is complete, so the
+//! repair story ("a repeat offer always reaches the pipeline, where the
+//! commit folds it into its record and repairs whatever facts the row was
+//! missing") is preserved exactly — a file whose record is missing anything
+//! the pipeline would produce is never dropped.
 //!
 //! The gates are ordered so that the *cheap* and the *exact* check are not
 //! competitors: this gate only ever drops a file it can prove is already
@@ -143,6 +148,84 @@ impl<'a> Held<'a> {
         }
         (rest, held)
     }
+}
+
+/// Split a user import's paths into "importable" and "already here, and
+/// held completely", preserving order. The strict gate a user import runs
+/// instead of [`Held::partition`]:
+///
+/// - **Only the authoritative tier drops.** The hash cache must remember
+///   this exact file (its current stat) *and* the remembered digest must be
+///   a live record's content. The loose name/size fallback never drops
+///   here — a same-name same-size rewrite reaches the pipeline, where the
+///   commit dedups or records the edit as it should.
+/// - **The record must be complete.** A record missing anything the
+///   pipeline would produce *and the commit would write back* — mined
+///   facts (`services::maintenance`'s predicate), dimensions, a cached
+///   thumbnail or poster — sends the file to staging, which is the repair
+///   path the user import exists to keep open. The visual signature is
+///   not in the predicate: the reuse path never writes it, so requiring
+///   it would gate a file on a repair that never comes.
+///
+/// A path that cannot be stat'ed is importable: the pipeline reports it.
+/// The count is advisory (`already_imported`), the rest is the job's work
+/// list.
+pub fn partition_importable(
+    conn: &Connection,
+    paths: &[std::path::PathBuf],
+    cache_root: &Path,
+) -> (Vec<std::path::PathBuf>, u64) {
+    let mut dropped = 0u64;
+    let mut rest = Vec::with_capacity(paths.len());
+    for path in paths {
+        // The authoritative tier only: the hash cache must remember this
+        // file under its *current* stat, and the digest must name a live
+        // record that is complete. Anything less and the pipeline decides.
+        let dropped_here = (|| -> bool {
+            use crate::model::AssetKind;
+
+            let Some((size, mtime)) = hash_cache::stamp(path) else {
+                return false;
+            };
+            let Some(hash) = hash_cache::lookup(cache_root, path, size, mtime) else {
+                return false;
+            };
+            let Some(asset) = assets::find_by_content_hash(conn, &hash).unwrap_or(None) else {
+                return false;
+            };
+            let kind = asset.kind;
+            if !crate::services::maintenance::remine_complete(&asset, kind) {
+                return false;
+            }
+            match kind {
+                // The visual signature is deliberately absent from the image
+                // predicate: the commit's reuse path never writes one (see
+                // `media::import::backfill_reused`), so a record without it
+                // would cycle through staging forever for a repair that does
+                // not happen there — its backfill is the signature job's.
+                // The cached thumbnail and poster, by contrast, ARE warmed by
+                // a staging pass, which is why the cache checks stay.
+                AssetKind::Image => {
+                    asset.width.is_some()
+                        && asset.height.is_some()
+                        && super::thumb::cached(cache_root, &hash).is_some()
+                }
+                AssetKind::Video => {
+                    asset.width.is_some()
+                        && asset.height.is_some()
+                        && asset.duration_ms.is_some()
+                        && super::thumb::cached_poster(cache_root, &hash).is_some()
+                }
+                _ => true,
+            }
+        })();
+        if dropped_here {
+            dropped += 1;
+        } else {
+            rest.push(path.clone());
+        }
+    }
+    (rest, dropped)
 }
 
 #[cfg(test)]

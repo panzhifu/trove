@@ -175,13 +175,18 @@ impl ImportStorage {
 /// thumbnail-sized end; the wide arm is for batches of real photographs, where
 /// the narrow arm was leaving ~1.85x on the table.
 ///
-/// Both are ceilings rather than tuned optima: [`STAGE_THREADS_WIDE_MAX`] is
-/// where the sweep was still descending when it stopped, so a machine with
-/// fewer cores gets a proportionally smaller pool, and nobody gets more than
-/// 12. The width also assumes a local filesystem — on a network or fuse mount
+/// The narrow arm is for small-file batches (stat + read bound, no decode to
+/// spread). The wide arm is for decode-heavy batches, and its ceiling is
+/// measured: a `stage_sweep` over 400 × 640×420 random PNGs on a 20-core
+/// machine (2026-10-02, medians excluding each process's first pass) gave
+/// 5.10 / 3.05 / 1.93 / 1.47 / 1.27 / 1.09 ms per file at widths 1 / 2 / 4 /
+/// 8 / 12, then 0.94 at 16 and 0.88 at 20 — the knee at the core count, 16
+/// keeping 94% of it with a third fewer concurrent decode buffers than 20.
+/// A machine with fewer cores gets a proportionally smaller pool; the width
+/// assumes a local filesystem — on a network or fuse mount
 /// [`STAGE_THREADS_ENV`] can pin it without a rebuild.
 const STAGE_THREADS_NARROW: usize = 4;
-const STAGE_THREADS_WIDE_MAX: usize = 12;
+const STAGE_THREADS_WIDE_MAX: usize = 16;
 
 /// Average source size at which a batch switches to the wide pool: ~1 Mpx of
 /// JPEG, a file whose decode costs a few milliseconds.
@@ -344,22 +349,132 @@ pub fn stage_all(
 /// failures) into the database, collecting per-file outcomes into an
 /// [`ImportReport`]. Runs on whatever thread owns the connection; the
 /// connection may be a transaction / savepoint (batched commits).
+/// Files per transaction. Bigger batches amortize syncs further but widen
+/// the window between progress updates and hold write locks longer. The
+/// default is calibrated on a real terminal (see `docs/IMPORT-PIPELINE.md`
+/// §4); `TROVE_COMMIT_BATCH` overrides it the same way `TROVE_STAGE_THREADS`
+/// pins the staging pool.
+pub fn commit_batch() -> usize {
+    static BATCH: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *BATCH.get_or_init(|| {
+        std::env::var("TROVE_COMMIT_BATCH")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|v| (1..=4096).contains(v))
+            .unwrap_or(COMMIT_BATCH_DEFAULT)
+    })
+}
+
+/// The calibrated default for [`commit_batch`].
+const COMMIT_BATCH_DEFAULT: usize = 64;
+
+/// A per-file hook run inside the file's own savepoint, before it commits —
+/// the collect-inbox sidecar stamp is the one user.
+pub type PostCommitHook<'a> = &'a dyn Fn(&Connection, &StagedFile, &ImportItem);
+
+/// Commit one batch inside `tx`: a savepoint per file so a bad file skips
+/// without poisoning its batch. Any savepoint-level failure is reported as a
+/// skip; a transaction-level failure fails the whole chunk to the caller.
+pub fn commit_batch_tx(
+    tx: &mut rusqlite::Transaction,
+    chunk: &[std::result::Result<StagedFile, ImportSkip>],
+    into_collection: Option<Uuid>,
+    post: Option<PostCommitHook<'_>>,
+    report: &mut ImportReport,
+) -> Result<()> {
+    let mut imported = Vec::new();
+    let mut skipped = Vec::new();
+    for item in chunk {
+        match item {
+            Ok(file) => {
+                let sp = tx
+                    .savepoint()
+                    .map_err(|e| Error::Db(format!("savepoint: {e}")))?;
+                match commit_staged(&sp, into_collection, file) {
+                    Ok(imported_item) => {
+                        if let Some(post) = post {
+                            post(&sp, file, &imported_item);
+                        }
+                        sp.commit()
+                            .map_err(|e| Error::Db(format!("commit file: {e}")))?;
+                        imported.push(imported_item);
+                    }
+                    Err(e) => {
+                        // Dropped savepoint = rolled back file.
+                        skipped.push(ImportSkip {
+                            path: file.path.clone(),
+                            reason: e.to_string(),
+                        });
+                    }
+                }
+            }
+            Err(skip) => skipped.push(skip.clone()),
+        }
+    }
+    // Only on a successful commit do the results enter the report — a failed
+    // commit rolls the batch back, so its files must not read as imported.
+    report.imported.extend(imported);
+    report.skipped.extend(skipped);
+    Ok(())
+}
+
+/// Phase two for a whole staged batch, on a `&Connection`: batches of
+/// [`commit_batch`] share one transaction (one commit per batch instead of
+/// per file), so the synchronous path costs what the job path costs. A batch
+/// that cannot commit is reported as per-file skips — whatever earlier
+/// batches committed must still reach the caller.
 pub fn commit_staged_all(
     store: &Connection,
     into_collection: Option<Uuid>,
     staged: Vec<std::result::Result<StagedFile, ImportSkip>>,
 ) -> ImportReport {
     let mut report = ImportReport::default();
-    for item in staged {
-        match item {
-            Ok(file) => match commit_staged(store, into_collection, &file) {
-                Ok(item) => report.imported.push(item),
-                Err(e) => report.skipped.push(ImportSkip {
-                    path: file.path,
-                    reason: e.to_string(),
-                }),
-            },
-            Err(skip) => report.skipped.push(skip),
+    for chunk in staged.chunks(commit_batch()) {
+        let mut tx = match store.unchecked_transaction() {
+            Ok(tx) => tx,
+            Err(e) => {
+                let reason = Error::Db(format!("begin batch: {e}")).to_string();
+                for item in chunk {
+                    let path = match item {
+                        Ok(file) => file.path.clone(),
+                        Err(skip) => skip.path.clone(),
+                    };
+                    report.skipped.push(ImportSkip {
+                        path,
+                        reason: reason.clone(),
+                    });
+                }
+                continue;
+            }
+        };
+        if let Err(e) = commit_batch_tx(&mut tx, chunk, into_collection, None, &mut report) {
+            let reason = e.to_string();
+            for item in chunk {
+                let path = match item {
+                    Ok(file) => file.path.clone(),
+                    Err(skip) => skip.path.clone(),
+                };
+                report.skipped.push(ImportSkip {
+                    path,
+                    reason: reason.clone(),
+                });
+            }
+            continue;
+        }
+        if let Err(e) = tx.commit() {
+            // The commit rolled the batch back together, so its files must
+            // not read as imported — same treatment as a failed begin.
+            let reason = crate::error::Error::Db(format!("commit batch: {e}")).to_string();
+            for item in chunk {
+                let path = match item {
+                    Ok(file) => file.path.clone(),
+                    Err(skip) => skip.path.clone(),
+                };
+                report.skipped.push(ImportSkip {
+                    path,
+                    reason: reason.clone(),
+                });
+            }
         }
     }
     report

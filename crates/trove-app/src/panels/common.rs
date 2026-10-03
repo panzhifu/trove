@@ -238,6 +238,93 @@ pub(crate) fn ensure_font_registered(
     }
 }
 
+/// (family, weight) faces already registered through
+/// [`ensure_font_at_weight`]. Separate from [`REGISTERED_FONTS`]: a patched
+/// face is one more candidate under the same family, and the weight picker
+/// may register several over a session — bounded by the 100–900 grid.
+static REGISTERED_FONT_WEIGHTS: OnceLock<Mutex<std::collections::HashSet<(String, u16)>>> =
+    OnceLock::new();
+
+/// Register `family` so that requesting `.font_weight(weight)` really
+/// renders that weight of a **variable** font.
+///
+/// The text system's face matcher scores candidates by their *static*
+/// weight and then renders at the face's own weight — the requested one
+/// never reaches the renderer. The way through is the variable axis
+/// itself: cosmic-text instantiates the requested weight along `wght`
+/// (clamped to the axis), so a face whose `OS/2.usWeightClass` says
+/// `weight` both wins the match and renders there. This registers a patched
+/// copy of the file with exactly that header field rewritten — two bytes in
+/// a scratch copy, the original on disk untouched.
+pub(crate) fn ensure_font_at_weight(
+    family: &str,
+    blob: Option<&std::path::Path>,
+    weight: u16,
+    cx: &mut App,
+) -> bool {
+    let set = REGISTERED_FONT_WEIGHTS.get_or_init(|| Mutex::new(std::collections::HashSet::new()));
+    if trove_core::sync::lock(set).contains(&(family.to_string(), weight)) {
+        return true;
+    }
+    let Some(path) = blob else {
+        return false;
+    };
+    let Ok(bytes) = std::fs::read(path) else {
+        return false;
+    };
+    let Some(patched) = patch_os2_weight(&bytes, weight) else {
+        return false;
+    };
+    if cx
+        .text_system()
+        .add_fonts(vec![std::borrow::Cow::Owned(patched)])
+        .is_ok()
+    {
+        trove_core::sync::lock(set).insert((family.to_string(), weight));
+        true
+    } else {
+        false
+    }
+}
+
+/// A copy of `bytes` whose `OS/2.usWeightClass` reads `weight`, or `None`
+/// when the input is not a parseable sfnt with an OS/2 table. Everything
+/// else — including the checksums, which nothing downstream validates — is
+/// byte-for-byte the input.
+pub(crate) fn patch_os2_weight(bytes: &[u8], weight: u16) -> Option<Vec<u8>> {
+    // sfnt header: version (4) + numTables (2) + search fields (6), then
+    // 16-byte table records of tag, checksum, offset, length.
+    if bytes.len() < 12 {
+        return None;
+    }
+    let num_tables = u16::from_be_bytes([bytes[4], bytes[5]]) as usize;
+    let mut patched = bytes.to_vec();
+    for entry in 0..num_tables {
+        let record = 12 + entry * 16;
+        let end = record + 16;
+        if end > patched.len() {
+            return None;
+        }
+        if &patched[record..record + 4] == b"OS/2" {
+            // usWeightClass sits after the version and xAvgCharWidth fields.
+            let offset = u32::from_be_bytes([
+                patched[record + 8],
+                patched[record + 9],
+                patched[record + 10],
+                patched[record + 11],
+            ]) as usize
+                + 4;
+            let field = offset..offset + 2;
+            if field.end > patched.len() {
+                return None;
+            }
+            patched[field].copy_from_slice(&weight.to_be_bytes());
+            return Some(patched);
+        }
+    }
+    None
+}
+
 /// One live specimen line for a registered font: the built-in sample text
 /// rendered in the font itself, centered on a soft card background, single
 /// row. The caller sizes it (grid cells stretch, list leads get fixed dims).
@@ -389,4 +476,100 @@ fn decode_apng(path: &std::path::Path) -> Option<Arc<gpui_kit::RenderImage>> {
         return None;
     }
     Some(Arc::new(gpui_kit::RenderImage::new(frames)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::patch_os2_weight;
+
+    /// A minimal sfnt: header + one table record naming `OS/2`, plus a
+    /// six-byte OS/2 table whose usWeightClass (offset +4) is the field the
+    /// patch rewrites. Everything else must survive untouched.
+    fn sfnt_with_os2(weight: u16) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&0x0001_0000u32.to_be_bytes()); // sfntVersion
+        bytes.extend_from_slice(&1u16.to_be_bytes()); // numTables
+        bytes.extend_from_slice(&0u16.to_be_bytes()); // searchRange
+        bytes.extend_from_slice(&0u16.to_be_bytes()); // entrySelector
+        bytes.extend_from_slice(&0u16.to_be_bytes()); // rangeShift
+        bytes.extend_from_slice(b"OS/2");
+        bytes.extend_from_slice(&0u32.to_be_bytes()); // checksum
+        bytes.extend_from_slice(&28u32.to_be_bytes()); // offset
+        bytes.extend_from_slice(&6u32.to_be_bytes()); // length
+        bytes.extend_from_slice(&1u16.to_be_bytes()); // OS/2 version
+        bytes.extend_from_slice(&0i16.to_be_bytes()); // xAvgCharWidth
+        bytes.extend_from_slice(&weight.to_be_bytes()); // usWeightClass
+        bytes
+    }
+
+    #[test]
+    fn the_weight_field_is_rewritten_and_nothing_else_is() {
+        let bytes = sfnt_with_os2(400);
+        let patched = patch_os2_weight(&bytes, 700).expect("a parseable sfnt");
+        assert_eq!(patched.len(), bytes.len(), "same size");
+        assert_eq!(&patched[..28], &bytes[..28], "header and record untouched");
+        assert_eq!(
+            u16::from_be_bytes([patched[32], patched[33]]),
+            700,
+            "usWeightClass reads back the requested weight"
+        );
+        assert_eq!(patched[28], bytes[28], "OS/2 version byte untouched");
+        assert_eq!(patched[30], bytes[30], "xAvgCharWidth byte untouched");
+        // The input is never touched.
+        assert_eq!(u16::from_be_bytes([bytes[32], bytes[33]]), 400);
+    }
+
+    /// The offset math against a real font in the tree: the patched file
+    /// must still parse, and its `OS/2` weight must read back as requested.
+    /// (ttf-parser is a trove-core dependency; here it only re-reads two
+    /// bytes the patch moved.)
+    #[test]
+    fn a_real_font_survives_the_patch() {
+        let Some(path) = std::fs::read_dir(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../reference/Serpent/resources/fonts"),
+        )
+        .ok()
+        .and_then(|entries| {
+            entries
+                .flatten()
+                .map(|entry| entry.path())
+                .find(|path| path.extension().is_some_and(|ext| ext == "ttf"))
+        }) else {
+            eprintln!("no reference fonts on this tree; skipping");
+            return;
+        };
+        let bytes = std::fs::read(&path).expect("reference font readable");
+        let Some(patched) = patch_os2_weight(&bytes, 650) else {
+            panic!("a real ttf must patch");
+        };
+        assert_ne!(&patched[..], &bytes[..], "the weight byte moved");
+        let read_weight = |data: &[u8]| {
+            let num_tables = u16::from_be_bytes([data[4], data[5]]) as usize;
+            for entry in 0..num_tables {
+                let record = 12 + entry * 16;
+                if &data[record..record + 4] == b"OS/2" {
+                    let offset = u32::from_be_bytes([
+                        data[record + 8],
+                        data[record + 9],
+                        data[record + 10],
+                        data[record + 11],
+                    ]) as usize;
+                    return u16::from_be_bytes([data[offset + 4], data[offset + 5]]);
+                }
+            }
+            panic!("no OS/2 in the real font");
+        };
+        assert_eq!(read_weight(&patched), 650);
+        assert_ne!(read_weight(&bytes), 650, "the original reads differently");
+    }
+
+    #[test]
+    fn a_font_without_an_os2_table_is_not_patched() {
+        let mut bytes = sfnt_with_os2(400);
+        // Retag the record: the table is there, `OS/2` is not.
+        bytes[12..16].copy_from_slice(b"head");
+        assert_eq!(patch_os2_weight(&bytes, 700), None);
+        assert_eq!(patch_os2_weight(&bytes[..8], 700), None, "truncated");
+    }
 }

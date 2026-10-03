@@ -18,10 +18,134 @@ use trove_core::tasks::import::{ImportOptions, ImportSource};
 use trove_core::tasks::{TaskKind, TaskManager};
 
 use crate::cli::{
-    AnalyzeArgs, CollectionCommand, Ids, ImportArgs, IndexCommand, PurgeArgs, SequenceCommand,
-    SetArgs, TagArgs,
+    AnalyzeArgs, CollectionCommand, Ids, ImportArgs, IndexCommand, MigrateArgs, PurgeArgs,
+    SequenceCommand, SetArgs, SourceArg, TagArgs,
 };
 use crate::ctx::{CliError, Env, Rendered, parse_asset_ids, resolve_collection};
+
+// ---------------------------------------------------------------------------
+// migrate
+// ---------------------------------------------------------------------------
+
+/// Migrate from Eagle / Billfish: scan the foreign library, link-import its
+/// files, then write the carried metadata back — the same job the desktop
+/// wizard drives, one `TaskManager` short of a window.
+pub fn migrate(
+    env: &Env,
+    args: &MigrateArgs,
+    style: &crate::ctx::Style,
+) -> Result<Rendered, CliError> {
+    let plan = trove_core::services::migrate::scan(&args.path).map_err(|error| match error {
+        trove_core::Error::Validation(_) => CliError::usage(error.to_string()),
+        _ => CliError::from(error),
+    })?;
+    if let Some(source) = args.from
+        && source != SourceArg::Auto
+    {
+        let wanted = match source {
+            SourceArg::Eagle => trove_core::services::migrate::SourceKind::Eagle,
+            SourceArg::Billfish => trove_core::services::migrate::SourceKind::Billfish,
+            SourceArg::Auto => unreachable!("excluded above"),
+        };
+        if plan.kind != wanted {
+            return Err(CliError::usage(format!(
+                "{} reads as a {} library, not a {} one",
+                args.path.display(),
+                plan.kind.as_str(),
+                wanted.as_str()
+            )));
+        }
+    }
+
+    let collections: Vec<Vec<String>> = plan.folders.values().cloned().collect();
+    if args.dry_run {
+        let preview: Vec<Value> = plan
+            .items
+            .iter()
+            .take(5)
+            .map(|item| {
+                json!({
+                    "file": item.source_path.display().to_string(),
+                    "tags": item.tags,
+                    "rating": item.rating,
+                    "note": item.note,
+                    "url": item.url,
+                    "collections": item.folder_ids.iter()
+                        .filter_map(|id| plan.folders.get(id))
+                        .collect::<Vec<_>>(),
+                })
+            })
+            .collect();
+        let result = json!({
+            "dry_run": true,
+            "kind": plan.kind.as_str(),
+            "root": plan.root.display().to_string(),
+            "items": plan.items.len(),
+            "skipped": plan.skipped.len(),
+            "tags": plan.tag_names(),
+            "collections": collections,
+            "sample": preview,
+        });
+        let human = format!(
+            "would migrate {} item(s) from {} ({} tag(s), {} collection(s), {} skipped)",
+            plan.items.len(),
+            plan.kind.as_str(),
+            plan.tag_names().len(),
+            plan.folders.len(),
+            plan.skipped.len(),
+        );
+        return Ok(Rendered::new(result, human));
+    }
+
+    style.progress(&format!(
+        "migrating {} item(s) from {}",
+        plan.items.len(),
+        plan.kind.as_str()
+    ));
+    let options = trove_core::tasks::migration::MigrationOptions {
+        source: args.path.clone(),
+        data_root: env.data_root.clone(),
+        cache_root: env.cache_root.clone(),
+    };
+    let manager = TaskManager::new();
+    let (_, receiver) = manager
+        .start(TaskKind::Migration, "cli migrate", move |ctx| {
+            trove_core::tasks::migration::run(&options, ctx)
+        })
+        .map_err(|error| CliError::runtime(format!("cannot start the migration job: {error:?}")))?;
+    let outcome = receiver
+        .recv()
+        .map_err(|_| CliError::runtime("the migration job did not run to completion"))?;
+    if let Some(error) = &outcome.error {
+        style.note(&format!("the import phase reported: {error}"));
+    }
+
+    let result = json!({
+        "kind": plan.kind.as_str(),
+        "imported": outcome.report.imported,
+        "reused": outcome.report.reused,
+        "skipped": outcome.report.skipped,
+        "tagged": outcome.report.tagged,
+        "collections_created": outcome.report.collections_created,
+        "backfilled": outcome.report.backfilled,
+        "backfill_failed": outcome.report.backfill_failed,
+        "cancelled": outcome.cancelled,
+    });
+    let human = format!(
+        "migrated: {} imported, {} reused, {} tagged, {} collection(s) created, {} skipped{}",
+        outcome.report.imported,
+        outcome.report.reused,
+        outcome.report.tagged,
+        outcome.report.collections_created,
+        outcome.report.skipped,
+        if outcome.cancelled {
+            " (cancelled)"
+        } else {
+            ""
+        },
+    );
+    Ok(Rendered::new(result, human))
+}
 
 // ---------------------------------------------------------------------------
 // import
@@ -75,6 +199,7 @@ pub fn import(
     }
 
     let options = ImportOptions {
+        pre_gate: true,
         data_root: env.data_root.clone(),
         cache_root: env.cache_root.clone(),
         storage,

@@ -46,8 +46,11 @@ use uuid::Uuid;
 
 pub mod ai_analysis;
 pub mod embed;
+pub mod export;
 pub mod ignore;
 pub mod import;
+pub mod migration;
+pub mod transcription;
 pub mod watch;
 
 /// Handle identifying one job inside the manager.
@@ -105,6 +108,21 @@ pub enum TaskKind {
     /// Multimodal AI analysis: description, tags, and rating from a vision
     /// model. One API call per asset.
     AiAnalysis,
+    /// Speech-to-text: an audio or video asset's track goes to a cloud
+    /// recogniser, the transcript comes back and is filed on the asset.
+    /// Network-bound like analysis, but with a local ffmpeg transcode in
+    /// front of every upload.
+    Transcription,
+    /// Migrating from another asset manager (Eagle / Billfish): scan the
+    /// foreign library, link-import its files, then write the carried
+    /// metadata back. Mutually exclusive with a plain import because both
+    /// drive the same store the same way.
+    Migration,
+    /// Handing asset files to a user-chosen folder: originals copied,
+    /// images re-encoded to a chosen raster format, videos transcoded or
+    /// remuxed through the system ffmpeg. Reads the library, writes only
+    /// outside it.
+    Export,
     /// A plugin-registered task type. The string is the plugin's stable name
     /// for the kind, used in logs, the journal, and mutual-exclusion checks.
     Custom(Cow<'static, str>),
@@ -125,6 +143,9 @@ impl TaskKind {
             TaskKind::EmbeddingBackfill => Cow::Borrowed("embedding-backfill"),
             TaskKind::AutoTag => Cow::Borrowed("auto-tag"),
             TaskKind::AiAnalysis => Cow::Borrowed("ai-analysis"),
+            TaskKind::Transcription => Cow::Borrowed("transcribe"),
+            TaskKind::Migration => Cow::Borrowed("migration"),
+            TaskKind::Export => Cow::Borrowed("export"),
             TaskKind::Custom(name) => Cow::Borrowed(name),
         }
     }

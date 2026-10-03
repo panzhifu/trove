@@ -513,6 +513,37 @@ pub fn update_facts(conn: &Connection, id: Uuid, facts: &AssetFacts) -> Result<(
     Ok(())
 }
 
+/// Store (or clear, with `None`) an asset's speech-to-text transcript.
+///
+/// A column write, not a facts write, because transcripts run to tens of
+/// kilobytes and `extra` is loaded on every listing query. The UPDATE fires
+/// the `search_queue` trigger like any other row write, so the next index
+/// drain picks the new text up with no manual reindex.
+pub fn set_transcript(conn: &Connection, id: Uuid, text: Option<&str>) -> Result<()> {
+    rows::execute(
+        conn,
+        "UPDATE assets SET transcript = ?1, updated_at = ?2 WHERE id = ?3",
+        vec![
+            bind_opt_str(text),
+            rows::ts(now()).into(),
+            rows::uuid(id).into(),
+        ],
+    )?;
+    Ok(())
+}
+
+/// The asset's transcript, read on demand — the column is deliberately left
+/// out of [`COLS`], so nothing bulk-loading assets pays for text it is not
+/// showing.
+pub fn transcript(conn: &Connection, id: Uuid) -> Result<Option<String>> {
+    let mut stmt = conn.prepare_cached("SELECT transcript FROM assets WHERE id = ?1")?;
+    let mut rows = stmt.query([rows::uuid(id)])?;
+    match rows.next()? {
+        Some(row) => Ok(row.get::<_, Option<String>>(0)?),
+        None => Ok(None),
+    }
+}
+
 /// Fold a fresh probe of the *same content* into a record the importer is
 /// reusing (the dedup path — see `media::import::commit_staged`). The facts
 /// JSON is replaced wholesale (the caller merged the sub-fields); the

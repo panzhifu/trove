@@ -260,25 +260,44 @@ pub(crate) fn tag_filter(
     cx: &App,
 ) -> impl IntoElement {
     let active = controller.read(cx).active_tag;
-    let tags: Vec<(Uuid, String)> = {
-        controller
-            .read(cx)
-            .library
-            .list_tags()
-            .unwrap_or_default()
-            .into_iter()
-            .map(|t| (t.id, t.name))
+    let tags: Vec<(Uuid, String, String)> = {
+        let all = controller.read(cx).library.list_tags().unwrap_or_default();
+        // A child tag listed flat would read as a root tag — an AI-invented
+        // "条形码" next to the user's own top-level tags — so every non-root
+        // tag carries its path down from the top-level ancestor, while the
+        // bare name stays available for the facet lookup.
+        let by_id: std::collections::HashMap<Uuid, &trove_core::model::Tag> =
+            all.iter().map(|t| (t.id, t)).collect();
+        let path = |tag: &trove_core::model::Tag| -> String {
+            let mut parts = vec![tag.name.clone()];
+            let mut parent = tag.parent_id;
+            while let Some(pid) = parent {
+                match by_id.get(&pid) {
+                    Some(ancestor) => {
+                        parts.push(ancestor.name.clone());
+                        parent = ancestor.parent_id;
+                    }
+                    None => break,
+                }
+            }
+            parts.reverse();
+            parts.join(" / ")
+        };
+        all.iter()
+            .map(|t| (t.id, t.name.clone(), path(t)))
             .collect()
     };
     let t = |k: &str| rust_i18n::t!(k).to_string();
     let tag_facets = facets.map(|f| f.tags.as_slice());
 
     // Pre-compute labels with counts before the closure so the facet borrow
-    // does not need to escape the function.
+    // does not need to escape the function. The facet lookup stays on the
+    // bare name (that is the value the facets are keyed by); only the label
+    // carries the path.
     let options: Vec<(Uuid, String)> = tags
         .iter()
-        .map(|(id, name)| {
-            let counted = with_count(name, facet_count(tag_facets, name));
+        .map(|(id, name, path)| {
+            let counted = with_count(path, facet_count(tag_facets, name));
             (*id, counted)
         })
         .collect();

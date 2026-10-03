@@ -245,7 +245,10 @@ impl TextIndex {
     }
 
     /// [`index_asset`] with the library root, which unlocks the one surface
-    /// that lives in a file rather than the row: a text asset's body.
+    /// that lives in a file rather than the row: a text asset's body. The
+    /// speech-to-text transcript rides the same body fields — spoken content
+    /// is content for search purposes, and the body surfaces are already
+    /// searchable unqualified.
     pub fn index_asset_in(
         &self,
         conn: &Connection,
@@ -259,7 +262,16 @@ impl TextIndex {
         };
         let tags = assets::tags_for_index(conn, asset_id)?;
         let facts = extract_fact_texts(&a.facts, a.source_url.as_deref());
-        let body = text_body(&a, root);
+        let mut body = text_body(&a, root);
+        // Read on demand and capped like any body: the transcript column is
+        // deliberately out of `assets::COLS`, so a bulk index drain pays for
+        // the text only here, where it is about to be indexed.
+        if let Ok(Some(transcript)) = assets::transcript(conn, asset_id) {
+            if !body.is_empty() {
+                body.push('\n');
+            }
+            body.push_str(cap_for_index(&transcript));
+        }
         self.index_asset_text(
             &writer,
             &asset_id.to_string(),
@@ -441,4 +453,18 @@ fn text_body(asset: &crate::model::Asset, root: Option<&Path>) -> String {
     text::read(&blob, text::MAX_INDEX_BYTES)
         .map(|c| c.text)
         .unwrap_or_default()
+}
+
+/// Cut indexed text to the body budget on a char boundary — the transcript
+/// column has no length cap, and a multi-megabyte document is an index
+/// liability, not a better search.
+fn cap_for_index(text: &str) -> &str {
+    if text.len() <= text::MAX_INDEX_BYTES {
+        return text;
+    }
+    let mut end = text::MAX_INDEX_BYTES;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
 }

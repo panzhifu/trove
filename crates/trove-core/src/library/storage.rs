@@ -132,6 +132,13 @@ impl Library {
         self.interrupted.clear();
     }
 
+    /// The asset's speech-to-text transcript, read on demand — the column is
+    /// deliberately out of the bulk row load, so this is the one accessor the
+    /// UI has (the inspector, the one place that pays for the text).
+    pub fn transcript(&self, id: Uuid) -> Result<Option<String>> {
+        assets::transcript(self.store.conn(), id)
+    }
+
     /// The background task manager. One running job per kind; progress and
     /// lifecycle events are polled from the UI side.
     pub fn tasks(&self) -> &crate::tasks::TaskManager {

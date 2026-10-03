@@ -12,6 +12,17 @@
 //! module still never touches the running binary or anything a package
 //! manager put on disk.
 //!
+//! The download carries three guarantees. It is *exclusive* — one stream at a
+//! time, claimed atomically under the state mutex, so a double click cannot
+//! start two. It is *verified* — the bytes must match the release's
+//! `BLAKE3SUMS` manifest (published by `release.yml` beside the artifacts;
+//! `SHA256SUMS` rides along for external tools) before they count as staged.
+//! BLAKE3 is the same digest every content hash in the library uses, and the
+//! manifest's trustworthiness comes from being published in the same release
+//! over HTTPS — not from the hash function it names. And it is *bounded* — an
+//! artifact over [`MAX_ARTIFACT_BYTES`] is refused from its content-length up
+//! front and cut off mid-stream if the response lies about its size.
+//!
 //! The probe is a `HEAD` on `…/releases/latest` with redirects turned off:
 //! GitHub answers `302` and puts the tag in the `location` header, so a check
 //! costs one request, needs no JSON, and — unlike the REST API — draws
@@ -42,6 +53,20 @@ const TIMEOUT: Duration = Duration::from_secs(10);
 /// startup library scan both want the machine, and a version badge is never
 /// urgent enough to compete with them.
 pub const STARTUP_DELAY: Duration = Duration::from_secs(10);
+
+/// Upper bound on one update artifact. Real installers are tens of
+/// megabytes; the cap is what stops a confused proxy or a wrong response
+/// from streaming unboundedly — checked against the response's
+/// content-length before the first byte is written, and against the
+/// received count while streaming in case the header was absent or lying.
+const MAX_ARTIFACT_BYTES: u64 = 512 * 1024 * 1024;
+
+/// The checksum manifest the staged download is verified against: generated
+/// by the release workflow with `b3sum`, in the same coreutils line shape as
+/// its `SHA256SUMS` sibling. BLAKE3 keeps the crate on the one hash primitive
+/// it already uses everywhere (see `media/hash.rs`); 256-bit output means the
+/// digest is 64 hex characters, exactly what [`checksum_line`] accepts.
+const CHECKSUMS_ASSET: &str = "BLAKE3SUMS";
 
 /// Seconds since the Unix epoch, for the config's last-check timestamp.
 pub fn now_unix() -> i64 {
@@ -228,17 +253,17 @@ pub enum DownloadState {
     /// Bytes are landing. `total` is `0` until the response's
     /// content-length is known; the UI shows percent only then.
     Downloading { received: u64, total: u64 },
-    /// The artifact is complete under the state directory's `updates/`,
-    /// hashed as it streamed. Ready for [`open_staged`].
+    /// The artifact is complete under the state directory's `updates/`, and
+    /// its BLAKE3 matched the release's `BLAKE3SUMS` line for this asset.
+    /// Ready for [`open_staged`].
     Staged {
         version: String,
         path: std::path::PathBuf,
-        /// BLAKE3 of the staged bytes — the same digest every content hash
-        /// in the library uses, recorded here (and in the log) so what
-        /// landed can be identified later. It is a fingerprint, not a
-        /// verification: the release publishes no checksum sidecar to
-        /// compare it against, so transport integrity rests on TLS and the
-        /// hash on the record.
+        /// BLAKE3 of the staged bytes, lowercase hex — the digest the
+        /// release's checksum manifest vouched for (see
+        /// [`expected_digest`]) and the same hash every content hash in
+        /// the library uses, recorded here and in the log so what landed
+        /// can be identified later.
         hash: String,
     },
     /// The download could not complete. Kept for the About row; never a
@@ -326,8 +351,32 @@ pub fn staged_path(version: &str) -> Option<std::path::PathBuf> {
     path.is_file().then_some(path)
 }
 
+/// Claim the single download slot: `true` with the state reading
+/// [`DownloadState::Downloading`], or `false` because a download is already
+/// in flight — in which case the caller must not touch the `.part` file, the
+/// state, or [`CANCELLED`].
+///
+/// Checking and claiming have to be one step under the same mutex: two quick
+/// clicks spawn two background tasks, and from two threads a check-then-set
+/// can both observe `Idle`.
+fn try_begin_download() -> bool {
+    let mut slot = crate::sync::lock(&DOWNLOAD_STATE);
+    if matches!(*slot, DownloadState::Downloading { .. }) {
+        return false;
+    }
+    *slot = DownloadState::Downloading {
+        received: 0,
+        total: 0,
+    };
+    true
+}
+
 /// Download this platform's artifact for `version` into
-/// [`updates_dir`], publish progress into [`DownloadState`], and stage it.
+/// [`updates_dir`], publish progress into [`DownloadState`], and stage it
+/// verified: the bytes are hashed as they stream and must match the
+/// release's [`CHECKSUMS_ASSET`] line for this asset before the `.part`
+/// file is renamed into place. One download runs at a time — a call that
+/// arrives while another is in flight is refused without disturbing it.
 ///
 /// Streaming, not `read_to_end`: an installer is tens of megabytes, the
 /// state is updated as it goes, and a cancel is honoured between chunks
@@ -338,7 +387,6 @@ pub fn staged_path(version: &str) -> Option<std::path::PathBuf> {
 /// Runs on the caller's executor — `ureq` is `Send`, the state is a mutex,
 /// nothing here touches a window.
 pub fn download_and_stage(version: &str) -> Result<std::path::PathBuf, Error> {
-    CANCELLED.store(false, std::sync::atomic::Ordering::Relaxed);
     let Some(url) = download_url(version) else {
         return Err(Error::Network(
             "this build has no downloadable installer; use the releases page".into(),
@@ -349,11 +397,19 @@ pub fn download_and_stage(version: &str) -> Result<std::path::PathBuf, Error> {
     let dest = dir.join(&asset);
     let part = dir.join(format!("{asset}.part"));
 
-    set_download_state(DownloadState::Downloading {
-        received: 0,
-        total: 0,
-    });
-    let run = (|| -> Result<(std::path::PathBuf, String), Error> {
+    // The claim comes before every fallible step that would otherwise leave
+    // the slot held without a stream behind it, and before the cancellation
+    // reset: a refused second caller must not blind the first task to the
+    // cancel already pending for it.
+    if !try_begin_download() {
+        return Err(Error::Network("a download is already in progress".into()));
+    }
+    CANCELLED.store(false, std::sync::atomic::Ordering::Relaxed);
+
+    let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        // The manifest comes first: a release that will not vouch for its
+        // own artifact never costs the (large) download.
+        let expected = expected_digest(version, &asset)?;
         // No global timeout — a tens-of-megabytes stream would die of it.
         // Each phase gets its own: connect once, response headers once,
         // and a per-read ceiling that only trips when the stream actually
@@ -374,6 +430,14 @@ pub fn download_and_stage(version: &str) -> Result<std::path::PathBuf, Error> {
             .and_then(|value| value.to_str().ok())
             .and_then(|value| value.parse::<u64>().ok())
             .unwrap_or(0);
+        // The honest response states its size; one past the cap is refused
+        // before a byte is written.
+        if total > MAX_ARTIFACT_BYTES {
+            return Err(Error::Network(format!(
+                "artifact is {total} bytes, over the {} MiB download cap",
+                MAX_ARTIFACT_BYTES / (1024 * 1024)
+            )));
+        }
         use std::io::{Read as _, Write as _};
         let mut reader = response.into_body().into_reader();
         let mut hasher = blake3::Hasher::new();
@@ -392,6 +456,15 @@ pub fn download_and_stage(version: &str) -> Result<std::path::PathBuf, Error> {
             hasher.update(&buf[..n]);
             file.write_all(&buf[..n])?;
             received += n as u64;
+            // The streaming half of the cap: a response that never sent a
+            // content-length (or sent a false one) is cut off here.
+            if received > MAX_ARTIFACT_BYTES {
+                let _ = std::fs::remove_file(&part);
+                return Err(Error::Network(format!(
+                    "artifact is over the {} MiB download cap",
+                    MAX_ARTIFACT_BYTES / (1024 * 1024)
+                )));
+            }
             // Lock churn, bounded: the About row polls per frame, but a
             // mutex tick per 64 KiB chunk buys nothing over one per 256 KiB.
             if received - reported >= 256 * 1024 {
@@ -407,9 +480,24 @@ pub fn download_and_stage(version: &str) -> Result<std::path::PathBuf, Error> {
             )));
         }
         let hash = crate::media::hash::hex(hasher.finalize().as_bytes());
+        // The manifest has the final word: bytes the release does not vouch
+        // for never become a staged installer.
+        if !hash.eq_ignore_ascii_case(&expected) {
+            let _ = std::fs::remove_file(&part);
+            return Err(Error::Network(format!(
+                "checksum mismatch for {asset}: expected {expected}, got {hash}"
+            )));
+        }
         std::fs::rename(&part, &dest)?;
         Ok((dest, hash))
-    })();
+    }))
+    // A panic mid-stream must not leave the slot claimed forever: the state
+    // would read `Downloading` with nothing in flight, and every later
+    // download this session would be refused by the single-flight check.
+    .unwrap_or_else(|_| {
+        let _ = std::fs::remove_file(&part);
+        Err(Error::Network("download panicked".into()))
+    });
 
     match run {
         Ok((path, hash)) => {
@@ -428,6 +516,57 @@ pub fn download_and_stage(version: &str) -> Result<std::path::PathBuf, Error> {
             Err(error)
         }
     }
+}
+
+/// The BLAKE3 the release's [`CHECKSUMS_ASSET`] manifest records for
+/// `asset`, fetched from the same release the artifact comes from.
+///
+/// A manifest that will not load — an older release that predates it, a
+/// yanked asset, a network that dropped between the two requests — fails the
+/// download rather than waving the bytes through unverified: fail closed is
+/// the only honest default for a check whose absence reads as success.
+fn expected_digest(version: &str, asset: &str) -> Result<String, Error> {
+    let url = format!("https://github.com/{REPO}/releases/download/v{version}/{CHECKSUMS_ASSET}");
+    let config = ureq::config::Config::builder()
+        .timeout_global(Some(TIMEOUT))
+        .user_agent(concat!("trove/", env!("CARGO_PKG_VERSION")))
+        .build();
+    let response = ureq::Agent::new_with_config(config)
+        .get(&url)
+        .call()
+        .map_err(|error| Error::Network(format!("fetch {CHECKSUMS_ASSET}: {error}")))?;
+    use std::io::Read as _;
+    // One line per asset; a megabyte is already absurd, so the read is
+    // capped rather than trusted to the response to end where it should.
+    let mut manifest = String::new();
+    response
+        .into_body()
+        .into_reader()
+        .take(1024 * 1024)
+        .read_to_string(&mut manifest)
+        .map_err(|error| Error::Network(format!("read {CHECKSUMS_ASSET}: {error}")))?;
+    checksum_line(&manifest, asset)
+        .ok_or_else(|| Error::Network(format!("{CHECKSUMS_ASSET} names no {asset}")))
+}
+
+/// The checksum line for `asset` in a coreutils-format manifest (`b3sum`
+/// writes the same shape `sha256sum` does): lines of
+/// `<64 hex digits>  <name>`, whitespace-separated, where `name` may carry
+/// the directory the manifest was generated in (the release job's artifact
+/// subdirectories). Matching is on the file's basename, and the digest comes
+/// back lowercase hex. `None` for every malformed line — a truncated
+/// manifest cannot stand in for a missing one.
+fn checksum_line(manifest: &str, asset: &str) -> Option<String> {
+    manifest.lines().find_map(|line| {
+        let line = line.trim();
+        let (digest, name) = line.split_once(char::is_whitespace)?;
+        if name.trim().rsplit('/').next()? != asset {
+            return None;
+        }
+        let digest = digest.trim();
+        let shaped = digest.len() == 64 && digest.chars().all(|ch| ch.is_ascii_hexdigit());
+        shaped.then(|| digest.to_ascii_lowercase())
+    })
 }
 
 /// Hand the staged artifact to the OS's own handler: `Setup.exe` launches
@@ -567,6 +706,67 @@ mod tests {
         Some(format!(
             "https://github.com/{REPO}/releases/download/v{version}/{asset}"
         ))
+    }
+
+    /// The manifest parser, against the shapes `b3sum` and the release
+    /// job actually produce: two-space separation, a name that may carry the
+    /// artifact subdirectory it was generated under, uppercase hex coming
+    /// back lowercase — and the refusals: a foreign asset, a digest that is
+    /// not 64 hex digits. A truncated manifest line cannot stand in for a
+    /// real one.
+    #[test]
+    fn the_checksum_manifest_is_parsed_by_asset_name() {
+        let setup = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+        let deb = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let manifest = format!(
+            "{setup}  Trove-0.5.2-Setup.exe\n{deb}  trove-x86_64-unknown-linux-gnu/trove_0.5.2_amd64.deb\n"
+        );
+        assert_eq!(
+            checksum_line(&manifest, "Trove-0.5.2-Setup.exe").as_deref(),
+            Some(setup)
+        );
+        assert_eq!(
+            checksum_line(&manifest, "trove_0.5.2_amd64.deb").as_deref(),
+            Some(deb),
+            "the subdirectory the manifest was generated under is not part of the key"
+        );
+        assert_eq!(checksum_line(&manifest, "trove-0.5.2-aarch64.dmg"), None);
+
+        // One space also parses, and hex is normalized to lowercase.
+        let upper = "ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789";
+        assert_eq!(
+            checksum_line(
+                &format!("{upper} trove-0.5.2-x86_64.tar.gz\n"),
+                "trove-0.5.2-x86_64.tar.gz"
+            )
+            .as_deref(),
+            Some(upper.to_ascii_lowercase().as_str())
+        );
+
+        // Not 64 hex digits: skipped, never matched.
+        assert_eq!(
+            checksum_line("deadbeef  Trove-0.5.2-Setup.exe", "Trove-0.5.2-Setup.exe"),
+            None
+        );
+    }
+
+    /// The download slot is exclusive and the refusal atomic: a second
+    /// claimant is refused while the first holds it. The state is restored
+    /// so the test leaves no phantom download behind.
+    #[test]
+    fn a_held_download_slot_refuses_a_second_claim() {
+        let previous = download_state();
+        assert!(
+            !matches!(previous, DownloadState::Downloading { .. }),
+            "another test left a download in flight"
+        );
+        assert!(try_begin_download());
+        assert!(matches!(
+            download_state(),
+            DownloadState::Downloading { .. }
+        ));
+        assert!(!try_begin_download(), "the second claim must be refused");
+        set_download_state(previous);
     }
 
     /// The one test that talks to GitHub: it pins the assumption the whole

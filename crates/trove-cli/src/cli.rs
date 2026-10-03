@@ -122,10 +122,14 @@ pub enum Command {
     /// Import files or directories.
     Import(ImportArgs),
 
+    /// Migrate from another asset manager (Eagle / Billfish).
+    Migrate(MigrateArgs),
+
     /// Analyse assets with a multimodal model.
     ///
     /// Each asset's thumbnail and metadata are handed to the configured
-    /// vendor (OpenAI / Anthropic / Gemini / DashScope); the description,
+    /// vendor (OpenAI / Anthropic / Gemini / DashScope / Moonshot / Zhipu /
+    /// Volcengine / SiliconFlow / DeepSeek); the description,
     /// tags and rating it returns are written back. Tags already in the
     /// library are offered to the model to reuse, and the few it invents are
     /// filed under a parent tag so the whole run can be reviewed — or thrown
@@ -386,6 +390,33 @@ pub struct ImportArgs {
     pub into: Option<String>,
 
     /// Report what would be imported without importing anything.
+    #[arg(long)]
+    pub dry_run: bool,
+}
+
+/// The source software `trove migrate` reads. Auto runs the detector over the
+/// folder; naming a source forces the parser and refuses a folder that reads
+/// as the other one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum SourceArg {
+    Auto,
+    Eagle,
+    Billfish,
+}
+
+#[derive(Debug, Args)]
+pub struct MigrateArgs {
+    /// The foreign library folder: an Eagle `.library` directory, or a
+    /// Billfish library (the folder holding `.bf`).
+    #[arg(value_name = "DIR")]
+    pub path: PathBuf,
+
+    /// Which source to read it as. Default: auto-detect.
+    #[arg(long, value_enum, value_name = "SOURCE")]
+    pub from: Option<SourceArg>,
+
+    /// Print what a migration would do — counts, tags, collections and a
+    /// few sample items — and touch nothing.
     #[arg(long)]
     pub dry_run: bool,
 }

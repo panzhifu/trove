@@ -14,7 +14,9 @@ use trove_core::tasks::ai_analysis::{AiAnalysisOutcome, AiAnalysisRunRequest, Un
 use trove_core::tasks::{TaskId, TaskKind};
 
 use super::embedding::start_embedding_backfill_app;
+use super::export::start_export_job_app;
 use super::import::start_import_job;
+use super::transcription::start_transcription_request_app;
 use super::{NoticeKey, watch_job};
 use crate::library::{AnalysisProbe, LibraryController, Retryable};
 
@@ -340,6 +342,10 @@ pub fn retry_task_app(
             start_import_job(controller, &manager, kind, options, total, window, cx)
         }
         Retryable::Embedding => start_embedding_backfill_app(controller, window, cx),
+        Retryable::Export { options } => {
+            let items = options.items.clone();
+            start_export_job_app(controller, items, options, window, cx)
+        }
         Retryable::Analysis { request, undo } => {
             if undo {
                 start_analysis_undo_app(controller, window, cx)
@@ -348,6 +354,9 @@ pub fn retry_task_app(
             } else {
                 false
             }
+        }
+        Retryable::Transcription { request } => {
+            start_transcription_request_app(controller, request.clone(), window, cx)
         }
     }
 }

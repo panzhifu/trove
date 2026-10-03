@@ -177,6 +177,13 @@ pub struct AppConfig {
     /// feature is not configured and asks no model anything.
     #[serde(default)]
     pub ai_analysis: Option<AiAnalysisConfig>,
+    /// Speech-to-text settings (the audio/video transcriber). `None` = the
+    /// feature is not configured and the menu stays silent.
+    #[serde(default)]
+    pub ai_transcription: Option<TranscriptionConfig>,
+    /// The font viewer's custom sample texts, keyed by preview language.
+    #[serde(default)]
+    pub font_preview: FontPreviewConfig,
 }
 
 /// Settings for an OpenAI-compatible embeddings endpoint — the shape every
@@ -301,7 +308,8 @@ impl SearchConfig {
 pub struct AiSearchConfig {
     #[serde(default)]
     pub enabled: bool,
-    /// Vendor family: `openai`, `anthropic`, `gemini` or `dashscope`.
+    /// Vendor family: `openai`, `anthropic`, `gemini`, `dashscope`,
+    /// `moonshot`, `zhipu`, `volcengine` or `siliconflow`.
     #[serde(default = "default_vendor")]
     pub vendor: String,
     #[serde(default = "default_embedding_base_url")]
@@ -338,8 +346,9 @@ impl AiSearchConfig {
 /// This keeps the tagging policy
 /// (vocabulary reuse, a budget for new words, one parent tag for them) and
 /// adds the description/rating the analysis protocol can produce — plus the
-/// `vendor` field that makes OpenAI, Anthropic, Gemini and DashScope
-/// interchangeable.
+/// `vendor` field that makes every supported family interchangeable
+/// (OpenAI, Anthropic, Gemini, DashScope, and the OpenAI-compatible
+/// Moonshot, Zhipu, Volcengine, SiliconFlow and DeepSeek).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AiAnalysisConfig {
     /// Vendor family: `openai`, `anthropic`, `gemini` or `dashscope`.
@@ -422,6 +431,119 @@ impl Default for AnalysisFieldsConfig {
             tags: true,
             rating: false,
         }
+    }
+}
+
+/// Settings for the speech-to-text endpoint the transcription job talks to.
+///
+/// One wire shape: the OpenAI-compatible `POST /audio/transcriptions` — the
+/// de-facto standard spoken by OpenAI itself (`whisper-1`,
+/// `gpt-4o-transcribe`), Groq, SiliconFlow (SenseVoice), and every
+/// self-hosted whisper server that copied the shape. The base URL decides
+/// which one; no vendor family selection is needed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TranscriptionConfig {
+    /// Base URL of the server, without the `/audio/transcriptions` tail.
+    #[serde(default = "default_embedding_base_url")]
+    pub base_url: String,
+    /// Bearer token. Empty is legitimate: local servers usually want none.
+    #[serde(default)]
+    pub api_key: String,
+    /// Model name exactly as the server knows it (`whisper-1`,
+    /// `gpt-4o-transcribe`, `FunAudioLLM/SenseVoiceLarge`, …).
+    #[serde(default)]
+    pub model: String,
+    /// Language hint for the recogniser (ISO 639-1: `zh`, `en`, `ja`, …).
+    /// `None` lets the server auto-detect.
+    #[serde(default)]
+    pub language: Option<String>,
+    /// Optional vocabulary hint (names, jargon) spelled the way the
+    /// transcript should spell them. Passed through as the endpoint's
+    /// `prompt` field; a server that does not know it ignores it.
+    #[serde(default)]
+    pub prompt: Option<String>,
+}
+
+impl Default for TranscriptionConfig {
+    fn default() -> Self {
+        Self {
+            base_url: default_embedding_base_url(),
+            api_key: String::new(),
+            model: String::new(),
+            language: None,
+            prompt: None,
+        }
+    }
+}
+
+impl TranscriptionConfig {
+    /// Whether enough is configured to talk to the server at all.
+    pub fn is_configured(&self) -> bool {
+        !self.model.trim().is_empty() && !self.base_url.trim().is_empty()
+    }
+}
+
+/// The font viewer's own preferences: the sample text the user typed, keyed
+/// by the preview language it belongs to.
+///
+/// Only custom texts persist. The language itself starts from what the font
+/// file declares and the size from the viewer's fit, so neither is a
+/// preference — re-opening a font should meet the font, not last session's
+/// zoom. An empty map means every language shows its built-in sample.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct FontPreviewConfig {
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub custom_texts: HashMap<String, String>,
+}
+
+impl FontPreviewConfig {
+    /// The custom sample text stored for `language`, if the user wrote one.
+    pub fn custom_text(&self, language: &str) -> Option<&str> {
+        self.custom_texts.get(language).map(String::as_str)
+    }
+
+    /// Store (or clear, when `text` is empty) the custom sample for
+    /// `language`.
+    pub fn set_custom_text(&mut self, language: &str, text: &str) {
+        let text = text.trim();
+        if text.is_empty() {
+            self.custom_texts.remove(language);
+        } else {
+            self.custom_texts
+                .insert(language.to_string(), text.to_string());
+        }
+    }
+}
+
+#[cfg(test)]
+mod font_preview_tests {
+    use super::*;
+
+    /// The round trip the viewer depends on: a stored sample reads back for
+    /// the language it was written for, clearing is a removal rather than an
+    /// empty string (an empty sample would render as a blank specimen), and
+    /// the whole section survives the config file's serde untouched.
+    #[test]
+    fn custom_texts_round_trip_per_language_and_clear_to_removal() {
+        let mut config = FontPreviewConfig::default();
+        assert!(config.custom_text("zh-Hans").is_none());
+
+        config.set_custom_text("zh-Hans", "  字体预览  ");
+        assert_eq!(config.custom_text("zh-Hans"), Some("字体预览"), "trimmed");
+        config.set_custom_text("zh-Hans", "");
+        assert!(
+            config.custom_text("zh-Hans").is_none(),
+            "clearing removes the entry instead of storing emptiness"
+        );
+
+        config.set_custom_text("ja", "フォントプレビュー");
+        let json = serde_json::to_string(&config).unwrap();
+        let back: FontPreviewConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            back.custom_text("ja"),
+            Some("フォントプレビュー"),
+            "an older build reading a newer config loses nothing"
+        );
     }
 }
 

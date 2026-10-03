@@ -10,6 +10,7 @@
 //!   dragged onto another one (or onto the section header, to un-nest it).
 
 use std::collections::{HashMap, HashSet};
+use std::ops::Range;
 
 use gpui_kit::assets;
 use gpui_kit::base::{h_flex, v_flex};
@@ -33,6 +34,7 @@ use super::common::{
     trash_count,
 };
 use crate::components::controls::muted_label;
+use crate::components::scrollbar::ScrollableElement as _;
 
 // ============================================================================
 // Layout metrics
@@ -97,6 +99,8 @@ struct SmartRow {
     appearance: Appearance,
     /// Nesting level below the section's own top level (0 = top).
     depth: usize,
+    /// Whether this row has nested children (so it gets a fold chevron).
+    has_children: bool,
 }
 
 /// Nesting depth of every entry, in display order, as `(index, depth)` pairs.
@@ -147,6 +151,8 @@ fn nest_order(entries: &[(Uuid, Option<Uuid>)]) -> Vec<(usize, usize)> {
 fn flat_smart_rows(ctl: &LibraryController) -> Vec<SmartRow> {
     let all = ctl.library.list_smart_collections().unwrap_or_default();
     let entries: Vec<(Uuid, Option<Uuid>)> = all.iter().map(|sc| (sc.id, sc.parent_id)).collect();
+    // Which ids are some other row's parent — i.e. get a fold chevron.
+    let parents: HashSet<Uuid> = all.iter().filter_map(|sc| sc.parent_id).collect();
 
     nest_order(&entries)
         .into_iter()
@@ -163,6 +169,7 @@ fn flat_smart_rows(ctl: &LibraryController) -> Vec<SmartRow> {
                 count,
                 appearance: sc.appearance.clone(),
                 depth,
+                has_children: parents.contains(&sc.id),
             }
         })
         .collect()
@@ -233,6 +240,48 @@ impl Snapshot {
     }
 }
 
+/// One row of the collections panel, flattened for the virtualized list.
+enum ExplorerRow {
+    All {
+        count: u64,
+        selected: bool,
+    },
+    Recent {
+        count: u64,
+        selected: bool,
+    },
+    Trash {
+        count: u64,
+        selected: bool,
+    },
+    Collection {
+        id: Uuid,
+        name: String,
+        count: u64,
+        selected: bool,
+        is_root: bool,
+        appearance: Appearance,
+    },
+    /// The inline add / rename editor, at a raw left indent in px.
+    Editor {
+        indent: f32,
+    },
+    SmartHeader,
+    Smart {
+        id: Uuid,
+        name: String,
+        count: u64,
+        appearance: Appearance,
+        depth: usize,
+        selected: bool,
+        has_children: bool,
+    },
+}
+
+/// Fixed height every row in the virtualized list shares (`uniform_list`
+/// measures the first row and positions the rest at that height).
+const EXPLORER_ROW_H: f32 = 28.;
+
 // ============================================================================
 // Panel state
 // ============================================================================
@@ -247,6 +296,11 @@ pub struct ExplorerPanel {
     /// at. That is the whole key: the counts move only when the library
     /// does, and no row highlight reads a filter any more.
     snapshot_cache: Option<(u64, Snapshot)>,
+    /// Smart collections whose nested children are folded away. UI state, not
+    /// part of the generation-keyed snapshot, so it survives across renders.
+    collapsed_smart: HashSet<Uuid>,
+    /// Scroll position of the virtualized row list.
+    scroll_handle: UniformListScrollHandle,
 }
 
 impl ExplorerPanel {
@@ -265,6 +319,8 @@ impl ExplorerPanel {
             editor_input,
             mode: EditorMode::None,
             snapshot_cache: None,
+            collapsed_smart: HashSet::new(),
+            scroll_handle: UniformListScrollHandle::default(),
         };
         observe_controller(cx, &this.controller);
         this.subscribe_enter(window, cx);
@@ -439,6 +495,232 @@ impl ExplorerPanel {
         }
         rust_i18n::t!("app.all_assets").to_string()
     }
+
+    /// Fold or unfold a smart collection's nested children.
+    fn toggle_fold_smart(&mut self, id: Uuid, cx: &mut Context<Self>) {
+        if !self.collapsed_smart.remove(&id) {
+            self.collapsed_smart.insert(id);
+        }
+        cx.notify();
+    }
+
+    /// Render one row of the virtualized list. Every arm must produce a row
+    /// of exactly [`EXPLORER_ROW_H`], or the uniform list misplaces the rows
+    /// below it.
+    fn render_row(
+        &mut self,
+        row: &ExplorerRow,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let inner: AnyElement = match row {
+            ExplorerRow::All { count, selected } => {
+                let folder = Appearance::default();
+                collection_row(
+                    cx,
+                    self.controller.clone(),
+                    None,
+                    rust_i18n::t!("app.all_assets").to_string(),
+                    RowView {
+                        count: *count,
+                        selected: *selected,
+                        is_root: true,
+                        folder: &folder,
+                    },
+                )
+                .h_full()
+                .into_any_element()
+            }
+            ExplorerRow::Recent { count, selected } => {
+                recent_row(cx, self.controller.clone(), *count, *selected)
+            }
+            ExplorerRow::Trash { count, selected } => {
+                trash_row(cx, self.controller.clone(), *count, *selected)
+            }
+            ExplorerRow::Collection {
+                id,
+                name,
+                count,
+                selected,
+                is_root,
+                appearance,
+            } => {
+                let id = *id;
+                let explorer = cx.entity();
+                let menu_name = name.clone();
+                collection_row(
+                    cx,
+                    self.controller.clone(),
+                    Some(id),
+                    name.clone(),
+                    RowView {
+                        count: *count,
+                        selected: *selected,
+                        is_root: *is_root,
+                        folder: appearance,
+                    },
+                )
+                .context_menu(move |menu, window, cx| {
+                    collection_menu(menu, window, cx, &explorer, id, menu_name.clone())
+                })
+                .h_full()
+                .into_any_element()
+            }
+            ExplorerRow::Editor { indent } => editor_row(&self.editor_input, px(*indent)),
+            ExplorerRow::SmartHeader => smart_section_header(cx, self.controller.clone()),
+            ExplorerRow::Smart {
+                id,
+                name,
+                count,
+                appearance,
+                depth,
+                selected,
+                has_children,
+            } => self.render_smart_row(
+                *id,
+                name,
+                *count,
+                appearance,
+                *depth,
+                *selected,
+                *has_children,
+                cx,
+            ),
+        };
+        div()
+            .h(px(EXPLORER_ROW_H))
+            .w_full()
+            .child(inner)
+            .into_any_element()
+    }
+
+    /// One smart-collection row, under the app-wide tree contract: a single
+    /// click selects it, a double click folds or unfolds its children.
+    #[allow(clippy::too_many_arguments)]
+    fn render_smart_row(
+        &mut self,
+        sid: Uuid,
+        name: &str,
+        count: u64,
+        appearance: &Appearance,
+        depth: usize,
+        selected: bool,
+        has_children: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let nested = depth > 0;
+        let controller = self.controller.clone();
+        let drop_ctl = self.controller.clone();
+        let menu_name = name.to_string();
+        let drag_name = name.to_string();
+
+        div()
+            .id(format!("smart-row-{sid}"))
+            .h_full()
+            .w_full()
+            .cursor_pointer()
+            .px_2()
+            .rounded(cx.theme().radius)
+            // The row stretches to the panel edge; the indent is padding, not
+            // a margin, so the count keeps its column.
+            .when(nested, |this| {
+                this.pl(px(ROW_PAD + ROW_INDENT * depth as f32))
+            })
+            .when(selected, |this| this.bg(cx.theme().secondary))
+            .on_click(cx.listener(move |this, ev: &ClickEvent, _window, cx| {
+                if has_children && ev.click_count() >= 2 {
+                    this.toggle_fold_smart(sid, cx);
+                } else {
+                    this.controller
+                        .update(cx, |ctl, _| ctl.select_smart(Some(sid)));
+                }
+            }))
+            // Drag onto another row to nest under it; the store refuses
+            // cycles, so a self- or descendant-drop is reported rather than
+            // performed. Attached before the context menu: that wrapper only
+            // forwards children.
+            .on_drag(SmartDrag(sid), move |_, _, _, cx| {
+                let name = drag_name.clone();
+                cx.new(|_| SmartDragPreview { name })
+            })
+            .drag_over::<SmartDrag>(|this, _, _, cx| this.bg(cx.theme().secondary))
+            .on_drop(move |payload: &SmartDrag, _window, cx| {
+                let dragged = payload.0;
+                if dragged != sid {
+                    drop_ctl.update(cx, move |ctl, cx| {
+                        let target_parent = ctl
+                            .library
+                            .get_smart_collection(sid)
+                            .ok()
+                            .flatten()
+                            .and_then(|s| s.parent_id);
+                        let target_pos = ctl
+                            .library
+                            .list_smart_collections()
+                            .map(|all| {
+                                all.iter()
+                                    .filter(|sc| sc.parent_id == target_parent)
+                                    .position(|sc| sc.id == sid)
+                                    .unwrap_or(0) as i64
+                            })
+                            .unwrap_or(0);
+                        if let Err(e) = ctl.library.reorder_smart_collection(dragged, target_pos) {
+                            ctl.notice = Some(
+                                rust_i18n::t!("explorer.move_failed", error = e.to_string())
+                                    .to_string(),
+                            );
+                        }
+                        ctl.generation += 1;
+                        cx.notify();
+                    });
+                }
+            })
+            .context_menu({
+                let explorer = cx.entity();
+                let controller = controller.clone();
+                let menu_name = menu_name.clone();
+                move |menu, window, cx| {
+                    smart_menu(
+                        menu,
+                        window,
+                        cx,
+                        &controller,
+                        &explorer,
+                        SmartTarget {
+                            id: sid,
+                            name: menu_name.clone(),
+                            nested,
+                        },
+                    )
+                }
+            })
+            .child(
+                h_flex()
+                    .h_full()
+                    .w_full()
+                    .items_center()
+                    .gap_2()
+                    // A saved search is found by searching, so that is its
+                    // default mark; a glyph the user chose replaces it the
+                    // same way it does on a folder row.
+                    .child(appearance::glyph(
+                        Some(appearance),
+                        assets::IconName::Search,
+                        cx,
+                    ))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .text_sm()
+                            .text_color(appearance::label_color(appearance, cx))
+                            .child(name.to_string()),
+                    )
+                    .child(muted_label(count.to_string(), cx)),
+            )
+            .into_any_element()
+    }
 }
 
 impl BasePanel for ExplorerPanel {
@@ -490,7 +772,6 @@ impl Focusable for ExplorerPanel {
 impl Render for ExplorerPanel {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let mode = self.mode;
-        let explorer = cx.entity();
         // Reuse the cached snapshot while the generation is unchanged: the
         // COUNT queries behind it re-run only after a mutation.
         let ctl = self.controller.read(cx);
@@ -504,208 +785,93 @@ impl Render for ExplorerPanel {
             }
         };
         let snap = snapshot;
-        let mut items: Vec<AnyElement> = Vec::new();
 
-        // --- Pseudo rows: All assets, Recently viewed, Trash ---
-
-        items.push(
-            collection_row(
-                cx,
-                self.controller.clone(),
-                None,
-                rust_i18n::t!("app.all_assets").to_string(),
-                RowView {
-                    count: snap.all_count,
-                    selected: snap.all_selected(),
-                    is_root: true,
-                    folder: &Appearance::default(),
-                },
-            )
-            .into_any_element(),
-        );
-
-        // Recently viewed: history count, click browses the view. Dropping
-        // assets here sends them to the trash like any other view.
-        items.push(recent_row(
-            cx,
-            self.controller.clone(),
-            snap.recent_total,
-            snap.showing_recent,
-        ));
-
-        items.push(trash_row(
-            cx,
-            self.controller.clone(),
-            snap.trash_total,
-            snap.showing_trash,
-        ));
-
-        // --- Managed collections ---
-
+        // Flatten the whole panel — the pseudo rows, the managed
+        // collections, the smart section header and its (fold-aware) rows,
+        // and any inline editor — into one row stream for the virtualized
+        // list. Every row shares `EXPLORER_ROW_H`.
         let rename_target = match mode {
             EditorMode::Renaming(id) => Some(id),
             _ => None,
         };
+        let mut rows: Vec<ExplorerRow> = Vec::new();
 
+        // --- Pseudo rows: All assets, Recently viewed, Trash ---
+        rows.push(ExplorerRow::All {
+            count: snap.all_count,
+            selected: snap.all_selected(),
+        });
+        rows.push(ExplorerRow::Recent {
+            count: snap.recent_total,
+            selected: snap.showing_recent,
+        });
+        rows.push(ExplorerRow::Trash {
+            count: snap.trash_total,
+            selected: snap.showing_trash,
+        });
+
+        // --- Managed collections ---
         for row in &snap.rows {
             if rename_target == Some(row.id) {
                 // The renamed row itself is replaced by the inline editor.
-                items.push(editor_row(&self.editor_input, px(14.)));
+                rows.push(ExplorerRow::Editor { indent: 14. });
                 continue;
             }
-            items.push(
-                collection_row(
-                    cx,
-                    self.controller.clone(),
-                    Some(row.id),
-                    row.name.clone(),
-                    RowView {
-                        count: row.count,
-                        selected: snap.current == Some(row.id) && !snap.showing_trash,
-                        is_root: row.is_root,
-                        folder: &row.appearance,
-                    },
-                )
-                .context_menu({
-                    let explorer = explorer.clone();
-                    let id = row.id;
-                    let name = row.name.clone();
-                    move |menu, window, cx| {
-                        collection_menu(menu, window, cx, &explorer, id, name.clone())
-                    }
-                })
-                .into_any_element(),
-            );
+            rows.push(ExplorerRow::Collection {
+                id: row.id,
+                name: row.name.clone(),
+                count: row.count,
+                selected: snap.current == Some(row.id) && !snap.showing_trash,
+                is_root: row.is_root,
+                appearance: row.appearance.clone(),
+            });
         }
-
         if matches!(mode, EditorMode::Adding { .. }) {
             // Editor appears after the last collection row.
-            items.push(editor_row(&self.editor_input, px(0.)));
+            rows.push(ExplorerRow::Editor { indent: 0. });
         }
 
         // --- Smart collections ---
+        rows.push(ExplorerRow::SmartHeader);
 
-        items.push(smart_section_header(cx, self.controller.clone()));
-
+        // Rows are in preorder, so once a folded row is met every deeper row
+        // is hidden until a row at the same or shallower depth appears.
+        let mut hidden_below: Option<usize> = None;
         for row in &snap.smart_rows {
-            let sid = row.id;
-            let depth = row.depth;
-            let nested = depth > 0;
-            let controller = self.controller.clone();
-            let drop_ctl = self.controller.clone();
-            let menu_name = row.name.clone();
-            let drag_name = row.name.clone();
-            items.push(
-                div()
-                    .id(format!("smart-row-{sid}"))
-                    .cursor_pointer()
-                    .w_full()
-                    .px_2()
-                    .py_1()
-                    .rounded(cx.theme().radius)
-                    // The row stretches to the panel edge; the indent is
-                    // padding, not a margin, so the count keeps its column.
-                    .when(nested, |this| {
-                        this.pl(px(ROW_PAD + ROW_INDENT * depth as f32))
-                    })
-                    .when(snap.active_smart == Some(sid), |this| {
-                        this.bg(cx.theme().secondary)
-                    })
-                    .on_click(move |_ev: &ClickEvent, _window, cx| {
-                        controller.update(cx, |ctl, _| ctl.select_smart(Some(sid)));
-                    })
-                    // Drag onto another row to nest under it; the store
-                    // refuses cycles, so a self- or descendant-drop is
-                    // reported rather than performed. Attached before the
-                    // context menu: that wrapper only forwards children.
-                    .on_drag(SmartDrag(sid), move |_, _, _, cx| {
-                        let name = drag_name.clone();
-                        cx.new(|_| SmartDragPreview { name })
-                    })
-                    .drag_over::<SmartDrag>(|this, _, _, cx| this.bg(cx.theme().secondary))
-                    .on_drop(move |payload: &SmartDrag, _window, cx| {
-                        let dragged = payload.0;
-                        if dragged != sid {
-                            drop_ctl.update(cx, move |ctl, cx| {
-                                let target_parent = ctl
-                                    .library
-                                    .get_smart_collection(sid)
-                                    .ok()
-                                    .flatten()
-                                    .and_then(|s| s.parent_id);
-                                let target_pos = ctl
-                                    .library
-                                    .list_smart_collections()
-                                    .map(|all| {
-                                        all.iter()
-                                            .filter(|sc| sc.parent_id == target_parent)
-                                            .position(|sc| sc.id == sid)
-                                            .unwrap_or(0)
-                                            as i64
-                                    })
-                                    .unwrap_or(0);
-                                if let Err(e) =
-                                    ctl.library.reorder_smart_collection(dragged, target_pos)
-                                {
-                                    ctl.notice = Some(
-                                        rust_i18n::t!(
-                                            "explorer.move_failed",
-                                            error = e.to_string()
-                                        )
-                                        .to_string(),
-                                    );
-                                }
-                                ctl.generation += 1;
-                                cx.notify();
-                            });
-                        }
-                    })
-                    .context_menu({
-                        let controller = self.controller.clone();
-                        let explorer = explorer.clone();
-                        let menu_name = menu_name.clone();
-                        move |menu, window, cx| {
-                            smart_menu(
-                                menu,
-                                window,
-                                cx,
-                                &controller,
-                                &explorer,
-                                SmartTarget {
-                                    id: sid,
-                                    name: menu_name.clone(),
-                                    nested,
-                                },
-                            )
-                        }
-                    })
-                    .child(
-                        h_flex()
-                            .w_full()
-                            .items_center()
-                            .gap_2()
-                            // A saved search is found by searching, so that is
-                            // its default mark; a glyph the user chose replaces
-                            // it the same way it does on a folder row.
-                            .child(appearance::glyph(
-                                Some(&row.appearance),
-                                assets::IconName::Search,
-                                cx,
-                            ))
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .truncate()
-                                    .text_sm()
-                                    .text_color(appearance::label_color(&row.appearance, cx))
-                                    .child(row.name.clone()),
-                            )
-                            .child(muted_label(row.count.to_string(), cx)),
-                    )
-                    .into_any_element(),
-            );
+            if let Some(depth) = hidden_below {
+                if row.depth > depth {
+                    continue;
+                }
+                hidden_below = None;
+            }
+            let folded = self.collapsed_smart.contains(&row.id);
+            rows.push(ExplorerRow::Smart {
+                id: row.id,
+                name: row.name.clone(),
+                count: row.count,
+                appearance: row.appearance.clone(),
+                depth: row.depth,
+                selected: snap.active_smart == Some(row.id),
+                has_children: row.has_children,
+            });
+            if folded && row.has_children {
+                hidden_below = Some(row.depth);
+            }
         }
+
+        let row_count = rows.len();
+        let scroll_handle = self.scroll_handle.clone();
+        let list = uniform_list(
+            "explorer-rows",
+            row_count,
+            cx.processor(move |this, range: Range<usize>, window, cx| {
+                range
+                    .map(|ix| this.render_row(&rows[ix], window, cx))
+                    .collect::<Vec<_>>()
+            }),
+        )
+        .track_scroll(&scroll_handle)
+        .size_full();
 
         v_flex()
             .size_full()
@@ -720,7 +886,9 @@ impl Render for ExplorerPanel {
             .child(
                 div()
                     .flex_1()
-                    .child(v_flex().gap_0p5().children(items).w_full()),
+                    .min_h_0()
+                    .child(list)
+                    .vertical_scrollbar(&scroll_handle),
             )
     }
 }
@@ -737,7 +905,9 @@ fn plus_button(id: &'static str, tooltip: String) -> Button {
 /// A full-width inline editor (add or rename).
 fn editor_row(editor: &Entity<InputState>, indent: Pixels) -> AnyElement {
     h_flex()
+        .h_full()
         .w_full()
+        .items_center()
         .pl(indent)
         .px_1()
         .child(Input::new(editor).small())
@@ -758,12 +928,13 @@ fn pseudo_row(
         .id(row_id)
         .cursor_pointer()
         .w_full()
+        .h_full()
         .px_2()
-        .py_1()
         .rounded(cx.theme().radius)
         .when(selected, |this| this.bg(cx.theme().secondary))
         .child(
             h_flex()
+                .h_full()
                 .w_full()
                 .items_center()
                 .gap_2()
@@ -855,6 +1026,7 @@ fn smart_section_header(
     .to_string();
     let add_ctl = controller.clone();
     h_flex()
+        .h_full()
         .w_full()
         .items_center()
         .justify_between()
@@ -917,8 +1089,8 @@ fn collection_row(
         .id(format!("collection-row-{row_id}"))
         .cursor_pointer()
         .w_full()
+        .h_full()
         .px_2()
-        .py_1()
         .rounded(cx.theme().radius)
         .on_click({
             let controller = controller.clone();
@@ -928,6 +1100,7 @@ fn collection_row(
         })
         .child(
             h_flex()
+                .h_full()
                 .w_full()
                 .items_center()
                 .gap_2()

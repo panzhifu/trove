@@ -282,6 +282,56 @@ impl Library {
         )
     }
 
+    /// Start one transcription pass over this library's audio/video assets.
+    ///
+    /// The provider comes in built, so the caller owns the "is this feature
+    /// configured" conversation; the run is retried once because every way it
+    /// fails *as a whole* is an opening one (database, temp directory), and a
+    /// retry re-asks nothing an earlier attempt already answered — the marker
+    /// each asset carries is the skip key (see `tasks::transcription`).
+    pub fn start_transcription(
+        &self,
+        provider: std::sync::Arc<dyn crate::ai::transcribe::TranscribeProvider>,
+        request: crate::tasks::transcription::TranscribeRunRequest,
+    ) -> std::result::Result<
+        (
+            crate::tasks::TaskId,
+            std::sync::mpsc::Receiver<crate::tasks::transcription::TranscribeOutcome>,
+        ),
+        crate::tasks::StartError,
+    > {
+        let options = self.transcription_options(&request);
+        let label = format!("transcribe ({})", provider.model());
+        self.tasks.start_with_retry(
+            crate::tasks::TaskKind::Transcription,
+            label,
+            crate::tasks::RetryPolicy::times(1),
+            move || {
+                let options = options.clone();
+                let provider = provider.clone();
+                Box::new(move |ctx| {
+                    crate::tasks::transcription::run(&options, provider.as_ref(), ctx)
+                })
+            },
+        )
+    }
+
+    /// The settings a transcription run would use, resolved against this
+    /// library's files and the stored speech-to-text configuration.
+    pub fn transcription_options(
+        &self,
+        request: &crate::tasks::transcription::TranscribeRunRequest,
+    ) -> crate::tasks::transcription::TranscribeOptions {
+        let config = crate::config::AppConfig::load();
+        let transcription = config.ai_transcription.clone().unwrap_or_default();
+        crate::tasks::transcription::TranscribeOptions::resolve(
+            request,
+            self.root.join("library.db"),
+            self.root.clone(),
+            &transcription,
+        )
+    }
+
     /// The settings a run would use, resolved against this library's files
     /// and the stored analysis configuration.
     ///

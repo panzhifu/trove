@@ -24,11 +24,12 @@
 //! [`trove_core::model::Appearance`]. The dialog is a two-column layout —
 //! conditions on the left, the appearance column on the right.
 
-use gpui_kit::base::{h_flex, v_flex};
+use gpui_kit::base::{ColorPickerEvent, ColorPickerState, h_flex, v_flex};
 use gpui_kit::component::WindowExt as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::color_picker::ColorPicker;
 use gpui_kit::component::input::{Input, InputState};
-use gpui_kit::component::{ActiveTheme, IconName, Sizable};
+use gpui_kit::component::{ActiveTheme, Colorize as _, IconName, Sizable};
 use gpui_kit::*;
 
 use trove_core::model::{AssetKind, SmartCollection, SmartCompare, SmartField, SmartNode};
@@ -43,11 +44,13 @@ use crate::panels::appearance;
 // ============================ draft state ====================================
 
 /// One condition row. `text` backs every free-text value (text, extension,
-/// color, size); the other value kinds keep their state inline.
+/// size); `color` carries the color condition's picker state; the other value
+/// kinds keep their state inline.
 struct ConditionRow {
     field: SmartField,
     op: SmartCompare,
     text: Entity<InputState>,
+    color: Entity<ColorPickerState>,
     kind: AssetKind,
     favorite: bool,
     tag: String,
@@ -58,7 +61,6 @@ struct ConditionRow {
 impl ConditionRow {
     fn new(window: &mut Window, cx: &mut App, field: SmartField) -> Self {
         let placeholder = match field {
-            SmartField::Color => rust_i18n::t!("rules.value_color_hint").to_string(),
             SmartField::SizeBytes => rust_i18n::t!("rules.value_bytes").to_string(),
             SmartField::Extension => "jpg, png…".to_string(),
             SmartField::CapturedAt => rust_i18n::t!("rules.value_date_hint").to_string(),
@@ -69,6 +71,7 @@ impl ConditionRow {
             field,
             op: SmartCompare::Eq,
             text: cx.new(|cx| InputState::new(window, cx).placeholder(placeholder)),
+            color: cx.new(|cx| ColorPickerState::new(window, cx)),
             kind: AssetKind::Image,
             favorite: true,
             tag: String::new(),
@@ -80,9 +83,9 @@ impl ConditionRow {
     /// A row is complete when its value side carries a usable value.
     fn is_complete(&self, cx: &App) -> bool {
         match self.field {
+            SmartField::Color => self.color.read(cx).value().is_some(),
             SmartField::Text
             | SmartField::Extension
-            | SmartField::Color
             | SmartField::SizeBytes
             | SmartField::CapturedAt
             | SmartField::AspectRatio => !self.text.read(cx).value().trim().is_empty(),
@@ -129,7 +132,13 @@ impl RuleDraft {
     }
 
     fn add_row(&mut self, field: SmartField, window: &mut Window, cx: &mut Context<Self>) {
-        self.rows.push(ConditionRow::new(window, cx, field));
+        let row = ConditionRow::new(window, cx, field);
+        // A picked colour bumps the revision, so the live match count keeps up.
+        cx.subscribe(&row.color, |this, _, _: &ColorPickerEvent, cx| {
+            this.touch(cx)
+        })
+        .detach();
+        self.rows.push(row);
         self.touch(cx);
     }
 
@@ -263,8 +272,10 @@ fn row_value(row: &ConditionRow, cx: &App) -> Result<serde_json::Value, trove_co
         SmartField::Extension => {
             serde_json::json!(normalize_extension(row.text.read(cx).value().trim()))
         }
-        SmartField::Color => match normalize_color(&row.text.read(cx).value()) {
-            Some(hex) => serde_json::json!(hex),
+        SmartField::Color => match row.color.read(cx).value() {
+            // The stored qualifier is an opaque sRGB hex; the picker's alpha
+            // is dropped on the way out.
+            Some(color) => serde_json::json!(Hsla { a: 1., ..color }.to_hex().to_lowercase()),
             None => return Err(trove_core::Error::Message(t("rules.invalid_color"))),
         },
         SmartField::SizeBytes => match row.text.read(cx).value().trim().parse::<i64>() {
@@ -328,11 +339,6 @@ fn normalize_extension(raw: &str) -> String {
     raw.trim().trim_start_matches('.').to_lowercase()
 }
 
-fn normalize_color(raw: &str) -> Option<String> {
-    let s = raw.trim().trim_start_matches('#').to_lowercase();
-    (s.len() == 6 && s.chars().all(|c| c.is_ascii_hexdigit())).then_some(format!("#{s}"))
-}
-
 // ============================ load ===========================================
 
 /// Load a stored tree into `(combine with and, rows)`. A tree the flat
@@ -359,7 +365,16 @@ fn match_row(node: SmartNode, window: &mut Window, cx: &mut App) -> Option<Condi
     let mut row = ConditionRow::new(window, cx, field);
     row.op = op;
     match field {
-        SmartField::Text | SmartField::Extension | SmartField::Color => {
+        SmartField::Color => {
+            // Seed the picker with the stored qualifier.
+            if let Some(hex) = value.as_str()
+                && let Ok(color) = Hsla::parse_hex(hex)
+            {
+                row.color
+                    .update(cx, |state, cx| state.set_value(color, window, cx));
+            }
+        }
+        SmartField::Text | SmartField::Extension => {
             let s = value.as_str().unwrap_or_default().to_string();
             row.text
                 .update(cx, |state, cx| state.set_value(s, window, cx));
@@ -457,19 +472,32 @@ pub fn open_rule_editor(
         String::new(),
         cx,
     );
-    let draft = cx.new(|_| RuleDraft {
-        controller,
-        editing: editing.map(|sc| sc.id),
-        parent,
-        name_input,
-        match_all,
-        rows,
-        tag_names,
-        chooser: chooser.clone(),
-        revision: 1,
-        evaluated: 0,
-        match_total: None,
-        error: None,
+    let draft = cx.new(|cx| {
+        let draft = RuleDraft {
+            controller,
+            editing: editing.map(|sc| sc.id),
+            parent,
+            name_input,
+            match_all,
+            rows,
+            tag_names,
+            chooser: chooser.clone(),
+            revision: 1,
+            evaluated: 0,
+            match_total: None,
+            error: None,
+        };
+        // Loaded rows' pickers feed the live match count too.
+        for row in &draft.rows {
+            cx.subscribe(
+                &row.color,
+                |this: &mut RuleDraft, _, _: &ColorPickerEvent, cx: &mut Context<RuleDraft>| {
+                    this.touch(cx)
+                },
+            )
+            .detach();
+        }
+        draft
     });
 
     window.open_dialog(cx, move |dialog, _, cx| {
@@ -692,7 +720,7 @@ fn render_row(
     cx: &mut App,
 ) -> Div {
     let t = |k: &str| rust_i18n::t!(k).to_string();
-    let (kind, favorite, tag, rating, orientation, tag_names, text_input) = {
+    let (kind, favorite, tag, rating, orientation, tag_names, text_input, color_picker) = {
         let d = draft.read(cx);
         let row = &d.rows[ix];
         (
@@ -703,6 +731,7 @@ fn render_row(
             row.orientation.clone(),
             d.tag_names.clone(),
             row.text.clone(),
+            row.color.clone(),
         )
     };
 
@@ -762,9 +791,13 @@ fn render_row(
 
     // Value widget per field.
     let value: Div = match field {
+        SmartField::Color => h_flex().flex_1().min_w_0().child(
+            // The swatch opens the palette / slider panel; the picked colour
+            // lands in the row's own picker state.
+            ColorPicker::new(&color_picker).xsmall(),
+        ),
         SmartField::Text
         | SmartField::Extension
-        | SmartField::Color
         | SmartField::SizeBytes
         | SmartField::CapturedAt
         | SmartField::AspectRatio => h_flex()

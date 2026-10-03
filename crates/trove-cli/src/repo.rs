@@ -23,7 +23,9 @@ pub fn export(args: &Cli, out: Option<&Path>, style: &Style) -> Result<Rendered,
     let dest = match out {
         Some(path) => with_trove_extension(path),
         None => std::env::current_dir()
-            .map_err(|error| CliError::runtime(format!("cannot locate the working directory: {error}")))?
+            .map_err(|error| {
+                CliError::runtime(format!("cannot locate the working directory: {error}"))
+            })?
             .join(repo_package::package_file_name(&entry.name)),
     };
 
@@ -60,7 +62,10 @@ pub fn import(
     style: &Style,
 ) -> Result<Rendered, CliError> {
     if !archive.is_file() {
-        return Err(CliError::usage(format!("no such file: {}", archive.display())));
+        return Err(CliError::usage(format!(
+            "no such file: {}",
+            archive.display()
+        )));
     }
     // The package names the library it was taken from; a `--name` on the
     // command line wins. A file that is not a package is the caller's
@@ -82,9 +87,7 @@ pub fn import(
     style.progress(&format!("installing into library '{}'", entry.slug));
     match repo_package::install_library_package(archive, &entry.dir()) {
         Ok(report) => {
-            if activate
-                && let Err(error) = config.set_active_library(&entry.slug)
-            {
+            if activate && let Err(error) = config.set_active_library(&entry.slug) {
                 // The library exists either way; the activation is a
                 // preference, and the error says so on its own.
                 style.note(&format!("could not activate the library: {error}"));
@@ -128,11 +131,7 @@ fn with_trove_extension(path: &Path) -> PathBuf {
 
 /// Dispatch helper: the two subcommands this module owns. Both live in the
 /// configuration-only branch of [`crate::main::dispatch`].
-pub fn dispatch(
-    command: &RepoCommand,
-    args: &Cli,
-    style: &Style,
-) -> Result<Rendered, CliError> {
+pub fn dispatch(command: &RepoCommand, args: &Cli, style: &Style) -> Result<Rendered, CliError> {
     match command {
         RepoCommand::Export { out } => export(args, out.as_deref(), style),
         RepoCommand::Import {

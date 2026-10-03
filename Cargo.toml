@@ -47,16 +47,18 @@ serde_json = "1"
 rusqlite = { version = "0.37", features = ["bundled", "chrono", "uuid", "serde_json", "backup"] }
 
 # Hashing: one primitive for the whole crate — content hashes (dedup key, blob
-# name, thumbnail cache key, integrity check) and the AI embedding fingerprint
-# alike, see `trove-core/src/media/hash.rs`. BLAKE3 over SHA-256 for the two
-# reasons that matter to an importer: several times faster per byte single
-# threaded, and a tree, so one large file can be hashed across the rayon pool
-# the caller is already on. The `rayon` feature is what buys that path; it
-# rides in the graph via the workspace's own rayon, adding no new crate.
-#
-# `sha2` is no longer declared: nothing of ours uses it. Two versions still
-# ride in the graph (`oo7` via `gpui-pre` pins 0.10, `gpui-kit-assets` asks
-# for 0.11) — that is upstream's business, not a pin of ours to maintain.
+# name, thumbnail cache key, integrity check), the AI embedding fingerprint,
+# and the updater's staged-download verification alike — see
+# `trove-core/src/media/hash.rs`. The download is verified against the
+# release's BLAKE3SUMS manifest (`trove-core/src/services/update.rs`), so
+# verification uses the same primitive as everything else. BLAKE3 over
+# SHA-256 for the two reasons that matter to an importer: several times
+# faster per byte single threaded, and a tree, so one large file can be
+# hashed across the rayon pool the caller is already on. The `rayon` feature
+# is what buys that path; it rides in the graph via the workspace's own
+# rayon, adding no new crate. (`sha2` stays undeclared: `oo7` via `gpui-pre`
+# pins 0.10 and `gpui-kit-assets` asks for 0.11 — upstream's business, not a
+# pin of ours.)
 blake3 = { version = "1", features = ["rayon"] }
 
 # CLI parsing for the headless `trove` binary (`crates/trove-cli`). Declared

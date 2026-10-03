@@ -68,6 +68,8 @@ pub fn set_language(language: Option<String>) -> trove_core::error::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
+    use std::path::Path;
 
     #[test]
     fn resolves_exact_prefix_and_fallback() {
@@ -85,6 +87,31 @@ mod tests {
         assert_eq!(resolve("ru"), "ru");
         assert_eq!(resolve("ar"), "en"); // Arabic not yet supported
         assert_eq!(effective(Some("zh-TW")), "zh-CN");
+    }
+
+    /// Parse a locale catalog into its flat `section.key` set. Line-based on
+    /// purpose: the catalogs are one level of sections and the parser must
+    /// stay as dumb as the files it guards.
+    fn catalog_keys(lang: &str) -> BTreeSet<String> {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("locales");
+        let text = std::fs::read_to_string(dir.join(format!("{lang}.toml")))
+            .unwrap_or_else(|e| panic!("{lang}.toml: {e}"));
+        let mut section = String::new();
+        let mut keys = BTreeSet::new();
+        for line in text.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            if let Some(head) = line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
+                section = head.to_string();
+                continue;
+            }
+            if let Some((key, _)) = line.split_once('=') {
+                keys.insert(format!("{section}.{}", key.trim()));
+            }
+        }
+        keys
     }
 
     /// Every catalog must carry exactly the same keys as English.
@@ -117,32 +144,10 @@ mod tests {
             ("zh-CN", 0, 0),
         ];
 
-        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("locales");
-        let keys_of = |lang: &str| -> std::collections::BTreeSet<String> {
-            let text = std::fs::read_to_string(dir.join(format!("{lang}.toml")))
-                .unwrap_or_else(|e| panic!("{lang}.toml: {e}"));
-            let mut section = String::new();
-            let mut keys = std::collections::BTreeSet::new();
-            for line in text.lines() {
-                let line = line.trim();
-                if line.is_empty() || line.starts_with('#') {
-                    continue;
-                }
-                if let Some(head) = line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
-                    section = head.to_string();
-                    continue;
-                }
-                if let Some((key, _)) = line.split_once('=') {
-                    keys.insert(format!("{section}.{}", key.trim()));
-                }
-            }
-            keys
-        };
-
-        let english = keys_of("en");
+        let english = catalog_keys("en");
         assert!(!english.is_empty(), "the English catalog read empty");
         for (lang, allowed_missing, allowed_extra) in ALLOWED {
-            let other = keys_of(lang);
+            let other = catalog_keys(lang);
             let missing: Vec<_> = english.difference(&other).collect();
             let extra: Vec<_> = other.difference(&english).collect();
             assert!(
@@ -158,5 +163,93 @@ mod tests {
                 extra.len(),
             );
         }
+    }
+
+    /// Literal `t!(\"…\")` keys across the app source, with the file they
+    /// came from. The scan is deliberately narrow: a `t!` whose `t` is
+    /// preceded by an identifier character (that is `pt!`, the plugin
+    /// lookup) is skipped, and keys built at runtime
+    /// (`format!("workspace.filter_tool_{tool}")`) are invisible to it by
+    /// construction — those are the two known ways a used key can hide from
+    /// this guard.
+    fn literal_t_keys() -> Vec<(String, String)> {
+        fn collect(dir: &Path, files: &mut Vec<std::path::PathBuf>) {
+            for entry in
+                std::fs::read_dir(dir).unwrap_or_else(|e| panic!("read {}: {e}", dir.display()))
+            {
+                let entry = entry.unwrap();
+                let path = entry.path();
+                if path.is_dir() {
+                    collect(&path, files);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    files.push(path);
+                }
+            }
+        }
+
+        let mut src = Vec::new();
+        collect(&Path::new(env!("CARGO_MANIFEST_DIR")).join("src"), &mut src);
+        src.sort();
+
+        let mut found = Vec::new();
+        for file in src {
+            let text = std::fs::read_to_string(&file).unwrap();
+            let bytes = text.as_bytes();
+            let mut index = 0;
+            while let Some(offset) = text[index..].find("t!(") {
+                let at = index + offset;
+                index = at + 3;
+                // Skip `pt!(` and any other ident ending in `t!`, and the
+                // `t!(` occurrences that live inside string literals or
+                // comments (this scanner's own needle among them).
+                if at > 0
+                    && (bytes[at - 1].is_ascii_alphanumeric()
+                        || bytes[at - 1] == b'"'
+                        || bytes[at - 1] == b'`'
+                        || bytes[at - 1] == b'\\')
+                {
+                    continue;
+                }
+                // Allow whitespace between the `(` and the first literal
+                // (multi-line `t!(` call sites exist).
+                let rest = &text[index..];
+                let Some(indent) = rest.find(|c: char| !c.is_whitespace()) else {
+                    continue;
+                };
+                let rest = &rest[indent..];
+                let Some(key) = rest.strip_prefix('"').and_then(|r| r.split('"').next()) else {
+                    continue;
+                };
+                found.push((
+                    file.file_name().unwrap().to_string_lossy().into_owned(),
+                    key.to_string(),
+                ));
+            }
+        }
+        found
+    }
+
+    /// A key the code asks for but no catalog carries is the one i18n bug
+    /// the parity test above cannot see: every catalog agrees on the same
+    /// wrong key set, and rust_i18n answers the miss with the raw key, so
+    /// the UI shows `workspace.create_sequence` where a menu label should
+    /// be — which is what happened when the sequence menu entries landed
+    /// as numbered `0`…`3` keys. This holds the catalogs to the source:
+    /// every literal `t!` key must exist in `en.toml`.
+    #[test]
+    fn every_literal_t_key_exists_in_the_catalog() {
+        let keys = catalog_keys("en");
+        let used = literal_t_keys();
+        let missing: Vec<&(String, String)> =
+            used.iter().filter(|(_, key)| !keys.contains(key)).collect();
+        assert!(
+            missing.is_empty(),
+            "keys used in code but absent from en.toml (rust_i18n shows the raw key in the UI):\n{}",
+            missing
+                .iter()
+                .map(|(file, key)| format!("  {file}: {key}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
     }
 }

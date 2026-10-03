@@ -16,6 +16,7 @@ mod embedding_openai;
 mod http;
 pub mod mock;
 pub mod search_planner;
+pub mod transcribe;
 pub mod vendor;
 
 pub use embedding_openai::OpenAICompatible;

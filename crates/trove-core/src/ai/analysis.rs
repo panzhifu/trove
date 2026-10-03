@@ -184,7 +184,13 @@ pub fn system_prompt(request: &AiAnalysisRequest) -> String {
     prompt.push_str("- Reply with a JSON object and nothing else: no prose, no code fence.\n");
 
     if fields.description {
-        prompt.push_str("- `description`: a concise natural-language description, or null.\n");
+        // No "or null" here: the field was asked for on purpose, and the
+        // escape hatch is what let a reasoning model answer tags-only and
+        // leave the description column empty.
+        prompt.push_str(
+            "- `description`: one short sentence describing what the asset is or shows. Null is \
+             only for assets with nothing to describe at all.\n",
+        );
     }
     if fields.tags {
         prompt.push_str(

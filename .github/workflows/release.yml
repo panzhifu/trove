@@ -212,6 +212,32 @@ jobs:
           path: artifacts
           merge-multiple: false
 
+      # Two manifests for the whole release, published beside the artifacts.
+      # BLAKE3SUMS is the one the in-app updater verifies a staged download
+      # against (trove-core/src/services/update.rs) — the same hash primitive
+      # the library itself uses. SHA256SUMS rides along for external tools
+      # (`sha256sum -c`) that have no b3sum. Both are `<digest>  <basename>`
+      # coreutils shape — the per-artifact subdirectory download-artifact
+      # creates is stripped, so the names match what the release page shows.
+      - name: Install b3sum
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Generate BLAKE3SUMS and SHA256SUMS
+        shell: bash
+        run: |
+          cargo install b3sum
+          cd artifacts
+          for tool in b3sum sha256sum; do
+            find . -type f \( -name '*.zip' -o -name '*.tar.gz' -o -name '*.deb' \
+              -o -name '*.rpm' -o -name '*.exe' -o -name '*.dmg' \) -print0 \
+              | sort -z \
+              | xargs -0 "$tool" \
+              | sed "s#^\([0-9a-f]\{64\}\)  \./[^/]*/#\1  #" \
+              | sort -k2 \
+              > "${tool^^}S"
+            cat "${tool^^}S"
+          done
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
@@ -219,7 +245,10 @@ jobs:
           name: "Trove ${{ github.ref_name }}"
           draft: false
           prerelease: ${{ contains(github.ref_name, 'alpha') || contains(github.ref_name, 'beta') || contains(github.ref_name, 'rc') }}
-          files: artifacts/**/*.{zip,tar.gz,deb,rpm,exe,dmg}
+          files: |
+            artifacts/**/*.{zip,tar.gz,deb,rpm,exe,dmg}
+            artifacts/BLAKE3SUMS
+            artifacts/SHA256SUMS
           generate_release_notes: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
