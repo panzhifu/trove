@@ -844,10 +844,11 @@ impl AssetPreviewPanel {
         self.video.is_some()
     }
 
-    /// Whether a player is on screen whose picture can be held and resumed:
-    /// a video or an animated image. The space bar answers for both.
+    /// Whether a player is on screen that the space bar can hold and resume:
+    /// a video, an animated image, or an audio track. The space bar answers
+    /// for all three.
     pub(crate) fn has_playback(&self) -> bool {
-        self.video.is_some() || self.anim.is_some()
+        self.video.is_some() || self.anim.is_some() || self.audio.is_some()
     }
 
     /// Whether this preview carries the exposure control at all: a
@@ -975,6 +976,8 @@ impl AssetPreviewPanel {
             video.update(cx, |video, cx| video.toggle_play(cx));
         } else if let Some(anim) = &self.anim {
             anim.update(cx, |anim, cx| anim.toggle_playing(cx));
+        } else if let Some(audio) = &self.audio {
+            audio.update(cx, |player, cx| player.toggle_playing(cx));
         }
     }
 

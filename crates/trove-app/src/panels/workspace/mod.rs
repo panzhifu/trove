@@ -672,10 +672,10 @@ impl Render for WorkspacePanel {
                 this.toggle_quick_look(cx);
             }))
             .on_action(cx.listener(|this, _: &TogglePlayback, _, cx| {
-                // Space holds and resumes the previewed clip, video or GIF.
-                // The grid's own space — quick look — is bound in `AssetGrid`,
-                // which is not on the focus path while a preview covers the
-                // grid, so the two never both answer the same press.
+                // Space holds and resumes the previewed clip — video, GIF or
+                // soundtrack. The grid's own space — quick look — is bound in
+                // `AssetGrid`, which is not on the focus path while a preview
+                // covers the grid, so the two never both answer the same press.
                 if let Some(panel) = this.preview_asset_panel() {
                     panel.update(cx, |panel, cx| panel.toggle_playback(cx));
                 }

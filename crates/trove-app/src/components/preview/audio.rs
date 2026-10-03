@@ -167,7 +167,9 @@ impl AudioPlayer {
 
     /// Nothing starts sound by itself: the grid plays a different file on every
     /// arrow-key move, and autoplay would turn browsing into a jukebox.
-    fn toggle_playing(&mut self, cx: &mut Context<Self>) {
+    /// `pub(super)` for the preview's space bar, which answers for the
+    /// soundtrack exactly as it does for the video and the animated image.
+    pub(super) fn toggle_playing(&mut self, cx: &mut Context<Self>) {
         self.transport.playing = !self.transport.playing;
         self.push_playing(cx);
     }
