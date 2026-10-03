@@ -314,7 +314,8 @@ fn write_font_card(blob_path: &Path, out: &Path) -> Option<PathBuf> {
     let font = fontdue::Font::from_bytes(bytes, fontdue::FontSettings::default()).ok()?;
 
     let (w, h) = FONT_CARD_SIZE;
-    let mut card = image::RgbaImage::from_pixel(w, h, image::Rgba([0xF7, 0xF6, 0xF3, 0xFF]));
+    let [r, g, b] = crate::media::CARD_PAPER;
+    let mut card = image::RgbaImage::from_pixel(w, h, image::Rgba([r, g, b, 0xFF]));
     let ink = [0x20_u8, 0x21, 0x24];
     let lines = default_specimen_rows();
 
@@ -881,9 +882,10 @@ fn text_card_svg(text: &str) -> String {
             crate::services::xmp::xml_escape(line)
         ));
     }
+    let [r, g, b] = crate::media::CARD_PAPER;
     format!(
         "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{w}\" height=\"{h}\">\
-         <rect width=\"{w}\" height=\"{h}\" fill=\"#F7F6F3\"/>{body}</svg>"
+         <rect width=\"{w}\" height=\"{h}\" fill=\"#{r:02X}{g:02X}{b:02X}\"/>{body}</svg>"
     )
 }
 

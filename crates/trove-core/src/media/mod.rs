@@ -32,4 +32,17 @@ pub mod thumb;
 pub mod video;
 pub mod waveform;
 
+/// The paper every generated card is baked on — font specimen, waveform,
+/// text — as `0xRRGGBB` for the UI surfaces that show one: a baked
+/// thumbnail cannot follow the theme, so the frame it sits in matches this
+/// instead of a theme surface reading as a grey band around the art.
+pub const CARD_PAPER_RGB: u32 = 0xF7_F6_F3;
+
+/// The same paper as RGB bytes, for the rasterizers that fill a bitmap.
+pub const CARD_PAPER: [u8; 3] = [
+    (CARD_PAPER_RGB >> 16) as u8,
+    (CARD_PAPER_RGB >> 8) as u8,
+    CARD_PAPER_RGB as u8,
+];
+
 pub use formats::streaming_point_cloud::StreamingPointCloud;

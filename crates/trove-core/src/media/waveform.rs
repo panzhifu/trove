@@ -274,7 +274,7 @@ impl Style {
     pub const CARD: Style = Style {
         span: 72,
         ink: [0x20, 0x21, 0x24],
-        background: Some([0xF7, 0xF6, 0xF3]),
+        background: Some(crate::media::CARD_PAPER),
     };
 }
 
@@ -394,7 +394,15 @@ mod tests {
         let peaks = vec![255u8; PEAK_COUNT];
         let image = bitmap(&peaks, 64, 48, &Style::CARD).unwrap();
         // 72% of 48 rows: the bar reaches rows 7..=41, so the corner is paper.
-        assert_eq!(image.get_pixel(0, 0).0, [0xF7, 0xF6, 0xF3, 255]);
+        assert_eq!(
+            image.get_pixel(0, 0).0,
+            [
+                crate::media::CARD_PAPER[0],
+                crate::media::CARD_PAPER[1],
+                crate::media::CARD_PAPER[2],
+                255
+            ]
+        );
         assert_eq!(image.get_pixel(0, 24).0, [0x20, 0x21, 0x24, 255]);
     }
 

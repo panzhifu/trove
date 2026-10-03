@@ -435,14 +435,22 @@ impl Render for InspectorPanel {
         let preview: AnyElement = AssetPreviewData::from_asset(&asset, &library_root, &cache_root)
             .element(PreviewContext::Inspector, cx);
         // Card frame per the reference layout: the image floats on the panel
-        // background with a format badge pinned to its top-left corner.
+        // background with a format badge pinned to its top-left corner. A
+        // font or audio asset shows a card baked on trove-core's own paper —
+        // a fixed colour a baked thumbnail cannot follow the theme through —
+        // so the frame takes that paper instead of a theme surface, which
+        // read as a grey band around the art.
+        let paper: gpui::Hsla = gpui::rgb(trove_core::media::CARD_PAPER_RGB).into();
         let preview = div()
             .w_full()
             .relative()
             .rounded_lg()
             .border_1()
             .border_color(cx.theme().border)
-            .bg(cx.theme().secondary)
+            .bg(match kind {
+                AssetKind::Font | AssetKind::Audio => paper,
+                _ => cx.theme().secondary,
+            })
             .overflow_hidden()
             .flex()
             .items_center()
