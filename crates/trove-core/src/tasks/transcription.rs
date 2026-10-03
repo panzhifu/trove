@@ -490,8 +490,25 @@ mod tests {
         JobContext::for_tests(false)
     }
 
+    /// Audio prep shells out to `ffmpeg` — the same optional, never-linked
+    /// runtime dependency the preview player and the export pipeline use (see
+    /// `media/thumb.rs` for the same guard). Where it is absent the run fails
+    /// every asset honestly, and these success-path tests have nothing to
+    /// assert.
+    fn ffmpeg_available() -> bool {
+        std::process::Command::new("ffmpeg")
+            .arg("-version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
     #[test]
-    fn transcripts_are_stored_and_the_second_run_asks_nothing() {
+    fn transcripts_are_stored_when_ffmpeg_present_and_the_second_run_asks_nothing() {
+        if !ffmpeg_available() {
+            eprintln!("skipping: ffmpeg not on PATH");
+            return;
+        }
         let (_root, ids) = library(2);
         let provider = MockTranscriber {
             calls: std::sync::atomic::AtomicUsize::new(0),
@@ -523,7 +540,11 @@ mod tests {
     /// candidates never reaches the provider, and `only` narrows the run to
     /// the selection that asked for it.
     #[test]
-    fn images_are_not_transcribed_and_only_narrows_the_run() {
+    fn images_are_not_transcribed_and_only_narrows_the_run_when_ffmpeg_present() {
+        if !ffmpeg_available() {
+            eprintln!("skipping: ffmpeg not on PATH");
+            return;
+        }
         let (_root, ids) = library(3);
         let provider = MockTranscriber {
             calls: std::sync::atomic::AtomicUsize::new(0),
@@ -538,7 +559,11 @@ mod tests {
     /// fingerprint skip reads the marker, so marker-without-text would make
     /// the next run skip an asset that has no transcript.
     #[test]
-    fn a_settled_row_carries_both_text_and_marker() {
+    fn a_settled_row_carries_both_text_and_marker_when_ffmpeg_present() {
+        if !ffmpeg_available() {
+            eprintln!("skipping: ffmpeg not on PATH");
+            return;
+        }
         let (_root, ids) = library(1);
         let provider = MockTranscriber {
             calls: std::sync::atomic::AtomicUsize::new(0),
