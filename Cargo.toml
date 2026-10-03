@@ -6,7 +6,7 @@ resolver = "3"
 # release, and the tag the updater compares against carries this number, so a
 # per-crate version could only ever drift out of step with it.
 [workspace.package]
-version = "0.5.4"
+version = "0.5.5"
 edition = "2024"
 license = "BUSL-1.1"
 
