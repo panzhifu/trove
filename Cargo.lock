@@ -8949,7 +8949,7 @@ dependencies = [
 
 [[package]]
 name = "trove-app"
-version = "0.5.3"
+version = "0.5.4"
 dependencies = [
  "arboard",
  "chrono",
@@ -8974,7 +8974,7 @@ dependencies = [
 
 [[package]]
 name = "trove-cli"
-version = "0.5.3"
+version = "0.5.4"
 dependencies = [
  "clap",
  "serde",
@@ -8985,7 +8985,7 @@ dependencies = [
 
 [[package]]
 name = "trove-core"
-version = "0.5.3"
+version = "0.5.4"
 dependencies = [
  "base64 0.22.1",
  "blake3",
