@@ -59,10 +59,23 @@ const ANIM_TICK: Duration = Duration::from_millis(33);
 /// never quite reaches the floor before the next reading lands.
 const LEVEL_DECAY: f32 = 0.85;
 
-/// How far a spectrum bar falls per animation tick, in band value — a full
-/// bar takes ~0.65 s to hit the floor, the ballistics of a classic
-/// analyzer: bars leap with a new reading and rain down between them.
-const SPECTRUM_FALL: f32 = 0.05;
+/// Spectrum ballistics, the classic analyzer's: a bar leaps to a new
+/// reading at once and falls under a hybrid model — an exponential pull
+/// (fast off the top, where the eye expects energy to vanish) with a floor
+/// velocity (so a bar never appears to stall mid-fall).
+const SPECTRUM_FALL_K: f32 = 0.10;
+const SPECTRUM_FALL_MIN: f32 = 0.012;
+/// Peak-hold caps ride above the bars and fall on their own slower clock,
+/// marking where the band has been.
+const SPECTRUM_PEAK_FALL: f32 = 0.02;
+
+/// Automatic gain: a rolling ceiling over the frames' peaks, released
+/// slowly (`AGC_RELEASE` per tick) and capped in boost. A quiet master gets
+/// lifted toward the display's range — up to `AGC_MAX_GAIN` — while a loud
+/// one plays untouched; the fall of the ceiling is what keeps a single
+/// transient from flattening everything after it.
+const AGC_RELEASE: f32 = 0.995;
+const AGC_MAX_GAIN: f32 = 3.0;
 
 /// Below this the display level counts as silent and the ticker drops back
 /// to its idle pace.
@@ -103,9 +116,14 @@ pub(super) struct AudioPlayer {
     /// stepping. Zero when nothing is audible; the ticker owns the decay.
     level: f32,
     /// The display spectrum — [`BAND_COUNT`] bars, 0..1, risen to the latest
-    /// engine reading at once and falling linearly between readings. The
+    /// engine reading at once and falling on the hybrid ballistics. The
     /// decay lives here, on scalars; the paint below only draws this frame.
     spectrum: Vec<f32>,
+    /// Peak-hold caps, one per band: they follow the bars up and fall on
+    /// their slower clock, marking where the band has been.
+    peak_hold: Vec<f32>,
+    /// The AGC's rolling ceiling — the recent peak of published frames.
+    agc_ceiling: f32,
     /// The strip's left edge and width in window coordinates, recorded at
     /// prepaint — the strip is sized by the stage, not a constant, so a
     /// pointer position maps to a moment only through the measured box.
@@ -178,6 +196,8 @@ impl AudioPlayer {
             wave: Wave::Pending,
             level: 0.0,
             spectrum: vec![0.0; trove_core::media::spectrum::BAND_COUNT],
+            peak_hold: vec![0.0; trove_core::media::spectrum::BAND_COUNT],
+            agc_ceiling: 1.0,
             band_left: Rc::new(Cell::new(None)),
             band_width: Rc::new(Cell::new(None)),
             band_dragging: Rc::new(Cell::new(false)),
@@ -356,14 +376,33 @@ impl AudioPlayer {
                     if let Some(ms) = advanced {
                         this.transport.position_ms = ms;
                         this.level = engine_level.max(this.level * LEVEL_DECAY).min(1.0);
+                        // AGC: roll the ceiling over this frame's peak and
+                        // lift the frame by whatever the cap allows. The
+                        // ceiling only falls — a transient stretches the
+                        // range, and quiet passages climb back slowly.
+                        let frame_max =
+                            engine_spectrum.iter().copied().fold(0.0f32, f32::max);
+                        this.agc_ceiling = (frame_max * 0.9).max(this.agc_ceiling * AGC_RELEASE);
+                        let gain = (1.0 / this.agc_ceiling).clamp(1.0, AGC_MAX_GAIN);
                         // Spectrum ballistics: a bar leaps to a new reading
-                        // the moment it lands, and rains down linearly when
-                        // the next one is lower.
-                        for (bar, &target) in this.spectrum.iter_mut().zip(&engine_spectrum) {
+                        // the moment it lands; below it, an exponential pull
+                        // with a floor velocity. The peak-hold cap follows
+                        // the same reading up and rains down slower.
+                        for (i, (bar, &raw)) in
+                            this.spectrum.iter_mut().zip(&engine_spectrum).enumerate()
+                        {
+                            let target = (raw * gain).min(1.0);
                             *bar = if target > *bar {
                                 target
                             } else {
-                                (*bar - SPECTRUM_FALL).max(target)
+                                (*bar - (*bar * SPECTRUM_FALL_K).max(SPECTRUM_FALL_MIN))
+                                    .max(target)
+                            };
+                            let peak = &mut this.peak_hold[i];
+                            *peak = if target > *peak {
+                                target
+                            } else {
+                                (*peak - SPECTRUM_PEAK_FALL).max(*bar)
                             };
                         }
                         moving = true;
@@ -378,12 +417,23 @@ impl AudioPlayer {
                             this.level = 0.0;
                             moving = true;
                         }
-                        // Nothing audible: every bar falls to the floor.
-                        for bar in this.spectrum.iter_mut() {
+                        // Nothing audible: bars and caps fall to the floor,
+                        // and the AGC ceiling drifts back up to unity.
+                        for (bar, peak) in
+                            this.spectrum.iter_mut().zip(this.peak_hold.iter_mut())
+                        {
                             if *bar > 0.0 {
-                                *bar = (*bar - SPECTRUM_FALL).max(0.0);
+                                *bar = (*bar - (*bar * SPECTRUM_FALL_K).max(SPECTRUM_FALL_MIN))
+                                    .max(0.0);
                                 moving = true;
                             }
+                            if *peak > *bar {
+                                *peak = (*peak - SPECTRUM_PEAK_FALL).max(*bar);
+                                moving = true;
+                            }
+                        }
+                        if this.agc_ceiling < 1.0 {
+                            this.agc_ceiling = (this.agc_ceiling * AGC_RELEASE).max(1.0);
                         }
                     }
                     if moving {
@@ -567,6 +617,7 @@ impl Render for AudioPlayer {
             // as an idle analyzer rather than a hole.
             .child({
                 let spectrum = self.spectrum.clone();
+                let peaks = self.peak_hold.clone();
                 div()
                     .w_full()
                     .px_6()
@@ -576,7 +627,7 @@ impl Render for AudioPlayer {
                             gpui::canvas(
                                 |_, _, _| {},
                                 move |bounds, _, window, _| {
-                                    paint_spectrum(bounds, &spectrum, accent, window);
+                                    paint_spectrum(bounds, &spectrum, &peaks, accent, window);
                                 },
                             )
                             .size_full(),
@@ -676,11 +727,18 @@ fn paint_wave(
 }
 
 /// The live spectrum strip: one bar per log-spaced band, rising from the
-/// strip's floor, brighter as it climbs. The ballistics live in the
-/// ticker — bars leap to a reading and rain down between them — so this
-/// only draws the current frame, the same split the waveform strip uses:
+/// strip's floor, brighter as it climbs, with a peak-hold cap riding above
+/// each bar at full strength. The ballistics live in the ticker — bars
+/// leap to a reading and rain down under the hybrid model — so this only
+/// draws the current frame, the same split the waveform strip uses:
 /// scalars on the CPU, pixels on the GPU.
-fn paint_spectrum(bounds: Bounds<Pixels>, bands: &[f32], accent: Hsla, window: &mut Window) {
+fn paint_spectrum(
+    bounds: Bounds<Pixels>,
+    bands: &[f32],
+    peaks: &[f32],
+    accent: Hsla,
+    window: &mut Window,
+) {
     let left: f32 = bounds.origin.x.into();
     let top: f32 = bounds.origin.y.into();
     let width: f32 = bounds.size.width.into();
@@ -708,5 +766,24 @@ fn paint_spectrum(bounds: Bounds<Pixels>, bands: &[f32], accent: Hsla, window: &
             ),
             accent.opacity(0.35 + 0.65 * value),
         ));
+        // The peak-hold cap: a two-pixel marker at full strength, hanging
+        // where the band last peaked while the bar rains down beneath it.
+        let peak = peaks.get(i).copied().unwrap_or(value).max(value);
+        let top = peak * height;
+        if top > 0.5 {
+            window.paint_quad(gpui::fill(
+                Bounds::from_corners(
+                    Point {
+                        x: px(x),
+                        y: px(bottom - top - 1.0),
+                    },
+                    Point {
+                        x: px(x + bar_w),
+                        y: px(bottom - top + 1.0),
+                    },
+                ),
+                accent,
+            ));
+        }
     }
 }

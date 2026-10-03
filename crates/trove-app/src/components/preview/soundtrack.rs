@@ -21,7 +21,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use gpui_kit::*;
-use trove_core::media::spectrum::{SpectrumAnalyzer, BAND_COUNT};
+use trove_core::media::spectrum::{BAND_COUNT, SpectrumAnalyzer, LOW_FFT_SIZE};
 use trove_core::media::video::AudioPipe;
 use rodio::cpal::traits::{DeviceTrait as _, HostTrait as _};
 
@@ -306,8 +306,11 @@ impl AudioEngine {
             // Per-chunk analysis, indexed by the same count `appended` uses —
             // the meter and the strip read them back out by how far the sink
             // has drained. ~2 KB per second of audio; the restart clears it.
+            // The analyzer wants a rolling mono history long enough for its
+            // long window, so the low bands can resolve notes apart.
             let mut levels: Vec<f32> = Vec::new();
             let mut spectra: Vec<Vec<f32>> = Vec::new();
+            let mut history: Vec<i16> = Vec::new();
             let mut analyzer = SpectrumAnalyzer::new(44_100.0);
             let mut seen_generation = output.generation();
             let mut force_restart = false;
@@ -364,6 +367,7 @@ impl AudioEngine {
                     last_published = None;
                     levels.clear();
                     spectra.clear();
+                    history.clear();
                     // The pipe is restarting: no clock to sync against until
                     // the first chunk is queued again.
                     if let Ok(mut clock) = clock.lock() {
@@ -439,12 +443,23 @@ impl AudioEngine {
                         levels.get(audible).copied().unwrap_or(0.0).to_bits(),
                         Ordering::Relaxed,
                     );
-                    // The same chunk's spectrum, for the strip's bars.
+                    // The same chunk's spectrum, for the strip's bars —
+                    // blended with the next chunk's by the progress through
+                    // this one, so the frame the ticker repeats at animation
+                    // pace rides a continuum instead of stepping at chunk
+                    // boundaries.
+                    let progress = (within / AUDIO_CHUNK_MS).clamp(0.0, 1.0) as f32;
+                    let frame = match (spectra.get(audible), spectra.get(audible + 1)) {
+                        (Some(a), Some(b)) => a
+                            .iter()
+                            .zip(b.iter())
+                            .map(|(x, y)| x + (y - x) * progress)
+                            .collect(),
+                        (Some(a), None) => a.clone(),
+                        _ => vec![0.0; BAND_COUNT],
+                    };
                     if let Ok(mut slot) = spectrum_slot.lock() {
-                        *slot = spectra
-                            .get(audible)
-                            .cloned()
-                            .unwrap_or_else(|| vec![0.0; BAND_COUNT]);
+                        *slot = frame;
                     }
                     // `len()` and `get_pos()` are read one after the other, so
                     // a chunk boundary landing between the two reads counts
@@ -506,8 +521,11 @@ impl AudioEngine {
                             let rms =
                                 (energy / samples.len().max(1) as f32).sqrt().min(1.0);
                             levels.push(rms);
-                            // Mono mix into the analyzer, before the buffer
-                            // is handed to the sink and consumed.
+                            // Mono mix into the rolling history, before the
+                            // buffer is handed to the sink and consumed.
+                            // The history is the analyzer's memory: the long
+                            // low window reads ~371 ms of it, four chunks
+                            // deep.
                             let mono: Vec<i16> = samples
                                 .as_chunks::<2>()
                                 .0
@@ -516,7 +534,12 @@ impl AudioEngine {
                                     ((i32::from(pair[0]) + i32::from(pair[1])) / 2) as i16
                                 })
                                 .collect();
-                            spectra.push(analyzer.bands(&mono));
+                            history.extend_from_slice(&mono);
+                            if history.len() > LOW_FFT_SIZE {
+                                let excess = history.len() - LOW_FFT_SIZE;
+                                history.drain(0..excess);
+                            }
+                            spectra.push(analyzer.bands(&history));
                             s.append(rodio::buffer::SamplesBuffer::new(2, 44_100, samples));
                             appended += 1;
                         }
