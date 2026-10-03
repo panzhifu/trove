@@ -1329,6 +1329,13 @@ fn next_window(
 /// [`LibraryConfig`], next to the purge-reach switch it interacts with, and is
 /// reversible from the settings' deletion group; a gate that could only ever
 /// be switched off would be a trap.
+///
+/// That opt-out makes `run` fire synchronously inside the context that opened
+/// the gate — and three of the four doors open from a listener body, which
+/// holds its panel's lease. A `run` that updated the panel again would
+/// re-enter it and panic, so every `run` closure acts on the controller alone
+/// (see [`empty_trash_on`]); the dialog path is the only one running outside,
+/// and it must stay equally safe.
 pub(crate) fn confirm_destruction(
     controller: &Entity<LibraryController>,
     window: &mut Window,
@@ -1425,6 +1432,28 @@ pub(crate) fn purge_warning_for(delete_sources: bool, count: usize) -> String {
         body.push_str(rust_i18n::t!("workspace.purge_confirm_sources").as_ref());
     }
     body
+}
+
+/// Empty the trash: one controller update — failure notice, selection reset,
+/// a new generation. A free function over the controller rather than a panel
+/// method on purpose: the deletion gate's opt-out path runs the action
+/// synchronously inside the context that opened it, and a listener body still
+/// holds its panel's lease, so a `workspace.update` there would re-enter the
+/// panel and panic. The panel method delegates here, and every gate closure
+/// must route through the controller the same way — never through a panel
+/// handle.
+pub(crate) fn empty_trash_on(controller: &Entity<crate::library::LibraryController>, cx: &mut App) {
+    controller.update(cx, |ctl, cx| {
+        ctl.notice = match ctl.library.empty_trash() {
+            Ok(n) => Some(rust_i18n::t!("workspace.trash_emptied", count = n).to_string()),
+            Err(e) => Some(
+                rust_i18n::t!("workspace.trash_empty_failed", error = e.to_string()).to_string(),
+            ),
+        };
+        ctl.selected_assets = Rc::new(Vec::new());
+        ctl.generation += 1;
+        cx.notify();
+    });
 }
 
 /// Permanent-delete `ids` behind the gate.

@@ -22,7 +22,7 @@ use crate::library::LibraryController;
 use crate::panels::WorkspacePanel;
 use crate::panels::workspace::MainPreview;
 use crate::panels::workspace::title_controls;
-use crate::panels::workspace::{confirm_destruction, purge_warning};
+use crate::panels::workspace::{confirm_destruction, empty_trash_on, purge_warning};
 use trove_core::media::edit::ImageEdit;
 
 impl DockPanel for WorkspacePanel {
@@ -162,9 +162,14 @@ impl DockPanel for WorkspacePanel {
                     }
                     let body = purge_warning(this.controller.read(cx), count);
                     let controller = this.controller.clone();
-                    let this = cx.entity();
-                    confirm_destruction(&controller, window, cx, body, move |cx| {
-                        this.update(cx, |this, cx| this.empty_trash(cx));
+                    // The gate's opt-out path runs the action synchronously,
+                    // still inside this listener body — and this listener body
+                    // runs inside the panel's own update. Only the controller
+                    // may be touched here; a `this.update` re-enters the panel
+                    // and panics (see `empty_trash_on`).
+                    confirm_destruction(&controller, window, cx, body, {
+                        let controller = controller.clone();
+                        move |cx| empty_trash_on(&controller, cx)
                     });
                 }))
             } else {
@@ -279,32 +284,45 @@ fn preview_toolbar(
                     .icon(icon)
                     .disabled(blocked)
                     .tooltip(tooltip(key))
-                    .on_click(cx.listener(move |_, _, window, cx| {
-                        let apply = {
-                            let ctl = ctl.clone();
-                            let edits = edits.clone();
-                            let panel = panel.clone();
-                            // `Fn`, not `FnOnce`: the write-back confirmation
-                            // hands it to a dialog callback that may be built
-                            // more than once.
-                            move |window: &mut Window, cx: &mut App| {
-                                if crate::dialogs::edit::apply_single_edit(
-                                    &ctl,
-                                    id,
-                                    edits.clone(),
-                                    window,
-                                    cx,
-                                ) {
-                                    panel.update(cx, |this, cx| {
-                                        this.open_asset_preview(id, &[], window, cx);
-                                    });
-                                }
-                            }
-                        };
+                    .on_click(cx.listener(move |this, _, window, cx| {
                         if write_back {
+                            let apply = {
+                                let ctl = ctl.clone();
+                                let edits = edits.clone();
+                                let panel = panel.clone();
+                                // `Fn`, not `FnOnce`: the write-back confirmation
+                                // hands it to a dialog callback that may be built
+                                // more than once.
+                                move |window: &mut Window, cx: &mut App| {
+                                    if crate::dialogs::edit::apply_single_edit(
+                                        &ctl,
+                                        id,
+                                        edits.clone(),
+                                        window,
+                                        cx,
+                                    ) {
+                                        panel.update(cx, |this, cx| {
+                                            this.open_asset_preview(id, &[], window, cx);
+                                        });
+                                    }
+                                }
+                            };
                             confirm_write_back(window, cx, original.clone(), apply);
                         } else {
-                            apply(window, cx);
+                            // A linked asset's edit asks; an owned blob's does
+                            // not, so this branch runs inside the listener body
+                            // — inside the panel's own update, where a
+                            // `panel.update` would re-enter it and panic. `this`
+                            // is the panel already; no handle needed here.
+                            if crate::dialogs::edit::apply_single_edit(
+                                &ctl,
+                                id,
+                                edits.clone(),
+                                window,
+                                cx,
+                            ) {
+                                this.open_asset_preview(id, &[], window, cx);
+                            }
                         }
                     })),
             );

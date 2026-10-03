@@ -67,19 +67,7 @@ impl WorkspacePanel {
     }
 
     pub(super) fn empty_trash(&mut self, cx: &mut Context<Self>) {
-        let controller = self.controller.clone();
-        controller.update(cx, |ctl, cx| {
-            ctl.notice = match ctl.library.empty_trash() {
-                Ok(n) => Some(rust_i18n::t!("workspace.trash_emptied", count = n).to_string()),
-                Err(e) => Some(
-                    rust_i18n::t!("workspace.trash_empty_failed", error = e.to_string())
-                        .to_string(),
-                ),
-            };
-            ctl.selected_assets = Rc::new(Vec::new());
-            ctl.generation += 1;
-            cx.notify();
-        });
+        empty_trash_on(&self.controller, cx);
     }
 
     /// Wipe the recently-viewed history (title-bar button of that view).
