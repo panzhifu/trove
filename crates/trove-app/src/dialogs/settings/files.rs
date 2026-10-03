@@ -872,6 +872,9 @@ fn rebuild_thumbs(controller: &Entity<LibraryController>, force: bool, cx: &mut 
                 )
                 .to_string(),
             );
+            // The rewritten files kept their paths, and the app's image cache
+            // keys by path — the epoch is what makes the grid re-read them.
+            ctl.thumb_epoch += 1;
         },
         cx,
     );

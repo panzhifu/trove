@@ -362,6 +362,11 @@ pub struct LibraryController {
     /// A maintenance / library job is running; Settings buttons refuse to
     /// start a second one until it finishes.
     pub busy: bool,
+    /// Bumped whenever thumbnail files may have been rewritten in place —
+    /// a maintenance rebuild regenerates them under paths the app's image
+    /// cache treats as immutable. The app view clears its cached decodes
+    /// when the number moves; nothing else needs to look at it.
+    pub thumb_epoch: u64,
     /// Result of the last AI-endpoint connection test (Settings ▸ AI). Not a
     /// task-manager job: it is one call against a server the user typed in,
     /// so it reports inline on the page and never blocks a job slot.
@@ -465,6 +470,7 @@ impl LibraryController {
             notice: None,
             integrity_report: None,
             busy: false,
+            thumb_epoch: 0,
             ai_probe: AiProbe::Idle,
             analysis_probe: AnalysisProbe::Idle,
             transcription_probe: TranscriptionProbe::Idle,

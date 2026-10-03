@@ -220,6 +220,15 @@ pub struct AppView {
     /// Kept alive for the life of the view: dropping it would unregister the
     /// OS light/dark observer that re-applies the appearance.
     _appearance: Subscription,
+    /// The image cache every image in the app resolves through. Thumbnail
+    /// files are keyed by content hash on disk, so a maintenance rebuild
+    /// rewrites them under paths a path-keyed cache treats as immutable —
+    /// clearing the cache is what makes the grid read the new bytes without
+    /// a restart.
+    images: Entity<gpui::RetainAllImageCache>,
+    /// The thumbnail epoch last seen on the controller, so the cache above
+    /// is cleared exactly once per rewrite.
+    seen_thumb_epoch: u64,
 }
 
 impl AppView {
@@ -333,9 +342,22 @@ impl AppView {
         // collapsed. Multi-select gestures (Ctrl toggle / Shift range) and
         // clears never steal the tab.
         cx.observe_in(&controller, window, move |this, controller, window, cx| {
-            let ctl = controller.read(cx);
-            let plain = ctl.selection_source == SelectionSource::Plain;
-            let selection: Vec<Uuid> = (*ctl.selected_assets).clone();
+            // A thumbnail rebuild rewrites the files but not their paths; the
+            // epoch is the signal to drop the cached decodes so the next
+            // paint re-reads the pictures from disk.
+            let thumb_epoch = controller.read(cx).thumb_epoch;
+            if this.seen_thumb_epoch != thumb_epoch {
+                this.seen_thumb_epoch = thumb_epoch;
+                this.images
+                    .update(cx, |images, cx| images.clear(window, cx));
+            }
+            let (plain, selection) = {
+                let ctl = controller.read(cx);
+                (
+                    ctl.selection_source == SelectionSource::Plain,
+                    (*ctl.selected_assets).clone(),
+                )
+            };
             let changed = this.last_selection != selection;
             this.last_selection = selection;
             if changed && plain && !this.last_selection.is_empty() {
@@ -406,6 +428,7 @@ impl AppView {
             .read(cx)
             .viewport_backend()
             .map(str::to_string);
+        let thumb_epoch = controller.read(cx).thumb_epoch;
         Self {
             controller,
             viewport_backend: initial_backend,
@@ -420,6 +443,8 @@ impl AppView {
             tray,
             quitting,
             _appearance,
+            images: gpui::RetainAllImageCache::new(cx),
+            seen_thumb_epoch: thumb_epoch,
         }
     }
 
@@ -1085,7 +1110,7 @@ impl Render for AppView {
                 .into_any_element();
         }
 
-        div()
+        let shell = div()
             .id("app-root")
             .relative()
             .size_full()
@@ -1248,7 +1273,14 @@ impl Render for AppView {
                 &self.controller,
                 self.viewport_backend.clone(),
                 cx,
-            ))
+            ));
+
+        // Every image resolves through one cache, so a thumbnail file
+        // rewritten in place can be re-read: gpui keys cached decodes by
+        // source path, and without this scope a rebuilt thumbnail would keep
+        // serving the old pixels until a restart.
+        gpui::image_cache(self.images.clone())
+            .child(shell)
             .into_any_element()
     }
 }
