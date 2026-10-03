@@ -1278,8 +1278,12 @@ impl Render for AppView {
         // Every image resolves through one cache, so a thumbnail file
         // rewritten in place can be re-read: gpui keys cached decodes by
         // source path, and without this scope a rebuilt thumbnail would keep
-        // serving the old pixels until a restart.
+        // serving the old pixels until a restart. The wrapper styles itself
+        // full-size — it sits where the root shell used to, and a default
+        // style would shrink the whole app to its content height, collapsing
+        // the dock (flex_1 of nothing) to zero.
         gpui::image_cache(self.images.clone())
+            .size_full()
             .child(shell)
             .into_any_element()
     }
