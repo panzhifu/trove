@@ -228,14 +228,22 @@ jobs:
           cargo install b3sum
           cd artifacts
           for tool in b3sum sha256sum; do
+            # The b3sum manifest must land as BLAKE3SUMS — the exact name the
+            # in-app updater fetches (trove-core/src/services/update.rs). The
+            # `${tool^^}S` spelling mangles b3sum into B3SUMS, which nothing
+            # reads.
+            case "$tool" in
+              b3sum) manifest=BLAKE3SUMS ;;
+              *) manifest="${tool^^}S" ;;
+            esac
             find . -type f \( -name '*.zip' -o -name '*.tar.gz' -o -name '*.deb' \
               -o -name '*.rpm' -o -name '*.exe' -o -name '*.dmg' \) -print0 \
               | sort -z \
               | xargs -0 "$tool" \
               | sed "s#^\([0-9a-f]\{64\}\)  \./[^/]*/#\1  #" \
               | sort -k2 \
-              > "${tool^^}S"
-            cat "${tool^^}S"
+              > "$manifest"
+            cat "$manifest"
           done
 
       - name: Create GitHub Release
