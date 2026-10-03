@@ -32,6 +32,13 @@ rodio = { workspace = true }
 # inert on macOS and Windows.
 tray-icon = { version = "0.25", default-features = false, features = ["ksni"] }
 
+# ALSA's raw bindings, already compiled in the graph via cpal. Linux only:
+# the audio output replaces ALSA's chatty default error handler with a
+# silent one, because the device scan *expects* half the probed PCMs to
+# fail to open (jack, oss, dmix) and ALSA prints a line for each.
+[target.'cfg(target_os = "linux")'.dependencies]
+alsa-sys = "0.3"
+
 [dev-dependencies]
 # Used only to parse and validate `gpu3d.wgsl` on machines without a GPU.
 naga = { version = "29", features = ["wgsl-in"] }

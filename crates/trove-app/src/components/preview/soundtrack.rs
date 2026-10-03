@@ -33,15 +33,60 @@ use super::video::IDLE_POLL;
 const AUDIO_CHUNK_MS: f64 = 100.0;
 
 /// How often the output's device-set fingerprint is refreshed. Enumerating
-/// ALSA PCMs is not free, and the set only matters when the default device
-/// reports as an alias whose name never changes.
-const DEVICE_RESCAN: Duration = Duration::from_secs(2);
+/// ALSA PCMs is not free, and the set only matters when the stream is not
+/// already riding a dynamic bridge.
+const DEVICE_RESCAN: Duration = Duration::from_secs(10);
 
 /// The dynamic-routing ALSA PCMs, in open-me order. A stream opened on one
 /// of them is routed by the sound server, so it lands in whatever the
 /// system's default output is at every instant — headphones, speakers,
 /// HDMI — with no help from us.
 const DYNAMIC_ALIASES: [&str; 2] = ["pulse", "pipewire"];
+
+/// ALSA's own error handler prints a line to stderr for every PCM that
+/// fails to open — the jack plugin, the OSS one, every dmix slave — and
+/// the device scan probes them all by design. The failures are expected;
+/// the messages are not. The handler is replaced by a silent one, once,
+/// on the only platform where ALSA exists.
+#[cfg(target_os = "linux")]
+fn silence_alsa_errors() {
+    use std::os::raw::{c_char, c_int};
+    use std::sync::Once;
+
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        // The prototype is variadic — a printf format and its arguments —
+        // and stable Rust cannot define a variadic function. The handler
+        // reads none of them, though, and a fixed-arity `extern "C"`
+        // function is reached through the same leading registers on every
+        // ABI this runs on; the transmute is that statement, made loud.
+        extern "C" fn silent(
+            _file: *const c_char,
+            _line: c_int,
+            _function: *const c_char,
+            _err: c_int,
+            _fmt: *const c_char,
+        ) {
+        }
+        type FixedHandler =
+            unsafe extern "C" fn(*const c_char, c_int, *const c_char, c_int, *const c_char);
+        type VariadicHandler = unsafe extern "C" fn(
+            *const c_char,
+            c_int,
+            *const c_char,
+            c_int,
+            *const c_char,
+            ...
+        );
+        unsafe {
+            let quiet: alsa_sys::snd_lib_error_handler_t = Some(std::mem::transmute::<
+                FixedHandler,
+                VariadicHandler,
+            >(silent));
+            alsa_sys::snd_lib_error_set_handler(quiet);
+        }
+    });
+}
 
 /// The process-wide audio output. `OutputStream` has to stay alive for as
 /// long as any player might make sound — and it stays welded to the device
@@ -122,6 +167,19 @@ impl AudioOutput {
     /// current device is no longer a candidate; between those, an open
     /// stream is left alone.
     fn follow_default(&self) {
+        #[cfg(target_os = "linux")]
+        silence_alsa_errors();
+
+        // A stream already riding a dynamic bridge has nothing left for
+        // this scan to do: the sound server moves it on hotplug by itself,
+        // so the steady state costs ALSA nothing at all — no enumeration,
+        // no probing, no noise.
+        if let Ok(current) = self.0.device_name.lock()
+            && DYNAMIC_ALIASES.contains(&current.as_str())
+        {
+            return;
+        }
+
         let scan_due = self
             .0
             .last_scan

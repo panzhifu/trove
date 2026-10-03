@@ -8951,6 +8951,7 @@ dependencies = [
 name = "trove-app"
 version = "0.5.4"
 dependencies = [
+ "alsa-sys",
  "arboard",
  "chrono",
  "dirs 5.0.1",
