@@ -15,7 +15,7 @@
 //! through shared blocks.
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -85,6 +85,10 @@ pub(super) struct AudioEngine {
     /// The live sink, so volume and pause apply immediately instead of at the
     /// task's next turn.
     sink: SinkSlot,
+    /// RMS of the chunk that is audible *right now*, as `f32` bits — the
+    /// level meter the waveform's bounce follows. Written by the task with
+    /// every clock publication, read by the preview's ticker.
+    level: Arc<AtomicU32>,
     alive: Arc<AtomicBool>,
 }
 
@@ -110,6 +114,7 @@ impl AudioEngine {
             })),
             clock: Arc::new(Mutex::new(None)),
             sink: Arc::new(Mutex::new(None)),
+            level: Arc::new(AtomicU32::new(0.0f32.to_bits())),
             alive: Arc::new(AtomicBool::new(true)),
         });
         engine.update(cx, |engine, cx| engine.start(cx));
@@ -120,6 +125,12 @@ impl AudioEngine {
     /// read it without borrowing this entity.
     pub(super) fn clock(&self) -> Clock {
         self.clock.clone()
+    }
+
+    /// How loud the sound that is playing this instant is, 0..1 — the RMS of
+    /// the chunk sitting at the sink's front. Zero when nothing is playing.
+    pub(super) fn level(&self) -> f32 {
+        f32::from_bits(self.level.load(Ordering::Relaxed))
     }
 
     /// Play or hold the soundtrack. Applied on the sink immediately: a pause
@@ -196,6 +207,7 @@ impl AudioEngine {
         let shared = self.shared.clone();
         let clock = self.clock.clone();
         let sink_slot = self.sink.clone();
+        let level_slot = self.level.clone();
         let alive = self.alive.clone();
 
         cx.spawn(async move |_weak, cx| {
@@ -205,6 +217,11 @@ impl AudioEngine {
             let mut base_ms = 0.0f64;
             let mut appended: u64 = 0;
             let mut last_published: Option<(f64, Instant)> = None;
+            // RMS per chunk appended since the pipe started, indexed by the
+            // same count `appended` uses — the level meter reads them back
+            // out by how far the sink has drained. One f32 per 100 ms of
+            // audio is ~40 KB an hour; the restart clears it.
+            let mut levels: Vec<f32> = Vec::new();
             loop {
                 if !alive.load(Ordering::Relaxed) {
                     break;
@@ -228,6 +245,7 @@ impl AudioEngine {
                     base_ms = position;
                     appended = 0;
                     last_published = None;
+                    levels.clear();
                     // The pipe is restarting: no clock to sync against until
                     // the first chunk is queued again.
                     if let Ok(mut clock) = clock.lock() {
@@ -277,6 +295,16 @@ impl AudioEngine {
                     let finished = appended.saturating_sub(queued);
                     let within = (s.get_pos().as_secs_f64() * 1000.0).min(AUDIO_CHUNK_MS);
                     let mut reading = base_ms + finished as f64 * AUDIO_CHUNK_MS + within;
+                    // The chunk at the sink's front is `finished` — the first
+                    // one not fully played — and its RMS is what is audible
+                    // right now. The whole soundtrack is queued long before it
+                    // plays, so a chunk's own decode moment is worthless as a
+                    // level reading; the drain position is the sync point.
+                    let audible = (finished as usize).min(levels.len().saturating_sub(1));
+                    level_slot.store(
+                        levels.get(audible).copied().unwrap_or(0.0).to_bits(),
+                        Ordering::Relaxed,
+                    );
                     // `len()` and `get_pos()` are read one after the other, so
                     // a chunk boundary landing between the two reads counts
                     // one chunk twice and reports the clock a whole chunk
@@ -293,6 +321,9 @@ impl AudioEngine {
                     }
                 } else {
                     s.pause();
+                    // Nothing is audible: the meter reads zero, and the
+                    // waveform relaxes back to its envelope on the UI side.
+                    level_slot.store(0.0f32.to_bits(), Ordering::Relaxed);
                     if let Ok(mut clock) = clock.lock() {
                         *clock = None;
                     }
@@ -324,6 +355,16 @@ impl AudioEngine {
                                 .iter()
                                 .map(|b| i16::from_le_bytes(*b))
                                 .collect();
+                            // RMS normalized to full scale — the reading the
+                            // waveform's bounce displays a moment later, when
+                            // this chunk reaches the sink's front.
+                            let energy = samples.iter().map(|s| {
+                                let v = f32::from(*s) / 32768.0;
+                                v * v
+                            }).sum::<f32>();
+                            let rms =
+                                (energy / samples.len().max(1) as f32).sqrt().min(1.0);
+                            levels.push(rms);
                             s.append(rodio::buffer::SamplesBuffer::new(2, 44_100, samples));
                             appended += 1;
                         }

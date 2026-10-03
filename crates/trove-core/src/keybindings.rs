@@ -160,9 +160,11 @@ pub fn default_keybindings() -> Vec<KeyBindingConfig> {
         },
         KeyBindingConfig {
             // `,` steps one frame back on the previewed clip — the editing
-            // convention (Premiere, DaVinci), and the pair is free here. Bound
-            // in the preview's own context, so the character is live only while
-            // a clip covers the grid and the search box keeps its typing.
+            // convention (Premiere, DaVinci), and the pair is free here. A
+            // soundtrack has no frames, so the same keys nudge it five
+            // seconds. Bound in the preview's own context, so the character
+            // is live only while a clip covers the grid and the search box
+            // keeps its typing.
             //
             // The key is written as the character, not the keysym name:
             // gpui-linux maps `Keysym::comma` to `","` and `Keysym::period` to

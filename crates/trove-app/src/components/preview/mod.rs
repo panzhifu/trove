@@ -54,6 +54,10 @@ const ZOOM_FACTOR: f32 = 1.15;
 /// fitted: the still and the live video stage are both measured against it.
 const STAGE_PAD: f32 = 32.0;
 
+/// How far `,` / `.` move a soundtrack that has no frames to step: five
+/// seconds, the scrub granularity a long-form player's arrow keys use.
+const AUDIO_STEP_MS: f64 = 5_000.0;
+
 pub(crate) use quick_look::LiveCard;
 pub(crate) use video::VideoPlayer;
 
@@ -982,13 +986,18 @@ impl AssetPreviewPanel {
     }
 
     /// Step the previewed clip one frame back or forward and hold it there.
-    /// Video or animated image, whichever has the screen — the same two players
-    /// space bar already answers, and the same no-op when neither is live.
+    /// Video or animated image, whichever has the screen — the same players
+    /// space bar already answers. The soundtrack has no frames to step, so
+    /// the same keys nudge it five seconds instead, and it is a no-op when
+    /// neither is live.
     pub(crate) fn step_frame(&mut self, forward: bool, cx: &mut App) {
         if let Some(video) = &self.video {
             video.update(cx, |video, cx| video.step_frame(forward, cx));
         } else if let Some(anim) = &self.anim {
             anim.update(cx, |anim, cx| anim.step_frame(forward, cx));
+        } else if let Some(audio) = &self.audio {
+            let delta = if forward { AUDIO_STEP_MS } else { -AUDIO_STEP_MS };
+            audio.update(cx, |player, cx| player.seek_by(delta, cx));
         }
     }
 

@@ -17,7 +17,6 @@
 
 use std::cell::Cell;
 use std::rc::Rc;
-use std::sync::Arc;
 use std::time::Duration;
 
 use gpui_kit::base::{ElementExt as _, v_flex};
@@ -37,10 +36,29 @@ const WAVE_H: u32 = 48;
 /// Thickness of the playhead drawn over the envelope.
 const PLAYHEAD_W: f32 = 2.0;
 
-/// How often the playhead re-reads the audio clock. The clock is a
-/// `(position, instant)` pair, so a tick locks it and repaints; it never
-/// touches the decoder.
+/// How often the playhead re-reads the audio clock while nothing animates.
+/// The clock is a `(position, instant)` pair, so a tick locks it and
+/// repaints; it never touches the decoder.
 const TICK: Duration = Duration::from_millis(250);
+
+/// The bounce's frame interval while something is audible. The bounce is a
+/// UI-side decay of the engine's per-chunk RMS readings, so it needs its own
+/// pace, well under the 100 ms chunk it samples.
+const ANIM_TICK: Duration = Duration::from_millis(33);
+
+/// Fraction of the display level kept per animation tick. Between two
+/// 100 ms engine readings the bounce decays to ~0.6 — a springy fall that
+/// never quite reaches the floor before the next reading lands.
+const LEVEL_DECAY: f32 = 0.85;
+
+/// Below this the display level counts as silent and the ticker drops back
+/// to its idle pace.
+const LEVEL_FLOOR: f32 = 0.004;
+
+/// Width of the live bounce's window around the playhead, in envelope
+/// buckets — one bucket is one pixel on the strip, so ±1σ is roughly ±14 px
+/// of visible lift travelling with the music.
+const BOUNCE_SIGMA: f32 = 14.0;
 
 /// Open the audio preview for `data`, or `None` when there is nothing to play:
 /// no file behind the asset, or no engine (no ffmpeg, or a stream the probe
@@ -66,10 +84,11 @@ pub(super) struct AudioPlayer {
     engine: Entity<AudioEngine>,
     transport: Transport,
     duration_ms: u64,
-    /// The envelope strip: `Pending` until the load task lands, `None` when
-    /// there is no ffmpeg, no cache address, or no decodable audio — in which
-    /// case the row simply carries no waveform, exactly as it did before.
     wave: Wave,
+    /// The display level, 0..1 — the engine's per-chunk RMS held up by a
+    /// per-tick decay, so the bounce falls off between readings instead of
+    /// stepping. Zero when nothing is audible; the ticker owns the decay.
+    level: f32,
     /// The strip's left edge in window coordinates, recorded at prepaint.
     /// Pointer events carry a window position, so a ratio needs something to
     /// subtract; a `Cell` because the prepaint closure cannot also borrow
@@ -85,7 +104,11 @@ pub(super) struct AudioPlayer {
 enum Wave {
     Pending,
     Unavailable,
-    Ready(Arc<RenderImage>),
+    /// The cached envelope, one level 0–255 per bucket. Drawn as bars
+    /// straight onto the strip each frame — the animation repaints the shape
+    /// every tick, so a rasterized copy would only be re-uploaded to the
+    /// sprite atlas at the same pace.
+    Ready(trove_core::media::waveform::Peaks),
 }
 
 impl AudioPlayer {
@@ -135,6 +158,7 @@ impl AudioPlayer {
             transport,
             duration_ms,
             wave: Wave::Pending,
+            level: 0.0,
             band_left: Rc::new(Cell::new(None)),
             band_dragging: Rc::new(Cell::new(false)),
         };
@@ -172,6 +196,19 @@ impl AudioPlayer {
     pub(super) fn toggle_playing(&mut self, cx: &mut Context<Self>) {
         self.transport.playing = !self.transport.playing;
         self.push_playing(cx);
+    }
+
+    /// `,` / `.`: step the playhead `delta_ms`, committed at once — the
+    /// soundtrack's counterpart of the video's frame step, which has no
+    /// answer for a stream with no frames. `pub(super)` for the same
+    /// reason as [`Self::toggle_playing`].
+    pub(super) fn seek_by(&mut self, delta_ms: f64, cx: &mut Context<Self>) {
+        if self.duration_ms == 0 {
+            return;
+        }
+        let target = (self.transport.position_ms + delta_ms)
+            .clamp(0., self.duration_ms as f64);
+        self.scrub_to(target, true, cx);
     }
 
     fn toggle_volume(&mut self, cx: &mut Context<Self>) {
@@ -254,40 +291,64 @@ impl AudioPlayer {
         cx.notify();
     }
 
-    /// Follow the audio clock. Only the position and a repaint — the slider has
-    /// to be set from `render`, which is where a `Window` lives.
+    /// Follow the audio clock, and drive the bounce. Two paces in one loop:
+    /// ~33 ms while something is audible or the display level is still
+    /// relaxing to zero, 250 ms once nothing moves. Only the position and a
+    /// repaint — the slider has to be set from `render`, which is where a
+    /// `Window` lives.
     fn start_ticker(&mut self, cx: &mut Context<Self>) {
         cx.spawn(async move |weak, cx| {
+            let mut sleep = TICK;
             loop {
-                cx.background_executor().timer(TICK).await;
+                cx.background_executor().timer(sleep).await;
                 // The entity is gone once the preview closes, which is the only
                 // reason this can fail. The clock handle comes out of the same
                 // update because a task's `AsyncApp` cannot `read` an entity.
-                let Ok((playing, seeking, clock)) = weak.update(cx, |this, cx| {
-                    (
-                        this.transport.playing,
-                        this.transport.seeking,
-                        this.engine.read(cx).clock(),
-                    )
-                }) else {
+                let Ok((playing, seeking, clock, engine_level)) =
+                    weak.update(cx, |this, cx| {
+                        (
+                            this.transport.playing,
+                            this.transport.seeking,
+                            this.engine.read(cx).clock(),
+                            this.engine.read(cx).level(),
+                        )
+                    })
+                else {
                     break;
                 };
-                if !playing || seeking {
-                    continue;
-                }
                 // The engine reports where its stream started plus when; wall
                 // time since then is the playhead. Same reading the video loop
                 // makes.
-                let advanced = clock
-                    .lock()
-                    .ok()
+                let advanced = (playing && !seeking)
+                    .then(|| clock.lock().ok())
+                    .flatten()
                     .and_then(|base| *base)
                     .map(|(ms, at)| ms + at.elapsed().as_secs_f64() * 1000.0);
-                let Some(ms) = advanced else { continue };
+                // The bounce: the engine's reading of what is audible now,
+                // held up by the previous display value decaying toward it —
+                // the RMS arrives once per 100 ms chunk, the movement is
+                // continuous.
+                let mut animate = false;
                 let _ = weak.update(cx, |this, cx| {
-                    this.transport.position_ms = ms;
-                    cx.notify();
+                    if let Some(ms) = advanced {
+                        this.transport.position_ms = ms;
+                        this.level = engine_level.max(this.level * LEVEL_DECAY).min(1.0);
+                        animate = true;
+                        cx.notify();
+                    } else if this.level > LEVEL_FLOOR {
+                        // Paused, seeking, or the clock not yet republished
+                        // after a restart: relax the bounce back to the
+                        // envelope.
+                        this.level *= LEVEL_DECAY;
+                        animate = true;
+                        cx.notify();
+                    } else if this.level != 0.0 {
+                        this.level = 0.0;
+                        animate = true; // one last repaint to settle
+                        cx.notify();
+                    }
                 });
+                sleep = if animate { ANIM_TICK } else { TICK };
             }
         })
         .detach();
@@ -299,21 +360,25 @@ impl Render for AudioPlayer {
         let host = cx.entity();
         self.transport.sync_sliders(window, cx);
         // Pulled out first: `when`'s closure borrows the builder, not `self`.
-        let stage_wave = self.wave.image();
+        let stage_peaks = self.wave.peaks();
         let band_left = self.band_left.clone();
         let accent = cx.theme().accent;
-        // Where the playhead sits on the strip. A running drag already wrote
-        // itself into `position_ms`, and the ticker holds off while seeking, so
-        // the one number serves both.
-        let playhead_left: Option<f32> =
-            self.band_left
-                .get()
-                .filter(|_| self.duration_ms > 0)
-                .map(|_| {
-                    let ratio =
-                        (self.transport.position_ms / self.duration_ms as f64).clamp(0., 1.) as f32;
-                    (ratio * WAVE_W as f32 - PLAYHEAD_W / 2.).max(0.)
-                });
+        let bounce = self.level;
+        // Where the playhead sits on the strip — a pixel offset for the
+        // accent line, a bucket index for the bounce window. A running drag
+        // already wrote itself into `position_ms`, and the ticker holds off
+        // while seeking, so the one number serves both.
+        let playhead_ratio = self
+            .band_left
+            .get()
+            .filter(|_| self.duration_ms > 0)
+            .map(|_| {
+                (self.transport.position_ms / self.duration_ms as f64).clamp(0., 1.) as f32
+            });
+        let playhead_left =
+            playhead_ratio.map(|ratio| (ratio * WAVE_W as f32 - PLAYHEAD_W / 2.).max(0.));
+        let playhead_bucket = playhead_ratio
+            .map(|ratio| ratio * trove_core::media::waveform::PEAK_COUNT as f32);
         let controls = transport::row(
             self.transport.position_ms,
             self.duration_ms,
@@ -351,9 +416,8 @@ impl Render for AudioPlayer {
                     .items_center()
                     .justify_center()
                     .when(self.wave.is_ready(), |stage| {
-                        let image = match &stage_wave {
-                            Some(image) => image.clone(),
-                            None => return stage,
+                        let Some(peaks) = stage_peaks else {
+                            return stage;
                         };
                         stage.child(
                             div()
@@ -416,7 +480,21 @@ impl Render for AudioPlayer {
                                         this.end_band_drag(cx)
                                     }),
                                 )
-                                .child(img(ImageSource::Render(image)).size_full())
+                                .child(
+                                    gpui::canvas(
+                                        |_, _, _| {},
+                                        move |bounds, _, window, _| {
+                                            paint_wave(
+                                                bounds,
+                                                &peaks,
+                                                bounce,
+                                                playhead_bucket,
+                                                window,
+                                            );
+                                        },
+                                    )
+                                    .size_full(),
+                                )
                                 .when_some(playhead_left, |band, left| {
                                     band.child(
                                         div()
@@ -441,27 +519,84 @@ impl Wave {
         matches!(self, Wave::Ready(_))
     }
 
-    fn image(&self) -> Option<Arc<RenderImage>> {
+    /// A copy of the envelope for the strip's canvas — 400 bytes, cloned per
+    /// render so the paint closure owns its data.
+    fn peaks(&self) -> Option<trove_core::media::waveform::Peaks> {
         match self {
-            Wave::Ready(image) => Some(image.clone()),
+            Wave::Ready(peaks) => Some(peaks.clone()),
             Wave::Pending | Wave::Unavailable => None,
         }
     }
 }
 
-/// The envelope as a bitmap for the transport row: the same rasterizer the
-/// grid card uses, in the style that sits over the panel.
+/// The envelope for the transport strip, loaded (and cached) off the UI
+/// thread. No bitmap is built here: the strip paints bars straight to the
+/// window every frame, because the bounce repaints the shape at animation
+/// pace and a rasterized copy would only be re-uploaded to the sprite atlas
+/// at the same pace.
 fn build_wave(
     cache_root: &std::path::Path,
     sha: &str,
     path: &std::path::Path,
-) -> Option<Arc<RenderImage>> {
-    let peaks = trove_core::media::waveform::load_or_build(cache_root, sha, path)?;
-    let canvas = trove_core::media::waveform::bitmap(
-        &peaks,
-        WAVE_W,
-        WAVE_H,
-        &trove_core::media::waveform::Style::PREVIEW,
-    )?;
-    Some(Arc::new(RenderImage::new(vec![image::Frame::new(canvas)])))
+) -> Option<trove_core::media::waveform::Peaks> {
+    trove_core::media::waveform::load_or_build(cache_root, sha, path)
+}
+
+/// The animated transport strip: one mirrored bar per envelope bucket,
+/// painted straight to the window so the bounce costs no bitmap upload.
+/// The shape is the song — the envelope, mirrored about the centre line
+/// exactly as the bitmap rasterizer drew it — and the buckets near the
+/// playhead lift with the live level, the sound happening now travelling
+/// along its own picture.
+fn paint_wave(
+    bounds: Bounds<Pixels>,
+    peaks: &[u8],
+    bounce: f32,
+    playhead_bucket: Option<f32>,
+    window: &mut Window,
+) {
+    let ink = gpui::rgb(0x8c8c96);
+    // Work in plain f32: the strip's geometry is fixed, and the paint API
+    // takes `Pixels` back at the end anyway.
+    let left: f32 = bounds.origin.x.into();
+    let top: f32 = bounds.origin.y.into();
+    let width: f32 = bounds.size.width.into();
+    let height: f32 = bounds.size.height.into();
+    let bar_w = width / peaks.len().max(1) as f32;
+    let centre = top + height / 2.0;
+    // A full-scale bar spans 44% of the strip's height, matching the
+    // PREVIEW style the bitmap rasterizer used for the same strip.
+    let span = height * 0.44;
+    for (i, &peak) in peaks.iter().enumerate() {
+        let mut full = f32::from(peak) / 255.0;
+        if bounce > 0.0
+            && let Some(head) = playhead_bucket
+        {
+            let d = i as f32 - head;
+            let lift = (-(d * d) / (2.0 * BOUNCE_SIGMA * BOUNCE_SIGMA)).exp();
+            full = (full + bounce * lift).min(1.0);
+        }
+        if full == 0.0 {
+            // A bucket that held no sound, and none playing over it:
+            // silence stays silence rather than a drawn baseline.
+            continue;
+        }
+        // At least one pixel each side, so a quiet slice is a thin band
+        // rather than an empty box.
+        let half = (full * span / 2.0).max(1.0);
+        let x = left + i as f32 * bar_w;
+        window.paint_quad(gpui::fill(
+            Bounds::from_corners(
+                Point {
+                    x: px(x),
+                    y: px(centre - half),
+                },
+                Point {
+                    x: px(x + bar_w),
+                    y: px(centre + half),
+                },
+            ),
+            ink,
+        ));
+    }
 }
