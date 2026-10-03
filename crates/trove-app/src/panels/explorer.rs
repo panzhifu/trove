@@ -33,7 +33,7 @@ use super::common::{
     AssetsDrag, CollectionDrag, SmartDrag, live_count, observe_controller, separator_label,
     trash_count,
 };
-use crate::components::controls::muted_label;
+use crate::components::controls::{fold_disclosure, muted_label};
 use crate::components::scrollbar::ScrollableElement as _;
 
 // ============================================================================
@@ -613,6 +613,7 @@ impl ExplorerPanel {
         let drop_ctl = self.controller.clone();
         let menu_name = name.to_string();
         let drag_name = name.to_string();
+        let expanded = !self.collapsed_smart.contains(&sid);
 
         div()
             .id(format!("smart-row-{sid}"))
@@ -700,6 +701,17 @@ impl ExplorerPanel {
                     .w_full()
                     .items_center()
                     .gap_2()
+                    // The fold disclosure: a chevron for a parent, an empty
+                    // slot for a leaf, so the names below align either way.
+                    .child(fold_disclosure(
+                        format!("smart-fold-{sid}"),
+                        has_children,
+                        expanded,
+                        cx.listener(move |this, _: &ClickEvent, _window, cx| {
+                            this.toggle_fold_smart(sid, cx);
+                        }),
+                        cx,
+                    ))
                     // A saved search is found by searching, so that is its
                     // default mark; a glyph the user chose replaces it the
                     // same way it does on a folder row.

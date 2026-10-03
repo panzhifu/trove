@@ -11,7 +11,7 @@ use gpui::Keystroke;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::kbd::Kbd;
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
-use gpui_kit::component::{ActiveTheme, Icon, Sizable as _};
+use gpui_kit::component::{ActiveTheme, Icon, IconName, Sizable as _};
 use gpui_kit::*;
 
 /// A muted caption: the label that sits above a field or beside a value,
@@ -107,4 +107,46 @@ pub(crate) fn kbd_or_raw(key: &str, cx: &App) -> AnyElement {
         Ok(stroke) => Kbd::new(stroke).into_any_element(),
         Err(_) => muted_label(key.to_string(), cx).into_any_element(),
     }
+}
+
+/// The fold disclosure at a tree row's leading edge, on the contract
+/// Serpent's sidebar runs (reference/Serpent NavigationSidebar.tsx): a fixed
+/// 16px slot that holds a rotating chevron when the row has children and an
+/// empty spacer when it has none, so sibling labels align across both states
+/// and a parent is recognisable at a glance. The chevron points down while
+/// the subtree is open and right while it is folded. The click stops here —
+/// the row's own handler never sees it — so folding never selects.
+pub(crate) fn fold_disclosure(
+    id: impl Into<ElementId>,
+    has_children: bool,
+    expanded: bool,
+    toggle: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
+    cx: &App,
+) -> AnyElement {
+    let slot = div()
+        .flex_none()
+        .size_4()
+        .flex()
+        .items_center()
+        .justify_center();
+    if !has_children {
+        return slot.into_any_element();
+    }
+    slot.id(id.into())
+        .cursor_pointer()
+        .rounded(cx.theme().radius)
+        .hover(|this| this.bg(cx.theme().secondary))
+        .on_click(move |event, window, cx| {
+            cx.stop_propagation();
+            toggle(event, window, cx);
+        })
+        .child(
+            // percentage() panics on negatives — 0.75 (270° cw) turns the
+            // down-chevron right, the same trick the inspector headers use.
+            Icon::new(IconName::ChevronDown)
+                .size_3()
+                .text_color(cx.theme().muted_foreground)
+                .rotate(gpui::percentage(if expanded { 0. } else { 0.75 })),
+        )
+        .into_any_element()
 }

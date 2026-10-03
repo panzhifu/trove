@@ -18,7 +18,7 @@ use std::ops::Range;
 
 use uuid::Uuid;
 
-use crate::components::controls::muted_label;
+use crate::components::controls::{fold_disclosure, muted_label};
 use crate::components::scrollbar::ScrollableElement as _;
 use crate::library::LibraryController;
 
@@ -298,10 +298,12 @@ impl TagsPanel {
     ///
     /// Interaction follows the app-wide tree contract: a single click selects
     /// (here: toggles the tag filter), a double click folds or unfolds a
-    /// parent's subtree.
+    /// parent's subtree — and the leading disclosure makes a parent visible
+    /// at a glance, folding on a single click of its own.
     fn render_tag_row(&mut self, row: &TagRow, cx: &mut Context<Self>) -> AnyElement {
         let id = row.id;
         let has_children = row.has_children;
+        let expanded = !self.collapsed.contains(&id);
         let color = row.color.clone();
         let name = row.name.clone();
         let name_for_menu = name.clone();
@@ -343,6 +345,17 @@ impl TagsPanel {
                     .w_full()
                     .items_center()
                     .gap_2()
+                    // The fold disclosure: a chevron for a parent, an empty
+                    // slot for a leaf, so the names below align either way.
+                    .child(fold_disclosure(
+                        format!("tag-fold-{id}"),
+                        has_children,
+                        expanded,
+                        cx.listener(move |this, _: &ClickEvent, _window, cx| {
+                            this.toggle_fold(id, cx);
+                        }),
+                        cx,
+                    ))
                     // The leading slot a collection row carries (its glyph),
                     // here the tag's colour dot, so names line up across the
                     // two sidebars whether or not the tag has a colour.
