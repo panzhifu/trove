@@ -18,7 +18,7 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use gpui_kit::*;
 use trove_core::media::spectrum::{BAND_COUNT, SpectrumAnalyzer, LOW_FFT_SIZE};
@@ -31,6 +31,17 @@ use super::video::IDLE_POLL;
 /// `trove_core::media::video`'s `AUDIO_CHUNK_BYTES` (100 ms of 44.1 kHz
 /// stereo i16). The clock counts finished chunks with it.
 const AUDIO_CHUNK_MS: f64 = 100.0;
+
+/// How often the output's device-set fingerprint is refreshed. Enumerating
+/// ALSA PCMs is not free, and the set only matters when the default device
+/// reports as an alias whose name never changes.
+const DEVICE_RESCAN: Duration = Duration::from_secs(2);
+
+/// The dynamic-routing ALSA PCMs, in open-me order. A stream opened on one
+/// of them is routed by the sound server, so it lands in whatever the
+/// system's default output is at every instant — headphones, speakers,
+/// HDMI — with no help from us.
+const DYNAMIC_ALIASES: [&str; 2] = ["pulse", "pipewire"];
 
 /// The process-wide audio output. `OutputStream` has to stay alive for as
 /// long as any player might make sound — and it stays welded to the device
@@ -52,10 +63,17 @@ struct OutputInner {
     handle: Mutex<Option<rodio::OutputStreamHandle>>,
     /// Name of the device the stream is on, "" while none is open.
     device_name: Mutex<String>,
+    /// Fingerprint of the output device set as of the last open. On an ALSA
+    /// host the default reports as the alias "default" forever, so the
+    /// *name* comparison is blind to a headset plugging in — the set of
+    /// enumerated devices is what actually moves.
+    device_set: Mutex<String>,
     /// Bumped on every rebuild; engine tasks watch it.
     generation: AtomicU64,
     /// Serializes rebuilds across engine tasks.
     rebuilding: Mutex<()>,
+    /// Last device-set scan, for the [`DEVICE_RESCAN`] throttle.
+    last_scan: Mutex<Instant>,
 }
 
 impl AudioOutput {
@@ -65,8 +83,12 @@ impl AudioOutput {
             stream: Mutex::new(None),
             handle: Mutex::new(None),
             device_name: Mutex::new(String::new()),
+            device_set: Mutex::new(String::new()),
             generation: AtomicU64::new(0),
             rebuilding: Mutex::new(()),
+            last_scan: Mutex::new(
+                Instant::now().checked_sub(DEVICE_RESCAN).unwrap_or(Instant::now()),
+            ),
         }))
     }
 
@@ -90,38 +112,107 @@ impl AudioOutput {
         self.0.generation.load(Ordering::Relaxed)
     }
 
-    /// Open the stream on the system's default output if the one in hand is
-    /// a different device — the default moved, or nothing is open yet. A
-    /// stream that cannot be opened leaves the old one playing; the next
-    /// poll tries again.
+    /// Open the stream on the best output PCM available. The candidates, in
+    /// order: the pulse/pipewire compatibility bridges — they route through
+    /// the sound server and follow the system's default sink *on their
+    /// own*, so whatever headphones connect next receives the stream
+    /// without our touching it — then the bare "default" alias, whose
+    /// routing is the distro's guess and can point at hardware that never
+    /// moves. The stream re-opens only when the device set changes or the
+    /// current device is no longer a candidate; between those, an open
+    /// stream is left alone.
     fn follow_default(&self) {
-        let Some(device) = rodio::cpal::default_host().default_output_device() else {
+        let scan_due = self
+            .0
+            .last_scan
+            .lock()
+            .map(|gate| gate.elapsed() >= DEVICE_RESCAN)
+            .unwrap_or(false);
+        if !scan_due {
+            return;
+        }
+        if let Ok(mut gate) = self.0.last_scan.lock() {
+            *gate = Instant::now();
+        }
+        let host = rodio::cpal::default_host();
+        // One enumeration serves both halves: the fingerprint watches for
+        // hotplug, the list names the candidates.
+        let Ok(listing) = host.output_devices() else {
             return;
         };
-        let Ok(name) = device.name() else {
-            return;
-        };
-        // Re-checked under the lock: another engine's task may have rebuilt
-        // for the same move a moment ago.
-        let guard = self.0.rebuilding.lock();
-        if let Ok(current) = self.0.device_name.lock()
-            && *current == name
+        let mut devices: Vec<(String, rodio::Device)> = listing
+            .filter_map(|d| {
+                let name = d.name().ok()?;
+                Some((name, d))
+            })
+            .collect();
+        devices.sort_by(|a, b| a.0.cmp(&b.0));
+        let fingerprint: String = devices
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut candidates: Vec<String> = DYNAMIC_ALIASES
+            .iter()
+            .filter(|alias| devices.iter().any(|(name, _)| name == *alias))
+            .map(|alias| (*alias).to_string())
+            .collect();
+        if let Some(default) = host.default_output_device().and_then(|d| d.name().ok())
+            && !candidates.contains(&default)
         {
+            candidates.push(default);
+        }
+        if candidates.is_empty() {
             return;
         }
-        let Ok((stream, handle)) = rodio::OutputStream::try_from_device(&device) else {
+
+        // Re-checked under the lock: another engine's task may have rebuilt
+        // for the same move a moment ago. An open stream whose device is
+        // still a candidate — and whose device set has not moved under it —
+        // stays exactly where it is.
+        let guard = self.0.rebuilding.lock();
+        let (Ok(current_name), Ok(current_set)) =
+            (self.0.device_name.lock(), self.0.device_set.lock())
+        else {
             return;
         };
-        if let Ok(mut slot) = self.0.stream.lock() {
-            *slot = Some(stream);
+        let settled = *current_set == fingerprint
+            && candidates.iter().any(|name| name == &*current_name);
+        if settled {
+            return;
         }
-        if let Ok(mut slot) = self.0.handle.lock() {
-            *slot = Some(handle);
+        drop((current_name, current_set));
+        for name in &candidates {
+            let Some((_, device)) = devices.iter().find(|(known, _)| known == name) else {
+                continue;
+            };
+            let Ok((stream, handle)) = rodio::OutputStream::try_from_device(device) else {
+                tracing::warn!(
+                    device = %name,
+                    "audio: opening the output device failed; trying the next candidate"
+                );
+                continue;
+            };
+            if let Ok(mut slot) = self.0.stream.lock() {
+                *slot = Some(stream);
+            }
+            if let Ok(mut slot) = self.0.handle.lock() {
+                *slot = Some(handle);
+            }
+            if let Ok(mut slot) = self.0.device_name.lock() {
+                *slot = name.clone();
+            }
+            if let Ok(mut slot) = self.0.device_set.lock() {
+                *slot = fingerprint.clone();
+            }
+            let generation = self.0.generation.fetch_add(1, Ordering::Relaxed) + 1;
+            tracing::info!(
+                device = %name,
+                generation,
+                "audio: output stream (re)opened"
+            );
+            break;
         }
-        if let Ok(mut slot) = self.0.device_name.lock() {
-            *slot = name;
-        }
-        self.0.generation.fetch_add(1, Ordering::Relaxed);
         drop(guard);
     }
 }

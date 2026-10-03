@@ -744,7 +744,7 @@ fn paint_spectrum(
     let width: f32 = bounds.size.width.into();
     let height: f32 = bounds.size.height.into();
     let slot = width / bands.len().max(1) as f32;
-    let bar_w = (slot * 0.7).max(1.0);
+    let bar_w = (slot * 0.8).max(1.0);
     let bottom = top + height;
     for (i, &value) in bands.iter().enumerate() {
         let h = value * height;
@@ -764,7 +764,9 @@ fn paint_spectrum(
                     y: px(bottom),
                 },
             ),
-            accent.opacity(0.35 + 0.65 * value),
+            // Near-solid: a bar that reads faint is a bar nobody watches,
+            // and the AGC already owns the brightness dynamic range.
+            accent.opacity(0.7 + 0.3 * value),
         ));
         // The peak-hold cap: a two-pixel marker at full strength, hanging
         // where the band last peaked while the bar rains down beneath it.
