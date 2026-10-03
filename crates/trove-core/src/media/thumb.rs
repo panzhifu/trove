@@ -8,7 +8,6 @@ use std::path::{Path, PathBuf};
 
 use image::GenericImageView;
 
-use crate::config::{AppConfig, AudioCardStyle};
 use crate::media::waveform;
 use crate::model::{Asset, AssetKind, AssetLocation};
 
@@ -71,10 +70,10 @@ pub fn ensure(root: &Path, sha: &str, kind: AssetKind, blob_path: &Path) -> Opti
         AssetKind::Video => write_video_thumb(blob_path, &out),
         AssetKind::Font => write_font_card(blob_path, &out),
         AssetKind::Model => write_model_card(blob_path, &out),
-        // An audio file carries no picture of its own, but a tagged one usually
-        // has one inside, and the rest can be recognised by their shape. Neither
-        // is built here — see `write_audio_cover`.
-        AssetKind::Audio => write_audio_cover(root, sha, blob_path, &out),
+        // An audio file draws its envelope waveform — from an envelope that
+        // is already cached, so the import hot path pays no ffmpeg pass.
+        // Neither is built here — see `write_audio_card`.
+        AssetKind::Audio => write_audio_card(root, sha, blob_path, &out),
         // A PDF is a Document the text arm must not catch (it is not text),
         // and its first page is worth a card whenever a rasterizer exists.
         _ if blob_ext(blob_path) == "pdf" => write_pdf_thumb(blob_path, &out),
@@ -129,7 +128,7 @@ pub fn regenerate(root: &Path, sha: &str, kind: AssetKind, blob_path: &Path) -> 
         }
         AssetKind::Font => write_font_card(blob_path, &out),
         AssetKind::Model => write_model_card(blob_path, &out),
-        AssetKind::Audio => rebuild_audio_cover(root, sha, blob_path, &out),
+        AssetKind::Audio => rebuild_audio_card(root, sha, blob_path, &out),
         _ if blob_ext(blob_path) == "pdf" => write_pdf_thumb(blob_path, &out),
         _ if crate::media::text::is_text_ext(&blob_ext(blob_path)) => {
             write_text_card(blob_path, &out)
@@ -910,76 +909,20 @@ fn card_lines(text: &str) -> Vec<String> {
     lines
 }
 
-/// The audio card: cover art from the tags, else the file's waveform.
+/// The audio card: the file's envelope waveform.
 ///
 /// The waveform is only drawn from an envelope that is *already* cached.
 /// Building one costs an ffmpeg pass, and this runs on the import hot path, so
-/// a file with neither a picture nor a cached envelope keeps the kind icon it
-/// always had — until the envelope exists because the file was previewed, or
-/// until a thumbnail rebuild asks for it.
-///
-/// The order is controlled by [`crate::config::AudioCardStyle`]: the default
-/// `cover` tries the tagged picture first and falls back to the waveform;
-/// `waveform` reverses the preference.
-fn write_audio_cover(root: &Path, sha: &str, blob_path: &Path, out: &Path) -> Option<PathBuf> {
-    audio_card(
-        AppConfig::load().audio_card_style(),
-        root,
-        sha,
-        blob_path,
-        out,
-        false,
-    )
+/// a file with no cached envelope keeps the kind icon it always had — until
+/// the envelope exists because the file was previewed, or until a thumbnail
+/// rebuild asks for it.
+fn write_audio_card(root: &Path, sha: &str, _blob_path: &Path, out: &Path) -> Option<PathBuf> {
+    write_wave_card(&waveform::cached(root, sha)?, out)
 }
 
 /// The same card for a rebuild that is allowed to decode the envelope first.
-fn rebuild_audio_cover(root: &Path, sha: &str, blob_path: &Path, out: &Path) -> Option<PathBuf> {
-    audio_card(
-        AppConfig::load().audio_card_style(),
-        root,
-        sha,
-        blob_path,
-        out,
-        true,
-    )
-}
-
-/// One audio card, ordered by `style` — cover-first or waveform-first —
-/// with the envelope source decided by `rebuild`: the import path only
-/// draws from an envelope that is already cached, the rebuild may pay one
-/// ffmpeg pass to decode one. The style lives in the user's config, which
-/// is why the tests call this directly with a pinned style: a test that
-/// read the running machine's preference would pass on one machine and
-/// fail on another.
-fn audio_card(
-    style: AudioCardStyle,
-    root: &Path,
-    sha: &str,
-    blob_path: &Path,
-    out: &Path,
-    rebuild: bool,
-) -> Option<PathBuf> {
-    let cached_envelope = |root: &Path, sha: &str| -> Option<Vec<u8>> {
-        if rebuild {
-            waveform::load_or_build(root, sha, blob_path)
-        } else {
-            waveform::cached(root, sha)
-        }
-    };
-    match style {
-        AudioCardStyle::Cover => {
-            if let Some(cover) = embedded_cover(blob_path) {
-                return write_cover(&cover, out);
-            }
-            write_wave_card(&cached_envelope(root, sha)?, out)
-        }
-        AudioCardStyle::Waveform => {
-            if let Some(peaks) = cached_envelope(root, sha) {
-                return write_wave_card(&peaks, out);
-            }
-            embedded_cover(blob_path).and_then(|c| write_cover(&c, out))
-        }
-    }
+fn rebuild_audio_card(root: &Path, sha: &str, blob_path: &Path, out: &Path) -> Option<PathBuf> {
+    write_wave_card(&waveform::load_or_build(root, sha, blob_path)?, out)
 }
 
 /// Draw the envelope as a card.
@@ -987,69 +930,6 @@ fn write_wave_card(peaks: &waveform::Peaks, out: &Path) -> Option<PathBuf> {
     let (w, h) = AUDIO_CARD_SIZE;
     let card = waveform::bitmap(peaks, w, h, &waveform::Style::CARD)?;
     write_downscaled(&image::DynamicImage::ImageRgba8(card), out)
-}
-
-/// Write an embedded picture to the cache, downscaled to fit [`THUMB_MAX`].
-fn write_cover(cover: &image::DynamicImage, out: &Path) -> Option<PathBuf> {
-    let (w, h) = cover.dimensions();
-    if w == 0 || h == 0 {
-        return None;
-    }
-    write_downscaled(&downscale(cover), out)
-}
-
-/// The audio file's embedded picture, preferring a front cover and otherwise
-/// the largest one.
-///
-/// "Largest" rather than "first" because a tag commonly carries more than one
-/// image and the first is frequently the 32×32 file icon ID3 writes by
-/// convention; a card built from that would be a blur. The icon types are
-/// excluded outright.
-///
-/// The probe reads the container from the content before falling back to the
-/// extension, for the same reason `metadata::mine_audio` does: lofty will not
-/// identify an `.oga` by name, and a thumbnail that disagrees with the tag
-/// reader about which files are audio would be a puzzle.
-fn embedded_cover(path: &Path) -> Option<image::DynamicImage> {
-    use lofty::file::TaggedFileExt;
-    use lofty::picture::PictureType;
-    use lofty::probe::Probe;
-
-    let tagged = Probe::open(path)
-        .ok()?
-        .guess_file_type()
-        .ok()?
-        .read()
-        .ok()?;
-
-    let mut best: Option<(u64, usize, &[u8])> = None;
-    for tag in tagged.tags() {
-        for pic in tag.pictures() {
-            // ID3 APIC types 1 and 2: a 32×32 file icon and "other file icon".
-            // Neither is cover art, and both are smaller than a real one.
-            if matches!(pic.pic_type(), PictureType::Icon | PictureType::OtherIcon) {
-                continue;
-            }
-            let data = pic.data();
-            if data.is_empty() {
-                continue;
-            }
-            // A front cover always wins; among the rest the biggest bytes win,
-            // which stands in for resolution without decoding every picture.
-            let rank = u64::from(pic.pic_type() == PictureType::CoverFront);
-            let better = match best {
-                None => true,
-                Some((best_rank, best_len, _)) => {
-                    rank > best_rank || (rank == best_rank && data.len() > best_len)
-                }
-            };
-            if better {
-                best = Some((rank, data.len(), data));
-            }
-        }
-    }
-    let (_, _, data) = best?;
-    image::load_from_memory(data).ok()
 }
 
 /// Decode and develop a camera-RAW file with rawler: demosaic, white
@@ -1120,74 +1000,13 @@ fn apply_orientation(
 mod tests {
     use super::*;
 
-    // ---- audio cover-art fixtures ------------------------------------------
+    // ---- audio fixtures -----------------------------------------------------
     //
     // Built from bytes so the test ships no binary asset. The ID3v2.3 frame IDs
     // must be four characters (`TIT2`, not the v2.2 `TT2`): a three-character ID
     // shifts every later byte by one, and lofty then reads a text frame's
     // *content* as a header and reports "Found invalid encoding" — nothing about
-    // the real mistake. `APIC` is four characters in both versions, so a
-    // cover-only tag hides the problem entirely.
-
-    /// A solid-color PNG, DEFLATE'd with stored blocks (no compressor dep).
-    fn png_fixture(w: u32, h: u32, rgb: [u8; 3]) -> Vec<u8> {
-        fn chunk(t: &[u8], d: &[u8]) -> Vec<u8> {
-            let mut c = t.to_vec();
-            c.extend_from_slice(d);
-            let mut out = (d.len() as u32).to_be_bytes().to_vec();
-            out.extend_from_slice(&c);
-            out.extend_from_slice(&crc32(&c).to_be_bytes());
-            out
-        }
-        let mut raw = Vec::new();
-        for _ in 0..h {
-            raw.push(0u8);
-            raw.extend_from_slice(&vec![rgb; w as usize].concat());
-        }
-        let mut ihdr = Vec::new();
-        ihdr.extend_from_slice(&w.to_be_bytes());
-        ihdr.extend_from_slice(&h.to_be_bytes());
-        ihdr.extend_from_slice(&[8, 2, 0, 0, 0]);
-        let mut out = b"\x89PNG\r\n\x1a\n".to_vec();
-        out.extend_from_slice(&chunk(b"IHDR", &ihdr));
-        out.extend_from_slice(&chunk(b"IDAT", &stored_deflate(&raw)));
-        out.extend_from_slice(&chunk(b"IEND", &[]));
-        out
-    }
-
-    fn stored_deflate(data: &[u8]) -> Vec<u8> {
-        let mut out = vec![0x78, 0x01];
-        let mut chunks = data.chunks(0xffff).peekable();
-        while let Some(block) = chunks.next() {
-            out.push(if chunks.peek().is_none() { 1 } else { 0 });
-            out.extend_from_slice(&(block.len() as u16).to_le_bytes());
-            out.extend_from_slice(&(!(block.len() as u16)).to_le_bytes());
-            out.extend_from_slice(block);
-        }
-        out.extend_from_slice(&adler32(data).to_be_bytes());
-        out
-    }
-
-    fn adler32(data: &[u8]) -> u32 {
-        let (mut a, mut b) = (1u32, 0u32);
-        for byte in data {
-            a = (a + u32::from(*byte)) % 65521;
-            b = (b + a) % 65521;
-        }
-        (b << 16) | a
-    }
-
-    fn crc32(data: &[u8]) -> u32 {
-        let mut crc = !0u32;
-        for byte in data {
-            crc ^= u32::from(*byte);
-            for _ in 0..8 {
-                let mask = (!crc & 1).wrapping_sub(1) & 0xedb8_8320;
-                crc = (crc >> 1) ^ mask;
-            }
-        }
-        !crc
-    }
+    // the real mistake.
 
     /// An MP3: an ID3v2.3 tag carrying `pictures` as `(pic_type, png bytes)`,
     /// then twenty real MPEG-1 Layer III frames.
@@ -1246,35 +1065,6 @@ mod tests {
         dir
     }
 
-    /// The card comes from the front cover, not from the 32×32 file icon ID3
-    /// type 1 that a tag often carries alongside it — "first picture" would
-    /// pick the icon and blur the card.
-    #[test]
-    fn an_embedded_cover_becomes_the_audio_thumbnail() {
-        let dir = temp_dir_named("audiocover");
-        let src = dir.join("album.mp3");
-        std::fs::write(
-            &src,
-            mp3_with_pictures(&[
-                (1, png_fixture(4, 4, [255, 0, 0])), // file icon, must be skipped
-                (3, png_fixture(40, 40, [10, 200, 20])), // front cover
-            ]),
-        )
-        .unwrap();
-
-        let out = ensure(&dir.join("cache"), &"a".repeat(64), AssetKind::Audio, &src);
-        assert!(out.is_some(), "a tagged MP3 should produce a thumbnail");
-        let img = image::open(out.unwrap()).unwrap().to_rgb8();
-        let (w, h) = img.dimensions();
-        assert!((15..=40).contains(&w) && (15..=40).contains(&h), "{w}x{h}");
-        let px = *img.get_pixel(2, 2);
-        assert!(
-            px[0] < 60 && px[1] > 150 && px[2] < 60,
-            "expected the cover's green, got {px:?}"
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
     /// No embedded picture is the common case, not an error: the caller keeps
     /// the kind icon. Junk that merely ends in `.mp3` must not panic either.
     ///
@@ -1330,36 +1120,6 @@ mod tests {
         // The rebuild reaches the same drawing without decoding anything.
         let rebuilt = regenerate(&cache, &sha, AssetKind::Audio, &src).expect("a waveform card");
         assert_eq!(rebuilt, out);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// A picture beats a waveform: the art is the thing the label came with.
-    ///
-    /// The style is pinned to the default (`Cover`) rather than read from
-    /// the running machine's config — a preference flipped in the app would
-    /// otherwise turn this into a test of the user's taste.
-    #[test]
-    fn a_cover_still_wins_over_a_cached_envelope() {
-        let dir = temp_dir_named("audiopriority");
-        let cache = dir.join("cache");
-        let src = dir.join("album.mp3");
-        std::fs::write(
-            &src,
-            mp3_with_pictures(&[(3, png_fixture(40, 40, [10, 200, 20]))]),
-        )
-        .unwrap();
-
-        let sha = "f".repeat(64);
-        let solid = vec![255u8; waveform::PEAK_COUNT];
-        waveform::store(&cache, &sha, &solid);
-        let out = abs_path(&cache, &sha);
-        audio_card(AudioCardStyle::Cover, &cache, &sha, &src, &out, false).expect("the cover");
-        let card = image::open(out).unwrap().to_rgb8();
-        let px = *card.get_pixel(2, 2);
-        assert!(
-            px[0] < 60 && px[1] > 150 && px[2] < 60,
-            "expected the cover's green, got {px:?}"
-        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

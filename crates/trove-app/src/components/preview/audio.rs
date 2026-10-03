@@ -1,6 +1,7 @@
-//! The audio-asset preview: cover art over a transport, no new media stack.
+//! The audio-asset preview: the waveform over a transport, no new media
+//! stack.
 //!
-//! Everything below the picture already existed — the ffmpeg pipe that emits
+//! Everything below the shape already existed — the ffmpeg pipe that emits
 //! 44.1 kHz stereo PCM, the rodio sink, the clock, the tempo-preserving speed
 //! chain — but it was only reachable through [`AudioEngine`], which the video
 //! player owns one of per soundtrack. An audio file is that same soundtrack
@@ -10,9 +11,9 @@
 //! Deliberately absent: fullscreen (the video stage exists to reconcile a
 //! picture with its controls; there is no picture here). The envelope strip is
 //! the cached peaks of `trove_core::media::waveform` drawn by the same
-//! rasterizer that paints a cover-less track's grid card — and it is a second
+//! rasterizer that paints the grid card — and it is a second
 //! hit target for the same seek, because pointing at a moment in the waveform
-//! is the gesture the picture of the music invites.
+//! is the gesture the shape of the music invites.
 
 use std::cell::Cell;
 use std::rc::Rc;
@@ -24,9 +25,9 @@ use gpui_kit::component::{ActiveTheme, Size};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
+use super::AssetPreviewData;
 use super::soundtrack::AudioEngine;
 use super::transport::{self, Transport};
-use super::{AssetPreviewData, video};
 
 /// Width and height of the envelope strip, in pixels. The peak count is also
 /// 400, so one column per peak and no resampling artefacts at 1×.
@@ -350,10 +351,6 @@ impl Render for AudioPlayer {
                     .items_center()
                     .justify_center()
                     .gap_3()
-                    // The artwork is the thumbnail the import pipeline wrote
-                    // from the file's own embedded cover; with none, this is
-                    // the kind icon.
-                    .child(video::cover(&self.data, cx))
                     .child(div().text_sm().text_center().child(self.data.name.clone()))
                     .when(self.wave.is_ready(), |stage| {
                         let image = match &stage_wave {
