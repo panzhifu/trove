@@ -422,28 +422,61 @@ pub(super) fn specimen_scaled(
     )
 }
 
-/// The control strip above a live font specimen: the sample text (editable,
-/// stored per language), a reset for it, and the language picker. Built per
-/// render because the input re-syncs to the current language's text — the
-/// same contract the settings page's model field runs on. The strip leads
-/// the preview like every other kind's tools; the data rides in as a
-/// reference on purpose: this runs inside the panel's own render, where the
-/// entity is already being updated and a `panel.read` would panic.
-pub(super) fn controls_bar(
+/// What the title bar's font tools render from, copied out of the preview:
+/// the title bar reads the preview and then mutates `cx` to build the
+/// controls, and a shared read of the entity must not stay open across
+/// those calls.
+pub(crate) struct FontToolState {
+    language: FontPreviewLanguage,
+    weight: u16,
+    text: String,
+    size: f32,
+    axis: Option<(u16, u16)>,
+}
+
+/// The font-tool state of a preview — `Some` only while a live specimen is
+/// up, the same gate that used to show the in-preview strip.
+pub(crate) fn tool_state(preview: &super::AssetPreviewPanel) -> Option<FontToolState> {
+    if !preview.font_live {
+        return None;
+    }
+    let data = &preview.data;
+    let (language, weight, text) = resolved(data);
+    let size = data
+        .font_preview
+        .as_ref()
+        .map(|state| state.size)
+        .unwrap_or_else(default_specimen_size);
+    Some(FontToolState {
+        language,
+        weight,
+        text,
+        size,
+        axis: data.font_variable_weight,
+    })
+}
+
+/// The font specimen's tools in the panel title bar, where every other
+/// preview keeps its tools: the sample text (editable, stored per
+/// language), a reset for it, and the language and weight pickers. Built
+/// per render because the input re-syncs to the current language's text —
+/// the same contract the settings page's model field runs on. The state
+/// arrives as a snapshot because the caller's read of the preview must be
+/// closed by the time this runs; the panel handle is all the callbacks
+/// need, and they fire outside the title bar's own update.
+pub(crate) fn toolbar(
     panel: Entity<super::AssetPreviewPanel>,
-    data: &AssetPreviewData,
+    state: FontToolState,
     window: &mut Window,
-    cx: &mut Context<super::AssetPreviewPanel>,
+    cx: &mut App,
 ) -> Div {
-    let (language, weight, text, size, axis) = {
-        let (language, weight, text) = resolved(data);
-        let size = data
-            .font_preview
-            .as_ref()
-            .map(|state| state.size)
-            .unwrap_or_else(default_specimen_size);
-        (language, weight, text, size, data.font_variable_weight)
-    };
+    let FontToolState {
+        language,
+        weight,
+        text,
+        size,
+        axis,
+    } = state;
 
     struct State {
         input: Entity<InputState>,
@@ -542,18 +575,13 @@ pub(super) fn controls_bar(
     });
 
     h_flex()
-        .w_full()
-        .justify_center()
-        .gap_2()
-        .px_4()
-        .py_2()
-        .border_b_1()
-        .border_color(cx.theme().border)
+        .items_center()
+        .gap_1()
         .child(
             Input::new(&state.input)
                 .small()
                 .appearance(true)
-                .w(px(420.)),
+                .w(px(280.)),
         )
         .child(reset)
         .child(language_dropdown)

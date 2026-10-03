@@ -17,7 +17,7 @@ use gpui_kit::component::{IconName, Sizable as _, WindowExt as _};
 use gpui_kit::*;
 
 use crate::components::controls::{icon_button, muted_label};
-use crate::components::preview::{AssetPreviewPanel, ModelViewport};
+use crate::components::preview::{AssetPreviewPanel, ModelViewport, font};
 use crate::library::LibraryController;
 use crate::panels::WorkspacePanel;
 use crate::panels::workspace::MainPreview;
@@ -57,7 +57,7 @@ impl DockPanel for WorkspacePanel {
     /// for a model. Opening a preview switches the bar with it.
     fn title_suffix(
         &mut self,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<impl IntoElement> {
         // A preview open: the title bar carries *that* preview's tools instead
@@ -65,7 +65,9 @@ impl DockPanel for WorkspacePanel {
         // set it is follows the preview, so opening one switches the bar.
         match &self.preview {
             Some(MainPreview::Asset(preview)) => {
-                return Some(preview_toolbar(preview, &self.controller, cx).into_any_element());
+                return Some(
+                    preview_toolbar(preview, &self.controller, window, cx).into_any_element(),
+                );
             }
             Some(MainPreview::Model(viewport)) => {
                 return Some(model_toolbar(viewport, cx));
@@ -211,6 +213,7 @@ fn model_toolbar(viewport: &Entity<ModelViewport>, cx: &mut Context<WorkspacePan
 fn preview_toolbar(
     preview: &Entity<AssetPreviewPanel>,
     controller: &Entity<LibraryController>,
+    window: &mut Window,
     cx: &mut Context<WorkspacePanel>,
 ) -> Div {
     use gpui_kit::assets::IconName as ToolIcon;
@@ -453,6 +456,15 @@ fn preview_toolbar(
                 });
             }),
         );
+    }
+
+    // The font specimen's tools: sample text, reset, language and weight —
+    // in the same slot every other preview's tools occupy. The state comes
+    // out as a snapshot first, because the read of the preview must close
+    // before the controls build their keyed input state.
+    let font_state = font::tool_state(preview.read(cx));
+    if let Some(state) = font_state {
+        bar = bar.child(font::toolbar(preview.clone(), state, window, cx));
     }
 
     bar.child(

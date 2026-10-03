@@ -21,7 +21,7 @@ mod anim;
 mod audio;
 mod chrome;
 mod fallback;
-mod font;
+pub(crate) mod font;
 mod gpu3d;
 mod image;
 pub(crate) mod model;
@@ -1206,7 +1206,7 @@ impl AssetPreviewPanel {
 }
 
 impl Render for AssetPreviewPanel {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let content: AnyElement = match (&self.video, &self.audio, &self.text) {
             (Some(player), _, _) => player.clone().into_any_element(),
             // The audio transport renders itself, so gpui passes the window to
@@ -1318,12 +1318,9 @@ impl Render for AssetPreviewPanel {
             })
             .child(content);
 
-        let mut root = v_flex().size_full().overflow_hidden();
-        if self.font_live {
-            // The control strip leads, the way every other preview keeps its
-            // tools at the top; the specimen takes the remaining space.
-            root = root.child(font::controls_bar(cx.entity(), &self.data, window, cx));
-        }
-        root.child(stage)
+        // The font specimen's tools live in the panel title bar now, the
+        // same place every other preview's tools sit — the stage is all
+        // this view renders.
+        v_flex().size_full().overflow_hidden().child(stage)
     }
 }
