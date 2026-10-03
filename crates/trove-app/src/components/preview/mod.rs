@@ -1320,7 +1320,7 @@ impl Render for AssetPreviewPanel {
 
         let mut root = v_flex().size_full().overflow_hidden().child(stage);
         if self.font_live {
-            root = root.child(font::controls_bar(cx.entity(), window, cx));
+            root = root.child(font::controls_bar(cx.entity(), &self.data, window, cx));
         }
         root
     }

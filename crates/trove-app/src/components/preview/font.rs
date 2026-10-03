@@ -425,14 +425,16 @@ pub(super) fn specimen_scaled(
 /// The control strip under a live font specimen: the sample text (editable,
 /// stored per language), a reset for it, and the language picker. Built per
 /// render because the input re-syncs to the current language's text — the
-/// same contract the settings page's model field runs on.
+/// same contract the settings page's model field runs on. The data rides in
+/// as a reference on purpose: this runs inside the panel's own render, where
+/// the entity is already being updated and a `panel.read` would panic.
 pub(super) fn controls_bar(
     panel: Entity<super::AssetPreviewPanel>,
+    data: &AssetPreviewData,
     window: &mut Window,
     cx: &mut Context<super::AssetPreviewPanel>,
 ) -> Div {
     let (language, weight, text, size, axis) = {
-        let data = &panel.read(cx).data;
         let (language, weight, text) = resolved(data);
         let size = data
             .font_preview
