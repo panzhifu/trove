@@ -15,12 +15,14 @@
 //! through shared blocks.
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use gpui_kit::*;
 use trove_core::media::video::AudioPipe;
+use rodio::cpal::traits::{DeviceTrait as _, HostTrait as _};
 
 use super::video::IDLE_POLL;
 
@@ -30,28 +32,97 @@ use super::video::IDLE_POLL;
 const AUDIO_CHUNK_MS: f64 = 100.0;
 
 /// The process-wide audio output. `OutputStream` has to stay alive for as
-/// long as any player might make sound, so it lives in a global; every
-/// engine's sink is created from its handle.
-struct AudioHost {
-    _stream: rodio::OutputStream,
-    handle: rodio::OutputStreamHandle,
+/// long as any player might make sound — and it stays welded to the device
+/// it was opened on, so the host is *rebuildable*: when the system's default
+/// output moves (headphones plug in, the mixer's default flips), the stream
+/// is replaced wholesale, the generation bumps, and every engine task that
+/// sees the new generation requeues its sound from where the playhead
+/// stands. An `Rc`, not an `Arc`: cpal's stream types are not `Send`, and
+/// every hand that touches this runs on the UI thread.
+#[derive(Clone)]
+struct AudioOutput(Rc<OutputInner>);
+
+impl Global for AudioOutput {}
+
+struct OutputInner {
+    /// The open stream, held alive. Swapped wholesale on a device change.
+    stream: Mutex<Option<rodio::OutputStream>>,
+    /// The handle new sinks are built from.
+    handle: Mutex<Option<rodio::OutputStreamHandle>>,
+    /// Name of the device the stream is on, "" while none is open.
+    device_name: Mutex<String>,
+    /// Bumped on every rebuild; engine tasks watch it.
+    generation: AtomicU64,
+    /// Serializes rebuilds across engine tasks.
+    rebuilding: Mutex<()>,
 }
 
-impl Global for AudioHost {}
-
-/// The audio output handle, opening the device on first use. `None` when the
-/// device cannot be opened — playback then stays silent (same as the
-/// pre-audio behavior) instead of erroring.
-fn audio_handle(cx: &mut App) -> Option<rodio::OutputStreamHandle> {
-    if let Some(host) = cx.try_global::<AudioHost>() {
-        return Some(host.handle.clone());
+impl AudioOutput {
+    /// An output with no stream. `follow_default` opens it.
+    fn empty() -> Self {
+        Self(Rc::new(OutputInner {
+            stream: Mutex::new(None),
+            handle: Mutex::new(None),
+            device_name: Mutex::new(String::new()),
+            generation: AtomicU64::new(0),
+            rebuilding: Mutex::new(()),
+        }))
     }
-    let (stream, handle) = rodio::OutputStream::try_default().ok()?;
-    cx.set_global(AudioHost {
-        _stream: stream,
-        handle: handle.clone(),
-    });
-    Some(handle)
+
+    /// Fetch or create the process-wide output.
+    fn global(cx: &mut App) -> Self {
+        if let Some(output) = cx.try_global::<AudioOutput>() {
+            return output.clone();
+        }
+        let output = Self::empty();
+        cx.set_global(output.clone());
+        output
+    }
+
+    /// The handle new sinks are built from, if the output is open.
+    fn handle(&self) -> Option<rodio::OutputStreamHandle> {
+        self.0.handle.lock().ok()?.clone()
+    }
+
+    /// The generation engine tasks watch.
+    fn generation(&self) -> u64 {
+        self.0.generation.load(Ordering::Relaxed)
+    }
+
+    /// Open the stream on the system's default output if the one in hand is
+    /// a different device — the default moved, or nothing is open yet. A
+    /// stream that cannot be opened leaves the old one playing; the next
+    /// poll tries again.
+    fn follow_default(&self) {
+        let Some(device) = rodio::cpal::default_host().default_output_device() else {
+            return;
+        };
+        let Ok(name) = device.name() else {
+            return;
+        };
+        // Re-checked under the lock: another engine's task may have rebuilt
+        // for the same move a moment ago.
+        let guard = self.0.rebuilding.lock();
+        if let Ok(current) = self.0.device_name.lock()
+            && *current == name
+        {
+            return;
+        }
+        let Ok((stream, handle)) = rodio::OutputStream::try_from_device(&device) else {
+            return;
+        };
+        if let Ok(mut slot) = self.0.stream.lock() {
+            *slot = Some(stream);
+        }
+        if let Ok(mut slot) = self.0.handle.lock() {
+            *slot = Some(handle);
+        }
+        if let Ok(mut slot) = self.0.device_name.lock() {
+            *slot = name;
+        }
+        self.0.generation.fetch_add(1, Ordering::Relaxed);
+        drop(guard);
+    }
 }
 
 /// Commands the windows send, and the state the audio task reads. Written
@@ -198,12 +269,13 @@ impl AudioEngine {
 
     /// The audio task: feeds ~100 ms PCM chunks into the sink, restarts the
     /// pipe whenever `seq` moves, and publishes the clock the video loops
-    /// pace against.
+    /// pace against. It also watches the audio output's generation: when the
+    /// default device moves, the sink dies with the old stream and the
+    /// soundtrack requeues from where the playhead stands.
     fn start(&mut self, cx: &mut Context<Self>) {
         let path = self.path.clone();
-        let Some(host) = audio_handle(cx) else {
-            return;
-        };
+        let output = AudioOutput::global(cx);
+        output.follow_default();
         let shared = self.shared.clone();
         let clock = self.clock.clone();
         let sink_slot = self.sink.clone();
@@ -222,9 +294,20 @@ impl AudioEngine {
             // out by how far the sink has drained. One f32 per 100 ms of
             // audio is ~40 KB an hour; the restart clears it.
             let mut levels: Vec<f32> = Vec::new();
+            let mut seen_generation = output.generation();
+            let mut force_restart = false;
             loop {
                 if !alive.load(Ordering::Relaxed) {
                     break;
+                }
+                // Follow the default output device: headphones plug in, the
+                // mixer's default flips — the stream is rebuilt, and this
+                // sink with it.
+                output.follow_default();
+                let generation = output.generation();
+                if generation != seen_generation {
+                    seen_generation = generation;
+                    force_restart = true;
                 }
                 let (playing, new_seq, position, speed, volume, muted) = {
                     let Ok(shared) = shared.lock() else {
@@ -240,9 +323,28 @@ impl AudioEngine {
                     )
                 };
 
-                if new_seq != seq {
+                if new_seq != seq || force_restart {
+                    let device_moved = force_restart;
+                    let from_seek = new_seq != seq;
+                    force_restart = false;
                     seq = new_seq;
-                    base_ms = position;
+                    // A device move restarts from where the sound stands, not
+                    // from the last seek: the clock's last reading, advanced
+                    // by wall time while playing, frozen where it was when
+                    // paused. A seek keeps its own requested position.
+                    base_ms = if from_seek || !device_moved {
+                        position
+                    } else {
+                        last_published
+                            .map(|(ms, at)| {
+                                if playing {
+                                    ms + at.elapsed().as_secs_f64() * 1000.0
+                                } else {
+                                    ms
+                                }
+                            })
+                            .unwrap_or(position)
+                    };
                     appended = 0;
                     last_published = None;
                     levels.clear();
@@ -253,14 +355,29 @@ impl AudioEngine {
                     }
                     // Kill the old pipe before opening the new one.
                     drop(pipe.take());
+                    // A device move welds the old sink to the stream that just
+                    // died; drop it so the branch below builds a fresh one. A
+                    // seek keeps its sink and just empties it.
+                    if device_moved
+                        && let Some(s) = sink.take()
+                    {
+                        s.clear();
+                    }
                     match &sink {
                         Some(s) => {
                             s.clear();
                             s.set_volume(if muted { 0. } else { volume });
                         }
                         None => {
-                            let Ok(s) = rodio::Sink::try_new(&host) else {
-                                break;
+                            let Some(handle) = output.handle() else {
+                                // No usable output right now: idle until a
+                                // device shows up and the generation moves.
+                                cx.background_executor().timer(IDLE_POLL).await;
+                                continue;
+                            };
+                            let Ok(s) = rodio::Sink::try_new(&handle) else {
+                                cx.background_executor().timer(IDLE_POLL).await;
+                                continue;
                             };
                             s.set_volume(if muted { 0. } else { volume });
                             let s = Arc::new(s);
@@ -271,9 +388,10 @@ impl AudioEngine {
                         }
                     }
                     let open_path = path.clone();
+                    let open_at = base_ms;
                     pipe = cx
                         .background_executor()
-                        .spawn(async move { AudioPipe::open(&open_path, position as u64, speed) })
+                        .spawn(async move { AudioPipe::open(&open_path, open_at as u64, speed) })
                         .await;
                 }
 

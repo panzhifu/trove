@@ -28,10 +28,15 @@ use super::AssetPreviewData;
 use super::soundtrack::AudioEngine;
 use super::transport::{self, Transport};
 
-/// Width and height of the envelope strip, in pixels. The peak count is also
-/// 400, so one column per peak and no resampling artefacts at 1×.
-const WAVE_W: u32 = 400;
-const WAVE_H: u32 = 48;
+/// Height of the envelope strip, in pixels — twice the rasterized card
+/// shape it grew out of, because the strip is the only thing on the stage
+/// and can carry the extra presence.
+const WAVE_H: f32 = 96.0;
+
+/// The strip spans the stage's width up to this cap: past it the envelope
+/// stretches into mush, and a bounded shape reads better centered than
+/// edge-to-edge.
+const WAVE_MAX_W: f32 = 960.0;
 
 /// Thickness of the playhead drawn over the envelope.
 const PLAYHEAD_W: f32 = 2.0;
@@ -89,11 +94,12 @@ pub(super) struct AudioPlayer {
     /// per-tick decay, so the bounce falls off between readings instead of
     /// stepping. Zero when nothing is audible; the ticker owns the decay.
     level: f32,
-    /// The strip's left edge in window coordinates, recorded at prepaint.
-    /// Pointer events carry a window position, so a ratio needs something to
-    /// subtract; a `Cell` because the prepaint closure cannot also borrow
-    /// `self`.
+    /// The strip's left edge and width in window coordinates, recorded at
+    /// prepaint — the strip is sized by the stage, not a constant, so a
+    /// pointer position maps to a moment only through the measured box.
+    /// `Cell`s because the prepaint closure cannot also borrow `self`.
     band_left: Rc<Cell<Option<f32>>>,
+    band_width: Rc<Cell<Option<f32>>>,
     /// Whether a drag across the strip is in progress. `transport.seeking`
     /// cannot answer this: the slider sets it too, and a move over the strip
     /// must not follow a drag that happens on the thumb.
@@ -160,6 +166,7 @@ impl AudioPlayer {
             wave: Wave::Pending,
             level: 0.0,
             band_left: Rc::new(Cell::new(None)),
+            band_width: Rc::new(Cell::new(None)),
             band_dragging: Rc::new(Cell::new(false)),
         };
 
@@ -247,7 +254,8 @@ impl AudioPlayer {
             return None;
         }
         let left = self.band_left.get()?;
-        Some(((x - left) / WAVE_W as f32).clamp(0., 1.) as f64)
+        let width = self.band_width.get()?;
+        Some(((x - left) / width).clamp(0., 1.) as f64)
     }
 
     /// A band drag that lets go: the seek lands wherever the pointer last was.
@@ -362,21 +370,22 @@ impl Render for AudioPlayer {
         // Pulled out first: `when`'s closure borrows the builder, not `self`.
         let stage_peaks = self.wave.peaks();
         let band_left = self.band_left.clone();
+        let band_width = self.band_width.clone();
         let accent = cx.theme().accent;
         let bounce = self.level;
         // Where the playhead sits on the strip — a pixel offset for the
         // accent line, a bucket index for the bounce window. A running drag
         // already wrote itself into `position_ms`, and the ticker holds off
         // while seeking, so the one number serves both.
-        let playhead_ratio = self
-            .band_left
-            .get()
+        let strip_width = self.band_width.get();
+        let playhead_ratio = strip_width
             .filter(|_| self.duration_ms > 0)
             .map(|_| {
                 (self.transport.position_ms / self.duration_ms as f64).clamp(0., 1.) as f32
             });
-        let playhead_left =
-            playhead_ratio.map(|ratio| (ratio * WAVE_W as f32 - PLAYHEAD_W / 2.).max(0.));
+        let playhead_left = playhead_ratio
+            .zip(strip_width)
+            .map(|(ratio, width)| (ratio * width - PLAYHEAD_W / 2.).max(0.));
         let playhead_bucket = playhead_ratio
             .map(|ratio| ratio * trove_core::media::waveform::PEAK_COUNT as f32);
         let controls = transport::row(
@@ -415,6 +424,7 @@ impl Render for AudioPlayer {
                     .min_h_0()
                     .items_center()
                     .justify_center()
+                    .px_6()
                     .when(self.wave.is_ready(), |stage| {
                         let Some(peaks) = stage_peaks else {
                             return stage;
@@ -422,8 +432,13 @@ impl Render for AudioPlayer {
                         stage.child(
                             div()
                                 .relative()
-                                .w(px(WAVE_W as f32))
-                                .h(px(WAVE_H as f32))
+                                // Sized by the stage, not a constant: the
+                                // strip spans the width it is given, up to
+                                // the cap past which the envelope reads as
+                                // mush.
+                                .w_full()
+                                .max_w(px(WAVE_MAX_W))
+                                .h(px(WAVE_H))
                                 .cursor_pointer()
                                 // The strip is a second timeline. Pointing at a
                                 // moment in the picture of the music is the
@@ -433,6 +448,7 @@ impl Render for AudioPlayer {
                                 // where the playhead is.
                                 .on_prepaint(move |bounds: Bounds<Pixels>, _, _| {
                                     band_left.set(Some(f32::from(bounds.origin.x)));
+                                    band_width.set(Some(f32::from(bounds.size.width)));
                                 })
                                 // The id comes after `on_prepaint` (the same
                                 // contract the preview stage follows), and it is
@@ -502,7 +518,7 @@ impl Render for AudioPlayer {
                                             .top_0()
                                             .left(px(left))
                                             .w(px(PLAYHEAD_W))
-                                            .h(px(WAVE_H as f32))
+                                            .h(px(WAVE_H))
                                             .bg(accent),
                                     )
                                 }),
