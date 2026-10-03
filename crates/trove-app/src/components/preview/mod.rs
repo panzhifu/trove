@@ -1318,10 +1318,12 @@ impl Render for AssetPreviewPanel {
             })
             .child(content);
 
-        let mut root = v_flex().size_full().overflow_hidden().child(stage);
+        let mut root = v_flex().size_full().overflow_hidden();
         if self.font_live {
+            // The control strip leads, the way every other preview keeps its
+            // tools at the top; the specimen takes the remaining space.
             root = root.child(font::controls_bar(cx.entity(), &self.data, window, cx));
         }
-        root
+        root.child(stage)
     }
 }

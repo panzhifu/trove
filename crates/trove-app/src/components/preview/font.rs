@@ -422,12 +422,13 @@ pub(super) fn specimen_scaled(
     )
 }
 
-/// The control strip under a live font specimen: the sample text (editable,
+/// The control strip above a live font specimen: the sample text (editable,
 /// stored per language), a reset for it, and the language picker. Built per
 /// render because the input re-syncs to the current language's text — the
-/// same contract the settings page's model field runs on. The data rides in
-/// as a reference on purpose: this runs inside the panel's own render, where
-/// the entity is already being updated and a `panel.read` would panic.
+/// same contract the settings page's model field runs on. The strip leads
+/// the preview like every other kind's tools; the data rides in as a
+/// reference on purpose: this runs inside the panel's own render, where the
+/// entity is already being updated and a `panel.read` would panic.
 pub(super) fn controls_bar(
     panel: Entity<super::AssetPreviewPanel>,
     data: &AssetPreviewData,
@@ -545,7 +546,9 @@ pub(super) fn controls_bar(
         .justify_center()
         .gap_2()
         .px_4()
-        .pb_2()
+        .py_2()
+        .border_b_1()
+        .border_color(cx.theme().border)
         .child(
             Input::new(&state.input)
                 .small()
