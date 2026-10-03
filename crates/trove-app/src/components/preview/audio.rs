@@ -63,7 +63,6 @@ pub(super) fn spawn_player(data: &AssetPreviewData, cx: &mut App) -> Option<Enti
 /// The live audio preview: the engine, the playhead it reports, and the
 /// controls that drive it.
 pub(super) struct AudioPlayer {
-    data: AssetPreviewData,
     engine: Entity<AudioEngine>,
     transport: Transport,
     duration_ms: u64,
@@ -132,7 +131,6 @@ impl AudioPlayer {
         .detach();
 
         let this = Self {
-            data: data.clone(),
             engine,
             transport,
             duration_ms,
@@ -350,8 +348,6 @@ impl Render for AudioPlayer {
                     .min_h_0()
                     .items_center()
                     .justify_center()
-                    .gap_3()
-                    .child(div().text_sm().text_center().child(self.data.name.clone()))
                     .when(self.wave.is_ready(), |stage| {
                         let image = match &stage_wave {
                             Some(image) => image.clone(),

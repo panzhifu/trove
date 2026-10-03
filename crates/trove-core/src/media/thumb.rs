@@ -70,9 +70,9 @@ pub fn ensure(root: &Path, sha: &str, kind: AssetKind, blob_path: &Path) -> Opti
         AssetKind::Video => write_video_thumb(blob_path, &out),
         AssetKind::Font => write_font_card(blob_path, &out),
         AssetKind::Model => write_model_card(blob_path, &out),
-        // An audio file draws its envelope waveform — from an envelope that
-        // is already cached, so the import hot path pays no ffmpeg pass.
-        // Neither is built here — see `write_audio_card`.
+        // An audio file draws its envelope waveform. Building the envelope
+        // costs one ffmpeg pass, and the card is the point of an audio
+        // thumbnail, so the import pays it — see `write_audio_card`.
         AssetKind::Audio => write_audio_card(root, sha, blob_path, &out),
         // A PDF is a Document the text arm must not catch (it is not text),
         // and its first page is worth a card whenever a rasterizer exists.
@@ -128,7 +128,9 @@ pub fn regenerate(root: &Path, sha: &str, kind: AssetKind, blob_path: &Path) -> 
         }
         AssetKind::Font => write_font_card(blob_path, &out),
         AssetKind::Model => write_model_card(blob_path, &out),
-        AssetKind::Audio => rebuild_audio_card(root, sha, blob_path, &out),
+        AssetKind::Audio => write_audio_card(root, sha, blob_path, &out),
+        // A PDF is a Document the text arm must not catch (it is not text),
+        // and its first page is worth a card whenever a rasterizer exists.
         _ if blob_ext(blob_path) == "pdf" => write_pdf_thumb(blob_path, &out),
         _ if crate::media::text::is_text_ext(&blob_ext(blob_path)) => {
             write_text_card(blob_path, &out)
@@ -916,12 +918,14 @@ fn card_lines(text: &str) -> Vec<String> {
 /// a file with no cached envelope keeps the kind icon it always had — until
 /// the envelope exists because the file was previewed, or until a thumbnail
 /// rebuild asks for it.
-fn write_audio_card(root: &Path, sha: &str, _blob_path: &Path, out: &Path) -> Option<PathBuf> {
-    write_wave_card(&waveform::cached(root, sha)?, out)
-}
-
-/// The same card for a rebuild that is allowed to decode the envelope first.
-fn rebuild_audio_card(root: &Path, sha: &str, blob_path: &Path, out: &Path) -> Option<PathBuf> {
+/// The audio card: the file's envelope waveform.
+///
+/// Building the envelope costs one ffmpeg pass, and the import pays it: the
+/// waveform is the audio thumbnail, and a card that only existed after a
+/// preview or a rebuild would leave most of the grid on the kind icon.
+/// `ensure` runs off the UI thread under the usual process slots, so the
+/// pass lands where the waits already live.
+fn write_audio_card(root: &Path, sha: &str, blob_path: &Path, out: &Path) -> Option<PathBuf> {
     write_wave_card(&waveform::load_or_build(root, sha, blob_path)?, out)
 }
 
@@ -1065,24 +1069,27 @@ mod tests {
         dir
     }
 
-    /// No embedded picture is the common case, not an error: the caller keeps
-    /// the kind icon. Junk that merely ends in `.mp3` must not panic either.
-    ///
-    /// The second assertion is the load-bearing one: `ensure` runs on the import
-    /// path, and a waveform card may not cost it an ffmpeg pass.
+    /// An audio file's card is its envelope, end to end on the import path:
+    /// `ensure` pays the one ffmpeg pass, the card is a waveform, and the
+    /// envelope it drew stays cached for the preview. Junk that merely ends
+    /// in `.mp3` must not panic — it stays no thumbnail.
     #[test]
-    fn audio_without_a_picture_has_no_thumbnail() {
+    fn an_audio_import_draws_the_waveform_card() {
         let dir = temp_dir_named("audiocover");
         let cache = dir.join("cache");
         let src = dir.join("plain.mp3");
         std::fs::write(&src, mp3_with_pictures(&[])).unwrap();
 
         let sha = "b".repeat(64);
-        assert!(ensure(&cache, &sha, AssetKind::Audio, &src).is_none());
-        assert!(
-            !waveform::abs_path(&cache, &sha).is_file(),
-            "the import path must not decode an envelope"
-        );
+        if ffmpeg_available() {
+            let out = ensure(&cache, &sha, AssetKind::Audio, &src).expect("a waveform card");
+            let card = image::open(&out).unwrap().to_rgb8();
+            assert_eq!(card.dimensions(), AUDIO_CARD_SIZE);
+            assert!(waveform::cached(&cache, &sha).is_some());
+        } else {
+            eprintln!("skipping the decode half: ffmpeg not on PATH");
+            assert!(ensure(&cache, &sha, AssetKind::Audio, &src).is_none());
+        }
 
         std::fs::write(&src, b"not an mp3 at all").unwrap();
         assert!(ensure(&cache, &"c".repeat(64), AssetKind::Audio, &src).is_none());
@@ -1123,11 +1130,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The claim behind a rebuilt thumbnail being a waveform card, end to end:
-    /// a real audio file with no picture and nothing cached. The import path
-    /// still refuses to pay for it; the rebuild does, and caches what it drew.
+    /// The same card through the rebuild door: a real audio file with
+    /// nothing cached, regenerated unconditionally — and the rebuild
+    /// reaches the same drawing without decoding anything a second time.
     #[test]
-    fn a_rebuild_draws_a_card_from_a_real_audio_file() {
+    fn a_rebuild_draws_the_same_waveform_card() {
         if !ffmpeg_available() {
             eprintln!("skipping: ffmpeg not on PATH");
             return;
@@ -1155,13 +1162,7 @@ mod tests {
 
         let sha = "1".repeat(64);
         let cache = dir.join("cache");
-        assert!(ensure(&cache, &sha, AssetKind::Audio, &audio).is_none());
-        assert!(
-            waveform::cached(&cache, &sha).is_none(),
-            "ensure must not have decoded anything"
-        );
-
-        let out = regenerate(&cache, &sha, AssetKind::Audio, &audio).expect("a decoded card");
+        let out = ensure(&cache, &sha, AssetKind::Audio, &audio).expect("a decoded card");
         let card = image::open(&out).unwrap().to_rgb8();
         assert_eq!(card.dimensions(), AUDIO_CARD_SIZE);
         // Measured across the card, not at one column: a 50 Hz tone sampled at
@@ -1174,6 +1175,9 @@ mod tests {
             waveform::cached(&cache, &sha).is_some(),
             "the envelope it paid for stays cached for the preview"
         );
+
+        let rebuilt = regenerate(&cache, &sha, AssetKind::Audio, &audio).expect("a waveform card");
+        assert_eq!(rebuilt, out);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
