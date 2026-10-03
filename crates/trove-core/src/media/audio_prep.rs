@@ -60,7 +60,7 @@ pub fn extract_chunks(
     // Long sources are cut on time boundaries; short ones are one chunk. An
     // unknown duration stays one chunk and leans on the endpoint's size error
     // to surface the pathological case.
-    let segmented = duration_ms.is_some_and(|ms| ms as u64 > CHUNK_SECONDS * 1000);
+    let segmented = duration_ms.is_some_and(|ms| ms > CHUNK_SECONDS * 1000);
     let pattern = dest_dir.join(format!("{CHUNK_PREFIX}-%03d.m4a"));
     let mut command = Command::new("ffmpeg");
     command.args(["-v", "error", "-y", "-i"]).arg(source).args([
@@ -128,7 +128,7 @@ pub fn probe_wav() -> Vec<u8> {
     wav.extend_from_slice(&1u16.to_le_bytes()); // PCM
     wav.extend_from_slice(&1u16.to_le_bytes()); // mono
     wav.extend_from_slice(&SAMPLE_RATE.to_le_bytes());
-    wav.extend_from_slice(&(SAMPLE_RATE as u32 * 2).to_le_bytes()); // byte rate
+    wav.extend_from_slice(&(SAMPLE_RATE * 2).to_le_bytes()); // byte rate
     wav.extend_from_slice(&2u16.to_le_bytes()); // block align
     wav.extend_from_slice(&16u16.to_le_bytes()); // bits per sample
     wav.extend_from_slice(b"data");
