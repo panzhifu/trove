@@ -920,33 +920,59 @@ fn card_lines(text: &str) -> Vec<String> {
 /// `cover` tries the tagged picture first and falls back to the waveform;
 /// `waveform` reverses the preference.
 fn write_audio_cover(root: &Path, sha: &str, blob_path: &Path, out: &Path) -> Option<PathBuf> {
-    match AppConfig::load().audio_card_style() {
-        AudioCardStyle::Cover => {
-            if let Some(cover) = embedded_cover(blob_path) {
-                return write_cover(&cover, out);
-            }
-            write_wave_card(&waveform::cached(root, sha)?, out)
-        }
-        AudioCardStyle::Waveform => {
-            if let Some(peaks) = waveform::cached(root, sha) {
-                return write_wave_card(&peaks, out);
-            }
-            embedded_cover(blob_path).and_then(|c| write_cover(&c, out))
-        }
-    }
+    audio_card(
+        AppConfig::load().audio_card_style(),
+        root,
+        sha,
+        blob_path,
+        out,
+        false,
+    )
 }
 
 /// The same card for a rebuild that is allowed to decode the envelope first.
 fn rebuild_audio_cover(root: &Path, sha: &str, blob_path: &Path, out: &Path) -> Option<PathBuf> {
-    match AppConfig::load().audio_card_style() {
+    audio_card(
+        AppConfig::load().audio_card_style(),
+        root,
+        sha,
+        blob_path,
+        out,
+        true,
+    )
+}
+
+/// One audio card, ordered by `style` — cover-first or waveform-first —
+/// with the envelope source decided by `rebuild`: the import path only
+/// draws from an envelope that is already cached, the rebuild may pay one
+/// ffmpeg pass to decode one. The style lives in the user's config, which
+/// is why the tests call this directly with a pinned style: a test that
+/// read the running machine's preference would pass on one machine and
+/// fail on another.
+fn audio_card(
+    style: AudioCardStyle,
+    root: &Path,
+    sha: &str,
+    blob_path: &Path,
+    out: &Path,
+    rebuild: bool,
+) -> Option<PathBuf> {
+    let cached_envelope = |root: &Path, sha: &str| -> Option<Vec<u8>> {
+        if rebuild {
+            waveform::load_or_build(root, sha, blob_path)
+        } else {
+            waveform::cached(root, sha)
+        }
+    };
+    match style {
         AudioCardStyle::Cover => {
             if let Some(cover) = embedded_cover(blob_path) {
                 return write_cover(&cover, out);
             }
-            write_wave_card(&waveform::load_or_build(root, sha, blob_path)?, out)
+            write_wave_card(&cached_envelope(root, sha)?, out)
         }
         AudioCardStyle::Waveform => {
-            if let Some(peaks) = waveform::load_or_build(root, sha, blob_path) {
+            if let Some(peaks) = cached_envelope(root, sha) {
                 return write_wave_card(&peaks, out);
             }
             embedded_cover(blob_path).and_then(|c| write_cover(&c, out))
@@ -1306,6 +1332,10 @@ mod tests {
     }
 
     /// A picture beats a waveform: the art is the thing the label came with.
+    ///
+    /// The style is pinned to the default (`Cover`) rather than read from
+    /// the running machine's config — a preference flipped in the app would
+    /// otherwise turn this into a test of the user's taste.
     #[test]
     fn a_cover_still_wins_over_a_cached_envelope() {
         let dir = temp_dir_named("audiopriority");
@@ -1320,7 +1350,8 @@ mod tests {
         let sha = "f".repeat(64);
         let solid = vec![255u8; waveform::PEAK_COUNT];
         waveform::store(&cache, &sha, &solid);
-        let out = ensure(&cache, &sha, AssetKind::Audio, &src).expect("the cover");
+        let out = abs_path(&cache, &sha);
+        audio_card(AudioCardStyle::Cover, &cache, &sha, &src, &out, false).expect("the cover");
         let card = image::open(out).unwrap().to_rgb8();
         let px = *card.get_pixel(2, 2);
         assert!(

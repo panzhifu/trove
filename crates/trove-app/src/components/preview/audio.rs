@@ -337,83 +337,106 @@ impl Render for AudioPlayer {
         );
         v_flex()
             .size_full()
-            .items_center()
-            .justify_center()
-            .gap_3()
-            // The artwork is the thumbnail the import pipeline wrote from the
-            // file's own embedded cover; with none, this is the kind icon.
-            .child(video::cover(&self.data, cx))
-            .child(div().text_sm().text_center().child(self.data.name.clone()))
-            .when(self.wave.is_ready(), |stage| {
-                let image = match &stage_wave {
-                    Some(image) => image.clone(),
-                    None => return stage,
-                };
-                stage.child(
-                    div()
-                        .relative()
-                        .w(px(WAVE_W as f32))
-                        .h(px(WAVE_H as f32))
-                        .cursor_pointer()
-                        // The strip is a second timeline. Pointing at a moment
-                        // in the picture of the music is the obvious gesture, so
-                        // it gets the same drag-then-commit as the thumb below
-                        // it — one `scrub_to`, so the two cannot disagree about
-                        // where the playhead is.
-                        .on_prepaint(move |bounds: Bounds<Pixels>, _, _| {
-                            band_left.set(Some(f32::from(bounds.origin.x)));
-                        })
-                        // The id comes after `on_prepaint` (the same contract
-                        // the preview stage follows), and it is what carries the
-                        // move/up stream while the pointer wanders off the
-                        // strip's edge mid-drag.
-                        .id("wave-band")
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(|this, event: &MouseDownEvent, _, cx| {
-                                let Some(ratio) = this.band_ratio(f32::from(event.position.x))
-                                else {
-                                    return;
-                                };
-                                this.band_dragging.set(true);
-                                this.scrub_to(ratio * this.duration_ms as f64, false, cx);
-                            }),
+            // The artwork and its strip take the stage; the transport rides
+            // the bottom edge as its own surface, drawn the way the video
+            // chrome_bar draws it — full width, popover colour, no separator
+            // — so both players read as one control. The bar never covers
+            // moving content here, so it stays put rather than borrowing the
+            // video's auto-hide.
+            .child(
+                v_flex()
+                    .flex_1()
+                    .min_h_0()
+                    .items_center()
+                    .justify_center()
+                    .gap_3()
+                    // The artwork is the thumbnail the import pipeline wrote
+                    // from the file's own embedded cover; with none, this is
+                    // the kind icon.
+                    .child(video::cover(&self.data, cx))
+                    .child(div().text_sm().text_center().child(self.data.name.clone()))
+                    .when(self.wave.is_ready(), |stage| {
+                        let image = match &stage_wave {
+                            Some(image) => image.clone(),
+                            None => return stage,
+                        };
+                        stage.child(
+                            div()
+                                .relative()
+                                .w(px(WAVE_W as f32))
+                                .h(px(WAVE_H as f32))
+                                .cursor_pointer()
+                                // The strip is a second timeline. Pointing at a
+                                // moment in the picture of the music is the
+                                // obvious gesture, so it gets the same
+                                // drag-then-commit as the thumb below it — one
+                                // `scrub_to`, so the two cannot disagree about
+                                // where the playhead is.
+                                .on_prepaint(move |bounds: Bounds<Pixels>, _, _| {
+                                    band_left.set(Some(f32::from(bounds.origin.x)));
+                                })
+                                // The id comes after `on_prepaint` (the same
+                                // contract the preview stage follows), and it is
+                                // what carries the move/up stream while the
+                                // pointer wanders off the strip's edge mid-drag.
+                                .id("wave-band")
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                                        let Some(ratio) =
+                                            this.band_ratio(f32::from(event.position.x))
+                                        else {
+                                            return;
+                                        };
+                                        this.band_dragging.set(true);
+                                        this.scrub_to(ratio * this.duration_ms as f64, false, cx);
+                                    }),
+                                )
+                                .on_mouse_move(cx.listener(
+                                    |this, event: &MouseMoveEvent, _, cx| {
+                                        if !this.band_dragging.get() {
+                                            return;
+                                        }
+                                        let Some(ratio) =
+                                            this.band_ratio(f32::from(event.position.x))
+                                        else {
+                                            return;
+                                        };
+                                        this.scrub_to(ratio * this.duration_ms as f64, false, cx);
+                                    },
+                                ))
+                                // Both the plain and the escaped release land
+                                // here: a drag that runs off the end of the
+                                // strip still means "go to the last position I
+                                // saw".
+                                .on_mouse_up(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _: &MouseUpEvent, _, cx| {
+                                        this.end_band_drag(cx)
+                                    }),
+                                )
+                                .on_mouse_up_out(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _: &MouseUpEvent, _, cx| {
+                                        this.end_band_drag(cx)
+                                    }),
+                                )
+                                .child(img(ImageSource::Render(image)).size_full())
+                                .when_some(playhead_left, |band, left| {
+                                    band.child(
+                                        div()
+                                            .absolute()
+                                            .top_0()
+                                            .left(px(left))
+                                            .w(px(PLAYHEAD_W))
+                                            .h(px(WAVE_H as f32))
+                                            .bg(accent),
+                                    )
+                                }),
                         )
-                        .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
-                            if !this.band_dragging.get() {
-                                return;
-                            }
-                            let Some(ratio) = this.band_ratio(f32::from(event.position.x)) else {
-                                return;
-                            };
-                            this.scrub_to(ratio * this.duration_ms as f64, false, cx);
-                        }))
-                        // Both the plain and the escaped release land here: a
-                        // drag that runs off the end of the strip still means
-                        // "go to the last position I saw".
-                        .on_mouse_up(
-                            MouseButton::Left,
-                            cx.listener(|this, _: &MouseUpEvent, _, cx| this.end_band_drag(cx)),
-                        )
-                        .on_mouse_up_out(
-                            MouseButton::Left,
-                            cx.listener(|this, _: &MouseUpEvent, _, cx| this.end_band_drag(cx)),
-                        )
-                        .child(img(ImageSource::Render(image)).size_full())
-                        .when_some(playhead_left, |band, left| {
-                            band.child(
-                                div()
-                                    .absolute()
-                                    .top_0()
-                                    .left(px(left))
-                                    .w(px(PLAYHEAD_W))
-                                    .h(px(WAVE_H as f32))
-                                    .bg(accent),
-                            )
-                        }),
-                )
-            })
-            .child(div().w(px(420.)).child(controls))
+                    }),
+            )
+            .child(div().px_3().py_2().bg(cx.theme().popover).child(controls))
             .into_any_element()
     }
 }
