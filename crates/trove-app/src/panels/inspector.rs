@@ -4,7 +4,9 @@
 //! text fields commit on Enter or when the field loses focus, kind and
 //! rating commit immediately on click. `editing_id` guards the refills so
 //! switching assets repopulates the inputs exactly once and typing is never
-//! interrupted by a render.
+//! interrupted by a render. Background writers (the AI analysis, an undo)
+//! land between renders; [`Self::refill_background_writes`] folds their
+//! values in, but only where the user has not started typing.
 
 use gpui_kit::base::{h_flex, v_flex};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
@@ -15,7 +17,7 @@ use gpui_kit::component::{ActiveTheme, Icon, IconName, Sizable};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
-use trove_core::model::{AssetKind, AssetPatch, Rating, UsageStatus};
+use trove_core::model::{Asset, AssetKind, AssetPatch, Rating, UsageStatus};
 use uuid::Uuid;
 
 use crate::components::preview::{AssetPreviewData, PreviewContext};
@@ -45,6 +47,11 @@ pub struct InspectorPanel {
     /// The asset the edit inputs currently hold. Refills happen only when
     /// the selection changes.
     editing_id: Option<Uuid>,
+    /// What each edit box last held when *the panel* put text there — a
+    /// selection change or a background-write refill — or the user committed
+    /// one. An input still holding this value carries no uncommitted typing,
+    /// which is what makes folding a background write in safe.
+    synced: [String; 3],
     /// Section ids the user collapsed (absent = expanded). Persisted on the
     /// panel so collapse state survives re-renders and asset switches.
     collapsed: std::collections::HashSet<&'static str>,
@@ -79,6 +86,7 @@ impl InspectorPanel {
             description_input,
             source_input,
             editing_id: None,
+            synced: [String::new(), String::new(), String::new()],
             collapsed: std::collections::HashSet::new(),
         };
         observe_controller(cx, &this.controller);
@@ -216,6 +224,12 @@ impl InspectorPanel {
         };
         let value: String = input.read(cx).value().trim().to_string();
         let controller = self.controller.clone();
+        // Set when the call leaves the store agreeing with the input — a
+        // real commit, or a no-op because they already matched. Both
+        // re-anchor the background-write watch on the typed text. A failed
+        // commit leaves the watch alone: the input then holds text the
+        // store never took, and nothing there is safe to clobber.
+        let mut settled = false;
         controller.update(cx, |ctl, cx| {
             let Some(asset) = ctl.library.asset(asset_id).ok().flatten() else {
                 return;
@@ -227,6 +241,7 @@ impl InspectorPanel {
             };
             let stored = (!value.is_empty()).then_some(value.clone());
             if original == stored {
+                settled = true;
                 return;
             }
             let patch = match field {
@@ -261,7 +276,31 @@ impl InspectorPanel {
             // refreshes the grid and any search-driven views.
             ctl.generation += 1;
             cx.notify();
+            settled = true;
         });
+        if settled {
+            self.synced[field as usize] = value;
+        }
+    }
+
+    /// What each edit box should show for `asset`: the stored text, with the
+    /// title falling back to the file name without the extension — the
+    /// suffix is not part of the editable name.
+    fn display_values(asset: &Asset) -> [(TextField, String); 3] {
+        [
+            (
+                TextField::Title,
+                asset.title.clone().unwrap_or_else(|| asset.file_stem()),
+            ),
+            (
+                TextField::Description,
+                asset.description.clone().unwrap_or_default(),
+            ),
+            (
+                TextField::SourceUrl,
+                asset.source_url.clone().unwrap_or_default(),
+            ),
+        ]
     }
 
     /// Sync the edit inputs with the asset about to be displayed. Only runs
@@ -270,30 +309,56 @@ impl InspectorPanel {
         if self.editing_id == Some(asset_id) {
             return;
         }
-        let (title, description, source) = self
-            .controller
-            .read(cx)
-            .library
-            .asset(asset_id)
-            .ok()
-            .flatten()
-            .map(|a| {
-                (
-                    // The title edit box shows the file name without the
-                    // extension — the suffix is not part of the editable name.
-                    a.title.clone().unwrap_or_else(|| a.file_stem()),
-                    a.description.unwrap_or_default(),
-                    a.source_url.unwrap_or_default(),
-                )
-            })
-            .unwrap_or_default();
+        let values = match self.controller.read(cx).library.asset(asset_id).ok().flatten() {
+            Some(asset) => Self::display_values(&asset),
+            None => [
+                (TextField::Title, String::new()),
+                (TextField::Description, String::new()),
+                (TextField::SourceUrl, String::new()),
+            ],
+        };
         self.editing_id = Some(asset_id);
-        for (input, value) in [
-            (&self.title_input, title),
-            (&self.description_input, description),
-            (&self.source_input, source),
-        ] {
-            input.update(cx, |state, cx| state.set_value(value, window, cx));
+        for (field, value) in values {
+            let input = match field {
+                TextField::Title => &self.title_input,
+                TextField::Description => &self.description_input,
+                TextField::SourceUrl => &self.source_input,
+            };
+            input.update(cx, |state, cx| state.set_value(value.clone(), window, cx));
+            self.synced[field as usize] = value;
+        }
+    }
+
+    /// Fold background writes into the edit boxes. The AI analysis (and any
+    /// other job patching an asset) writes through its own connection
+    /// between renders; this runs every render and picks those values up —
+    /// but only for an input still holding exactly what this panel last put
+    /// there. Text typed and not yet committed is the user's until Enter or
+    /// blur commits it, which re-anchors the watch. One visible consequence:
+    /// clearing the title immediately shows the file stem, the same thing a
+    /// re-selection would show.
+    fn refill_background_writes(
+        &mut self,
+        asset: &Asset,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        for (field, value) in Self::display_values(asset) {
+            let slot = field as usize;
+            let current = match field {
+                TextField::Title => self.title_input.read(cx).value().to_string(),
+                TextField::Description => self.description_input.read(cx).value().to_string(),
+                TextField::SourceUrl => self.source_input.read(cx).value().to_string(),
+            };
+            if let Some(fresh) = refill_target(&current, &self.synced[slot], &value) {
+                let input = match field {
+                    TextField::Title => &self.title_input,
+                    TextField::Description => &self.description_input,
+                    TextField::SourceUrl => &self.source_input,
+                };
+                input.update(cx, |state, cx| state.set_value(fresh.clone(), window, cx));
+                self.synced[slot] = fresh;
+            }
         }
     }
 }
@@ -427,6 +492,9 @@ impl Render for InspectorPanel {
 
         // Re-populate the edit inputs when the selection changed.
         self.sync_editors(asset_id, window, cx);
+        // Background writers (the AI analysis, an undo) land between renders;
+        // fold their values in wherever the user has not started typing.
+        self.refill_background_writes(&asset, window, cx);
 
         // Preview element from the shared asset-preview component, in its
         // compact inspector variant: videos show their cover thumbnail,
@@ -1261,6 +1329,18 @@ fn gps_line(photo: &trove_core::model::PhotoFacts) -> Option<String> {
     Some(format!("{lat:.4}, {lng:.4}"))
 }
 
+/// The background-write refill decision, pure so it can be tested without a
+/// window: refill only when the input still shows exactly what the panel
+/// last put there (`synced`) *and* the store's display value has moved away
+/// from it. Anything else — typing under way, nothing new in the store —
+/// keeps the input as it is.
+fn refill_target(current: &str, synced: &str, display: &str) -> Option<String> {
+    if current != synced || display == synced {
+        return None;
+    }
+    Some(display.to_string())
+}
+
 /// The OpenType `usWidthClass` names, 1–9. Left in English on purpose:
 /// these are the spec's own terms, the same words every font editor shows.
 fn width_class_name(width: u16) -> &'static str {
@@ -1355,7 +1435,7 @@ fn prompt_relink(controller: &Entity<LibraryController>, asset_id: Uuid, cx: &mu
 
 #[cfg(test)]
 mod tests {
-    use super::{audio_format_line, camera_line, exposure_line, gps_line};
+    use super::{audio_format_line, camera_line, exposure_line, gps_line, refill_target};
     use trove_core::model::{AudioFacts, PhotoFacts};
 
     /// The row is assembled from whatever exists — and a file with nothing
@@ -1457,5 +1537,27 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(gps_line(&half), None);
+    }
+
+    /// The whole background-write feature is this one decision: refill when
+    /// the input still shows exactly what the panel last put there *and*
+    /// the store's display value has moved away from it.
+    #[test]
+    fn refill_fires_only_when_pristine_and_the_store_moved() {
+        // The report that opened this: the box sits pristine-empty while the
+        // analysis writes a description behind the panel's back.
+        assert_eq!(
+            refill_target("", "", "AI 写的描述").as_deref(),
+            Some("AI 写的描述")
+        );
+        // Typing under way is never clobbered.
+        assert_eq!(refill_target("我自己写的…", "", "AI 写的描述"), None);
+        // Nothing new in the store is a no-op.
+        assert_eq!(refill_target("same", "same", "same"), None);
+        // A second background write lands on top of a previous refill.
+        assert_eq!(refill_target("first", "first", "second").as_deref(), Some("second"));
+        // A user commit re-anchors the watch, so their own text is not
+        // "moved away from" on the next render.
+        assert_eq!(refill_target("mine", "mine", "mine"), None);
     }
 }
