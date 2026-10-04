@@ -782,14 +782,22 @@ impl Render for WorkspacePanel {
                 ctl.visual_results.as_ref().map(|r| r.ids.clone()),
                 ctl.visual_results.as_ref().map(|r| r.label.clone()),
                 // Whether the listing carries an async refinement — the
-                // query vector and/or the AI plan fused into the ranking.
-                // Their arrival re-ranks the listing under a key the layout
-                // otherwise cannot see, so it rides along here: without it
-                // the refined order either never renders (same hit count)
-                // or refills the rows in place (different count), leaving
-                // the viewport parked mid-listing when it lands — the
-                // "search jumps to the middle" report.
-                ctl.query_vector.is_some() || ctl.ai_plan.is_some(),
+                // query vector and/or the AI plan fused into the ranking —
+                // *and that refinement belongs to the term on screen*. A
+                // vector held over from the previous term must not read as
+                // a refinement of this one: the bool then never flips when
+                // the real vector lands, the refined pass falls through to
+                // the offset-preserving relayout, and the viewport clamps
+                // to the bottom of the re-ranked listing — the "search
+                // jumps to the bottom" report. (Their arrival re-ranks the
+                // listing under a key the layout otherwise cannot see, so
+                // it rides along here: without it the refined order either
+                // never renders (same hit count) or refills the rows in
+                // place (different count).)
+                ctl.query_vector
+                    .as_ref()
+                    .is_some_and(|vector| vector.text == ctl.search_text.trim())
+                    || ctl.ai_plan.is_some(),
             )
         };
         let library_root = self.controller.read(cx).library.root().to_path_buf();

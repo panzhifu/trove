@@ -39,9 +39,7 @@ pub fn embedding_provider(
     config: &crate::config::EmbeddingConfig,
 ) -> Result<std::sync::Arc<dyn EmbeddingProvider>> {
     match config.engine {
-        EmbeddingEngine::Local => {
-            Ok(std::sync::Arc::new(embed_local::build(config.local_model_id())?))
-        }
+        EmbeddingEngine::Local => Ok(embed_local::build_cached(config.local_model_id())?),
         EmbeddingEngine::Cloud => Ok(std::sync::Arc::new(OpenAICompatible::new(config)?)),
     }
 }

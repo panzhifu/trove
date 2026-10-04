@@ -21,7 +21,7 @@
 //! fingerprints embed fine under the Chinese checkpoint, and `bge-m3` embeds
 //! both at full strength.
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use candle_core::{DType, D, IndexOp as _, Tensor};
 use candle_nn::VarBuilder;
@@ -33,6 +33,28 @@ use super::EmbeddingProvider;
 use crate::config::local_embedding_identity;
 use crate::error::{Error, Result};
 use crate::model::EmbeddingSpace;
+
+/// The process-wide cache of the one local embedder the settings point at.
+/// Building a provider reads and parses the weights (a 2.27 GB torch pickle
+/// for `bge-m3`) and uploads them to the device — seconds of work that a
+/// search must not pay per query. Keyed by model id: a re-pick in the
+/// settings replaces the entry, and the old weights drop with it.
+static CACHE: OnceLock<Mutex<Option<(String, Arc<LocalBert>)>>> = OnceLock::new();
+
+/// Build the local provider for `model`, reusing the cached instance when the
+/// settings still point at the same checkpoint. See [`CACHE`].
+pub fn build_cached(model: &str) -> Result<Arc<LocalBert>> {
+    let cache = CACHE.get_or_init(|| Mutex::new(None));
+    let mut cached = cache.lock().unwrap();
+    if let Some((cached_id, provider)) = cached.as_ref() {
+        if cached_id == model {
+            return Ok(provider.clone());
+        }
+    }
+    let provider = Arc::new(build(model)?);
+    *cached = Some((model.to_string(), provider.clone()));
+    Ok(provider)
+}
 
 /// Texts per forward pass. The cloud client batches at 64, but a local BERT
 /// holds the whole batch's activations in memory; 16 keeps a CPU run at a
