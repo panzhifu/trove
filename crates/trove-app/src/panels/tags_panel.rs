@@ -307,6 +307,7 @@ impl TagsPanel {
         let color = row.color.clone();
         let name = row.name.clone();
         let name_for_menu = name.clone();
+        let color_for_menu = color.clone();
         let controller = self.controller.clone();
 
         let mut el = div()
@@ -408,6 +409,7 @@ impl TagsPanel {
                 &controller,
                 id,
                 name_for_menu.clone(),
+                color_for_menu.clone(),
                 has_children,
             )
         })
@@ -604,6 +606,7 @@ fn tag_context_menu(
     controller: &Entity<LibraryController>,
     tag_id: Uuid,
     tag_name: String,
+    tag_color: Option<String>,
     has_children: bool,
 ) -> PopupMenu {
     let ctl_filter = controller.clone();
@@ -645,35 +648,60 @@ fn tag_context_menu(
             ),
         );
 
-    // Color submenu: a preset palette plus "no color".
+    // Color submenu: one row per preset — a swatch of the colour itself plus
+    // its name, because a menu of bare colour chips (or, worse, the hex
+    // strings this menu used to show) asks the user to match a hue they
+    // cannot name. The tag's current colour carries a check.
     let color_menu = PopupMenu::build(window, cx, move |menu, _window, _cx| {
-        let mut menu = menu.min_w(px(130.));
-        for hex in TAG_COLORS {
+        // The stored colour and the preset go through the same parser, so a
+        // `#`-ful stored hex still matches its preset row.
+        let current = tag_color.as_deref().and_then(hex_to_rgb);
+        let mut menu = menu.min_w(px(150.));
+        for (hex, label) in [
+            ("#ef4444", rust_i18n::t!("tags.color_red").to_string()),
+            ("#f97316", rust_i18n::t!("tags.color_orange").to_string()),
+            ("#eab308", rust_i18n::t!("tags.color_yellow").to_string()),
+            ("#22c55e", rust_i18n::t!("tags.color_green").to_string()),
+            ("#06b6d4", rust_i18n::t!("tags.color_cyan").to_string()),
+            ("#3b82f6", rust_i18n::t!("tags.color_blue").to_string()),
+            ("#a855f7", rust_i18n::t!("tags.color_purple").to_string()),
+            ("#ec4899", rust_i18n::t!("tags.color_pink").to_string()),
+        ] {
             let ctl = ctl_color.clone();
-            let label = hex.to_string();
             let value = hex.to_string();
-            menu = menu.item(PopupMenuItem::new(label).on_click(move |_, _, cx| {
-                let value = value.clone();
-                ctl.update(cx, move |ctl, cx| {
-                    let outcome = ctl.library.set_tag_color(tag_id, Some(&value));
-                    ctl.report_failed("tag colour", outcome);
-                    ctl.generation += 1;
-                    cx.notify();
-                });
-            }));
+            let swatch = rgb(hex_to_rgb(hex).unwrap_or(0));
+            let checked = current == hex_to_rgb(hex);
+            menu = menu.item(
+                PopupMenuItem::element(move |_, _| {
+                    h_flex()
+                        .gap_2()
+                        .child(div().size_3().rounded_full().bg(swatch))
+                        .child(label.clone())
+                })
+                .checked(checked)
+                .on_click(move |_, _, cx| {
+                    let value = value.clone();
+                    ctl.update(cx, move |ctl, cx| {
+                        let outcome = ctl.library.set_tag_color(tag_id, Some(&value));
+                        ctl.report_failed("tag colour", outcome);
+                        ctl.generation += 1;
+                        cx.notify();
+                    });
+                }),
+            );
         }
         let ctl_clear = ctl_color.clone();
         menu.item(
-            PopupMenuItem::new(rust_i18n::t!("tags.no_color").to_string()).on_click(
-                move |_, _, cx| {
+            PopupMenuItem::new(rust_i18n::t!("tags.no_color").to_string())
+                .checked(current.is_none())
+                .on_click(move |_, _, cx| {
                     ctl_clear.update(cx, move |ctl, cx| {
                         let outcome = ctl.library.set_tag_color(tag_id, None);
                         ctl.report_failed("tag colour cleared", outcome);
                         ctl.generation += 1;
                         cx.notify();
                     });
-                },
-            ),
+                }),
         )
     });
 
@@ -725,11 +753,6 @@ fn tag_context_menu(
     );
     m
 }
-
-/// Preset tag colors (hex, no `#` — `set_color` normalizes).
-const TAG_COLORS: [&str; 8] = [
-    "#ef4444", "#f97316", "#eab308", "#22c55e", "#06b6d4", "#3b82f6", "#a855f7", "#ec4899",
-];
 
 /// Rename a tag via a small modal dialog (renaming is a different act from
 /// the inline add the "+" and "New child tag" use).
