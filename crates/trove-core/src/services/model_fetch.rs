@@ -39,6 +39,11 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 /// multi-GB checkpoint is routine, and one retry is often all it takes.
 pub(crate) const FETCH_ATTEMPTS: usize = 3;
 
+/// Hard ceiling on one response body. A runaway server must not write the
+/// disk forever (the global timeout is the other guard), but it has to sit
+/// comfortably above the largest catalog checkpoint.
+const MAX_RESPONSE_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+
 /// Stream one model file to `dest` through the mirrors, returning the bytes
 /// written. `report` is called per chunk with the newly received bytes.
 pub(crate) fn fetch_file(
@@ -92,10 +97,12 @@ fn fetch_file_from(
             message: format!("HTTP {status} for {url}"),
         });
     }
-    let mut reader = response
-        .into_body()
-        .into_reader()
-        .take(2 * 1024 * 1024 * 1024);
+    // Bounds a runaway response, nothing more — and it must sit well above
+    // the largest real checkpoint: the cap used to be 2 GiB, and bge-m3's
+    // 2.11 GiB `pytorch_model.bin` silently died at exactly that offset (the
+    // truncated stream reads as a clean EOF, the size check below the caller
+    // rejects it, and the download can never succeed).
+    let mut reader = response.into_body().into_reader().take(MAX_RESPONSE_BYTES);
     let mut out = fs::File::create(dest)?;
     let mut buf = [0u8; 64 * 1024];
     let mut written: u64 = 0;

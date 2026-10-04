@@ -183,6 +183,7 @@ pub fn download(model: &str, cancel: &AtomicBool, progress: &dyn Fn(u64, u64)) -
     let entry = resolve(model);
     let dir = crate::paths::data_dir().join("models").join(entry.id);
     fs::create_dir_all(&dir)?;
+    tracing::info!(model = entry.id, dir = %dir.display(), "model download: starting");
 
     let sources = entry.files().map(|file| (entry.repo, file));
     // The weights dominate the transfer; the small files barely register,
@@ -218,10 +219,13 @@ pub fn download(model: &str, cancel: &AtomicBool, progress: &dyn Fn(u64, u64)) -
         let partial = dir.join(format!("{file}.part"));
         // The redirected CDN stalls and resets mid-stream on constrained
         // networks, so one pull is not a promise — each file gets a few
-        // attempts before the download gives up. An attempt restarts the
-        // file (the `.part` is truncated), and the progress bar rewinds
-        // with it: `received` only counts what the wire actually delivered
-        // for the *winning* attempt.
+        // attempts before the download gives up. A stream that ends short
+        // of (or past) the advertised size is a failed attempt too, not a
+        // success: the CDN truncates cleanly sometimes, and a silent size
+        // mismatch here used to kill the whole download without a single
+        // log line. An attempt restarts the file (the `.part` is
+        // truncated), and the progress bar rewinds with it: `received`
+        // only counts what the wire delivered for the winning attempt.
         let mut written = 0u64;
         for attempt in 1..=FETCH_ATTEMPTS {
             let mut attempt_received: u64 = 0;
@@ -229,29 +233,31 @@ pub fn download(model: &str, cancel: &AtomicBool, progress: &dyn Fn(u64, u64)) -
                 attempt_received += delta;
                 progress(received + attempt_received, total);
             });
-            match result {
+            let outcome = result.and_then(|bytes| match size {
+                Some(expected) if bytes != expected => Err(Error::External {
+                    program: "embed-model".into(),
+                    message: format!("{file} downloaded {bytes} bytes, expected {expected}"),
+                }),
+                _ => Ok(bytes),
+            });
+            match outcome {
                 Ok(bytes) => {
                     written = bytes;
                     break;
                 }
                 Err(error) if cancel.load(Ordering::Relaxed) => return Err(error),
-                Err(error) if attempt == FETCH_ATTEMPTS => return Err(error),
                 Err(error) => {
+                    let _ = fs::remove_file(&partial);
+                    if attempt == FETCH_ATTEMPTS {
+                        return Err(error);
+                    }
                     tracing::warn!(file, attempt, %error, "model fetch: attempt failed, retrying");
                     std::thread::sleep(std::time::Duration::from_secs(2 * attempt as u64));
                 }
             }
         }
         received += written;
-        if let Some(size) = size
-            && written != size
-        {
-            let _ = fs::remove_file(&partial);
-            return Err(Error::External {
-                program: "embed-model".into(),
-                message: format!("{file} downloaded {written} bytes, expected {size}"),
-            });
-        }
+        progress(received, total);
         fs::rename(&partial, &dest)?;
     }
     match usable(&dir, entry) {
