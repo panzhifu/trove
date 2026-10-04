@@ -124,6 +124,7 @@ fn probe_request() -> trove_core::ai::analysis::AiAnalysisRequest {
         media_type: MediaType::Other,
         thumbnail_jpeg: None,
         contact_sheet_jpeg: None,
+        transcript: None,
         language: "en".into(),
         enabled_fields: AiAnalysisFields {
             description: true,

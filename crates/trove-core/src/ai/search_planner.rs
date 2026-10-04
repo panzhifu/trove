@@ -346,6 +346,7 @@ pub fn plan(
                 media_type: crate::ai::analysis::MediaType::Other,
                 thumbnail_jpeg: None,
                 contact_sheet_jpeg: None,
+                transcript: None,
                 language: "en".into(),
                 enabled_fields: crate::ai::analysis::AiAnalysisFields::default(),
                 existing_tag_names: vec![],

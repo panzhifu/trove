@@ -275,13 +275,16 @@ pub fn run(
             continue;
         }
 
-        let request = build_request(&asset, options, &existing, &vocabulary);
-        let thumbnail = options
-            .send_images
+        // Audio never gets an image attached: its thumbnail is a synthetic
+        // waveform card, and a vision model shown it describes the drawing —
+        // "black-and-white audio waveform" — instead of the recording. The
+        // transcript in the request is the content; the card is not.
+        let wants_images = options.send_images && asset.kind != AssetKind::Audio;
+        let request = build_request(&conn, &asset, options, &existing, &vocabulary);
+        let thumbnail = wants_images
             .then(|| thumbnail_path(options, &asset))
             .flatten();
-        let contact_sheet = options
-            .send_images
+        let contact_sheet = wants_images
             .then(|| contact_sheet(options, &asset))
             .flatten();
         work.push(Prepared {
@@ -552,11 +555,32 @@ fn is_request_rejection(error: &VendorError) -> bool {
 
 /// The request one asset's analysis is built from.
 fn build_request(
+    conn: &Connection,
     asset: &Asset,
     options: &AiAnalysisOptions,
     existing: &[String],
     vocabulary: &[String],
 ) -> AiAnalysisRequest {
+    // The transcript is read on demand and only for audio: it is the one
+    // kind whose content cannot reach a vision model as a picture, so its
+    // speech-to-text output rides along as the content. A read failure must
+    // not sink the run — the analysis proceeds from name and metadata, the
+    // shape every audio asset had before transcripts existed.
+    let transcript = if asset.kind == AssetKind::Audio {
+        match assets::transcript(conn, asset.id) {
+            Ok(transcript) => transcript,
+            Err(error) => {
+                tracing::warn!(
+                    asset = %asset.file_name,
+                    error = %error,
+                    "analysis: could not read the transcript; analysing from metadata"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
     AiAnalysisRequest {
         asset_id: asset.id,
         display_name: asset
@@ -569,6 +593,7 @@ fn build_request(
         media_type: media_type_of(asset.kind),
         thumbnail_jpeg: None,
         contact_sheet_jpeg: None,
+        transcript,
         language: options.language.clone(),
         enabled_fields: options.fields,
         metadata_lines: analysis::asset_metadata_lines(asset),
@@ -582,6 +607,7 @@ fn media_type_of(kind: AssetKind) -> MediaType {
     match kind {
         AssetKind::Image => MediaType::Image,
         AssetKind::Video => MediaType::Video,
+        AssetKind::Audio => MediaType::Audio,
         AssetKind::Model => MediaType::Model3D,
         _ => MediaType::Other,
     }
@@ -906,6 +932,10 @@ mod tests {
         response: String,
         requests: std::sync::atomic::AtomicUsize,
         images_sent: std::sync::atomic::AtomicUsize,
+        /// The last request seen, for tests that assert on what the task
+        /// actually sent — the audio path's text-only shape, the transcript
+        /// riding along — rather than on what came back.
+        last: std::sync::Mutex<Option<AiAnalysisRequest>>,
     }
 
     impl MockAdapter {
@@ -914,6 +944,7 @@ mod tests {
                 response: response.into(),
                 requests: std::sync::atomic::AtomicUsize::new(0),
                 images_sent: std::sync::atomic::AtomicUsize::new(0),
+                last: std::sync::Mutex::new(None),
             }
         }
 
@@ -923,6 +954,10 @@ mod tests {
 
         fn images_sent(&self) -> usize {
             self.images_sent.load(Ordering::Relaxed)
+        }
+
+        fn last_request(&self) -> Option<AiAnalysisRequest> {
+            self.last.lock().unwrap().clone()
         }
     }
 
@@ -944,6 +979,7 @@ mod tests {
             if request.thumbnail_jpeg.is_some() {
                 self.images_sent.fetch_add(1, Ordering::Relaxed);
             }
+            *self.last.lock().unwrap() = Some(request.clone());
             Ok(self.response.clone())
         }
 
@@ -1202,6 +1238,76 @@ mod tests {
         // Two requests for the first asset (image refused, then text), one
         // each for the rest.
         assert_eq!(provider.requests.load(Ordering::Relaxed), 4);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// An audio asset's analysis is text-driven: no waveform card is sent,
+    /// and the transcript rides along as the content the model judges.
+    #[test]
+    fn audio_is_analysed_from_text_without_the_waveform_card() {
+        let (root, data, cache) = library(0);
+        {
+            let store = Store::open(&data.join("library.db")).unwrap();
+            let mut asset =
+                crate::model::test_asset("love-story.mp3", AssetKind::Audio, Uuid::new_v4());
+            asset.title = Some("Love Story".into());
+            assets::insert(store.conn(), &asset).unwrap();
+            assets::set_transcript(
+                store.conn(),
+                asset.id,
+                Some("Romeo, take me somewhere we can be alone."),
+            )
+            .unwrap();
+        }
+
+        let provider = MockAdapter::new(
+            r#"{"description": "Love Story by Taylor Swift.", "tags": ["pop"], "rating": null}"#,
+        );
+        let outcome = run(&options(&data, &cache), &provider, &ctx()).unwrap();
+        assert_eq!(outcome.analysed, 1);
+        assert_eq!(
+            provider.images_sent(),
+            0,
+            "the waveform card is not a picture of the content"
+        );
+
+        let request = provider.last_request().unwrap();
+        assert_eq!(request.media_type, MediaType::Audio);
+        assert_eq!(request.thumbnail_jpeg, None);
+        assert_eq!(
+            request.transcript.as_deref(),
+            Some("Romeo, take me somewhere we can be alone.")
+        );
+        // The transcript reaches the prompt itself, not just the struct.
+        let prompt = analysis::user_text_lines(&request).join("\n");
+        assert!(prompt.contains("Romeo, take me somewhere"), "{prompt}");
+
+        let conn = open(&data);
+        let stored = &live_assets(&conn)[0];
+        assert_eq!(
+            stored.description.as_deref(),
+            Some("Love Story by Taylor Swift.")
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// An audio asset without a transcript still goes text-only — name and
+    /// metadata are the whole input, and that is still better than a
+    /// description of the waveform graphic.
+    #[test]
+    fn an_audio_without_a_transcript_still_goes_text_only() {
+        let (root, data, cache) = library(0);
+        {
+            let store = Store::open(&data.join("library.db")).unwrap();
+            let asset = crate::model::test_asset("song.mp3", AssetKind::Audio, Uuid::new_v4());
+            assets::insert(store.conn(), &asset).unwrap();
+        }
+
+        let provider = MockAdapter::new(r#"{"description": "A song.", "tags": [], "rating": null}"#);
+        let outcome = run(&options(&data, &cache), &provider, &ctx()).unwrap();
+        assert_eq!(outcome.analysed, 1);
+        assert_eq!(provider.images_sent(), 0);
+        assert_eq!(provider.last_request().unwrap().transcript, None);
         let _ = std::fs::remove_dir_all(&root);
     }
 }

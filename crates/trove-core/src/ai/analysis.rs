@@ -21,7 +21,11 @@ use crate::model::{Asset, AssetKind, MAX_NAME_LEN, Rating};
 /// earlier results stale. It is part of the fingerprint stored beside every
 /// analysed asset, so rewording the prompt makes the next run re-analyse the
 /// library instead of skipping it as already done.
-pub const PROMPT_VERSION: u32 = 1;
+///
+/// 2: audio assets are analysed from text (name, metadata, transcript) and
+/// no longer from their waveform card, whose picture taught a vision model
+/// to answer "black-and-white audio waveform" where a description belonged.
+pub const PROMPT_VERSION: u32 = 2;
 
 /// How many existing tags are quoted to the model. A library with thousands
 /// of tags would otherwise spend its whole prompt on the vocabulary; the
@@ -100,6 +104,12 @@ pub struct AiAnalysisRequest {
     pub thumbnail_jpeg: Option<Vec<u8>>,
     /// For videos: a contact-sheet (key-frame collage) as JPEG bytes.
     pub contact_sheet_jpeg: Option<Vec<u8>>,
+    /// The audio's speech-to-text transcript, when the asset has one and the
+    /// caller could read it. This is how audio is analysed at all: its
+    /// "thumbnail" is a synthetic waveform card — a picture of the request
+    /// for a picture, not of the music — so what the recording *contains*
+    /// can only reach the model as text.
+    pub transcript: Option<String>,
     /// The prompt language line (may list multiple).
     pub language: String,
     /// Which fields the model should produce.
@@ -125,9 +135,20 @@ pub struct AiAnalysisRequest {
 pub enum MediaType {
     Image,
     Video,
+    /// Audio has no picture of its *content*: the card in the grid is a
+    /// synthetic waveform, and the analysis is text-driven (metadata, and
+    /// the transcript when there is one).
+    Audio,
     Model3D,
     Other,
 }
+
+/// How much of a transcript one analysis request carries. The transcript is
+/// context for a one-sentence description, not the deliverable, and a
+/// two-hour podcast's full text would spend the request's budget on words
+/// the answer will not quote; the head of the recording is where the
+/// identifying content (title line, host, topic) lives.
+const TRANSCRIPT_PROMPT_CHARS: usize = 4000;
 
 /// User-tunable policy knobs that the prompt cannot enforce. The prompt is
 /// advisory: a model that answers in prose, wraps its JSON in a fence, or
@@ -191,6 +212,14 @@ pub fn system_prompt(request: &AiAnalysisRequest) -> String {
             "- `description`: one short sentence describing what the asset is or shows. Null is \
              only for assets with nothing to describe at all.\n",
         );
+        if request.media_type == MediaType::Audio {
+            prompt.push_str(
+                "- For audio, describe what the recording *is* — song, podcast, interview, \
+                 ambient sound — from its name, metadata and transcript. Never describe a \
+                 waveform image or the fact that it is audio; that is the container, not the \
+                 content.\n",
+            );
+        }
     }
     if fields.tags {
         prompt.push_str(
@@ -248,6 +277,33 @@ pub fn user_text_lines(req: &AiAnalysisRequest) -> Vec<String> {
         format!("Filename: {}", req.file_name),
     ];
     lines.extend(req.metadata_lines.iter().cloned());
+
+    // Audio carries no picture of its content — the card in the grid is a
+    // drawn waveform — so the framing has to say where the judgment comes
+    // from instead, or the model answers about the waveform graphic.
+    if req.media_type == MediaType::Audio {
+        lines.push(
+            "This asset is audio: there is no picture of its content. Judge it by its name, \
+             metadata"
+                .to_string()
+                + match &req.transcript {
+                    Some(_) => " and the transcript below.",
+                    None => ".",
+                },
+        );
+    }
+
+    if let Some(transcript) = &req.transcript {
+        let capped: String = if transcript.chars().count() > TRANSCRIPT_PROMPT_CHARS {
+            let mut head: String = transcript.chars().take(TRANSCRIPT_PROMPT_CHARS).collect();
+            head.push_str(" …(truncated)");
+            head
+        } else {
+            transcript.clone()
+        };
+        lines.push("Transcript of the recording:".to_string());
+        lines.push(capped);
+    }
 
     if let Some(_sheet) = &req.contact_sheet_jpeg {
         if req.thumbnail_jpeg.is_some() {
@@ -562,6 +618,7 @@ mod tests {
             media_type: MediaType::Image,
             thumbnail_jpeg: None,
             contact_sheet_jpeg: None,
+            transcript: None,
             language: "en".into(),
             enabled_fields,
             metadata_lines: Vec::new(),
@@ -734,5 +791,54 @@ mod tests {
         assert_eq!(language_name("zh-CN"), "Simplified Chinese");
         assert_eq!(language_name("ja"), "Japanese");
         assert_eq!(language_name("en-US"), "English");
+    }
+
+    /// Audio is judged from text: the framing line must be there with and
+    /// without a transcript, and the transcript must ride along — capped.
+    #[test]
+    fn audio_requests_frame_the_judgment_and_carry_the_transcript() {
+        let mut req = request(AiAnalysisFields::default(), Vec::new(), Vec::new());
+        req.media_type = MediaType::Audio;
+        req.transcript = Some("Is this the real life? Is this just fantasy?".into());
+
+        let joined = user_text_lines(&req).join("\n");
+        assert!(joined.contains("This asset is audio"), "{joined}");
+        assert!(joined.contains("and the transcript below"), "{joined}");
+        assert!(joined.contains("Is this the real life?"), "{joined}");
+
+        req.transcript = None;
+        let joined = user_text_lines(&req).join("\n");
+        assert!(joined.contains("Judge it by its name, metadata."), "{joined}");
+        assert!(!joined.contains("Transcript of the recording"), "{joined}");
+    }
+
+    /// A long transcript is context, not the deliverable: it rides in capped,
+    /// with the cut marked, so a two-hour podcast cannot eat the request.
+    #[test]
+    fn a_long_transcript_is_truncated_with_the_cut_marked() {
+        let mut req = request(AiAnalysisFields::default(), Vec::new(), Vec::new());
+        req.media_type = MediaType::Audio;
+        let long: String = "词".repeat(TRANSCRIPT_PROMPT_CHARS + 100);
+        req.transcript = Some(long);
+
+        let joined = user_text_lines(&req).join("\n");
+        assert!(joined.contains("…(truncated)"), "{joined}");
+        assert!(
+            !joined.contains(&"词".repeat(TRANSCRIPT_PROMPT_CHARS + 100)),
+            "the tail of the transcript must be gone"
+        );
+    }
+
+    /// The audio rule in the standing prompt only exists to steer the
+    /// description away from the waveform card; image requests must not
+    /// carry it.
+    #[test]
+    fn the_audio_description_rule_rides_only_on_audio_requests() {
+        let mut req = request(AiAnalysisFields::default(), Vec::new(), Vec::new());
+        req.media_type = MediaType::Audio;
+        assert!(system_prompt(&req).contains("Never describe a waveform image"));
+
+        req.media_type = MediaType::Image;
+        assert!(!system_prompt(&req).contains("waveform"));
     }
 }
