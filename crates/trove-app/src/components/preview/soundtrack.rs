@@ -48,6 +48,11 @@ const DYNAMIC_ALIASES: [&str; 2] = ["pulse", "pipewire"];
 /// the device scan probes them all by design. The failures are expected;
 /// the messages are not. The handler is replaced by a silent one, once,
 /// on the only platform where ALSA exists.
+///
+/// This covers ALSA's mouth only. The jack PCM's failure is announced by
+/// libjack — a separate library, five plain `fprintf`s per open — and
+/// nothing ALSA offers can reach it; that one takes
+/// [`with_stderr_muted`].
 #[cfg(target_os = "linux")]
 fn silence_alsa_errors() {
     use std::os::raw::{c_char, c_int};
@@ -86,6 +91,47 @@ fn silence_alsa_errors() {
             alsa_sys::snd_lib_error_set_handler(quiet);
         }
     });
+}
+
+/// Runs `f` with stderr (fd 2) pointed at `/dev/null`, and puts the real
+/// one back after.
+///
+/// libjack cannot be asked to be quiet. When the scan opens the `jack`
+/// PCM — cpal probes every hint in both directions, so twice per scan —
+/// the plugin calls `jack_client_open`, and the client library answers
+/// with its "Cannot connect to server socket" block: five plain
+/// `fprintf`s, past `snd_lib_error_set_handler` and everything else ALSA
+/// can offer. The only lever that reaches a C library printing straight
+/// to a descriptor is the descriptor itself, so the enumeration runs with
+/// fd 2 swung at `/dev/null`. The scan runs on the UI thread and lasts a
+/// few milliseconds, so the only writes the window can swallow are other
+/// threads' log lines unlucky enough to land in it.
+#[cfg(target_os = "linux")]
+fn with_stderr_muted<T>(f: impl FnOnce() -> T) -> T {
+    // If any step of the dance fails, run unmuted — the worst case is
+    // then exactly the noise this exists to swallow.
+    let saved = unsafe { libc::dup(libc::STDERR_FILENO) };
+    if saved < 0 {
+        return f();
+    }
+    let devnull = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_WRONLY) };
+    let muted = devnull >= 0 && unsafe { libc::dup2(devnull, libc::STDERR_FILENO) } >= 0;
+    if devnull >= 0 {
+        unsafe { libc::close(devnull) };
+    }
+    let out = f();
+    if muted {
+        unsafe { libc::dup2(saved, libc::STDERR_FILENO) };
+    }
+    unsafe { libc::close(saved) };
+    out
+}
+
+/// Everywhere else the audio stacks keep their noise inside error values;
+/// only Linux carries a C library that prints over the app's head.
+#[cfg(not(target_os = "linux"))]
+fn with_stderr_muted<T>(f: impl FnOnce() -> T) -> T {
+    f()
 }
 
 /// The process-wide audio output. `OutputStream` has to stay alive for as
@@ -194,16 +240,20 @@ impl AudioOutput {
         }
         let host = rodio::cpal::default_host();
         // One enumeration serves both halves: the fingerprint watches for
-        // hotplug, the list names the candidates.
+        // hotplug, the list names the candidates. The iterator's open of
+        // the `jack` hint is what draws libjack's five-line chorus — twice,
+        // playback and capture — so the enumeration runs muted.
         let Ok(listing) = host.output_devices() else {
             return;
         };
-        let mut devices: Vec<(String, rodio::Device)> = listing
-            .filter_map(|d| {
-                let name = d.name().ok()?;
-                Some((name, d))
-            })
-            .collect();
+        let mut devices: Vec<(String, rodio::Device)> = with_stderr_muted(|| {
+            listing
+                .filter_map(|d| {
+                    let name = d.name().ok()?;
+                    Some((name, d))
+                })
+                .collect()
+        });
         devices.sort_by(|a, b| a.0.cmp(&b.0));
         let fingerprint: String = devices
             .iter()
@@ -714,5 +764,45 @@ impl AudioEngine {
 impl Drop for AudioEngine {
     fn drop(&mut self) {
         self.alive.store(false, Ordering::Relaxed);
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::with_stderr_muted;
+
+    /// The mute must swallow writes to fd 2 made while it is up — libjack
+    /// writes through the descriptor, not through Rust's `eprintln!` — and
+    /// hand the real stderr back afterwards.
+    #[test]
+    fn stderr_mute_swallows_fd2_writes_and_restores() {
+        let mut fds = [0 as libc::c_int; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        let (read_fd, write_fd) = (fds[0], fds[1]);
+
+        // Park the real stderr, then swing fd 2 at the pipe's write end, so
+        // everything written to fd 2 during the test lands in the pipe.
+        let saved = unsafe { libc::dup(libc::STDERR_FILENO) };
+        assert!(saved >= 0);
+        assert!(unsafe { libc::dup2(write_fd, libc::STDERR_FILENO) } >= 0);
+        unsafe { libc::close(write_fd) };
+
+        unsafe { libc::write(libc::STDERR_FILENO, c"before".as_ptr().cast(), 6) };
+        with_stderr_muted(|| {
+            unsafe { libc::write(libc::STDERR_FILENO, c"during".as_ptr().cast(), 6) };
+        });
+        unsafe { libc::write(libc::STDERR_FILENO, c"|after".as_ptr().cast(), 6) };
+
+        // Read the pipe with fd 2 back on the real stderr.
+        assert!(unsafe { libc::dup2(saved, libc::STDERR_FILENO) } >= 0);
+        unsafe { libc::close(saved) };
+        let mut buf = [0u8; 64];
+        let n = unsafe { libc::read(read_fd, buf.as_mut_ptr().cast(), buf.len()) };
+        unsafe { libc::close(read_fd) };
+        assert_eq!(
+            String::from_utf8_lossy(&buf[..n.max(0) as usize]),
+            "before|after",
+            "the write inside the mute must vanish, the ones outside must not"
+        );
     }
 }

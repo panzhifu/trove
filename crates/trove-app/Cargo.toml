@@ -38,6 +38,11 @@ tray-icon = { version = "0.25", default-features = false, features = ["ksni"] }
 # fail to open (jack, oss, dmix) and ALSA prints a line for each.
 [target.'cfg(target_os = "linux")'.dependencies]
 alsa-sys = "0.3"
+# dup/dup2 for the same scan: libjack's "no server" lines are plain
+# fprintfs inside the client library, past every error handler ALSA can
+# offer, so the enumeration mutes fd 2 itself. Already in the graph via
+# alsa-sys; this adds no compiled crates.
+libc = "0.2"
 
 [dev-dependencies]
 # Used only to parse and validate `gpu3d.wgsl` on machines without a GPU.
