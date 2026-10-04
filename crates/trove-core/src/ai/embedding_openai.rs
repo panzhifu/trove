@@ -294,6 +294,8 @@ mod tests {
 
     fn config(base_url: &str, model: &str) -> EmbeddingConfig {
         EmbeddingConfig {
+            engine: crate::config::EmbeddingEngine::Cloud,
+            vendor_id: None,
             base_url: base_url.into(),
             api_key: String::new(),
             model: model.into(),
@@ -377,6 +379,8 @@ mod tests {
 
     fn multimodal_config(model: &str) -> EmbeddingConfig {
         EmbeddingConfig {
+            engine: crate::config::EmbeddingEngine::Cloud,
+            vendor_id: None,
             base_url: "https://api.example.com/v1".into(),
             api_key: String::new(),
             model: model.into(),

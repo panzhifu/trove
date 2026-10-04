@@ -8,7 +8,6 @@ use gpui_kit::component::WindowExt as _;
 use gpui_kit::component::notification::Notification;
 use gpui_kit::*;
 
-use trove_core::ai::transcribe::TranscribeProvider as _;
 use trove_core::model::AssetKind;
 use trove_core::tasks::transcription::{TranscribeOutcome, TranscribeRunRequest};
 use trove_core::tasks::{TaskKind, TaskStatus};
@@ -54,12 +53,16 @@ pub enum TranscribeTarget {
 ///
 /// Deliberately not a task-manager job, like the analysis probe: it writes no
 /// rows and must not occupy the transcription slot a real run needs.
-pub fn test_transcription_endpoint_app(controller: &Entity<LibraryController>, cx: &mut App) {
+pub fn test_transcription_endpoint_app(
+    controller: &Entity<LibraryController>,
+    window: &mut Window,
+    cx: &mut App,
+) {
     if controller.read(cx).transcription_probe.is_running() {
         return;
     }
     let Some(config) = trove_core::config::AppConfig::load()
-        .ai_transcription
+        .resolved_transcription()
         .filter(trove_core::config::TranscriptionConfig::is_configured)
     else {
         set_transcription_probe(
@@ -71,6 +74,13 @@ pub fn test_transcription_endpoint_app(controller: &Entity<LibraryController>, c
         );
         return;
     };
+    // The local engine's probe needs its model on disk; the ask is the same
+    // dialog the run path shows, with nothing chained after it.
+    if config.engine == trove_core::config::TranscriptionEngine::Local
+        && !super::local_model::ensure_local_model_app(controller, None, window, cx)
+    {
+        return;
+    }
     let provider = match trove_core::ai::transcribe::build_from_config(&config) {
         Ok(provider) => provider,
         Err(error) => {
@@ -175,6 +185,24 @@ pub fn start_transcription_request_app(
     window: &mut Window,
     cx: &mut App,
 ) -> bool {
+    // The local engine needs its weights on disk before anything runs. The
+    // ask happens here — the one launch point, shared by the menu, the
+    // settings page and the retry button — and when the download lands, the
+    // same request re-launches itself through this very call.
+    let engine = trove_core::config::AppConfig::load()
+        .ai_transcription
+        .unwrap_or_default()
+        .engine;
+    if engine == trove_core::config::TranscriptionEngine::Local
+        && !super::local_model::ensure_local_model_app(
+            controller,
+            Some(request.clone()),
+            window,
+            cx,
+        )
+    {
+        return false;
+    }
     let Some(provider) = transcription_provider(window, cx) else {
         return false;
     };
@@ -227,7 +255,7 @@ fn transcription_provider(
     cx: &mut App,
 ) -> Option<std::sync::Arc<dyn trove_core::ai::transcribe::TranscribeProvider>> {
     let transcription = trove_core::config::AppConfig::load()
-        .ai_transcription
+        .resolved_transcription()
         .unwrap_or_default();
     if !transcription.is_configured() {
         window.push_notification(
@@ -239,7 +267,7 @@ fn transcription_provider(
         return None;
     }
     match trove_core::ai::transcribe::build_from_config(&transcription) {
-        Ok(provider) => Some(std::sync::Arc::from(provider)),
+        Ok(provider) => Some(provider),
         Err(error) => {
             window.push_notification(Notification::warning(error.to_string()), cx);
             None

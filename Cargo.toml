@@ -187,3 +187,12 @@ arboard = { version = "3", features = ["wayland-data-control"] }
 # No `[patch.crates-io]` section on purpose: `gpui-kit` is declared as a git
 # dependency above, and everything else it drags in is either a path member of
 # that checkout or a crates.io crate at the version upstream asks for.
+
+# CUDA 13's headers ship __hmax_nan/__hmin_nan for host and device, which
+# collides with candle-kernels 0.11's own compatibility shim; the vendored
+# copy guards the shim by CUDA version. Provenance: crates.io
+# candle-kernels 0.11.0 (MIT OR Apache-2.0), patched in
+# vendor/candle-kernels/src/compatibility.cuh. Revisit when candle ships a
+# release with CUDA 13 support.
+[patch.crates-io]
+candle-kernels = { path = "vendor/candle-kernels" }

@@ -1530,8 +1530,13 @@ fn embedding_backfill_semantic_search_and_reset() {
     // Coverage is zero before any backfill.
     assert_eq!(lib.embedding_coverage("mock-embed").unwrap(), (0, 3));
 
-    // Backfill on the task manager; wait for the outcome channel.
-    let (task_id, rx) = lib.start_embedding_backfill(provider.clone()).unwrap();
+    // Backfill on the task manager; wait for the outcome channel. The
+    // provider arrives as a factory, exactly as the app hands it over: the
+    // task thread builds it.
+    let make = provider.clone();
+    let (task_id, rx) = lib
+        .start_embedding_backfill("mock-embed", move || Ok(make.clone()))
+        .unwrap();
     let outcome = rx.recv().expect("the job returns an outcome");
     assert_eq!(outcome.embedded, 3, "{outcome:?}");
     assert_eq!(outcome.error, None);

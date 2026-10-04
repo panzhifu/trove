@@ -43,7 +43,10 @@ pub(super) use gpui_kit::component::setting::{
     SelectIndex, SettingField, SettingGroup, SettingItem, SettingPage, Settings,
 };
 pub(super) use gpui_kit::component::{ActiveTheme, Disableable as _, IconName, Sizable, ThemeMode};
+use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::{Root, TitleBar};
+
+use crate::components::controls;
 pub(super) use gpui_kit::prelude::FluentBuilder as _;
 pub(super) use gpui_kit::*;
 
@@ -73,35 +76,238 @@ pub(super) fn config_switch(
     )
 }
 
-/// The AI vendors Trove can talk to, as `(stored id, display name)` pairs in
-/// the shape [`SettingField::dropdown`] takes. Shared by every settings page
-/// that configures an endpoint (ai, search) so the option lists cannot drift.
-pub(super) fn vendor_options() -> Vec<(SharedString, SharedString)> {
-    use trove_core::ai::vendor::VendorId;
-    [
-        (VendorId::OpenAI, "OpenAI"),
-        (VendorId::Anthropic, "Anthropic"),
-        (VendorId::Gemini, "Google Gemini"),
-        (VendorId::DashScope, "Alibaba DashScope"),
-        (VendorId::Moonshot, "Moonshot Kimi"),
-        (VendorId::Zhipu, "Zhipu GLM"),
-        (VendorId::Volcengine, "Volcengine Ark (Doubao)"),
-        (VendorId::SiliconFlow, "SiliconFlow"),
-        (VendorId::DeepSeek, "DeepSeek"),
-    ]
-    .into_iter()
-    .map(|(id, name)| (SharedString::from(id.as_str()), SharedString::from(name)))
-    .collect()
+// ============================ vendor profiles ================================
+
+/// The saved AI vendor profiles, as `(profile id, display line)` pairs for a
+/// settings dropdown. The display line carries the host, because two
+/// profiles of the same brand (a relay and the real thing) differ only
+/// there — the host is what makes the choice legible.
+pub(super) fn profile_options() -> Vec<(SharedString, SharedString)> {
+    AppConfig::load()
+        .vendors
+        .iter()
+        .map(|profile| {
+            let host = host_of(&profile.base_url);
+            (
+                SharedString::from(profile.id.clone()),
+                SharedString::from(format!("{} — {}", profile.name, host)),
+            )
+        })
+        .collect()
 }
 
-/// Apply a vendor choice from a settings dropdown: store the id and point
-/// the endpoint at that vendor's official address. The endpoint field stays
-/// editable, so a relay or a local server can be typed over it afterwards.
-pub(super) fn apply_vendor_choice(vendor: &mut String, base_url: &mut String, value: &str) {
-    *vendor = value.to_string();
-    if let Ok(id) = value.parse::<trove_core::ai::vendor::VendorId>() {
-        *base_url = id.default_base_url().to_string();
-    }
+/// The host of a base URL (`http://localhost:11434/v1` → `localhost`), the
+/// one stable part a dropdown line can name.
+pub(super) fn host_of(url: &str) -> &str {
+    url.split("://")
+        .nth(1)
+        .unwrap_or(url)
+        .split('/')
+        .next()
+        .unwrap_or(url)
+}
+
+/// Which adapter family a profile's endpoint implies: the brand behind a
+/// known host keeps its native wire shape, everything else — relays, local
+/// servers, unknown hosts — speaks the OpenAI wire. Picking a profile in a
+/// feature's dropdown stores this as the feature's family, so a legacy
+/// Anthropic/Gemini config keeps working when its profile is re-picked and
+/// a new pick defaults to the shape every profile can serve.
+pub(super) fn family_for_base_url(base_url: &str) -> String {
+    let family = match host_of(base_url) {
+        "api.anthropic.com" => "anthropic",
+        "generativelanguage.googleapis.com" => "gemini",
+        "dashscope.aliyuncs.com" => "dashscope",
+        "api.moonshot.cn" => "moonshot",
+        "open.bigmodel.cn" => "zhipu",
+        "ark.cn-beijing.volces.com" => "volcengine",
+        _ => "openai",
+    };
+    family.to_string()
+}
+
+/// What a model-name dropdown should suggest, by the kind of feature asking.
+/// Suggestions, not an allowlist — the model input stays free text.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum ModelPresets {
+    /// Multimodal analysis models (vision-capable).
+    Vision,
+    /// Text-only chat models (the search planner).
+    Chat,
+    /// Embedding models.
+    Embedding,
+}
+
+/// The model presets for one vendor profile: the presets of the brand
+/// behind a known host, or — for a local service — the models its
+/// ecosystem is known for. An unknown host gets no suggestions; the free
+/// text input is the whole interface there.
+pub(super) fn presets_for_profile(profile_base_url: &str, kind: ModelPresets) -> Vec<String> {
+    use trove_core::ai::vendor::VendorId;
+
+    let host = host_of(profile_base_url);
+    let names: &[&str] = match host {
+        // Ollama's and LM Studio's usual suspects; the analysis list is
+        // vision-first because analysis sends images.
+        "localhost" | "127.0.0.1" | "[::1]" => match kind {
+            ModelPresets::Vision => &[
+                "qwen2.5vl:7b",
+                "qwen2.5vl:32b",
+                "llama3.2-vision:11b",
+                "minicpm-v",
+            ],
+            ModelPresets::Chat => &["qwen3:8b", "qwen2.5:7b", "llama3.1:8b", "glm4:9b"],
+            ModelPresets::Embedding => {
+                &["nomic-embed-text", "bge-m3", "snowflake-arctic-embed"]
+            }
+        },
+        "api.siliconflow.cn" => match kind {
+            ModelPresets::Embedding => &[
+                "BAAI/bge-m3",
+                "Pro/BAAI/bge-m3",
+                "netease-youdao/bce-embedding-base_v1",
+            ],
+            _ => VendorId::SiliconFlow.models(),
+        },
+        _ => {
+            let vendor = [
+                ("api.openai.com", VendorId::OpenAI),
+                ("api.anthropic.com", VendorId::Anthropic),
+                ("generativelanguage.googleapis.com", VendorId::Gemini),
+                ("dashscope.aliyuncs.com", VendorId::DashScope),
+                ("api.moonshot.cn", VendorId::Moonshot),
+                ("open.bigmodel.cn", VendorId::Zhipu),
+                ("ark.cn-beijing.volces.com", VendorId::Volcengine),
+                ("api.deepseek.com", VendorId::DeepSeek),
+            ]
+            .into_iter()
+            .find(|(known, _)| *known == host)
+            .map(|(_, vendor)| vendor);
+            match vendor {
+                Some(vendor) => vendor.models(),
+                None => &[],
+            }
+        }
+    };
+    names.iter().map(|name| name.to_string()).collect()
+}
+
+/// The profile dropdown the cloud feature groups share: the saved vendors by
+/// name, the referenced one checked. The pick writes the feature's
+/// `vendor_id`; the endpoint and key themselves live in the registry at the
+/// top of the AI page.
+pub(super) fn vendor_field(
+    current_of: impl Fn() -> Option<String> + Clone + 'static,
+    pick: impl Fn(String, &mut App) + Clone + 'static,
+) -> SettingField<SharedString> {
+    let options = profile_options();
+    let current = match current_of() {
+        Some(id) if options.iter().any(|(value, _)| value.as_ref() == id) => id,
+        _ => AppConfig::load()
+            .vendors
+            .first()
+            .map(|vendor| vendor.id.clone())
+            .unwrap_or_default(),
+    };
+    SettingField::dropdown(
+        options,
+        move |_| SharedString::from(current.clone()),
+        move |value, cx| pick(value.to_string(), cx),
+    )
+}
+
+/// A model field for an endpoint whose server decides which models make
+/// sense: the presets known for the referenced vendor profile sit one click
+/// away in a dropdown, beside a free-text input for everything the preset
+/// tables do not cover — relay names, Volcengine `ep-…` endpoint ids, models
+/// newer than the table. Both controls write the same stored value; the
+/// input re-syncs when the dropdown (or another window) changes it behind
+/// its back, the same way the framework's own input fields do.
+pub(super) fn model_field(
+    key: &'static str,
+    presets_base_url: String,
+    kind: ModelPresets,
+    get_model: impl Fn() -> String + Clone + 'static,
+    set_model: impl Fn(String, &mut App) + Clone + 'static,
+) -> SettingField<SharedString> {
+    SettingField::<SharedString>::element(
+        move |_options: &gpui_kit::component::setting::RenderOptions,
+              window: &mut Window,
+              cx: &mut App| {
+            let presets: Vec<(SharedString, String)> =
+                presets_for_profile(&presets_base_url, kind)
+                    .into_iter()
+                    .map(|m| (SharedString::from(m.clone()), m))
+                    .collect();
+            let current = SharedString::from((get_model)());
+
+            struct State {
+                input: Entity<InputState>,
+                _subscription: gpui::Subscription,
+            }
+            let state_entity = window.use_keyed_state(SharedString::from(key), cx, {
+                let current = current.clone();
+                let set_model = set_model.clone();
+                move |window, cx| {
+                    let input = cx.new(|cx| {
+                        InputState::new(window, cx)
+                            .default_value(current.clone())
+                            .placeholder(rust_i18n::t!("settings.model_hint").to_string())
+                    });
+                    let subscription = cx.subscribe(&input, {
+                        move |_, input, event: &InputEvent, cx| {
+                            if let InputEvent::Change = event {
+                                (set_model)(input.read(cx).value().to_string(), cx);
+                            }
+                        }
+                    });
+                    State {
+                        input,
+                        _subscription: subscription,
+                    }
+                }
+            });
+
+            // A change from outside this box (the dropdown below, another
+            // settings window) reaches the input on the next repaint.
+            state_entity.update(cx, |state, cx| {
+                if state.input.read(cx).value() != current {
+                    state.input.update(cx, |input, cx| {
+                        input.set_value(current.clone(), window, cx);
+                    });
+                }
+            });
+            let state = state_entity.read(cx);
+
+            let label = if current.is_empty() {
+                rust_i18n::t!("settings.model_hint").to_string()
+            } else {
+                current.to_string()
+            };
+            let dropdown = controls::dropdown_button(
+                SharedString::from(format!("settings-model-presets-{key}")),
+                label,
+                presets,
+                current.clone(),
+                {
+                    let set_model = set_model.clone();
+                    move |picked: SharedString, cx: &mut App| (set_model)(picked.to_string(), cx)
+                },
+                240.0,
+                Anchor::TopLeft,
+            );
+            h_flex()
+                .gap_2()
+                .child(dropdown)
+                .child(
+                    Input::new(&state.input)
+                        .small()
+                        .appearance(true)
+                        .w(px(260.)),
+                )
+                .into_any_element()
+        },
+    )
 }
 
 /// Which page a freshly-opened settings window shows. Menu items and other

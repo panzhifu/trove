@@ -1,120 +1,30 @@
-//! AI page: the OpenAI-compatible embedding endpoint and the vector store it
-//! feeds.
+//! AI page: the vendor profiles the AI features share, then each feature's
+//! own slice — which profile to talk to and which model to ask, with the
+//! probe line that proves the pairing works.
 //!
 //! This started as one group on the Search page and moved out once it grew a
 //! second operation: an endpoint is its own subsystem with its own failure
 //! modes (an unreachable server, a key the server rejects, a model name it
 //! does not know, rows left over from a differently-configured provider),
-//! while that page is about the two model-free indexes. Everything a vector
-//! needs — the endpoint, its coverage, generating it, deleting it — is on
-//! this page, in the order a user meets it.
+//! while that page is about the two model-free indexes. The endpoints
+//! themselves live in the vendor registry at the top of the page — one
+//! server, one entry — so a feature's own group only has to answer "which
+//! vendor, which model".
 
-use gpui_kit::component::input::{Input, InputEvent, InputState};
+use gpui_kit::assets::IconName;
+use gpui_kit::component::input::{Input, InputState};
+use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
+use gpui_kit::component::notification::Notification;
 use gpui_kit::component::setting::NumberFieldOptions;
+use gpui_kit::component::switch::Switch;
+use gpui_kit::component::WindowExt as _;
 
 use super::*;
 use crate::app::settings_write;
 use crate::components::controls;
-use crate::library::{AiProbe, AnalysisProbe, TranscriptionProbe};
-
-/// A model field for an endpoint whose vendor decides which models make
-/// sense: the current vendor's known models sit one click away in a
-/// dropdown, beside a free-text input for everything the preset table does
-/// not cover — relay names, Volcengine `ep-…` endpoint ids, models newer
-/// than the table. Both controls write the same stored value; the input
-/// re-syncs when the dropdown (or another window) changes it behind its
-/// back, the same way the framework's own input fields do.
-fn model_field(
-    key: &'static str,
-    get_vendor: impl Fn() -> String + Clone + 'static,
-    get_model: impl Fn() -> String + Clone + 'static,
-    set_model: impl Fn(String, &mut App) + Clone + 'static,
-    presets_of: fn(trove_core::ai::vendor::VendorId) -> &'static [&'static str],
-) -> SettingField<SharedString> {
-    SettingField::<SharedString>::element(
-        move |_options: &gpui_kit::component::setting::RenderOptions,
-              window: &mut Window,
-              cx: &mut App| {
-            let vendor = (get_vendor)();
-            let presets: Vec<(SharedString, String)> = vendor
-                .parse::<trove_core::ai::vendor::VendorId>()
-                .map(|vendor| {
-                    presets_of(vendor)
-                        .iter()
-                        .map(|m| (SharedString::from(*m), m.to_string()))
-                        .collect()
-                })
-                .unwrap_or_default();
-            let current = SharedString::from((get_model)());
-
-            struct State {
-                input: Entity<InputState>,
-                _subscription: gpui::Subscription,
-            }
-            let state_entity = window.use_keyed_state(SharedString::from(key), cx, {
-                let current = current.clone();
-                let set_model = set_model.clone();
-                move |window, cx| {
-                    let input = cx.new(|cx| {
-                        InputState::new(window, cx)
-                            .default_value(current.clone())
-                            .placeholder(rust_i18n::t!("settings.model_hint").to_string())
-                    });
-                    let subscription = cx.subscribe(&input, {
-                        move |_, input, event: &InputEvent, cx| {
-                            if let InputEvent::Change = event {
-                                (set_model)(input.read(cx).value().to_string(), cx);
-                            }
-                        }
-                    });
-                    State {
-                        input,
-                        _subscription: subscription,
-                    }
-                }
-            });
-
-            // A change from outside this box (the dropdown below, another
-            // settings window) reaches the input on the next repaint.
-            state_entity.update(cx, |state, cx| {
-                if state.input.read(cx).value() != current {
-                    state.input.update(cx, |input, cx| {
-                        input.set_value(current.clone(), window, cx);
-                    });
-                }
-            });
-            let state = state_entity.read(cx);
-
-            let label = if current.is_empty() {
-                rust_i18n::t!("settings.model_hint").to_string()
-            } else {
-                current.to_string()
-            };
-            let dropdown = controls::dropdown_button(
-                SharedString::from("settings-model-presets"),
-                label,
-                presets,
-                current.clone(),
-                {
-                    let set_model = set_model.clone();
-                    move |picked: SharedString, cx: &mut App| (set_model)(picked.to_string(), cx)
-                },
-                240.0,
-                Anchor::TopLeft,
-            );
-            h_flex()
-                .gap_2()
-                .child(dropdown)
-                .child(
-                    Input::new(&state.input)
-                        .small()
-                        .appearance(true)
-                        .w(px(260.)),
-                )
-                .into_any_element()
-        },
-    )
-}
+use crate::library::{
+    AiProbe, AnalysisProbe, ModelDownload, TranscriptionProbe,
+};
 
 // ============================ config ========================================
 
@@ -138,8 +48,9 @@ fn save_embedding_config(
 
 // ============================ page ==========================================
 
-/// The AI page: endpoint + connection test, then the vector store's coverage
-/// and its two operations.
+/// The AI page: the vendor registry, then each feature's slice of it —
+/// which profile to talk to, which model to ask, and the probe that proves
+/// the pairing works.
 pub(super) fn ai_page(controller: &Entity<LibraryController>, cx: &App) -> SettingPage {
     let config = embedding_config();
     // One query per paint, shared by the coverage line and the delete button:
@@ -150,7 +61,7 @@ pub(super) fn ai_page(controller: &Entity<LibraryController>, cx: &App) -> Setti
         controller
             .read(cx)
             .library
-            .embedding_coverage(&config.model)
+            .embedding_coverage(config.model_id())
             .ok()
     } else {
         None
@@ -163,6 +74,7 @@ pub(super) fn ai_page(controller: &Entity<LibraryController>, cx: &App) -> Setti
         .icon(IconName::Bot)
         .description(rust_i18n::t!("settings.ai_desc").to_string())
         .resettable(false)
+        .group(vendors_group())
         .group(endpoint_group(controller, &probe))
         .group(vector_group(controller, coverage))
         .group(analysis_group(controller, &analysis_probe))
@@ -171,6 +83,326 @@ pub(super) fn ai_page(controller: &Entity<LibraryController>, cx: &App) -> Setti
         .group(transcription_run_group(controller))
 }
 
+// ============================ vendor registry ================================
+
+/// The saved AI servers — one entry per server, shared by every feature —
+/// plus the control that adds one. Editing a profile is editing every
+/// feature that points at it, which is exactly the point: the base URL and
+/// the key are typed once.
+fn vendors_group() -> SettingGroup {
+    let profiles = AppConfig::load().vendors;
+    let mut group = SettingGroup::new().title(rust_i18n::t!("settings.vendors").to_string());
+    for profile in &profiles {
+        let profile = profile.clone();
+        group = group.item(
+            SettingItem::new(profile.name.clone(), SettingField::render(move |_, _, cx| {
+                vendor_row(&profile, cx)
+            })),
+        );
+    }
+    if profiles.is_empty() {
+        group = group.item(SettingItem::new(
+            rust_i18n::t!("settings.vendors_empty").to_string(),
+            SettingField::render(|_, _, cx| {
+                controls::empty_note(rust_i18n::t!("settings.vendors_empty_note").to_string(), cx)
+            }),
+        ));
+    }
+    group.item(
+        SettingItem::new(
+            rust_i18n::t!("settings.vendors_add").to_string(),
+            SettingField::render(|_, _, cx| add_vendor_row(cx)),
+        )
+        .description(rust_i18n::t!("settings.vendors_desc").to_string()),
+    )
+}
+
+/// One saved server: its name and host, a "local" chip when the service
+/// runs on this machine, and the two acts a registry entry supports.
+fn vendor_row(profile: &trove_core::config::VendorProfile, cx: &mut App) -> Div {
+    let editing = profile.clone();
+    let deleting = profile.clone();
+    h_flex()
+        .w_full()
+        .items_center()
+        .justify_end()
+        .gap_2()
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .truncate()
+                .text_sm()
+                .text_color(cx.theme().muted_foreground)
+                .child(profile.base_url.clone()),
+        )
+        .when(profile.local, |row| {
+            row.child(
+                div()
+                    .px_2()
+                    .py_0p5()
+                    .rounded_full()
+                    .bg(cx.theme().secondary)
+                    .text_xs()
+                    .text_color(cx.theme().secondary_foreground)
+                    .child(rust_i18n::t!("settings.vendors_local").to_string()),
+            )
+        })
+        .child(
+            Button::new(SharedString::from(format!("vendor-edit-{}", profile.id)))
+                .ghost()
+                .xsmall()
+                .icon(IconName::Pencil)
+                .tooltip(rust_i18n::t!("settings.vendors_edit").to_string())
+                .on_click(move |_, window, cx| {
+                    open_vendor_editor(window, cx, editing.clone())
+                }),
+        )
+        .child(
+            Button::new(SharedString::from(format!("vendor-delete-{}", profile.id)))
+                .ghost()
+                .xsmall()
+                .icon(IconName::Trash)
+                .tooltip(rust_i18n::t!("settings.vendors_delete").to_string())
+                .on_click(move |_, window, cx| {
+                    open_vendor_delete_confirm(window, cx, deleting.clone())
+                }),
+        )
+}
+
+/// The add-vendor control: one row per well-known service, prefilled with
+/// its endpoint (a local one for Ollama and LM Studio), "Custom" opening the
+/// editor blank.
+fn add_vendor_row(_cx: &mut App) -> AnyElement {
+    let presets: Vec<(usize, String)> = trove_core::config::VENDOR_PRESETS
+        .iter()
+        .enumerate()
+        .map(|(index, (name, _, local))| {
+            let label = match *local {
+                true => format!("{name} ({})", rust_i18n::t!("settings.vendors_local")),
+                false => name.to_string(),
+            };
+            (index, label)
+        })
+        .collect();
+    Button::new("add-vendor")
+        .outline()
+        .small()
+        .label(rust_i18n::t!("settings.vendors_add").to_string())
+        .dropdown_menu_with_anchor(Anchor::TopLeft, move |menu, _, _| {
+            let mut menu = menu.min_w(px(220.));
+            for (index, label) in presets.clone() {
+                menu = menu.item(
+                    PopupMenuItem::new(label).on_click(move |_, window, cx| {
+                        open_vendor_preset_editor(window, cx, index);
+                    }),
+                );
+            }
+            menu
+        })
+        .into_any_element()
+}
+
+/// A vendor profile mid-edit: the entry's id (empty when adding), the three
+/// text fields as input states, and the local flag as a plain bool the
+/// switch writes back into.
+struct VendorEditor {
+    id: String,
+    name: Entity<InputState>,
+    base_url: Entity<InputState>,
+    api_key: Entity<InputState>,
+    local: bool,
+}
+
+/// Open the add-or-edit dialog for one vendor profile. An empty `id` means a
+/// new entry (the add path, prefilled by the preset that opened the editor);
+/// otherwise the saved entry is replaced in place, and every feature
+/// pointing at it picks up the change by id.
+fn open_vendor_editor(
+    window: &mut Window,
+    cx: &mut App,
+    profile: trove_core::config::VendorProfile,
+) {
+    let is_new = profile.id.is_empty();
+    let editor = cx.new(|cx| {
+        let name = cx.new(|cx| InputState::new(window, cx).default_value(profile.name.clone()));
+        let base_url = cx.new(|cx| {
+            InputState::new(window, cx)
+                .default_value(profile.base_url.clone())
+                .placeholder("http://localhost:11434/v1")
+        });
+        let api_key =
+            cx.new(|cx| InputState::new(window, cx).default_value(profile.api_key.clone()));
+        VendorEditor {
+            id: profile.id.clone(),
+            name,
+            base_url,
+            api_key,
+            local: profile.local,
+        }
+    });
+    let title = match is_new {
+        true => rust_i18n::t!("settings.vendors_add").to_string(),
+        false => {
+            rust_i18n::t!("settings.vendors_edit_title", name = profile.name.clone()).to_string()
+        }
+    };
+    window.open_dialog(cx, move |dialog, _, cx| {
+        let editor = editor.clone();
+        let local = editor.read(cx).local;
+        let (name, base_url, api_key) = {
+            let editor = editor.read(cx);
+            (editor.name.clone(), editor.base_url.clone(), editor.api_key.clone())
+        };
+        let switch_editor = editor.clone();
+        dialog
+            .title(title.clone())
+            .width(px(460.))
+            .child(
+                v_flex()
+                    .gap_3()
+                    .child(form_label(rust_i18n::t!("settings.vendors_name").to_string()))
+                    .child(Input::new(&name).small().appearance(true))
+                    .child(form_label(rust_i18n::t!("settings.ai_base_url").to_string()))
+                    .child(Input::new(&base_url).small().appearance(true))
+                    .child(form_label(rust_i18n::t!("settings.ai_api_key").to_string()))
+                    .child(Input::new(&api_key).small().appearance(true))
+                    .child(
+                        h_flex()
+                            .justify_between()
+                            .child(form_label(rust_i18n::t!("settings.vendors_local").to_string()))
+                            .child(
+                                Switch::new("vendor-editor-local")
+                                    .checked(local)
+                                    .on_click(move |checked: &bool, _, cx| {
+                                        switch_editor.update(cx, |editor, _| editor.local = *checked);
+                                    }),
+                            ),
+                    ),
+            )
+            .on_ok(move |_, window, cx| save_vendor_editor(&editor, window, cx))
+    });
+}
+
+/// A small form label above a dialog field.
+fn form_label(text: String) -> Div {
+    div().text_sm().child(text)
+}
+
+/// The add path: a preset chosen from the dropdown opens the editor with its
+/// endpoint and local flag already in place, so Ollama is one confirmation
+/// away from being a registry entry. "Custom" has no endpoint and opens
+/// blank.
+pub(super) fn open_vendor_preset_editor(window: &mut Window, cx: &mut App, preset: usize) {
+    let Some((name, base_url, local)) = trove_core::config::VENDOR_PRESETS.get(preset) else {
+        return;
+    };
+    open_vendor_editor(
+        window,
+        cx,
+        trove_core::config::VendorProfile {
+            id: String::new(),
+            name: name.to_string(),
+            base_url: base_url.to_string(),
+            api_key: String::new(),
+            local: *local,
+        },
+    );
+}
+
+/// Validate and persist one edited profile. `false` keeps the dialog open —
+/// the toast says what is missing.
+fn save_vendor_editor(
+    editor: &Entity<VendorEditor>,
+    window: &mut Window,
+    cx: &mut App,
+) -> bool {
+    let (name, base_url, api_key) = {
+        let editor = editor.read(cx);
+        (
+            editor.name.read(cx).value().trim().to_string(),
+            editor.base_url.read(cx).value().trim().to_string(),
+            editor.api_key.read(cx).value().trim().to_string(),
+        )
+    };
+    let base_url = base_url.trim_end_matches('/').to_string();
+    // A URL that is not a URL would only surface as per-request failures
+    // later; refuse it here, where fixing it costs nothing.
+    if !base_url.starts_with("http://") && !base_url.starts_with("https://") {
+        window.push_notification(
+            Notification::warning(
+                rust_i18n::t!("settings.vendors_bad_url", url = base_url.clone()).to_string(),
+            ),
+            cx,
+        );
+        return false;
+    }
+    // A nameless profile is named after its host — the same fold the
+    // migration does for an endpoint it already knows.
+    let name = if name.is_empty() {
+        let host = super::host_of(&base_url).to_string();
+        if host.is_empty() { "Custom".into() } else { host }
+    } else {
+        name
+    };
+
+    let id = editor.read(cx).id.clone();
+    let mut config = AppConfig::load();
+    match config.vendors.iter_mut().find(|vendor| vendor.id == id) {
+        // Editing in place: the id survives, so every feature pointing at
+        // this profile picks up the new endpoint without a re-pick.
+        Some(entry) => {
+            entry.name = name;
+            entry.base_url = base_url.clone();
+            entry.api_key = api_key;
+            entry.local = editor.read(cx).local;
+        }
+        None => config.vendors.push(trove_core::config::VendorProfile {
+            id: uuid::Uuid::new_v4().simple().to_string(),
+            name,
+            base_url,
+            api_key,
+            local: editor.read(cx).local,
+        }),
+    }
+    settings_write::note(config.save(), "vendor profile");
+    cx.refresh_windows();
+    true
+}
+
+/// Deleting a registry entry silently re-points nothing: every feature that
+/// referenced it falls back to the first remaining profile, and a registry
+/// reduced to zero leaves every cloud feature unconfigured. Name that in
+/// the gate before the delete runs.
+fn open_vendor_delete_confirm(
+    window: &mut Window,
+    cx: &mut App,
+    profile: trove_core::config::VendorProfile,
+) {
+    let id = profile.id.clone();
+    window.open_alert_dialog(cx, move |alert, _, _| {
+        let profile = profile.clone();
+        let id = id.clone();
+        alert
+            .title(rust_i18n::t!("settings.vendors_delete_title").to_string())
+            .description(
+                rust_i18n::t!("settings.vendors_delete_body", name = profile.name.clone())
+                    .to_string(),
+            )
+            .confirm()
+            .ok_text(rust_i18n::t!("settings.vendors_delete").to_string())
+            .on_ok(move |_, _, cx| {
+                let mut config = AppConfig::load();
+                config.vendors.retain(|vendor| vendor.id != id);
+                settings_write::note(config.save(), "vendor profile");
+                cx.refresh_windows();
+                true
+            })
+    })
+}
+
+// ============================ embedding ======================================
+
 // ============================ endpoint ======================================
 
 /// Base URL / API key / model, plus the connection test. The three inputs
@@ -178,50 +410,184 @@ pub(super) fn ai_page(controller: &Entity<LibraryController>, cx: &App) -> Setti
 /// Ollama, LM Studio, vLLM, proxies), so the same three fields cover cloud
 /// and local setups alike.
 fn endpoint_group(controller: &Entity<LibraryController>, probe: &AiProbe) -> SettingGroup {
-    SettingGroup::new()
+    let engine = embedding_config().engine;
+    let group = SettingGroup::new()
         .title(rust_i18n::t!("settings.ai_endpoint").to_string())
-        .item(SettingItem::new(
-            rust_i18n::t!("settings.ai_base_url").to_string(),
-            SettingField::input(
-                |_cx| SharedString::from(embedding_config().base_url.clone()),
-                |value, cx| save_embedding_config(|c| c.base_url = value.to_string(), cx),
-            ),
-        ))
-        .item(SettingItem::new(
-            rust_i18n::t!("settings.ai_api_key").to_string(),
-            SettingField::input(
-                |_cx| SharedString::from(embedding_config().api_key.clone()),
-                |value, cx| save_embedding_config(|c| c.api_key = value.to_string(), cx),
-            ),
-        ))
-        .item(SettingItem::new(
-            rust_i18n::t!("settings.ai_model").to_string(),
-            SettingField::input(
-                |_cx| SharedString::from(embedding_config().model.clone()),
-                |value, cx| save_embedding_config(|c| c.model = value.to_string(), cx),
-            ),
-        ))
         .item(
             SettingItem::new(
-                rust_i18n::t!("settings.embed_multimodal").to_string(),
-                SettingField::switch(
-                    |_cx| embedding_config().multimodal,
-                    |value, cx| save_embedding_config(|c| c.multimodal = value, cx),
-                ),
+                rust_i18n::t!("settings.embed_engine").to_string(),
+                engine_field(),
             )
-            .description(rust_i18n::t!("settings.embed_multimodal_desc").to_string()),
-        )
-        .item(
+            .description(rust_i18n::t!("settings.embed_engine_desc").to_string()),
+        );
+    // The endpoint fields name a server, which means nothing to the local
+    // engine; they only show when a server is what the runs talk to.
+    let group = if engine == trove_core::config::EmbeddingEngine::Cloud {
+        group
+            .item(
+                SettingItem::new(
+                    rust_i18n::t!("settings.feature_vendor").to_string(),
+                    embedding_vendor_field(),
+                )
+                .description(rust_i18n::t!("settings.feature_vendor_desc").to_string()),
+            )
+            .item(SettingItem::new(
+                rust_i18n::t!("settings.ai_model").to_string(),
+                embedding_model_field(),
+            ))
+            .item(
+                SettingItem::new(
+                    rust_i18n::t!("settings.embed_multimodal").to_string(),
+                    SettingField::switch(
+                        |_cx| embedding_config().multimodal,
+                        |value, cx| save_embedding_config(|c| c.multimodal = value, cx),
+                    ),
+                )
+                .description(rust_i18n::t!("settings.embed_multimodal_desc").to_string()),
+            )
+    } else {
+        group.item(
             SettingItem::new(
-                rust_i18n::t!("settings.ai_probe").to_string(),
+                rust_i18n::t!("settings.embed_model_item").to_string(),
                 SettingField::render({
                     let controller = controller.clone();
-                    let probe = probe.clone();
-                    move |_, _, cx| probe_row(&controller, &probe, cx)
+                    move |_, _, cx| embed_model_row(&controller, cx)
                 }),
             )
-            .description(rust_i18n::t!("settings.ai_probe_desc").to_string()),
+            .description(rust_i18n::t!("settings.embed_model_desc").to_string()),
         )
+    };
+    group.item(
+        SettingItem::new(
+            rust_i18n::t!("settings.ai_probe").to_string(),
+            SettingField::render({
+                let controller = controller.clone();
+                let probe = probe.clone();
+                move |_, _, cx| probe_row(&controller, &probe, cx)
+            }),
+        )
+        .description(rust_i18n::t!("settings.ai_probe_desc").to_string()),
+    )
+}
+
+/// The cloud/local switch the two model-bearing engines share (this one and
+/// transcription's, below): the local engine reads no server, so the
+/// endpoint fields fold away under it.
+fn engine_field() -> SettingField<SharedString> {
+    SettingField::dropdown(
+        vec![
+            (
+                SharedString::from("cloud"),
+                SharedString::from(rust_i18n::t!("settings.embed_engine_cloud").to_string()),
+            ),
+            (
+                SharedString::from("local"),
+                SharedString::from(rust_i18n::t!("settings.embed_engine_local").to_string()),
+            ),
+        ],
+        move |_cx| {
+            SharedString::from(match embedding_config().engine {
+                trove_core::config::EmbeddingEngine::Cloud => "cloud",
+                trove_core::config::EmbeddingEngine::Local => "local",
+            })
+        },
+        |value, cx| {
+            save_embedding_config(
+                |config| {
+                    config.engine = if value == "local" {
+                        trove_core::config::EmbeddingEngine::Local
+                    } else {
+                        trove_core::config::EmbeddingEngine::Cloud
+                    }
+                },
+                cx,
+            )
+        },
+    )
+}
+
+fn embedding_vendor_field() -> SettingField<SharedString> {
+    vendor_field(
+        || embedding_config().vendor_id.clone(),
+        |value, cx| save_embedding_config(|config| config.vendor_id = Some(value), cx),
+    )
+}
+
+/// The embedding model row: presets for the referenced profile's host, free
+/// text for everything else.
+fn embedding_model_field() -> SettingField<SharedString> {
+    let presets_url = AppConfig::load()
+        .vendor(embedding_config().vendor_id.as_deref())
+        .map(|profile| profile.base_url.clone())
+        .unwrap_or_default();
+    model_field(
+        "embedding-model",
+        presets_url,
+        super::ModelPresets::Embedding,
+        || embedding_config().model,
+        |value, cx| save_embedding_config(|config| config.model = value, cx),
+    )
+}
+
+/// The local embedding model's row: where it is, how the download is going,
+/// and the one button that starts (or retries) it — the transcription
+/// model's row with a different model service behind it.
+fn embed_model_row(controller: &Entity<LibraryController>, cx: &mut App) -> Div {
+    use trove_core::services::embed_model as em;
+
+    let (text, color, download_label) = match controller.read(cx).embed_model_download.clone() {
+        Some(ModelDownload::Running { received, total }) => {
+            let text = if total > 0 {
+                rust_i18n::t!(
+                    "settings.local_model_progress",
+                    received = received / 1_048_576,
+                    total = total / 1_048_576
+                )
+                .to_string()
+            } else {
+                rust_i18n::t!("settings.local_model_downloading").to_string()
+            };
+            (text, cx.theme().muted_foreground, None)
+        }
+        Some(ModelDownload::Failed { message }) => (
+            rust_i18n::t!("settings.local_model_failed", error = message.as_str()).to_string(),
+            cx.theme().danger,
+            Some(rust_i18n::t!("settings.local_model_retry").to_string()),
+        ),
+        None => match em::status() {
+            em::ModelStatus::Ready { path } => (
+                rust_i18n::t!("settings.local_model_ready", path = path.display().to_string())
+                    .to_string(),
+                cx.theme().success,
+                None,
+            ),
+            em::ModelStatus::Missing => (
+                rust_i18n::t!("settings.local_model_missing").to_string(),
+                cx.theme().muted_foreground,
+                Some(rust_i18n::t!("settings.local_model_download").to_string()),
+            ),
+        },
+    };
+
+    let mut row = h_flex()
+        .w_full()
+        .items_center()
+        .justify_end()
+        .gap_2()
+        .child(div().text_sm().text_color(color).child(text));
+    if let Some(label) = download_label {
+        let controller = controller.clone();
+        row = row.child(
+            Button::new("embed-model-download")
+                .outline()
+                .small()
+                .label(label)
+                .on_click(move |_, window, cx| {
+                    crate::library::jobs::start_embed_model_download_app(&controller, window, cx);
+                }),
+        );
+    }
+    row
 }
 
 /// The connection-test row: the last result on the left, the button on the
@@ -261,8 +627,8 @@ fn probe_row(controller: &Entity<LibraryController>, probe: &AiProbe, cx: &mut A
                 .small()
                 .disabled(running)
                 .label(rust_i18n::t!("settings.ai_probe_run").to_string())
-                .on_click(move |_, _, cx| {
-                    crate::library::jobs::test_embedding_endpoint_app(&controller, cx);
+                .on_click(move |_, window, cx| {
+                    crate::library::jobs::test_embedding_endpoint_app(&controller, window, cx);
                 }),
         )
 }
@@ -396,52 +762,47 @@ fn save_analysis_config(
 /// together; the embedding endpoint above is configured apart from it, since
 /// the two are different models on the same host as often as not.
 fn analysis_group(controller: &Entity<LibraryController>, probe: &AnalysisProbe) -> SettingGroup {
+    // The referenced profile's endpoint decides which presets the model
+    // dropdown offers — a local Ollama gets its vision models, a known
+    // brand gets its table.
+    let presets_url = AppConfig::load()
+        .vendor(analysis_config().vendor_id.as_deref())
+        .map(|profile| profile.base_url.clone())
+        .unwrap_or_default();
     SettingGroup::new()
         .title(rust_i18n::t!("settings.chat_endpoint").to_string())
         .item(
             SettingItem::new(
-                rust_i18n::t!("settings.chat_vendor").to_string(),
-                SettingField::dropdown(
-                    vendor_options(),
-                    |_cx| SharedString::from(analysis_config().vendor.clone()),
+                rust_i18n::t!("settings.feature_vendor").to_string(),
+                vendor_field(
+                    || analysis_config().vendor_id.clone(),
                     |value, cx| {
-                        save_analysis_config(
-                            |config| {
-                                apply_vendor_choice(
-                                    &mut config.vendor,
-                                    &mut config.base_url,
-                                    &value,
-                                )
-                            },
-                            cx,
-                        )
+                        save_analysis_config(|config| {
+                            config.vendor_id = Some(value.clone());
+                            // The stored family follows the profile's host,
+                            // so a legacy Anthropic/Gemini config keeps its
+                            // native adapter when its profile is re-picked
+                            // and a new pick speaks the wire every profile
+                            // can serve.
+                            if let Some(profile) =
+                                AppConfig::load().vendors.iter().find(|v| v.id == value)
+                            {
+                                config.vendor = family_for_base_url(&profile.base_url);
+                            }
+                        }, cx)
                     },
                 ),
             )
-            .description(rust_i18n::t!("settings.chat_vendor_desc").to_string()),
+            .description(rust_i18n::t!("settings.feature_vendor_desc").to_string()),
         )
-        .item(SettingItem::new(
-            rust_i18n::t!("settings.ai_base_url").to_string(),
-            SettingField::input(
-                |_cx| SharedString::from(analysis_config().base_url.clone()),
-                |value, cx| save_analysis_config(|config| config.base_url = value.to_string(), cx),
-            ),
-        ))
-        .item(SettingItem::new(
-            rust_i18n::t!("settings.ai_api_key").to_string(),
-            SettingField::input(
-                |_cx| SharedString::from(analysis_config().api_key.clone()),
-                |value, cx| save_analysis_config(|config| config.api_key = value.to_string(), cx),
-            ),
-        ))
         .item(SettingItem::new(
             rust_i18n::t!("settings.chat_model").to_string(),
             model_field(
                 "analysis-model",
-                || analysis_config().vendor,
+                presets_url,
+                super::ModelPresets::Vision,
                 || analysis_config().model,
                 |value, cx| save_analysis_config(|config| config.model = value, cx),
-                trove_core::ai::vendor::VendorId::models,
             ),
         ))
         .item(
@@ -686,46 +1047,95 @@ const TRANSCRIBE_MODEL_PRESETS: &[&str] = &[
     "FunAudioLLM/SenseVoiceLarge",
 ];
 
-/// The speech-to-text endpoint: where the audio goes, what it costs, and the
-/// one way to find out any of it was right — the probe row at the bottom,
-/// which uploads a second of synthesized silence.
+/// The speech-to-text engine: which recogniser runs, and — for the cloud —
+/// where the audio goes, what it costs, and the one way to find out any of
+/// it was right — the probe row at the bottom, which uploads a second of
+/// synthesized silence. For the local engine the row instead tracks the
+/// model files: where they are, how the download is going, and the one
+/// button that starts it.
 fn transcription_group(
     controller: &Entity<LibraryController>,
     probe: &TranscriptionProbe,
 ) -> SettingGroup {
-    SettingGroup::new()
+    let engine = transcription_config().engine;
+    let group = SettingGroup::new()
         .title(rust_i18n::t!("settings.transcription_endpoint").to_string())
-        .item(SettingItem::new(
-            rust_i18n::t!("settings.ai_base_url").to_string(),
-            SettingField::input(
-                |_cx| SharedString::from(transcription_config().base_url.clone()),
-                |value, cx| {
-                    save_transcription_config(|config| config.base_url = value.to_string(), cx)
-                },
-            ),
-        ))
-        .item(SettingItem::new(
-            rust_i18n::t!("settings.ai_api_key").to_string(),
-            SettingField::input(
-                |_cx| SharedString::from(transcription_config().api_key.clone()),
-                |value, cx| {
-                    save_transcription_config(|config| config.api_key = value.to_string(), cx)
-                },
-            ),
-        ))
-        .item(SettingItem::new(
-            rust_i18n::t!("settings.transcription_model").to_string(),
-            SettingField::dropdown(
-                TRANSCRIBE_MODEL_PRESETS
-                    .iter()
-                    .map(|m| (SharedString::from(*m), SharedString::from(*m)))
-                    .collect(),
-                |_cx| SharedString::from(transcription_config().model.clone()),
-                |value, cx| {
-                    save_transcription_config(|config| config.model = value.to_string(), cx)
-                },
-            ),
-        ))
+        .item(
+            SettingItem::new(
+                rust_i18n::t!("settings.transcription_engine").to_string(),
+                SettingField::dropdown(
+                    vec![
+                        (
+                            SharedString::from("cloud"),
+                            rust_i18n::t!("settings.transcription_engine_cloud")
+                                .to_string()
+                                .into(),
+                        ),
+                        (
+                            SharedString::from("local"),
+                            rust_i18n::t!("settings.transcription_engine_local")
+                                .to_string()
+                                .into(),
+                        ),
+                    ],
+                    |_cx| {
+                        SharedString::from(match transcription_config().engine {
+                            trove_core::config::TranscriptionEngine::Cloud => "cloud",
+                            trove_core::config::TranscriptionEngine::Local => "local",
+                        })
+                    },
+                    |value, cx| {
+                        save_transcription_config(
+                            |config| {
+                                config.engine = if value == "local" {
+                                    trove_core::config::TranscriptionEngine::Local
+                                } else {
+                                    trove_core::config::TranscriptionEngine::Cloud
+                                }
+                            },
+                            cx,
+                        )
+                    },
+                ),
+            )
+            .description(rust_i18n::t!("settings.transcription_engine_desc").to_string()),
+        );
+    // The endpoint fields name a server, which means nothing to the local
+    // engine; they only show when a server is what the runs talk to.
+    let group = if engine == trove_core::config::TranscriptionEngine::Cloud {
+        group
+            .item(
+                SettingItem::new(
+                    rust_i18n::t!("settings.feature_vendor").to_string(),
+                    vendor_field(
+                        || transcription_config().vendor_id.clone(),
+                        |value, cx| {
+                            save_transcription_config(
+                                |config| config.vendor_id = Some(value),
+                                cx,
+                            )
+                        },
+                    ),
+                )
+                .description(rust_i18n::t!("settings.feature_vendor_desc").to_string()),
+            )
+            .item(SettingItem::new(
+                rust_i18n::t!("settings.transcription_model").to_string(),
+                SettingField::dropdown(
+                    TRANSCRIBE_MODEL_PRESETS
+                        .iter()
+                        .map(|m| (SharedString::from(*m), SharedString::from(*m)))
+                        .collect(),
+                    |_cx| SharedString::from(transcription_config().model.clone()),
+                    |value, cx| {
+                        save_transcription_config(|config| config.model = value.to_string(), cx)
+                    },
+                ),
+            ))
+    } else {
+        group
+    };
+    let group = group
         .item(
             SettingItem::new(
                 rust_i18n::t!("settings.transcription_language").to_string(),
@@ -776,9 +1186,84 @@ fn transcription_group(
                 }),
             )
             .description(rust_i18n::t!("settings.transcription_probe_desc").to_string()),
+        );
+
+    // The local model's own row: status, download progress, the button.
+    if engine == trove_core::config::TranscriptionEngine::Local {
+        group.item(
+            SettingItem::new(
+                rust_i18n::t!("settings.local_model_item").to_string(),
+                SettingField::render({
+                    let controller = controller.clone();
+                    move |_, _, cx| local_model_row(&controller, cx)
+                }),
+            )
+            .description(rust_i18n::t!("settings.local_model_desc").to_string()),
         )
+    } else {
+        group
+    }
 }
 
+/// The local model's row: where it is, how the download is going, and the
+/// one button that starts (or retries) it.
+fn local_model_row(controller: &Entity<LibraryController>, cx: &mut App) -> Div {
+    use trove_core::services::local_model as lm;
+
+    let (text, color, download_label) = match controller.read(cx).local_model_download.clone() {
+        Some(ModelDownload::Running { received, total }) => {
+            let text = if total > 0 {
+                rust_i18n::t!(
+                    "settings.local_model_progress",
+                    received = received / 1_048_576,
+                    total = total / 1_048_576
+                )
+                .to_string()
+            } else {
+                rust_i18n::t!("settings.local_model_downloading").to_string()
+            };
+            (text, cx.theme().muted_foreground, None)
+        }
+        Some(ModelDownload::Failed { message }) => (
+            rust_i18n::t!("settings.local_model_failed", error = message.as_str()).to_string(),
+            cx.theme().danger,
+            Some(rust_i18n::t!("settings.local_model_retry").to_string()),
+        ),
+        None => match lm::status() {
+            lm::ModelStatus::Ready { path } => (
+                rust_i18n::t!("settings.local_model_ready", path = path.display().to_string())
+                    .to_string(),
+                cx.theme().success,
+                None,
+            ),
+            lm::ModelStatus::Missing => (
+                rust_i18n::t!("settings.local_model_missing").to_string(),
+                cx.theme().muted_foreground,
+                Some(rust_i18n::t!("settings.local_model_download").to_string()),
+            ),
+        },
+    };
+
+    let mut row = h_flex()
+        .w_full()
+        .items_center()
+        .justify_end()
+        .gap_2()
+        .child(div().text_sm().text_color(color).child(text));
+    if let Some(label) = download_label {
+        let controller = controller.clone();
+        row = row.child(
+            Button::new("local-model-download")
+                .outline()
+                .small()
+                .label(label)
+                .on_click(move |_, window, cx| {
+                    crate::library::jobs::start_model_download_app(&controller, None, window, cx);
+                }),
+        );
+    }
+    row
+}
 /// The connection-test row for the transcription endpoint. The probe uploads
 /// silence, so an empty reply is the *success* shape here — the row says so
 /// rather than showing a blank line.
@@ -823,8 +1308,10 @@ fn transcription_probe_row(
                 .small()
                 .disabled(running)
                 .label(rust_i18n::t!("settings.ai_probe_run").to_string())
-                .on_click(move |_, _, cx| {
-                    crate::library::jobs::test_transcription_endpoint_app(&controller, cx);
+                .on_click(move |_, window, cx| {
+                    crate::library::jobs::test_transcription_endpoint_app(
+                        &controller, window, cx,
+                    );
                 }),
         )
 }

@@ -98,12 +98,23 @@ impl Library {
 
     /// Start an embedding backfill on a background thread: every live asset
     /// whose source fingerprint moved (or that has no vector yet) is
-    /// embedded through `provider` and stored. One backfill at a time
-    /// (mutual exclusion is per [`crate::tasks::TaskKind`]); progress and
-    /// lifecycle events come off [`Self::tasks`].
+    /// embedded through the provider `make_provider` builds and stored. One
+    /// backfill at a time (mutual exclusion is per [`crate::tasks::TaskKind`]);
+    /// progress and lifecycle events come off [`Self::tasks`].
+    ///
+    /// The provider arrives as a factory because building one can be
+    /// seconds of work (the local engine loads its weights) that belongs on
+    /// the task thread, not the UI thread; `model_id` names the storage key
+    /// for the run's label and its rows.
     pub fn start_embedding_backfill(
         &self,
-        provider: std::sync::Arc<dyn crate::ai::EmbeddingProvider>,
+        model_id: &str,
+        make_provider: impl Fn() -> std::result::Result<
+            std::sync::Arc<dyn crate::ai::EmbeddingProvider>,
+            crate::error::Error,
+        > + Send
+        + Clone
+        + 'static,
     ) -> std::result::Result<
         (
             crate::tasks::TaskId,
@@ -116,7 +127,7 @@ impl Library {
             data_root: self.root.clone(),
             cache_root: self.cache.clone(),
         };
-        let label = format!("embedding backfill ({})", provider.id());
+        let label = format!("embedding backfill ({model_id})");
         // Retried, and at low priority. Every way this job can fail as a whole
         // is in its opening — open the database, set the pragmas, list assets —
         // and each of those is transient when the CLI holds the same library:
@@ -133,8 +144,15 @@ impl Library {
             crate::tasks::TaskPriority::Low,
             move || {
                 let options = options.clone();
-                let provider = provider.clone();
-                Box::new(move |ctx| crate::tasks::embed::run(&options, provider.as_ref(), ctx))
+                let make_provider = make_provider.clone();
+                Box::new(move |ctx| {
+                    // The factory runs here, on the task thread, so a local
+                    // model's load never touches the UI; a failure (model
+                    // missing, weights broken) fails the run with its
+                    // message, like any other opening.
+                    let provider = make_provider()?;
+                    crate::tasks::embed::run(&options, provider.as_ref(), ctx)
+                })
             },
         )
     }

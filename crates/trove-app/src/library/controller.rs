@@ -187,6 +187,28 @@ impl TranscriptionProbe {
     }
 }
 
+/// A local model's download (the transcriber's Whisper, the embedder's
+/// BGE), while one is in flight or has just failed. Written by the download
+/// task in `jobs::local_model` / `jobs::embed_model`, read by the settings
+/// page's model row; `None` means no download is running (the model itself
+/// may or may not be on disk — that is the model service's `status`'s
+/// question).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ModelDownload {
+    /// In flight: bytes received, bytes total (0 while the server has not
+    /// advertised a length).
+    Running { received: u64, total: u64 },
+    /// Every mirror failed. The message is the reason the user has to read.
+    Failed { message: String },
+}
+
+impl ModelDownload {
+    /// Whether a download is in flight (the download button guards on this).
+    pub fn is_running(&self) -> bool {
+        matches!(self, Self::Running { .. })
+    }
+}
+
 /// Page size of the workspace asset grid: how many assets one page of the
 /// paged queries loads. Scrolling near the end loads the next page.
 pub const GRID_PAGE_SIZE: usize = 200;
@@ -376,6 +398,15 @@ pub struct LibraryController {
     /// user typed in, answered inline on the page, no job slot taken.
     pub analysis_probe: AnalysisProbe,
     pub transcription_probe: TranscriptionProbe,
+    /// The local transcription model's download state, when one is running
+    /// or freshly failed. Not a task-manager job either: it is a plain
+    /// fetch-and-unpack against a fixed mirror list, reported inline on the
+    /// settings page and by toasts.
+    pub local_model_download: Option<ModelDownload>,
+    /// The local embedding model's download state — the same shape, same
+    /// discipline, and its own slot so a Whisper download and a BGE download
+    /// can be in flight without erasing each other's progress.
+    pub embed_model_download: Option<ModelDownload>,
     /// The embedding of the committed search term, when one has been fetched
     /// (`jobs::request_query_embedding_app` runs after Enter). The workspace
     /// hands it to the query, which fuses it into the text ranking for as
@@ -474,6 +505,8 @@ impl LibraryController {
             ai_probe: AiProbe::Idle,
             analysis_probe: AnalysisProbe::Idle,
             transcription_probe: TranscriptionProbe::Idle,
+            local_model_download: None,
+            embed_model_download: None,
             query_vector: None,
             search_tiers: resolved_search_tiers(&config),
             ai_plan: None,

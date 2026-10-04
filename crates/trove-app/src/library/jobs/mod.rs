@@ -11,9 +11,11 @@
 //! re-exported from here, so callers keep using `crate::library::jobs::…`.
 
 mod analysis;
+mod embed_model;
 mod embedding;
 mod export;
 mod import;
+mod local_model;
 mod migrate;
 mod search;
 mod transcription;
@@ -220,6 +222,8 @@ pub use self::{
     import::{
         ImportTaskHandle, InboxDrain, collect_inbox_app, import_copied_app, import_paths_app,
     },
+    embed_model::start_embed_model_download_app,
+    local_model::start_model_download_app,
     migrate::{start_migration_job_app, start_migration_standalone},
     search::{request_ai_plan_app, request_query_embedding_app},
     transcription::{

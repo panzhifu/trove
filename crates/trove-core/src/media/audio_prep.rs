@@ -1,30 +1,28 @@
-//! Audio preparation for cloud speech-to-text: turn a source's audio track
-//! into small, speech-shaped chunks an OpenAI-compatible transcription
-//! endpoint will accept.
+//! Audio preparation for speech-to-text: turn a source's audio track into
+//! small, speech-shaped chunks a transcription engine will accept.
 //!
 //! The transcode is not optional even for plain audio files: recognisers
-//! resample to 16 kHz mono internally, the API caps upload sizes, and ffmpeg
-//! normalises every container into one the endpoint is known to parse. AAC is
-//! the codec of choice because its encoder is the one ffmpeg always ships —
-//! quality is predictable across machines, unlike the optional MP3/Opus
-//! encoders.
-//!
-//! The chunking exists because speech endpoints cap uploads (OpenAI: 25 MB)
-//! and a podcast runs longer than that. Chunks are cut on time boundaries
-//! with the segment muxer; a sentence straddling a boundary lands on the
-//! wrong side of the join, which is the accepted cost of a stateless API.
+//! resample to 16 kHz mono internally, the cloud API caps upload sizes, and
+//! ffmpeg normalises every container into one the consumer is known to
+//! parse. The codec follows the consumer: AAC (32 kbps) for the cloud
+//! endpoint, whose encoder is the one ffmpeg always ships and whose bytes
+//! are metered; 16-bit PCM WAV for the local Whisper engine, which reads
+//! the samples directly and uploads nothing.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use crate::ai::transcribe::ChunkFormat;
 use crate::error::{Error, Result};
 
-/// Seconds of speech one chunk carries. At 32 kbps mono a chunk lands around
-/// 7 MB — comfortably under [`MAX_UPLOAD_BYTES`](crate::ai::transcribe::MAX_UPLOAD_BYTES)
-/// with headroom for container overhead, and short enough that a server
-/// processing it does not run out of patience.
+/// Seconds of speech one chunk carries. At 32 kbps mono AAC a chunk lands
+/// around 7 MB — comfortably under the cloud endpoint's upload cap with
+/// headroom for container overhead, and short enough that a server
+/// processing it does not run out of patience. (A WAV chunk of the same
+/// length is ~57 MB, but the local engine reads it from the local disk; the
+/// cap is a cloud shape, not a local one.)
 const CHUNK_SECONDS: u64 = 30 * 60;
 
 /// How long one transcode may run before it is killed. Audio-only encodes run
@@ -38,7 +36,7 @@ const CHUNK_PREFIX: &str = "chunk";
 /// Extract `source`'s audio into chunk files under `dest_dir`, returning the
 /// chunk paths in playback order. `dest_dir` is the caller's to create and to
 /// clean up — a temp directory the job owns is the right shape, since chunks
-/// are disposable once uploaded.
+/// are disposable once consumed.
 ///
 /// Returns an empty vec without running anything when `duration_ms` says the
 /// source is long past its useful end (a zero-duration probe of a broken
@@ -48,6 +46,7 @@ pub fn extract_chunks(
     duration_ms: Option<u64>,
     dest_dir: &Path,
     cancel: &AtomicBool,
+    format: ChunkFormat,
 ) -> Result<Vec<PathBuf>> {
     let _slot = super::proc::slot();
     if cancel.load(Ordering::Relaxed) {
@@ -58,14 +57,19 @@ pub fn extract_chunks(
     }
 
     // Long sources are cut on time boundaries; short ones are one chunk. An
-    // unknown duration stays one chunk and leans on the endpoint's size error
+    // unknown duration stays one chunk and leans on the consumer's size error
     // to surface the pathological case.
     let segmented = duration_ms.is_some_and(|ms| ms > CHUNK_SECONDS * 1000);
-    let pattern = dest_dir.join(format!("{CHUNK_PREFIX}-%03d.m4a"));
+    let (ext, codec_args, segment_format): (&str, [&str; 4], &str) = match format {
+        ChunkFormat::AacM4a => ("m4a", ["-c:a", "aac", "-b:a", "32k"], "mp4"),
+        ChunkFormat::Wav => ("wav", ["-c:a", "pcm_s16le", "-f", "wav"], "wav"),
+    };
+    let pattern = dest_dir.join(format!("{CHUNK_PREFIX}-%03d.{ext}"));
     let mut command = Command::new("ffmpeg");
     command.args(["-v", "error", "-y", "-i"]).arg(source).args([
-        "-vn", "-sn", "-map", "0:a:0", "-ac", "1", "-ar", "16000", "-c:a", "aac", "-b:a", "32k",
+        "-vn", "-sn", "-map", "0:a:0", "-ac", "1", "-ar", "16000",
     ]);
+    command.args(codec_args);
     if segmented {
         command.args([
             "-f",
@@ -73,7 +77,7 @@ pub fn extract_chunks(
             "-segment_time",
             &CHUNK_SECONDS.to_string(),
             "-segment_format",
-            "mp4",
+            segment_format,
             "-reset_timestamps",
             "1",
         ]);
@@ -100,7 +104,7 @@ pub fn extract_chunks(
         .flatten()
         .map(|entry| entry.path())
         .filter(|path| {
-            path.extension().is_some_and(|ext| ext == "m4a")
+            path.extension().is_some_and(|extension| extension == ext)
                 && path
                     .file_stem()
                     .and_then(|stem| stem.to_str())
@@ -165,7 +169,13 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let cancel = AtomicBool::new(false);
         // `false` is not a media file; ffmpeg fails with a clear diagnostic.
-        let result = extract_chunks(Path::new("/bin/false"), Some(1_000), &dir, &cancel);
+        let result = extract_chunks(
+            Path::new("/bin/false"),
+            Some(1_000),
+            &dir,
+            &cancel,
+            crate::ai::transcribe::ChunkFormat::AacM4a,
+        );
         // A machine without ffmpeg fails the spawn instead — both are errors,
         // which is the property under test.
         assert!(result.is_err());

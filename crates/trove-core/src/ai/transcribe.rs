@@ -38,6 +38,17 @@ const MAX_REPLY_BYTES: u64 = 1024 * 1024;
 /// Sleep between retries of a transient failure, doubling per attempt.
 const BACKOFF: Duration = Duration::from_secs(2);
 
+/// The audio shape a provider wants its chunks cut into. The cloud endpoint
+/// caps uploads and pays per byte, so its chunks are 32 kbps AAC; the local
+/// recogniser reads 16-bit PCM WAV straight off the disk — nothing is
+/// uploaded, so bytes are free and the format is the one Whisper's own
+/// pipeline wants (16 kHz mono, which `audio_prep` normalises to anyway).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChunkFormat {
+    AacM4a,
+    Wav,
+}
+
 /// A source of transcripts for the library's audio and video.
 ///
 /// Synchronous like every provider here: it runs on a background task thread.
@@ -48,6 +59,12 @@ pub trait TranscribeProvider: Send + Sync {
     /// Identity recorded in the asset's marker beside every transcript, so a
     /// re-run under a different model re-asks instead of skipping.
     fn model(&self) -> &str;
+
+    /// The chunk shape [`crate::media::audio_prep`] should cut for this
+    /// provider.
+    fn chunk_format(&self) -> ChunkFormat {
+        ChunkFormat::AacM4a
+    }
 
     /// Transcribe one prepared audio chunk. `language` is an ISO 639-1 hint
     /// (`None` = server auto-detects); `prompt` is the endpoint's vocabulary
@@ -71,18 +88,30 @@ pub struct OpenAiCompatible {
     model: String,
 }
 
-/// Build a provider from the stored settings, rejecting a shape that cannot
-/// possibly work before a network round is spent discovering it.
-pub fn build_from_config(config: &TranscriptionConfig) -> crate::error::Result<OpenAiCompatible> {
-    OpenAiCompatible::new(
-        config.base_url.trim().to_string(),
-        config.api_key.clone(),
-        config.model.trim().to_string(),
-    )
-    .map_err(|error| crate::error::Error::External {
-        program: "speech-to-text".into(),
-        message: error.message,
-    })
+/// Build the provider the saved settings ask for: the OpenAI-compatible
+/// cloud client, or the local candle Whisper engine (whose model must
+/// already be on disk — the UI asks to download it before a run starts).
+pub fn build_from_config(
+    config: &TranscriptionConfig,
+) -> crate::error::Result<std::sync::Arc<dyn TranscribeProvider>> {
+    match config.engine {
+        crate::config::TranscriptionEngine::Local => {
+            let provider = crate::ai::transcribe_local::build(config)?;
+            Ok(std::sync::Arc::new(provider))
+        }
+        crate::config::TranscriptionEngine::Cloud => {
+            let provider = OpenAiCompatible::new(
+                config.base_url.trim().to_string(),
+                config.api_key.clone(),
+                config.model.trim().to_string(),
+            )
+            .map_err(|error| crate::error::Error::External {
+                program: "speech-to-text".into(),
+                message: error.message,
+            })?;
+            Ok(std::sync::Arc::new(provider))
+        }
+    }
 }
 
 impl OpenAiCompatible {

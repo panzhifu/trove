@@ -186,6 +186,7 @@ pub fn run(
                 asset.duration_ms,
                 &asset_dir,
                 ctx.cancel_flag(),
+                provider.chunk_format(),
             ),
             Err(error) => Err(Error::Io(error)),
         };

@@ -77,7 +77,7 @@ pub fn task_panel(controller: &Entity<LibraryController>, cx: &App) -> AnyElemen
 
 /// Localized label for a job kind, shown on each panel row.
 fn task_kind_label(kind: &TaskKind) -> SharedString {
-    match kind {
+    let key = match kind {
         TaskKind::Import | TaskKind::CollectInbox => "task.kind_import",
         TaskKind::Migration => "task.kind_migration",
         TaskKind::Export => "task.kind_export",
@@ -94,9 +94,8 @@ fn task_kind_label(kind: &TaskKind) -> SharedString {
         TaskKind::Custom(name) => {
             return format!("{} · {}", rust_i18n::t!("task.kind_custom"), name).into();
         }
-    }
-    .to_string()
-    .into()
+    };
+    rust_i18n::t!(key).to_string().into()
 }
 
 /// Localized state word for a job, colored by the caller.

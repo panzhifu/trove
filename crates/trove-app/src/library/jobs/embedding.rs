@@ -45,7 +45,17 @@ pub fn start_embedding_backfill_app(
     window: &mut Window,
     cx: &mut App,
 ) -> bool {
-    let config = trove_core::config::AppConfig::load().ai_embedding;
+    // The local engine needs its weights on disk before anything runs; the
+    // ask is the same dialog the transcription download uses, with the
+    // backfill re-launched when the model lands.
+    let config = trove_core::config::AppConfig::load().resolved_embedding();
+    if config
+        .as_ref()
+        .is_some_and(|config| config.engine == trove_core::config::EmbeddingEngine::Local)
+        && !super::embed_model::ensure_embed_model_app(controller, window, cx)
+    {
+        return false;
+    }
     let Some(config) = config.filter(trove_core::config::EmbeddingConfig::is_configured) else {
         window.push_notification(
             Notification::warning(rust_i18n::t!("settings.ai_not_configured").to_string()),
@@ -53,17 +63,15 @@ pub fn start_embedding_backfill_app(
         );
         return false;
     };
-    let provider: std::sync::Arc<dyn trove_core::ai::EmbeddingProvider> =
-        match trove_core::ai::OpenAICompatible::new(&config) {
-            Ok(provider) => std::sync::Arc::new(provider),
-            Err(error) => {
-                window.push_notification(Notification::warning(error.to_string()), cx);
-                return false;
-            }
-        };
+    let model_id = config.model_id().to_string();
 
     let manager = controller.read(cx).library.tasks().clone();
-    let started = controller.update(cx, |ctl, _| ctl.library.start_embedding_backfill(provider));
+    let started = controller.update(cx, |ctl, _| {
+        ctl.library
+            .start_embedding_backfill(&model_id, move || {
+                trove_core::ai::embedding_provider(&config)
+            })
+    });
     let Ok((task_id, rx)) = started else {
         return false; // one backfill at a time; the running toast is up
     };
@@ -119,14 +127,25 @@ const PROBE_TEXT: &str = "trove connection test";
 /// Deliberately not a task-manager job: it writes no rows, must not occupy
 /// the embedding slot a real backfill needs, and its answer is one line of
 /// text on the page rather than a progress bar.
-pub fn test_embedding_endpoint_app(controller: &Entity<LibraryController>, cx: &mut App) {
+pub fn test_embedding_endpoint_app(
+    controller: &Entity<LibraryController>,
+    window: &mut Window,
+    cx: &mut App,
+) {
     if controller.read(cx).ai_probe.is_running() {
         return;
     }
-    let Some(config) = trove_core::config::AppConfig::load()
-        .ai_embedding
-        .filter(trove_core::config::EmbeddingConfig::is_configured)
-    else {
+    // The local engine's probe needs its model on disk; the ask is the same
+    // dialog the run path shows, with nothing chained after it.
+    let config = trove_core::config::AppConfig::load().resolved_embedding();
+    if config
+        .as_ref()
+        .is_some_and(|config| config.engine == trove_core::config::EmbeddingEngine::Local)
+        && !super::embed_model::ensure_embed_model_app(controller, window, cx)
+    {
+        return;
+    }
+    let Some(config) = config.filter(trove_core::config::EmbeddingConfig::is_configured) else {
         set_ai_probe(
             controller,
             ai_probe_failure(rust_i18n::t!("settings.ai_not_configured").to_string()),
@@ -134,26 +153,23 @@ pub fn test_embedding_endpoint_app(controller: &Entity<LibraryController>, cx: &
         );
         return;
     };
-    let provider: std::sync::Arc<dyn trove_core::ai::EmbeddingProvider> =
-        match trove_core::ai::OpenAICompatible::new(&config) {
-            Ok(provider) => std::sync::Arc::new(provider),
-            Err(error) => {
-                set_ai_probe(controller, ai_probe_failure(error.to_string()), cx);
-                return;
-            }
-        };
 
     set_ai_probe(controller, AiProbe::Running, cx);
     let controller = controller.clone();
     cx.spawn(async move |cx| {
         // Flattened to a string on the worker: the page only needs the
         // message, and that keeps the awaited payload trivially `Send`.
+        // The provider is built here too — a local model's load is seconds
+        // of work and must not touch the UI thread.
         let result: Result<usize, String> = cx
             .background_executor()
             .spawn(async move {
-                provider
-                    .embed_texts(&[PROBE_TEXT.to_string()])
-                    .map(|vectors| vectors.first().map_or(0, Vec::len))
+                trove_core::ai::embedding_provider(&config)
+                    .and_then(|provider| {
+                        provider
+                            .embed_texts(&[PROBE_TEXT.to_string()])
+                            .map(|vectors| vectors.first().map_or(0, Vec::len))
+                    })
                     .map_err(|error| error.to_string())
             })
             .await;
@@ -186,17 +202,21 @@ pub fn delete_embeddings_app(
     window: &mut Window,
     cx: &mut App,
 ) {
-    let Some(config) = trove_core::config::AppConfig::load()
+    // Deleting needs the *storage identity*, not a working endpoint: the
+    // rows live under the model name (cloud) or the local model's label, so
+    // a profile-less cloud config still gets its vectors cleared.
+    let model = trove_core::config::AppConfig::load()
         .ai_embedding
-        .filter(trove_core::config::EmbeddingConfig::is_configured)
-    else {
+        .map(|config| config.model_id().to_string())
+        .filter(|model| !model.is_empty());
+    let Some(model) = model else {
         window.push_notification(
             Notification::warning(rust_i18n::t!("settings.ai_not_configured").to_string()),
             cx,
         );
         return;
     };
-    let note = match controller.update(cx, |ctl, _| ctl.library.delete_embeddings(&config.model)) {
+    let note = match controller.update(cx, |ctl, _| ctl.library.delete_embeddings(&model)) {
         Ok(count) => {
             Notification::success(rust_i18n::t!("settings.ai_deleted", count = count).to_string())
         }

@@ -5,12 +5,15 @@
 
 pub mod backup;
 pub mod collect;
+pub mod embed_model;
 pub mod font_manager;
 #[cfg(target_os = "linux")]
 pub mod kwin;
 #[cfg(target_os = "linux")]
 pub mod kwin_script;
 pub mod maintenance;
+pub mod local_model;
+mod model_fetch;
 pub mod migrate;
 pub mod open_external;
 pub mod repo_package;

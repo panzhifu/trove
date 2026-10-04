@@ -40,6 +40,10 @@ memchr = "2"
 memmap2 = "0.9"  # memory-mapped file access for large PLY files
 ureq = { workspace = true }
 base64 = { workspace = true }
+# The local recogniser's hallucination gate gzips its own output and reads
+# the ratio (see ai/transcribe_local.rs). Already in the graph via zip, so
+# this adds no compiled crates.
+flate2 = "1"
 notify = { workspace = true }
 ignore = { workspace = true }
 resvg = { workspace = true }
@@ -88,8 +92,21 @@ exr = "1"
 gif = "0.13"
 
 [target.'cfg(target_os = "linux")'.dependencies]
+# Local speech-to-text runs on the GPU: candle's CUDA backend is part of the
+# default Linux build. It costs the CUDA toolkit at *build* time (nvcc
+# compiles the bundled kernels) and the CUDA runtime libraries at *run*
+# time; when the runtime side is missing the recogniser still works — the
+# device is picked at runtime with a CPU fallback (see
+# ai/transcribe_local.rs). Linux without NVIDIA therefore builds, but every
+# Linux build needs the toolkit installed.
+candle-core = { version = "0.11", features = ["cuda"] }
+candle-nn = { version = "0.11", features = ["cuda"] }
+candle-transformers = { version = "0.11", features = ["cuda"] }
 # KWin's own capture interface (org.kde.KWin.ScreenShot2): KDE implements
 # neither wlr-screencopy nor ext-image-copy-capture, so this D-Bus call is
 # the only in-process way to capture on Plasma. zbus already rides in the
 # graph via gpui-pre -> ashpd/oo7, so no new compiled crates.
 zbus = "5"
+# Whisper's own tokenizer (BPE), loaded from the model directory. The
+# tokenizers crate is pure Rust.
+tokenizers = "0.21"

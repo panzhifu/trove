@@ -29,6 +29,68 @@ use crate::paths;
 ///
 /// Not `Clone`: every reader loads its own (`AppConfig::load` is a cheap
 /// small-JSON read), and an owned copy invites stale reads.
+/// The display name a folded profile gets: the brand behind a known host,
+/// else the host itself.
+fn vendor_name_from_url(url: &str) -> String {
+    let host = url
+        .split("://")
+        .nth(1)
+        .unwrap_or(url)
+        .split('/')
+        .next()
+        .unwrap_or(url);
+    match host {
+        "api.openai.com" => "OpenAI".into(),
+        "api.siliconflow.cn" => "SiliconFlow".into(),
+        "api.anthropic.com" => "Anthropic".into(),
+        "dashscope.aliyuncs.com" => "DashScope".into(),
+        other => other
+            .split(':')
+            .next()
+            .unwrap_or(other)
+            .to_string(),
+    }
+}
+
+fn is_local_url(url: &str) -> bool {
+    let host = url.split("://").nth(1).unwrap_or(url);
+    host.starts_with("localhost") || host.starts_with("127.0.0.1") || host.starts_with("[::1]")
+}
+
+/// One AI server — a hosted API or a service on this machine — that the
+/// OpenAI-compatible features share. One endpoint and key, many models:
+/// the features ([`AppConfig::ai_embedding`], [`AppConfig::search`]'s
+/// planner, [`AppConfig::ai_analysis`], [`AppConfig::ai_transcription`])
+/// each reference a profile by id instead of carrying their own endpoint,
+/// which is what turned the AI settings page into a wall of repeated
+/// base-url/key pairs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VendorProfile {
+    /// Stable id the feature configs reference. A uuid.
+    pub id: String,
+    /// Display name ("Ollama", "SiliconFlow", "工作室 vLLM", …).
+    pub name: String,
+    /// OpenAI-compatible base URL, without the endpoint tail.
+    pub base_url: String,
+    /// Bearer token. Empty is legitimate for local servers.
+    #[serde(default)]
+    pub api_key: String,
+    /// The service runs on this machine (Ollama, LM Studio, vLLM…): no
+    /// uploads, no API cost. UI presentation only.
+    #[serde(default)]
+    pub local: bool,
+}
+
+/// The vendors the add-vendor control offers, with their well-known
+/// endpoints. "Custom" is the blank slate the user fills in.
+pub const VENDOR_PRESETS: [(&str, &str, bool); 5] = [
+    ("Ollama", "http://localhost:11434/v1", true),
+    ("LM Studio", "http://localhost:1234/v1", true),
+    ("SiliconFlow", "https://api.siliconflow.cn/v1", false),
+    ("OpenAI", "https://api.openai.com/v1", false),
+    ("Custom", "", false),
+];
+
 #[derive(Debug, Serialize, Deserialize, Default)]
 pub struct AppConfig {
     /// Every library the user has, in creation order. A fresh install starts
@@ -175,35 +237,72 @@ pub struct AppConfig {
     /// feature is not configured and the menu stays silent.
     #[serde(default)]
     pub ai_transcription: Option<TranscriptionConfig>,
+    /// The AI servers the features talk to. One profile — endpoint and key —
+    /// is shared by any number of features; see [`VendorProfile`].
+    #[serde(default)]
+    pub vendors: Vec<VendorProfile>,
     /// The font viewer's custom sample texts, keyed by preview language.
     #[serde(default)]
     pub font_preview: FontPreviewConfig,
 }
 
-/// Settings for an OpenAI-compatible embeddings endpoint — the shape every
-/// mainstream server speaks: OpenAI itself, Ollama (`http://127.0.0.1:11434/v1`),
-/// LM Studio, vLLM, and the hosted proxies.
+/// Which embedder turns text into vectors: an OpenAI-compatible cloud
+/// endpoint, or a BGE model running on this machine through candle. The
+/// default is the cloud endpoint — every configuration written before the
+/// local engine existed reads back unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum EmbeddingEngine {
+    #[default]
+    #[serde(rename = "cloud")]
+    Cloud,
+    #[serde(rename = "local")]
+    Local,
+}
+
+/// The identity the local engine's vectors are stored under — the provider
+/// reports the same string from its `id()`. The cloud engine stores its
+/// vectors under the model name instead.
+pub const LOCAL_EMBEDDING_MODEL: &str = "bge-small-zh-v1.5 (local)";
+
+/// Settings for the embedding engine the semantic search tier talks to.
+///
+/// The cloud shape is one wire format: the OpenAI-compatible
+/// `POST /embeddings` — OpenAI itself, Ollama
+/// (`http://127.0.0.1:11434/v1`), LM Studio, vLLM, and the hosted proxies.
+/// The endpoint and key live in the referenced
+/// [`VendorProfile`](`AppConfig::vendors`) entry, not here. The local shape
+/// is no wire at all: candle runs BGE (`bge-small-zh-v1.5`) on the machine,
+/// and the model files are fetched once (see `services::embed_model`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EmbeddingConfig {
-    /// Base URL of the server, without the `/embeddings` tail.
+    /// Which embedder runs: the cloud endpoint or the local model.
+    #[serde(default)]
+    pub engine: EmbeddingEngine,
+    /// DEPRECATED — superseded by the vendor profiles; kept so configs
+    /// written before profiles existed read back until migration folds
+    /// them in.
     #[serde(default = "default_embedding_base_url")]
     pub base_url: String,
-    /// Bearer token. Empty is legitimate: local servers usually want none.
     #[serde(default)]
     pub api_key: String,
-    /// Model name exactly as the server knows it
+    /// The vendor profile this feature talks to ([`AppConfig::vendors`]).
+    /// `None` falls back to the first profile.
+    #[serde(default)]
+    pub vendor_id: Option<String>,
+    /// Cloud engine: model name exactly as the server knows it
     /// (`text-embedding-3-small`, `nomic-embed-text`, `jina-clip-v2`, …).
     /// This string is the `model` identity stored beside every vector, so
     /// renaming it orphans the old rows (delete them from the settings page
-    /// and re-embed).
+    /// and re-embed). Local engine: unused — the identity is
+    /// [`LOCAL_EMBEDDING_MODEL`]; see [`Self::model_id`].
     #[serde(default)]
     pub model: String,
     /// When true the endpoint is a multimodal (CLIP-style) embedder: an asset
     /// is embedded from its **image**, and a text query lands in the same
     /// vector space — so typing `猫` can find an untagged cat photo.
     ///
-    /// Off by default, because a plain text endpoint rejects the object-shaped
-    /// `input` entries this mode sends.
+    /// Cloud engine only; off by default, because a plain text endpoint
+    /// rejects the object-shaped `input` entries this mode sends.
     #[serde(default)]
     pub multimodal: bool,
 }
@@ -216,8 +315,10 @@ fn default_embedding_base_url() -> String {
 impl Default for EmbeddingConfig {
     fn default() -> Self {
         Self {
+            engine: EmbeddingEngine::Cloud,
             base_url: default_embedding_base_url(),
             api_key: String::new(),
+            vendor_id: None,
             model: String::new(),
             multimodal: false,
         }
@@ -225,9 +326,28 @@ impl Default for EmbeddingConfig {
 }
 
 impl EmbeddingConfig {
-    /// Whether enough is configured to talk to the server at all.
+    /// Whether enough is configured to talk to the server at all. The local
+    /// engine is always "configured" — the model files are a download away,
+    /// and the UI asks before spending that.
     pub fn is_configured(&self) -> bool {
-        !self.model.trim().is_empty() && !self.base_url.trim().is_empty()
+        match self.engine {
+            EmbeddingEngine::Local => true,
+            EmbeddingEngine::Cloud => {
+                !self.model.trim().is_empty() && !self.base_url.trim().is_empty()
+            }
+        }
+    }
+
+    /// The identity embeddings are stored under: the model name for the
+    /// cloud engine, the pinned local model's label for the local one. The
+    /// provider's `id()` must answer the same string — it is the `model`
+    /// key every stored vector is filed under and the coverage and delete
+    /// commands query by.
+    pub fn model_id(&self) -> &str {
+        match self.engine {
+            EmbeddingEngine::Local => LOCAL_EMBEDDING_MODEL,
+            EmbeddingEngine::Cloud => self.model.trim(),
+        }
     }
 }
 
@@ -306,10 +426,15 @@ pub struct AiSearchConfig {
     /// `moonshot`, `zhipu`, `volcengine` or `siliconflow`.
     #[serde(default = "default_vendor")]
     pub vendor: String,
+    /// DEPRECATED — superseded by the vendor profiles; see
+    /// [`EmbeddingConfig::base_url`].
     #[serde(default = "default_embedding_base_url")]
     pub base_url: String,
     #[serde(default)]
     pub api_key: String,
+    /// The vendor profile this feature talks to. `None` = first profile.
+    #[serde(default)]
+    pub vendor_id: Option<String>,
     #[serde(default)]
     pub model: String,
 }
@@ -319,6 +444,7 @@ impl Default for AiSearchConfig {
         Self {
             enabled: false,
             vendor: default_vendor(),
+            vendor_id: None,
             base_url: default_embedding_base_url(),
             api_key: String::new(),
             model: String::new(),
@@ -348,12 +474,15 @@ pub struct AiAnalysisConfig {
     /// Vendor family: `openai`, `anthropic`, `gemini` or `dashscope`.
     #[serde(default = "default_vendor")]
     pub vendor: String,
-    /// Base URL of the server, without the endpoint tail.
+    /// DEPRECATED — superseded by the vendor profiles; see
+    /// [`EmbeddingConfig::base_url`].
     #[serde(default = "default_embedding_base_url")]
     pub base_url: String,
-    /// Bearer token / API key. Empty is legitimate for local servers.
     #[serde(default)]
     pub api_key: String,
+    /// The vendor profile this feature talks to. `None` = first profile.
+    #[serde(default)]
+    pub vendor_id: Option<String>,
     /// Model name exactly as the vendor knows it (`gpt-4o-mini`,
     /// `claude-3-5-sonnet-latest`, `gemini-2.0-flash`, `qwen-vl-max`, …).
     #[serde(default)]
@@ -383,6 +512,7 @@ impl Default for AiAnalysisConfig {
     fn default() -> Self {
         Self {
             vendor: default_vendor(),
+            vendor_id: None,
             base_url: default_embedding_base_url(),
             api_key: String::new(),
             model: String::new(),
@@ -428,27 +558,48 @@ impl Default for AnalysisFieldsConfig {
     }
 }
 
-/// Settings for the speech-to-text endpoint the transcription job talks to.
+/// Which recogniser turns speech into text: the OpenAI-compatible cloud
+/// endpoint, or a Whisper model running on this machine through candle. The
+/// default is the cloud endpoint — every configuration written before the
+/// local engine existed reads back unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum TranscriptionEngine {
+    #[default]
+    #[serde(rename = "cloud")]
+    Cloud,
+    #[serde(rename = "local")]
+    Local,
+}
+
+/// Settings for the speech-to-text engine the transcription job talks to.
 ///
-/// One wire shape: the OpenAI-compatible `POST /audio/transcriptions` — the
-/// de-facto standard spoken by OpenAI itself (`whisper-1`,
-/// `gpt-4o-transcribe`), Groq, SiliconFlow (SenseVoice), and every
-/// self-hosted whisper server that copied the shape. The base URL decides
-/// which one; no vendor family selection is needed.
+/// The cloud shape is one wire format: the OpenAI-compatible
+/// `POST /audio/transcriptions` — the de-facto standard spoken by OpenAI
+/// itself (`whisper-1`, `gpt-4o-transcribe`), Groq, SiliconFlow (SenseVoice),
+/// and every self-hosted whisper server that copied the shape. The base URL
+/// decides which one; no vendor family selection is needed. The local shape
+/// is no wire at all: candle runs Whisper on the CPU, and the model files
+/// are fetched once (see `services::local_model`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TranscriptionConfig {
-    /// Base URL of the server, without the `/audio/transcriptions` tail.
+    /// Which recogniser runs: the cloud endpoint or the local model.
+    #[serde(default)]
+    pub engine: TranscriptionEngine,
+    /// DEPRECATED — superseded by the vendor profiles; see
+    /// [`EmbeddingConfig::base_url`].
     #[serde(default = "default_embedding_base_url")]
     pub base_url: String,
-    /// Bearer token. Empty is legitimate: local servers usually want none.
     #[serde(default)]
     pub api_key: String,
+    /// The vendor profile the cloud engine talks to. `None` = first profile.
+    #[serde(default)]
+    pub vendor_id: Option<String>,
     /// Model name exactly as the server knows it (`whisper-1`,
     /// `gpt-4o-transcribe`, `FunAudioLLM/SenseVoiceLarge`, …).
     #[serde(default)]
     pub model: String,
     /// Language hint for the recogniser (ISO 639-1: `zh`, `en`, `ja`, …).
-    /// `None` lets the server auto-detect.
+    /// `None` lets the recogniser auto-detect.
     #[serde(default)]
     pub language: Option<String>,
     /// Optional vocabulary hint (names, jargon) spelled the way the
@@ -461,6 +612,8 @@ pub struct TranscriptionConfig {
 impl Default for TranscriptionConfig {
     fn default() -> Self {
         Self {
+            engine: TranscriptionEngine::Cloud,
+            vendor_id: None,
             base_url: default_embedding_base_url(),
             api_key: String::new(),
             model: String::new(),
@@ -471,9 +624,17 @@ impl Default for TranscriptionConfig {
 }
 
 impl TranscriptionConfig {
-    /// Whether enough is configured to talk to the server at all.
+    /// Whether enough is configured to attempt a run at all. The cloud
+    /// engine needs an endpoint and a model name; the local engine is always
+    /// "configured" — the model files are a download away, and the UI asks
+    /// before spending that.
     pub fn is_configured(&self) -> bool {
-        !self.model.trim().is_empty() && !self.base_url.trim().is_empty()
+        match self.engine {
+            TranscriptionEngine::Local => true,
+            TranscriptionEngine::Cloud => {
+                !self.model.trim().is_empty() && !self.base_url.trim().is_empty()
+            }
+        }
     }
 }
 
@@ -840,10 +1001,11 @@ fn quarantine_corrupt(path: &Path, error: &serde_json::Error) {
 
 impl AppConfig {
     /// The embedding endpoint to use for L2 semantic search, when the toggle
-    /// is on and [`Self::ai_embedding`] is configured. `None` = the search
-    /// runs its local full-text leg only.
+    /// is on and the feature is configured (its profile resolved, model
+    /// named). `None` = the search runs its local full-text leg only.
     pub fn semantic_endpoint(&self) -> Option<EmbeddingConfig> {
-        self.search.semantic_endpoint(self.ai_embedding.as_ref())
+        let endpoint = self.resolved_embedding()?;
+        (self.search.semantic_enabled && endpoint.is_configured()).then_some(endpoint)
     }
 
     /// Load the config from disk, or return a default config if none exists.
@@ -856,8 +1018,11 @@ impl AppConfig {
     /// way.
     pub fn load() -> Self {
         match fs::read_to_string(paths::config_file()) {
-            Ok(text) => match serde_json::from_str(&text) {
-                Ok(config) => config,
+            Ok(text) => match serde_json::from_str::<AppConfig>(&text) {
+                Ok(mut config) => {
+                    config.migrate_vendors();
+                    config
+                }
                 Err(error) => {
                     quarantine_corrupt(&paths::config_file(), &error);
                     Self::default()
@@ -865,6 +1030,152 @@ impl AppConfig {
             },
             Err(_) => Self::default(),
         }
+    }
+
+    /// The profile a feature talks to: the referenced one, or the first
+    /// profile when the feature has no explicit pick.
+    pub fn vendor(&self, id: Option<&str>) -> Option<&VendorProfile> {
+        match id {
+            Some(id) => self.vendors.iter().find(|v| v.id == *id),
+            None => self.vendors.first(),
+        }
+    }
+
+    /// The embedding settings with the referenced profile's endpoint and key
+    /// folded in — what the provider actually talks to. The local engine
+    /// needs no endpoint and is returned as stored. `None` = the feature is
+    /// unconfigured (nothing saved, or the cloud engine has no profile to
+    /// talk through).
+    pub fn resolved_embedding(&self) -> Option<EmbeddingConfig> {
+        let mut config = self.ai_embedding.clone()?;
+        if config.engine == EmbeddingEngine::Cloud {
+            // A pick that names a deleted profile folds back onto the first
+            // one — the same answer the vendor-delete dialog promises.
+            let profile = self
+                .vendor(config.vendor_id.as_deref())
+                .or_else(|| self.vendors.first())?;
+            config.base_url = profile.base_url.clone();
+            config.api_key = profile.api_key.clone();
+        }
+        Some(config)
+    }
+
+    /// The analysis settings with the referenced profile's endpoint and key
+    /// folded in. `None` = the feature is unconfigured.
+    pub fn resolved_analysis(&self) -> Option<AiAnalysisConfig> {
+        let mut config = self.ai_analysis.clone()?;
+        let profile = self
+            .vendor(config.vendor_id.as_deref())
+            .or_else(|| self.vendors.first())?;
+        config.base_url = profile.base_url.clone();
+        config.api_key = profile.api_key.clone();
+        Some(config)
+    }
+
+    /// The transcription settings with the referenced profile's endpoint and
+    /// key folded in — for the local engine, the settings as stored. `None`
+    /// = the feature is unconfigured.
+    pub fn resolved_transcription(&self) -> Option<TranscriptionConfig> {
+        let mut config = self.ai_transcription.clone()?;
+        if config.engine == TranscriptionEngine::Cloud {
+            let profile = self
+                .vendor(config.vendor_id.as_deref())
+                .or_else(|| self.vendors.first())?;
+            config.base_url = profile.base_url.clone();
+            config.api_key = profile.api_key.clone();
+        }
+        Some(config)
+    }
+
+    /// The search planner's settings with the referenced profile's endpoint
+    /// and key folded in. `None` = the planner has no profile to talk
+    /// through.
+    pub fn resolved_search_ai(&self) -> Option<AiSearchConfig> {
+        let mut config = self.search.ai.clone();
+        let profile = self
+            .vendor(config.vendor_id.as_deref())
+            .or_else(|| self.vendors.first())?;
+        config.base_url = profile.base_url.clone();
+        config.api_key = profile.api_key.clone();
+        Some(config)
+    }
+
+    /// Fold the per-feature endpoints the pre-profile configs carried into
+    /// vendor profiles, once, and point each feature at its fold. Idempotent:
+    /// a non-empty vendor list means the fold already happened (the settings
+    /// page owns the list from there on). The legacy per-feature endpoint
+    /// fields end up empty — they only exist so configs written before
+    /// profiles deserialize.
+    pub fn migrate_vendors(&mut self) {
+        if !self.vendors.is_empty() {
+            return;
+        }
+        // Only a feature that was actually configured folds its endpoint in:
+        // the defaults carry a well-known base_url too, and folding those
+        // would manufacture profiles for features nobody ever used.
+        let used = |model: &str| !model.trim().is_empty();
+        let endpoints = [
+            self.ai_embedding
+                .as_ref()
+                .filter(|c| used(&c.model))
+                .map(|c| (c.base_url.clone(), c.api_key.clone())),
+            used(&self.search.ai.model)
+                .then(|| (self.search.ai.base_url.clone(), self.search.ai.api_key.clone())),
+            self.ai_analysis
+                .as_ref()
+                .filter(|c| used(&c.model))
+                .map(|c| (c.base_url.clone(), c.api_key.clone())),
+            self.ai_transcription
+                .as_ref()
+                .filter(|c| c.engine == TranscriptionEngine::Cloud && used(&c.model))
+                .map(|c| (c.base_url.clone(), c.api_key.clone())),
+        ];
+
+        let mut folded: Vec<VendorProfile> = Vec::new();
+        for (base_url, api_key) in endpoints.into_iter().flatten() {
+            if base_url.trim().is_empty()
+                || folded.iter().any(|v| v.base_url == base_url)
+            {
+                continue;
+            }
+            folded.push(VendorProfile {
+                id: uuid::Uuid::new_v4().simple().to_string(),
+                name: vendor_name_from_url(&base_url),
+                base_url: base_url.clone(),
+                api_key,
+                local: is_local_url(&base_url),
+            });
+        }
+        if folded.is_empty() {
+            return;
+        }
+
+        let pick = |vendors: &[VendorProfile], url: &str| -> Option<String> {
+            vendors
+                .iter()
+                .find(|v| v.base_url == url)
+                .map(|v| v.id.clone())
+                .or_else(|| vendors.first().map(|v| v.id.clone()))
+        };
+        if let Some(config) = self.ai_embedding.as_mut() {
+            config.vendor_id = pick(&folded, &config.base_url);
+            config.base_url = String::new();
+            config.api_key = String::new();
+        }
+        self.search.ai.vendor_id = pick(&folded, &self.search.ai.base_url);
+        self.search.ai.base_url = String::new();
+        self.search.ai.api_key = String::new();
+        if let Some(config) = self.ai_analysis.as_mut() {
+            config.vendor_id = pick(&folded, &config.base_url);
+            config.base_url = String::new();
+            config.api_key = String::new();
+        }
+        if let Some(config) = self.ai_transcription.as_mut() {
+            config.vendor_id = pick(&folded, &config.base_url);
+            config.base_url = String::new();
+            config.api_key = String::new();
+        }
+        self.vendors = folded;
     }
 
     /// Persist the config to disk.
@@ -1341,6 +1652,8 @@ mod tests {
     #[test]
     fn a_tier_needs_both_its_toggle_and_a_configured_endpoint() {
         let endpoint = EmbeddingConfig {
+            engine: EmbeddingEngine::Cloud,
+            vendor_id: None,
             base_url: "https://api.example.com/v1".into(),
             api_key: String::new(),
             model: "text-embedding-3-small".into(),
@@ -1672,5 +1985,91 @@ mod tests {
         assert!(!LibraryConfig::load(&dir).skip_purge_confirm());
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+#[cfg(test)]
+mod vendor_migration_tests {
+    use super::*;
+
+    /// The one-time fold: distinct endpoints become profiles, features share
+    /// the profile of the endpoint they carried, legacy fields end up empty,
+    /// and a second run is a no-op.
+    #[test]
+    fn migration_folds_endpoints_into_shared_profiles() {
+        let mut config = AppConfig {
+            ai_embedding: Some(EmbeddingConfig {
+                engine: EmbeddingEngine::Cloud,
+                base_url: "https://api.siliconflow.cn/v1".into(),
+                api_key: "sk-1".into(),
+                vendor_id: None,
+                model: "text-embedding-3-small".into(),
+                multimodal: false,
+            }),
+            search: SearchConfig {
+                ai: AiSearchConfig {
+                    enabled: true,
+                    vendor: "openai".into(),
+                    base_url: "https://api.siliconflow.cn/v1".into(),
+                    api_key: "sk-1".into(),
+                    vendor_id: None,
+                    model: "qwen-turbo".into(),
+                },
+                ..Default::default()
+            },
+            ai_analysis: Some(AiAnalysisConfig {
+                base_url: "http://localhost:11434/v1".into(),
+                api_key: String::new(),
+                vendor_id: None,
+                model: "qwen2.5vl".into(),
+                ..Default::default()
+            }),
+            ai_transcription: None,
+            ..Default::default()
+        };
+
+        config.migrate_vendors();
+
+        assert_eq!(config.vendors.len(), 2, "two distinct endpoints, two profiles");
+        let embedding = config.ai_embedding.as_ref().unwrap();
+        let search = &config.search.ai;
+        assert_eq!(
+            embedding.vendor_id, search.vendor_id,
+            "features on the same endpoint share a profile"
+        );
+        assert_ne!(
+            embedding.vendor_id,
+            config.ai_analysis.as_ref().unwrap().vendor_id,
+        );
+        assert!(
+            config
+                .vendors
+                .iter()
+                .any(|v| v.local && v.name == "localhost"),
+            "localhost endpoints fold into a local-marked profile"
+        );
+        assert!(embedding.base_url.is_empty() && embedding.api_key.is_empty());
+
+        let vendors = config.vendors.clone();
+        config.migrate_vendors();
+        assert_eq!(config.vendors, vendors, "the fold is one-time");
+    }
+
+    /// A fresh install has nothing to fold: no profiles, no churn.
+    #[test]
+    fn migration_leaves_a_fresh_config_alone() {
+        let mut config = AppConfig::default();
+        config.migrate_vendors();
+        assert!(config.vendors.is_empty());
+        assert!(config.ai_embedding.is_none());
+    }
+
+    /// The preset list is what the settings page offers; the well-known
+    /// endpoints must be there and the local ones flagged.
+    #[test]
+    fn vendor_presets_cover_the_known_local_servers() {
+        let ollama = VENDOR_PRESETS.iter().find(|(name, _, _)| *name == "Ollama");
+        assert!(ollama.is_some());
+        assert!(ollama.unwrap().2, "Ollama is a local service");
     }
 }

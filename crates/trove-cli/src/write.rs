@@ -659,7 +659,7 @@ pub fn analyze(
     style: &crate::ctx::Style,
 ) -> Result<Rendered, CliError> {
     let config = trove_core::config::AppConfig::load();
-    let analysis = config.ai_analysis.clone().unwrap_or_default();
+    let analysis = config.resolved_analysis().unwrap_or_default();
     let request = AiAnalysisRunRequest {
         only: parse_asset_ids(&args.ids)?,
         limit: args.limit,

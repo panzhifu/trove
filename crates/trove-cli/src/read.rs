@@ -655,7 +655,7 @@ pub fn doctor(env: &Env) -> Result<Rendered, CliError> {
         },
     );
 
-    let embedding = trove_core::config::AppConfig::load().ai_embedding;
+    let embedding = trove_core::config::AppConfig::load().resolved_embedding();
     match embedding {
         Some(config) => push(
             "embeddings",

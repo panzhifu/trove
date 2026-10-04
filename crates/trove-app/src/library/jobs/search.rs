@@ -41,31 +41,28 @@ pub fn request_query_embedding_app(controller: &Entity<LibraryController>, cx: &
     let Some(endpoint) = trove_core::config::AppConfig::load().semantic_endpoint() else {
         return;
     };
-    let provider: std::sync::Arc<dyn trove_core::ai::EmbeddingProvider> =
-        match trove_core::ai::OpenAICompatible::new(&endpoint) {
-            Ok(provider) => std::sync::Arc::new(provider),
-            Err(error) => {
-                tracing::warn!(%error, "query embedding skipped: endpoint is misconfigured");
-                return;
-            }
-        };
-    let model = endpoint.model.trim().to_string();
-    let space = provider.asset_space();
+    let model = endpoint.model_id().to_string();
     let controller = controller.clone();
 
     cx.spawn(async move |cx| {
         let asked = text.clone();
-        let result: Result<Vec<f32>, String> = cx
+        let result: Result<(Vec<f32>, trove_core::model::EmbeddingSpace), String> = cx
             .background_executor()
             .spawn(async move {
-                provider
+                // The provider is built here, on the worker: a local
+                // embedder loads its weights, which is seconds of work.
+                let provider = trove_core::ai::embedding_provider(&endpoint)
+                    .map_err(|error| error.to_string())?;
+                let space = provider.asset_space();
+                let vector = provider
                     .embed_texts(std::slice::from_ref(&asked))
                     .map(|mut vectors| vectors.pop().unwrap_or_default())
-                    .map_err(|error| error.to_string())
+                    .map_err(|error| error.to_string())?;
+                Ok((vector, space))
             })
             .await;
-        let vector = match result {
-            Ok(vector) if !vector.is_empty() => vector,
+        let (vector, space) = match result {
+            Ok((vector, space)) if !vector.is_empty() => (vector, space),
             Ok(_) => return,
             Err(error) => {
                 tracing::warn!(%error, "query embedding failed; searching with text only");
@@ -110,10 +107,12 @@ pub fn request_ai_plan_app(controller: &Entity<LibraryController>, cx: &mut App)
     if !controller.read(cx).search_tiers.ai {
         return;
     }
-    let config = trove_core::config::AppConfig::load().search.ai;
-    if !config.is_configured() {
+    let config = trove_core::config::AppConfig::load()
+        .resolved_search_ai()
+        .filter(|config| config.is_configured());
+    let Some(config) = config else {
         return;
-    }
+    };
     let provider: std::sync::Arc<dyn trove_core::ai::vendor::VendorAdapter> = match config
         .vendor
         .parse::<trove_core::ai::vendor::VendorId>()

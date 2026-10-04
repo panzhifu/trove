@@ -47,8 +47,6 @@ fn tiers_group(controller: &Entity<LibraryController>) -> SettingGroup {
     let semantic = controller.clone();
     let ai = controller.clone();
     let ai_vendor = controller.clone();
-    let ai_url = controller.clone();
-    let ai_key = controller.clone();
     let ai_model = controller.clone();
 
     SettingGroup::new()
@@ -85,50 +83,40 @@ fn tiers_group(controller: &Entity<LibraryController>) -> SettingGroup {
             )
             .description(rust_i18n::t!("settings.search_ai_desc").to_string()),
         )
-        .item(SettingItem::new(
-            rust_i18n::t!("settings.search_ai_vendor").to_string(),
-            SettingField::dropdown(
-                vendor_options(),
-                |_cx| SharedString::from(search_config().ai.vendor.clone()),
-                move |value, cx| {
-                    save_search(
-                        &ai_vendor,
-                        |config| {
-                            apply_vendor_choice(
-                                &mut config.ai.vendor,
-                                &mut config.ai.base_url,
-                                &value,
-                            )
-                        },
-                        cx,
-                    )
-                },
-            ),
-        ))
-        .item(SettingItem::new(
-            rust_i18n::t!("settings.ai_base_url").to_string(),
-            SettingField::input(
-                |_cx| SharedString::from(search_config().ai.base_url.clone()),
-                move |value, cx| {
-                    save_search(&ai_url, |config| config.ai.base_url = value.to_string(), cx)
-                },
-            ),
-        ))
-        .item(SettingItem::new(
-            rust_i18n::t!("settings.ai_api_key").to_string(),
-            SettingField::input(
-                |_cx| SharedString::from(search_config().ai.api_key.clone()),
-                move |value, cx| {
-                    save_search(&ai_key, |config| config.ai.api_key = value.to_string(), cx)
-                },
-            ),
-        ))
+        .item(
+            SettingItem::new(
+                rust_i18n::t!("settings.feature_vendor").to_string(),
+                vendor_field(
+                    || search_config().ai.vendor_id.clone(),
+                    move |value, cx| {
+                        save_search(&ai_vendor, |config| {
+                            config.ai.vendor_id = Some(value.clone());
+                            // Same rule as the analysis feature: the stored
+                            // family follows the profile's host, so the
+                            // native adapters survive a re-pick.
+                            if let Some(profile) =
+                                AppConfig::load().vendors.iter().find(|v| v.id == value)
+                            {
+                                config.ai.vendor = family_for_base_url(&profile.base_url);
+                            }
+                        }, cx)
+                    },
+                ),
+            )
+            .description(rust_i18n::t!("settings.feature_vendor_desc").to_string()),
+        )
         .item(SettingItem::new(
             rust_i18n::t!("settings.search_ai_model").to_string(),
-            SettingField::input(
-                |_cx| SharedString::from(search_config().ai.model.clone()),
+            model_field(
+                "search-planner-model",
+                AppConfig::load()
+                    .vendor(search_config().ai.vendor_id.as_deref())
+                    .map(|profile| profile.base_url.clone())
+                    .unwrap_or_default(),
+                ModelPresets::Chat,
+                || search_config().ai.model.clone(),
                 move |value, cx| {
-                    save_search(&ai_model, |config| config.ai.model = value.to_string(), cx)
+                    save_search(&ai_model, |config| config.ai.model = value, cx)
                 },
             ),
         ))

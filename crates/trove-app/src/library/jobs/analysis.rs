@@ -9,7 +9,9 @@ use gpui_kit::component::WindowExt as _;
 use gpui_kit::component::notification::Notification;
 use gpui_kit::*;
 
+use trove_core::model::AssetKind;
 use trove_core::tasks::TaskStatus;
+use trove_core::tasks::transcription::TranscribeRunRequest;
 use trove_core::tasks::ai_analysis::{AiAnalysisOutcome, AiAnalysisRunRequest, UndoOutcome};
 use trove_core::tasks::{TaskId, TaskKind};
 
@@ -61,7 +63,7 @@ pub fn test_analysis_endpoint_app(controller: &Entity<LibraryController>, cx: &m
         return;
     }
     let Some(config) = trove_core::config::AppConfig::load()
-        .ai_analysis
+        .resolved_analysis()
         .filter(trove_core::config::AiAnalysisConfig::is_configured)
     else {
         set_analysis_probe(
@@ -146,7 +148,7 @@ fn analysis_provider(
     cx: &mut App,
 ) -> Option<std::sync::Arc<dyn trove_core::ai::vendor::VendorAdapter>> {
     let analysis = trove_core::config::AppConfig::load()
-        .ai_analysis
+        .resolved_analysis()
         .unwrap_or_default();
     if !analysis.is_configured() {
         window.push_notification(
@@ -224,6 +226,49 @@ pub fn start_analysis_app(
     window: &mut Window,
     cx: &mut App,
 ) -> bool {
+    // The transcript is what gives an audio asset's analysis its content,
+    // and the local transcription engine needs its weights to make one. So
+    // analysis time is when the download question earns its ask: if the
+    // selection holds sound that has never been transcribed and the model
+    // is not on disk, offer the download now — the transcription it chains
+    // runs the moment the model lands, and the analysis can be re-run on
+    // assets that then carry transcripts.
+    let transcription = trove_core::config::AppConfig::load()
+        .ai_transcription
+        .unwrap_or_default();
+    if transcription.engine == trove_core::config::TranscriptionEngine::Local
+        && matches!(target, AnalysisTarget::Selection)
+        && !matches!(
+            trove_core::services::local_model::status(),
+            trove_core::services::local_model::ModelStatus::Ready { .. }
+        )
+    {
+        let selection = controller.read(cx).selected_assets.as_ref().clone();
+        let untranscribed: Vec<uuid::Uuid> = controller
+            .read(cx)
+            .library
+            .assets_by_ids(&selection)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|asset| matches!(asset.kind, AssetKind::Audio | AssetKind::Video))
+            .map(|asset| asset.id)
+            .filter(|id| controller.read(cx).library.transcript(*id).ok().flatten().is_none())
+            .collect();
+        if !untranscribed.is_empty() {
+            let ready = super::local_model::ensure_local_model_app(
+                controller,
+                Some(TranscribeRunRequest {
+                    only: untranscribed,
+                    ..TranscribeRunRequest::default()
+                }),
+                window,
+                cx,
+            );
+            if !ready {
+                return false;
+            }
+        }
+    }
     let Some(provider) = analysis_provider(window, cx) else {
         return false;
     };

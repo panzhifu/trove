@@ -12,18 +12,37 @@
 //! task threads ([`crate::tasks`]), which are plain `std::thread`s.
 
 pub mod analysis;
+mod embed_local;
 mod embedding_openai;
 mod http;
+mod local_device;
 pub mod mock;
 pub mod search_planner;
 pub mod transcribe;
+pub mod transcribe_local;
 pub mod vendor;
 
+pub use embed_local::LocalBert;
 pub use embedding_openai::OpenAICompatible;
 pub use mock::MockProvider;
 
+use crate::config::EmbeddingEngine;
 use crate::error::Result;
 use crate::model::{Asset, EmbeddingSpace};
+
+/// Build the embedding provider the saved settings ask for: the
+/// OpenAI-compatible cloud client, or the local candle BGE engine (whose
+/// model must already be on disk — the UI asks to download it before a run
+/// starts, and construction loads the weights, so callers keep it off the
+/// UI thread).
+pub fn embedding_provider(
+    config: &crate::config::EmbeddingConfig,
+) -> Result<std::sync::Arc<dyn EmbeddingProvider>> {
+    match config.engine {
+        EmbeddingEngine::Local => Ok(std::sync::Arc::new(embed_local::build()?)),
+        EmbeddingEngine::Cloud => Ok(std::sync::Arc::new(OpenAICompatible::new(config)?)),
+    }
+}
 
 /// A source of embeddings for the library's assets and queries.
 ///
