@@ -22,6 +22,19 @@ const LOUPE_PRIORITY: usize = 5;
 
 // ============================ cell rendering =================================
 
+/// Whether this asset is a subtitle sidecar (`.srt`), which opens straight
+/// into the subtitle editor. Resolved on the double-click handler, not per
+/// frame, so the grid's hot path never reads the store for it.
+fn opens_as_subtitle(controller: &Entity<LibraryController>, id: Uuid, cx: &App) -> bool {
+    controller
+        .read(cx)
+        .library
+        .asset(id)
+        .ok()
+        .flatten()
+        .is_some_and(|asset| asset.ext.eq_ignore_ascii_case("srt"))
+}
+
 /// One cell thumbnail with click / drag / context-menu behavior, rendered at
 /// the exact pixel size the row layout assigned to it. Selection is read live
 /// from the controller. Clicking focuses the tiles so the grid keyboard
@@ -119,13 +132,19 @@ pub(super) fn build_cell_element(
             cx.theme().border
         })
         .overflow_hidden()
-        // An audio card is baked on trove-core's fixed paper, and its
-        // contained image floats over this cell's background — a theme
-        // surface there read as bands above and below the waveform. The
-        // cell takes the paper instead, and the bands disappear.
-        .when(kind == AssetKind::Audio, |cell| {
-            cell.bg(gpui::rgb(trove_core::media::CARD_PAPER_RGB))
-        })
+        // A card baked on trove-core's fixed paper floats over this cell's
+        // background, and a theme surface behind it read as bands above and
+        // below the picture. Audio's waveform and every text card (a `.srt`
+        // subtitle, a `.txt`, a source file — which arrive as `Document` or
+        // `Other`) are all such cards, so those cells take the paper too and
+        // the bands disappear.
+        .when(
+            matches!(
+                kind,
+                AssetKind::Audio | AssetKind::Document | AssetKind::Other
+            ),
+            |cell| cell.bg(gpui::rgb(trove_core::media::CARD_PAPER_RGB)),
+        )
         // `on_prepaint` belongs on the plain div, before the id (same contract
         // as the preview stage). The live tile measures itself so the larger view
         // has a box to hang off, and the first measurement of a tile asks for one
@@ -196,10 +215,12 @@ pub(super) fn build_cell_element(
     let base = base.on_click(move |event: &ClickEvent, window, _cx| {
         // Focus the grid so keyboard navigation applies right away.
         window.focus(&focus, _cx);
-        // A double click on a model is the mouse way of saying "preview
-        // this one"; the grid handles the action, and only opens the
-        // viewport for a mesh.
-        if kind == AssetKind::Model && event.click_count() == 2 {
+        // A double click opens the preview: the 3D viewport for a mesh, the
+        // subtitle editor for a sidecar. Other kinds select only — their
+        // preview is Enter's job.
+        if event.click_count() == 2
+            && (kind == AssetKind::Model || opens_as_subtitle(&ctl_click, id_click, _cx))
+        {
             window.dispatch_action(Box::new(OpenPreview), _cx);
             return;
         }
@@ -494,8 +515,10 @@ pub(super) fn build_list_row_element(
     let focus = focus_handle.clone();
     let base = base.on_click(move |event: &ClickEvent, window, _cx| {
         window.focus(&focus, _cx);
-        // A double click on a model previews it (see the grid cell).
-        if kind == AssetKind::Model && event.click_count() == 2 {
+        // A double click opens the preview (see the grid cell).
+        if event.click_count() == 2
+            && (kind == AssetKind::Model || opens_as_subtitle(&ctl_click, id, _cx))
+        {
             window.dispatch_action(Box::new(OpenPreview), _cx);
             return;
         }

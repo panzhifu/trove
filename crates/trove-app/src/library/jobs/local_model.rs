@@ -77,6 +77,76 @@ pub fn ensure_local_model_app(
     false
 }
 
+/// Delete the local transcription model's files after a confirm. Guarded
+/// against a download in flight and a running transcription job (the
+/// recogniser holds the weights open for its whole run).
+pub fn delete_local_model_app(
+    controller: &Entity<LibraryController>,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    if controller
+        .read(cx)
+        .local_model_download
+        .as_ref()
+        .is_some_and(ModelDownload::is_running)
+    {
+        window.push_notification(
+            Notification::warning(rust_i18n::t!("settings.model_delete_busy_download").to_string()),
+            cx,
+        );
+        return;
+    }
+    if controller
+        .read(cx)
+        .library
+        .tasks()
+        .is_active(&trove_core::tasks::TaskKind::Transcription)
+    {
+        window.push_notification(
+            Notification::warning(rust_i18n::t!("settings.model_delete_busy_run").to_string()),
+            cx,
+        );
+        return;
+    }
+    let controller = controller.clone();
+    window.open_alert_dialog(
+        cx,
+        move |alert, _, _| {
+            let controller = controller.clone();
+            alert
+                .title(rust_i18n::t!("settings.model_delete_title").to_string())
+                .description(
+                    rust_i18n::t!("settings.model_delete_body", mb = local_model::MODEL_DOWNLOAD_MB)
+                        .to_string(),
+                )
+                .confirm()
+                .ok_text(rust_i18n::t!("settings.model_delete").to_string())
+                .cancel_text(rust_i18n::t!("settings.local_model_not_now").to_string())
+                .on_ok(move |_, window, cx| {
+                    match local_model::delete() {
+                        Ok(()) => {
+                            window.push_notification(
+                                Notification::success(
+                                    rust_i18n::t!("settings.model_deleted").to_string(),
+                                ),
+                                cx,
+                            );
+                        }
+                        Err(error) => {
+                            window.push_notification(
+                                Notification::warning(error.to_string()),
+                                cx,
+                            );
+                        }
+                    }
+                    controller.update(cx, |_, cx| cx.notify());
+                    true
+                })
+        },
+    );
+}
+
 /// Run the model download in the background: progress on the controller for
 /// the settings page, toasts at the end, and `then` re-launched on success.
 pub fn start_model_download_app(

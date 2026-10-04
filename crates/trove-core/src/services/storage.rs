@@ -60,6 +60,10 @@ pub struct StorageReport {
     /// Screenshots and collected files waiting to be imported, or already
     /// imported and linked from here.
     pub incoming: DirUsage,
+    /// Downloaded local models (the transcriber's Whisper, the embedder's
+    /// BGE/bge-m3) under `<data>/models` — hundreds of MB to a couple of GB,
+    /// and deletable from the AI settings page.
+    pub models: DirUsage,
     /// Everything above, added up.
     pub total: DirUsage,
 }
@@ -97,6 +101,7 @@ pub fn report(library_data_root: &Path, library_cache_root: &Path) -> StorageRep
     let search_index = dir_usage(&library_cache_root.join("search_index"));
     let logs = dir_usage(&paths::logs_dir());
     let incoming = dir_usage(&paths::incoming_dir());
+    let models = dir_usage(&paths::data_dir().join("models"));
 
     let total = config
         .plus(library_db)
@@ -107,7 +112,8 @@ pub fn report(library_data_root: &Path, library_cache_root: &Path) -> StorageRep
         .plus(sheets)
         .plus(search_index)
         .plus(logs)
-        .plus(incoming);
+        .plus(incoming)
+        .plus(models);
 
     StorageReport {
         config,
@@ -120,6 +126,7 @@ pub fn report(library_data_root: &Path, library_cache_root: &Path) -> StorageRep
         search_index,
         logs,
         incoming,
+        models,
         total,
     }
 }
@@ -242,9 +249,13 @@ mod tests {
                 bytes: 128,
                 files: 7,
             },
+            models: DirUsage {
+                bytes: 256,
+                files: 8,
+            },
             total: DirUsage {
-                bytes: 284,
-                files: 37,
+                bytes: 540,
+                files: 45,
             },
         };
         assert_eq!(
@@ -261,6 +272,6 @@ mod tests {
                 files: 17
             }
         );
-        assert_eq!(report.total.bytes, 284);
+        assert_eq!(report.total.bytes, 540);
     }
 }

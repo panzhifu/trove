@@ -12,7 +12,7 @@ use trove_core::model::AssetKind;
 use trove_core::tasks::transcription::{TranscribeOutcome, TranscribeRunRequest};
 use trove_core::tasks::{TaskKind, TaskStatus};
 
-use super::{NoticeKey, watch_job};
+use super::{JobStep, NoticeKey, watch_job};
 use crate::library::{LibraryController, Retryable, TranscriptionProbe};
 
 /// Marker for the keyed transcription toast.
@@ -240,7 +240,23 @@ pub fn start_transcription_request_app(
         rx,
         window.window_handle(),
         |outcome: &TranscribeOutcome| Some(transcribe_outcome_toast(outcome)),
-        |_, _| {},
+        // The run's transcribed ids become the subtitle exports. The watcher
+        // has no window to ask an overwrite question from, so it only leaves
+        // the ids on the controller; the app view's observer does the writing.
+        |ctl, step| {
+            if let JobStep::Completed(outcome) = step {
+                let export = crate::library::PendingSubtitleExport {
+                    transcribed: outcome.transcribed_ids.clone(),
+                    // Skipped assets still get a missing sidecar backfilled:
+                    // the recogniser was not asked again, but a stored
+                    // transcript whose `.srt` is gone should not stay gone.
+                    backfill: outcome.skipped_ids.clone(),
+                };
+                if !export.is_empty() {
+                    ctl.pending_subtitle_save = Some(export);
+                }
+            }
+        },
         cx,
     );
     true

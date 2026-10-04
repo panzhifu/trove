@@ -63,7 +63,7 @@ pub fn start_embedding_backfill_app(
         );
         return false;
     };
-    let model_id = config.model_id().to_string();
+    let model_id = config.model_id();
 
     let manager = controller.read(cx).library.tasks().clone();
     let started = controller.update(cx, |ctl, _| {
@@ -207,7 +207,7 @@ pub fn delete_embeddings_app(
     // a profile-less cloud config still gets its vectors cleared.
     let model = trove_core::config::AppConfig::load()
         .ai_embedding
-        .map(|config| config.model_id().to_string())
+        .map(|config| config.model_id())
         .filter(|model| !model.is_empty());
     let Some(model) = model else {
         window.push_notification(

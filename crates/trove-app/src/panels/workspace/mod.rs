@@ -49,7 +49,8 @@ use crate::app::actions::{
     StepFrameForward, TogglePlayback,
 };
 use crate::components::preview::{
-    AssetPreviewEvent, AssetPreviewPanel, LiveCard, ModelViewport, ModelViewportEvent, VideoPlayer,
+    AssetPreviewEvent, AssetPreviewPanel, LiveCard, ModelViewport, ModelViewportEvent,
+    SubtitleEditor, SubtitleEvent, VideoPlayer,
 };
 use crate::library::{GRID_PAGE_SIZE, LibraryController, ViewMode};
 
@@ -120,6 +121,8 @@ const TOTAL_SETTLE_DELAY: std::time::Duration = std::time::Duration::from_millis
 enum MainPreview {
     Model(Entity<ModelViewport>),
     Asset(Entity<AssetPreviewPanel>),
+    /// The subtitle editor for an audio/video asset that carries a `.srt`.
+    Subtitle(Entity<SubtitleEditor>),
 }
 
 impl MainPreview {
@@ -133,6 +136,8 @@ impl MainPreview {
             MainPreview::Asset(preview) => {
                 preview.update(cx, |preview, cx| preview.release(window, cx));
             }
+            // Text only: no decoded frames to hand back.
+            MainPreview::Subtitle(_) => {}
         }
     }
 }
@@ -245,6 +250,14 @@ pub struct WorkspacePanel {
     /// in `render` for why a per-frame flag pages eagerly. `usize::MAX` means
     /// "no request yet", which no real cursor can equal.
     page_guard: Rc<CellFlag<usize>>,
+    /// The search term the rows were last laid out for, and whether an async
+    /// refinement was fused into that layout. A committed search — and the
+    /// semantic/AI refinement landing for it — must show the first match; even
+    /// though the row relayout resets the list, a later width-only restore can
+    /// park the viewport on a stale anchor, so these two drive one explicit
+    /// scroll back to row 0 the moment either moves.
+    last_search: String,
+    last_fused: bool,
 }
 
 impl WorkspacePanel {
@@ -715,6 +728,7 @@ impl Render for WorkspacePanel {
                 .child(match preview {
                     MainPreview::Model(viewport) => viewport.into_any_element(),
                     MainPreview::Asset(preview) => preview.into_any_element(),
+                    MainPreview::Subtitle(editor) => editor.into_any_element(),
                 })
                 .into_any_element();
         }
@@ -742,6 +756,7 @@ impl Render for WorkspacePanel {
             active_folder,
             visual_ids,
             visual_label,
+            fused,
         ) = {
             let ctl = self.controller.read(cx);
             (
@@ -766,6 +781,15 @@ impl Render for WorkspacePanel {
                 ctl.active_folder.clone(),
                 ctl.visual_results.as_ref().map(|r| r.ids.clone()),
                 ctl.visual_results.as_ref().map(|r| r.label.clone()),
+                // Whether the listing carries an async refinement — the
+                // query vector and/or the AI plan fused into the ranking.
+                // Their arrival re-ranks the listing under a key the layout
+                // otherwise cannot see, so it rides along here: without it
+                // the refined order either never renders (same hit count)
+                // or refills the rows in place (different count), leaving
+                // the viewport parked mid-listing when it lands — the
+                // "search jumps to the middle" report.
+                ctl.query_vector.is_some() || ctl.ai_plan.is_some(),
             )
         };
         let library_root = self.controller.read(cx).library.root().to_path_buf();
@@ -940,6 +964,7 @@ impl Render for WorkspacePanel {
                 || k.sort != sort
                 || k.sort_desc != sort_desc
                 || k.visual != visual_ids
+                || k.fused != fused
         });
 
         // Structural changes (view / filter / asset set) always relayout now;
@@ -986,6 +1011,7 @@ impl Render for WorkspacePanel {
             content_width,
             row_height_scale,
             visual: visual_ids.clone(),
+            fused,
         };
         // The debounce settled on a width that already equals the applied one
         // (resize flickered back): clear the pending flag so future resizes
@@ -1053,9 +1079,15 @@ impl Render for WorkspacePanel {
                 }
             } else {
                 self.list_state.reset(self.rows.len());
+                // Reset alone leaves the offset implicit; pin it to the first
+                // row as well so no earlier pending scroll re-applies and a
+                // new view always opens on its first result.
+                self.list_state.scroll_to(ListOffset {
+                    item_ix: 0,
+                    offset_in_item: px(0.),
+                });
             }
-        } else if !defer_layout && self.covered != cells.len() {
-            // Assets were added or removed. A page appended to the end of a
+        } else if !defer_layout && self.covered != cells.len() {            // Assets were added or removed. A page appended to the end of a
             // listing the grid already has rows for leaves those rows holding
             // the same cells in the same order, so they are kept as they are and
             // only the new window is laid out. Anything else — an import, a
@@ -1100,6 +1132,20 @@ impl Render for WorkspacePanel {
             } else {
                 self.list_state.splice(new_count..old_rows, 0);
             }
+        }
+        // A committed search — and the semantic/AI refinement landing for it —
+        // must land on the first match. The row relayout above resets the
+        // list, but a width-only restore on a later frame can scroll to a
+        // stale anchor and park the viewport mid-listing; pin row 0 here the
+        // moment the term or the fused refinement moves, so the top match is
+        // what is shown.
+        if self.last_search != search || self.last_fused != fused {
+            self.last_search = search.clone();
+            self.last_fused = fused;
+            self.list_state.scroll_to(ListOffset {
+                item_ix: 0,
+                offset_in_item: px(0.),
+            });
         }
         let rows = self.rows.clone();
         self.last_total = total;

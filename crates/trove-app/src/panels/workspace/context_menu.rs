@@ -28,7 +28,7 @@ pub(crate) fn asset_context_menu(
         return trash_menu(menu, controller, asset_id);
     }
 
-    let (favorite, current_status, current_clearance, is_image, font_file) = controller
+    let (favorite, current_status, current_clearance, is_image, is_av, font_file) = controller
         .read(cx)
         .library
         .asset(asset_id)
@@ -51,10 +51,29 @@ pub(crate) fn asset_context_menu(
                 a.usage_status,
                 a.commercial_use,
                 a.kind == AssetKind::Image,
+                matches!(a.kind, AssetKind::Audio | AssetKind::Video),
                 font_file,
             )
         })
-        .unwrap_or((false, UsageStatus::Unused, None, false, None));
+        .unwrap_or((false, UsageStatus::Unused, None, false, false, None));
+    // The view-subtitles entry appears only where there is something to show:
+    // a transcript, or a sidecar already on disk. One indexed-column read per
+    // right-click, on the menu's own build (which happens on click, not per
+    // frame).
+    let has_transcript = controller
+        .read(cx)
+        .library
+        .transcript(asset_id)
+        .ok()
+        .flatten()
+        .is_some_and(|text| !text.trim().is_empty());
+    // A sidecar on disk makes the subtitle view worth opening even without a
+    // transcript (a hand-authored `.srt`, or one whose asset was re-imported).
+    let has_srt = controller
+        .read(cx)
+        .library
+        .asset_file(asset_id)
+        .is_some_and(|path| path.with_extension("srt").is_file());
     let browsed_collection = controller.read(cx).current_collection;
 
     let ctl_build = controller.clone();
@@ -114,7 +133,25 @@ pub(crate) fn asset_context_menu(
                     );
                 }
             }),
-        )
+        );
+
+    if is_av && (has_transcript || has_srt) {
+        let c_view = controller.clone();
+        menu = menu.item(
+            PopupMenuItem::new(rust_i18n::t!("workspace.view_subtitles").to_string()).on_click(
+                move |_, _, cx| {
+                    // The workspace owns the center view; leave the request on
+                    // the controller for it to pick up on its next notify.
+                    c_view.update(cx, |ctl, cx| {
+                        ctl.pending_subtitle_open = Some(asset_id);
+                        cx.notify();
+                    });
+                },
+            ),
+        );
+    }
+
+    let mut menu = menu
         .item(
             PopupMenuItem::new(if favorite {
                 rust_i18n::t!("workspace.remove_from_favorites").to_string()

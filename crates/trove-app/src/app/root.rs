@@ -342,6 +342,14 @@ impl AppView {
         // collapsed. Multi-select gestures (Ctrl toggle / Shift range) and
         // clears never steal the tab.
         cx.observe_in(&controller, window, move |this, controller, window, cx| {
+            // A finished transcription leaves its subtitle-export request on
+            // the controller; only here is there a window to write the
+            // sidecars and to ask before overwriting one that exists.
+            if let Some(request) =
+                controller.update(cx, |ctl, _| ctl.pending_subtitle_save.take())
+            {
+                crate::library::jobs::auto_save_subtitles_app(&controller, request, window, cx);
+            }
             // A thumbnail rebuild rewrites the files but not their paths; the
             // epoch is the signal to drop the cached decodes so the next
             // paint re-reads the pictures from disk.

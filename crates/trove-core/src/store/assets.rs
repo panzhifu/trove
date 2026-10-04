@@ -117,6 +117,23 @@ pub fn find_by_content_hash(conn: &Connection, content_hash: &str) -> Result<Opt
     )
 }
 
+/// Find a live linked asset whose original source path is exactly `path`.
+///
+/// A sidecar Trove writes itself (a subtitle `.srt`) reuses its record by
+/// path, not by content hash: editing it changes the hash, and a hash-keyed
+/// lookup would then insert a second row pointing at the same file.
+pub fn find_linked_by_path(conn: &Connection, path: &str) -> Result<Option<Asset>> {
+    rows::query_one(
+        conn,
+        &format!(
+            "SELECT {COLS} FROM assets \
+             WHERE origin = 'linked' AND source_path = ?1 AND {LIVE_ROWS}"
+        ),
+        vec![path.to_string().into()],
+        asset_from_row,
+    )
+}
+
 // -- full-text search --------------------------------------------------------
 
 /// Materialise assets by id, preserving the input order. Missing ids are

@@ -455,14 +455,6 @@ impl Render for InspectorPanel {
         let added = asset.created_at.format("%Y-%m-%d %H:%M").to_string();
         let mime = asset.mime.clone();
         let font_facts = asset.facts.font.clone();
-        // Speech-to-text output, read on demand: the column is deliberately
-        // out of the bulk row load, and the inspector is the one place that
-        // pays for the text.
-        let transcript = if matches!(kind, AssetKind::Audio | AssetKind::Video) {
-            ctl.library.transcript(asset_id).ok().flatten()
-        } else {
-            None
-        };
         // Workflow state + license clearance, edited from the workspace
         // context menu; the inspector displays them read-only.
         let status_text = match asset.usage_status {
@@ -516,7 +508,11 @@ impl Render for InspectorPanel {
             .border_1()
             .border_color(cx.theme().border)
             .bg(match kind {
-                AssetKind::Font | AssetKind::Audio => paper,
+                // Cards baked on trove-core's own paper (font specimen, audio
+                // waveform, text/subtitle documents) take that paper as the
+                // frame, so the contained card does not float on a theme
+                // surface with bands around it. Everything else uses the theme.
+                AssetKind::Font | AssetKind::Audio | AssetKind::Document | AssetKind::Other => paper,
                 _ => cx.theme().secondary,
             })
             .overflow_hidden()
@@ -854,17 +850,6 @@ impl Render for InspectorPanel {
                 cx,
                 props_content,
             ));
-
-        if let Some(transcript) = transcript {
-            content = content.child(self.collapsible_section(
-                "transcript",
-                rust_i18n::t!("inspector.transcript").to_string(),
-                cx,
-                v_flex().gap_1().px_1().child(scrollbar::vertical(
-                    div().max_h(px(260.)).text_sm().child(transcript),
-                )),
-            ));
-        }
 
         if kind == AssetKind::Font {
             let font_content = self.font_section(

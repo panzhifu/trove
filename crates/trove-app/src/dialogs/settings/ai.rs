@@ -61,7 +61,7 @@ pub(super) fn ai_page(controller: &Entity<LibraryController>, cx: &App) -> Setti
         controller
             .read(cx)
             .library
-            .embedding_coverage(config.model_id())
+            .embedding_coverage(&config.model_id())
             .ok()
     } else {
         None
@@ -446,16 +446,24 @@ fn endpoint_group(controller: &Entity<LibraryController>, probe: &AiProbe) -> Se
                 .description(rust_i18n::t!("settings.embed_multimodal_desc").to_string()),
             )
     } else {
-        group.item(
-            SettingItem::new(
-                rust_i18n::t!("settings.embed_model_item").to_string(),
-                SettingField::render({
-                    let controller = controller.clone();
-                    move |_, _, cx| embed_model_row(&controller, cx)
-                }),
+        group
+            .item(
+                SettingItem::new(
+                    rust_i18n::t!("settings.embed_model_pick").to_string(),
+                    embed_model_pick_field(),
+                )
+                .description(rust_i18n::t!("settings.embed_model_pick_desc").to_string()),
             )
-            .description(rust_i18n::t!("settings.embed_model_desc").to_string()),
-        )
+            .item(
+                SettingItem::new(
+                    rust_i18n::t!("settings.embed_model_item").to_string(),
+                    SettingField::render({
+                        let controller = controller.clone();
+                        move |_, _, cx| embed_models_block(&controller, cx)
+                    }),
+                )
+                .description(rust_i18n::t!("settings.embed_model_desc").to_string()),
+            )
     };
     group.item(
         SettingItem::new(
@@ -529,15 +537,54 @@ fn embedding_model_field() -> SettingField<SharedString> {
     )
 }
 
-/// The local embedding model's row: where it is, how the download is going,
-/// and the one button that starts (or retries) it — the transcription
-/// model's row with a different model service behind it.
-fn embed_model_row(controller: &Entity<LibraryController>, cx: &mut App) -> Div {
+/// Which catalog model the local engine runs: one row per BGE checkpoint,
+/// the size annotating what a pick costs to fetch. The pick only names the
+/// target — the row below downloads it and shows whether it is present.
+fn embed_model_pick_field() -> SettingField<SharedString> {
+    let options: Vec<(SharedString, SharedString)> = trove_core::services::embed_model::MODELS
+        .iter()
+        .map(|model| {
+            (
+                SharedString::from(model.id),
+                SharedString::from(format!("{} · {} MB", model.id, model.download_mb)),
+            )
+        })
+        .collect();
+    let current = SharedString::from(embedding_config().local_model_id().to_string());
+    SettingField::dropdown(
+        options,
+        move |_| current.clone(),
+        |value, cx| {
+            save_embedding_config(|config| config.local_model = Some(value.to_string()), cx)
+        },
+    )
+}
+
+/// The selected local embedding model — the one the picker above names, and
+/// the only model this row talks about: what it is, whether it is on disk,
+/// and the one control that matters for its state (download or retry while
+/// it is missing, delete once it is on disk). Another model enters the row
+/// by being picked, not by being listed.
+fn embed_models_block(controller: &Entity<LibraryController>, cx: &mut App) -> Div {
     use trove_core::services::embed_model as em;
 
-    let (text, color, download_label) = match controller.read(cx).embed_model_download.clone() {
+    let model = em::resolve(embedding_config().local_model_id());
+    let embed_download = controller.read(cx).embed_model_download.clone();
+    let download_for = controller.read(cx).embed_model_download_for.clone();
+    let any_running = embed_download
+        .as_ref()
+        .is_some_and(ModelDownload::is_running);
+    // The download slot is page-global, but its state belongs to the model it
+    // was started for: a row left behind by a re-pick must not wear another
+    // model's progress or failure.
+    let download = (download_for.as_deref() == Some(model.id))
+        .then_some(embed_download)
+        .flatten();
+    let ready = matches!(em::status(model.id), em::ModelStatus::Ready { .. });
+
+    let (status_text, status_color) = match &download {
         Some(ModelDownload::Running { received, total }) => {
-            let text = if total > 0 {
+            let text = if *total > 0 {
                 rust_i18n::t!(
                     "settings.local_model_progress",
                     received = received / 1_048_576,
@@ -547,46 +594,98 @@ fn embed_model_row(controller: &Entity<LibraryController>, cx: &mut App) -> Div 
             } else {
                 rust_i18n::t!("settings.local_model_downloading").to_string()
             };
-            (text, cx.theme().muted_foreground, None)
+            (text, cx.theme().muted_foreground)
         }
         Some(ModelDownload::Failed { message }) => (
             rust_i18n::t!("settings.local_model_failed", error = message.as_str()).to_string(),
             cx.theme().danger,
-            Some(rust_i18n::t!("settings.local_model_retry").to_string()),
         ),
-        None => match em::status() {
-            em::ModelStatus::Ready { path } => (
-                rust_i18n::t!("settings.local_model_ready", path = path.display().to_string())
-                    .to_string(),
-                cx.theme().success,
-                None,
-            ),
-            em::ModelStatus::Missing => (
-                rust_i18n::t!("settings.local_model_missing").to_string(),
-                cx.theme().muted_foreground,
-                Some(rust_i18n::t!("settings.local_model_download").to_string()),
-            ),
-        },
+        None if ready => (
+            rust_i18n::t!("settings.model_downloaded").to_string(),
+            cx.theme().success,
+        ),
+        None => (
+            rust_i18n::t!("settings.local_model_missing").to_string(),
+            cx.theme().muted_foreground,
+        ),
     };
 
     let mut row = h_flex()
         .w_full()
         .items_center()
-        .justify_end()
+        .justify_between()
         .gap_2()
-        .child(div().text_sm().text_color(color).child(text));
-    if let Some(label) = download_label {
+        .child(
+            h_flex()
+                .flex_1()
+                .min_w_0()
+                .gap_2()
+                .items_baseline()
+                .child(
+                    div()
+                        .flex_none()
+                        .text_sm()
+                        .text_color(cx.theme().foreground)
+                        .child(format!("{} · {} MB", model.id, model.download_mb)),
+                )
+                // The status can be an entire failure sentence (a URL plus a
+                // reason). It takes the free space and wraps; the button keeps
+                // its own width and stays reachable instead of being pushed
+                // out of the row by the text.
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .text_xs()
+                        .text_color(status_color)
+                        .child(status_text),
+                ),
+        );
+
+    // Not on disk: start (or retry) its download. While any embedding-model
+    // download is in flight the button steps aside — the slot is single, and
+    // its progress is the downloading model's own status text.
+    if !ready && !any_running {
+        let label = if matches!(download, Some(ModelDownload::Failed { .. })) {
+            rust_i18n::t!("settings.local_model_retry").to_string()
+        } else {
+            rust_i18n::t!("settings.local_model_download").to_string()
+        };
         let controller = controller.clone();
         row = row.child(
             Button::new("embed-model-download")
                 .outline()
                 .small()
+                .flex_none()
                 .label(label)
                 .on_click(move |_, window, cx| {
                     crate::library::jobs::start_embed_model_download_app(&controller, window, cx);
                 }),
         );
     }
+    // On disk: free it. The vectors it built stay — clearing those is the
+    // Vectors group's own delete button below.
+    if ready {
+        let controller = controller.clone();
+        let id = model.id.to_string();
+        row = row.child(
+            Button::new("embed-model-delete")
+                .ghost()
+                .small()
+                .flex_none()
+                .icon(IconName::Trash)
+                .tooltip(rust_i18n::t!("settings.model_delete").to_string())
+                .on_click(move |_, window, cx| {
+                    crate::library::jobs::delete_embed_model_id_app(
+                        &controller,
+                        id.clone(),
+                        window,
+                        cx,
+                    );
+                }),
+        );
+    }
+
     row
 }
 
@@ -1247,18 +1346,43 @@ fn local_model_row(controller: &Entity<LibraryController>, cx: &mut App) -> Div 
     let mut row = h_flex()
         .w_full()
         .items_center()
-        .justify_end()
+        .justify_between()
         .gap_2()
-        .child(div().text_sm().text_color(color).child(text));
+        // The message can be an entire failure sentence (a URL plus a reason).
+        // It takes the free space and wraps; the button keeps its own width and
+        // stays reachable instead of being pushed out of the row by the text.
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .text_sm()
+                .text_color(color)
+                .child(text),
+        );
     if let Some(label) = download_label {
         let controller = controller.clone();
         row = row.child(
             Button::new("local-model-download")
                 .outline()
                 .small()
+                .flex_none()
                 .label(label)
                 .on_click(move |_, window, cx| {
                     crate::library::jobs::start_model_download_app(&controller, None, window, cx);
+                }),
+        );
+    }
+    if matches!(lm::status(), lm::ModelStatus::Ready { .. }) {
+        let controller = controller.clone();
+        row = row.child(
+            Button::new("local-model-delete")
+                .ghost()
+                .small()
+                .flex_none()
+                .icon(IconName::Trash)
+                .tooltip(rust_i18n::t!("settings.model_delete").to_string())
+                .on_click(move |_, window, cx| {
+                    crate::library::jobs::delete_local_model_app(&controller, window, cx);
                 }),
         );
     }

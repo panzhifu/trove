@@ -28,6 +28,7 @@ pub(crate) mod model;
 mod quick_look;
 mod sequence;
 mod soundtrack;
+mod subtitle;
 mod text;
 mod transport;
 mod video;
@@ -36,6 +37,9 @@ mod video;
 // this folder too; re-exported here so hosts reach it without knowing the
 // internal layout.
 pub(crate) use model::{ModelViewport, ModelViewportEvent};
+// The subtitle view is a main-area host like the asset preview; the
+// workspace opens it directly.
+pub(crate) use subtitle::{SubtitleEditor, SubtitleEvent};
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

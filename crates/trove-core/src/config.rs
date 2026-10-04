@@ -259,10 +259,15 @@ pub enum EmbeddingEngine {
     Local,
 }
 
-/// The identity the local engine's vectors are stored under — the provider
-/// reports the same string from its `id()`. The cloud engine stores its
-/// vectors under the model name instead.
-pub const LOCAL_EMBEDDING_MODEL: &str = "bge-small-zh-v1.5 (local)";
+/// The identity the local engine's vectors are stored under for `model` —
+/// the provider reports the same string from its `id()`. The model id is
+/// part of the identity, so switching the local model orphans the old
+/// rows (the settings page's delete action clears them; the next backfill
+/// re-embeds under the new identity). The cloud engine stores its vectors
+/// under the model name instead.
+pub fn local_embedding_identity(model: &str) -> String {
+    format!("{model} (local)")
+}
 
 /// Settings for the embedding engine the semantic search tier talks to.
 ///
@@ -293,10 +298,15 @@ pub struct EmbeddingConfig {
     /// (`text-embedding-3-small`, `nomic-embed-text`, `jina-clip-v2`, …).
     /// This string is the `model` identity stored beside every vector, so
     /// renaming it orphans the old rows (delete them from the settings page
-    /// and re-embed). Local engine: unused — the identity is
-    /// [`LOCAL_EMBEDDING_MODEL`]; see [`Self::model_id`].
+    /// and re-embed). Local engine: unused — the identity comes from
+    /// [`Self::local_model`]; see [`Self::model_id`].
     #[serde(default)]
     pub model: String,
+    /// Local engine: which catalog model runs (see
+    /// `services::embed_model::MODELS`). `None` = the build's default —
+    /// what every configuration written before the picker existed read as.
+    #[serde(default)]
+    pub local_model: Option<String>,
     /// When true the endpoint is a multimodal (CLIP-style) embedder: an asset
     /// is embedded from its **image**, and a text query lands in the same
     /// vector space — so typing `猫` can find an untagged cat photo.
@@ -320,12 +330,22 @@ impl Default for EmbeddingConfig {
             api_key: String::new(),
             vendor_id: None,
             model: String::new(),
+            local_model: None,
             multimodal: false,
         }
     }
 }
 
 impl EmbeddingConfig {
+    /// The local engine's model: the picked catalog entry, or the build's
+    /// default. What `services::embed_model` fetches, what the provider
+    /// loads, and the prefix of the vector identity.
+    pub fn local_model_id(&self) -> &str {
+        self.local_model
+            .as_deref()
+            .unwrap_or(crate::services::embed_model::DEFAULT_MODEL_ID)
+    }
+
     /// Whether enough is configured to talk to the server at all. The local
     /// engine is always "configured" — the model files are a download away,
     /// and the UI asks before spending that.
@@ -339,14 +359,14 @@ impl EmbeddingConfig {
     }
 
     /// The identity embeddings are stored under: the model name for the
-    /// cloud engine, the pinned local model's label for the local one. The
-    /// provider's `id()` must answer the same string — it is the `model`
-    /// key every stored vector is filed under and the coverage and delete
-    /// commands query by.
-    pub fn model_id(&self) -> &str {
+    /// cloud engine, the selected local model's label for the local one.
+    /// The provider's `id()` must answer the same string — it is the
+    /// `model` key every stored vector is filed under and the coverage and
+    /// delete commands query by.
+    pub fn model_id(&self) -> String {
         match self.engine {
-            EmbeddingEngine::Local => LOCAL_EMBEDDING_MODEL,
-            EmbeddingEngine::Cloud => self.model.trim(),
+            EmbeddingEngine::Local => local_embedding_identity(self.local_model_id()),
+            EmbeddingEngine::Cloud => self.model.trim().to_string(),
         }
     }
 }
@@ -1653,6 +1673,7 @@ mod tests {
     fn a_tier_needs_both_its_toggle_and_a_configured_endpoint() {
         let endpoint = EmbeddingConfig {
             engine: EmbeddingEngine::Cloud,
+            local_model: None,
             vendor_id: None,
             base_url: "https://api.example.com/v1".into(),
             api_key: String::new(),
@@ -2000,6 +2021,7 @@ mod vendor_migration_tests {
         let mut config = AppConfig {
             ai_embedding: Some(EmbeddingConfig {
                 engine: EmbeddingEngine::Cloud,
+                local_model: None,
                 base_url: "https://api.siliconflow.cn/v1".into(),
                 api_key: "sk-1".into(),
                 vendor_id: None,

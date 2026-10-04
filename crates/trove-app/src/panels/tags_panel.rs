@@ -22,7 +22,7 @@ use crate::components::controls::{fold_disclosure, muted_label};
 use crate::components::scrollbar::ScrollableElement as _;
 use crate::library::LibraryController;
 
-use super::common::{AssetsDrag, hex_to_rgb, observe_controller, separator_label};
+use super::common::{AssetsDrag, color_chip, hex_to_rgb, observe_controller, separator_label};
 
 // =========================== Tags panel ======================================
 
@@ -669,13 +669,12 @@ fn tag_context_menu(
         ] {
             let ctl = ctl_color.clone();
             let value = hex.to_string();
-            let swatch = rgb(hex_to_rgb(hex).unwrap_or(0));
             let checked = current == hex_to_rgb(hex);
             menu = menu.item(
-                PopupMenuItem::element(move |_, _| {
+                PopupMenuItem::element(move |_, cx| {
                     h_flex()
                         .gap_2()
-                        .child(div().size_3().rounded_full().bg(swatch))
+                        .child(color_chip(hex, cx))
                         .child(label.clone())
                 })
                 .checked(checked)
@@ -684,7 +683,13 @@ fn tag_context_menu(
                     ctl.update(cx, move |ctl, cx| {
                         let outcome = ctl.library.set_tag_color(tag_id, Some(&value));
                         ctl.report_failed("tag colour", outcome);
-                        ctl.generation += 1;
+                        // Deliberately no `generation` bump. A colour changes
+                        // nothing any generation-keyed cache holds — no asset
+                        // listing, no count, no facet — and a bump would make
+                        // the workspace re-run its whole data pass (browse
+                        // query, a stat per asset, facets) for a dot's hue.
+                        // Every tag-colour display reads the store per paint,
+                        // so a plain notify repaints them all.
                         cx.notify();
                     });
                 }),
@@ -698,7 +703,8 @@ fn tag_context_menu(
                     ctl_clear.update(cx, move |ctl, cx| {
                         let outcome = ctl.library.set_tag_color(tag_id, None);
                         ctl.report_failed("tag colour cleared", outcome);
-                        ctl.generation += 1;
+                        // Same as picking a colour above: no cache holds a
+                        // tag's colour, so a notify is the whole broadcast.
                         cx.notify();
                     });
                 }),

@@ -266,6 +266,22 @@ impl WorkspacePanel {
             self.open_model_preview(name, path, id, window, cx);
             return;
         }
+        // Only a subtitle sidecar itself opens the subtitle editor here. An
+        // audio or video asset plays: Enter is its playback preview, and its
+        // subtitle is reached through the asset menu or by opening the `.srt`
+        // asset on its own.
+        let open_subtitles = {
+            let ctl = self.controller.read(cx);
+            ctl.library
+                .asset(id)
+                .ok()
+                .flatten()
+                .is_some_and(|a| a.ext.eq_ignore_ascii_case("srt"))
+        };
+        if open_subtitles {
+            self.open_subtitles(id, window, cx);
+            return;
+        }
         // Flatten the row layout into a plain ID list so left/right arrows
         // can step through the grid order while the preview is open.
         let asset_ids: Vec<Uuid> = self
@@ -392,6 +408,41 @@ impl WorkspacePanel {
         cx.notify();
     }
 
+    /// Show an audio/video asset's subtitle editor in the main area. Like the
+    /// asset preview, it replaces whatever was on screen; unlike it, the arrow
+    /// keys do not step through the grid (see [`Self::navigate_preview`]) —
+    /// there is no second subtitle to step to, and leaving silently would drop
+    /// unsaved edits.
+    pub(super) fn open_subtitles(
+        &mut self,
+        id: Uuid,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(editor) = SubtitleEditor::spawn(&self.controller, id, cx) else {
+            return;
+        };
+        let subscription = cx.subscribe(&editor, |this, _, event: &SubtitleEvent, cx| {
+            if *event == SubtitleEvent::Closed {
+                this.forget_preview(cx);
+            }
+        });
+        // The title-bar controls read the editor's state (edit toggled, the
+        // copy buffer), so a change there must repaint this panel too — the
+        // editor's own notify only repaints its content area.
+        cx.observe(&editor, |_, _, cx| cx.notify()).detach();
+        if let Some(previous) = self.preview.replace(MainPreview::Subtitle(editor)) {
+            previous.release(window, cx);
+        }
+        self.viewport_backend = None;
+        self.viewport_observer = None;
+        self.preview_subscription = Some(subscription);
+        self.preview_asset_ids.clear();
+        self.preview_index = 0;
+        self.focus_preview_keys(window, cx);
+        cx.notify();
+    }
+
     /// Step the preview to the next or previous asset in the frozen row
     /// order. `forward` = true moves right/down, false moves left/up.
     pub(super) fn navigate_preview(
@@ -400,6 +451,11 @@ impl WorkspacePanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // The subtitle editor is not one of a run: there is nothing to step
+        // to, and stepping would leave its edits behind.
+        if matches!(self.preview, Some(MainPreview::Subtitle(_))) {
+            return;
+        }
         if self.preview_asset_ids.is_empty() {
             return;
         }

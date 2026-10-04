@@ -20,6 +20,18 @@ use trove_core::services::embed_model;
 
 use crate::library::{LibraryController, ModelDownload};
 
+/// The embedding model the settings currently point at — the one every
+/// download, status row and delete below talks about.
+fn selected_model() -> &'static embed_model::EmbeddingModel {
+    embed_model::resolve(
+        &trove_core::config::AppConfig::load()
+            .ai_embedding
+            .as_ref()
+            .map(|config| config.local_model_id().to_string())
+            .unwrap_or_default(),
+    )
+}
+
 /// Whether the caller may proceed right now. `true` = a usable model is on
 /// disk. `false` = the dialog was shown (and the download, if accepted, is
 /// already running); the caller simply stays idle until the user repeats the
@@ -29,8 +41,9 @@ pub fn ensure_embed_model_app(
     window: &mut Window,
     cx: &mut App,
 ) -> bool {
+    let model = selected_model();
     if matches!(
-        embed_model::status(),
+        embed_model::status(model.id),
         embed_model::ModelStatus::Ready { .. }
     ) {
         return true;
@@ -46,6 +59,7 @@ pub fn ensure_embed_model_app(
     }
 
     let controller = controller.clone();
+    let mb = model.download_mb;
     window.open_alert_dialog(
         cx,
         move |alert, _, _| {
@@ -53,11 +67,7 @@ pub fn ensure_embed_model_app(
             alert
                 .title(rust_i18n::t!("settings.embed_model_dialog_title").to_string())
                 .description(
-                    rust_i18n::t!(
-                        "settings.embed_model_dialog_description",
-                        mb = embed_model::MODEL_DOWNLOAD_MB
-                    )
-                    .to_string(),
+                    rust_i18n::t!("settings.embed_model_dialog_description", mb = mb).to_string(),
                 )
                 .confirm()
                 .ok_text(rust_i18n::t!("settings.embed_model_download_now").to_string())
@@ -69,6 +79,85 @@ pub fn ensure_embed_model_app(
         },
     );
     false
+}
+
+/// Delete one local embedding model's files after a confirm, by id — so a
+/// model downloaded earlier can be freed even after the picker moved to
+/// another one. Guarded against a download in flight *for this very model*
+/// (the files it is writing would go halfway with it; another model's
+/// download writes its own directory) and a running backfill (the provider
+/// holds the weights open); a backfill that is merely queued re-resolves the
+/// model at its factory, so it is safe.
+pub fn delete_embed_model_id_app(
+    controller: &Entity<LibraryController>,
+    model_id: String,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let download_in_flight = {
+        let state = controller.read(cx);
+        state
+            .embed_model_download
+            .as_ref()
+            .is_some_and(ModelDownload::is_running)
+            && state.embed_model_download_for.as_deref() == Some(model_id.as_str())
+    };
+    if download_in_flight {
+        window.push_notification(
+            Notification::warning(rust_i18n::t!("settings.model_delete_busy_download").to_string()),
+            cx,
+        );
+        return;
+    }
+    if controller
+        .read(cx)
+        .library
+        .tasks()
+        .is_active(&trove_core::tasks::TaskKind::EmbeddingBackfill)
+    {
+        window.push_notification(
+            Notification::warning(rust_i18n::t!("settings.model_delete_busy_run").to_string()),
+            cx,
+        );
+        return;
+    }
+    let mb = embed_model::resolve(&model_id).download_mb;
+    let controller = controller.clone();
+    window.open_alert_dialog(
+        cx,
+        move |alert, _, _| {
+            let controller = controller.clone();
+            let model_id = model_id.clone();
+            alert
+                .title(rust_i18n::t!("settings.model_delete_title").to_string())
+                .description(
+                    rust_i18n::t!("settings.model_delete_body", mb = mb).to_string(),
+                )
+                .confirm()
+                .ok_text(rust_i18n::t!("settings.model_delete").to_string())
+                .cancel_text(rust_i18n::t!("settings.embed_model_not_now").to_string())
+                .on_ok(move |_, window, cx| {
+                    match embed_model::delete(&model_id) {
+                        Ok(()) => {
+                            window.push_notification(
+                                Notification::success(
+                                    rust_i18n::t!("settings.model_deleted").to_string(),
+                                ),
+                                cx,
+                            );
+                        }
+                        Err(error) => {
+                            window.push_notification(
+                                Notification::warning(error.to_string()),
+                                cx,
+                            );
+                        }
+                    }
+                    controller.update(cx, |_, cx| cx.notify());
+                    true
+                })
+        },
+    );
 }
 
 /// Run the model download in the background: progress on the controller for
@@ -86,12 +175,14 @@ pub fn start_embed_model_download_app(
     {
         return;
     }
+    let model = selected_model().id.to_string();
     let handle = window.window_handle();
     controller.update(cx, |ctl, cx| {
         ctl.embed_model_download = Some(ModelDownload::Running {
             received: 0,
             total: 0,
         });
+        ctl.embed_model_download_for = Some(model.clone());
         cx.notify();
     });
     window.push_notification(
@@ -111,8 +202,9 @@ pub fn start_embed_model_download_app(
             let outcome = outcome.clone();
             cx.background_executor()
                 .spawn(async move {
-                    let result = embed_model::download(&AtomicBool::new(false), &|received,
-                                                                                    total| {
+                    let result =
+                        embed_model::download(&model, &AtomicBool::new(false), &|received,
+                                                                                  total| {
                         *progress.lock().unwrap() = (received, total);
                     });
                     *outcome.lock().unwrap() =
@@ -147,6 +239,12 @@ pub fn start_embed_model_download_app(
                 }),
                 None => ctl.embed_model_download.clone(),
             };
+            // A failure lingers (labelled with the model it belongs to, so
+            // its row keeps showing the Retry button); a success clears the
+            // slot and the model it pointed at.
+            if ctl.embed_model_download.is_none() {
+                ctl.embed_model_download_for = None;
+            }
             cx.notify();
         });
         let _ = handle.update(cx, |_view, window, cx| {

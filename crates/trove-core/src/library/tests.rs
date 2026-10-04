@@ -2205,3 +2205,34 @@ fn delete_many_takes_each_tag_and_its_relations() {
 
     std::fs::remove_dir_all(&root).ok();
 }
+
+/// A file Trove writes itself beside the media — a subtitle sidecar — becomes
+/// a linked asset once; re-writing it refreshes that same record (hash and
+/// size move) instead of adding a second row for the same path.
+#[test]
+fn ensure_linked_file_is_idempotent_and_refreshes_content() {
+    let (lib, root) = temp_library("ensure-linked");
+    let source = root.join("clip.srt");
+    std::fs::write(&source, b"1\n00:00:00,000 --> 00:00:01,000\nhi\n").unwrap();
+
+    let first = lib.ensure_linked_file(&source).unwrap();
+    // Same path, same content: the same record.
+    assert_eq!(lib.ensure_linked_file(&source).unwrap(), first);
+
+    // The pipeline draws a text card for it, so the grid has a picture to
+    // show rather than only a kind icon.
+    let hash = lib.asset(first).unwrap().unwrap().content_hash.unwrap();
+    let thumb = thumb::abs_path(&root.join("cache"), &hash);
+    assert!(thumb.is_file(), "subtitle text card was not generated");
+
+    // Rewritten content (an edited subtitle): still the same record, not a
+    // second one for a path the library already knows.
+    std::fs::write(&source, b"1\n00:00:00,000 --> 00:00:02,000\nbye\n").unwrap();
+    assert_eq!(lib.ensure_linked_file(&source).unwrap(), first);
+
+    let asset = lib.asset(first).unwrap().unwrap();
+    assert!(asset.location().is_linked());
+    assert_eq!(asset.file_name, "clip.srt");
+
+    std::fs::remove_dir_all(&root).ok();
+}

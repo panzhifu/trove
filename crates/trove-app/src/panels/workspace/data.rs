@@ -141,7 +141,11 @@ pub(super) struct ViewKey {
     /// change of the hit set relayouts and resets scrolling. Shared with the
     /// controller's cached id list: both keys are rebuilt every frame, so a
     /// plain `Vec` here would deep-copy up to CANDIDATE_CAP ids per frame.
-    pub(super) visual: Option<Rc<Vec<Uuid>>>,
+    pub(super) visual: Option<Rc<Vec<Uuid>>>,    /// Whether an async refinement (query vector, AI plan) is fused into
+    /// the ranking. Part of the key so its arrival relayouts as a
+    /// structural change — a refined listing opens at the top, like any
+    /// new view.
+    pub(super) fused: bool,
 }
 
 /// Inputs that decide *which* assets are listed. This is the expensive
@@ -303,6 +307,8 @@ impl WorkspacePanel {
             filter_exts: None,
             title_cache: None,
             page_guard: Rc::new(CellFlag::new(usize::MAX)),
+            last_search: String::new(),
+            last_fused: false,
         };
         observe_controller(cx, &this.controller);
         // Quick look follows the card. Once the space bar has lit one, moving the
@@ -331,6 +337,18 @@ impl WorkspacePanel {
                     cards.point_to(id, kind, &controller, cx);
                 }
             });
+        })
+        .detach();
+        // A right-click "View / edit subtitles" cannot reach this panel
+        // directly — the menu is built from the controller alone — so it
+        // leaves the asset id on the controller; consume it here, where the
+        // center view lives.
+        cx.observe_in(&this.controller, window, |this, controller, window, cx| {
+            let pending =
+                controller.update(cx, |ctl, _| ctl.pending_subtitle_open.take());
+            if let Some(id) = pending {
+                this.open_subtitles(id, window, cx);
+            }
         })
         .detach();
         this

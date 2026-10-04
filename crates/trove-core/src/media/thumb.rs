@@ -836,25 +836,28 @@ fn write_thumb(blob_path: &Path, out: &Path) -> Option<PathBuf> {
     write_downscaled(&downscale(&image), out)
 }
 
-/// Landscape size of a waveform card, in pixels.
-const AUDIO_CARD_SIZE: (u32, u32) = (512, 288);
+/// Size of a waveform card, in pixels. Square, so the card fills a square
+/// grid tile exactly (no letterbox bars around a landscape card) and shows
+/// the same surface as a model card.
+const AUDIO_CARD_SIZE: (u32, u32) = (512, 512);
 
-/// Size of a text card, in pixels — the same landscape box, so one family of
-/// derived cards never grows a grid row.
-const TEXT_CARD_SIZE: (u32, u32) = (512, 288);
+/// Size of a text card, in pixels — the same square box, so one family of
+/// derived cards never grows a grid row and every card fills its tile.
+const TEXT_CARD_SIZE: (u32, u32) = (512, 512);
 
 /// How many lines a text card shows and how wide each may be: enough of a file
 /// to recognise it by its opening, few enough that the type stays legible at
-/// card size.
-const TEXT_CARD_LINES: usize = 11;
-const TEXT_CARD_COLUMNS: usize = 72;
+/// card size. Tuned to the square card (512 px wide, 24 px leading).
+const TEXT_CARD_LINES: usize = 18;
+const TEXT_CARD_COLUMNS: usize = 52;
 
 /// How much of the file a card reads. One screenful of characters, not the
 /// megabyte the viewer is allowed.
 const TEXT_CARD_READ_BYTES: usize = 8 * 1024;
 
-/// The card for a text file: the file's own opening lines, set as a page on a
-/// light card.
+/// The card for a text file: the file's own opening lines, drawn as ink with
+/// no background of its own, composited over the model card's background so a
+/// text/subtitle card is the same surface as a model card.
 ///
 /// Drawn through the SVG path rather than a hand-rolled layout because that path
 /// is the one place here that resolves a font family *with* a fallback, which is
@@ -867,11 +870,21 @@ fn write_text_card(blob_path: &Path, out: &Path) -> Option<PathBuf> {
         return None;
     }
     let markup = text_card_svg(&content.text);
-    write_downscaled(&render_svg_data(markup.as_bytes())?, out)
+    let (w, h) = TEXT_CARD_SIZE;
+    let ink = render_svg_data(markup.as_bytes())?;
+    let ink = ink.resize_exact(w, h, image::imageops::FilterType::Triangle).to_rgba8();
+    let mut base = image::RgbaImage::from_raw(
+        w,
+        h,
+        crate::media::render3d::background_rgba(w, h),
+    )?;
+    image::imageops::overlay(&mut base, &ink, 0, 0);
+    write_downscaled(&image::DynamicImage::ImageRgba8(base), out)
 }
 
-/// The card's markup: a light page carrying the file's first lines in a
-/// monospace stack, so indentation is part of what makes the file recognisable.
+/// The card's markup: the file's first lines in a monospace stack, so
+/// indentation is part of what makes the file recognisable. No background
+/// rect — the caller draws this over the shared card background.
 fn text_card_svg(text: &str) -> String {
     let (w, h) = TEXT_CARD_SIZE;
     let mut body = String::new();
@@ -883,10 +896,8 @@ fn text_card_svg(text: &str) -> String {
             crate::services::xmp::xml_escape(line)
         ));
     }
-    let [r, g, b] = crate::media::CARD_PAPER;
     format!(
-        "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{w}\" height=\"{h}\">\
-         <rect width=\"{w}\" height=\"{h}\" fill=\"#{r:02X}{g:02X}{b:02X}\"/>{body}</svg>"
+        "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{w}\" height=\"{h}\">{body}</svg>"
     )
 }
 
@@ -929,11 +940,24 @@ fn write_audio_card(root: &Path, sha: &str, blob_path: &Path, out: &Path) -> Opt
     write_wave_card(&waveform::load_or_build(root, sha, blob_path)?, out)
 }
 
-/// Draw the envelope as a card.
+/// Draw the envelope as a card, over the shared model-card background.
 fn write_wave_card(peaks: &waveform::Peaks, out: &Path) -> Option<PathBuf> {
     let (w, h) = AUDIO_CARD_SIZE;
-    let card = waveform::bitmap(peaks, w, h, &waveform::Style::CARD)?;
-    write_downscaled(&image::DynamicImage::ImageRgba8(card), out)
+    // Transparent bars, then composited over the model card's background so an
+    // audio thumbnail is the same surface as a model thumbnail.
+    let wave = waveform::bitmap(
+        peaks,
+        w,
+        h,
+        &waveform::Style {
+            background: None,
+            ..waveform::Style::CARD
+        },
+    )?;
+    let mut base =
+        image::RgbaImage::from_raw(w, h, crate::media::render3d::background_rgba(w, h))?;
+    image::imageops::overlay(&mut base, &wave, 0, 0);
+    write_downscaled(&image::DynamicImage::ImageRgba8(base), out)
 }
 
 /// Decode and develop a camera-RAW file with rawler: demosaic, white

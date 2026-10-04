@@ -207,6 +207,20 @@ pub fn download(cancel: &AtomicBool, progress: &dyn Fn(u64, u64)) -> Result<Path
     }
 }
 
+/// Delete the managed copy of the transcriber's model, freeing its disk.
+/// A model found by [`find_system_models`] — a copy some other tool put
+/// down — is untouched; `status` keeps reporting it. A model that is not
+/// on disk is already the requested state, not an error.
+pub fn delete() -> Result<()> {
+    let dir = managed_model_dir();
+    match fs::metadata(&dir) {
+        Ok(_) => fs::remove_dir_all(dir)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

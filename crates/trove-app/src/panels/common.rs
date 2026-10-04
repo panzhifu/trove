@@ -152,6 +152,30 @@ pub(crate) fn color_swatch(
         .on_click(on_click)
 }
 
+/// A passive square colour chip in the shared palette style: the
+/// [`color_swatch`] look without the interaction, for rows whose click
+/// belongs to something larger — the tag colour menu, where the row picks
+/// the colour and the chip only shows it. Same frame-as-padding trick and
+/// concentric radii; see [`color_swatch`] for why the frame is not a
+/// `border`.
+pub(crate) fn color_chip(hex: &str, cx: &App) -> Div {
+    let rgb = u32::from_str_radix(hex.trim_start_matches('#'), 16).unwrap_or(0);
+    let ring = px(1.);
+    let inner_radius = (cx.theme().radius - ring).max(px(0.));
+    div()
+        .size(px(16.))
+        .flex_shrink_0()
+        .rounded(cx.theme().radius)
+        .p(ring)
+        .bg(cx.theme().border)
+        .child(
+            div()
+                .size_full()
+                .rounded(inner_radius)
+                .bg(gpui_kit::rgb(rgb)),
+        )
+}
+
 /// Payload for internal drag & drop of one or many selected assets.
 #[derive(Debug, Clone)]
 pub struct AssetsDrag(pub Vec<Uuid>);

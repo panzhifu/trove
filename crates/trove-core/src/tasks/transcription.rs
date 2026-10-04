@@ -93,8 +93,17 @@ impl TranscribeOptions {
 pub struct TranscribeOutcome {
     /// Assets whose transcript was fetched and stored.
     pub transcribed: u64,
+    /// The ids behind [`Self::transcribed`], in the order they landed. The
+    /// UI side uses these to write the matching subtitle sidecars as soon as
+    /// the run settles; a count alone could not say *which* files to export.
+    pub transcribed_ids: Vec<Uuid>,
     /// Assets skipped because their fingerprint already matched this run.
     pub skipped: u64,
+    /// The ids behind [`Self::skipped`]. The UI side exports a missing
+    /// subtitle sidecar for these too: a stored transcript whose `.srt` was
+    /// deleted (or never written) must come back when the run settles, even
+    /// though the recogniser was not asked again.
+    pub skipped_ids: Vec<Uuid>,
     /// Video assets with no audio track — nothing a recogniser could do.
     pub no_audio: u64,
     /// Assets whose extraction or request failed; their marker is untouched
@@ -160,6 +169,7 @@ pub fn run(
         let fingerprint = fingerprint(&model, options, &asset);
         if !options.force && stored_fingerprint(&asset).as_deref() == Some(fingerprint.as_str()) {
             outcome.skipped += 1;
+            outcome.skipped_ids.push(asset.id);
             done += 1;
             ctx.progress(done, total);
             continue;
@@ -200,6 +210,7 @@ pub fn run(
                 Ok(text) => match write_transcript(&conn, &asset, &model, &fingerprint, &text) {
                     Ok(()) => {
                         outcome.transcribed += 1;
+                        outcome.transcribed_ids.push(asset.id);
                         outcome.chars += text.chars().count() as u64;
                     }
                     Err(error) => {
@@ -519,6 +530,7 @@ mod tests {
 
         let outcome = run(&options, &provider, &ctx()).unwrap();
         assert_eq!(outcome.transcribed, 2, "{outcome:?}");
+        assert_eq!(outcome.transcribed_ids.len(), 2, "ids name the exported files");
         assert_eq!(outcome.failed, 0);
         assert_eq!(outcome.chars, "hello world".len() as u64 * 2);
         assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
@@ -534,6 +546,7 @@ mod tests {
         let second = run(&options, &provider, &ctx()).unwrap();
         assert_eq!(second.transcribed, 0);
         assert_eq!(second.skipped, 2, "a repeat run is free: {second:?}");
+        assert_eq!(second.skipped_ids.len(), 2, "skipped ids let the UI backfill");
         assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
     }
 

@@ -323,6 +323,44 @@ impl Library {
         Ok(())
     }
 
+    /// Ensure a *linked* asset exists for `path` and return its id.
+    ///
+    /// Used for files Trove writes itself beside the user's media — a
+    /// subtitle `.srt` — so they show in the library like any imported file.
+    /// A record already linking this exact path is refreshed (its hash and
+    /// size move when the file was rewritten) rather than duplicated; a hash
+    /// lookup would not do, because editing a subtitle changes its content
+    /// hash and would insert a second row for the same file.
+    pub fn ensure_linked_file(&self, path: &Path) -> Result<Uuid> {
+        let source = path.to_string_lossy().into_owned();
+        if let Some(existing) = assets::find_linked_by_path(self.store.conn(), &source)? {
+            let (hash, size) = crate::media::hash::hash_file_cached(self.cache(), path)?;
+            let changed = existing.content_hash.as_deref() != Some(hash.as_str());
+            assets::set_linked_media_columns(
+                self.store.conn(),
+                existing.id,
+                &hash,
+                size,
+                None,
+                None,
+            )?;
+            // Rewritten content (an edited subtitle) keys a *new* thumbnail
+            // path, and the grid would find nothing there and fall back to the
+            // kind icon. Redraw the card for the new hash so the tile keeps a
+            // picture.
+            if changed {
+                let _ = crate::media::thumb::regenerate(self.cache(), &hash, existing.kind, path);
+            }
+            return Ok(existing.id);
+        }
+        let report = self.link_files(&[path.to_path_buf()], None)?;
+        report
+            .imported
+            .first()
+            .map(|item| item.asset_id)
+            .ok_or_else(|| crate::Error::Validation("linked file produced no asset".into()))
+    }
+
     // -----------------------------------------------------------------------
     // In-place image edits & metadata export
     // -----------------------------------------------------------------------

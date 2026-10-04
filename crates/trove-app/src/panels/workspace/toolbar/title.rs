@@ -9,15 +9,17 @@ use gpui_kit::base::{h_flex, v_flex};
 use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::component::Selectable as _;
 use gpui_kit::component::button::{Button, ButtonVariant, ButtonVariants as _};
+use gpui_kit::component::clipboard::Clipboard;
 use gpui_kit::component::dialog::DialogButtonProps;
 use gpui_kit::component::dock::{Panel as DockPanel, PanelControl};
 use gpui_kit::component::popover::Popover;
 use gpui_kit::component::slider::Slider;
 use gpui_kit::component::{IconName, Sizable as _, WindowExt as _};
+use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use crate::components::controls::{icon_button, muted_label};
-use crate::components::preview::{AssetPreviewPanel, ModelViewport, font};
+use crate::components::preview::{AssetPreviewPanel, ModelViewport, SubtitleEditor, font};
 use crate::library::LibraryController;
 use crate::panels::WorkspacePanel;
 use crate::panels::workspace::MainPreview;
@@ -37,6 +39,7 @@ impl DockPanel for WorkspacePanel {
         let label = match &self.preview {
             Some(MainPreview::Asset(preview)) => preview.read(cx).asset_name().to_string(),
             Some(MainPreview::Model(viewport)) => viewport.read(cx).name().to_string(),
+            Some(MainPreview::Subtitle(editor)) => editor.read(cx).title().to_string(),
             None => self.title_label(cx),
         };
         div()
@@ -71,6 +74,9 @@ impl DockPanel for WorkspacePanel {
             }
             Some(MainPreview::Model(viewport)) => {
                 return Some(model_toolbar(viewport, cx));
+            }
+            Some(MainPreview::Subtitle(editor)) => {
+                return Some(subtitle_toolbar(editor, cx));
             }
             None => {}
         }
@@ -200,6 +206,66 @@ fn model_toolbar(viewport: &Entity<ModelViewport>, cx: &mut Context<WorkspacePan
     viewport.update(cx, |viewport, cx| {
         viewport.title_tools(cx).into_any_element()
     })
+}
+
+/// The subtitle editor's title-bar controls — copy, edit, save, then close —
+/// the same set every other preview puts here. They ask the editor entity for
+/// its state and drive it back, so the view's content area stays just cues.
+fn subtitle_toolbar(
+    editor: &Entity<SubtitleEditor>,
+    cx: &mut Context<WorkspacePanel>,
+) -> AnyElement {
+    use gpui_kit::assets::IconName as MediaIcon;
+
+    let (editing, copy_text) = {
+        let view = editor.read(cx);
+        (view.editing(), view.copy_text(cx))
+    };
+    let edit_host = editor.clone();
+    let save_host = editor.clone();
+    let close_host = editor.clone();
+    h_flex()
+        .items_center()
+        .gap_1()
+        .child(
+            Clipboard::new("subtitle-copy")
+                .value(copy_text)
+                .tooltip(rust_i18n::t!("subtitle.copy").to_string()),
+        )
+        .child(
+            Button::new("subtitle-edit")
+                .ghost()
+                .xsmall()
+                .icon(MediaIcon::Pencil)
+                .toggled(editing)
+                .tooltip(rust_i18n::t!("subtitle.edit").to_string())
+                .on_click(cx.listener(move |_, _, _, cx| {
+                    edit_host.update(cx, |this, cx| this.toggle_editing(cx));
+                })),
+        )
+        .when(editing, |row| {
+            row.child(
+                Button::new("subtitle-save")
+                    .ghost()
+                    .xsmall()
+                    .icon(MediaIcon::Save)
+                    .tooltip(rust_i18n::t!("subtitle.save").to_string())
+                    .on_click(cx.listener(move |_, _, _, cx| {
+                        save_host.update(cx, |this, cx| this.save(cx));
+                    })),
+            )
+        })
+        .child(
+            icon_button(
+                "subtitle-close",
+                IconName::Close,
+                rust_i18n::t!("viewport.close").to_string(),
+            )
+            .on_click(cx.listener(move |_, _, _, cx| {
+                close_host.update(cx, |this, cx| this.close(cx));
+            })),
+        )
+        .into_any_element()
 }
 
 /// The still / video preview's title-bar controls: the picture's edit tools

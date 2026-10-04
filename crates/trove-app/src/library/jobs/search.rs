@@ -41,7 +41,7 @@ pub fn request_query_embedding_app(controller: &Entity<LibraryController>, cx: &
     let Some(endpoint) = trove_core::config::AppConfig::load().semantic_endpoint() else {
         return;
     };
-    let model = endpoint.model_id().to_string();
+    let model = endpoint.model_id();
     let controller = controller.clone();
 
     cx.spawn(async move |cx| {

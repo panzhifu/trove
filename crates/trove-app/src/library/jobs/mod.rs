@@ -18,6 +18,7 @@ mod import;
 mod local_model;
 mod migrate;
 mod search;
+mod subtitles;
 mod transcription;
 mod watch;
 mod xmp;
@@ -222,10 +223,11 @@ pub use self::{
     import::{
         ImportTaskHandle, InboxDrain, collect_inbox_app, import_copied_app, import_paths_app,
     },
-    embed_model::start_embed_model_download_app,
-    local_model::start_model_download_app,
+    embed_model::{delete_embed_model_id_app, start_embed_model_download_app},
+    local_model::{delete_local_model_app, start_model_download_app},
     migrate::{start_migration_job_app, start_migration_standalone},
     search::{request_ai_plan_app, request_query_embedding_app},
+    subtitles::{auto_save_subtitles_app, ensure_subtitle_asset},
     transcription::{
         TranscribeTarget, cancel_transcription_app, start_transcription_app,
         test_transcription_endpoint_app,

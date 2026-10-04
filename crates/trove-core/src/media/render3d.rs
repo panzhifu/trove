@@ -1738,6 +1738,26 @@ fn background(x: usize, y: usize, width: usize, height: usize) -> [f32; 3] {
     lerp3(top, BG_BOTTOM, vignette)
 }
 
+/// The model card's background as tight RGBA bytes for a `width`×`height`
+/// image. The other generated cards — an audio waveform, a text/subtitle card
+/// — composite their ink over this so they sit on the exact same surface as a
+/// model card instead of a paper of their own.
+pub fn background_rgba(width: u32, height: u32) -> Vec<u8> {
+    let (w, h) = (width as usize, height as usize);
+    let mut out = vec![0u8; w * h * 4];
+    for y in 0..h {
+        for x in 0..w {
+            let [r, g, b] = background(x, y, w, h);
+            let i = (y * w + x) * 4;
+            out[i] = (r * 255.0).round().clamp(0.0, 255.0) as u8;
+            out[i + 1] = (g * 255.0).round().clamp(0.0, 255.0) as u8;
+            out[i + 2] = (b * 255.0).round().clamp(0.0, 255.0) as u8;
+            out[i + 3] = 255;
+        }
+    }
+    out
+}
+
 /// Box-filter an oversized buffer down to the requested size.
 fn downsample(src: &[[f32; 3]], sw: usize, sh: usize, dw: usize, dh: usize) -> Vec<[f32; 3]> {
     let sx = (sw / dw).max(1);

@@ -276,6 +276,27 @@ pub enum SelectionSource {
 /// guard against a job that cannot stop, not the expected wait.
 const IMPORT_CANCEL_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// What a finished transcription run wants exported as subtitle sidecars.
+///
+/// Split by intent, because the two halves treat an existing `.srt`
+/// differently: a freshly transcribed asset asks before replacing one (the
+/// user may have hand-tuned it), while a skipped asset only fills in a
+/// *missing* one — the recogniser was not asked again, so an existing sidecar
+/// is left exactly as it is.
+#[derive(Debug, Clone, Default)]
+pub struct PendingSubtitleExport {
+    /// Assets this run actually transcribed.
+    pub transcribed: Vec<Uuid>,
+    /// Assets skipped as already done. Only a missing sidecar is written.
+    pub backfill: Vec<Uuid>,
+}
+
+impl PendingSubtitleExport {
+    pub fn is_empty(&self) -> bool {
+        self.transcribed.is_empty() && self.backfill.is_empty()
+    }
+}
+
 pub struct LibraryController {
     pub library: Library,
     /// The running import job, if any: what the cancel button presses and
@@ -407,6 +428,21 @@ pub struct LibraryController {
     /// discipline, and its own slot so a Whisper download and a BGE download
     /// can be in flight without erasing each other's progress.
     pub embed_model_download: Option<ModelDownload>,
+    /// Which model the [`Self::embed_model_download`] state belongs to: the
+    /// id captured when the download started. The settings row shows one
+    /// model at a time, and a row for a *different* model must not wear this
+    /// download's progress or failure — the row matches on this before
+    /// showing the state.
+    pub embed_model_download_for: Option<String>,
+    /// Assets a just-finished transcription run asked to export as subtitle
+    /// sidecars. The job watcher leaves the ids here and the app view's
+    /// controller observer — which has a window — does the writing and the
+    /// overwrite ask; the watcher itself cannot open a dialog.
+    pub pending_subtitle_save: Option<PendingSubtitleExport>,
+    /// An asset whose subtitle view the asset menu asked the workspace to
+    /// open. The workspace owns the center view, so the menu cannot reach it
+    /// directly; it leaves the request here and the workspace consumes it.
+    pub pending_subtitle_open: Option<Uuid>,
     /// The embedding of the committed search term, when one has been fetched
     /// (`jobs::request_query_embedding_app` runs after Enter). The workspace
     /// hands it to the query, which fuses it into the text ranking for as
@@ -507,6 +543,9 @@ impl LibraryController {
             transcription_probe: TranscriptionProbe::Idle,
             local_model_download: None,
             embed_model_download: None,
+            embed_model_download_for: None,
+            pending_subtitle_save: None,
+            pending_subtitle_open: None,
             query_vector: None,
             search_tiers: resolved_search_tiers(&config),
             ai_plan: None,

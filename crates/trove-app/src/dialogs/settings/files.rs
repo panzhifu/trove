@@ -113,7 +113,7 @@ fn app_data_block(report: Option<StorageReport>, cx: &App) -> Div {
     };
 
     // (label, measurement) — one line per directory, in a stable order.
-    let rows: [(String, DirUsage); 6] = [
+    let rows: [(String, DirUsage); 7] = [
         (
             rust_i18n::t!("settings.storage_config").to_string(),
             report.config,
@@ -129,6 +129,10 @@ fn app_data_block(report: Option<StorageReport>, cx: &App) -> Div {
         (
             rust_i18n::t!("settings.storage_cache").to_string(),
             report.cache(),
+        ),
+        (
+            rust_i18n::t!("settings.storage_models").to_string(),
+            report.models,
         ),
         (
             rust_i18n::t!("settings.storage_logs").to_string(),
