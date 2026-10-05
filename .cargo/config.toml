@@ -6,3 +6,5 @@
 [alias]
 build-cuda = "build -p trove-app -p trove-cli --features cuda"
 run-cuda = "run -p trove-app --features cuda"
+build-cuda-release = "build --release -p trove-app -p trove-cli --features cuda"
+run-cuda-release = "run --release -p trove-app --features cuda"
