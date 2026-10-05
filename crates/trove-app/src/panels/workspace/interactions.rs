@@ -413,12 +413,7 @@ impl WorkspacePanel {
     /// keys do not step through the grid (see [`Self::navigate_preview`]) —
     /// there is no second subtitle to step to, and leaving silently would drop
     /// unsaved edits.
-    pub(super) fn open_subtitles(
-        &mut self,
-        id: Uuid,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    pub(super) fn open_subtitles(&mut self, id: Uuid, window: &mut Window, cx: &mut Context<Self>) {
         let Some(editor) = SubtitleEditor::spawn(&self.controller, id, cx) else {
             return;
         };

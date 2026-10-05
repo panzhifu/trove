@@ -66,9 +66,10 @@ pub fn extract_chunks(
     };
     let pattern = dest_dir.join(format!("{CHUNK_PREFIX}-%03d.{ext}"));
     let mut command = Command::new("ffmpeg");
-    command.args(["-v", "error", "-y", "-i"]).arg(source).args([
-        "-vn", "-sn", "-map", "0:a:0", "-ac", "1", "-ar", "16000",
-    ]);
+    command
+        .args(["-v", "error", "-y", "-i"])
+        .arg(source)
+        .args(["-vn", "-sn", "-map", "0:a:0", "-ac", "1", "-ar", "16000"]);
     command.args(codec_args);
     if segmented {
         command.args([

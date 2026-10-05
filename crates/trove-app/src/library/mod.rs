@@ -6,6 +6,6 @@ mod controller;
 pub mod jobs;
 
 pub use controller::{
-    AiProbe, AnalysisProbe, GRID_PAGE_SIZE, LibraryController, Retryable, SelectionSource,
-    ModelDownload, PendingSubtitleExport, TaskCard, TranscriptionProbe, ViewMode,
+    AiProbe, AnalysisProbe, GRID_PAGE_SIZE, LibraryController, ModelDownload,
+    PendingSubtitleExport, Retryable, SelectionSource, TaskCard, TranscriptionProbe, ViewMode,
 };

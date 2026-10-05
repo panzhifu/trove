@@ -112,20 +112,25 @@ jobs:
           #   libpipewire-0.3-dev libspa-sys <- pipewire <- xcap
           # and the link-only one, which consults no .pc file:
           #   libgbm-dev          gbm (rustc-link-lib=gbm, gpui's GBM surface)
+          # plus the build-time one the Linux candle dependencies need:
+          #   nvidia-cuda-toolkit nvcc <- cudarc's build script (candle's CUDA
+          #     kernels compile at build time; the runner image does NOT ship
+          #     it — see trove-core/Cargo.toml)
           sudo apt-get install -y \
             libxcb1-dev libxkbcommon-dev libxkbcommon-x11-dev \
             libegl1-mesa-dev libgl1-mesa-dev libfontconfig-dev \
             libasound2-dev libwayland-dev libdrm-dev libzstd-dev \
-            libgbm-dev libpipewire-0.3-dev
+            libgbm-dev libpipewire-0.3-dev \
+            nvidia-cuda-toolkit
 
       # Both binaries: the GUI (trove-app) and the CLI (trove) — every package
       # and archive below ships both; they share one library on disk.
       #
       # Linux builds carry candle's CUDA backend by default (see
-      # trove-core/Cargo.toml): the kernels compile with nvcc, which the
-      # 24.04 runner image ships on PATH. At runtime the recogniser picks
-      # CUDA when a working driver answers and falls back to CPU otherwise,
-      # so the artifact also runs on machines without NVIDIA.
+      # trove-core/Cargo.toml): the kernels compile with nvcc, installed
+      # above. At runtime the recogniser picks CUDA when a working driver
+      # answers and falls back to CPU otherwise, so the artifact also runs on
+      # machines without NVIDIA.
       - name: Build release binaries
         run: cargo build --release --target ${{ matrix.target }} -p trove-app -p trove-cli
 

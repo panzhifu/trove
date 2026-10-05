@@ -1095,7 +1095,8 @@ impl Render for WorkspacePanel {
                     offset_in_item: px(0.),
                 });
             }
-        } else if !defer_layout && self.covered != cells.len() {            // Assets were added or removed. A page appended to the end of a
+        } else if !defer_layout && self.covered != cells.len() {
+            // Assets were added or removed. A page appended to the end of a
             // listing the grid already has rows for leaves those rows holding
             // the same cells in the same order, so they are kept as they are and
             // only the new window is laid out. Anything else — an import, a

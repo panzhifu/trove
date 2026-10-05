@@ -21,9 +21,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use gpui_kit::*;
-use trove_core::media::spectrum::{BAND_COUNT, SpectrumAnalyzer, LOW_FFT_SIZE};
-use trove_core::media::video::AudioPipe;
 use rodio::cpal::traits::{DeviceTrait as _, HostTrait as _};
+use trove_core::media::spectrum::{BAND_COUNT, LOW_FFT_SIZE, SpectrumAnalyzer};
+use trove_core::media::video::AudioPipe;
 
 use super::video::IDLE_POLL;
 
@@ -75,19 +75,11 @@ fn silence_alsa_errors() {
         }
         type FixedHandler =
             unsafe extern "C" fn(*const c_char, c_int, *const c_char, c_int, *const c_char);
-        type VariadicHandler = unsafe extern "C" fn(
-            *const c_char,
-            c_int,
-            *const c_char,
-            c_int,
-            *const c_char,
-            ...
-        );
+        type VariadicHandler =
+            unsafe extern "C" fn(*const c_char, c_int, *const c_char, c_int, *const c_char, ...);
         unsafe {
-            let quiet: alsa_sys::snd_lib_error_handler_t = Some(std::mem::transmute::<
-                FixedHandler,
-                VariadicHandler,
-            >(silent));
+            let quiet: alsa_sys::snd_lib_error_handler_t =
+                Some(std::mem::transmute::<FixedHandler, VariadicHandler>(silent));
             alsa_sys::snd_lib_error_set_handler(quiet);
         }
     });
@@ -178,7 +170,9 @@ impl AudioOutput {
             generation: AtomicU64::new(0),
             rebuilding: Mutex::new(()),
             last_scan: Mutex::new(
-                Instant::now().checked_sub(DEVICE_RESCAN).unwrap_or(Instant::now()),
+                Instant::now()
+                    .checked_sub(DEVICE_RESCAN)
+                    .unwrap_or(Instant::now()),
             ),
         }))
     }
@@ -284,8 +278,8 @@ impl AudioOutput {
         else {
             return;
         };
-        let settled = *current_set == fingerprint
-            && candidates.iter().any(|name| name == &*current_name);
+        let settled =
+            *current_set == fingerprint && candidates.iter().any(|name| name == &*current_name);
         if settled {
             return;
         }
@@ -577,9 +571,7 @@ impl AudioEngine {
                     // A device move welds the old sink to the stream that just
                     // died; drop it so the branch below builds a fresh one. A
                     // seek keeps its sink and just empties it.
-                    if device_moved
-                        && let Some(s) = sink.take()
-                    {
+                    if device_moved && let Some(s) = sink.take() {
                         s.clear();
                     }
                     match &sink {
@@ -713,12 +705,14 @@ impl AudioEngine {
                             // RMS normalized to full scale — the reading the
                             // waveform's bounce displays a moment later, when
                             // this chunk reaches the sink's front.
-                            let energy = samples.iter().map(|s| {
-                                let v = f32::from(*s) / 32768.0;
-                                v * v
-                            }).sum::<f32>();
-                            let rms =
-                                (energy / samples.len().max(1) as f32).sqrt().min(1.0);
+                            let energy = samples
+                                .iter()
+                                .map(|s| {
+                                    let v = f32::from(*s) / 32768.0;
+                                    v * v
+                                })
+                                .sum::<f32>();
+                            let rms = (energy / samples.len().max(1) as f32).sqrt().min(1.0);
                             levels.push(rms);
                             // Mono mix into the rolling history, before the
                             // buffer is handed to the sink and consumed.
@@ -729,9 +723,7 @@ impl AudioEngine {
                                 .as_chunks::<2>()
                                 .0
                                 .iter()
-                                .map(|pair| {
-                                    ((i32::from(pair[0]) + i32::from(pair[1])) / 2) as i16
-                                })
+                                .map(|pair| ((i32::from(pair[0]) + i32::from(pair[1])) / 2) as i16)
                                 .collect();
                             history.extend_from_slice(&mono);
                             if history.len() > LOW_FFT_SIZE {

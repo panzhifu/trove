@@ -345,8 +345,7 @@ impl AppView {
             // A finished transcription leaves its subtitle-export request on
             // the controller; only here is there a window to write the
             // sidecars and to ask before overwriting one that exists.
-            if let Some(request) =
-                controller.update(cx, |ctl, _| ctl.pending_subtitle_save.take())
+            if let Some(request) = controller.update(cx, |ctl, _| ctl.pending_subtitle_save.take())
             {
                 crate::library::jobs::auto_save_subtitles_app(&controller, request, window, cx);
             }

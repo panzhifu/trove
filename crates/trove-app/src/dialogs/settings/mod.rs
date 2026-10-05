@@ -39,11 +39,11 @@ pub(super) use crate::components::scrollbar;
 pub(super) use gpui_kit::base::{h_flex, v_flex};
 pub(super) use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::group_box::GroupBoxVariant;
+use gpui_kit::component::input::{Input, InputEvent, InputState};
 pub(super) use gpui_kit::component::setting::{
     SelectIndex, SettingField, SettingGroup, SettingItem, SettingPage, Settings,
 };
 pub(super) use gpui_kit::component::{ActiveTheme, Disableable as _, IconName, Sizable, ThemeMode};
-use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::{Root, TitleBar};
 
 use crate::components::controls;
@@ -157,9 +157,7 @@ pub(super) fn presets_for_profile(profile_base_url: &str, kind: ModelPresets) ->
                 "minicpm-v",
             ],
             ModelPresets::Chat => &["qwen3:8b", "qwen2.5:7b", "llama3.1:8b", "glm4:9b"],
-            ModelPresets::Embedding => {
-                &["nomic-embed-text", "bge-m3", "snowflake-arctic-embed"]
-            }
+            ModelPresets::Embedding => &["nomic-embed-text", "bge-m3", "snowflake-arctic-embed"],
         },
         "api.siliconflow.cn" => match kind {
             ModelPresets::Embedding => &[
@@ -234,11 +232,10 @@ pub(super) fn model_field(
         move |_options: &gpui_kit::component::setting::RenderOptions,
               window: &mut Window,
               cx: &mut App| {
-            let presets: Vec<(SharedString, String)> =
-                presets_for_profile(&presets_base_url, kind)
-                    .into_iter()
-                    .map(|m| (SharedString::from(m.clone()), m))
-                    .collect();
+            let presets: Vec<(SharedString, String)> = presets_for_profile(&presets_base_url, kind)
+                .into_iter()
+                .map(|m| (SharedString::from(m.clone()), m))
+                .collect();
             let current = SharedString::from((get_model)());
 
             struct State {

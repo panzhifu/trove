@@ -1000,7 +1000,11 @@ impl AssetPreviewPanel {
         } else if let Some(anim) = &self.anim {
             anim.update(cx, |anim, cx| anim.step_frame(forward, cx));
         } else if let Some(audio) = &self.audio {
-            let delta = if forward { AUDIO_STEP_MS } else { -AUDIO_STEP_MS };
+            let delta = if forward {
+                AUDIO_STEP_MS
+            } else {
+                -AUDIO_STEP_MS
+            };
             audio.update(cx, |player, cx| player.seek_by(delta, cx));
         }
     }

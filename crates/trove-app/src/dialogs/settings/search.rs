@@ -89,17 +89,21 @@ fn tiers_group(controller: &Entity<LibraryController>) -> SettingGroup {
                 vendor_field(
                     || search_config().ai.vendor_id.clone(),
                     move |value, cx| {
-                        save_search(&ai_vendor, |config| {
-                            config.ai.vendor_id = Some(value.clone());
-                            // Same rule as the analysis feature: the stored
-                            // family follows the profile's host, so the
-                            // native adapters survive a re-pick.
-                            if let Some(profile) =
-                                AppConfig::load().vendors.iter().find(|v| v.id == value)
-                            {
-                                config.ai.vendor = family_for_base_url(&profile.base_url);
-                            }
-                        }, cx)
+                        save_search(
+                            &ai_vendor,
+                            |config| {
+                                config.ai.vendor_id = Some(value.clone());
+                                // Same rule as the analysis feature: the stored
+                                // family follows the profile's host, so the
+                                // native adapters survive a re-pick.
+                                if let Some(profile) =
+                                    AppConfig::load().vendors.iter().find(|v| v.id == value)
+                                {
+                                    config.ai.vendor = family_for_base_url(&profile.base_url);
+                                }
+                            },
+                            cx,
+                        )
                     },
                 ),
             )
@@ -115,9 +119,7 @@ fn tiers_group(controller: &Entity<LibraryController>) -> SettingGroup {
                     .unwrap_or_default(),
                 ModelPresets::Chat,
                 || search_config().ai.model.clone(),
-                move |value, cx| {
-                    save_search(&ai_model, |config| config.ai.model = value, cx)
-                },
+                move |value, cx| save_search(&ai_model, |config| config.ai.model = value, cx),
             ),
         ))
 }

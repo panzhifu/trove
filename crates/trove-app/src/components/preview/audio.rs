@@ -246,8 +246,7 @@ impl AudioPlayer {
         if self.duration_ms == 0 {
             return;
         }
-        let target = (self.transport.position_ms + delta_ms)
-            .clamp(0., self.duration_ms as f64);
+        let target = (self.transport.position_ms + delta_ms).clamp(0., self.duration_ms as f64);
         self.scrub_to(target, true, cx);
     }
 
@@ -380,8 +379,7 @@ impl AudioPlayer {
                         // lift the frame by whatever the cap allows. The
                         // ceiling only falls — a transient stretches the
                         // range, and quiet passages climb back slowly.
-                        let frame_max =
-                            engine_spectrum.iter().copied().fold(0.0f32, f32::max);
+                        let frame_max = engine_spectrum.iter().copied().fold(0.0f32, f32::max);
                         this.agc_ceiling = (frame_max * 0.9).max(this.agc_ceiling * AGC_RELEASE);
                         let gain = (1.0 / this.agc_ceiling).clamp(1.0, AGC_MAX_GAIN);
                         // Spectrum ballistics: a bar leaps to a new reading
@@ -395,8 +393,7 @@ impl AudioPlayer {
                             *bar = if target > *bar {
                                 target
                             } else {
-                                (*bar - (*bar * SPECTRUM_FALL_K).max(SPECTRUM_FALL_MIN))
-                                    .max(target)
+                                (*bar - (*bar * SPECTRUM_FALL_K).max(SPECTRUM_FALL_MIN)).max(target)
                             };
                             let peak = &mut this.peak_hold[i];
                             *peak = if target > *peak {
@@ -419,9 +416,7 @@ impl AudioPlayer {
                         }
                         // Nothing audible: bars and caps fall to the floor,
                         // and the AGC ceiling drifts back up to unity.
-                        for (bar, peak) in
-                            this.spectrum.iter_mut().zip(this.peak_hold.iter_mut())
-                        {
+                        for (bar, peak) in this.spectrum.iter_mut().zip(this.peak_hold.iter_mut()) {
                             if *bar > 0.0 {
                                 *bar = (*bar - (*bar * SPECTRUM_FALL_K).max(SPECTRUM_FALL_MIN))
                                     .max(0.0);
@@ -465,14 +460,12 @@ impl Render for AudioPlayer {
         let strip_width = self.band_width.get();
         let playhead_ratio = strip_width
             .filter(|_| self.duration_ms > 0)
-            .map(|_| {
-                (self.transport.position_ms / self.duration_ms as f64).clamp(0., 1.) as f32
-            });
+            .map(|_| (self.transport.position_ms / self.duration_ms as f64).clamp(0., 1.) as f32);
         let playhead_left = playhead_ratio
             .zip(strip_width)
             .map(|(ratio, width)| (ratio * width - PLAYHEAD_W / 2.).max(0.));
-        let playhead_bucket = playhead_ratio
-            .map(|ratio| ratio * trove_core::media::waveform::PEAK_COUNT as f32);
+        let playhead_bucket =
+            playhead_ratio.map(|ratio| ratio * trove_core::media::waveform::PEAK_COUNT as f32);
         let controls = transport::row(
             self.transport.position_ms,
             self.duration_ms,
@@ -618,12 +611,12 @@ impl Render for AudioPlayer {
             .child({
                 let spectrum = self.spectrum.clone();
                 let peaks = self.peak_hold.clone();
-                div()
-                    .w_full()
-                    .px_6()
-                    .pb_2()
-                    .child(
-                        div().w_full().max_w(px(WAVE_MAX_W)).h(px(SPECTRUM_H)).child(
+                div().w_full().px_6().pb_2().child(
+                    div()
+                        .w_full()
+                        .max_w(px(WAVE_MAX_W))
+                        .h(px(SPECTRUM_H))
+                        .child(
                             gpui::canvas(
                                 |_, _, _| {},
                                 move |bounds, _, window, _| {
@@ -632,7 +625,7 @@ impl Render for AudioPlayer {
                             )
                             .size_full(),
                         ),
-                    )
+                )
             })
             .child(div().px_3().py_2().bg(cx.theme().popover).child(controls))
             .into_any_element()

@@ -11,8 +11,8 @@ use gpui_kit::*;
 
 use trove_core::model::AssetKind;
 use trove_core::tasks::TaskStatus;
-use trove_core::tasks::transcription::TranscribeRunRequest;
 use trove_core::tasks::ai_analysis::{AiAnalysisOutcome, AiAnalysisRunRequest, UndoOutcome};
+use trove_core::tasks::transcription::TranscribeRunRequest;
 use trove_core::tasks::{TaskId, TaskKind};
 
 use super::embedding::start_embedding_backfill_app;
@@ -252,7 +252,15 @@ pub fn start_analysis_app(
             .into_iter()
             .filter(|asset| matches!(asset.kind, AssetKind::Audio | AssetKind::Video))
             .map(|asset| asset.id)
-            .filter(|id| controller.read(cx).library.transcript(*id).ok().flatten().is_none())
+            .filter(|id| {
+                controller
+                    .read(cx)
+                    .library
+                    .transcript(*id)
+                    .ok()
+                    .flatten()
+                    .is_none()
+            })
             .collect();
         if !untranscribed.is_empty() {
             let ready = super::local_model::ensure_local_model_app(

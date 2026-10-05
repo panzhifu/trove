@@ -27,8 +27,8 @@ fn transcribes_jfk_locally() {
         engine: trove_core::config::TranscriptionEngine::Local,
         ..Default::default()
     };
-    let provider = trove_core::ai::transcribe::build_from_config(&config)
-        .expect("the model is on disk");
+    let provider =
+        trove_core::ai::transcribe::build_from_config(&config).expect("the model is on disk");
     println!("provider: {}", provider.model());
     let cancel = AtomicBool::new(false);
     let started = std::time::Instant::now();

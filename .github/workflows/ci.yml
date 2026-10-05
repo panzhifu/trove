@@ -65,11 +65,15 @@ jobs:
           #   libpipewire-0.3-dev libspa-sys <- pipewire <- xcap
           # and the link-only one, which consults no .pc file:
           #   libgbm-dev          gbm (rustc-link-lib=gbm, gpui's GBM surface)
+          # plus the build-time one the Linux candle dependencies need:
+          #   nvidia-cuda-toolkit nvcc <- cudarc's build script (candle's CUDA
+          #     kernels compile at build time; see trove-core/Cargo.toml)
           sudo apt-get install -y \
             libxcb1-dev libxkbcommon-dev libxkbcommon-x11-dev \
             libegl1-mesa-dev libgl1-mesa-dev libfontconfig-dev \
             libasound2-dev libwayland-dev libdrm-dev libzstd-dev \
-            libgbm-dev libpipewire-0.3-dev
+            libgbm-dev libpipewire-0.3-dev \
+            nvidia-cuda-toolkit
 
       - name: cargo fmt --check
         run: cargo fmt --all -- --check
@@ -122,12 +126,15 @@ jobs:
         run: |
           sudo apt-get update
           # The same set the `check` job installs: miri still *builds* the
-          # native dependencies, it just does not execute their code.
+          # native dependencies, it just does not execute their code — and
+          # since the candle dependencies entered the graph, that build
+          # includes cudarc's build script, which needs nvcc.
           sudo apt-get install -y \
             libxcb1-dev libxkbcommon-dev libxkbcommon-x11-dev \
             libegl1-mesa-dev libgl1-mesa-dev libfontconfig-dev \
             libasound2-dev libwayland-dev libdrm-dev libzstd-dev \
-            libgbm-dev libpipewire-0.3-dev
+            libgbm-dev libpipewire-0.3-dev \
+            nvidia-cuda-toolkit
 
       # Miri cannot execute foreign functions, so it cannot reach the two
       # FFI-backed `unsafe` sites: `store::Store::conn` aliases the sqlite3

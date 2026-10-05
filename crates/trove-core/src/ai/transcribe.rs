@@ -91,14 +91,21 @@ pub struct OpenAiCompatible {
 /// Build the provider the saved settings ask for: the OpenAI-compatible
 /// cloud client, or the local candle Whisper engine (whose model must
 /// already be on disk — the UI asks to download it before a run starts).
+/// The local engine exists only where candle does (the Linux dependency
+/// gate); elsewhere the pick answers with a runtime error.
 pub fn build_from_config(
     config: &TranscriptionConfig,
 ) -> crate::error::Result<std::sync::Arc<dyn TranscribeProvider>> {
     match config.engine {
+        #[cfg(target_os = "linux")]
         crate::config::TranscriptionEngine::Local => {
             let provider = crate::ai::transcribe_local::build(config)?;
             Ok(std::sync::Arc::new(provider))
         }
+        #[cfg(not(target_os = "linux"))]
+        crate::config::TranscriptionEngine::Local => Err(crate::error::Error::Validation(
+            "the local transcription engine ships on Linux builds; use the cloud engine".into(),
+        )),
         crate::config::TranscriptionEngine::Cloud => {
             let provider = OpenAiCompatible::new(
                 config.base_url.trim().to_string(),

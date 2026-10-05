@@ -276,7 +276,10 @@ mod tests {
             .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
             .unwrap();
         assert_eq!(peak_at, owner, "1 kHz must land in band {owner}");
-        assert!(peak > 0.4, "a half-scale tone must read clearly, got {peak}");
+        assert!(
+            peak > 0.4,
+            "a half-scale tone must read clearly, got {peak}"
+        );
     }
 
     /// The two-window stitching pays for itself at the bottom: 41 Hz and 47

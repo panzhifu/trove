@@ -12,19 +12,17 @@
 //! vendor, which model".
 
 use gpui_kit::assets::IconName;
+use gpui_kit::component::WindowExt as _;
 use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::notification::Notification;
 use gpui_kit::component::setting::NumberFieldOptions;
 use gpui_kit::component::switch::Switch;
-use gpui_kit::component::WindowExt as _;
 
 use super::*;
 use crate::app::settings_write;
 use crate::components::controls;
-use crate::library::{
-    AiProbe, AnalysisProbe, ModelDownload, TranscriptionProbe,
-};
+use crate::library::{AiProbe, AnalysisProbe, ModelDownload, TranscriptionProbe};
 
 // ============================ config ========================================
 
@@ -94,11 +92,10 @@ fn vendors_group() -> SettingGroup {
     let mut group = SettingGroup::new().title(rust_i18n::t!("settings.vendors").to_string());
     for profile in &profiles {
         let profile = profile.clone();
-        group = group.item(
-            SettingItem::new(profile.name.clone(), SettingField::render(move |_, _, cx| {
-                vendor_row(&profile, cx)
-            })),
-        );
+        group = group.item(SettingItem::new(
+            profile.name.clone(),
+            SettingField::render(move |_, _, cx| vendor_row(&profile, cx)),
+        ));
     }
     if profiles.is_empty() {
         group = group.item(SettingItem::new(
@@ -154,9 +151,7 @@ fn vendor_row(profile: &trove_core::config::VendorProfile, cx: &mut App) -> Div 
                 .xsmall()
                 .icon(IconName::Pencil)
                 .tooltip(rust_i18n::t!("settings.vendors_edit").to_string())
-                .on_click(move |_, window, cx| {
-                    open_vendor_editor(window, cx, editing.clone())
-                }),
+                .on_click(move |_, window, cx| open_vendor_editor(window, cx, editing.clone())),
         )
         .child(
             Button::new(SharedString::from(format!("vendor-delete-{}", profile.id)))
@@ -192,11 +187,9 @@ fn add_vendor_row(_cx: &mut App) -> AnyElement {
         .dropdown_menu_with_anchor(Anchor::TopLeft, move |menu, _, _| {
             let mut menu = menu.min_w(px(220.));
             for (index, label) in presets.clone() {
-                menu = menu.item(
-                    PopupMenuItem::new(label).on_click(move |_, window, cx| {
-                        open_vendor_preset_editor(window, cx, index);
-                    }),
-                );
+                menu = menu.item(PopupMenuItem::new(label).on_click(move |_, window, cx| {
+                    open_vendor_preset_editor(window, cx, index);
+                }));
             }
             menu
         })
@@ -252,7 +245,11 @@ fn open_vendor_editor(
         let local = editor.read(cx).local;
         let (name, base_url, api_key) = {
             let editor = editor.read(cx);
-            (editor.name.clone(), editor.base_url.clone(), editor.api_key.clone())
+            (
+                editor.name.clone(),
+                editor.base_url.clone(),
+                editor.api_key.clone(),
+            )
         };
         let switch_editor = editor.clone();
         dialog
@@ -261,23 +258,27 @@ fn open_vendor_editor(
             .child(
                 v_flex()
                     .gap_3()
-                    .child(form_label(rust_i18n::t!("settings.vendors_name").to_string()))
+                    .child(form_label(
+                        rust_i18n::t!("settings.vendors_name").to_string(),
+                    ))
                     .child(Input::new(&name).small().appearance(true))
-                    .child(form_label(rust_i18n::t!("settings.ai_base_url").to_string()))
+                    .child(form_label(
+                        rust_i18n::t!("settings.ai_base_url").to_string(),
+                    ))
                     .child(Input::new(&base_url).small().appearance(true))
                     .child(form_label(rust_i18n::t!("settings.ai_api_key").to_string()))
                     .child(Input::new(&api_key).small().appearance(true))
                     .child(
                         h_flex()
                             .justify_between()
-                            .child(form_label(rust_i18n::t!("settings.vendors_local").to_string()))
-                            .child(
-                                Switch::new("vendor-editor-local")
-                                    .checked(local)
-                                    .on_click(move |checked: &bool, _, cx| {
-                                        switch_editor.update(cx, |editor, _| editor.local = *checked);
-                                    }),
-                            ),
+                            .child(form_label(
+                                rust_i18n::t!("settings.vendors_local").to_string(),
+                            ))
+                            .child(Switch::new("vendor-editor-local").checked(local).on_click(
+                                move |checked: &bool, _, cx| {
+                                    switch_editor.update(cx, |editor, _| editor.local = *checked);
+                                },
+                            )),
                     ),
             )
             .on_ok(move |_, window, cx| save_vendor_editor(&editor, window, cx))
@@ -312,11 +313,7 @@ pub(super) fn open_vendor_preset_editor(window: &mut Window, cx: &mut App, prese
 
 /// Validate and persist one edited profile. `false` keeps the dialog open —
 /// the toast says what is missing.
-fn save_vendor_editor(
-    editor: &Entity<VendorEditor>,
-    window: &mut Window,
-    cx: &mut App,
-) -> bool {
+fn save_vendor_editor(editor: &Entity<VendorEditor>, window: &mut Window, cx: &mut App) -> bool {
     let (name, base_url, api_key) = {
         let editor = editor.read(cx);
         (
@@ -341,7 +338,11 @@ fn save_vendor_editor(
     // migration does for an endpoint it already knows.
     let name = if name.is_empty() {
         let host = super::host_of(&base_url).to_string();
-        if host.is_empty() { "Custom".into() } else { host }
+        if host.is_empty() {
+            "Custom".into()
+        } else {
+            host
+        }
     } else {
         name
     };
@@ -876,19 +877,22 @@ fn analysis_group(controller: &Entity<LibraryController>, probe: &AnalysisProbe)
                 vendor_field(
                     || analysis_config().vendor_id.clone(),
                     |value, cx| {
-                        save_analysis_config(|config| {
-                            config.vendor_id = Some(value.clone());
-                            // The stored family follows the profile's host,
-                            // so a legacy Anthropic/Gemini config keeps its
-                            // native adapter when its profile is re-picked
-                            // and a new pick speaks the wire every profile
-                            // can serve.
-                            if let Some(profile) =
-                                AppConfig::load().vendors.iter().find(|v| v.id == value)
-                            {
-                                config.vendor = family_for_base_url(&profile.base_url);
-                            }
-                        }, cx)
+                        save_analysis_config(
+                            |config| {
+                                config.vendor_id = Some(value.clone());
+                                // The stored family follows the profile's host,
+                                // so a legacy Anthropic/Gemini config keeps its
+                                // native adapter when its profile is re-picked
+                                // and a new pick speaks the wire every profile
+                                // can serve.
+                                if let Some(profile) =
+                                    AppConfig::load().vendors.iter().find(|v| v.id == value)
+                                {
+                                    config.vendor = family_for_base_url(&profile.base_url);
+                                }
+                            },
+                            cx,
+                        )
                     },
                 ),
             )
@@ -1209,10 +1213,7 @@ fn transcription_group(
                     vendor_field(
                         || transcription_config().vendor_id.clone(),
                         |value, cx| {
-                            save_transcription_config(
-                                |config| config.vendor_id = Some(value),
-                                cx,
-                            )
+                            save_transcription_config(|config| config.vendor_id = Some(value), cx)
                         },
                     ),
                 )
@@ -1330,8 +1331,11 @@ fn local_model_row(controller: &Entity<LibraryController>, cx: &mut App) -> Div 
         ),
         None => match lm::status() {
             lm::ModelStatus::Ready { path } => (
-                rust_i18n::t!("settings.local_model_ready", path = path.display().to_string())
-                    .to_string(),
+                rust_i18n::t!(
+                    "settings.local_model_ready",
+                    path = path.display().to_string()
+                )
+                .to_string(),
                 cx.theme().success,
                 None,
             ),
@@ -1433,9 +1437,7 @@ fn transcription_probe_row(
                 .disabled(running)
                 .label(rust_i18n::t!("settings.ai_probe_run").to_string())
                 .on_click(move |_, window, cx| {
-                    crate::library::jobs::test_transcription_endpoint_app(
-                        &controller, window, cx,
-                    );
+                    crate::library::jobs::test_transcription_endpoint_app(&controller, window, cx);
                 }),
         )
 }

@@ -140,7 +140,12 @@ fn candidate_dirs(root: &Path) -> Vec<PathBuf> {
         }
         dirs.push(child.clone());
         if let Ok(grandchildren) = fs::read_dir(&child) {
-            dirs.extend(grandchildren.flatten().map(|e| e.path()).filter(|p| p.is_dir()));
+            dirs.extend(
+                grandchildren
+                    .flatten()
+                    .map(|e| e.path())
+                    .filter(|p| p.is_dir()),
+            );
         }
     }
     dirs
@@ -164,7 +169,11 @@ pub fn download(cancel: &AtomicBool, progress: &dyn Fn(u64, u64)) -> Result<Path
     for (repo, file) in SOURCES {
         let size = content_length(repo, file, cancel)?;
         sizes.push(size);
-        total += size.unwrap_or(if file.ends_with(".safetensors") { 290_000_000 } else { 1 << 20 });
+        total += size.unwrap_or(if file.ends_with(".safetensors") {
+            290_000_000
+        } else {
+            1 << 20
+        });
     }
     let mut received: u64 = 0;
     progress(received, total);

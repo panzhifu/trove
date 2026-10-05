@@ -48,32 +48,29 @@ pub fn ensure_local_model_app(
     }
 
     let controller = controller.clone();
-    window.open_alert_dialog(
-        cx,
-        move |alert, _, _| {
-            // The dialog's builders are `Fn` — callable for every rebuild —
-            // so each layer clones what the next one hands down, and the
-            // click handler owns its own copies.
-            let controller = controller.clone();
-            let then = then.clone();
-            alert
-                .title(rust_i18n::t!("settings.local_model_dialog_title").to_string())
-                .description(
-                    rust_i18n::t!(
-                        "settings.local_model_dialog_description",
-                        mb = local_model::MODEL_DOWNLOAD_MB
-                    )
-                    .to_string(),
+    window.open_alert_dialog(cx, move |alert, _, _| {
+        // The dialog's builders are `Fn` — callable for every rebuild —
+        // so each layer clones what the next one hands down, and the
+        // click handler owns its own copies.
+        let controller = controller.clone();
+        let then = then.clone();
+        alert
+            .title(rust_i18n::t!("settings.local_model_dialog_title").to_string())
+            .description(
+                rust_i18n::t!(
+                    "settings.local_model_dialog_description",
+                    mb = local_model::MODEL_DOWNLOAD_MB
                 )
-                .confirm()
-                .ok_text(rust_i18n::t!("settings.local_model_download_now").to_string())
-                .cancel_text(rust_i18n::t!("settings.local_model_not_now").to_string())
-                .on_ok(move |_, window, cx| {
-                    start_model_download_app(&controller, then.clone(), window, cx);
-                    true
-                })
-        },
-    );
+                .to_string(),
+            )
+            .confirm()
+            .ok_text(rust_i18n::t!("settings.local_model_download_now").to_string())
+            .cancel_text(rust_i18n::t!("settings.local_model_not_now").to_string())
+            .on_ok(move |_, window, cx| {
+                start_model_download_app(&controller, then.clone(), window, cx);
+                true
+            })
+    });
     false
 }
 
@@ -110,41 +107,38 @@ pub fn delete_local_model_app(
         return;
     }
     let controller = controller.clone();
-    window.open_alert_dialog(
-        cx,
-        move |alert, _, _| {
-            let controller = controller.clone();
-            alert
-                .title(rust_i18n::t!("settings.model_delete_title").to_string())
-                .description(
-                    rust_i18n::t!("settings.model_delete_body", mb = local_model::MODEL_DOWNLOAD_MB)
-                        .to_string(),
+    window.open_alert_dialog(cx, move |alert, _, _| {
+        let controller = controller.clone();
+        alert
+            .title(rust_i18n::t!("settings.model_delete_title").to_string())
+            .description(
+                rust_i18n::t!(
+                    "settings.model_delete_body",
+                    mb = local_model::MODEL_DOWNLOAD_MB
                 )
-                .confirm()
-                .ok_text(rust_i18n::t!("settings.model_delete").to_string())
-                .cancel_text(rust_i18n::t!("settings.local_model_not_now").to_string())
-                .on_ok(move |_, window, cx| {
-                    match local_model::delete() {
-                        Ok(()) => {
-                            window.push_notification(
-                                Notification::success(
-                                    rust_i18n::t!("settings.model_deleted").to_string(),
-                                ),
-                                cx,
-                            );
-                        }
-                        Err(error) => {
-                            window.push_notification(
-                                Notification::warning(error.to_string()),
-                                cx,
-                            );
-                        }
+                .to_string(),
+            )
+            .confirm()
+            .ok_text(rust_i18n::t!("settings.model_delete").to_string())
+            .cancel_text(rust_i18n::t!("settings.local_model_not_now").to_string())
+            .on_ok(move |_, window, cx| {
+                match local_model::delete() {
+                    Ok(()) => {
+                        window.push_notification(
+                            Notification::success(
+                                rust_i18n::t!("settings.model_deleted").to_string(),
+                            ),
+                            cx,
+                        );
                     }
-                    controller.update(cx, |_, cx| cx.notify());
-                    true
-                })
-        },
-    );
+                    Err(error) => {
+                        window.push_notification(Notification::warning(error.to_string()), cx);
+                    }
+                }
+                controller.update(cx, |_, cx| cx.notify());
+                true
+            })
+    });
 }
 
 /// Run the model download in the background: progress on the controller for
@@ -188,10 +182,10 @@ pub fn start_model_download_app(
             let outcome = outcome.clone();
             cx.background_executor()
                 .spawn(async move {
-                    let result = local_model::download(&AtomicBool::new(false), &|received,
-                                                                                    total| {
-                        *progress.lock().unwrap() = (received, total);
-                    });
+                    let result =
+                        local_model::download(&AtomicBool::new(false), &|received, total| {
+                            *progress.lock().unwrap() = (received, total);
+                        });
                     *outcome.lock().unwrap() =
                         Some(result.map(|_| ()).map_err(|error| error.to_string()));
                     finished.store(true, Ordering::Relaxed);
@@ -239,8 +233,11 @@ pub fn start_model_download_app(
                 Some(Err(message)) => {
                     window.push_notification(
                         Notification::warning(
-                            rust_i18n::t!("settings.local_model_download_failed", error = message.clone())
-                                .to_string(),
+                            rust_i18n::t!(
+                                "settings.local_model_download_failed",
+                                error = message.clone()
+                            )
+                            .to_string(),
                         ),
                         cx,
                     );

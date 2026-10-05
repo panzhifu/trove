@@ -808,7 +808,10 @@ mod tests {
 
         req.transcript = None;
         let joined = user_text_lines(&req).join("\n");
-        assert!(joined.contains("Judge it by its name, metadata."), "{joined}");
+        assert!(
+            joined.contains("Judge it by its name, metadata."),
+            "{joined}"
+        );
         assert!(!joined.contains("Transcript of the recording"), "{joined}");
     }
 

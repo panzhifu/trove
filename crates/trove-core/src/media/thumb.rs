@@ -872,12 +872,10 @@ fn write_text_card(blob_path: &Path, out: &Path) -> Option<PathBuf> {
     let markup = text_card_svg(&content.text);
     let (w, h) = TEXT_CARD_SIZE;
     let ink = render_svg_data(markup.as_bytes())?;
-    let ink = ink.resize_exact(w, h, image::imageops::FilterType::Triangle).to_rgba8();
-    let mut base = image::RgbaImage::from_raw(
-        w,
-        h,
-        crate::media::render3d::background_rgba(w, h),
-    )?;
+    let ink = ink
+        .resize_exact(w, h, image::imageops::FilterType::Triangle)
+        .to_rgba8();
+    let mut base = image::RgbaImage::from_raw(w, h, crate::media::render3d::background_rgba(w, h))?;
     image::imageops::overlay(&mut base, &ink, 0, 0);
     write_downscaled(&image::DynamicImage::ImageRgba8(base), out)
 }
@@ -896,9 +894,7 @@ fn text_card_svg(text: &str) -> String {
             crate::services::xmp::xml_escape(line)
         ));
     }
-    format!(
-        "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{w}\" height=\"{h}\">{body}</svg>"
-    )
+    format!("<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{w}\" height=\"{h}\">{body}</svg>")
 }
 
 /// The card's lines: CRLF folded, tabs widened into a real indent, each line cut
@@ -954,8 +950,7 @@ fn write_wave_card(peaks: &waveform::Peaks, out: &Path) -> Option<PathBuf> {
             ..waveform::Style::CARD
         },
     )?;
-    let mut base =
-        image::RgbaImage::from_raw(w, h, crate::media::render3d::background_rgba(w, h))?;
+    let mut base = image::RgbaImage::from_raw(w, h, crate::media::render3d::background_rgba(w, h))?;
     image::imageops::overlay(&mut base, &wave, 0, 0);
     write_downscaled(&image::DynamicImage::ImageRgba8(base), out)
 }

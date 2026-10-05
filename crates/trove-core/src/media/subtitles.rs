@@ -262,7 +262,7 @@ fn parse_timestamp(raw: &str) -> Option<u64> {
         [m, s] => ("0", *m, *s),
         _ => return None,
     };
-    let (secs, millis) = match seconds.split_once(|c| c == ',' || c == '.') {
+    let (secs, millis) = match seconds.split_once([',', '.']) {
         Some((s, m)) => (s, m),
         None => (seconds, "0"),
     };
@@ -278,7 +278,6 @@ fn parse_timestamp(raw: &str) -> Option<u64> {
     };
     Some(hours * 3_600_000 + minutes * 60_000 + secs * 1000 + millis)
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -320,7 +319,10 @@ mod tests {
     #[test]
     fn timeline_spans_the_duration() {
         let duration = 60_000;
-        let cues = cues("第一句。第二句，比较长一些一些一些一些。Third and last!", Some(duration));
+        let cues = cues(
+            "第一句。第二句，比较长一些一些一些一些。Third and last!",
+            Some(duration),
+        );
         assert!(cues.len() >= 3);
         assert_eq!(cues.first().unwrap().start_ms, 0);
         assert_eq!(cues.last().unwrap().end_ms, duration);
@@ -416,10 +418,7 @@ mod tests {
         assert_eq!(parse_timestamp("01:02:03,004"), Some(3_723_004));
         assert_eq!(parse_timestamp("01:02:03.004"), Some(3_723_004));
         assert_eq!(parse_timestamp("00:05,5"), Some(5_500));
-        assert_eq!(
-            parse_timestamp("00:00:01,000 X1:100 X2:200"),
-            Some(1_000)
-        );
+        assert_eq!(parse_timestamp("00:00:01,000 X1:100 X2:200"), Some(1_000));
         assert_eq!(parse_timestamp("garbage"), None);
     }
 }

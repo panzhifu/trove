@@ -23,8 +23,8 @@
 //! before being given up on.
 
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use candle_core::{Device, IndexOp as _};
 use candle_nn::VarBuilder;
@@ -125,11 +125,9 @@ fn load(dir: &Path) -> std::result::Result<Loaded, String> {
 
     // The mel filter bank: num_mel_bins filters over N_FFT/2 + 1 slots, in
     // the `mel_80` tensor of the demo's safetensors file.
-    let filter_tensors = candle_core::safetensors::load(
-        dir.join("mel_filters.safetensors"),
-        &device,
-    )
-    .map_err(|e| format!("load mel_filters.safetensors: {e}"))?;
+    let filter_tensors =
+        candle_core::safetensors::load(dir.join("mel_filters.safetensors"), &device)
+            .map_err(|e| format!("load mel_filters.safetensors: {e}"))?;
     let filters: Vec<f32> = filter_tensors
         .get("mel_80")
         .ok_or("mel_filters.safetensors lacks the mel_80 tensor")?
@@ -197,18 +195,22 @@ impl TranscribeProvider for LocalWhisper {
         if cancel.load(Ordering::Relaxed) {
             return Err(cancelled());
         }
-        let (samples, sample_rate) =
-            pcm_from_wav(audio).map_err(|message| VendorError {
-                kind: VendorErrorKind::InvalidResponse,
-                message,
-                http_status: None,
-                provider_code: None,
-                request_id: None,
-            })?;
+        let (samples, sample_rate) = pcm_from_wav(audio).map_err(|message| VendorError {
+            kind: VendorErrorKind::InvalidResponse,
+            message,
+            http_status: None,
+            provider_code: None,
+            request_id: None,
+        })?;
         // A per-run hint wins over the saved preference; both fall back to
         // detection on the first window.
-        let language = language.map(str::to_string).or_else(|| self.language.clone());
-        let mut guard = self.loaded.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let language = language
+            .map(str::to_string)
+            .or_else(|| self.language.clone());
+        let mut guard = self
+            .loaded
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         guard.transcribe(&samples, sample_rate, language.as_deref(), cancel)
     }
 }
@@ -311,7 +313,12 @@ impl Loaded {
     /// `<|startoftranscript|>`, the language, then the transcription task
     /// with timestamps off.
     fn initial_prompt(&self, language_token: u32) -> Vec<u32> {
-        vec![self.sot, language_token, self.transcribe, self.no_timestamps]
+        vec![
+            self.sot,
+            language_token,
+            self.transcribe,
+            self.no_timestamps,
+        ]
     }
 
     fn language_token(&self, code: &str) -> Option<u32> {
@@ -553,9 +560,7 @@ fn pcm_from_wav(bytes: &[u8]) -> std::result::Result<(Vec<f32>, u32), String> {
         let end = (body + size).min(bytes.len());
         match id {
             b"fmt " => {
-                let fmt = bytes
-                    .get(body..body + 16)
-                    .ok_or("truncated fmt chunk")?;
+                let fmt = bytes.get(body..body + 16).ok_or("truncated fmt chunk")?;
                 let format = u16::from_le_bytes(fmt[0..2].try_into().unwrap());
                 if format != 1 {
                     return Err(format!("unsupported WAV format tag {format} (need PCM)"));
@@ -592,9 +597,7 @@ fn pcm_from_wav(bytes: &[u8]) -> std::result::Result<(Vec<f32>, u32), String> {
             .as_chunks::<2>()
             .0
             .iter()
-            .map(|pair| {
-                (f32::from(pair[0]) + f32::from(pair[1])) / 2.0 / 32768.0
-            })
+            .map(|pair| (f32::from(pair[0]) + f32::from(pair[1])) / 2.0 / 32768.0)
             .collect::<Vec<f32>>(),
         channels => return Err(format!("unsupported WAV channel count {channels}")),
     };
@@ -746,7 +749,11 @@ mod tests {
 
         let (samples, rate) = pcm_from_wav(&wav).unwrap();
         assert_eq!(rate, 16_000);
-        assert_eq!(samples.len(), 1, "one stereo frame folds to one mono sample");
+        assert_eq!(
+            samples.len(),
+            1,
+            "one stereo frame folds to one mono sample"
+        );
         assert!((samples[0] - 0.0).abs() < 1e-6, "the pair averages out");
 
         // Not WAV at all.

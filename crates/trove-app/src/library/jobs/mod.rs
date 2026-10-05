@@ -215,6 +215,7 @@ pub use self::{
         AnalysisTarget, cancel_analysis_app, pause_task_app, resume_task_app, retry_task_app,
         start_analysis_app, start_analysis_undo_app, test_analysis_endpoint_app,
     },
+    embed_model::{delete_embed_model_id_app, start_embed_model_download_app},
     embedding::{
         cancel_embedding_backfill_app, delete_embeddings_app, start_embedding_backfill_app,
         test_embedding_endpoint_app,
@@ -223,7 +224,6 @@ pub use self::{
     import::{
         ImportTaskHandle, InboxDrain, collect_inbox_app, import_copied_app, import_paths_app,
     },
-    embed_model::{delete_embed_model_id_app, start_embed_model_download_app},
     local_model::{delete_local_model_app, start_model_download_app},
     migrate::{start_migration_job_app, start_migration_standalone},
     search::{request_ai_plan_app, request_query_embedding_app},

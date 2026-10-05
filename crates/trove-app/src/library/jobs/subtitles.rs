@@ -26,15 +26,13 @@ pub fn ensure_subtitle_asset(
     path: &std::path::Path,
     cx: &mut App,
 ) {
-    controller.update(cx, |ctl, cx| {
-        match ctl.library.ensure_linked_file(path) {
-            Ok(_) => {
-                ctl.generation += 1;
-                cx.notify();
-            }
-            Err(error) => {
-                tracing::warn!(%error, path = %path.display(), "subtitle asset registration failed")
-            }
+    controller.update(cx, |ctl, cx| match ctl.library.ensure_linked_file(path) {
+        Ok(_) => {
+            ctl.generation += 1;
+            cx.notify();
+        }
+        Err(error) => {
+            tracing::warn!(%error, path = %path.display(), "subtitle asset registration failed")
         }
     });
 }
@@ -82,7 +80,11 @@ pub fn auto_save_subtitles_app(
             let Some(disk_path) = ctl.library.asset_file(id) else {
                 continue;
             };
-            let entry = (disk_path.with_extension("srt"), transcript, asset.duration_ms);
+            let entry = (
+                disk_path.with_extension("srt"),
+                transcript,
+                asset.duration_ms,
+            );
             if entry.0.exists() {
                 if ask_on_conflict {
                     conflicts.push(entry);
@@ -120,44 +122,33 @@ pub fn auto_save_subtitles_app(
     let count = conflicts.len();
     let first = conflicts[0].0.display().to_string();
     let controller = controller.clone();
-    window.open_alert_dialog(
-        cx,
-        move |alert, _, _| {
-            let conflicts = conflicts.clone();
-            let first = first.clone();
-            let controller = controller.clone();
-            alert
-                .title(rust_i18n::t!("inspector.transcript_overwrite_title").to_string())
-                .description(
-                    rust_i18n::t!(
-                        "subtitle.auto_overwrite_body",
-                        count = count,
-                        path = first
-                    )
+    window.open_alert_dialog(cx, move |alert, _, _| {
+        let conflicts = conflicts.clone();
+        let first = first.clone();
+        let controller = controller.clone();
+        alert
+            .title(rust_i18n::t!("inspector.transcript_overwrite_title").to_string())
+            .description(
+                rust_i18n::t!("subtitle.auto_overwrite_body", count = count, path = first)
                     .to_string(),
-                )
-                .confirm()
-                .ok_text(rust_i18n::t!("inspector.transcript_save").to_string())
-                .on_ok(move |_, window, cx| {
-                    let mut overwritten = 0usize;
-                    for (path, transcript, duration) in &conflicts {
-                        if trove_core::media::subtitles::save(path, transcript, *duration).is_ok() {
-                            ensure_subtitle_asset(&controller, path, cx);
-                            overwritten += 1;
-                        }
+            )
+            .confirm()
+            .ok_text(rust_i18n::t!("inspector.transcript_save").to_string())
+            .on_ok(move |_, window, cx| {
+                let mut overwritten = 0usize;
+                for (path, transcript, duration) in &conflicts {
+                    if trove_core::media::subtitles::save(path, transcript, *duration).is_ok() {
+                        ensure_subtitle_asset(&controller, path, cx);
+                        overwritten += 1;
                     }
-                    window.push_notification(
-                        Notification::success(
-                            rust_i18n::t!(
-                                "subtitle.auto_overwritten",
-                                count = overwritten
-                            )
-                            .to_string(),
-                        ),
-                        cx,
-                    );
-                    true
-                })
-        },
-    );
+                }
+                window.push_notification(
+                    Notification::success(
+                        rust_i18n::t!("subtitle.auto_overwritten", count = overwritten).to_string(),
+                    ),
+                    cx,
+                );
+                true
+            })
+    });
 }

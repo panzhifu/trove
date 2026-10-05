@@ -1303,7 +1303,8 @@ mod tests {
             assets::insert(store.conn(), &asset).unwrap();
         }
 
-        let provider = MockAdapter::new(r#"{"description": "A song.", "tags": [], "rating": null}"#);
+        let provider =
+            MockAdapter::new(r#"{"description": "A song.", "tags": [], "rating": null}"#);
         let outcome = run(&options(&data, &cache), &provider, &ctx()).unwrap();
         assert_eq!(outcome.analysed, 1);
         assert_eq!(provider.images_sent(), 0);

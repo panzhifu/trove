@@ -530,7 +530,11 @@ mod tests {
 
         let outcome = run(&options, &provider, &ctx()).unwrap();
         assert_eq!(outcome.transcribed, 2, "{outcome:?}");
-        assert_eq!(outcome.transcribed_ids.len(), 2, "ids name the exported files");
+        assert_eq!(
+            outcome.transcribed_ids.len(),
+            2,
+            "ids name the exported files"
+        );
         assert_eq!(outcome.failed, 0);
         assert_eq!(outcome.chars, "hello world".len() as u64 * 2);
         assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
@@ -546,7 +550,11 @@ mod tests {
         let second = run(&options, &provider, &ctx()).unwrap();
         assert_eq!(second.transcribed, 0);
         assert_eq!(second.skipped, 2, "a repeat run is free: {second:?}");
-        assert_eq!(second.skipped_ids.len(), 2, "skipped ids let the UI backfill");
+        assert_eq!(
+            second.skipped_ids.len(),
+            2,
+            "skipped ids let the UI backfill"
+        );
         assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
     }
 

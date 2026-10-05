@@ -44,11 +44,7 @@ fn vendor_name_from_url(url: &str) -> String {
         "api.siliconflow.cn" => "SiliconFlow".into(),
         "api.anthropic.com" => "Anthropic".into(),
         "dashscope.aliyuncs.com" => "DashScope".into(),
-        other => other
-            .split(':')
-            .next()
-            .unwrap_or(other)
-            .to_string(),
+        other => other.split(':').next().unwrap_or(other).to_string(),
     }
 }
 
@@ -1139,8 +1135,12 @@ impl AppConfig {
                 .as_ref()
                 .filter(|c| used(&c.model))
                 .map(|c| (c.base_url.clone(), c.api_key.clone())),
-            used(&self.search.ai.model)
-                .then(|| (self.search.ai.base_url.clone(), self.search.ai.api_key.clone())),
+            used(&self.search.ai.model).then(|| {
+                (
+                    self.search.ai.base_url.clone(),
+                    self.search.ai.api_key.clone(),
+                )
+            }),
             self.ai_analysis
                 .as_ref()
                 .filter(|c| used(&c.model))
@@ -1153,9 +1153,7 @@ impl AppConfig {
 
         let mut folded: Vec<VendorProfile> = Vec::new();
         for (base_url, api_key) in endpoints.into_iter().flatten() {
-            if base_url.trim().is_empty()
-                || folded.iter().any(|v| v.base_url == base_url)
-            {
+            if base_url.trim().is_empty() || folded.iter().any(|v| v.base_url == base_url) {
                 continue;
             }
             folded.push(VendorProfile {
@@ -2052,7 +2050,11 @@ mod vendor_migration_tests {
 
         config.migrate_vendors();
 
-        assert_eq!(config.vendors.len(), 2, "two distinct endpoints, two profiles");
+        assert_eq!(
+            config.vendors.len(),
+            2,
+            "two distinct endpoints, two profiles"
+        );
         let embedding = config.ai_embedding.as_ref().unwrap();
         let search = &config.search.ai;
         assert_eq!(

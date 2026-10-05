@@ -16,8 +16,8 @@
 //! re-parses the cue list so the two views never disagree.
 
 use gpui_kit::base::{h_flex, v_flex};
-use gpui_kit::component::input::{Editor, EditorState};
 use gpui_kit::component::ActiveTheme;
+use gpui_kit::component::input::{Editor, EditorState};
 use gpui_kit::*;
 use trove_core::media::subtitles::{self, Cue};
 use uuid::Uuid;
@@ -241,17 +241,11 @@ impl Render for SubtitleEditor {
                                     .flex_none()
                                     .child(format!("{}", index + 1)),
                             )
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(muted)
-                                    .flex_none()
-                                    .child(format!(
-                                        "{} → {}",
-                                        subtitles::format_timestamp(cue.start_ms),
-                                        subtitles::format_timestamp(cue.end_ms)
-                                    )),
-                            ),
+                            .child(div().text_xs().text_color(muted).flex_none().child(format!(
+                                "{} → {}",
+                                subtitles::format_timestamp(cue.start_ms),
+                                subtitles::format_timestamp(cue.end_ms)
+                            ))),
                     )
                     .child(
                         v_flex()

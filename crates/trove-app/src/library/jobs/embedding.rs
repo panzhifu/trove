@@ -67,10 +67,9 @@ pub fn start_embedding_backfill_app(
 
     let manager = controller.read(cx).library.tasks().clone();
     let started = controller.update(cx, |ctl, _| {
-        ctl.library
-            .start_embedding_backfill(&model_id, move || {
-                trove_core::ai::embedding_provider(&config)
-            })
+        ctl.library.start_embedding_backfill(&model_id, move || {
+            trove_core::ai::embedding_provider(&config)
+        })
     });
     let Ok((task_id, rx)) = started else {
         return false; // one backfill at a time; the running toast is up

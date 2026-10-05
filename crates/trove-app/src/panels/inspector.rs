@@ -309,7 +309,14 @@ impl InspectorPanel {
         if self.editing_id == Some(asset_id) {
             return;
         }
-        let values = match self.controller.read(cx).library.asset(asset_id).ok().flatten() {
+        let values = match self
+            .controller
+            .read(cx)
+            .library
+            .asset(asset_id)
+            .ok()
+            .flatten()
+        {
             Some(asset) => Self::display_values(&asset),
             None => [
                 (TextField::Title, String::new()),
@@ -512,7 +519,9 @@ impl Render for InspectorPanel {
                 // waveform, text/subtitle documents) take that paper as the
                 // frame, so the contained card does not float on a theme
                 // surface with bands around it. Everything else uses the theme.
-                AssetKind::Font | AssetKind::Audio | AssetKind::Document | AssetKind::Other => paper,
+                AssetKind::Font | AssetKind::Audio | AssetKind::Document | AssetKind::Other => {
+                    paper
+                }
                 _ => cx.theme().secondary,
             })
             .overflow_hidden()
@@ -1540,7 +1549,10 @@ mod tests {
         // Nothing new in the store is a no-op.
         assert_eq!(refill_target("same", "same", "same"), None);
         // A second background write lands on top of a previous refill.
-        assert_eq!(refill_target("first", "first", "second").as_deref(), Some("second"));
+        assert_eq!(
+            refill_target("first", "first", "second").as_deref(),
+            Some("second")
+        );
         // A user commit re-anchors the watch, so their own text is not
         // "moved away from" on the next render.
         assert_eq!(refill_target("mine", "mine", "mine"), None);

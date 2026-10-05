@@ -60,24 +60,21 @@ pub fn ensure_embed_model_app(
 
     let controller = controller.clone();
     let mb = model.download_mb;
-    window.open_alert_dialog(
-        cx,
-        move |alert, _, _| {
-            let controller = controller.clone();
-            alert
-                .title(rust_i18n::t!("settings.embed_model_dialog_title").to_string())
-                .description(
-                    rust_i18n::t!("settings.embed_model_dialog_description", mb = mb).to_string(),
-                )
-                .confirm()
-                .ok_text(rust_i18n::t!("settings.embed_model_download_now").to_string())
-                .cancel_text(rust_i18n::t!("settings.embed_model_not_now").to_string())
-                .on_ok(move |_, window, cx| {
-                    start_embed_model_download_app(&controller, window, cx);
-                    true
-                })
-        },
-    );
+    window.open_alert_dialog(cx, move |alert, _, _| {
+        let controller = controller.clone();
+        alert
+            .title(rust_i18n::t!("settings.embed_model_dialog_title").to_string())
+            .description(
+                rust_i18n::t!("settings.embed_model_dialog_description", mb = mb).to_string(),
+            )
+            .confirm()
+            .ok_text(rust_i18n::t!("settings.embed_model_download_now").to_string())
+            .cancel_text(rust_i18n::t!("settings.embed_model_not_now").to_string())
+            .on_ok(move |_, window, cx| {
+                start_embed_model_download_app(&controller, window, cx);
+                true
+            })
+    });
     false
 }
 
@@ -123,41 +120,33 @@ pub fn delete_embed_model_id_app(
     }
     let mb = embed_model::resolve(&model_id).download_mb;
     let controller = controller.clone();
-    window.open_alert_dialog(
-        cx,
-        move |alert, _, _| {
-            let controller = controller.clone();
-            let model_id = model_id.clone();
-            alert
-                .title(rust_i18n::t!("settings.model_delete_title").to_string())
-                .description(
-                    rust_i18n::t!("settings.model_delete_body", mb = mb).to_string(),
-                )
-                .confirm()
-                .ok_text(rust_i18n::t!("settings.model_delete").to_string())
-                .cancel_text(rust_i18n::t!("settings.embed_model_not_now").to_string())
-                .on_ok(move |_, window, cx| {
-                    match embed_model::delete(&model_id) {
-                        Ok(()) => {
-                            window.push_notification(
-                                Notification::success(
-                                    rust_i18n::t!("settings.model_deleted").to_string(),
-                                ),
-                                cx,
-                            );
-                        }
-                        Err(error) => {
-                            window.push_notification(
-                                Notification::warning(error.to_string()),
-                                cx,
-                            );
-                        }
+    window.open_alert_dialog(cx, move |alert, _, _| {
+        let controller = controller.clone();
+        let model_id = model_id.clone();
+        alert
+            .title(rust_i18n::t!("settings.model_delete_title").to_string())
+            .description(rust_i18n::t!("settings.model_delete_body", mb = mb).to_string())
+            .confirm()
+            .ok_text(rust_i18n::t!("settings.model_delete").to_string())
+            .cancel_text(rust_i18n::t!("settings.embed_model_not_now").to_string())
+            .on_ok(move |_, window, cx| {
+                match embed_model::delete(&model_id) {
+                    Ok(()) => {
+                        window.push_notification(
+                            Notification::success(
+                                rust_i18n::t!("settings.model_deleted").to_string(),
+                            ),
+                            cx,
+                        );
                     }
-                    controller.update(cx, |_, cx| cx.notify());
-                    true
-                })
-        },
-    );
+                    Err(error) => {
+                        window.push_notification(Notification::warning(error.to_string()), cx);
+                    }
+                }
+                controller.update(cx, |_, cx| cx.notify());
+                true
+            })
+    });
 }
 
 /// Run the model download in the background: progress on the controller for
@@ -202,11 +191,13 @@ pub fn start_embed_model_download_app(
             let outcome = outcome.clone();
             cx.background_executor()
                 .spawn(async move {
-                    let result =
-                        embed_model::download(&model, &AtomicBool::new(false), &|received,
-                                                                                  total| {
-                        *progress.lock().unwrap() = (received, total);
-                    });
+                    let result = embed_model::download(
+                        &model,
+                        &AtomicBool::new(false),
+                        &|received, total| {
+                            *progress.lock().unwrap() = (received, total);
+                        },
+                    );
                     *outcome.lock().unwrap() =
                         Some(result.map(|_| ()).map_err(|error| error.to_string()));
                     finished.store(true, Ordering::Relaxed);
@@ -247,30 +238,28 @@ pub fn start_embed_model_download_app(
             }
             cx.notify();
         });
-        let _ = handle.update(cx, |_view, window, cx| {
-            match result.as_ref() {
-                Some(Ok(())) => {
-                    window.push_notification(
-                        Notification::success(
-                            rust_i18n::t!("settings.embed_model_download_done").to_string(),
-                        ),
-                        cx,
-                    );
-                }
-                Some(Err(message)) => {
-                    window.push_notification(
-                        Notification::warning(
-                            rust_i18n::t!(
-                                "settings.embed_model_download_failed",
-                                error = message.clone()
-                            )
-                            .to_string(),
-                        ),
-                        cx,
-                    );
-                }
-                None => {}
+        let _ = handle.update(cx, |_view, window, cx| match result.as_ref() {
+            Some(Ok(())) => {
+                window.push_notification(
+                    Notification::success(
+                        rust_i18n::t!("settings.embed_model_download_done").to_string(),
+                    ),
+                    cx,
+                );
             }
+            Some(Err(message)) => {
+                window.push_notification(
+                    Notification::warning(
+                        rust_i18n::t!(
+                            "settings.embed_model_download_failed",
+                            error = message.clone()
+                        )
+                        .to_string(),
+                    ),
+                    cx,
+                );
+            }
+            None => {}
         });
     })
     .detach();

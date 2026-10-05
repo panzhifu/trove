@@ -391,8 +391,8 @@ mod tests {
     /// — the settings button must not toast a failure for doing nothing.
     #[test]
     fn removal_is_idempotent() {
-        let dir = std::env::temp_dir()
-            .join(format!("trove-embed-model-del-{}", crate::model::new_id()));
+        let dir =
+            std::env::temp_dir().join(format!("trove-embed-model-del-{}", crate::model::new_id()));
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join("model.safetensors"), b"x").unwrap();
         remove_model_dir(&dir).unwrap();

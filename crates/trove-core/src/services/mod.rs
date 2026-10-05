@@ -11,10 +11,10 @@ pub mod font_manager;
 pub mod kwin;
 #[cfg(target_os = "linux")]
 pub mod kwin_script;
-pub mod maintenance;
 pub mod local_model;
-mod model_fetch;
+pub mod maintenance;
 pub mod migrate;
+mod model_fetch;
 pub mod open_external;
 pub mod repo_package;
 pub mod screenshot;

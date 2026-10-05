@@ -23,7 +23,7 @@
 
 use std::sync::{Arc, Mutex, OnceLock};
 
-use candle_core::{DType, D, IndexOp as _, Tensor};
+use candle_core::{D, DType, IndexOp as _, Tensor};
 use candle_nn::VarBuilder;
 use candle_transformers::models::bert::{self, BertModel};
 use candle_transformers::models::xlm_roberta::{self, XLMRobertaModel};
@@ -39,17 +39,18 @@ use crate::model::EmbeddingSpace;
 /// for `bge-m3`) and uploads them to the device — seconds of work that a
 /// search must not pay per query. Keyed by model id: a re-pick in the
 /// settings replaces the entry, and the old weights drop with it.
-static CACHE: OnceLock<Mutex<Option<(String, Arc<LocalBert>)>>> = OnceLock::new();
+type CachedEmbedder = (String, Arc<LocalBert>);
+static CACHE: OnceLock<Mutex<Option<CachedEmbedder>>> = OnceLock::new();
 
 /// Build the local provider for `model`, reusing the cached instance when the
 /// settings still point at the same checkpoint. See [`CACHE`].
 pub fn build_cached(model: &str) -> Result<Arc<LocalBert>> {
     let cache = CACHE.get_or_init(|| Mutex::new(None));
     let mut cached = cache.lock().unwrap();
-    if let Some((cached_id, provider)) = cached.as_ref() {
-        if cached_id == model {
-            return Ok(provider.clone());
-        }
+    if let Some((cached_id, provider)) = cached.as_ref()
+        && cached_id == model
+    {
+        return Ok(provider.clone());
     }
     let provider = Arc::new(build(model)?);
     *cached = Some((model.to_string(), provider.clone()));
@@ -183,8 +184,8 @@ fn load(dir: &std::path::Path) -> std::result::Result<Loaded, String> {
             } else {
                 vb
             };
-            let model = XLMRobertaModel::new(&config, vb)
-                .map_err(|e| format!("build the model: {e}"))?;
+            let model =
+                XLMRobertaModel::new(&config, vb).map_err(|e| format!("build the model: {e}"))?;
             (Backend::XlmRoberta(model), dim)
         }
         _ => {
@@ -284,12 +285,10 @@ impl EmbeddingProvider for LocalBert {
         let loaded = self.loaded.lock().unwrap();
         let mut out = Vec::with_capacity(texts.len());
         for chunk in texts.chunks(LOCAL_BATCH) {
-            out.extend(loaded
-                .embed_batch(chunk)
-                .map_err(|error| Error::External {
-                    program: "embed-local".into(),
-                    message: error.to_string(),
-                })?);
+            out.extend(loaded.embed_batch(chunk).map_err(|error| Error::External {
+                program: "embed-local".into(),
+                message: error.to_string(),
+            })?);
         }
         Ok(out)
     }

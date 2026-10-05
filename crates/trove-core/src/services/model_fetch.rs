@@ -183,7 +183,14 @@ mod tests {
     #[ignore = "network"]
     fn a_missing_file_reports_the_http_status() {
         let cancel = AtomicBool::new(false);
-        let error = fetch_file("trove/nonexistent-repo", "model.safetensors", &std::env::temp_dir().join("trove-fetch-test"), &cancel, |_| {}).unwrap_err();
+        let error = fetch_file(
+            "trove/nonexistent-repo",
+            "model.safetensors",
+            &std::env::temp_dir().join("trove-fetch-test"),
+            &cancel,
+            |_| {},
+        )
+        .unwrap_err();
         assert!(error.to_string().contains("HTTP"), "{error}");
     }
 
