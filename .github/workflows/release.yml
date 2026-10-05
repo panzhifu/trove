@@ -164,14 +164,14 @@ jobs:
       # forward-compatible — the user's driver JIT-compiles it for whatever
       # GPU they actually own, so every Ampere-or-newer NVIDIA runs the same
       # artifact; pre-Ampere cards fall back to CPU at runtime.
+      # The build step stays on the default shell deliberately: the `bash`
+      # shell on Windows runners prepends Git's usr/bin to PATH, whose
+      # coreutils `link.exe` then shadows the MSVC linker and kills the
+      # build at the first proc-macro.
       - name: Build release binaries
-        shell: bash
         env:
           CUDA_COMPUTE_CAP: 80
-        run: |
-          cargo build --release --target ${{ matrix.target }} \
-            --features ${{ matrix.features }} \
-            -p trove-app -p trove-cli
+        run: cargo build --release --target ${{ matrix.target }} --features ${{ matrix.features }} -p trove-app -p trove-cli
 
       # ---------------------------------------------------------------- macOS
       - name: Package (zip)
