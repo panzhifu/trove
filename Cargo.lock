@@ -9773,7 +9773,7 @@ dependencies = [
 
 [[package]]
 name = "trove-app"
-version = "0.5.6"
+version = "0.5.7"
 dependencies = [
  "alsa-sys",
  "arboard",
@@ -9800,7 +9800,7 @@ dependencies = [
 
 [[package]]
 name = "trove-cli"
-version = "0.5.6"
+version = "0.5.7"
 dependencies = [
  "clap",
  "serde",
@@ -9811,7 +9811,7 @@ dependencies = [
 
 [[package]]
 name = "trove-core"
-version = "0.5.6"
+version = "0.5.7"
 dependencies = [
  "base64 0.22.1",
  "blake3",
