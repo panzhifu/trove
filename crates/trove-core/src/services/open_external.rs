@@ -5,7 +5,7 @@
 //! application (`Some(app_path)`). The `plan` function is a pure, unit-testable
 //! decision; `open` runs the resulting command.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::error::Error;
@@ -18,6 +18,78 @@ pub enum OpenTarget<'a> {
     /// Open with a specific application (absolute path to the .exe/.app, or
     /// a command found on `$PATH`).
     With(&'a Path),
+}
+
+/// The Python expression that imports a mesh file into a fresh Blender
+/// session. Blender's command line only *opens* `.blend` files — handing it
+/// an `.obj` or an `.fbx` as the file argument gets the user a "not a Blender
+/// file" error instead of a model. Every other format has to go through an
+/// import operator, and the operator names moved between Blender versions
+/// (OBJ grew the C++ `wm.obj_import` in 3.1, STL followed with
+/// `wm.stl_import` in 4.0), so each extension carries a candidate chain and
+/// the first operator the running Blender knows wins. The path rides after
+/// `--`, which Blender forwards verbatim on `sys.argv` — no quoting, no
+/// matter what the file is named.
+const BLENDER_IMPORT_SCRIPT: &str = r#"import bpy, functools, os, sys
+path = sys.argv[-1]
+ext = os.path.splitext(path)[1].lower().lstrip('.')
+candidates = {
+    'obj': ('wm.obj_import', 'import_scene.obj'),
+    'stl': ('wm.stl_import', 'import_mesh.stl'),
+    'ply': ('wm.ply_import', 'import_mesh.ply'),
+    'gltf': ('import_scene.gltf',),
+    'glb': ('import_scene.gltf',),
+    'fbx': ('import_scene.fbx',),
+    'dae': ('wm.collada_import',),
+    'usd': ('wm.usd_import',),
+    'usdz': ('wm.usd_import',),
+    'abc': ('wm.alembic_import',),
+    '3ds': ('import_scene.autodesk_3ds',),
+}.get(ext, ())
+for name in candidates:
+    try:
+        functools.reduce(getattr, name.split('.'), bpy.ops)(filepath=path)
+        break
+    except Exception:
+        pass
+else:
+    print('trove: no import operator found for .' + ext)
+"#;
+
+/// The mesh formats Blender cannot open from its command line — the
+/// "open with" model list minus `.blend` itself, which opens natively.
+fn needs_blender_import(path: &Path) -> bool {
+    matches!(
+        path.extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase())
+            .as_deref(),
+        Some(
+            "obj" | "fbx" | "gltf" | "glb" | "stl" | "ply" | "dae" | "3ds" | "usd" | "usdz" | "abc"
+        )
+    )
+}
+
+/// Does this application look like Blender? The stem is matched so
+/// `blender.exe`, `blender-4.1` and `/Applications/Blender.app` all read as
+/// the same program.
+fn is_blender(app: &Path) -> bool {
+    app.file_stem()
+        .and_then(|s| s.to_str())
+        .is_some_and(|s| s.to_ascii_lowercase().contains("blender"))
+}
+
+/// The executable to hand Blender's own arguments to. A macOS `.app` bundle
+/// cannot be exec'd directly; its binary sits one level inside.
+fn blender_executable(app: &Path) -> PathBuf {
+    if cfg!(target_os = "macos") && app.extension().and_then(|e| e.to_str()) == Some("app") {
+        let stem = app.file_stem().unwrap_or_default();
+        let inner = app.join("Contents/MacOS").join(stem);
+        if inner.is_file() {
+            return inner;
+        }
+    }
+    app.to_path_buf()
 }
 
 /// Build the command that opens `path` using `target`.
@@ -36,6 +108,14 @@ pub fn plan<'a>(path: &Path, target: OpenTarget<'a>) -> Command {
                 cmd.arg("/c").arg("start").arg("\"\"").arg(path);
                 cmd
             }
+            OpenTarget::With(app) if is_blender(app) && needs_blender_import(path) => {
+                let mut cmd = Command::new(blender_executable(app));
+                cmd.arg("--python-expr")
+                    .arg(BLENDER_IMPORT_SCRIPT)
+                    .arg("--")
+                    .arg(path);
+                cmd
+            }
             OpenTarget::With(app) => {
                 let mut cmd = Command::new(app);
                 cmd.arg(path);
@@ -47,6 +127,14 @@ pub fn plan<'a>(path: &Path, target: OpenTarget<'a>) -> Command {
             OpenTarget::Default => {
                 let mut cmd = Command::new("open");
                 cmd.arg(path);
+                cmd
+            }
+            OpenTarget::With(app) if is_blender(app) && needs_blender_import(path) => {
+                let mut cmd = Command::new(blender_executable(app));
+                cmd.arg("--python-expr")
+                    .arg(BLENDER_IMPORT_SCRIPT)
+                    .arg("--")
+                    .arg(path);
                 cmd
             }
             OpenTarget::With(app) => {
@@ -61,6 +149,14 @@ pub fn plan<'a>(path: &Path, target: OpenTarget<'a>) -> Command {
             OpenTarget::Default => {
                 let mut cmd = Command::new("xdg-open");
                 cmd.arg(path);
+                cmd
+            }
+            OpenTarget::With(app) if is_blender(app) && needs_blender_import(path) => {
+                let mut cmd = Command::new(blender_executable(app));
+                cmd.arg("--python-expr")
+                    .arg(BLENDER_IMPORT_SCRIPT)
+                    .arg("--")
+                    .arg(path);
                 cmd
             }
             OpenTarget::With(app) => {
@@ -147,6 +243,64 @@ mod tests {
             Path::new("/tmp/file.png"),
             OpenTarget::With(Path::new("/usr/bin/gimp")),
         );
+    }
+
+    #[test]
+    fn blender_gets_the_import_script_for_mesh_formats() {
+        for name in [
+            "model.obj",
+            "scene.fbx",
+            "mesh.stl",
+            "asset.glb",
+            "shape.ply",
+        ] {
+            let cmd = plan(
+                &Path::new("/tmp").join(name),
+                OpenTarget::With(Path::new("/usr/bin/blender")),
+            );
+            let args: Vec<String> = cmd
+                .get_args()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect();
+            assert!(
+                args.iter().any(|arg| arg == "--python-expr"),
+                "{name}: the import script must ride along: {args:?}"
+            );
+            assert!(
+                args.iter().any(|arg| arg == "--"),
+                "{name}: the path must be fenced behind --: {args:?}"
+            );
+            assert!(
+                args.last().is_some_and(|arg| arg.ends_with(name)),
+                "{name}: the file must be the last argument: {args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn blender_opens_blend_files_directly() {
+        let cmd = plan(
+            Path::new("/tmp/scene.blend"),
+            OpenTarget::With(Path::new("/usr/bin/blender")),
+        );
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(args, vec!["/tmp/scene.blend"], "a .blend opens natively");
+    }
+
+    #[test]
+    fn other_apps_keep_the_plain_file_argument() {
+        let cmd = plan(
+            Path::new("/tmp/model.obj"),
+            OpenTarget::With(Path::new("/usr/bin/meshlab")),
+        );
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(args, vec!["/tmp/model.obj"]);
     }
 
     #[test]
