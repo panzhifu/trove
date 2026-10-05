@@ -4,6 +4,13 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+# Forward the local-AI GPU backends so `cargo build -p trove-app --features
+# cuda` (or the `build-cuda` alias) reaches trove-core's candle.
+[features]
+cuda = ["trove-core/cuda"]
+accelerate = ["trove-core/accelerate"]
+metal = ["trove-core/metal"]
+
 [dependencies]
 gpui-kit = { workspace = true }
 wgpu = { workspace = true }

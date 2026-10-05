@@ -4,6 +4,25 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+# GPU backends for the local AI engines. The default build is CPU-only and
+# compiles on every platform with no CUDA toolkit; candle picks its device at
+# runtime (a build without `cuda` answers `Device::new_cuda` with an error
+# and the caller falls back to CPU). The release workflow enables `cuda` on
+# the Linux/Windows legs and `accelerate` on macOS — see
+# .github/workflows/release.yml.
+[features]
+# NVIDIA GPU backend: costs the CUDA toolkit at *build* time (nvcc compiles
+# the bundled kernels) and the driver at *run* time; machines without either
+# still run the CPU fallback. Enabled by the release workflow on the
+# Linux/Windows legs and locally via `cargo build-cuda`.
+cuda = ["candle-core/cuda", "candle-nn/cuda", "candle-transformers/cuda"]
+# Apple's CPU acceleration framework — macOS only (the helper crate links a
+# system framework), nothing to download or install.
+accelerate = ["candle-core/accelerate"]
+# Experimental Apple GPU backend. Not enabled by the release; flip it on to
+# try the M-series GPU.
+metal = ["candle-core/metal"]
+
 [dependencies]
 chrono = { workspace = true }
 dirs = { workspace = true }
@@ -82,6 +101,16 @@ qcms = { workspace = true }
 # (the `image/exr` feature pulls it in), so this costs no download and no
 # second copy.
 exr = "1"
+# The local AI engines (BGE embeddings, Whisper transcription) run through
+# candle — a pure-Rust tensor stack, so nothing here compiles or links C++.
+# The GPU backends ride the features above: the default build is CPU and the
+# release workflow turns CUDA on where a toolkit is installed.
+candle-core = "0.11"
+candle-nn = "0.11"
+candle-transformers = "0.11"
+# Whisper's own tokenizer (BPE), loaded from the model directory. The
+# tokenizers crate is pure Rust.
+tokenizers = "0.21"
 
 [dev-dependencies]
 # Same reasoning as `exr` above, and the same shape of problem: `image`'s GIF
@@ -92,21 +121,8 @@ exr = "1"
 gif = "0.13"
 
 [target.'cfg(target_os = "linux")'.dependencies]
-# Local speech-to-text runs on the GPU: candle's CUDA backend is part of the
-# default Linux build. It costs the CUDA toolkit at *build* time (nvcc
-# compiles the bundled kernels) and the CUDA runtime libraries at *run*
-# time; when the runtime side is missing the recogniser still works — the
-# device is picked at runtime with a CPU fallback (see
-# ai/transcribe_local.rs). Linux without NVIDIA therefore builds, but every
-# Linux build needs the toolkit installed.
-candle-core = { version = "0.11", features = ["cuda"] }
-candle-nn = { version = "0.11", features = ["cuda"] }
-candle-transformers = { version = "0.11", features = ["cuda"] }
 # KWin's own capture interface (org.kde.KWin.ScreenShot2): KDE implements
 # neither wlr-screencopy nor ext-image-copy-capture, so this D-Bus call is
 # the only in-process way to capture on Plasma. zbus already rides in the
 # graph via gpui-pre -> ashpd/oo7, so no new compiled crates.
 zbus = "5"
-# Whisper's own tokenizer (BPE), loaded from the model directory. The
-# tokenizers crate is pure Rust.
-tokenizers = "0.21"

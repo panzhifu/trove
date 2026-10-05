@@ -22,14 +22,19 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # macOS (Apple Silicon)
+          # macOS (Apple Silicon). Apple does not do CUDA — the local AI
+          # engines compile against candle's CPU backend, sped up by Apple's
+          # Accelerate framework (a system framework, nothing to install).
+          # The experimental `metal` backend is not enabled in releases.
           - target: aarch64-apple-darwin
             os: macos-14
             artifact: trove-aarch64-apple-darwin
+            features: accelerate
           # macOS (Intel)
           - target: x86_64-apple-darwin
             os: macos-14
             artifact: trove-x86_64-apple-darwin
+            features: accelerate
           # Linux (x86_64). Built on 24.04, not 22.04: xcap -> libspa needs
           # pipewire headers >= 0.3.65 (see the Ubuntu step below), and jammy's
           # 0.3.48 cannot compile the crate. Consequence: this artifact needs
@@ -38,10 +43,14 @@ jobs:
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-24.04
             artifact: trove-x86_64-unknown-linux-gnu
-          # Windows (x86_64)
+            features: cuda
+          # Windows (x86_64) — CUDA like Linux: the toolkit is installed
+          # below and nvcc compiles the kernels at build time. The artifact
+          # runs on machines without NVIDIA too (CPU fallback at runtime).
           - target: x86_64-pc-windows-msvc
             os: windows-2022
             artifact: trove-x86_64-pc-windows-msvc
+            features: cuda
 
     runs-on: ${{ matrix.os }}
     steps:
@@ -123,16 +132,36 @@ jobs:
             libgbm-dev libpipewire-0.3-dev \
             nvidia-cuda-toolkit
 
+      # The Windows CUDA build needs nvcc, which needs cl.exe on PATH: the
+      # toolkit download below only installs it, this action wires the MSVC
+      # environment the kernels' host-side compile runs through.
+      - name: Set up MSVC environment (Windows)
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Install CUDA toolkit (Windows)
+        if: runner.os == 'Windows'
+        uses: Jimver/cuda-toolkit@v0.2.21
+        with:
+          cuda-toolkit-version: "12.6.3"
+          method: network
+          use-local-cache: false
+
       # Both binaries: the GUI (trove-app) and the CLI (trove) — every package
       # and archive below ships both; they share one library on disk.
       #
-      # Linux builds carry candle's CUDA backend by default (see
-      # trove-core/Cargo.toml): the kernels compile with nvcc, installed
-      # above. At runtime the recogniser picks CUDA when a working driver
-      # answers and falls back to CPU otherwise, so the artifact also runs on
-      # machines without NVIDIA.
+      # Each leg carries the GPU backend its platform supports (the matrix's
+      # `features`): CUDA on Linux/Windows, whose kernels compile with nvcc
+      # from the toolkit installed above; Apple's Accelerate framework on
+      # macOS. At runtime the device is picked per machine — CUDA when a
+      # working driver answers, CPU otherwise — so a CUDA-built artifact also
+      # runs on machines without NVIDIA.
       - name: Build release binaries
-        run: cargo build --release --target ${{ matrix.target }} -p trove-app -p trove-cli
+        shell: bash
+        run: |
+          cargo build --release --target ${{ matrix.target }} \
+            --features ${{ matrix.features }} \
+            -p trove-app -p trove-cli
 
       # ---------------------------------------------------------------- macOS
       - name: Package (zip)

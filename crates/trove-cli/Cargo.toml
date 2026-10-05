@@ -5,6 +5,12 @@ edition.workspace = true
 license.workspace = true
 description = "Command-line access to a Trove library, for scripts and agents."
 
+# Forward the local-AI GPU backends (see trove-app's [features]).
+[features]
+cuda = ["trove-core/cuda"]
+accelerate = ["trove-core/accelerate"]
+metal = ["trove-core/metal"]
+
 [[bin]]
 name = "trove"
 path = "src/main.rs"

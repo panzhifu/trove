@@ -1,0 +1,8 @@
+# Local AI GPU builds. The default `cargo build` is CPU-only so CI and every
+# platform compile without the CUDA toolkit; these aliases turn CUDA on for
+# machines that have it (an NVIDIA driver plus nvcc — on Arch, the `cuda`
+# package). `cargo build-cuda` produces the same binaries the release
+# workflow ships for Linux/Windows.
+[alias]
+build-cuda = "build -p trove-app -p trove-cli --features cuda"
+run-cuda = "run -p trove-app --features cuda"

@@ -12,23 +12,19 @@
 //! task threads ([`crate::tasks`]), which are plain `std::thread`s.
 
 pub mod analysis;
-// The local engines are candle-backed, and candle rides the Linux
-// dependency gate in trove-core's Cargo.toml (its default CUDA backend
-// needs nvcc at build time). Everywhere else these modules do not exist,
-// and the factories below answer the Local pick with a runtime error
-// instead of failing the compile.
-#[cfg(target_os = "linux")]
+// The local engines are candle-backed; candle is a dependency on every
+// platform and its GPU backends ride the trove-core features (`cuda`,
+// `accelerate`, `metal`). A build without a GPU feature compiles the same
+// modules against candle's CPU device — `select_device` handles the choice
+// at runtime.
 mod embed_local;
-#[cfg(target_os = "linux")]
 pub use embed_local::LocalBert;
 mod embedding_openai;
 mod http;
-#[cfg(target_os = "linux")]
 mod local_device;
 pub mod mock;
 pub mod search_planner;
 pub mod transcribe;
-#[cfg(target_os = "linux")]
 pub mod transcribe_local;
 pub mod vendor;
 
@@ -45,18 +41,13 @@ use crate::model::{Asset, EmbeddingSpace};
 /// OpenAI-compatible cloud client, or the local candle BGE engine (whose
 /// model must already be on disk — the UI asks to download it before a run
 /// starts, and construction loads the weights, so callers keep it off the
-/// UI thread). The local engine exists only where candle does (the Linux
-/// dependency gate); elsewhere the pick answers with a runtime error.
+/// UI thread). The local engine compiles on every platform; GPU acceleration
+/// rides the `cuda`/`accelerate` features and CPU is always the fallback.
 pub fn embedding_provider(
     config: &crate::config::EmbeddingConfig,
 ) -> Result<std::sync::Arc<dyn EmbeddingProvider>> {
     match config.engine {
-        #[cfg(target_os = "linux")]
         EmbeddingEngine::Local => Ok(embed_local::build_cached(config.local_model_id())?),
-        #[cfg(not(target_os = "linux"))]
-        EmbeddingEngine::Local => Err(crate::error::Error::Validation(
-            "the local embedding engine ships on Linux builds; use the cloud engine".into(),
-        )),
         EmbeddingEngine::Cloud => Ok(std::sync::Arc::new(OpenAICompatible::new(config)?)),
     }
 }
