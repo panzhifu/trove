@@ -156,8 +156,18 @@ jobs:
       # macOS. At runtime the device is picked per machine — CUDA when a
       # working driver answers, CPU otherwise — so a CUDA-built artifact also
       # runs on machines without NVIDIA.
+      #
+      # CUDA_COMPUTE_CAP pins the kernels' target: the build script normally
+      # auto-detects the installed GPU through nvidia-smi, which no CI runner
+      # has. 80 (Ampere) is the floor the kernels compile at with current
+      # CUDA toolchains (the compatibility shim breaks on sm_75), and PTX is
+      # forward-compatible — the user's driver JIT-compiles it for whatever
+      # GPU they actually own, so every Ampere-or-newer NVIDIA runs the same
+      # artifact; pre-Ampere cards fall back to CPU at runtime.
       - name: Build release binaries
         shell: bash
+        env:
+          CUDA_COMPUTE_CAP: 80
         run: |
           cargo build --release --target ${{ matrix.target }} \
             --features ${{ matrix.features }} \
