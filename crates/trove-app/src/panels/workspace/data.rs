@@ -604,6 +604,17 @@ pub(super) fn total_identity(key: &DataKey) -> DataKey {
     identity
 }
 
+/// Whether two listing windows hold the same assets in the same order.
+///
+/// The layout branches ask this instead of comparing counts, because a
+/// same-length reorder — a refinement re-ranking, a rename moving a row — is
+/// exactly the change a count comparison cannot see and a stale grid cannot
+/// survive. Comparing ids, not whole cells: the frozen rows exist to keep
+/// paint-time content stable, and the listing's identity is the id order.
+pub(super) fn same_listing(a: &[Cell], b: &[Cell]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.id == y.id)
+}
+
 /// One listing window → the cells that paint it. Trash is already decided by
 /// the query, so the filter here is a belt on top of braces: a row that came
 /// back trashed while the view is live would otherwise be listed.

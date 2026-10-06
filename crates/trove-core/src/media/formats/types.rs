@@ -165,6 +165,43 @@ pub struct TextureData {
     /// Per-vertex `(metallic factor, roughness factor)`, the multipliers the
     /// glTF spec pairs with the two channels above.
     pub factors: Vec<[f32; 2]>,
+    /// Per-vertex normal-map texture slot, parallel to `positions`. The map
+    /// is tangent-space, glTF's OpenGL convention, sampled with the same UV
+    /// as the base colour. [`NO_TEXTURE`] when the primitive carries none and
+    /// the geometric normal stands alone.
+    pub normal_slot: Vec<u16>,
+    /// Per-vertex normal-map strength — the material's `normalTexture.scale`,
+    /// applied to the tangent-plane components before the vector normalises.
+    pub normal_scale: Vec<f32>,
+    /// Per-vertex ambient-occlusion texture slot, parallel to `positions`
+    /// (glTF packs occlusion in the R channel). [`NO_TEXTURE`] when the
+    /// primitive carries none.
+    pub ao_slot: Vec<u16>,
+    /// Per-vertex occlusion strength — the material's
+    /// `occlusionTexture.strength`, lerping between unoccluded light and the
+    /// sampled value.
+    pub ao_strength: Vec<f32>,
+    /// Per-vertex emissive texture slot, parallel to `positions`.
+    /// [`NO_TEXTURE`] when the primitive carries none and the factor stands
+    /// alone.
+    pub emissive_slot: Vec<u16>,
+    /// Per-vertex emissive factor — the material's `emissiveFactor`, the
+    /// light the surface gives off before any texture multiplies it.
+    pub emissive_factor: Vec<[f32; 3]>,
+    /// Per-vertex alpha cutoff — the material's `alphaMode` folded into one
+    /// number: negative for `OPAQUE` (no pixel is ever discarded), the
+    /// `alphaCutoff` for `MASK`, and 0.5 for `BLEND`. The preview cannot blend
+    /// a whole mesh in draw order, so a blended material clips like a mask —
+    /// the read every cutout foliage export gets either way.
+    pub alpha_cutoff: Vec<f32>,
+    /// Per-vertex base-colour alpha factor — `baseColorFactor[3]`, the fourth
+    /// multiplier of the texel alpha the cutoff tests against.
+    pub alpha_factor: Vec<f32>,
+    /// Per-vertex double-sided flag — the material's `doubleSided`. A
+    /// double-sided material's back faces are the surface you see from
+    /// behind, so the renderers must not cull them even on a mesh whose
+    /// winding says closed.
+    pub double_sided: Vec<bool>,
     /// The decoded textures, in slot order.
     pub maps: Vec<TextureMap>,
 }
@@ -210,6 +247,84 @@ pub fn resize_rgba(rgba: &[u8], width: u32, height: u32, tw: u32, th: u32) -> Ve
     out
 }
 
+/// The mip chain of a square RGBA8 image: level 0 is the input itself, each
+/// following level halves the edge with a 2×2 box filter, down to 1×1.
+///
+/// The filter averages in *scene-linear* space — each texel is decoded, the
+/// decoded values averaged, and the result re-encoded — because the bytes are
+/// display-encoded and averaging encoded values darkens a high-contrast edge
+/// the way averaging log values would. This is what a GPU blit between sRGB
+/// views does, and what the hardware expects a mip to hold, since the sampler
+/// linearly interpolates the stored (encoded) bytes. Alpha averages as the raw
+/// byte: it is coverage, not colour, and carries no transfer curve.
+///
+/// The chain is what the GPU preview's trilinear/anisotropic sampling reads;
+/// the software path keeps its nearest-neighbour lookups and never touches it.
+/// Non-power-of-two sizes floor-halve (`1023 → 511 → …`), matching the level
+/// sizes `(dim >> level).max(1)` the upload names for every level.
+pub fn mip_chain(rgba: &[u8], dim: u32) -> Vec<Vec<u8>> {
+    let lut = decode_lut();
+    let mut chain = vec![rgba.to_vec()];
+    let mut size = dim.max(1);
+    while size > 1 {
+        let prev = chain.last().expect("the chain is never empty");
+        let next = (size / 2).max(1);
+        let (prev_w, next_w) = (size as usize, next as usize);
+        let mut out = vec![0u8; next_w * next_w * 4];
+        for ty in 0..next {
+            for tx in 0..next {
+                // The 2×2 cell, clamped at the edge of an odd-sized parent: a
+                // doubled pixel is the area weight the halving deserves.
+                let at = |x: u32, y: u32| {
+                    ((y.min(size - 1) as usize) * prev_w + (x.min(size - 1) as usize)) * 4
+                };
+                let corners = [
+                    at(tx * 2, ty * 2),
+                    at(tx * 2 + 1, ty * 2),
+                    at(tx * 2, ty * 2 + 1),
+                    at(tx * 2 + 1, ty * 2 + 1),
+                ];
+                let mut texel = [0u8; 4];
+                for channel in 0..3 {
+                    let sum: f32 = corners
+                        .iter()
+                        .map(|&i| lut[prev[i + channel] as usize])
+                        .sum();
+                    texel[channel] = encode_byte(sum / 4.0);
+                }
+                let alpha: u32 = corners.iter().map(|&i| prev[i + 3] as u32).sum();
+                texel[3] = (alpha / 4) as u8;
+                let o = (ty as usize * next_w + tx as usize) * 4;
+                out[o..o + 4].copy_from_slice(&texel);
+            }
+        }
+        chain.push(out);
+        size = next;
+    }
+    chain
+}
+
+/// Scene-linear → sRGB byte, the inverse of [`decode_lut`]: a 4096-entry
+/// table, since the mip chain runs it once per texel per level and the
+/// quantised output stays within one LSB of the exact curve.
+fn encode_byte(linear: f32) -> u8 {
+    static LUT: std::sync::OnceLock<[u8; 4097]> = std::sync::OnceLock::new();
+    let lut = LUT.get_or_init(|| {
+        let mut table = [0u8; 4097];
+        for (entry, value) in table.iter_mut().enumerate() {
+            let x = entry as f32 / 4096.0;
+            let encoded = if x <= 0.0031308 {
+                12.92 * x
+            } else {
+                1.055 * x.powf(1.0 / 2.4) - 0.055
+            };
+            *value = (encoded.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+        }
+        table
+    });
+    lut[(linear.clamp(0.0, 1.0) * 4096.0) as usize]
+}
+
 impl TextureMap {
     /// Sample the texture at UV `(u, v)` and decode to scene-linear.
     ///
@@ -229,6 +344,17 @@ impl TextureMap {
             lut[px[1] as usize],
             lut[px[2] as usize],
         )
+    }
+
+    /// The texel's alpha at UV `(u, v)`, in 0..=1.
+    ///
+    /// Alpha is coverage, not colour: it is read as the raw byte scaled, the
+    /// way both the shader and the glTF spec treat it — no sRGB decode.
+    pub fn sample_alpha(&self, u: f32, v: f32) -> f32 {
+        let (w, h) = (self.width.max(1) as usize, self.height.max(1) as usize);
+        let x = (u.rem_euclid(1.0) * w as f32) as usize % w;
+        let y = (v.rem_euclid(1.0) * h as f32) as usize % h;
+        self.rgba[(y * w + x) * 4 + 3] as f32 / 255.0
     }
 }
 
@@ -293,6 +419,18 @@ impl Mesh {
     pub fn has_textures(&self) -> bool {
         matches!(&self.texture, Some(t)
             if !t.maps.is_empty() && t.uv.len() == self.positions.len())
+    }
+
+    /// Whether any material on the mesh declared itself double-sided.
+    ///
+    /// The GPU culls back faces per pipeline, not per material, so one
+    /// double-sided material anywhere in the file takes the whole mesh off
+    /// the culled pipeline — the single-sided materials get their culling in
+    /// the fragment stage instead, from this same per-vertex flag.
+    pub fn has_double_sided_material(&self) -> bool {
+        self.texture
+            .as_ref()
+            .is_some_and(|t| t.double_sided.iter().any(|doubled| *doubled))
     }
 
     /// What the frame-size heuristics count: triangles for a mesh, points for
@@ -740,6 +878,54 @@ mod tests {
                 Vec::new(),
             )
             .is_none()
+        );
+    }
+
+    /// The mip chain halves a square image down to 1×1, and averages in
+    /// scene-linear space: a texel that is a quarter white does not average
+    /// the encoded bytes (64), it encodes the average linear value — that is
+    /// what the sampler's linear interpolation of the stored mip expects,
+    /// and what a GPU blit between sRGB views would bake.
+    #[test]
+    fn the_mip_chain_halves_in_linear_space() {
+        // 2×2: three black texels and one white one, alpha 255 everywhere.
+        let mut base = vec![0u8; 16];
+        for pixel in base.as_chunks_mut::<4>().0 {
+            pixel[3] = 255;
+        }
+        base[12..15].copy_from_slice(&[255, 255, 255]);
+        let chain = mip_chain(&base, 2);
+        assert_eq!(chain.len(), 2, "a 2×2 image carries base and 1×1");
+        assert_eq!(chain[1].len(), 4);
+        // decode(0) = 0 and decode(255) = 1; the average linear value is
+        // 0.25, which the sRGB curve encodes back to byte 137.
+        let grey = chain[1][0];
+        assert_eq!(
+            grey, 137,
+            "a quarter-white texel is linear 0.25 re-encoded, got {grey}"
+        );
+        assert_eq!(chain[1][3], 255, "alpha averages raw, no transfer curve");
+    }
+
+    /// An odd-sized edge floors its way down (`3 → 1`), matching the level
+    /// sizes `(dim >> level).max(1)` the GPU upload names — a chain the
+    /// texture does not agree with would sample garbage — and a uniform
+    /// image survives every level unchanged, the round trip through the
+    /// transfer curve landing back on its own byte.
+    #[test]
+    fn the_mip_chain_floors_odd_sizes() {
+        let mut base = vec![128u8; 3 * 3 * 4];
+        for pixel in base.as_chunks_mut::<4>().0 {
+            pixel[3] = 255;
+        }
+        let chain = mip_chain(&base, 3);
+        let texels: Vec<usize> = chain.iter().map(|level| level.len() / 4).collect();
+        assert_eq!(texels, vec![9, 1], "3 floors to 1, one level below base");
+        assert!(
+            chain
+                .iter()
+                .all(|level| level.chunks(4).all(|px| px == [128, 128, 128, 255])),
+            "a uniform image re-encodes to itself"
         );
     }
 }

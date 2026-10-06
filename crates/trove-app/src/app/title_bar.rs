@@ -12,7 +12,6 @@ use gpui_kit::component::menu::AppMenuBar;
 use gpui_kit::*;
 
 use crate::app::actions::*;
-use crate::library::LibraryController;
 
 /// Correct `WindowOptions` for a window whose title bar we draw ourselves.
 ///
@@ -220,10 +219,6 @@ fn build_menus() -> Vec<Menu> {
 /// The title bar view: a `gpui_kit` `TitleBar` hosting the app menu bar. The
 /// right-hand window controls (min/max/close) are drawn by `TitleBar` itself.
 pub struct TitleBarView {
-    /// Present for symmetry with the other panels; the menus act on the
-    /// controller through actions dispatched by `AppView`.
-    #[allow(dead_code)]
-    controller: Entity<LibraryController>,
     menu_bar: Entity<AppMenuBar>,
     /// Signature of the menu names the bar was built from. The bar's data
     /// source (gpui-kit's `GlobalState`) is replaced on a language switch;
@@ -232,12 +227,11 @@ pub struct TitleBarView {
 }
 
 impl TitleBarView {
-    pub fn new(controller: Entity<LibraryController>, cx: &mut Context<Self>) -> Self {
+    pub fn new(cx: &mut Context<Self>) -> Self {
         // `AppMenuBar::new` already returns an `Entity<AppMenuBar>`.
         let menu_bar = AppMenuBar::new(cx);
         let menu_signature = menu_signature(cx);
         Self {
-            controller,
             menu_bar,
             menu_signature,
         }

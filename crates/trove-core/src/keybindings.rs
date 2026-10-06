@@ -182,6 +182,16 @@ pub fn default_keybindings() -> Vec<KeyBindingConfig> {
             key: ".",
             context: Some("VideoPreview"),
         },
+        KeyBindingConfig {
+            // Ctrl+K, the summon-everywhere chord (browsers, launchers): the
+            // search box opens with the caret in it wherever the focus was.
+            // Global on purpose — a search is worth reaching from the
+            // settings dialog or the tags panel too — and a chord no text
+            // input claims by default, so it never shadows typing.
+            action: "FocusSearch",
+            key: "ctrl-k",
+            context: None,
+        },
     ]
 }
 

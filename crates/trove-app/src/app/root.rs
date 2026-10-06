@@ -266,6 +266,12 @@ impl AppView {
                 .tasks()
                 .is_running(&trove_core::tasks::TaskKind::EmbeddingBackfill);
         let controller = cx.new(|_cx| LibraryController::new(library));
+        // The local embedder's weights take seconds to reach the device and
+        // the provider cache is per process, so without this the first
+        // committed search pays the whole load before its fused refinement
+        // lands. The gate inside skips every configuration that would not
+        // ask the provider (tier off, cloud engine, model not on disk).
+        crate::library::jobs::warm_local_embedder_app(cx);
         if resume_backfill {
             let weak = controller.downgrade();
             cx.defer_in(window, move |this, window, cx| {
@@ -278,7 +284,7 @@ impl AppView {
         // This window is now the running session: the library manager's
         // library switch swaps its library through this handle.
         cx.set_global(crate::app::root::SessionState(Some(controller.downgrade())));
-        let title_bar = cx.new(|cx| TitleBarView::new(controller.clone(), cx));
+        let title_bar = cx.new(TitleBarView::new);
 
         let explorer = cx.new(|cx| ExplorerPanel::new(window, cx, controller.clone()));
         let folders = cx.new(|cx| FoldersPanel::new(cx, controller.clone()));
@@ -1193,6 +1199,12 @@ impl Render for AppView {
             }))
             .on_action(cx.listener(|this, _: &Screenshot, window, cx| {
                 this.take_screenshot(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &FocusSearch, window, cx| {
+                // The window root handles it, so Ctrl+K works from the tags
+                // panel or a settings dialog just as it does from the grid.
+                this.workspace
+                    .update(cx, |ws, cx| ws.summon_search(window, cx));
             }))
             .on_action(cx.listener(|this, _: &BatchRename, window, cx| {
                 crate::dialogs::rename::RenameDialog::open(window, cx, this.controller.clone());

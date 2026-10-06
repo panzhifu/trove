@@ -458,6 +458,14 @@ pub struct LibraryController {
     /// the term changes: a plan carries no term of its own, so a stale one
     /// cannot be recognised the way a stale [`Self::query_vector`] can.
     pub ai_plan: Option<trove_core::ai::search_planner::AiSearchPlan>,
+    /// How many async refinements (query embedding, AI plan) are in flight
+    /// right now. Both legs are silent by design and land whenever they land,
+    /// so the title bar shows one "refining" marker while this is above zero
+    /// — the visible promise that the listing on screen may still reorder.
+    /// Each request increments exactly once at spawn and decrements exactly
+    /// once at settle (success, failure, or dropped as stale), so the count
+    /// can never strand above zero.
+    pub refinements_in_flight: usize,
     /// Cached duplicate clusters for the duplicates dialog: computed once on
     /// a backend thread (the O(n²) pHash pass must not run per render frame),
     /// invalidated on cleanup and library swap.
@@ -549,6 +557,7 @@ impl LibraryController {
             query_vector: None,
             search_tiers: resolved_search_tiers(&config),
             ai_plan: None,
+            refinements_in_flight: 0,
             duplicates: None,
             duplicates_computing: false,
             watch_task: None,
@@ -559,6 +568,23 @@ impl LibraryController {
             retryable: std::collections::HashMap::new(),
             task_panel_open: false,
         }
+    }
+
+    /// Whether any async search refinement (query embedding, AI plan) is
+    /// still in flight for the committed term. The title bar reads this to
+    /// show its refining marker; the state itself lives in
+    /// [`Self::refinements_in_flight`].
+    pub fn refining(&self) -> bool {
+        self.refinements_in_flight > 0
+    }
+
+    /// One refinement request left the pipeline. Every spawn in
+    /// `jobs::search` pairs its increment with exactly one call here —
+    /// success, failure and stale-drop alike — and asks for a frame so the
+    /// marker goes away the moment the last leg settles.
+    pub(crate) fn refinement_settled(&mut self, cx: &mut gpui_kit::Context<Self>) {
+        self.refinements_in_flight = self.refinements_in_flight.saturating_sub(1);
+        cx.notify();
     }
 
     pub fn begin_import(&mut self, total: usize) {

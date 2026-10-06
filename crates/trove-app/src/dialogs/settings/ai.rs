@@ -42,6 +42,10 @@ fn save_embedding_config(
     edit(config.ai_embedding.get_or_insert_with(Default::default));
     settings_write::note(config.save(), "AI settings");
     cx.refresh_windows();
+    // An engine or model pick here is what search will talk to next; the
+    // warm-up keeps the provider matching the pick already on the device,
+    // and is a microsecond cache hit when the pick changed nothing.
+    crate::library::jobs::warm_local_embedder_app(cx);
 }
 
 // ============================ page ==========================================

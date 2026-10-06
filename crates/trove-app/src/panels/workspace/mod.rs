@@ -71,7 +71,7 @@ mod toolbar;
 use cells::{build_cell_element, build_list_row_element, model_source};
 use data::{
     Cell, DataKey, Direction, Row, TIMELINE_HEADER_HEIGHT, ViewData, ViewKey, hsla_to_hex,
-    total_identity,
+    same_listing, total_identity,
 };
 // Re-exported for the smart-collection editor: it embeds the colour-filter
 // panel as its color column, fed by the same recently-used colours.
@@ -428,6 +428,19 @@ impl BasePanel for WorkspacePanel {
 }
 
 impl WorkspacePanel {
+    /// Ctrl+K from anywhere in the window: bring the search box up with the
+    /// caret in it. Reached through the app view, which is why it works from
+    /// any panel, not just the grid.
+    pub fn summon_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // A preview replaces the toolbar the search box lives in; back to
+        // the grid first, so what the user asked for is actually on screen.
+        if self.preview.is_some() {
+            self.dismiss_preview(window, cx);
+        }
+        self.search_box
+            .update(cx, |search, cx| search.summon(window, cx));
+    }
+
     /// The in-panel toolbar row below the title bar. While a visual search
     /// is active it collapses to the result-mode chip and an exit button;
     /// otherwise it shows the colour picker (colour search), the user's
@@ -846,6 +859,13 @@ impl Render for WorkspacePanel {
         // on screen holding the cells it held, while any other pass replaced the
         // listing under them.
         let mut appended = false;
+        // Whether the listing the rows were built from no longer matches what
+        // the data pass holds. A same-length *reorder* used to slip past the
+        // old `covered != cells.len()` proxy — a refinement (or a rename) that
+        // returned the same assets in a new order left the stale order frozen
+        // in the rows with nothing to unfreeze it — so the identity of the
+        // listing itself is what the layout branches ask for now.
+        let mut listing_changed = false;
         if let Some((offset, window)) =
             next_window(extends, cached_total, cached_cells, grid_loaded)
         {
@@ -874,6 +894,7 @@ impl Render for WorkspacePanel {
             // truncation — those belong to the listing as a whole, which is the
             // pass that froze and counted it.
             let previous = self.data.take();
+            let previous_cells = previous.as_ref().map(|d| d.cells.clone());
             let (total, cells, truncated, session, facets) = match previous {
                 Some(previous) if extends => {
                     let (added, nothing_new) = self.run_page_pass(
@@ -887,6 +908,7 @@ impl Render for WorkspacePanel {
                     // asking again from there returns nothing forever, so paging
                     // stops until the view changes.
                     self.page_finished |= nothing_new;
+                    listing_changed = !added.is_empty();
                     let mut cells = Rc::unwrap_or_clone(previous.cells);
                     cells.extend(added);
                     appended = true;
@@ -902,6 +924,9 @@ impl Render for WorkspacePanel {
                     self.page_finished = false;
                     let (pass_total, cells, pass_truncated, session, facets) =
                         self.run_data_pass(cx, &data_key, need_count, window);
+                    listing_changed = previous_cells
+                        .as_deref()
+                        .is_none_or(|previous| !same_listing(previous, &cells));
                     if need_count {
                         (pass_total, cells, pass_truncated, session, facets)
                     } else {
@@ -979,7 +1004,7 @@ impl Render for WorkspacePanel {
         // a size-only change (width or zoom) is deferred until the resize /
         // slider drag settles, at which point the timer sets
         // `relayout_pending` and the next render applies it.
-        let structural_changed = other_changed || self.covered != cells.len();
+        let structural_changed = other_changed || listing_changed;
         let defer_layout =
             !structural_changed && width_changed && !jumped_width && !self.relayout_pending;
 
@@ -1037,7 +1062,19 @@ impl Render for WorkspacePanel {
         if other_changed {
             self.page_guard.set(usize::MAX);
         }
-        if self.view_key.as_ref() != Some(&key) && !defer_layout {
+        // The frame a refinement lands on: the view key moved, but *only* by
+        // its fused flag — no width, no term, no filter. Whether that means
+        // "adopt silently" or "new answer, start from the top" is decided by
+        // `listing_changed` in the branches below.
+        let fused_only = self.view_key.as_ref().is_some_and(|old| {
+            let mut without_fused = key.clone();
+            without_fused.fused = old.fused;
+            old == &without_fused && old.fused != fused
+        });
+        if self.view_key.as_ref() != Some(&key)
+            && !defer_layout
+            && !(fused_only && !listing_changed)
+        {
             // View, width or zoom changed: full layout. Structural changes
             // reset scrolling (a new view starts at the top), but a
             // width/zoom-only change merely re-justifies the same assets —
@@ -1095,7 +1132,21 @@ impl Render for WorkspacePanel {
                     offset_in_item: px(0.),
                 });
             }
-        } else if !defer_layout && self.covered != cells.len() {
+        } else if fused_only && !listing_changed {
+            // The refinement answered with the very listing the rows already
+            // hold. Nothing visible has changed: rebuilding the rows and
+            // resetting the scroll would only throw the user off the spot
+            // they were reading, so the new key is adopted silently and the
+            // view stays exactly where it is. (`last_search` / `last_fused`
+            // are brought along so the pin below does not read the flip as a
+            // new answer.) A deferred width change can never be in the same
+            // step — a fused flip is an `other_changed`, and that always
+            // refuses the defer — so adopting the key here adopts nothing
+            // else.
+            self.view_key = Some(key);
+            self.last_search = search.clone();
+            self.last_fused = fused;
+        } else if !defer_layout && listing_changed {
             // Assets were added or removed. A page appended to the end of a
             // listing the grid already has rows for leaves those rows holding
             // the same cells in the same order, so they are kept as they are and
@@ -1608,7 +1659,7 @@ mod tests {
     // below recurse.
     use super::{
         Cell, Row, close_commits, color_change_commits, next_cell_row, next_window,
-        picker_just_closed, prev_cell_row, timeline_rows,
+        picker_just_closed, prev_cell_row, same_listing, timeline_rows,
     };
     use trove_core::layout::target_row_height_for_scale;
     use trove_core::model::AssetKind;
@@ -1655,6 +1706,40 @@ mod tests {
         // asset's own pixels.
         let image = cell(2, "2026-09-10");
         assert_eq!(image.aspect(), 1.0);
+    }
+
+    /// The layout branches ask whether the *listing* moved, not whether its
+    /// length moved: a same-length reorder — a refinement re-ranking, a
+    /// rename shuffling a sort — is the change a count comparison cannot see,
+    /// and the one a stale grid cannot survive.
+    #[test]
+    fn same_listing_answers_order_not_just_length() {
+        let a = [
+            cell(1, "2026-09-10"),
+            cell(2, "2026-09-10"),
+            cell(3, "2026-09-10"),
+        ];
+        let same = [
+            cell(1, "2026-09-10"),
+            cell(2, "2026-09-10"),
+            cell(3, "2026-09-10"),
+        ];
+        let reordered = [
+            cell(3, "2026-09-10"),
+            cell(1, "2026-09-10"),
+            cell(2, "2026-09-10"),
+        ];
+        let shorter = [cell(1, "2026-09-10"), cell(2, "2026-09-10")];
+
+        assert!(same_listing(&a, &same), "identical listings are the same");
+        assert!(
+            !same_listing(&a, &reordered),
+            "a same-length reorder is a different listing"
+        );
+        assert!(
+            !same_listing(&a, &shorter),
+            "a length change is a different listing"
+        );
     }
 
     /// Appending a page must leave the rows the user is looking at alone: they

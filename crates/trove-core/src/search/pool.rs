@@ -108,12 +108,17 @@ impl TextIndex {
     /// filters are free to reject it. Only past the ceiling does a gather return
     /// less than exists, and only then is `truncated` the honest word.
     pub(super) fn gather_cap(docs: u64) -> (usize, bool) {
-        let docs = docs as usize;
-        if docs <= MAX_RANKED_POOL {
-            (docs.max(CANDIDATE_CAP), false)
-        } else {
-            (MAX_RANKED_POOL, true)
-        }
+        // Written as an explicit clamp, not `if docs <= MAX_RANKED_POOL {
+        // docs.max(CANDIDATE_CAP) } else { MAX_RANKED_POOL }`. The branchy form
+        // lowers to `select(icmp, const, umax)`, which rustc 1.98.0/1.99.0
+        // miscompiles at opt-level >= 1: LLVM's InstCombine drops the upper
+        // clamp and returns the raw `docs` past the ceiling (a minimal repro
+        // returns 200001 where 200000 is required). Clamping lowers to
+        // `umin(umax(..), ..)`, which folds correctly, and keeps the crate
+        // optimised *and* incremental.
+        let over = docs > MAX_RANKED_POOL as u64;
+        let width = (docs as usize).clamp(CANDIDATE_CAP, MAX_RANKED_POOL);
+        (width, over)
     }
 
     pub(super) fn pool_at(

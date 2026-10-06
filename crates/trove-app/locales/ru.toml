@@ -149,6 +149,7 @@ empty_all_tooltip = "Окончательно удалить все ресурс
 item_one = "1 элемент"
 items_many = "%{count} элементов"
 items_at_least = "как минимум %{count} элементов"
+refining_results = "Уточнение результатов…"
 scroll_hint = "%{loaded} из %{total} — прокрутите для загрузки"
 scroll_hint_at_least = "%{loaded} из как минимум %{total} — прокрутите для загрузки"
 selected_many = "Выбрано: %{count}"
@@ -845,6 +846,7 @@ backend_unavailable = "Предпросмотр невозможен · %{reason
 gpu_no_adapter = "нет доступного графического устройства"
 gpu_software = "только программный рендерер（%{name}）"
 gpu_no_device = "нет устройства от адаптера（%{detail}）"
+gpu_out_of_memory = "модель не помещается в память GPU（%{detail}）"
 reset = "Сбросить вид"
 close = "Вернуться в библиотеку"
 rotate_cw = "Повернуть на 90° по часовой стрелке"
@@ -946,6 +948,7 @@ ExitVideoFullscreen = "Выйти из полноэкранного режима
 TogglePlayback = "Пауза или продолжение воспроизведения"
 StepFrameBack = "Кадр назад"
 StepFrameForward = "Кадр вперёд"
+FocusSearch = "Перейти к поиску"
 AutoTag = "ИИ-тегирование"
 
 [shortcuts.context]

@@ -155,30 +155,35 @@ pub fn plan(target: &CaptureTarget, dest: &Path) -> Option<CapturePlan> {
 
 /// [`plan`] with an explicit session type — the unit-testable core.
 ///
-/// Every platform block returns early so the other targets' blocks can be
-/// `cfg`'d out entirely; on any one target that leaves the surviving
-/// `return` looking needless to clippy.
-#[allow(unused_variables, clippy::needless_return)]
+/// Each platform is its own `cfg`'d block placed in tail position, so the
+/// other targets' blocks drop out entirely and the survivor is the function's
+/// return value — no `return` keyword, and no lint suppressions needed.
 pub fn plan_for(target: &CaptureTarget, dest: &Path, platform: Platform) -> Option<CapturePlan> {
+    // The session type only steers the Linux toolchain choice (Wayland's
+    // `grim`/`slurp` versus X11's `scrot`); macOS and Windows capture the
+    // same way whatever the session. Naming it here keeps the parameter used
+    // on every target.
+    let _ = platform;
+
     #[cfg(target_os = "macos")]
     {
         // `screencapture` takes the destination as a positional argument
         // and `-x` silences the shutter sound, which every mode wants.
-        return Some(match target {
-            CaptureTarget::Workspace => CapturePlan {
+        match target {
+            CaptureTarget::Workspace => Some(CapturePlan {
                 program: "screencapture".into(),
                 args: vec!["-x".into(), quotable(dest)],
-            },
-            CaptureTarget::PickArea => CapturePlan {
+            }),
+            CaptureTarget::PickArea => Some(CapturePlan {
                 program: "screencapture".into(),
                 args: vec!["-i".into(), quotable(dest)],
-            },
+            }),
             CaptureTarget::Area {
                 x,
                 y,
                 width,
                 height,
-            } => CapturePlan {
+            } => Some(CapturePlan {
                 program: "screencapture".into(),
                 args: vec![
                     "-x".into(),
@@ -186,18 +191,18 @@ pub fn plan_for(target: &CaptureTarget, dest: &Path, platform: Platform) -> Opti
                     format!("{x},{y},{width},{height}"),
                     quotable(dest),
                 ],
-            },
+            }),
             // Screens, windows and the window picker are the compositor's
             // or the window server's business; no CLI route worth taking.
-            _ => return None,
-        });
+            _ => None,
+        }
     }
 
     #[cfg(target_os = "windows")]
     {
         // Only the whole screen: region picking needs a custom overlay, and
         // window capture is `xcap`'s job (Windows Graphics Capture).
-        return match target {
+        match target {
             CaptureTarget::Workspace => Some(CapturePlan {
                 program: "powershell".into(),
                 args: vec![
@@ -207,13 +212,13 @@ pub fn plan_for(target: &CaptureTarget, dest: &Path, platform: Platform) -> Opti
                 ],
             }),
             _ => None,
-        };
+        }
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         if platform.wayland {
-            return match target {
+            match target {
                 CaptureTarget::Workspace => Some(CapturePlan {
                     program: "grim".into(),
                     args: vec![quotable(dest)],
@@ -237,10 +242,9 @@ pub fn plan_for(target: &CaptureTarget, dest: &Path, platform: Platform) -> Opti
                     ],
                 }),
                 _ => None,
-            };
-        }
-        if platform.x11 {
-            return match target {
+            }
+        } else if platform.x11 {
+            match target {
                 CaptureTarget::Workspace => Some(CapturePlan {
                     program: "scrot".into(),
                     args: vec![quotable(dest)],
@@ -263,9 +267,10 @@ pub fn plan_for(target: &CaptureTarget, dest: &Path, platform: Platform) -> Opti
                     ],
                 }),
                 _ => None,
-            };
+            }
+        } else {
+            None
         }
-        None
     }
 }
 

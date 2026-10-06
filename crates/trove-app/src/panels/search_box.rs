@@ -58,7 +58,7 @@ impl SearchBox {
             InputState::new(window, cx)
                 .placeholder(rust_i18n::t!("workspace.search_placeholder").to_string())
         });
-        cx.subscribe_in(&input, window, |this, _, event, _window, cx| {
+        cx.subscribe_in(&input, window, |this, _, event, window, cx| {
             match event {
                 InputEvent::PressEnter { .. } => {
                     let text = this.input.read(cx).value().trim().to_string();
@@ -67,6 +67,12 @@ impl SearchBox {
                     // open and re-render so the controlled popover stays.
                     // The ✕ is the only way to close it.
                     this.open.set(true);
+                    // The commit re-runs much of the window behind the pill;
+                    // pinning the caret here means whatever answered keeps
+                    // the input, and the next keystroke edits the query the
+                    // user just ran rather than going nowhere.
+                    let focus = this.input.read(cx).focus_handle(cx);
+                    window.focus(&focus, cx);
                     cx.notify();
                 }
                 // Re-render so the ✕ tracks the text while typing. Only this
@@ -132,6 +138,18 @@ impl SearchBox {
             self.history = config.search_history;
         }
     }
+
+    /// Ctrl+K, or any other summons from outside the box: open the pill with
+    /// the caret already in it and the committed query selected, so the next
+    /// keystroke replaces the last search instead of being lost.
+    pub fn summon(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.open.set(true);
+        let focus = self.input.read(cx).focus_handle(cx);
+        window.focus(&focus, cx);
+        self.input
+            .update(cx, |state, cx| state.select_all(window, cx));
+        cx.notify();
+    }
 }
 
 impl Render for SearchBox {
@@ -140,15 +158,20 @@ impl Render for SearchBox {
         let this = cx.entity();
         let open = self.open.clone();
         let input = self.input.clone();
+        let input_focus = self.input.read(cx).focus_handle(cx);
         let ctl = self.controller.clone();
 
         Popover::new("search-popover")
             .anchor(Anchor::TopRight)
             .open(self.open.get())
+            // Opening the pill puts the caret straight in the input: without
+            // this the popover's dialog handle takes focus and the first
+            // search after every open costs a second click just to type.
+            .track_focus(&input_focus)
             .on_open_change({
                 let open = open.clone();
                 let this = this.clone();
-                move |is_open: &bool, _, cx| {
+                move |is_open: &bool, window, cx| {
                     open.set(*is_open);
                     // A fresh open starts clean: the syntax reference is a
                     // per-look thing, not something to still be reading after
@@ -156,6 +179,15 @@ impl Render for SearchBox {
                     this.update(cx, |this, cx| {
                         if !*is_open && this.help {
                             this.help = false;
+                        }
+                        // An open lands with the query selected: trying
+                        // another keyword replaces the old one outright —
+                        // no hitting End or dragging over the text first.
+                        if *is_open {
+                            let focus = this.input.read(cx).focus_handle(cx);
+                            window.focus(&focus, cx);
+                            this.input
+                                .update(cx, |state, cx| state.select_all(window, cx));
                         }
                         cx.notify();
                     });

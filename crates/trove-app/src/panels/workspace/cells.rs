@@ -192,6 +192,28 @@ pub(super) fn build_cell_element(
                     .bg(cx.theme().primary),
             )
         })
+        .when_some(cell.score, |cell, score| {
+            // A visual search is a ranked answer, and "how close was this
+            // one" is the one thing about the tile the ranking can say. A
+            // pill in the popover surface — opaque, so it stays legible over
+            // any thumbnail — carrying the same percentage the list view's
+            // column shows; in an ordinary browse the score is `None` and no
+            // chip paints at all.
+            cell.child(
+                div()
+                    .absolute()
+                    .top_1()
+                    .right_1()
+                    .rounded_full()
+                    .px_1()
+                    .bg(cx.theme().popover)
+                    .border_1()
+                    .border_color(cx.theme().border)
+                    .text_xs()
+                    .text_color(cx.theme().popover_foreground)
+                    .child(score_label(score)),
+            )
+        })
         .when_some(loupe, |cell, loupe| cell.child(loupe))
         // Not a looked-at card: a still and a specimen have no timeline for the
         // pointer to be a shuttle across, so that tile gets no move listener.
@@ -356,6 +378,13 @@ fn loupe_for(cell: &Cell, anchor: Bounds<Pixels>, cx: &mut App) -> Option<AnyEle
     )
 }
 
+/// The similarity a visual search answered with, as the percentage both
+/// surfaces that show it — the list view's column and the grid tile's chip —
+/// display. One formatter, so the two cannot drift apart.
+fn score_label(score: f32) -> String {
+    format!("{:.0}%", score * 100.0)
+}
+
 /// One full-width info row for list view: small thumbnail (or kind icon),
 /// name, kind label, size and import date, with the same click / drag /
 /// context-menu behavior as the grid cells.
@@ -420,7 +449,7 @@ pub(super) fn build_list_row_element(
     let (name, size, added) = (cell.name.clone(), cell.size_bytes, cell.added.clone());
     // A visual search's rank, as a percentage. `None` for every other view,
     // which is what keeps the column from being an empty gutter in a browse.
-    let score = cell.score.map(|value| format!("{:.0}%", value * 100.0));
+    let score = cell.score.map(score_label);
     let is_sel = controller.read(cx).selected_assets.contains(&id);
 
     let lead: AnyElement = if kind == AssetKind::Font

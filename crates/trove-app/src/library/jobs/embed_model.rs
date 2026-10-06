@@ -78,6 +78,58 @@ pub fn ensure_embed_model_app(
     false
 }
 
+/// Load the selected local embedder into the process-wide cache before
+/// anything needs it, so no caller pays the load interactively.
+///
+/// Building the local provider reads the weights and uploads them to the
+/// device — under a second for `bge-small-zh-v1.5`, ~8 s for `bge-m3` — and
+/// the cache is per process, so after every launch one caller pays it all.
+/// Without this warm-up that caller is a committed search: the listing
+/// comes back text-only and the fused refinement only lands once the load
+/// finishes. The gate is the same one the search leg uses
+/// (`semantic_endpoint`), so a tier that is off, a cloud engine or a model
+/// not yet on disk skips the work — and the manual consumers (a backfill, a
+/// probe click) keep paying their own load on a worker thread, where a
+/// one-off is fine.
+///
+/// Silent: the outcome is a log line, nothing else. A broken install
+/// surfaces exactly as it always has, at the first real use.
+pub fn warm_local_embedder_app(cx: &mut App) {
+    let Some(config) = trove_core::config::AppConfig::load().semantic_endpoint() else {
+        return;
+    };
+    if config.engine != trove_core::config::EmbeddingEngine::Local {
+        return;
+    }
+    let model = config.local_model_id().to_string();
+    if !matches!(
+        embed_model::status(&model),
+        embed_model::ModelStatus::Ready { .. }
+    ) {
+        return;
+    }
+    cx.spawn(async move |cx| {
+        let started = std::time::Instant::now();
+        let result = cx
+            .background_executor()
+            .spawn(async move { trove_core::ai::embedding_provider(&config).map(|_| ()) })
+            .await;
+        match result {
+            Ok(()) => tracing::info!(
+                model = %model,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "local embedder warmed; the next search's refinement is a cache hit"
+            ),
+            Err(error) => tracing::warn!(
+                %error,
+                model = %model,
+                "local embedder warm-up failed; the first search retries the load"
+            ),
+        }
+    })
+    .detach();
+}
+
 /// Delete one local embedding model's files after a confirm, by id — so a
 /// model downloaded earlier can be freed even after the picker moved to
 /// another one. Guarded against a download in flight *for this very model*
@@ -246,6 +298,11 @@ pub fn start_embed_model_download_app(
                     ),
                     cx,
                 );
+                // The weights are on disk the moment the user was promised
+                // they are; with the semantic tier on, having them on the
+                // device too before the next committed search is the whole
+                // point of the download.
+                warm_local_embedder_app(cx);
             }
             Some(Err(message)) => {
                 window.push_notification(

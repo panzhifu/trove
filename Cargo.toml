@@ -6,7 +6,7 @@ resolver = "3"
 # release, and the tag the updater compares against carries this number, so a
 # per-crate version could only ever drift out of step with it.
 [workspace.package]
-version = "0.5.7"
+version = "0.5.8"
 edition = "2024"
 license = "BUSL-1.1"
 
@@ -14,6 +14,32 @@ license = "BUSL-1.1"
 strip = true
 lto = true
 codegen-units = 1
+
+# Debug builds stay worth running against real files: the media hot paths —
+# the image decoders, the GLB parse, the QEM simplifier's math — are pure CPU
+# loops that run 10-20x slower unoptimized, which reads as "the preview hangs"
+# on the very files a developer is testing.
+#
+# `package."*"` reaches the *dependencies* only — Cargo keeps workspace
+# members out of the wildcard — so the decode/parse inside `image`, `gltf`,
+# `resvg` and friends is covered. The GLB/OBJ/STL parse, `Mesh::finish` and
+# the QEM simplifier live in `trove-core`, so they need an override of their
+# own (below); without it a model load runs at opt-level 0 even though the
+# paragraph above names exactly those loops. `trove-app` stays at opt-level 0
+# so the UI crate still rebuilds incrementally on every edit.
+[profile.dev.package."*"]
+opt-level = 2
+
+# `trove-core` is optimised too, so the GLB/OBJ/STL parse and the QEM
+# simplifier run fast in a debug build. It stays *incremental*: the one codegen
+# that used to be wrong here — the branchy `gather_cap` shape, which this rustc
+# miscompiles at opt-level >= 1 with incremental on (`gather_cap(MAX_RANKED_POOL
+# + 1)` returns the raw doc count instead of the clamped ceiling) — is now
+# written as an explicit clamp in `search/pool.rs`, which lowers to a form LLVM
+# folds correctly. So there is no reason to give up incremental rebuilds.
+[profile.dev.package.trove-core]
+opt-level = 2
+incremental = true
 
 [workspace.dependencies]
 # UI

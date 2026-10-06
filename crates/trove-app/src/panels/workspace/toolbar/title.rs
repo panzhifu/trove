@@ -14,6 +14,7 @@ use gpui_kit::component::dialog::DialogButtonProps;
 use gpui_kit::component::dock::{Panel as DockPanel, PanelControl};
 use gpui_kit::component::popover::Popover;
 use gpui_kit::component::slider::Slider;
+use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::{IconName, Sizable as _, WindowExt as _};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -87,6 +88,10 @@ impl DockPanel for WorkspacePanel {
         let loaded = ctl.grid_loaded.min(self.last_total);
         let total = self.last_total;
         let controller = self.controller.clone();
+        // The refinement marker only means something on a search: the legs
+        // it announces refine the *ranking*, and an empty box has none.
+        let refining =
+            ctl.refining() && !ctl.search_text.trim().is_empty() && !in_trash && !in_recent;
         let slider_value = self.zoom_slider.read(cx).value().start();
         let zoom_label = format!("{:.0}%", (slider_value * 100.0).round());
         let count_label = if loaded < total {
@@ -113,6 +118,21 @@ impl DockPanel for WorkspacePanel {
             .items_center()
             .gap_1()
             .child(muted_label(count_label, cx))
+            // The listing on screen is the fast answer; these two legs are
+            // still re-ordering it in the background. An indeterminate
+            // spinner, not dots: nothing about the wait is known.
+            .when(refining, |row| {
+                row.child(
+                    h_flex()
+                        .items_center()
+                        .gap_1()
+                        .child(Spinner::new().xsmall().color(cx.theme().muted_foreground))
+                        .child(muted_label(
+                            rust_i18n::t!("workspace.refining_results").to_string(),
+                            cx,
+                        )),
+                )
+            })
             .child(
                 div()
                     .id("grid-zoom")

@@ -170,7 +170,13 @@ impl ModelViewport {
         // A gesture gets a draft: a quarter of the geometry (so a heavy mesh
         // turns fluently on the CPU path), half the resolution and no MSAA.
         // The gesture's end sets `dirty` again and draws the settled version.
-        let interactive = self.is_interacting();
+        // So does the stretch while the GPU bring-up is still in flight —
+        // `Backend::Starting` means the device is coming and this frame is a
+        // placeholder it will replace, so a full-quality software rasterise
+        // here would lengthen the very wait the placeholder exists to cover.
+        // A machine that ends up without a device settles on `Backend::Cpu`,
+        // never `Starting`, and its frames stay settled.
+        let interactive = self.is_interacting() || matches!(self.backend, Backend::Starting);
         let quality = if interactive { 0.25 } else { 1.0 };
         let scratch = self.scratch.clone();
         // Measured against the scene's bounds and the channels the file
@@ -188,6 +194,12 @@ impl ModelViewport {
             // The file's own materials show while the switch is on; off, the
             // flat material stands in for them.
             material_colors: self.material_render,
+            // The key light's shadow map rides every frame, drafts included:
+            // a model whose shadows pop in the instant the drag ends reads
+            // as a glitch, and a depth-only pass is the cheapest one there
+            // is. The material switch is what it shadows, so the flag stays
+            // on for clouds too — they opt out on their own.
+            shadows: true,
             height,
         };
 

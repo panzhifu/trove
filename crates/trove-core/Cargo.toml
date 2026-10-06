@@ -72,8 +72,14 @@ jxl-oxide = { workspace = true }
 # allow_empty_texture: `Texture::source` returns `Option` instead of
 # unwrapping — the validator is skipped on the fallback import path, so a
 # texture whose source index points past the image table must not panic.
+# KHR_materials_emissive_strength: `Material::emissive_strength`, the
+# multiplier the emissive factor needs folded in at load.
+# KHR_texture_transform: `texture::Info::texture_transform`, the UV
+# offset/rotation/scale folded into the shared per-vertex uv at load.
 gltf = { workspace = true, features = [
     "KHR_materials_pbrSpecularGlossiness",
+    "KHR_materials_emissive_strength",
+    "KHR_texture_transform",
     "allow_empty_texture",
     "extensions",
 ] }

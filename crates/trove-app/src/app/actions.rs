@@ -56,6 +56,11 @@ gpui_kit::actions!(
         MoveDown,
         OpenPreview,
         QuickLook,
+        // -- Search ----------------------------------------------------------
+        // Ctrl+K wherever the focus is: the search pill opens with the caret
+        // in it and the committed query selected. Handled on `AppView` (the
+        // window root), so it reaches the search box from any panel.
+        FocusSearch,
         // -- Fullscreen video stage -----------------------------------------
         EnterVideoFullscreen,
         ExitVideoFullscreen,

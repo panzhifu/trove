@@ -543,8 +543,10 @@ impl QueueState {
     }
 }
 
-/// Priority of a task. Higher-priority tasks are listed first in snapshots
-/// and may be scheduled before lower-priority ones in the future.
+/// Priority of a task. Higher-priority tasks are listed first in snapshots,
+/// and `High` work also jumps ahead of the `Normal` queue in the pool: a
+/// model preview's parse is the reason a viewport is showing a placeholder,
+/// and it should not line up behind a backfill that can wait.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
 pub enum TaskPriority {
     Low,
@@ -561,8 +563,22 @@ pub struct TaskPool {
     inner: Arc<TaskPoolInner>,
 }
 
+/// The two queues workers pull from: the priority lane is drained before
+/// the normal one, so interactive work does not queue behind batch work.
+/// Within a lane order is arrival order.
+struct WorkQueues {
+    high: VecDeque<Work>,
+    normal: VecDeque<Work>,
+}
+
+impl WorkQueues {
+    fn is_empty(&self) -> bool {
+        self.high.is_empty() && self.normal.is_empty()
+    }
+}
+
 struct TaskPoolInner {
-    queue: Mutex<Option<VecDeque<Work>>>,
+    queue: Mutex<Option<WorkQueues>>,
     /// Signalled when a new task is enqueued; workers sleep on it when the
     /// queue is empty.
     notify: Condvar,
@@ -576,7 +592,10 @@ impl TaskPool {
     /// queue and runs them to completion.
     pub fn new(num_threads: usize) -> Self {
         let inner = Arc::new(TaskPoolInner {
-            queue: Mutex::new(Some(VecDeque::new())),
+            queue: Mutex::new(Some(WorkQueues {
+                high: VecDeque::new(),
+                normal: VecDeque::new(),
+            })),
             notify: Condvar::new(),
         });
         for i in 0..num_threads {
@@ -592,10 +611,25 @@ impl TaskPool {
     /// Submit a closure for execution. Returns immediately; the closure runs
     /// on the next available worker.
     pub fn execute(&self, work: impl FnOnce() + Send + 'static) {
+        self.execute_with_priority(work, TaskPriority::Normal)
+    }
+
+    /// [`TaskPool::execute`], into the lane the priority names. A `High`
+    /// closure is picked up before every queued `Normal` one — it does not
+    /// preempt a closure that already runs.
+    pub fn execute_with_priority(
+        &self,
+        work: impl FnOnce() + Send + 'static,
+        priority: TaskPriority,
+    ) {
         let mut queue = crate::sync::lock(&self.inner.queue);
         match queue.as_mut() {
             Some(q) => {
-                q.push_back(Box::new(work));
+                let work: Work = Box::new(work);
+                match priority {
+                    TaskPriority::High => q.high.push_back(work),
+                    _ => q.normal.push_back(work),
+                }
                 self.inner.notify.notify_one();
             }
             None => {
@@ -607,27 +641,34 @@ impl TaskPool {
 }
 
 impl TaskPoolInner {
+    /// The next closure to run: the priority lane first, then the normal
+    /// one. `None` means both lanes are empty.
+    fn pop(queue: &mut Option<WorkQueues>) -> Option<Work> {
+        let q = queue.as_mut()?;
+        q.high.pop_front().or_else(|| q.normal.pop_front())
+    }
+
     fn worker_loop(&self) {
         loop {
             let work = {
                 let mut queue = crate::sync::lock(&self.queue);
                 loop {
-                    match queue.as_mut() {
-                        Some(q) => {
-                            if let Some(w) = q.pop_front() {
-                                break w;
-                            }
+                    match Self::pop(&mut queue) {
+                        Some(work) => break work,
+                        None => match queue.as_ref() {
                             // Queue is empty but still alive: wait for work.
                             // `wait_while` re-checks on every wake so a
                             // spurious notify cannot pop an empty queue.
-                            queue = self
-                                .notify
-                                .wait_while(queue, |q| {
-                                    q.as_ref().is_some_and(|inner| inner.is_empty())
-                                })
-                                .unwrap();
-                        }
-                        None => return, // pool shut down
+                            Some(_) => {
+                                queue = self
+                                    .notify
+                                    .wait_while(queue, |q| {
+                                        q.as_ref().is_some_and(|inner| inner.is_empty())
+                                    })
+                                    .unwrap();
+                            }
+                            None => return, // pool shut down
+                        },
                     }
                 }
             };
@@ -903,104 +944,107 @@ impl TaskManager {
         };
         let journal = self.journal.clone();
         let degraded = self.journal_degraded.clone();
-        self.pool.execute(move || {
-            let outcome = panic::catch_unwind(AssertUnwindSafe(|| run(&ctx)));
-            // Extract the terminal state and the success value (if any)
-            // while the registry lock is held, then drop it before the
-            // journal write and the channel send.
-            let (status, summary, error, done, total, value) = {
-                let mut jobs = crate::sync::lock(&ctx.jobs);
-                let Some(state) = jobs.get_mut(&ctx.id) else {
-                    return;
+        self.pool.execute_with_priority(
+            move || {
+                let outcome = panic::catch_unwind(AssertUnwindSafe(|| run(&ctx)));
+                // Extract the terminal state and the success value (if any)
+                // while the registry lock is held, then drop it before the
+                // journal write and the channel send.
+                let (status, summary, error, done, total, value) = {
+                    let mut jobs = crate::sync::lock(&ctx.jobs);
+                    let Some(state) = jobs.get_mut(&ctx.id) else {
+                        return;
+                    };
+                    match outcome {
+                        Ok(Ok(value)) if !ctx.cancelled() => {
+                            state.status = TaskStatus::Completed;
+                            let summary = state.summary.clone().unwrap_or_default();
+                            ctx.events.push(TaskEvent::Completed {
+                                id: ctx.id,
+                                kind: ctx.kind.clone(),
+                                summary: summary.clone(),
+                            });
+                            (
+                                TaskStatus::Completed,
+                                Some(summary),
+                                None,
+                                state.done,
+                                state.total,
+                                Some(value),
+                            )
+                        }
+                        Ok(Ok(_)) => {
+                            state.status = TaskStatus::Cancelled;
+                            ctx.events.push(TaskEvent::Cancelled {
+                                id: ctx.id,
+                                kind: ctx.kind.clone(),
+                            });
+                            (
+                                TaskStatus::Cancelled,
+                                None,
+                                None,
+                                state.done,
+                                state.total,
+                                None,
+                            )
+                        }
+                        Ok(Err(error)) => {
+                            // The event and the journal carry text, not the error
+                            // value: both outlive the job and are read by other
+                            // processes, so one message has to be materialized here.
+                            let error = error.to_string();
+                            state.status = TaskStatus::Failed;
+                            ctx.events.push(TaskEvent::Failed {
+                                id: ctx.id,
+                                kind: ctx.kind.clone(),
+                                error: error.clone(),
+                            });
+                            (
+                                TaskStatus::Failed,
+                                None,
+                                Some(error),
+                                state.done,
+                                state.total,
+                                None,
+                            )
+                        }
+                        Err(_) => {
+                            state.status = TaskStatus::Failed;
+                            ctx.events.push(TaskEvent::Failed {
+                                id: ctx.id,
+                                kind: ctx.kind.clone(),
+                                error: "task panicked".into(),
+                            });
+                            (
+                                TaskStatus::Failed,
+                                None,
+                                Some("task panicked".into()),
+                                state.done,
+                                state.total,
+                                None,
+                            )
+                        }
+                    }
                 };
-                match outcome {
-                    Ok(Ok(value)) if !ctx.cancelled() => {
-                        state.status = TaskStatus::Completed;
-                        let summary = state.summary.clone().unwrap_or_default();
-                        ctx.events.push(TaskEvent::Completed {
-                            id: ctx.id,
-                            kind: ctx.kind.clone(),
-                            summary: summary.clone(),
-                        });
-                        (
-                            TaskStatus::Completed,
-                            Some(summary),
-                            None,
-                            state.done,
-                            state.total,
-                            Some(value),
-                        )
-                    }
-                    Ok(Ok(_)) => {
-                        state.status = TaskStatus::Cancelled;
-                        ctx.events.push(TaskEvent::Cancelled {
-                            id: ctx.id,
-                            kind: ctx.kind.clone(),
-                        });
-                        (
-                            TaskStatus::Cancelled,
-                            None,
-                            None,
-                            state.done,
-                            state.total,
-                            None,
-                        )
-                    }
-                    Ok(Err(error)) => {
-                        // The event and the journal carry text, not the error
-                        // value: both outlive the job and are read by other
-                        // processes, so one message has to be materialized here.
-                        let error = error.to_string();
-                        state.status = TaskStatus::Failed;
-                        ctx.events.push(TaskEvent::Failed {
-                            id: ctx.id,
-                            kind: ctx.kind.clone(),
-                            error: error.clone(),
-                        });
-                        (
-                            TaskStatus::Failed,
-                            None,
-                            Some(error),
-                            state.done,
-                            state.total,
-                            None,
-                        )
-                    }
-                    Err(_) => {
-                        state.status = TaskStatus::Failed;
-                        ctx.events.push(TaskEvent::Failed {
-                            id: ctx.id,
-                            kind: ctx.kind.clone(),
-                            error: "task panicked".into(),
-                        });
-                        (
-                            TaskStatus::Failed,
-                            None,
-                            Some("task panicked".into()),
-                            state.done,
-                            state.total,
-                            None,
-                        )
-                    }
+                // Send the value before the journal write: the watcher picks
+                // up the outcome from the channel, so it must arrive first.
+                if let Some(value) = value {
+                    let _ = tx.send(value);
                 }
-            };
-            // Send the value before the journal write: the watcher picks
-            // up the outcome from the channel, so it must arrive first.
-            if let Some(value) = value {
-                let _ = tx.send(value);
-            }
-            journal_write(&journal, &degraded, ctx.id, "record_status", |conn| {
-                task_journal::record_status(
-                    conn,
-                    ctx.id,
-                    status,
-                    done,
-                    total,
-                    summary.as_deref(),
-                    error.as_deref(),
-                )
-            });
-        });
+                journal_write(&journal, &degraded, ctx.id, "record_status", |conn| {
+                    task_journal::record_status(
+                        conn,
+                        ctx.id,
+                        status,
+                        done,
+                        total,
+                        summary.as_deref(),
+                        error.as_deref(),
+                    )
+                });
+            },
+            priority,
+        );
         Ok((id, rx))
     }
 
@@ -1103,178 +1147,185 @@ impl TaskManager {
         };
         let journal = self.journal.clone();
         let degraded = self.journal_degraded.clone();
-        self.pool.execute(move || {
-            // The factory is wrapped in a Mutex so the worker can call it
-            // once per attempt (it is FnMut, not Fn).
-            let factory = Mutex::new(factory);
-            loop {
-                let run = crate::sync::lock(&factory)();
-                let outcome = panic::catch_unwind(AssertUnwindSafe(|| run(&ctx)));
-                let mut jobs = crate::sync::lock(&ctx.jobs);
-                let Some(state) = jobs.get_mut(&ctx.id) else {
-                    return;
-                };
-                match outcome {
-                    Ok(Ok(value)) if !ctx.cancelled() => {
-                        state.status = TaskStatus::Completed;
-                        let summary = state.summary.clone().unwrap_or_default();
-                        ctx.events.push(TaskEvent::Completed {
-                            id: ctx.id,
-                            kind: ctx.kind.clone(),
-                            summary: summary.clone(),
-                        });
-                        let done = state.done;
-                        let total = state.total;
-                        drop(jobs);
-                        let _ = tx.send(value);
-                        journal_write(&journal, &degraded, ctx.id, "record_status", |conn| {
-                            task_journal::record_status(
-                                conn,
-                                ctx.id,
-                                TaskStatus::Completed,
-                                done,
-                                total,
-                                Some(&summary),
-                                None,
-                            )
-                        });
+        self.pool.execute_with_priority(
+            move || {
+                // The factory is wrapped in a Mutex so the worker can call it
+                // once per attempt (it is FnMut, not Fn).
+                let factory = Mutex::new(factory);
+                loop {
+                    let run = crate::sync::lock(&factory)();
+                    let outcome = panic::catch_unwind(AssertUnwindSafe(|| run(&ctx)));
+                    let mut jobs = crate::sync::lock(&ctx.jobs);
+                    let Some(state) = jobs.get_mut(&ctx.id) else {
                         return;
-                    }
-                    Ok(Ok(_)) => {
-                        // Cancelled mid-run.
-                        state.status = TaskStatus::Cancelled;
-                        ctx.events.push(TaskEvent::Cancelled {
-                            id: ctx.id,
-                            kind: ctx.kind.clone(),
-                        });
-                        let done = state.done;
-                        let total = state.total;
-                        drop(jobs);
-                        journal_write(&journal, &degraded, ctx.id, "record_status", |conn| {
-                            task_journal::record_status(
-                                conn,
-                                ctx.id,
-                                TaskStatus::Cancelled,
-                                done,
-                                total,
-                                None,
-                                None,
-                            )
-                        });
-                        return;
-                    }
-                    Ok(Err(error)) => {
-                        let error = error.to_string();
-                        // Check whether we have retries left.
-                        let can_retry = state.retry.as_mut().is_some_and(|r| r.remaining > 0);
-                        if can_retry {
-                            let retry = state.retry.as_mut().unwrap();
-                            retry.remaining -= 1;
-                            let attempt = retry.max - retry.remaining;
-                            let backoff = retry.backoff;
-                            ctx.events.push(TaskEvent::Retrying {
+                    };
+                    match outcome {
+                        Ok(Ok(value)) if !ctx.cancelled() => {
+                            state.status = TaskStatus::Completed;
+                            let summary = state.summary.clone().unwrap_or_default();
+                            ctx.events.push(TaskEvent::Completed {
                                 id: ctx.id,
                                 kind: ctx.kind.clone(),
-                                attempt,
-                                max_retries: retry.max,
+                                summary: summary.clone(),
                             });
+                            let done = state.done;
+                            let total = state.total;
                             drop(jobs);
-                            journal_write(&journal, &degraded, ctx.id, "record_retry", |conn| {
-                                task_journal::record_retry(conn, ctx.id)
+                            let _ = tx.send(value);
+                            journal_write(&journal, &degraded, ctx.id, "record_status", |conn| {
+                                task_journal::record_status(
+                                    conn,
+                                    ctx.id,
+                                    TaskStatus::Completed,
+                                    done,
+                                    total,
+                                    Some(&summary),
+                                    None,
+                                )
                             });
-                            // Sleep for backoff, but wake early on cancel.
-                            let deadline = Instant::now() + backoff;
-                            while Instant::now() < deadline && !ctx.cancelled() {
-                                std::thread::sleep(Duration::from_millis(100));
-                            }
-                            if ctx.cancelled() {
-                                let mut jobs = crate::sync::lock(&ctx.jobs);
-                                if let Some(state) = jobs.get_mut(&ctx.id) {
-                                    state.status = TaskStatus::Cancelled;
-                                    ctx.events.push(TaskEvent::Cancelled {
-                                        id: ctx.id,
-                                        kind: ctx.kind.clone(),
-                                    });
-                                }
+                            return;
+                        }
+                        Ok(Ok(_)) => {
+                            // Cancelled mid-run.
+                            state.status = TaskStatus::Cancelled;
+                            ctx.events.push(TaskEvent::Cancelled {
+                                id: ctx.id,
+                                kind: ctx.kind.clone(),
+                            });
+                            let done = state.done;
+                            let total = state.total;
+                            drop(jobs);
+                            journal_write(&journal, &degraded, ctx.id, "record_status", |conn| {
+                                task_journal::record_status(
+                                    conn,
+                                    ctx.id,
+                                    TaskStatus::Cancelled,
+                                    done,
+                                    total,
+                                    None,
+                                    None,
+                                )
+                            });
+                            return;
+                        }
+                        Ok(Err(error)) => {
+                            let error = error.to_string();
+                            // Check whether we have retries left.
+                            let can_retry = state.retry.as_mut().is_some_and(|r| r.remaining > 0);
+                            if can_retry {
+                                let retry = state.retry.as_mut().unwrap();
+                                retry.remaining -= 1;
+                                let attempt = retry.max - retry.remaining;
+                                let backoff = retry.backoff;
+                                ctx.events.push(TaskEvent::Retrying {
+                                    id: ctx.id,
+                                    kind: ctx.kind.clone(),
+                                    attempt,
+                                    max_retries: retry.max,
+                                });
                                 drop(jobs);
                                 journal_write(
                                     &journal,
                                     &degraded,
                                     ctx.id,
-                                    "record_status",
-                                    |conn| {
-                                        task_journal::record_status(
-                                            conn,
-                                            ctx.id,
-                                            TaskStatus::Cancelled,
-                                            0,
-                                            0,
-                                            None,
-                                            None,
-                                        )
-                                    },
+                                    "record_retry",
+                                    |conn| task_journal::record_retry(conn, ctx.id),
                                 );
-                                return;
+                                // Sleep for backoff, but wake early on cancel.
+                                let deadline = Instant::now() + backoff;
+                                while Instant::now() < deadline && !ctx.cancelled() {
+                                    std::thread::sleep(Duration::from_millis(100));
+                                }
+                                if ctx.cancelled() {
+                                    let mut jobs = crate::sync::lock(&ctx.jobs);
+                                    if let Some(state) = jobs.get_mut(&ctx.id) {
+                                        state.status = TaskStatus::Cancelled;
+                                        ctx.events.push(TaskEvent::Cancelled {
+                                            id: ctx.id,
+                                            kind: ctx.kind.clone(),
+                                        });
+                                    }
+                                    drop(jobs);
+                                    journal_write(
+                                        &journal,
+                                        &degraded,
+                                        ctx.id,
+                                        "record_status",
+                                        |conn| {
+                                            task_journal::record_status(
+                                                conn,
+                                                ctx.id,
+                                                TaskStatus::Cancelled,
+                                                0,
+                                                0,
+                                                None,
+                                                None,
+                                            )
+                                        },
+                                    );
+                                    return;
+                                }
+                                // Reset progress for the next attempt.
+                                let mut jobs = crate::sync::lock(&ctx.jobs);
+                                if let Some(state) = jobs.get_mut(&ctx.id) {
+                                    state.done = 0;
+                                    state.total = 0;
+                                }
+                                drop(jobs);
+                                continue;
                             }
-                            // Reset progress for the next attempt.
-                            let mut jobs = crate::sync::lock(&ctx.jobs);
-                            if let Some(state) = jobs.get_mut(&ctx.id) {
-                                state.done = 0;
-                                state.total = 0;
-                            }
+                            // No retries left: report final failure.
+                            state.status = TaskStatus::Failed;
+                            ctx.events.push(TaskEvent::Failed {
+                                id: ctx.id,
+                                kind: ctx.kind.clone(),
+                                error: error.clone(),
+                            });
+                            let done = state.done;
+                            let total = state.total;
                             drop(jobs);
-                            continue;
+                            journal_write(&journal, &degraded, ctx.id, "record_status", |conn| {
+                                task_journal::record_status(
+                                    conn,
+                                    ctx.id,
+                                    TaskStatus::Failed,
+                                    done,
+                                    total,
+                                    None,
+                                    Some(&error),
+                                )
+                            });
+                            return;
                         }
-                        // No retries left: report final failure.
-                        state.status = TaskStatus::Failed;
-                        ctx.events.push(TaskEvent::Failed {
-                            id: ctx.id,
-                            kind: ctx.kind.clone(),
-                            error: error.clone(),
-                        });
-                        let done = state.done;
-                        let total = state.total;
-                        drop(jobs);
-                        journal_write(&journal, &degraded, ctx.id, "record_status", |conn| {
-                            task_journal::record_status(
-                                conn,
-                                ctx.id,
-                                TaskStatus::Failed,
-                                done,
-                                total,
-                                None,
-                                Some(&error),
-                            )
-                        });
-                        return;
-                    }
-                    Err(_) => {
-                        // Panic: treat as a non-retryable failure.
-                        state.status = TaskStatus::Failed;
-                        ctx.events.push(TaskEvent::Failed {
-                            id: ctx.id,
-                            kind: ctx.kind.clone(),
-                            error: "task panicked".into(),
-                        });
-                        let done = state.done;
-                        let total = state.total;
-                        drop(jobs);
-                        journal_write(&journal, &degraded, ctx.id, "record_status", |conn| {
-                            task_journal::record_status(
-                                conn,
-                                ctx.id,
-                                TaskStatus::Failed,
-                                done,
-                                total,
-                                None,
-                                Some("task panicked"),
-                            )
-                        });
-                        return;
+                        Err(_) => {
+                            // Panic: treat as a non-retryable failure.
+                            state.status = TaskStatus::Failed;
+                            ctx.events.push(TaskEvent::Failed {
+                                id: ctx.id,
+                                kind: ctx.kind.clone(),
+                                error: "task panicked".into(),
+                            });
+                            let done = state.done;
+                            let total = state.total;
+                            drop(jobs);
+                            journal_write(&journal, &degraded, ctx.id, "record_status", |conn| {
+                                task_journal::record_status(
+                                    conn,
+                                    ctx.id,
+                                    TaskStatus::Failed,
+                                    done,
+                                    total,
+                                    None,
+                                    Some("task panicked"),
+                                )
+                            });
+                            return;
+                        }
                     }
                 }
-            }
-        });
+            },
+            priority,
+        );
         Ok((id, rx))
     }
 
@@ -1534,6 +1585,40 @@ mod tests {
             .find(|t| t.id == id)
             .map(|t| t.status)
             .expect("job present in registry")
+    }
+
+    /// The pool's two lanes: while a worker is busy and more work queues up,
+    /// `High` closures are picked up before every queued `Normal` one. This
+    /// is what keeps a model preview's parse from lining up behind a
+    /// low-priority backfill. One worker makes the order deterministic.
+    #[test]
+    fn the_pool_runs_high_priority_work_ahead_of_queued_normal_work() {
+        let pool = TaskPool::new(1);
+        let (gate_tx, gate_rx) = mpsc::channel::<()>();
+        let (done_tx, done_rx) = mpsc::channel::<&'static str>();
+        // Occupy the only worker until the gate opens. It is the first
+        // closure submitted, so whichever way the worker's wake-up races
+        // with the submits below, it is the one that takes the worker.
+        pool.execute(move || {
+            gate_rx.recv().expect("the gate opens");
+        });
+        pool.execute({
+            let done_tx = done_tx.clone();
+            move || {
+                let _ = done_tx.send("normal");
+            }
+        });
+        pool.execute_with_priority(
+            move || {
+                let _ = done_tx.send("high");
+            },
+            TaskPriority::High,
+        );
+        let _ = gate_tx.send(());
+        drop(gate_tx);
+        let order: Vec<&'static str> =
+            (0..2).filter_map(|_| done_rx.recv_timeout(std::time::Duration::from_secs(5)).ok()).collect();
+        assert_eq!(order, ["high", "normal"], "the priority lane runs first");
     }
 
     /// The journal is the only record a *later* process has of a job, so a write

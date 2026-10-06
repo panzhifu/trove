@@ -75,6 +75,35 @@ pub enum Backend {
     Unavailable(String),
 }
 
+/// The O(n) facts one mesh contributes to the viewport: which way it winds, and
+/// the scanner channels it carries. Computed where the mesh is built — the
+/// parse task, a streaming step, an index step, all off the UI thread — so the
+/// swap that installs it on the UI thread only merges constants.
+#[derive(Clone, Copy, Default)]
+pub(super) struct MeshFacts {
+    pub(super) winding: Winding,
+    pub(super) intensities: Option<(f32, f32)>,
+    pub(super) classes: Option<usize>,
+}
+
+impl MeshFacts {
+    /// Scan a freshly built mesh for its facts. A point cloud is two-sided by
+    /// construction, whatever its triangles say. A level built from an LOD set
+    /// carries no channels and inherits the surface's winding, so its caller
+    /// names both instead of calling this.
+    pub(super) fn of(mesh: &Mesh) -> Self {
+        Self {
+            winding: if mesh.is_point_cloud() {
+                Winding::TwoSided
+            } else {
+                mesh.winding()
+            },
+            intensities: mesh.intensity_range(),
+            classes: mesh.class_count(),
+        }
+    }
+}
+
 /// The viewport's own handles for the panel, so the element builders in `ui`
 /// do not reach into fields across the module boundary.
 impl ModelViewport {
@@ -130,20 +159,20 @@ impl ModelViewport {
         self.height.resolve(&self.field_data())
     }
 
-    /// Fold one mesh's scalar channels into the ranges the colouring reads.
+    /// Fold one mesh's facts into the ranges the colouring reads.
     ///
     /// Only ever widens, and never clears: the chunks that arrive later cover
     /// points the earlier ones did not, and a range that shrank back would
     /// repaint what is already on screen. An LOD level carries no channels at
     /// all, and the model underneath it still has the values.
-    pub(super) fn note_channels(&mut self, mesh: &Mesh) {
-        if let Some((min, max)) = mesh.intensity_range() {
+    pub(super) fn merge_channels(&mut self, facts: &MeshFacts) {
+        if let Some((min, max)) = facts.intensities {
             self.channel_intensities = Some(match self.channel_intensities {
                 Some((lo, hi)) => (lo.min(min), hi.max(max)),
                 None => (min, max),
             });
         }
-        if let Some(count) = mesh.class_count() {
+        if let Some(count) = facts.classes {
             self.channel_classes = Some(self.channel_classes.unwrap_or(0).max(count));
         }
     }
@@ -633,6 +662,9 @@ fn reason_text(unavailable: &GpuUnavailable) -> String {
         }
         GpuUnavailable::NoDevice(detail) => {
             rust_i18n::t!("viewport.gpu_no_device", detail = detail).to_string()
+        }
+        GpuUnavailable::OutOfMemory(detail) => {
+            rust_i18n::t!("viewport.gpu_out_of_memory", detail = detail).to_string()
         }
     }
 }

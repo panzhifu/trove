@@ -186,6 +186,9 @@ pub(crate) fn register(cx: &mut App, config: &trove_core::config::AppConfig) {
 
     // Screenshots are global (like paste import), not grid-scoped.
     bind!(Screenshot, None);
+    // The search summon is global too: Ctrl+K is worth reaching from the
+    // settings dialog or the tags panel, not only the grid.
+    bind!(FocusSearch, None);
 
     cx.bind_keys(bindings);
 }

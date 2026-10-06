@@ -12,7 +12,18 @@ fn main() {
         mesh.winding(),
         mesh.colors.len()
     );
-    let camera = trove_core::media::render3d::Camera::default();
+    let camera = match std::env::var("TROVE_DEBUG_CAMERA") {
+        Ok(spec) => {
+            let parts: Vec<f32> = spec.split(',').filter_map(|v| v.parse().ok()).collect();
+            trove_core::media::render3d::Camera {
+                yaw: parts.first().copied().unwrap_or(0.0),
+                pitch: parts.get(1).copied().unwrap_or(0.0),
+                zoom: parts.get(2).copied().unwrap_or(1.0),
+                ..trove_core::media::render3d::Camera::default()
+            }
+        }
+        Err(_) => trove_core::media::render3d::Camera::default(),
+    };
     let frame = trove_core::media::render3d::render(&mesh, &camera, 800, 600, 2, 1.0);
     write_png("/tmp/trove-render.png", &frame);
     println!("wrote /tmp/trove-render.png");

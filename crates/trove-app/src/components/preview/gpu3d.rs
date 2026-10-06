@@ -18,7 +18,9 @@
 
 use std::sync::{Arc, OnceLock, mpsc};
 use trove_core::media::formats::meshlet::{self, Meshlet};
-use trove_core::media::formats::types::{Mesh, NO_TEXTURE, Winding, resize_rgba};
+use trove_core::media::formats::types::{
+    Mesh, NO_TEXTURE, TextureMap, Winding, mip_chain, resize_rgba,
+};
 use trove_core::media::gpu::{self, UNIFORM_SIZE, Uniforms};
 use trove_core::media::height_color::HeightUniforms;
 use trove_core::media::render3d::{self, Framing};
@@ -35,6 +37,42 @@ const COLOR_FORMATS: [wgpu::TextureFormat; 2] = [
 ];
 /// Depth buffer for the model pass.
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
+
+/// Cap on a model's texture array, mip chains included.
+///
+/// Every layer is one RGBA8 square of the set's largest edge — 2048² plus its
+/// chain is ~22 MiB — so a scene of hundreds of maps asks for gigabytes and the
+/// driver answers `OutOfMemory`. Keeping the whole set under this turns a large
+/// texture set into a degraded preview (a smaller shared edge, or the flat
+/// material when even that will not fit) instead of a crash.
+const MODEL_TEXTURE_BUDGET: u64 = 256 << 20;
+
+/// Bytes a `layers`-deep, `dim`-square RGBA8 array costs, mip chain included
+/// (a chain is ~4/3 of its base level).
+fn array_bytes(dim: u32, layers: u64) -> u64 {
+    layers * (dim as u64 * dim as u64 * 4) * 4 / 3
+}
+
+/// The shared edge and mip count a model's texture array is created with, or
+/// `None` when even the smallest useful edge overflows [`MODEL_TEXTURE_BUDGET`].
+///
+/// An array demands one size for every layer, so the edge is the largest map's,
+/// halved until the whole set fits. Below a sane floor and it is not worth a
+/// texture at all — the caller binds the white stand-in and the model opens
+/// flat rather than not at all.
+fn texture_layout(maps: &[TextureMap]) -> Option<(u32, u32)> {
+    let mut dim = maps
+        .iter()
+        .map(|m| m.width.max(m.height))
+        .max()
+        .unwrap_or(1)
+        .clamp(1, 2048);
+    let layers = maps.len() as u64 + 1;
+    while dim > 16 && array_bytes(dim, layers) > MODEL_TEXTURE_BUDGET {
+        dim /= 2;
+    }
+    (array_bytes(dim, layers) <= MODEL_TEXTURE_BUDGET).then(|| (dim, 32 - dim.leading_zeros()))
+}
 
 /// The read-back order of a frame rendered in `format`, for [`gpu::unpack_bgra`].
 fn pixel_order(format: wgpu::TextureFormat) -> gpu::PixelOrder {
@@ -90,6 +128,11 @@ pub enum GpuUnavailable {
     /// An adapter was found but no device could be created from it. Carries
     /// the backend's own message.
     NoDevice(String),
+    /// The device came up but could not hold this model: a buffer or the
+    /// packed texture array asked for more than the driver had. Carries the
+    /// backend's own message. The viewport answers this by falling back to the
+    /// CPU rasteriser, so a model too large for the GPU still opens.
+    OutOfMemory(String),
 }
 
 /// A model whose geometry already lives in GPU buffers.
@@ -201,6 +244,24 @@ struct Pipelines {
 }
 
 /// Device, pipelines and the resources shared by every frame.
+/// Pack one f32 channel of an RGBA16Float texel: scene-linear radiance has
+/// no subnormals worth keeping, so the conversion clamps negatives to zero
+/// and everything past half's range to infinity.
+fn f16_bits(value: f32) -> u16 {
+    let value = value.max(0.0);
+    let bits = value.to_bits();
+    let sign = ((bits >> 16) & 0x8000) as u16;
+    let exponent = ((bits >> 23) & 0xff) as i32 - 127 + 15;
+    let mantissa = bits & 0x007f_ffff;
+    if exponent >= 0x1f {
+        return sign | 0x7c00;
+    }
+    if exponent <= 0 {
+        return sign;
+    }
+    sign | ((exponent as u16) << 10) | ((mantissa >> 13) as u16)
+}
+
 pub struct GpuRenderer {
     device: wgpu::Device,
     queue: wgpu::Queue,
@@ -216,6 +277,10 @@ pub struct GpuRenderer {
     /// so a mesh's own texture bind group can be built at upload time.
     bind_group_layout: wgpu::BindGroupLayout,
     texture_sampler: wgpu::Sampler,
+    /// The baked studio environment: one prefiltered cube shared by every
+    /// mesh bind group, so the specular's IBL term reads the same room the
+    /// thumbnails' analytic approximation stands in for.
+    env_view: wgpu::TextureView,
     /// Layout of the post pass's depth + resolved-colour bindings. Separate
     /// from the uniform-only layout the draw pipelines use, because only the
     /// post pass reads those two textures.
@@ -223,6 +288,25 @@ pub struct GpuRenderer {
     /// Eye-dome lighting and gap filling over a settled point-cloud frame.
     /// The CPU rasteriser's `render3d::enhance_points`, as a full-screen pass.
     edl_pipeline: wgpu::RenderPipeline,
+    /// The key light's shadow map and the sampler that compares against it.
+    /// The texture is rewritten by the shadow pass every frame that draws a
+    /// mesh, and read by every model fragment; a point-cloud frame never
+    /// writes it, so a cloud never shadows.
+    _shadow_depth: wgpu::Texture,
+    shadow_view: wgpu::TextureView,
+    shadow_cmp: wgpu::Sampler,
+    /// The shadow pass: the mesh from the light, depth only.
+    shadow_pipeline: wgpu::RenderPipeline,
+    /// The shadow pass's uniforms-only group, kept apart from the full one
+    /// for the usage-conflict reason its layout documents.
+    _shadow_layout: wgpu::BindGroupLayout,
+    _shadow_pipeline_layout: wgpu::PipelineLayout,
+    shadow_bind_group: wgpu::BindGroup,
+    /// The split-sum environment BRDF table and its clamped sampler, bound
+    /// beside the environment cube in every model bind group.
+    _brdf_texture: wgpu::Texture,
+    brdf_view: wgpu::TextureView,
+    lut_sampler: wgpu::Sampler,
     /// Colour format every target and pipeline uses, chosen so the read-back
     /// needs no swizzle where the adapter allows it.
     format: wgpu::TextureFormat,
@@ -421,6 +505,17 @@ impl GpuRenderer {
         };
         let adapter_name = format!("{} · {:?}", info.name, info.backend);
 
+        // An error that no error scope captures would otherwise reach wgpu's
+        // default handler, which panics the worker thread the driver reports
+        // on — and that panic tears the process down, leaving any task waiting
+        // on a frame to be "polled after completion". Out-of-memory is the one
+        // that actually happens on a laptop GPU, so log it and let the upload's
+        // own error scope (or the CPU fallback) decide; never abort the
+        // process over a resource the driver could not hand out.
+        device.on_uncaptured_error(std::sync::Arc::new(|error: wgpu::Error| {
+            tracing::error!(error = ?error, "wgpu device error");
+        }));
+
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("trove-3d"),
             source: wgpu::ShaderSource::Wgsl(SHADER.into()),
@@ -455,6 +550,58 @@ impl GpuRenderer {
                 },
                 wgpu::BindGroupLayoutEntry {
                     binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+                // The studio environment, prefiltered into five mips: the
+                // specular's IBL term, sampled along the reflection.
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::Cube,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                // The key light's shadow map and its comparison sampler: the
+                // model fragments test themselves against it. Pipelines that
+                // never test — the backdrop, the points — still bind this
+                // group; the entries go unread, like the texture array's.
+                wgpu::BindGroupLayoutEntry {
+                    binding: 4,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Depth,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 5,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Comparison),
+                    count: None,
+                },
+                // The split-sum environment BRDF table, baked once by the
+                // CPU and shared by every bind group, with its own clamped
+                // sampler — the texture sampler repeats, and a BRDF table
+                // must not wrap at its edges.
+                wgpu::BindGroupLayoutEntry {
+                    binding: 6,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 7,
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                     count: None,
@@ -512,10 +659,180 @@ impl GpuRenderer {
             dimension: Some(wgpu::TextureViewDimension::D2Array),
             ..Default::default()
         });
+        // The studio environment: baked once on the host (the sharp room plus
+        // EEVEE's prefilter cascade), uploaded as a float cube so a mirror
+        // still reads the panels at their real brightness.
+        let env_mips = render3d::environment_mips();
+        let env = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("trove-3d-env"),
+            size: wgpu::Extent3d {
+                width: env_mips[0].face_size,
+                height: env_mips[0].face_size,
+                depth_or_array_layers: 6,
+            },
+            mip_level_count: env_mips.len() as u32,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba16Float,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        for (level, mip) in env_mips.iter().enumerate() {
+            let bytes: Vec<u8> = mip
+                .faces
+                .iter()
+                .flat_map(|texel| {
+                    texel
+                        .map(f16_bits)
+                        .into_iter()
+                        .flat_map(|h| h.to_le_bytes())
+                })
+                .collect();
+            let texel_bytes = 2u32;
+            let face = mip.face_size;
+            for layer in 0..6u32 {
+                let face_bytes = (face * face * 4 * texel_bytes) as usize;
+                queue.write_texture(
+                    wgpu::TexelCopyTextureInfo {
+                        texture: &env,
+                        mip_level: level as u32,
+                        origin: wgpu::Origin3d {
+                            x: 0,
+                            y: 0,
+                            z: layer,
+                        },
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    &bytes[layer as usize * face_bytes..(layer as usize + 1) * face_bytes],
+                    wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(face * 4 * texel_bytes),
+                        rows_per_image: Some(face),
+                    },
+                    wgpu::Extent3d {
+                        width: face,
+                        height: face,
+                        depth_or_array_layers: 1,
+                    },
+                );
+            }
+        }
+        let env_view = env.create_view(&wgpu::TextureViewDescriptor {
+            dimension: Some(wgpu::TextureViewDimension::Cube),
+            ..Default::default()
+        });
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("trove-3d-texture"),
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear,
+            // Trilinear across the mip chain, with 16-tap anisotropy: the two
+            // settings that keep a minified texture from shimmering on a
+            // surface seen at a grazing angle — the ones Blender's viewport
+            // turns on for its image textures. The env cube is sampled at an
+            // explicit level and does not read either, and the address modes
+            // stay glTF's repeat default — the CPU sampler has always
+            // answered with `fract`, and a clamped edge streaks every model
+            // whose UVs step outside the unit square.
+            mipmap_filter: wgpu::MipmapFilterMode::Linear,
+            anisotropy_clamp: 16,
+            address_mode_u: wgpu::AddressMode::Repeat,
+            address_mode_v: wgpu::AddressMode::Repeat,
+            ..Default::default()
+        });
+        // The key light's shadow map: a fixed-size depth texture, rewritten
+        // by the depth-only pass every frame draws a mesh. Reversed-Z like
+        // the main pass — the clear value is the far end — and sampled
+        // through a comparison sampler so the PCF's nine taps each come back
+        // hardware-filtered: bilinear on the compare result, the softness
+        // nine plain taps would need thirty-six for.
+        let shadow_depth = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("trove-3d-shadow"),
+            size: wgpu::Extent3d {
+                width: render3d::SHADOW_MAP_SIZE,
+                height: render3d::SHADOW_MAP_SIZE,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Depth32Float,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::TEXTURE_BINDING
+                // The debug dump below reads the map back onto the CPU.
+                | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let shadow_view = shadow_depth.create_view(&wgpu::TextureViewDescriptor::default());
+        let shadow_cmp = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("trove-3d-shadow-compare"),
+            // Linear filtering on a comparison sampler is what turns each tap
+            // into a bilinear PCF sample; `GreaterEqual` is "reference at or
+            // in front of the stored depth", the direction reversed-Z calls
+            // lit.
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            compare: Some(wgpu::CompareFunction::GreaterEqual),
+            ..Default::default()
+        });
+        // The split-sum environment BRDF table, baked once by the CPU and
+        // uploaded as half-float pairs — the same table `render3d`'s
+        // specular reads bilinearly, so a thumbnail's reflections and the
+        // viewport's come off one set of numbers. Two channels: u = NoV,
+        // v = roughness, rg = (scale, bias).
+        let brdf = render3d::environment_brdf_lut();
+        let brdf_bytes: Vec<u8> = brdf
+            .data
+            .iter()
+            .flat_map(|pair| {
+                let mut bytes = Vec::with_capacity(4);
+                for value in pair {
+                    bytes.extend_from_slice(&f16_bits(*value).to_le_bytes());
+                }
+                bytes
+            })
+            .collect();
+        let brdf_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("trove-3d-brdf"),
+            size: wgpu::Extent3d {
+                width: brdf.size,
+                height: brdf.size,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rg16Float,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &brdf_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &brdf_bytes,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(brdf.size * 4),
+                rows_per_image: Some(brdf.size),
+            },
+            wgpu::Extent3d {
+                width: brdf.size,
+                height: brdf.size,
+                depth_or_array_layers: 1,
+            },
+        );
+        let brdf_view = brdf_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        // The table must not wrap: its edges are the domain's ends (NoV 0..1,
+        // roughness 0..1), and a repeating sampler would blend across them.
+        let lut_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("trove-3d-brdf"),
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
             ..Default::default()
         });
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -533,6 +850,26 @@ impl GpuRenderer {
                 wgpu::BindGroupEntry {
                     binding: 2,
                     resource: wgpu::BindingResource::Sampler(&sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::TextureView(&env_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: wgpu::BindingResource::TextureView(&shadow_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: wgpu::BindingResource::Sampler(&shadow_cmp),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: wgpu::BindingResource::TextureView(&brdf_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 7,
+                    resource: wgpu::BindingResource::Sampler(&lut_sampler),
                 },
             ],
         });
@@ -598,6 +935,76 @@ impl GpuRenderer {
             cache: None,
         });
 
+        // The shadow pass reads nothing but the uniforms — binding the full
+        // group here would hold the shadow map as a resource in the very
+        // pass that writes it, which wgpu refuses as a usage conflict — so
+        // the pass carries a uniforms-only layout and bind group of its own.
+        let shadow_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("trove-3d-shadow"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: wgpu::BufferSize::new(UNIFORM_SIZE as u64),
+                },
+                count: None,
+            }],
+        });
+        let shadow_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("trove-3d-shadow"),
+                bind_group_layouts: &[Some(&shadow_layout)],
+                immediate_size: 0,
+            });
+        let shadow_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("trove-3d-shadow"),
+            layout: &shadow_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: uniforms.as_entire_binding(),
+            }],
+        });
+
+        // The shadow pass: the mesh seen from the key light, depth only. One
+        // pipeline for every sample count — the shadow map is never
+        // multisampled — and no fragment stage, since the pipeline writes
+        // depth and nothing else. Back faces are kept rather than culled: a
+        // thin shell seen edge-on by the light must still occlude, and the
+        // bias handles the self-shadowing that keeping both faces invites.
+        let shadow_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("trove-3d-shadow"),
+            layout: Some(&shadow_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_shadow"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                buffers: &[wgpu::VertexBufferLayout {
+                    array_stride: render3d::VertexData::STRIDE,
+                    step_mode: wgpu::VertexStepMode::Vertex,
+                    // Position only: the interleaved normal rides along
+                    // unread.
+                    attributes: &wgpu::vertex_attr_array![0 => Float32x3],
+                }],
+            },
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth32Float,
+                depth_write_enabled: Some(true),
+                // Reversed-Z, like the main pass: nearer to the light is
+                // larger, the clear is zero, and GreaterEqual keeps the
+                // nearest surface per texel.
+                depth_compare: Some(wgpu::CompareFunction::GreaterEqual),
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            fragment: None,
+            multiview_mask: None,
+            cache: None,
+        });
+
         // Built once per sample count: the settled frame gets the adapter's
         // MSAA, the frame drawn while the pointer is down gets none — it is
         // about to be scaled up anyway, so its antialiasing is spent on pixels
@@ -639,7 +1046,13 @@ impl GpuRenderer {
 
             let attributes = wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3];
             let color_attributes = wgpu::vertex_attr_array![2 => Float32x3];
-            let tex_attributes = wgpu::vertex_attr_array![3 => Float32x4, 4 => Float32x2];
+            let tex_attributes = wgpu::vertex_attr_array![
+                3 => Float32x4,
+                4 => Float32x4,
+                5 => Float32x2,
+                6 => Float32x4,
+                7 => Float32x4
+            ];
             let model = |cull: bool, colored: bool| {
                 // A coloured mesh reads its RGB from a second vertex buffer and
                 // its texture coordinate from a third, so the interleaved
@@ -834,8 +1247,19 @@ impl GpuRenderer {
             bind_group,
             bind_group_layout: layout,
             texture_sampler: sampler,
+            env_view,
             edl_bind_group_layout,
             edl_pipeline,
+            _shadow_depth: shadow_depth,
+            shadow_view,
+            shadow_cmp,
+            shadow_pipeline,
+            _shadow_layout: shadow_layout,
+            _shadow_pipeline_layout: shadow_pipeline_layout,
+            shadow_bind_group,
+            _brdf_texture: brdf_texture,
+            brdf_view,
+            lut_sampler,
             targets: std::sync::Mutex::new(None),
             adapter: adapter_name,
         })
@@ -1011,6 +1435,23 @@ impl GpuRenderer {
         }
     }
 
+    /// [`GpuRenderer::upload`] with the driver's own out-of-memory answer
+    /// turned into an `Err` instead of a panic.
+    ///
+    /// An upload can ask a laptop GPU for more than it has. Without a scope
+    /// around it that failure reaches wgpu's fallback handler and aborts the
+    /// driver's worker thread — which is the whole process going down, not the
+    /// viewport falling back. The scope captures it so the caller can drop to
+    /// the CPU rasteriser with a nameable reason.
+    pub async fn upload_checked(&self, mesh: &Mesh) -> Result<GpuMesh, GpuUnavailable> {
+        let scope = self.device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
+        let uploaded = self.upload(mesh);
+        match scope.pop().await {
+            Some(error) => Err(GpuUnavailable::OutOfMemory(error.to_string())),
+            None => Ok(uploaded),
+        }
+    }
+
     /// Move a mesh or cloud into GPU buffers, choosing indexed (smooth),
     /// expanded (flat) or instanced-point geometry exactly as the CPU path
     /// does.
@@ -1123,18 +1564,22 @@ impl GpuRenderer {
             buffer
         });
 
+        // The array is budgeted before it is created: a scene with hundreds of
+        // maps would otherwise ask for gigabytes and be answered with an OOM.
+        // `texture_layout` halves the shared edge until the set fits, and gives
+        // up (`None`) when even the smallest useful edge overflows — the mesh
+        // then binds the renderer's white stand-in, so it still opens.
+        let texture_plan =
+            texture_data.and_then(|t| texture_layout(&t.maps).map(|(dim, mips)| (t, dim, mips)));
         // The mesh's own bind group: the shared uniforms plus its texture
         // array — or the renderer's white stand-in when there is nothing to
         // sample, which every pipeline accepts.
-        let bind_group = match texture_data {
-            Some(t) => {
-                let dim = t
-                    .maps
-                    .iter()
-                    .map(|m| m.width.max(m.height))
-                    .max()
-                    .unwrap_or(1)
-                    .clamp(1, 2048);
+        let bind_group = match texture_plan {
+            Some((t, dim, mips)) => {
+                // Every layer gets the full mip chain: the sampler reads it
+                // trilinearly (with 16-tap anisotropy), which is what keeps a
+                // minified texture from shimmering the way Blender's viewport
+                // — whose images all carry mipmaps — does not.
                 let layers = t.maps.len() + 1;
                 let texture = self.device.create_texture(&wgpu::TextureDescriptor {
                     label: Some("trove-3d-textures"),
@@ -1143,44 +1588,50 @@ impl GpuRenderer {
                         height: dim,
                         depth_or_array_layers: layers as u32,
                     },
-                    mip_level_count: 1,
+                    mip_level_count: mips,
                     sample_count: 1,
                     dimension: wgpu::TextureDimension::D2,
                     format: wgpu::TextureFormat::Rgba8UnormSrgb,
                     usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
                     view_formats: &[],
                 });
-                let white = vec![255u8; (dim * dim * 4) as usize];
-                for (layer, pixels) in std::iter::once(white)
-                    .chain(
-                        t.maps
-                            .iter()
-                            .map(|map| resize_rgba(&map.rgba, map.width, map.height, dim, dim)),
-                    )
-                    .enumerate()
-                {
-                    self.queue.write_texture(
-                        wgpu::TexelCopyTextureInfo {
-                            texture: &texture,
-                            mip_level: 0,
-                            origin: wgpu::Origin3d {
-                                z: layer as u32,
-                                ..Default::default()
-                            },
-                            aspect: wgpu::TextureAspect::All,
-                        },
-                        &pixels,
-                        wgpu::TexelCopyBufferLayout {
-                            offset: 0,
-                            bytes_per_row: Some(dim * 4),
-                            rows_per_image: Some(dim),
-                        },
-                        wgpu::Extent3d {
-                            width: dim,
-                            height: dim,
-                            depth_or_array_layers: 1,
-                        },
+                // Layer 0 is white at every level, and each map's chain is
+                // filtered on the host in scene-linear space — the same
+                // average a GPU blit between sRGB views computes.
+                let chains =
+                    std::iter::once(mip_chain(&vec![255u8; (dim * dim * 4) as usize], dim)).chain(
+                        t.maps.iter().map(|map| {
+                            let base = resize_rgba(&map.rgba, map.width, map.height, dim, dim);
+                            mip_chain(&base, dim)
+                        }),
                     );
+                for (layer, chain) in chains.enumerate() {
+                    debug_assert_eq!(chain.len(), mips as usize, "chain covers the chain");
+                    for (level, level_bytes) in chain.into_iter().enumerate() {
+                        let level_size = (dim >> level).max(1);
+                        self.queue.write_texture(
+                            wgpu::TexelCopyTextureInfo {
+                                texture: &texture,
+                                mip_level: level as u32,
+                                origin: wgpu::Origin3d {
+                                    z: layer as u32,
+                                    ..Default::default()
+                                },
+                                aspect: wgpu::TextureAspect::All,
+                            },
+                            &level_bytes,
+                            wgpu::TexelCopyBufferLayout {
+                                offset: 0,
+                                bytes_per_row: Some(level_size * 4),
+                                rows_per_image: Some(level_size),
+                            },
+                            wgpu::Extent3d {
+                                width: level_size,
+                                height: level_size,
+                                depth_or_array_layers: 1,
+                            },
+                        );
+                    }
                 }
                 let view = texture.create_view(&wgpu::TextureViewDescriptor {
                     dimension: Some(wgpu::TextureViewDimension::D2Array),
@@ -1202,6 +1653,26 @@ impl GpuRenderer {
                             binding: 2,
                             resource: wgpu::BindingResource::Sampler(&self.texture_sampler),
                         },
+                        wgpu::BindGroupEntry {
+                            binding: 3,
+                            resource: wgpu::BindingResource::TextureView(&self.env_view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 4,
+                            resource: wgpu::BindingResource::TextureView(&self.shadow_view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 5,
+                            resource: wgpu::BindingResource::Sampler(&self.shadow_cmp),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 6,
+                            resource: wgpu::BindingResource::TextureView(&self.brdf_view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 7,
+                            resource: wgpu::BindingResource::Sampler(&self.lut_sampler),
+                        },
                     ],
                 })
             }
@@ -1214,7 +1685,11 @@ impl GpuRenderer {
             vertex_count: data.vertex_count,
             index_count: data.indices.as_ref().map_or(0, |i| i.len() as u32),
             point_count: 0,
-            cull_backfaces: winding != Winding::TwoSided,
+            // One double-sided material anywhere in the file takes the whole
+            // mesh off the culled pipeline — culling is a pipeline choice, not
+            // a per-material one — and the fragment stage culls the single-
+            // sided materials' back faces from the same flag the CPU reads.
+            cull_backfaces: winding != Winding::TwoSided && !mesh.has_double_sided_material(),
             meshlets,
             colors,
             tex,
@@ -1282,6 +1757,48 @@ impl GpuRenderer {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("trove-3d"),
             });
+        // The key light's shadow map, baked before anything shades: every
+        // model fragment is about to test itself against it. A point cloud
+        // never shadows (its eye-dome lighting is what gives it form), and
+        // with the switch off the pass runs empty — clearing only, since a
+        // cleared map is "nothing in front of you" and every fragment tests
+        // out of it fully lit. That is also what keeps the sampling and the
+        // skip from disagreeing: the shader never needs a flag.
+        if mesh.point_count == 0 {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("trove-3d-shadow"),
+                color_attachments: &[],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &self.shadow_view,
+                    depth_ops: Some(wgpu::Operations {
+                        // Reversed-Z: the clear is the far end of the range.
+                        load: wgpu::LoadOp::Clear(0.0),
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            if options.shadows {
+                pass.set_pipeline(&self.shadow_pipeline);
+                pass.set_bind_group(0, &self.shadow_bind_group, &[]);
+                pass.set_vertex_buffer(0, mesh.vertices.slice(..));
+                match &mesh.indices {
+                    Some(indices) => {
+                        // The whole buffer, in one call: the light's window
+                        // was sized to hold the model, so there is nothing to
+                        // cull against — the main camera's meshlets are not
+                        // the light's business.
+                        pass.set_index_buffer(indices.slice(..), wgpu::IndexFormat::Uint32);
+                        pass.draw_indexed(0..mesh.index_count, 0, 0..1);
+                    }
+                    None => pass.draw(0..mesh.vertex_count, 0..1),
+                }
+            }
+            drop(pass);
+        }
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("trove-3d"),
@@ -1534,6 +2051,7 @@ mod tests {
                 ("vs_model", naga::ShaderStage::Vertex),
                 ("vs_model_colored", naga::ShaderStage::Vertex),
                 ("vs_point", naga::ShaderStage::Vertex),
+                ("vs_shadow", naga::ShaderStage::Vertex),
             ]
         );
     }
@@ -1556,7 +2074,10 @@ mod tests {
                 render3d::VertexData::STRIDE / 4,
             ),
             // The coloured entry reads the interleaved buffer, the colour
-            // buffer and the texture coordinates: six floats plus six.
+            // buffer and the texture/material record: six floats plus
+            // eighteen — uv and layers, PBR factors and map layers, the
+            // normal/occlusion scalars, the emissive layer and factor, and
+            // the alpha test's cutoff and factor with the doubleSided flag.
             (
                 "vs_model_colored",
                 vec![
@@ -1564,7 +2085,10 @@ mod tests {
                     float(1, 3),
                     float(2, 3),
                     float(3, 4),
-                    float(4, 2),
+                    float(4, 4),
+                    float(5, 2),
+                    float(6, 4),
+                    float(7, 4),
                 ],
                 render3d::VertexData::STRIDE / 4
                     + render3d::VertexData::COLOR_STRIDE / 4
@@ -1624,11 +2148,14 @@ mod tests {
         let layout = uniform_layout(&module);
 
         // (name, bytes) in declaration order — the Rust packing order.
-        let expected: [(&str, u32); 12] = [
+        let expected: [(&str, u32); 15] = [
             ("view_proj", 64),
+            ("view_proj_shadow", 64),
             ("material", 16),
             ("params", 16),
             ("lights", 4 * 3 * 16),
+            ("basis", 3 * 16),
+            ("env_sh", 4 * 16),
             ("params2", 16),
             ("eye", 16),
             ("viewport", 16),
@@ -2028,6 +2555,357 @@ mod tests {
             "a white class came out of the palette warm"
         );
         assert_ne!(buildings, unclassified, "the classes were ignored");
+    }
+
+    /// A textured mesh's atlas is uploaded with its full mip chain — every
+    /// level the sampler's trilinear read expects, at the floor-halved sizes
+    /// the descriptor names — and the mesh renders through it. The map here
+    /// is deliberately an odd 3×3, the size whose chain is not a clean
+    /// power-of-two walk; a level whose extent disagreed with the chain would
+    /// fail the upload or draw garbage. Skipped where there is no adapter.
+    #[test]
+    fn a_textured_mesh_uploads_its_mip_chain_and_renders() {
+        let Ok(renderer) = GpuRenderer::new() else {
+            eprintln!("no graphics device: skipping the textured frame test");
+            return;
+        };
+        let positions = vec![[0.0f32, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]];
+        let mut mesh = Mesh::from_parts(
+            positions.clone(),
+            vec![[0.0f32, 0.0, 1.0]; 3],
+            vec![[0.8f32, 0.8, 0.8]; 3],
+            vec![[0, 1, 2]],
+        )
+        .expect("triangle builds");
+        mesh.texture = Some(Box::new(trove_core::media::formats::types::TextureData {
+            uv: vec![[0.25, 0.25]; 3],
+            slot: vec![0; 3],
+            // The remaining layers point at the white stand-in; the alpha
+            // test is off (negative cutoff) and the PBR factors are the
+            // spec defaults the white layer's samples leave standing.
+            mr_slot: vec![trove_core::media::formats::types::NO_TEXTURE; 3],
+            factors: vec![[0.0, 1.0]; 3],
+            normal_slot: vec![trove_core::media::formats::types::NO_TEXTURE; 3],
+            normal_scale: vec![1.0; 3],
+            ao_slot: vec![trove_core::media::formats::types::NO_TEXTURE; 3],
+            ao_strength: vec![1.0; 3],
+            emissive_slot: vec![trove_core::media::formats::types::NO_TEXTURE; 3],
+            emissive_factor: vec![[0.0; 3]; 3],
+            alpha_cutoff: vec![-1.0; 3],
+            alpha_factor: vec![1.0; 3],
+            double_sided: vec![false; 3],
+            // One odd-sized red map: dim 3, chain [3, 1].
+            maps: vec![trove_core::media::formats::types::TextureMap {
+                rgba: {
+                    let mut v = vec![255u8; 3 * 3 * 4];
+                    for pixel in v.as_chunks_mut::<4>().0 {
+                        pixel[1] = 0;
+                        pixel[2] = 0;
+                    }
+                    v
+                },
+                width: 3,
+                height: 3,
+            }],
+        }));
+        let uploaded = renderer.upload(&mesh);
+        let frame = renderer
+            .render(
+                &uploaded,
+                &render3d::Camera::default().framing(mesh.bounds, 1.0),
+                (160, 120),
+                false,
+                &render3d::RenderOptions::default(),
+                HeightUniforms::default(),
+            )
+            .expect("a textured frame comes back");
+        assert!(
+            frame
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .any(|pixel| pixel[2] > 0 || pixel[1] > 0 || pixel[0] > 0),
+            "the textured mesh drew nothing"
+        );
+    }
+
+    /// A small occluder floating over a wide ground plane casts a shadow the
+    /// renderer can see: the frame with the key light's shadow pass differs
+    /// from the one without, and only ever gets darker — the shadow scales
+    /// the key light's share down from its full strength, never up. Skipped
+    /// where there is no adapter.
+    #[test]
+    fn an_occluder_darkens_the_ground_on_the_gpu() {
+        let Ok(renderer) = GpuRenderer::new() else {
+            eprintln!("no graphics device: skipping the shadow frame test");
+            return;
+        };
+        let mesh = occluder_over_ground();
+        let uploaded = renderer.upload(&mesh);
+        let framing = render3d::Camera::default().framing(mesh.bounds, 1.0);
+        let frame = |shadows: bool| {
+            renderer
+                .render(
+                    &uploaded,
+                    &framing,
+                    (320, 240),
+                    false,
+                    &render3d::RenderOptions {
+                        shadows,
+                        ..Default::default()
+                    },
+                    HeightUniforms::default(),
+                )
+                .expect("a frame comes back")
+        };
+        let lit = frame(true);
+        let plain = frame(false);
+        assert_ne!(lit, plain, "the shadow pass has to change the frame");
+        let mean = |frame: &[u8]| {
+            frame
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|pixel| pixel[0] as u64 + pixel[1] as u64 + pixel[2] as u64)
+                .sum::<u64>()
+        };
+        assert!(
+            mean(&lit) < mean(&plain),
+            "shadows only darken: {} against {}",
+            mean(&lit),
+            mean(&plain)
+        );
+    }
+
+    /// A wide ground plane at y = 0 carrying a small box at its centre: the
+    /// shape the shadow test needs — a caster above a receiver, with the key
+    /// light above the horizon, so the box's shadow falls on visible ground.
+    fn occluder_over_ground() -> Mesh {
+        trove_core::media::formats::load_obj(
+            "vn 0 1 0\n\
+             v -5 0 -5\nv 5 0 -5\nv 5 0 5\nv -5 0 5\n\
+             f 1//1 3//1 2//1\nf 1//1 4//1 3//1\n\
+             v 0.4 0.4 0.4\nv 0.6 0.4 0.4\nv 0.6 0.4 0.6\nv 0.4 0.4 0.6\n\
+             v 0.4 0.8 0.4\nv 0.6 0.8 0.4\nv 0.6 0.8 0.6\nv 0.4 0.8 0.6\n\
+             f 5//1 7//1 6//1\nf 5//1 8//1 7//1\n\
+             f 9//1 10//1 11//1\nf 9//1 11//1 12//1\n\
+             f 5//1 6//1 10//1\nf 5//1 10//1 9//1\n\
+             f 6//1 7//1 11//1\nf 6//1 11//1 10//1\n\
+             f 7//1 8//1 12//1\nf 7//1 12//1 11//1\n\
+             f 8//1 5//1 9//1\nf 8//1 9//1 12//1\n",
+        )
+        .expect("the occluder scene parses")
+    }
+
+    /// The display matrices in the shader must be the CPU's `display_color`
+    /// matrices in column-major form — WGSL `mat3x3` arguments are columns,
+    /// and copying the CPU's *rows* in as columns silently transposes the
+    /// transform. That transpose held neutral greys through the wrong
+    /// rotation and painted every GPU-rendered model with a blue-violet
+    /// cast, which is why this is pinned number for number.
+    #[test]
+    fn the_display_matrices_match_the_cpu_row_form() {
+        // The CPU's row-multiplication constants, from `display_color`.
+        let cpu: [(&str, [[f32; 3]; 3]); 4] = [
+            (
+                "srgb_to_rec2020",
+                [
+                    [0.627_403_9, 0.329_283, 0.043_313_1],
+                    [0.069_097_3, 0.919_540_4, 0.011_362_3],
+                    [0.016_391_4, 0.088_013_3, 0.895_595_3],
+                ],
+            ),
+            (
+                "rec2020_to_srgb",
+                [
+                    [1.660_491, -0.587_641_1, -0.072_849_9],
+                    [-0.124_550_5, 1.132_899_9, -0.008_349_4],
+                    [-0.018_150_8, -0.100_578_9, 1.118_729_7],
+                ],
+            ),
+            (
+                "agx_inset",
+                [
+                    [0.856_627_2, 0.095_121_2, 0.048_251_6],
+                    [0.137_319, 0.761_242, 0.101_439],
+                    [0.111_898_2, 0.076_799_4, 0.811_302_4],
+                ],
+            ),
+            (
+                "agx_outset",
+                [
+                    [1.127_100_6, -0.110_606_6, -0.016_493_9],
+                    [-0.141_329_8, 1.157_823_7, -0.016_493_9],
+                    [-0.141_329_8, -0.110_606_6, 1.251_936_4],
+                ],
+            ),
+        ];
+        for (name, rows) in cpu {
+            let block = SHADER
+                .split_once(&format!("const {name} = mat3x3<f32>("))
+                .map(|(_, rest)| rest)
+                .unwrap_or_else(|| panic!("the shader declares const {name}"));
+            let block = &block[..block.find(");").expect("the matrix block closes")];
+            let values: Vec<f32> = block
+                .split(&[',', '(', ')'][..])
+                .filter_map(|token| token.trim().parse::<f32>().ok())
+                .collect();
+            assert_eq!(values.len(), 9, "{name} holds nine floats");
+            // WGSL column j against CPU column j: the transposed copy put
+            // the CPU's row 0 where column 0 belongs, which is exactly the
+            // drift this test exists to catch.
+            for column in 0..3 {
+                for row in 0..3 {
+                    let got = values[column * 3 + row];
+                    let want = rows[row][column];
+                    assert!(
+                        (got - want).abs() < 1e-5,
+                        "{name} column {column} row {row}: {got} against {want}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A plane facing the key light must shade uniformly: nothing stands
+    /// between it and the light, so its shadow map reads "nothing nearer"
+    /// everywhere. The shadow lookup used to fold the light-space NDC into
+    /// the map's uv without flipping v, so the plane sampled its own
+    /// mirrored depths and a band of false shadow crossed every lit face.
+    /// Skipped where there is no adapter.
+    #[test]
+    fn a_facing_plane_shades_without_a_false_shadow() {
+        let Ok(renderer) = GpuRenderer::new() else {
+            eprintln!("no graphics device: skipping the plane shadow test");
+            return;
+        };
+        let mesh = trove_core::media::formats::load_obj(
+            "vn 0 0 1\n\
+             v -1 -1 0\nv 1 -1 0\nv 1 1 0\nv -1 1 0\n\
+             f 1//1 2//1 3//1\nf 1//1 3//1 4//1\n",
+        )
+        .expect("the plane parses");
+        let uploaded = renderer.upload(&mesh);
+        let camera = render3d::Camera {
+            yaw: 0.0,
+            pitch: 0.0,
+            ..render3d::Camera::default()
+        };
+        let frame = renderer
+            .render(
+                &uploaded,
+                &camera.framing(mesh.bounds, 1.0),
+                (320, 240),
+                false,
+                &render3d::RenderOptions::default(),
+                HeightUniforms::default(),
+            )
+            .expect("a frame comes back");
+        // The middle half of the frame is plane, backdrop nowhere in sight.
+        let pixels = frame.as_chunks::<4>().0;
+        let (width, height) = (320usize, 240usize);
+        let mut darkest = 255u32;
+        for y in height / 4..height * 3 / 4 {
+            for x in width / 4..width * 3 / 4 {
+                let pixel = &pixels[y * width + x];
+                let brightness = (pixel[0] as u32 + pixel[1] as u32 + pixel[2] as u32) / 3;
+                darkest = darkest.min(brightness);
+            }
+        }
+        assert!(
+            darkest >= 60,
+            "a facing plane shaded to near-black ({darkest}): the shadow test \
+             is answering against the wrong part of the map"
+        );
+    }
+
+    /// Where a model open spends its time: device bring-up, the upload, the
+    /// first GPU frame, and the CPU first frame it would have drawn instead.
+    /// Prints rather than asserts — the numbers are the point. Runs when
+    /// `TROVE_DEBUG_GPU_TIMING` is set; skipped where there is no adapter.
+    #[test]
+    fn a_model_open_timed_stage_by_stage() {
+        if std::env::var_os("TROVE_DEBUG_GPU_TIMING").is_none() {
+            return;
+        }
+        let Ok(renderer) = GpuRenderer::new() else {
+            eprintln!("no graphics device: skipping the timing run");
+            return;
+        };
+        // A grid big enough to matter, carrying a 1024² map like a real file.
+        let mesh = {
+            let mut mesh = grid_mesh(320); // 204 800 triangles
+            let side = 1024usize;
+            let mut rgba = vec![0u8; side * side * 4];
+            for pixel in rgba.as_chunks_mut::<4>().0 {
+                pixel.copy_from_slice(&[200, 150, 100, 255]);
+            }
+            let count = mesh.positions.len();
+            mesh.texture = Some(Box::new(trove_core::media::formats::types::TextureData {
+                uv: vec![[0.5, 0.5]; count],
+                slot: vec![0; count],
+                mr_slot: vec![trove_core::media::formats::types::NO_TEXTURE; count],
+                factors: vec![[0.0, 1.0]; count],
+                normal_slot: vec![trove_core::media::formats::types::NO_TEXTURE; count],
+                normal_scale: vec![1.0; count],
+                ao_slot: vec![trove_core::media::formats::types::NO_TEXTURE; count],
+                ao_strength: vec![1.0; count],
+                emissive_slot: vec![trove_core::media::formats::types::NO_TEXTURE; count],
+                emissive_factor: vec![[0.0; 3]; count],
+                alpha_cutoff: vec![-1.0; count],
+                alpha_factor: vec![1.0; count],
+                double_sided: vec![false; count],
+                maps: vec![trove_core::media::formats::types::TextureMap {
+                    rgba,
+                    width: side as u32,
+                    height: side as u32,
+                }],
+            }));
+            mesh
+        };
+        let mark = |what: &str, started: std::time::Instant| {
+            eprintln!("{what}: {:.1?}", started.elapsed());
+        };
+
+        let started = std::time::Instant::now();
+        let _data = render3d::vertex_data_with(&mesh, false);
+        mark("vertex data", started);
+        let started = std::time::Instant::now();
+        let _partitioned = trove_core::media::formats::meshlet::partition(
+            &mesh,
+            trove_core::media::formats::meshlet::DEFAULT_MESHLET_TRIANGLES,
+        );
+        mark("meshlet partition", started);
+        let started = std::time::Instant::now();
+        if let Some(map) = mesh.texture.as_ref().unwrap().maps.first() {
+            let base = trove_core::media::formats::types::resize_rgba(
+                &map.rgba, map.width, map.height, 1024, 1024,
+            );
+            let _ = trove_core::media::formats::types::mip_chain(&base, 1024);
+        }
+        mark("one 1024² map: resize + mip chain", started);
+
+        let started = std::time::Instant::now();
+        let uploaded = renderer.upload(&mesh);
+        mark("gpu upload (meshlets + atlas + mip chain)", started);
+
+        let started = std::time::Instant::now();
+        let frame = renderer
+            .render(
+                &uploaded,
+                &render3d::Camera::default().framing(mesh.bounds, 1.0),
+                (800, 600),
+                false,
+                &render3d::RenderOptions::default(),
+                HeightUniforms::default(),
+            )
+            .expect("a frame comes back");
+        mark("first gpu frame (incl. readback)", started);
+        eprintln!("frame bytes: {}", frame.len());
+
+        let started = std::time::Instant::now();
+        let _ = render3d::render(&mesh, &render3d::Camera::default(), 800, 600, 1, 1.0);
+        mark("cpu first frame at full size (debug build!)", started);
     }
 
     /// The members of the shader's `Uniforms` struct, in order.

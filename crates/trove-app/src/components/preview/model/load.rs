@@ -18,12 +18,12 @@ use trove_core::media::chunked::{self, LodConfig};
 use trove_core::media::formats::meshlet;
 use trove_core::media::formats::simplify::{select_lod, simplify_mesh};
 use trove_core::media::formats::streaming_point_cloud::StreamingPointCloud;
-use trove_core::media::formats::types::{Bounds as MeshBounds, Mesh, Winding};
+use trove_core::media::formats::types::{Bounds as MeshBounds, Mesh};
 use trove_core::media::index::{IndexedCloud, index_path_for};
 use trove_core::media::render3d;
 
 use super::super::gpu3d::{GpuRenderer, GpuUnavailable};
-use super::{Backend, ModelViewport, STREAM_REFINEMENTS, reason_text};
+use super::{Backend, MeshFacts, ModelViewport, STREAM_REFINEMENTS, reason_text};
 
 /// Parsed geometry the chunked PLY loader may hold.
 ///
@@ -39,6 +39,15 @@ const CHUNKED_MEMORY_BUDGET: usize = 128 << 20;
 /// written down somewhere, and this is the only place that knows it before
 /// the allocation that may fail.
 const LARGE_UPLOAD_LOG_BYTES: usize = 256 << 20;
+
+/// Largest mesh (in estimated GPU bytes) the viewport will try to upload.
+///
+/// Past this the CPU rasteriser draws the model instead. It is not a hardware
+/// limit — the driver reports its own — but a ceiling on the host-side vertex
+/// data the upload builds first, which is several times the mesh's own size
+/// for a flat-shaded soup and would abort the process uncatchably if it ran
+/// away. The driver's refusal below this is caught by the upload's error scope.
+const MAX_GPU_MESH_BYTES: usize = 1 << 30;
 
 impl ModelViewport {
     /// Parse the mesh through the backend task manager (registered, visible
@@ -142,7 +151,12 @@ impl ModelViewport {
                 let _ = ctx; // parsing is one indivisible unit; no checkpoints
                 // The mesh loaders still speak `String`; the task contract
                 // speaks the crate error, so the message is carried across.
-                Self::load_mesh(&path).map_err(trove_core::Error::Message)
+                let mesh = Self::load_mesh(&path).map_err(trove_core::Error::Message)?;
+                // The winding and the scanner channels are O(n) scans; done
+                // here, on the task's own thread, the swap on the UI thread is
+                // a couple of comparisons instead of a stall.
+                let facts = MeshFacts::of(&mesh);
+                Ok((mesh, facts))
             },
         );
         let (id, rx) = match started {
@@ -157,7 +171,7 @@ impl ModelViewport {
                 .spawn(async move { rx.recv().ok() })
                 .await;
             weak.update(cx, |this, cx| match result {
-                Some(mesh) => this.set_mesh(mesh, cx),
+                Some((mesh, facts)) => this.set_mesh(mesh, facts, cx),
                 // Failed or cancelled — the task event carries the details,
                 // and all the channel itself can say is that nothing came
                 // back for this file.
@@ -174,7 +188,7 @@ impl ModelViewport {
     }
 
     /// Swap in a freshly parsed mesh and bring the GPU up.
-    fn set_mesh(&mut self, mesh: Mesh, cx: &mut Context<Self>) {
+    fn set_mesh(&mut self, mesh: Mesh, facts: MeshFacts, cx: &mut Context<Self>) {
         // Don't simplify synchronously — QEM is O(n log n) and would block
         // the UI thread for large meshes. Instead, show the mesh immediately
         // and compute LOD levels in the background.
@@ -188,7 +202,7 @@ impl ModelViewport {
         // whatever the last one measured.
         self.channel_intensities = None;
         self.channel_classes = None;
-        self.swap_mesh(mesh);
+        self.swap_mesh(mesh, facts);
 
         // Spawn QEM simplification in the background for large meshes — the
         // same threshold at which the partitioner bothers, because below it a
@@ -223,24 +237,19 @@ impl ModelViewport {
 
     /// Replace the displayed geometry, recording that it is newer than
     /// anything an in-flight task might still be holding.
-    fn swap_mesh(&mut self, mesh: Mesh) {
-        // Derived geometry passes the winding it inherits: an LOD level comes
-        // off the same surface as the mesh it was simplified from, and
-        // re-classifying a million-triangle level (a hash map over its edges)
-        // on the UI thread is exactly the stall this avoids. A cloud has no
-        // triangles to classify, so two-sided is free and correct.
-        let winding = if mesh.is_point_cloud() {
-            Winding::TwoSided
-        } else {
-            mesh.winding()
-        };
-        self.swap_mesh_with(mesh, winding);
+    ///
+    /// `facts` were scanned where the mesh was built — off the UI thread — so
+    /// nothing here walks the geometry: an O(n) winding pass or a channel scan
+    /// used to run on the UI thread on exactly the large models this path
+    /// exists for.
+    fn swap_mesh(&mut self, mesh: Mesh, facts: MeshFacts) {
+        self.swap_mesh_with(mesh, facts);
     }
 
-    /// [`ModelViewport::swap_mesh`], with the winding already decided.
-    fn swap_mesh_with(&mut self, mesh: Mesh, winding: Winding) {
-        self.note_channels(&mesh);
-        self.mesh_winding = winding;
+    /// [`ModelViewport::swap_mesh`], with the facts already scanned.
+    fn swap_mesh_with(&mut self, mesh: Mesh, facts: MeshFacts) {
+        self.merge_channels(&facts);
+        self.mesh_winding = facts.winding;
         self.mesh_serial += 1;
         self.mesh = Arc::new(mesh);
         self.dirty = true;
@@ -299,8 +308,16 @@ impl ModelViewport {
             level.triangles.clone(),
         );
         if let Some(mesh) = mesh {
-            // The level inherits the original mesh's winding.
-            self.swap_mesh_with(mesh, self.mesh_winding);
+            // The level inherits the original mesh's winding and carries no
+            // channels of its own — its vertices are QEM output with no
+            // provenance to the file's colours.
+            self.swap_mesh_with(
+                mesh,
+                MeshFacts {
+                    winding: self.mesh_winding,
+                    ..MeshFacts::default()
+                },
+            );
             self.backend = Backend::Starting;
             self.start_gpu(cx);
         }
@@ -340,12 +357,16 @@ impl ModelViewport {
                         || step.points_read.saturating_sub(last_rendered)
                             >= (step.total_points / STREAM_REFINEMENTS).max(1);
                     let mesh = due.then(|| streamer.render_mesh_all(cam_pos));
-                    (streamer, step, mesh)
+                    // Scan the channels and winding on this thread, not the UI
+                    // thread: a streamed cloud grows, and this pass walks all
+                    // of it.
+                    let facts = mesh.as_ref().map(MeshFacts::of);
+                    (streamer, step, mesh, facts)
                 })
                 .await;
             weak.update(cx, |this, cx| {
                 this.stream_step = false;
-                let (streamer, step, mesh) = outcome;
+                let (streamer, step, mesh, facts) = outcome;
                 this.stream_read = step.points_read;
                 this.stream_total = step.total_points;
                 this.stream_kept = step.points_loaded;
@@ -358,7 +379,9 @@ impl ModelViewport {
                 if let Some(mesh) = mesh {
                     this.stream_rendered_read = step.points_read;
                     if mesh.vertex_count() > 0 {
-                        this.swap_mesh(mesh);
+                        if let Some(facts) = facts {
+                            this.swap_mesh(mesh, facts);
+                        }
                         this.backend = Backend::Streaming;
                     }
                 }
@@ -408,17 +431,21 @@ impl ModelViewport {
                     let mut cloud = cloud;
                     let step = cloud.step(&frustum, cam_pos);
                     let mesh = cloud.render_mesh(cam_pos);
-                    (cloud, step, mesh)
+                    // The channels are scanned here rather than on the UI
+                    // thread; a resident cloud of millions of points makes the
+                    // difference a stall versus a comparison.
+                    let facts = MeshFacts::of(&mesh);
+                    (cloud, step, mesh, facts)
                 })
                 .await;
             weak.update(cx, |this, cx| {
                 this.index_step = false;
-                let (cloud, step, mesh) = outcome;
+                let (cloud, step, mesh, facts) = outcome;
                 this.index_chunks_read = step.chunks_read;
                 this.index_chunks_total = step.chunks_total;
                 this.indexed = Some(cloud);
                 if mesh.vertex_count() > 0 {
-                    this.swap_mesh(mesh);
+                    this.swap_mesh(mesh, facts);
                     this.backend = Backend::Indexed;
                 }
                 if step.complete {
@@ -490,12 +517,12 @@ impl ModelViewport {
     /// Bring the GPU up on a background thread and upload the mesh. Until it
     /// finishes — or forever, if it fails — the CPU renders the viewport.
     ///
-    /// Every mesh is uploaded, however large. There used to be a 256 MiB
-    /// ceiling above which the upload was skipped and the viewport quietly
-    /// became a software render; it spared a machine that could not hold the
-    /// geometry at the cost of making every machine that could look like a
-    /// broken GPU. The size goes to the log instead, so a genuine
-    /// out-of-video-memory failure has a line naming the model and the figure.
+    /// A mesh larger than [`MAX_GPU_MESH_BYTES`], or one the driver refuses to
+    /// hold, falls back to the CPU rasteriser with a nameable reason instead of
+    /// crashing: the upload runs inside an error scope, so the driver's own
+    /// out-of-memory answer becomes an `Err`. The size goes to the log either
+    /// way, so a genuine out-of-video-memory failure has a line naming the
+    /// model and the figure.
     ///
     /// A device that is already up is reused: only the geometry is re-uploaded.
     /// Building a second device and a second set of pipelines for every LOD
@@ -524,6 +551,18 @@ impl ModelViewport {
                         None => super::super::gpu3d::shared_renderer()?,
                     };
                     let wanted = GpuRenderer::estimate_gpu_bytes(&mesh);
+                    // A mesh whose buffers clearly will not fit is not even
+                    // built on the host: `vertex_data_with` expands a
+                    // flat-shaded mesh to three vertices per triangle, so a
+                    // mesh of a real gigabyte is several on the way in, and a
+                    // host allocation that size aborts before the driver ever
+                    // sees it. This is the cheaper door in front of the
+                    // driver's own refusal, which the error scope catches.
+                    if wanted > MAX_GPU_MESH_BYTES {
+                        return Err(GpuUnavailable::OutOfMemory(format!(
+                            "the mesh needs {wanted} bytes, over the {MAX_GPU_MESH_BYTES} byte preview budget"
+                        )));
+                    }
                     if wanted >= LARGE_UPLOAD_LOG_BYTES {
                         tracing::info!(
                             bytes = wanted,
@@ -532,7 +571,7 @@ impl ModelViewport {
                             "uploading a large mesh to the GPU"
                         );
                     }
-                    let uploaded = renderer.upload(&mesh);
+                    let uploaded = renderer.upload_checked(&mesh).await?;
                     Ok::<_, GpuUnavailable>((renderer, uploaded))
                 })
                 .await;

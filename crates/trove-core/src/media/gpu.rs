@@ -15,14 +15,15 @@
 
 use super::height_color::{HeightUniforms, RAMP_STOPS};
 use super::render3d::{
-    BG_BOTTOM, BG_TOP, EDL_STRENGTH, Framing, MATERIAL, MATERIAL_ROUGHNESS, POINT_RADIUS, VIGNETTE,
-    model_space_lights,
+    BG_BOTTOM, BG_TOP, EDL_STRENGTH, Framing, MATERIAL, MATERIAL_ROUGHNESS, POINT_RADIUS,
+    SHADOW_MAP_SIZE, VIGNETTE, environment_sh, model_space_lights, shadow_framing,
 };
 
-/// Bytes of [`Uniforms`]: one `mat4x4<f32>`, twenty-one `vec4<f32>`s (two
-/// scalars' worth, four lights of three each, six more) and the colour scale's
-/// stop table.
-pub const UNIFORM_SIZE: usize = 64 + 21 * 16 + RAMP_STOPS * 16;
+/// Bytes of [`Uniforms`]: two `mat4x4<f32>`s, twenty-eight `vec4<f32>`s (two
+/// scalars' worth, four lights of three each, the camera basis and the
+/// environment's harmonic coefficients, six more) and the colour scale's stop
+/// table.
+pub const UNIFORM_SIZE: usize = 2 * 64 + 28 * 16 + RAMP_STOPS * 16;
 
 /// One studio light as the shader reads it: direction plus wrap, then the
 /// light's diffuse and specular colours.
@@ -44,6 +45,11 @@ pub struct LightUniform {
 pub struct Uniforms {
     /// Model space → clip space, column-major.
     pub view_proj: [[f32; 4]; 4],
+    /// Model space → the key light's shadow map, column-major: NDC in `xy`
+    /// (the shader folds it to the map's uv), reversed depth in `z`. Built
+    /// from the same [`render3d::shadow_framing`] the CPU rasteriser walks,
+    /// so a thumbnail's shadow and the viewport's fall on the same side.
+    pub view_proj_shadow: [[f32; 4]; 4],
     /// rgb = the flat material colour; `w` unused.
     pub material: [f32; 4],
     /// x = material roughness, z = vignette strength; `y`/`w` unused.
@@ -53,9 +59,20 @@ pub struct Uniforms {
     /// host rides it through the basis once instead of the shader doing it
     /// per pixel.
     pub lights: [LightUniform; 4],
+    /// The camera basis in model space — right, up, forward — the same
+    /// orthonormal frame the lights ride. The environment cubemap is baked in
+    /// view space (the rig is camera-anchored), so the shader folds a
+    /// reflection direction back through this basis before sampling it.
+    pub basis: [[f32; 4]; 3],
+    /// The baked studio environment's first two harmonic bands —
+    /// `render3d::environment_sh`, constant for the process. rgb per band
+    /// coefficient: L0.M0, L1.Mn1, L1.M0, L1.Mp1.
+    pub env_sh: [[f32; 4]; 4],
     /// `x` = point sprite radius in pixels, `y` = eye-dome lighting strength,
     /// `z` = the near plane (the reversed depth is `near / vz`, which the
-    /// point-cloud post pass inverts with one division).
+    /// point-cloud post pass inverts with one division), `w` = one over the
+    /// shadow map's edge in texels — the PCF taps' uv stride and the slope
+    /// bias's scale.
     pub params2: [f32; 4],
     /// Camera position in model space, so shading can work where the normals
     /// live; `w` unused.
@@ -84,8 +101,12 @@ impl Uniforms {
         // back into a view distance with one division by the near plane —
         // the constant the eye-dome pass reads out of `params2`.
         let near = framing.depth_range().0;
+        // The key light's shadow window; one over the map's edge rides in
+        // `params2.w` as the PCF taps' uv stride and the slope bias's scale.
+        let shadow = shadow_framing(framing);
         Self {
             view_proj: framing.view_projection(),
+            view_proj_shadow: shadow.view_projection(),
             material: [MATERIAL[0], MATERIAL[1], MATERIAL[2], 0.0],
             params: [MATERIAL_ROUGHNESS, 0.0, VIGNETTE, 0.0],
             lights: model_space_lights(framing).map(|light| LightUniform {
@@ -98,7 +119,23 @@ impl Uniforms {
                 diffuse: [light.diffuse[0], light.diffuse[1], light.diffuse[2], 0.0],
                 specular: [light.specular[0], light.specular[1], light.specular[2], 0.0],
             }),
-            params2: [POINT_RADIUS, EDL_STRENGTH, near, 0.0],
+            basis: [
+                [framing.right[0], framing.right[1], framing.right[2], 0.0],
+                [framing.up[0], framing.up[1], framing.up[2], 0.0],
+                [
+                    framing.forward[0],
+                    framing.forward[1],
+                    framing.forward[2],
+                    0.0,
+                ],
+            ],
+            env_sh: environment_sh().map(|band| [band[0], band[1], band[2], 0.0]),
+            params2: [
+                POINT_RADIUS,
+                EDL_STRENGTH,
+                near,
+                1.0 / SHADOW_MAP_SIZE as f32,
+            ],
             eye: [eye[0], eye[1], eye[2], 0.0],
             viewport: [viewport.0.max(1) as f32, viewport.1.max(1) as f32, 0.0, 0.0],
             background: [
@@ -133,12 +170,21 @@ impl Uniforms {
         for column in &self.view_proj {
             push(column, &mut at);
         }
+        for column in &self.view_proj_shadow {
+            push(column, &mut at);
+        }
         push(&self.material, &mut at);
         push(&self.params, &mut at);
         for light in &self.lights {
             push(&light.direction_wrap, &mut at);
             push(&light.diffuse, &mut at);
             push(&light.specular, &mut at);
+        }
+        for vector in &self.basis {
+            push(vector, &mut at);
+        }
+        for vector in &self.env_sh {
+            push(vector, &mut at);
         }
         for vector in [
             self.params2,
@@ -250,12 +296,13 @@ mod tests {
 
     #[test]
     fn the_uniform_block_is_the_size_the_shader_expects() {
-        // 64 bytes of matrix + twenty-one vec4 (two scalars' worth, four
-        // lights of three each, and six more) + a 32-stop colour scale = 912,
-        // a multiple of 16.
-        assert_eq!(UNIFORM_SIZE, 912);
+        // Two 64-byte matrices + twenty-eight vec4 (two scalars' worth, four
+        // lights of three each, the camera basis and the environment's
+        // harmonics, and six more) + a 32-stop colour scale = 1088, a
+        // multiple of 16.
+        assert_eq!(UNIFORM_SIZE, 1088);
         assert_eq!(UNIFORM_SIZE % 16, 0);
-        assert_eq!(Uniforms::new(&framing(), (800, 600)).to_bytes().len(), 912);
+        assert_eq!(Uniforms::new(&framing(), (800, 600)).to_bytes().len(), 1088);
     }
 
     /// The height look is the payload the viewport's panel changes, so its
@@ -282,8 +329,9 @@ mod tests {
         let float_at =
             |offset: usize| f32::from_ne_bytes(bytes[offset..offset + 4].try_into().unwrap());
 
-        // Nineteen vec4s follow the matrix, and the look is the twentieth.
-        let coloring = 64 + 19 * 16;
+        // Twenty-eight vec4s follow the two matrices, and the look is the
+        // twenty-seventh of them.
+        let coloring = 2 * 64 + 26 * 16;
         assert_eq!(float_at(coloring), HeightMode::Ramp.index() as f32, "mode");
         assert_eq!(float_at(coloring + 4), 1.0, "axis");
         assert_eq!(float_at(coloring + 8), 0.0, "the range floor");
@@ -317,14 +365,25 @@ mod tests {
                 assert_eq!(stored, *value, "matrix [{column}][{row}]");
             }
         }
+        // The shadow matrix follows immediately, byte for byte what the key
+        // light's framing builds.
+        let shadow_at = 64;
+        let shadow = uniforms.view_proj_shadow;
+        for (column, values) in shadow.iter().enumerate() {
+            for (row, value) in values.iter().enumerate() {
+                let at = shadow_at + (column * 4 + row) * 4;
+                let stored = f32::from_ne_bytes(bytes[at..at + 4].try_into().unwrap());
+                assert_eq!(stored, *value, "shadow matrix [{column}][{row}]");
+            }
+        }
         // Followed immediately by the material's rgb, then the lighting
         // parameters.
-        let material_at = 64;
+        let material_at = 128;
         assert_eq!(
             f32::from_ne_bytes(bytes[material_at..material_at + 4].try_into().unwrap()),
             uniforms.material[0]
         );
-        let roughness_at = 64 + 16;
+        let roughness_at = 128 + 16;
         assert_eq!(
             f32::from_ne_bytes(bytes[roughness_at..roughness_at + 4].try_into().unwrap()),
             MATERIAL_ROUGHNESS
@@ -347,6 +406,7 @@ mod tests {
         assert_eq!(uniforms.params, [MATERIAL_ROUGHNESS, 0.0, VIGNETTE, 0.0]);
         assert_eq!(uniforms.params2[0], POINT_RADIUS);
         assert_eq!(uniforms.params2[1], EDL_STRENGTH);
+        assert_eq!(uniforms.params2[3], 1.0 / SHADOW_MAP_SIZE as f32);
         // The reversed depth stores `near / vz`, so the post pass rebuilds
         // the view distance with one division by the near plane it finds in
         // `params2.z`.

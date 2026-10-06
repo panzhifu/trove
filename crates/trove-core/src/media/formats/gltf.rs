@@ -22,14 +22,39 @@ use super::types::{Mesh, NO_TEXTURE, TextureData, TextureMap, resize_rgba};
 
 /// Load a glTF or GLB file. Buffers are resolved relative to the file.
 ///
-/// Images are decoded here rather than by the gltf crate's own import, whose
-/// decoder only carries png and jpeg — a Sketchfab model's webp textures
-/// would fail the whole import and leave the model flat.
+/// Images are decoded here, and the parse never asks the gltf crate for them:
+/// its own import decodes every texture with the codecs it ships with — png
+/// and jpeg only — only for this module to decode them again from the raw
+/// buffer views, so the crate's pass is a second full decode of every image
+/// in the file, and a Sketchfab model's webp textures would fail the whole
+/// import and leave the model flat.
 pub fn load_gltf(path: &Path) -> Result<Mesh, String> {
-    let (document, buffers) = match gltf::import(path) {
-        Ok(imported) => (imported.0, imported.1),
-        Err(error) => fallback_import(path, error)?,
+    let bytes = std::fs::read(path).map_err(|e| format!("failed to load glTF: {e}"))?;
+    // The document is validated when it can be. A file whose
+    // `extensionsRequired` names an extension this build of the crate was not
+    // compiled with is refused on sight — the refusal covers the whole file,
+    // geometry included — but the geometry is still perfectly readable, so
+    // the parse is retried without validation: the extension's own material
+    // block is read where the crate knows it (the feature is enabled), and
+    // ignored where it does not. A file that fails this way too was never
+    // going to open, and the validation error — which names the extension —
+    // is the more useful one to report.
+    let parsed = match gltf::Gltf::from_slice(&bytes) {
+        Ok(gltf) => gltf,
+        Err(original) => {
+            let gltf = gltf::Gltf::from_slice_without_validation(&bytes)
+                .map_err(|_| format!("failed to load glTF: {original}"))?;
+            tracing::info!(
+                path = %path.display(),
+                %original,
+                "glTF imported without validation"
+            );
+            gltf
+        }
     };
+    let gltf::Gltf { document, blob } = parsed;
+    let buffers = gltf::import_buffers(&document, Some(path), blob)
+        .map_err(|e| format!("failed to load glTF: {e}"))?;
     // Every image the document's textures reference becomes one texture slot,
     // decoded once and shared (two materials on one image share the slot).
     // The per-texture slot table comes out alongside: a texture whose source
@@ -59,53 +84,20 @@ pub fn load_gltf(path: &Path) -> Result<Mesh, String> {
     builder.finish()
 }
 
-/// Import without the validator, for the files it refuses on sight.
-///
-/// `import` fails outright when a document's `extensionsRequired` names an
-/// extension this build of the crate was not compiled with — a Sketchfab
-/// export asking for `KHR_materials_pbrSpecularGlossiness`, say — and the
-/// refusal covers the whole file, geometry included. The geometry is still
-/// perfectly readable, so the parse is retried without validation: the
-/// extension's own material block is read where the crate knows it (the
-/// feature is enabled), and ignored where it does not. A file that fails this
-/// way too was never going to open, and the original error — which names the
-/// extension — is the more useful one to report.
-fn fallback_import(
-    path: &Path,
-    original: gltf::Error,
-) -> Result<(gltf::Document, Vec<gltf::buffer::Data>), String> {
-    let parsed = std::fs::read(path)
-        .map_err(|e| format!("failed to load glTF: {e}"))
-        .and_then(|bytes| {
-            gltf::Gltf::from_slice_without_validation(&bytes)
-                .map_err(|e| format!("failed to load glTF: {e}"))
-        });
-    match parsed {
-        Ok(gltf) => {
-            let buffers = gltf::import_buffers(&gltf.document, Some(path), gltf.blob)
-                .map_err(|e| format!("failed to load glTF: {e}"))?;
-            tracing::info!(
-                path = %path.display(),
-                %original,
-                "glTF imported without validation"
-            );
-            Ok((gltf.document, buffers))
-        }
-        // The fallback got no further than the first attempt did; the error
-        // that named the unsupported extension is the one worth keeping.
-        Err(_) => Err(format!("failed to load glTF: {original}")),
-    }
-}
-
 /// Decode every image the document declares into a texture slot, in document
-/// order. A decode failure costs that image its slot, never the model.
+/// order. A decode failure costs that image its slot, never the model. The
+/// decodes run across the rayon pool: a file of 4K PNGs spends most of its
+/// parse inside the decoders, and they are embarrassingly parallel.
 fn decode_images(
     document: &gltf::Document,
     buffers: &[gltf::buffer::Data],
     path: &Path,
 ) -> Vec<TextureMap> {
-    document
-        .images()
+    use rayon::prelude::*;
+
+    let images: Vec<gltf::Image<'_>> = document.images().collect();
+    images
+        .par_iter()
         .filter_map(|image| {
             let bytes = match image.source() {
                 gltf::image::Source::View { view, .. } => {
@@ -157,14 +149,20 @@ struct Builder {
     /// Some vertex so far came without a normal.
     normals_incomplete: bool,
     /// Parallel to `positions`; the material colour each vertex is painted
-    /// with — the primitive's base colour factor times its `COLOR_0`, when
-    /// either is present. Placeholder zeros where a primitive carried neither,
-    /// dropped as a set by `finish` when `colors_incomplete` is set: shading
+    /// with — `COLOR_0` times the base colour factor, or the factor alone.
+    /// Placeholder zeros where a primitive carried neither, dropped as a set
+    /// by `finish` when no primitive carried a real material colour: shading
     /// half a model by its materials and half by the flat default reads as a
     /// bug, so the set stands or falls together.
     colors: Vec<[f32; 3]>,
-    /// Some vertex so far came without a material colour.
-    colors_incomplete: bool,
+    /// Any primitive carried a real material colour — a `COLOR_0`, a
+    /// base-colour texture, or a non-default base colour factor. `finish`
+    /// keeps the colour set only when this is set: a document with no
+    /// material anywhere keeps the flat default it always had, while one
+    /// with materials paints *every* vertex, the default-white ones
+    /// included (the spec gives each material a total base colour factor —
+    /// white is a material, not a missing one).
+    material_colored: bool,
     /// The decoded base-colour textures, in slot order; empty when the
     /// document carries none.
     textures: Vec<TextureMap>,
@@ -177,6 +175,24 @@ struct Builder {
     /// Per-vertex `(metallic factor, roughness factor)`, parallel to
     /// `positions`.
     factors: Vec<[f32; 2]>,
+    /// Per-vertex normal-map texture slot, parallel to `positions`.
+    normal_slot: Vec<u16>,
+    /// Per-vertex normal-map strength, parallel to `positions`.
+    normal_scale: Vec<f32>,
+    /// Per-vertex ambient-occlusion texture slot, parallel to `positions`.
+    ao_slot: Vec<u16>,
+    /// Per-vertex occlusion strength, parallel to `positions`.
+    ao_strength: Vec<f32>,
+    /// Per-vertex emissive texture slot, parallel to `positions`.
+    emissive_slot: Vec<u16>,
+    /// Per-vertex emissive factor, parallel to `positions`.
+    emissive_factors: Vec<[f32; 3]>,
+    /// Per-vertex alpha cutoff and base-colour alpha factor, parallel to
+    /// `positions`. Negative cutoff = opaque.
+    alpha_cutoff: Vec<f32>,
+    alpha_factor: Vec<f32>,
+    /// Per-vertex double-sided flag, parallel to `positions`.
+    double_sided: Vec<bool>,
     /// Vertices of `POINTS` primitives. Used only when the document has no
     /// triangles at all: a mesh is either a surface or a cloud.
     points: Vec<[f32; 3]>,
@@ -280,22 +296,31 @@ impl Builder {
                         color[2] * factor[2],
                     ]);
                 }
+                self.material_colored = true;
                 debug_assert_eq!(self.colors.len() - base as usize, count);
             }
             // A textured primitive's texture carries its colour, so white is
-            // the multiply that leaves it alone — the colour set may not break
-            // here, or the model's one textured part would drag every colour
-            // down as incomplete and the texture would never be sampled.
+            // the multiply that leaves it alone. A factor that is not the
+            // spec default is a material statement of its own: the paint the
+            // primitive wears, as read by every importer.
             None if base_texture.is_some() || factor[..3] != [1.0, 1.0, 1.0] => {
+                self.material_colored = true;
                 self.colors.extend(std::iter::repeat_n(
                     [factor[0], factor[1], factor[2]],
                     count,
                 ));
             }
+            // No `COLOR_0` and the default factor: the primitive paints
+            // white — which is a *colour*, not a missing one. The factor is
+            // total per the spec, so the set fills rather than turning
+            // incomplete: the old poison here let one default-material part
+            // (a white bulb on a black lamp) erase every other part's colour
+            // and drop the whole model back to bare clay.
             None => {
-                self.colors_incomplete = true;
-                self.colors
-                    .extend(std::iter::repeat_n([0.0, 0.0, 0.0], count));
+                self.colors.extend(std::iter::repeat_n(
+                    [factor[0], factor[1], factor[2]],
+                    count,
+                ));
             }
         }
 
@@ -303,6 +328,7 @@ impl Builder {
         // primitive with neither carries the no-texture marker — the arrays
         // stay parallel to the positions either way.
         let slot = base_texture
+            .as_ref()
             .map(|info| {
                 slot_of_texture
                     .get(info.texture().index())
@@ -325,15 +351,101 @@ impl Builder {
                     .unwrap_or(NO_TEXTURE)
             })
             .unwrap_or(NO_TEXTURE);
-        let pbr = material.pbr_metallic_roughness();
-        let factors = [pbr.metallic_factor(), pbr.roughness_factor()];
+        // A specular-glossiness material has no metallic-roughness block —
+        // the crate hands back the spec defaults for it, full metal at full
+        // roughness — so its own numbers are read instead: glossiness is
+        // roughness inverted, and the specular factor is a dielectric tint
+        // rather than a metal, the way Blender's importer converts it. Read
+        // as the defaults, the GPU preview multiplies the whole diffuse away
+        // and paints the file black.
+        let factors = material
+            .pbr_specular_glossiness()
+            .map(|sg| [0.0, (1.0 - sg.glossiness_factor()).clamp(0.0, 1.0)])
+            .unwrap_or_else(|| {
+                let pbr = material.pbr_metallic_roughness();
+                [pbr.metallic_factor(), pbr.roughness_factor()]
+            });
+        // The normal map relights the surface and the occlusion map darkens
+        // the lighting where the file says it is shadowed; both ride the same
+        // per-vertex slot table as the base colour, with their per-material
+        // strengths alongside.
+        let normal_texture = material.normal_texture();
+        let normal_slot = normal_texture
+            .as_ref()
+            .and_then(|info| slot_of_texture.get(info.texture().index()).copied())
+            .unwrap_or(NO_TEXTURE);
+        let normal_scale = normal_texture.map(|info| info.scale()).unwrap_or(1.0);
+        let ao_texture = material.occlusion_texture();
+        let ao_slot = ao_texture
+            .as_ref()
+            .and_then(|info| slot_of_texture.get(info.texture().index()).copied())
+            .unwrap_or(NO_TEXTURE);
+        let ao_strength = ao_texture.map(|info| info.strength()).unwrap_or(1.0);
+        // Emissive is the light the surface gives off on its own — the glow
+        // that survives a dark scene. The texture, when there is one,
+        // multiplies the factor.
+        let emissive_texture = material.emissive_texture();
+        let emissive_slot = emissive_texture
+            .as_ref()
+            .and_then(|info| slot_of_texture.get(info.texture().index()).copied())
+            .unwrap_or(NO_TEXTURE);
+        // KHR_materials_emissive_strength scales the factor; without the
+        // extension the spec's default multiplier is 1.
+        let emissive_strength = material.emissive_strength().unwrap_or(1.0);
+        let emissive_factor = material
+            .emissive_factor()
+            .map(|channel| channel * emissive_strength);
+        // The material's alpha, folded to the two numbers the renderers pack
+        // per vertex: the cutoff a texel's alpha is tested against (negative
+        // = never discard) and the base-colour factor's alpha that multiplies
+        // the texel into the value tested. A blended material needs per-pixel
+        // blending in draw order, which an off-screen preview has no sort
+        // for — clipping it at the default cutoff keeps the cutout silhouette
+        // a leaf card is meant to have instead of a sheet of black.
+        let alpha_cutoff = match material.alpha_mode() {
+            gltf::material::AlphaMode::Mask => material.alpha_cutoff().unwrap_or(0.5),
+            gltf::material::AlphaMode::Blend => 0.5,
+            gltf::material::AlphaMode::Opaque => -1.0,
+        };
+        let alpha_factor = factor[3];
+        // The material's doubleSided: its back faces are the surface seen
+        // from behind, and no renderer may cull them — the flag rides the
+        // per-vertex table so the decision lands on the face that owns it.
+        let double_sided = material.double_sided();
+        // KHR_texture_transform: the affine map one texture's uv go through
+        // (scale, then a counter-clockwise rotation, then the offset). The
+        // preview carries ONE uv per vertex, shared by every map the
+        // primitive samples, so the base-colour texture's transform is the
+        // one applied — exporters write the same transform on every map of a
+        // material, and where a file genuinely disagrees, the base colour is
+        // the one that owns the picture. A transform naming a different
+        // TEXCOORD set is ignored: only set 0 is read.
+        let uv_transform = base_texture
+            .as_ref()
+            .and_then(|info| info.texture_transform())
+            .or_else(|| {
+                material
+                    .pbr_metallic_roughness()
+                    .metallic_roughness_texture()
+                    .as_ref()
+                    .and_then(|info| info.texture_transform())
+            });
         match reader.read_tex_coords(0) {
             Some(uv) => {
                 for uv in uv.into_f32() {
-                    self.uv.push(uv);
+                    self.uv.push(transform_uv(uv, &uv_transform));
                     self.slots.push(slot);
                     self.mr_slots.push(mr_slot);
                     self.factors.push(factors);
+                    self.normal_slot.push(normal_slot);
+                    self.normal_scale.push(normal_scale);
+                    self.ao_slot.push(ao_slot);
+                    self.ao_strength.push(ao_strength);
+                    self.emissive_slot.push(emissive_slot);
+                    self.emissive_factors.push(emissive_factor);
+                    self.alpha_cutoff.push(alpha_cutoff);
+                    self.alpha_factor.push(alpha_factor);
+                    self.double_sided.push(double_sided);
                 }
             }
             None => {
@@ -341,12 +453,26 @@ impl Builder {
                 self.slots.extend(std::iter::repeat_n(slot, count));
                 self.mr_slots.extend(std::iter::repeat_n(mr_slot, count));
                 self.factors.extend(std::iter::repeat_n(factors, count));
+                self.normal_slot
+                    .extend(std::iter::repeat_n(normal_slot, count));
+                self.normal_scale
+                    .extend(std::iter::repeat_n(normal_scale, count));
+                self.ao_slot.extend(std::iter::repeat_n(ao_slot, count));
+                self.ao_strength
+                    .extend(std::iter::repeat_n(ao_strength, count));
+                self.emissive_slot
+                    .extend(std::iter::repeat_n(emissive_slot, count));
+                self.emissive_factors
+                    .extend(std::iter::repeat_n(emissive_factor, count));
+                self.alpha_cutoff
+                    .extend(std::iter::repeat_n(alpha_cutoff, count));
+                self.alpha_factor
+                    .extend(std::iter::repeat_n(alpha_factor, count));
+                self.double_sided
+                    .extend(std::iter::repeat_n(double_sided, count));
             }
         }
 
-        if std::env::var_os("TROVE_DEBUG_SLOTS").is_some() {
-            eprintln!("prim base={base} count={count} slot={slot}");
-        }
         let indices: Vec<u32> = match reader.read_indices() {
             Some(indices) => indices.into_u32().collect(),
             None => (0..(self.positions.len() - base as usize) as u32).collect(),
@@ -365,7 +491,7 @@ impl Builder {
             } else {
                 Vec::new()
             };
-            let colors = if !self.colors_incomplete && self.colors.len() == self.positions.len() {
+            let colors = if self.material_colored && self.colors.len() == self.positions.len() {
                 self.colors
             } else {
                 Vec::new()
@@ -378,6 +504,15 @@ impl Builder {
                     slot: self.slots,
                     mr_slot: self.mr_slots,
                     factors: self.factors,
+                    normal_slot: self.normal_slot,
+                    normal_scale: self.normal_scale,
+                    ao_slot: self.ao_slot,
+                    ao_strength: self.ao_strength,
+                    emissive_slot: self.emissive_slot,
+                    emissive_factor: self.emissive_factors,
+                    alpha_cutoff: self.alpha_cutoff,
+                    alpha_factor: self.alpha_factor,
+                    double_sided: self.double_sided,
                     maps: self.textures,
                 }));
             }
@@ -463,6 +598,21 @@ fn finish_texture(rgba: Vec<u8>, width: u32, height: u32) -> TextureMap {
         width: tw,
         height: th,
     }
+}
+
+/// Apply a `KHR_texture_transform` to one uv, the spec's affine map: scale,
+/// then a counter-clockwise rotation, then the offset. `None` leaves the uv
+/// untouched.
+fn transform_uv(uv: [f32; 2], transform: &Option<gltf::texture::TextureTransform<'_>>) -> [f32; 2] {
+    let Some(transform) = transform else {
+        return uv;
+    };
+    let scale = transform.scale();
+    let rotation = transform.rotation();
+    let offset = transform.offset();
+    let (sin, cos) = rotation.sin_cos();
+    let (u, v) = (uv[0] * scale[0], uv[1] * scale[1]);
+    [u * cos - v * sin + offset[0], u * sin + v * cos + offset[1]]
 }
 
 /// Apply a composed node transform/// Apply a composed node transform to a point. The matrix is glTF's own
@@ -565,7 +715,12 @@ mod tests {
             }
             v
         };
+        glb_bin(json, bin)
+    }
 
+    /// [`glb`], with the binary chunk spelled out — tests that pack an image
+    /// in beside the geometry build their own layout.
+    fn glb_bin(json: String, bin: Vec<u8>) -> std::path::PathBuf {
         let json_bytes = json.into_bytes();
         let json_pad = (4 - (json_bytes.len() % 4)) % 4;
         let bin_pad = (4 - (bin.len() % 4)) % 4;
@@ -667,6 +822,209 @@ mod tests {
         assert_eq!(mesh.colors[2], [1.0, 0.5, 0.0]);
     }
 
+    /// A mesh mixing a real material with the spec-default one keeps all of
+    /// its colours: the default factor is *white*, a material — not a
+    /// missing one. The old behaviour dropped the whole set when one
+    /// primitive wore the default, which is how a black lamp with a white
+    /// bulb rendered as bare clay.
+    #[test]
+    fn a_default_material_keeps_the_meshs_colours() {
+        let json = r#"{
+            "asset": {"version": "2.0"},
+            "scenes": [{"nodes": [0]}],
+            "scene": 0,
+            "nodes": [{"mesh": 0}],
+            "meshes": [{"primitives": [
+                {"attributes": {"POSITION": 0}, "indices": 1, "material": 0},
+                {"attributes": {"POSITION": 0}, "indices": 1}
+            ]}],
+            "materials": [{"pbrMetallicRoughness": {"baseColorFactor": [0.01, 0.01, 0.01, 1.0]}}],
+            "buffers": [{"byteLength": 48}],
+            "bufferViews": [
+                {"buffer": 0, "byteOffset": 0, "byteLength": 36, "target": 34962},
+                {"buffer": 0, "byteOffset": 36, "byteLength": 12, "target": 34963}
+            ],
+            "accessors": [
+                {"bufferView": 0, "componentType": 5126, "count": 3, "type": "VEC3", "max": [1,1,0], "min": [0,0,0]},
+                {"bufferView": 1, "componentType": 5125, "count": 3, "type": "SCALAR"}
+            ]
+        }"#.to_string();
+        let path = glb(json);
+        let mesh = load_gltf(&path).expect("glb two-primitive mesh parses");
+        std::fs::remove_file(&path).ok();
+        assert_eq!(mesh.vertex_count(), 6);
+        assert!(
+            mesh.has_vertex_colors(),
+            "one default-material part must not erase the others' colours"
+        );
+        // The black part first, the default-white part second.
+        assert_eq!(&mesh.colors[0..3], &[[0.01, 0.01, 0.01]; 3]);
+        assert_eq!(&mesh.colors[3..6], &[[1.0, 1.0, 1.0]; 3]);
+    }
+
+    /// A material's normal and occlusion textures land in the per-vertex slot
+    /// table with their strengths, and a material without them carries the
+    /// no-texture marker there: the renderers shade relief and shadowed
+    /// creases from these, and a slot that missed its image — or a strength
+    /// stuck at its default — would show as a flat, uniformly lit surface.
+    #[test]
+    fn a_materials_normal_and_occlusion_maps_reach_the_slot_table() {
+        // A 2×2 opaque PNG rides the binary chunk beside the triangle's
+        // geometry: the smallest image the decoder accepts.
+        let png = {
+            let mut img = image::RgbaImage::new(2, 2);
+            for p in img.pixels_mut() {
+                *p = image::Rgba([128, 128, 255, 255]);
+            }
+            let mut bytes = std::io::Cursor::new(Vec::new());
+            image::DynamicImage::ImageRgba8(img)
+                .write_to(&mut bytes, image::ImageFormat::Png)
+                .unwrap();
+            bytes.into_inner()
+        };
+        let bin = {
+            let mut v = Vec::new();
+            for &[x, y, z] in &[[0f32, 0., 0.], [1., 0., 0.], [0., 1., 0.]] {
+                v.extend_from_slice(&x.to_le_bytes());
+                v.extend_from_slice(&y.to_le_bytes());
+                v.extend_from_slice(&z.to_le_bytes());
+            }
+            for idx in [0u32, 1, 2] {
+                v.extend_from_slice(&idx.to_le_bytes());
+            }
+            // 4-aligned by construction: 36 bytes of positions, 12 of indices.
+            v.extend_from_slice(&png);
+            v
+        };
+        let json = format!(
+            r#"{{
+            "asset": {{"version": "2.0"}},
+            "scenes": [{{"nodes": [0]}}],
+            "scene": 0,
+            "nodes": [{{"mesh": 0}}],
+            "meshes": [{{"primitives": [
+                {{"attributes": {{"POSITION": 0}}, "indices": 1, "material": 0}},
+                {{"attributes": {{"POSITION": 0}}, "indices": 1, "material": 1}}
+            ]}}],
+            "materials": [
+                {{"normalTexture": {{"index": 0, "scale": 2.0}}, "occlusionTexture": {{"index": 0, "strength": 0.5}}}},
+                {{"pbrMetallicRoughness": {{"baseColorFactor": [1.0, 1.0, 1.0, 1.0]}}}}
+            ],
+            "textures": [{{"source": 0}}],
+            "images": [{{"bufferView": 2, "mimeType": "image/png"}}],
+            "buffers": [{{"byteLength": {}}}],
+            "bufferViews": [
+                {{"buffer": 0, "byteOffset": 0, "byteLength": 36, "target": 34962}},
+                {{"buffer": 0, "byteOffset": 36, "byteLength": 12, "target": 34963}},
+                {{"buffer": 0, "byteOffset": 48, "byteLength": {}}}
+            ],
+            "accessors": [
+                {{"bufferView": 0, "componentType": 5126, "count": 3, "type": "VEC3", "max": [1,1,0], "min": [0,0,0]}},
+                {{"bufferView": 1, "componentType": 5125, "count": 3, "type": "SCALAR"}}
+            ]
+        }}"#,
+            bin.len(),
+            png.len()
+        );
+        let path = glb_bin(json, bin);
+        let mesh = load_gltf(&path).expect("glb with maps parses");
+        std::fs::remove_file(&path).ok();
+        let texture = mesh.texture.as_ref().expect("the file carries an image");
+        assert_eq!(texture.maps.len(), 1);
+        // The mapped primitive first, the bare one second.
+        assert_eq!(texture.normal_slot[0..3], [0, 0, 0]);
+        assert_eq!(texture.normal_scale[0..3], [2.0; 3]);
+        assert_eq!(texture.ao_slot[0..3], [0, 0, 0]);
+        assert_eq!(texture.ao_strength[0..3], [0.5; 3]);
+        assert_eq!(
+            texture.normal_slot[3..6],
+            [NO_TEXTURE; 3],
+            "the unmapped material carries the no-texture marker"
+        );
+        assert_eq!(texture.ao_slot[3..6], [NO_TEXTURE; 3]);
+    }
+
+    /// `KHR_texture_transform` folds the base-colour texture's affine map —
+    /// scale, then the counter-clockwise rotation, then the offset — into
+    /// the per-vertex uv at load, so both renderers sample the atlas region
+    /// the material points at.
+    #[test]
+    fn a_texture_transform_reaches_the_vertex_uvs() {
+        // A 2×2 opaque PNG rides the binary chunk so the document declares
+        // an image and the slot table attaches.
+        let png = {
+            let mut img = image::RgbaImage::new(2, 2);
+            for p in img.pixels_mut() {
+                *p = image::Rgba([128, 128, 255, 255]);
+            }
+            let mut bytes = std::io::Cursor::new(Vec::new());
+            image::DynamicImage::ImageRgba8(img)
+                .write_to(&mut bytes, image::ImageFormat::Png)
+                .unwrap();
+            bytes.into_inner()
+        };
+        let bin = {
+            let mut v = Vec::new();
+            for &[x, y, z] in &[[0f32, 0., 0.], [1., 0., 0.], [0., 1., 0.]] {
+                v.extend_from_slice(&x.to_le_bytes());
+                v.extend_from_slice(&y.to_le_bytes());
+                v.extend_from_slice(&z.to_le_bytes());
+            }
+            for idx in [0u32, 1, 2] {
+                v.extend_from_slice(&idx.to_le_bytes());
+            }
+            v.extend_from_slice(&png);
+            // The uv set the transform runs on: three vec2s behind the image.
+            for uv in &[[0.0f32, 0.0], [0.5, 0.0], [0.0, 0.5]] {
+                v.extend_from_slice(&uv[0].to_le_bytes());
+                v.extend_from_slice(&uv[1].to_le_bytes());
+            }
+            v
+        };
+        let json = format!(
+            r#"{{
+            "asset": {{"version": "2.0"}},
+            "extensionsUsed": ["KHR_texture_transform"],
+            "scenes": [{{"nodes": [0]}}],
+            "scene": 0,
+            "nodes": [{{"mesh": 0}}],
+            "meshes": [{{"primitives": [
+                {{"attributes": {{"POSITION": 0, "TEXCOORD_0": 2}}, "indices": 1, "material": 0}}
+            ]}}],
+            "materials": [{{
+                "pbrMetallicRoughness": {{"baseColorTexture": {{"index": 0, "extensions": {{
+                    "KHR_texture_transform": {{"offset": [0.25, 0.0], "scale": [2.0, 2.0]}}
+                }}}}}}
+            }}],
+            "textures": [{{"source": 0}}],
+            "images": [{{"bufferView": 2, "mimeType": "image/png"}}],
+            "buffers": [{{"byteLength": {}}}],
+            "bufferViews": [
+                {{"buffer": 0, "byteOffset": 0, "byteLength": 36, "target": 34962}},
+                {{"buffer": 0, "byteOffset": 36, "byteLength": 12, "target": 34963}},
+                {{"buffer": 0, "byteOffset": 48, "byteLength": {}}},
+                {{"buffer": 0, "byteOffset": {}, "byteLength": 24, "target": 34962}}
+            ],
+            "accessors": [
+                {{"bufferView": 0, "componentType": 5126, "count": 3, "type": "VEC3", "max": [1,1,0], "min": [0,0,0]}},
+                {{"bufferView": 1, "componentType": 5125, "count": 3, "type": "SCALAR"}},
+                {{"bufferView": 3, "componentType": 5126, "count": 3, "type": "VEC2", "max": [0.5,0.5], "min": [0,0]}}
+            ]
+        }}"#,
+            bin.len(),
+            png.len(),
+            48 + png.len()
+        );
+        let path = glb_bin(json, bin);
+        let mesh = load_gltf(&path).expect("glb with a transformed texture parses");
+        std::fs::remove_file(&path).ok();
+        let texture = mesh.texture.as_ref().expect("the file carries an image");
+        // scale 2, then offset 0.25: uv (0.5, 0) lands at (1.25, 0), and the
+        // untouched (0, 0) takes only the offset.
+        assert_eq!(texture.uv[0], [0.25, 0.0]);
+        assert_eq!(texture.uv[1], [1.25, 0.0]);
+    }
+
     /// A primitive with neither `COLOR_0` nor a non-default base colour
     /// factor has no material to preview, so the mesh keeps the flat default
     /// it always had.
@@ -677,6 +1035,90 @@ mod tests {
         std::fs::remove_file(&path).ok();
         assert!(!mesh.has_vertex_colors());
         assert!(mesh.colors.is_empty());
+    }
+
+    /// The material's alpha test and its emissive strength reach the
+    /// per-vertex slot table: a masked material carries its cutoff (and the
+    /// base-colour factor's alpha), an opaque one carries the negative
+    /// "never discard" marker, and `KHR_materials_emissive_strength`
+    /// multiplies the factor at load — the two numbers the renderers clip
+    /// and light by.
+    #[test]
+    fn a_materials_alpha_and_emissive_strength_reach_the_slot_table() {
+        // A 2×2 opaque PNG rides the binary chunk beside the triangles, so
+        // the document declares an image and the slot table attaches.
+        let png = {
+            let mut img = image::RgbaImage::new(2, 2);
+            for p in img.pixels_mut() {
+                *p = image::Rgba([128, 128, 255, 255]);
+            }
+            let mut bytes = std::io::Cursor::new(Vec::new());
+            image::DynamicImage::ImageRgba8(img)
+                .write_to(&mut bytes, image::ImageFormat::Png)
+                .unwrap();
+            bytes.into_inner()
+        };
+        let bin = {
+            let mut v = Vec::new();
+            for &[x, y, z] in &[[0f32, 0., 0.], [1., 0., 0.], [0., 1., 0.]] {
+                v.extend_from_slice(&x.to_le_bytes());
+                v.extend_from_slice(&y.to_le_bytes());
+                v.extend_from_slice(&z.to_le_bytes());
+            }
+            for idx in [0u32, 1, 2] {
+                v.extend_from_slice(&idx.to_le_bytes());
+            }
+            v.extend_from_slice(&png);
+            v
+        };
+        let json = format!(
+            r#"{{
+            "asset": {{"version": "2.0"}},
+            "scenes": [{{"nodes": [0]}}],
+            "scene": 0,
+            "nodes": [{{"mesh": 0}}],
+            "meshes": [{{"primitives": [
+                {{"attributes": {{"POSITION": 0}}, "indices": 1, "material": 0}},
+                {{"attributes": {{"POSITION": 0}}, "indices": 1, "material": 1}}
+            ]}}],
+            "materials": [
+                {{
+                    "pbrMetallicRoughness": {{"baseColorTexture": {{"index": 0}}, "baseColorFactor": [1.0, 0.5, 0.0, 0.8]}},
+                    "alphaMode": "MASK",
+                    "alphaCutoff": 0.25,
+                    "emissiveFactor": [0.5, 0.5, 0.5],
+                    "extensions": {{"KHR_materials_emissive_strength": {{"emissiveStrength": 3.0}}}}
+                }},
+                {{}}
+            ],
+            "textures": [{{"source": 0}}],
+            "images": [{{"bufferView": 2, "mimeType": "image/png"}}],
+            "buffers": [{{"byteLength": {}}}],
+            "bufferViews": [
+                {{"buffer": 0, "byteOffset": 0, "byteLength": 36, "target": 34962}},
+                {{"buffer": 0, "byteOffset": 36, "byteLength": 12, "target": 34963}},
+                {{"buffer": 0, "byteOffset": 48, "byteLength": {}}}
+            ],
+            "accessors": [
+                {{"bufferView": 0, "componentType": 5126, "count": 3, "type": "VEC3", "max": [1,1,0], "min": [0,0,0]}},
+                {{"bufferView": 1, "componentType": 5125, "count": 3, "type": "SCALAR"}}
+            ]
+        }}"#,
+            bin.len(),
+            png.len()
+        );
+        let path = glb_bin(json, bin);
+        let mesh = load_gltf(&path).expect("glb with masked material parses");
+        std::fs::remove_file(&path).ok();
+        let texture = mesh.texture.as_ref().expect("the file carries an image");
+        // The masked primitive first: its cutoff and alpha factor, and the
+        // emissive factor times the extension's strength.
+        assert_eq!(texture.alpha_cutoff[0..3], [0.25; 3]);
+        assert_eq!(texture.alpha_factor[0..3], [0.8; 3]);
+        assert_eq!(texture.emissive_factor[0..3], [[1.5; 3]; 3]);
+        // The bare material second: opaque, so nothing is ever discarded.
+        assert_eq!(texture.alpha_cutoff[3..6], [-1.0; 3]);
+        assert_eq!(texture.alpha_factor[3..6], [1.0; 3]);
     }
 
     /// A node's placement is its own transform on top of every ancestor's.

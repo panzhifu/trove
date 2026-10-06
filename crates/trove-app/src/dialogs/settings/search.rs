@@ -32,6 +32,10 @@ fn save_search(
         cx.notify();
     });
     cx.refresh_windows();
+    // A tier save can be the moment the semantic leg turned on, which makes
+    // it the moment the local engine becomes worth having on the device;
+    // the gate inside skips every other shape of configuration.
+    crate::library::jobs::warm_local_embedder_app(cx);
 }
 
 /// The three search legs and their toggles.

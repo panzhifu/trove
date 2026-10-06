@@ -215,7 +215,9 @@ pub use self::{
         AnalysisTarget, cancel_analysis_app, pause_task_app, resume_task_app, retry_task_app,
         start_analysis_app, start_analysis_undo_app, test_analysis_endpoint_app,
     },
-    embed_model::{delete_embed_model_id_app, start_embed_model_download_app},
+    embed_model::{
+        delete_embed_model_id_app, start_embed_model_download_app, warm_local_embedder_app,
+    },
     embedding::{
         cancel_embedding_backfill_app, delete_embeddings_app, start_embedding_backfill_app,
         test_embedding_endpoint_app,

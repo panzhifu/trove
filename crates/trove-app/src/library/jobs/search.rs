@@ -42,6 +42,12 @@ pub fn request_query_embedding_app(controller: &Entity<LibraryController>, cx: &
         return;
     };
     let model = endpoint.model_id();
+    // The marker rides on this counter: increment at spawn, settle exactly
+    // once in the completion handler below.
+    controller.update(cx, |ctl, cx| {
+        ctl.refinements_in_flight += 1;
+        cx.notify();
+    });
     let controller = controller.clone();
 
     cx.spawn(async move |cx| {
@@ -51,6 +57,11 @@ pub fn request_query_embedding_app(controller: &Entity<LibraryController>, cx: &
             .spawn(async move {
                 // The provider is built here, on the worker: a local
                 // embedder loads its weights, which is seconds of work.
+                // `warm_local_embedder_app` usually got here first (startup,
+                // a tier toggle, a finished download), so this is a cache
+                // hit in microseconds; when it did not — the model was
+                // picked or landed after the app came up — this pays the
+                // load once and the cache carries it for the session.
                 let provider = trove_core::ai::embedding_provider(&endpoint)
                     .map_err(|error| error.to_string())?;
                 let space = provider.asset_space();
@@ -61,15 +72,19 @@ pub fn request_query_embedding_app(controller: &Entity<LibraryController>, cx: &
                 Ok((vector, space))
             })
             .await;
-        let (vector, space) = match result {
-            Ok((vector, space)) if !vector.is_empty() => (vector, space),
-            Ok(_) => return,
-            Err(error) => {
-                tracing::warn!(%error, "query embedding failed; searching with text only");
-                return;
-            }
-        };
         controller.update(cx, |ctl, cx| {
+            // The request has left the pipeline whatever it answered, so the
+            // marker tracks it down even on the paths below that change
+            // nothing else.
+            ctl.refinement_settled(cx);
+            let (vector, space) = match result {
+                Ok((vector, space)) if !vector.is_empty() => (vector, space),
+                Ok(_) => return,
+                Err(error) => {
+                    tracing::warn!(%error, "query embedding failed; searching with text only");
+                    return;
+                }
+            };
             if ctl.search_text.trim() != text {
                 return; // the user moved on while the request was in flight
             }
@@ -132,6 +147,12 @@ pub fn request_ai_plan_app(controller: &Entity<LibraryController>, cx: &mut App)
             return;
         }
     };
+    // Same marker contract as the embedding job: one increment at spawn,
+    // one settle in the completion handler.
+    controller.update(cx, |ctl, cx| {
+        ctl.refinements_in_flight += 1;
+        cx.notify();
+    });
     let controller = controller.clone();
 
     cx.spawn(async move |cx| {
@@ -144,14 +165,15 @@ pub fn request_ai_plan_app(controller: &Entity<LibraryController>, cx: &mut App)
                     .map_err(|error| error.to_string())
             })
             .await;
-        let plan = match result {
-            Ok(plan) => plan,
-            Err(error) => {
-                tracing::warn!(%error, "AI search plan failed; searching with the raw term");
-                return;
-            }
-        };
         controller.update(cx, |ctl, cx| {
+            ctl.refinement_settled(cx);
+            let plan = match result {
+                Ok(plan) => plan,
+                Err(error) => {
+                    tracing::warn!(%error, "AI search plan failed; searching with the raw term");
+                    return;
+                }
+            };
             if ctl.search_text.trim() != text {
                 return; // the user moved on while the request was in flight
             }
