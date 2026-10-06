@@ -175,7 +175,13 @@ pub fn load_obj_at(path: &Path, text: &str) -> Result<Mesh, String> {
                 .or_insert_with(|| {
                     split_positions.push(positions[position as usize]);
                     split_normals.push(normals[normal as usize]);
-                    split_colors.push(color);
+                    // Only a file that named a material carries colours — the
+                    // same rule the flat path above keeps. Filling white here
+                    // for a bare OBJ put every normal-bearing model on the
+                    // coloured pipeline and painted it the wrong default.
+                    if colored {
+                        split_colors.push(color);
+                    }
                     (split_positions.len() - 1) as u32
                 });
         }
@@ -485,5 +491,25 @@ f 1 2 3
 
         let bare = load_obj("v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n").expect("bare parses");
         assert!(!bare.has_vertex_colors());
+    }
+
+    /// A bare OBJ that *does* carry normals stays uncoloured too. The normals
+    /// path used to fill a white colour for every vertex regardless of whether
+    /// the file named a material — the flat path guarded, this one did not —
+    /// which put every normal-bearing untextured model on the coloured
+    /// pipeline and painted it white instead of the default material.
+    #[test]
+    fn a_normal_bearing_bare_obj_stays_uncoloured() {
+        let mesh = load_obj(
+            "vn 0 0 1\n\
+             v 0 0 0\nv 1 0 0\nv 0 1 0\n\
+             f 1//1 2//1 3//1\n",
+        )
+        .expect("triangle parses");
+        assert!(mesh.has_vertex_normals(), "the normal comes through");
+        assert!(
+            !mesh.has_vertex_colors(),
+            "a file with no material must not bring a white colour array"
+        );
     }
 }

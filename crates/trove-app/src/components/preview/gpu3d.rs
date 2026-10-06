@@ -1419,20 +1419,15 @@ impl GpuRenderer {
     /// and what it was expected to cost.
     ///
     /// The three layouts have to be counted as [`render3d::vertex_data`]
-    /// and [`render3d::point_data`] actually build them. A flat-shaded mesh
-    /// is expanded per face, so its vertex buffer is `triangles × 3` —
-    /// counting the source vertices instead under-reports a soup with more
-    /// triangles than vertices by a factor of three or more.
+    /// and [`render3d::point_data`] actually build them. A triangle mesh is
+    /// always indexed now — one vertex per position plus three `u32` indices
+    /// per triangle — whether or not it carries normals, so the geometry is
+    /// counted as vertices, never as corners.
     pub fn estimate_gpu_bytes(mesh: &Mesh) -> usize {
         if mesh.is_point_cloud() {
             return mesh.vertex_count() * render3d::PointData::STRIDE as usize;
         }
-        if mesh.has_vertex_normals() {
-            mesh.vertex_count() * render3d::VertexData::STRIDE as usize
-                + mesh.triangle_count() * 3 * 4
-        } else {
-            mesh.triangle_count() * 3 * render3d::VertexData::STRIDE as usize
-        }
+        mesh.vertex_count() * render3d::VertexData::STRIDE as usize + mesh.triangle_count() * 3 * 4
     }
 
     /// [`GpuRenderer::upload`] with the driver's own out-of-memory answer
@@ -1443,9 +1438,13 @@ impl GpuRenderer {
     /// driver's worker thread — which is the whole process going down, not the
     /// viewport falling back. The scope captures it so the caller can drop to
     /// the CPU rasteriser with a nameable reason.
-    pub async fn upload_checked(&self, mesh: &Mesh) -> Result<GpuMesh, GpuUnavailable> {
+    pub async fn upload_checked(
+        &self,
+        mesh: &Mesh,
+        winding: Winding,
+    ) -> Result<GpuMesh, GpuUnavailable> {
         let scope = self.device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
-        let uploaded = self.upload(mesh);
+        let uploaded = self.upload(mesh, winding);
         match scope.pop().await {
             Some(error) => Err(GpuUnavailable::OutOfMemory(error.to_string())),
             None => Ok(uploaded),
@@ -1455,7 +1454,11 @@ impl GpuRenderer {
     /// Move a mesh or cloud into GPU buffers, choosing indexed (smooth),
     /// expanded (flat) or instanced-point geometry exactly as the CPU path
     /// does.
-    pub fn upload(&self, mesh: &Mesh) -> GpuMesh {
+    ///
+    /// `winding` is passed in rather than recomputed: the parse already
+    /// established it for the viewport's own facts, and the check is an
+    /// O(triangles) edge scan.
+    pub fn upload(&self, mesh: &Mesh, winding: Winding) -> GpuMesh {
         if mesh.is_point_cloud() {
             let data = render3d::point_data(mesh);
             let points = self.device.create_buffer(&wgpu::BufferDescriptor {
@@ -1485,7 +1488,6 @@ impl GpuRenderer {
         // Which way the surface faces decides whether its back faces can be
         // culled. An inside-out file is re-wound on the way into the buffer,
         // so one culled pipeline serves any closed mesh.
-        let winding = mesh.winding();
         let flip_winding = winding == Winding::ClosedInward;
         let mut data = render3d::vertex_data_with(mesh, flip_winding);
         // Cut a large mesh into cullable clusters. The triangles are reordered
@@ -1601,8 +1603,15 @@ impl GpuRenderer {
                 let chains =
                     std::iter::once(mip_chain(&vec![255u8; (dim * dim * 4) as usize], dim)).chain(
                         t.maps.iter().map(|map| {
-                            let base = resize_rgba(&map.rgba, map.width, map.height, dim, dim);
-                            mip_chain(&base, dim)
+                            // A map already at the array's edge is filtered as
+                            // it stands: `resize_rgba` would only copy it byte
+                            // for byte.
+                            if map.width == dim && map.height == dim {
+                                mip_chain(&map.rgba, dim)
+                            } else {
+                                let base = resize_rgba(&map.rgba, map.width, map.height, dim, dim);
+                                mip_chain(&base, dim)
+                            }
                         }),
                     );
                 for (layer, chain) in chains.enumerate() {
@@ -1999,9 +2008,9 @@ mod tests {
             trove_core::media::formats::load_obj(obj).expect("mesh parses")
         };
         let flat = {
-            // Two triangles over four vertices: the expanded buffer is six
-            // corners, so counting source vertices under-reports it by half —
-            // the direction of the error that let oversized meshes through.
+            // Two triangles over four vertices, carrying no normals: the
+            // buffer stays indexed, so the count follows the vertices and the
+            // three indices per triangle.
             let obj = "v 0 0 0\nv 1 0 0\nv 1 1 0\nv 0 1 0\nf 1 2 3\nf 1 3 4\n";
             trove_core::media::formats::load_obj(obj).expect("mesh parses")
         };
@@ -2222,7 +2231,7 @@ mod tests {
             positions.push([r * cos, y, r * sin]);
         }
         let mesh = Mesh::from_parts(positions, Vec::new(), Vec::new(), Vec::new()).expect("cloud");
-        let uploaded = renderer.upload(&mesh);
+        let uploaded = renderer.upload(&mesh, mesh.winding());
         let framing = render3d::Camera::default().framing(mesh.bounds, 1.0);
         let size = (160, 120);
 
@@ -2307,7 +2316,7 @@ mod tests {
             mesh.winding(),
             mesh.colors.len()
         );
-        let uploaded = renderer.upload(&mesh);
+        let uploaded = renderer.upload(&mesh, mesh.winding());
         eprintln!(
             "gpu mesh: meshlets={} colors={} cull={}",
             uploaded.meshlets.len(),
@@ -2434,7 +2443,7 @@ mod tests {
         };
         let mesh = grid_mesh(256); // 131 072 triangles
         assert!(mesh.triangle_count() >= meshlet::MIN_MESHLET_TRIANGLES);
-        let uploaded = renderer.upload(&mesh);
+        let uploaded = renderer.upload(&mesh, mesh.winding());
         assert!(
             uploaded.meshlets.len() > 1,
             "a large mesh has to be partitioned"
@@ -2509,7 +2518,7 @@ mod tests {
         let frame = |classes: [u8; 2]| {
             let mesh = cloud(classes);
             let bounds = mesh.bounds;
-            let uploaded = renderer.upload(&mesh);
+            let uploaded = renderer.upload(&mesh, mesh.winding());
             renderer
                 .render(
                     &uploaded,
@@ -2579,21 +2588,24 @@ mod tests {
         .expect("triangle builds");
         mesh.texture = Some(Box::new(trove_core::media::formats::types::TextureData {
             uv: vec![[0.25, 0.25]; 3],
-            slot: vec![0; 3],
-            // The remaining layers point at the white stand-in; the alpha
-            // test is off (negative cutoff) and the PBR factors are the
-            // spec defaults the white layer's samples leave standing.
-            mr_slot: vec![trove_core::media::formats::types::NO_TEXTURE; 3],
-            factors: vec![[0.0, 1.0]; 3],
-            normal_slot: vec![trove_core::media::formats::types::NO_TEXTURE; 3],
-            normal_scale: vec![1.0; 3],
-            ao_slot: vec![trove_core::media::formats::types::NO_TEXTURE; 3],
-            ao_strength: vec![1.0; 3],
-            emissive_slot: vec![trove_core::media::formats::types::NO_TEXTURE; 3],
-            emissive_factor: vec![[0.0; 3]; 3],
-            alpha_cutoff: vec![-1.0; 3],
-            alpha_factor: vec![1.0; 3],
-            double_sided: vec![false; 3],
+            material: vec![0; 3],
+            materials: vec![trove_core::media::formats::types::MaterialSlot {
+                slot: 0,
+                // The remaining layers point at the white stand-in; the alpha
+                // test is off (negative cutoff) and the PBR factors are the
+                // spec defaults the white layer's samples leave standing.
+                mr_slot: trove_core::media::formats::types::NO_TEXTURE,
+                factors: [0.0, 1.0],
+                normal_slot: trove_core::media::formats::types::NO_TEXTURE,
+                normal_scale: 1.0,
+                ao_slot: trove_core::media::formats::types::NO_TEXTURE,
+                ao_strength: 1.0,
+                emissive_slot: trove_core::media::formats::types::NO_TEXTURE,
+                emissive_factor: [0.0; 3],
+                alpha_cutoff: -1.0,
+                alpha_factor: 1.0,
+                double_sided: false,
+            }],
             // One odd-sized red map: dim 3, chain [3, 1].
             maps: vec![trove_core::media::formats::types::TextureMap {
                 rgba: {
@@ -2608,7 +2620,7 @@ mod tests {
                 height: 3,
             }],
         }));
-        let uploaded = renderer.upload(&mesh);
+        let uploaded = renderer.upload(&mesh, mesh.winding());
         let frame = renderer
             .render(
                 &uploaded,
@@ -2641,7 +2653,7 @@ mod tests {
             return;
         };
         let mesh = occluder_over_ground();
-        let uploaded = renderer.upload(&mesh);
+        let uploaded = renderer.upload(&mesh, mesh.winding());
         let framing = render3d::Camera::default().framing(mesh.bounds, 1.0);
         let frame = |shadows: bool| {
             renderer
@@ -2785,7 +2797,7 @@ mod tests {
              f 1//1 2//1 3//1\nf 1//1 3//1 4//1\n",
         )
         .expect("the plane parses");
-        let uploaded = renderer.upload(&mesh);
+        let uploaded = renderer.upload(&mesh, mesh.winding());
         let camera = render3d::Camera {
             yaw: 0.0,
             pitch: 0.0,
@@ -2819,6 +2831,75 @@ mod tests {
         );
     }
 
+    /// A mesh with no normals renders like its twin that spells the face
+    /// normals out: the fragment stage derives the geometric normal from the
+    /// surface, so the indexed, unexpanded buffer shades the way the old
+    /// per-face expansion did. Skipped where there is no adapter.
+    #[test]
+    fn a_flat_mesh_shades_like_its_normals_twin() {
+        let Ok(renderer) = GpuRenderer::new() else {
+            eprintln!("no graphics device: skipping the flat-mesh shading test");
+            return;
+        };
+        // The same quad built both ways, so the only difference is the normal
+        // attribute: an OBJ would not do, because the loader gives a file with
+        // normal references its own colour buffer and the two would land on
+        // different pipelines for reasons that have nothing to do with the
+        // normal.
+        let positions = vec![[-1.0, -1.0, 0.0], [1.0, -1.0, 0.0], [1.0, 1.0, 0.0], [-1.0, 1.0, 0.0]];
+        let triangles = vec![[0, 1, 2], [0, 2, 3]];
+        let with_normals = Mesh::from_parts(
+            positions.clone(),
+            vec![[0.0, 0.0, 1.0]; 4],
+            Vec::new(),
+            triangles.clone(),
+        )
+        .expect("the plane builds");
+        let without_normals = Mesh::from_parts(positions, Vec::new(), Vec::new(), triangles)
+            .expect("the plane builds");
+        let camera = render3d::Camera {
+            yaw: 0.0,
+            pitch: 0.0,
+            ..render3d::Camera::default()
+        };
+        let render = |mesh: &Mesh| {
+            let uploaded = renderer.upload(mesh, mesh.winding());
+            renderer
+                .render(
+                    &uploaded,
+                    &camera.framing(mesh.bounds, 1.0),
+                    (320, 240),
+                    false,
+                    &render3d::RenderOptions::default(),
+                    HeightUniforms::default(),
+                )
+                .expect("a frame comes back")
+        };
+        let baked = render(&with_normals);
+        let derived = render(&without_normals);
+        // The derived normal is the baked one, so the two frames match to
+        // within a rounding step per channel. The frame's border is skipped:
+        // a silhouette fragment sits in a partial derivative quad, where
+        // `dpdx`/`dpdy` are undefined, and antialiasing weights its coverage
+        // differently between the two draws.
+        let (width, height) = (320usize, 240usize);
+        let a = baked.as_chunks::<4>().0;
+        let b = derived.as_chunks::<4>().0;
+        let mut worst = 0i32;
+        for y in height / 4..height * 3 / 4 {
+            for x in width / 4..width * 3 / 4 {
+                let (pa, pb) = (&a[y * width + x], &b[y * width + x]);
+                for channel in 0..3 {
+                    worst = worst.max((pa[channel] as i32 - pb[channel] as i32).abs());
+                }
+            }
+        }
+        assert!(
+            worst <= 4,
+            "the derived normal shades differently (max channel delta {worst})"
+        );
+    }
+
     /// Where a model open spends its time: device bring-up, the upload, the
     /// first GPU frame, and the CPU first frame it would have drawn instead.
     /// Prints rather than asserts — the numbers are the point. Runs when
@@ -2843,18 +2924,21 @@ mod tests {
             let count = mesh.positions.len();
             mesh.texture = Some(Box::new(trove_core::media::formats::types::TextureData {
                 uv: vec![[0.5, 0.5]; count],
-                slot: vec![0; count],
-                mr_slot: vec![trove_core::media::formats::types::NO_TEXTURE; count],
-                factors: vec![[0.0, 1.0]; count],
-                normal_slot: vec![trove_core::media::formats::types::NO_TEXTURE; count],
-                normal_scale: vec![1.0; count],
-                ao_slot: vec![trove_core::media::formats::types::NO_TEXTURE; count],
-                ao_strength: vec![1.0; count],
-                emissive_slot: vec![trove_core::media::formats::types::NO_TEXTURE; count],
-                emissive_factor: vec![[0.0; 3]; count],
-                alpha_cutoff: vec![-1.0; count],
-                alpha_factor: vec![1.0; count],
-                double_sided: vec![false; count],
+                material: vec![0; count],
+                materials: vec![trove_core::media::formats::types::MaterialSlot {
+                    slot: 0,
+                    mr_slot: trove_core::media::formats::types::NO_TEXTURE,
+                    factors: [0.0, 1.0],
+                    normal_slot: trove_core::media::formats::types::NO_TEXTURE,
+                    normal_scale: 1.0,
+                    ao_slot: trove_core::media::formats::types::NO_TEXTURE,
+                    ao_strength: 1.0,
+                    emissive_slot: trove_core::media::formats::types::NO_TEXTURE,
+                    emissive_factor: [0.0; 3],
+                    alpha_cutoff: -1.0,
+                    alpha_factor: 1.0,
+                    double_sided: false,
+                }],
                 maps: vec![trove_core::media::formats::types::TextureMap {
                     rgba,
                     width: side as u32,
@@ -2886,7 +2970,7 @@ mod tests {
         mark("one 1024² map: resize + mip chain", started);
 
         let started = std::time::Instant::now();
-        let uploaded = renderer.upload(&mesh);
+        let uploaded = renderer.upload(&mesh, mesh.winding());
         mark("gpu upload (meshlets + atlas + mip chain)", started);
 
         let started = std::time::Instant::now();

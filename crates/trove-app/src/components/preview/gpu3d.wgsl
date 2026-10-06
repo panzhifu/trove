@@ -229,9 +229,10 @@ struct ModelOut {
     // are defined, without transforming them per vertex.
     @location(0) model_pos: vec3<f32>,
     @location(1) normal: vec3<f32>,
-    // Base colour: the material, or what the height look asks for. Resolved
-    // here, from the model-space position, so toggling the look costs a uniform
-    // write rather than a vertex-buffer re-upload.
+    // The vertex's own base colour — the material, or a vertex colour — left
+    // un-resolved. The fragment stage folds the height look into it, from the
+    // normal it resolves there, so a mesh whose normal only exists in the
+    // fragment stage (one the vertex stage left zero) is looked up correctly.
     @location(2) tint: vec3<f32>,
     // u, v, the base-colour layer and the metallic-roughness layer the
     // vertex samples; layers 0 is the white stand-in.
@@ -261,9 +262,10 @@ fn vs_model(
     out.clip = u.view_proj * vec4<f32>(position, 1.0);
     out.model_pos = position;
     out.normal = normal;
-    // A triangle has no scalar channels to read: the attributes stop at the
-    // normal, and the two the point path carries are zero here by construction.
-    out.tint = surface_color(position, normal, 0.0, 0.0, u.material.rgb);
+    // The vertex's own base colour, un-resolved: the height look needs the
+    // surface normal, which a mesh without one only has in the fragment stage,
+    // so `fs_model` computes the tint from the normal it resolves there.
+    out.tint = u.material.rgb;
     out.mat_meta = vec4<f32>(0.0);
     out.mat_scalars = vec2<f32>(0.0);
     out.emissive_meta = vec4<f32>(0.0);
@@ -294,7 +296,8 @@ fn vs_model_colored(
     out.clip = u.view_proj * vec4<f32>(position, 1.0);
     out.model_pos = position;
     out.normal = normal;
-    out.tint = surface_color(position, normal, 0.0, 0.0, color);
+    // The vertex's own base colour, un-resolved — see `vs_model`.
+    out.tint = color;
     out.tex_meta = tex_meta;
     out.mat_meta = mat_meta;
     out.mat_scalars = mat_scalars;
@@ -527,12 +530,29 @@ fn display(color: vec3<f32>) -> vec3<f32> {
     return encode(clamp(rec2020_to_srgb * c, vec3<f32>(0.0), vec3<f32>(1.0)));
 }
 
+// The normal a triangle's fragment shades with: the interpolated vertex
+// normal, or — for a mesh that carries none, where the vertex stage wrote a
+// zero — the geometric normal of the triangle, from the screen-space
+// derivatives of the model position. The two-sided `select` the callers apply
+// orients it toward the eye either way.
+fn surface_normal(model_pos: vec3<f32>, normal: vec3<f32>) -> vec3<f32> {
+    if dot(normal, normal) > 1e-12 {
+        return normalize(normal);
+    }
+    return normalize(cross(dpdx(model_pos), dpdy(model_pos)));
+}
+
 @fragment
 fn fs_model(in: ModelOut) -> @location(0) vec4<f32> {
-    let geometric = normalize(in.normal);
+    let geometric = surface_normal(in.model_pos, in.normal);
     let to_eye = normalize(u.eye.xyz - in.model_pos);
     // Two-sided, so an open shell never shows black back faces.
     let n = select(-geometric, geometric, dot(geometric, to_eye) >= 0.0);
+    // The base colour: the material, or the height look resolved against the
+    // surface normal — here, not in the vertex stage, so a mesh that carries
+    // no normal of its own is looked up against the geometric normal rather
+    // than the zero the vertex stage had.
+    let tint = surface_color(in.model_pos, geometric, 0.0, 0.0, in.tint);
 
     // The key light's test runs before the light sums that read it: how much
     // of the light this pixel can see decides both its diffuse and its
@@ -544,11 +564,11 @@ fn fs_model(in: ModelOut) -> @location(0) vec4<f32> {
     );
 
     let diffuse = studio_diffuse(n, shadow);
-    let spec = studio_specular(n, to_eye, u.params.x, shadow, 0.0, in.tint);
+    let spec = studio_specular(n, to_eye, u.params.x, shadow, 0.0, tint);
     let specular = spec.xyz;
     let energy = spec.w;
 
-    return vec4<f32>(display(in.tint * diffuse * (1.0 - energy) + specular), 1.0);
+    return vec4<f32>(display(tint * diffuse * (1.0 - energy) + specular), 1.0);
 }
 
 // The normal map's rotation applied in the tangent frame the screen-space
@@ -596,9 +616,11 @@ fn perturb_normal(
 // aliasing costs nothing next to a cutout's.
 @fragment
 fn fs_model_textured(in: ModelOut) -> @location(0) vec4<f32> {
-    let geometric = normalize(in.normal);
+    let geometric = surface_normal(in.model_pos, in.normal);
     let to_eye = normalize(u.eye.xyz - in.model_pos);
     let n = select(-geometric, geometric, dot(geometric, to_eye) >= 0.0);
+    // The base colour, height look resolved here — see `fs_model`.
+    let tint = surface_color(in.model_pos, geometric, 0.0, 0.0, in.tint);
 
     // Round, never truncate: the perspective interpolation of an exact 1.0
     // can land at 0.9999, and a truncation would fall to the white layer.
@@ -685,7 +707,7 @@ fn fs_model_textured(in: ModelOut) -> @location(0) vec4<f32> {
     // The metallic mix reads the MATERIAL's colour, not the texel: the
     // texture varies per pixel, and Blender's mix uses the base colour the
     // material declares.
-    let spec = studio_specular(shaded, to_eye, roughness, shadow, metallic, in.tint);
+    let spec = studio_specular(shaded, to_eye, roughness, shadow, metallic, tint);
     let specular = spec.xyz;
     let energy = spec.w;
 
@@ -713,7 +735,7 @@ fn fs_model_textured(in: ModelOut) -> @location(0) vec4<f32> {
     // display transform lands on the whole pixel, as Blender's does.
     return vec4<f32>(
         display(
-            in.tint * base_texel.rgb * (1.0 - metallic) * occlusion * diffuse * (1.0 - energy)
+            tint * base_texel.rgb * (1.0 - metallic) * occlusion * diffuse * (1.0 - energy)
                 + specular
                 + lit,
         ),

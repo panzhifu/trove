@@ -18,7 +18,14 @@ use std::path::Path;
 
 use image::GenericImageView as _;
 
-use super::types::{Mesh, NO_TEXTURE, TextureData, TextureMap, resize_rgba};
+use super::types::{MaterialSlot, Mesh, NO_TEXTURE, TextureData, TextureMap, resize_rgba};
+
+/// File size above which a glTF/GLB parse maps the file instead of reading it.
+///
+/// Below this a plain read is cheaper than a mapping's syscall and page
+/// faults; above it, mapping avoids a full second copy of the file beside the
+/// `gltf` crate's own copy of the binary chunk.
+const GLTF_MMAP_THRESHOLD: u64 = 8 << 20;
 
 /// Load a glTF or GLB file. Buffers are resolved relative to the file.
 ///
@@ -29,7 +36,31 @@ use super::types::{Mesh, NO_TEXTURE, TextureData, TextureMap, resize_rgba};
 /// in the file, and a Sketchfab model's webp textures would fail the whole
 /// import and leave the model flat.
 pub fn load_gltf(path: &Path) -> Result<Mesh, String> {
-    let bytes = std::fs::read(path).map_err(|e| format!("failed to load glTF: {e}"))?;
+    // A GLB carries its binary chunk inline, and the `gltf` crate copies that
+    // chunk into an owned buffer itself — so reading the whole file into a
+    // `Vec` here would put a second full copy of it in memory at peak. Above
+    // the threshold the file is mapped and the parser borrows it; below it a
+    // plain read is cheaper than the mapping. The map is read-only and lives
+    // only until the parse returns.
+    let file = std::fs::File::open(path).map_err(|e| format!("failed to load glTF: {e}"))?;
+    let len = file
+        .metadata()
+        .map_err(|e| format!("failed to load glTF: {e}"))?
+        .len();
+    let mapped;
+    let read;
+    let bytes: &[u8] = if len >= GLTF_MMAP_THRESHOLD {
+        // SAFETY: a read-only mapping of a file this process just opened. The
+        // parser borrows it for the length of the call and copies anything it
+        // keeps; a file truncated underneath is a read the parser reports as
+        // an error, the same contract `chunked.rs` takes for its maps.
+        mapped = unsafe { memmap2::MmapOptions::new().map(&file) }
+            .map_err(|e| format!("failed to load glTF: {e}"))?;
+        &mapped[..]
+    } else {
+        read = std::fs::read(path).map_err(|e| format!("failed to load glTF: {e}"))?;
+        &read[..]
+    };
     // The document is validated when it can be. A file whose
     // `extensionsRequired` names an extension this build of the crate was not
     // compiled with is refused on sight — the refusal covers the whole file,
@@ -39,10 +70,10 @@ pub fn load_gltf(path: &Path) -> Result<Mesh, String> {
     // ignored where it does not. A file that fails this way too was never
     // going to open, and the validation error — which names the extension —
     // is the more useful one to report.
-    let parsed = match gltf::Gltf::from_slice(&bytes) {
+    let parsed = match gltf::Gltf::from_slice(bytes) {
         Ok(gltf) => gltf,
         Err(original) => {
-            let gltf = gltf::Gltf::from_slice_without_validation(&bytes)
+            let gltf = gltf::Gltf::from_slice_without_validation(bytes)
                 .map_err(|_| format!("failed to load glTF: {original}"))?;
             tracing::info!(
                 path = %path.display(),
@@ -55,21 +86,17 @@ pub fn load_gltf(path: &Path) -> Result<Mesh, String> {
     let gltf::Gltf { document, blob } = parsed;
     let buffers = gltf::import_buffers(&document, Some(path), blob)
         .map_err(|e| format!("failed to load glTF: {e}"))?;
-    // Every image the document's textures reference becomes one texture slot,
-    // decoded once and shared (two materials on one image share the slot).
-    // The per-texture slot table comes out alongside: a texture whose source
-    // points past the image table — possible on the validation-free fallback
-    // path — maps to no slot rather than stopping the parse.
-    // Slots are the document image order — `decode_images` walks exactly
-    // that — so a texture names its image index, capped at the table.
-    let maps = decode_images(&document, &buffers, path);
+    // Only the images a texture names are decoded, and each success gets a
+    // slot. The document image index → slot map comes back alongside, so a
+    // texture resolves to its own image rather than to a positional guess:
+    // a compacted table indexed by the raw image index would mis-assign every
+    // texture after the first decode failure.
+    let (maps, slot_of_image) = decode_images(&document, &buffers, path);
     let slot_of_texture: Vec<u16> = document
         .textures()
         .map(|texture| {
             texture_source_index(&texture)
-                .and_then(|index| {
-                    (index < maps.len()).then(|| index.min(NO_TEXTURE as usize - 1) as u16)
-                })
+                .and_then(|index| slot_of_image.get(index).copied())
                 .unwrap_or(NO_TEXTURE)
         })
         .collect();
@@ -84,37 +111,147 @@ pub fn load_gltf(path: &Path) -> Result<Mesh, String> {
     builder.finish()
 }
 
-/// Decode every image the document declares into a texture slot, in document
-/// order. A decode failure costs that image its slot, never the model. The
-/// decodes run across the rayon pool: a file of 4K PNGs spends most of its
-/// parse inside the decoders, and they are embarrassingly parallel.
+/// Decode the images the document's textures reference into texture slots,
+/// and return them with a map from document image index to slot.
+///
+/// An image no texture points at is never decoded. A decode failure costs that
+/// image its slot, never the model — and, because the slot table is keyed by
+/// image index rather than by position in the result, never the slot of any
+/// other image. The decodes run across the rayon pool: a file of 4K PNGs
+/// spends most of its parse inside the decoders, and they are embarrassingly
+/// parallel.
 fn decode_images(
     document: &gltf::Document,
     buffers: &[gltf::buffer::Data],
     path: &Path,
-) -> Vec<TextureMap> {
+) -> (Vec<TextureMap>, Vec<u16>) {
     use rayon::prelude::*;
 
     let images: Vec<gltf::Image<'_>> = document.images().collect();
-    images
+    // The distinct image indices any texture names, first reference first.
+    let mut referenced: Vec<usize> = Vec::new();
+    let mut seen = vec![false; images.len()];
+    for index in document
+        .textures()
+        .filter_map(|texture| texture_source_index(&texture))
+    {
+        if let Some(seen) = seen.get_mut(index)
+            && !*seen
+        {
+            *seen = true;
+            referenced.push(index);
+        }
+    }
+    // Decode them, keeping each image index so a slot is only assigned to the
+    // ones that actually decoded.
+    let decoded: Vec<(usize, Option<TextureMap>)> = referenced
         .par_iter()
-        .filter_map(|image| {
-            let bytes = match image.source() {
-                gltf::image::Source::View { view, .. } => {
-                    let buffer = buffers.get(view.buffer().index())?;
-                    let start = view.offset();
-                    Some(buffer[start..start + view.length()].to_vec())
-                }
-                gltf::image::Source::Uri { uri, .. } => {
-                    std::fs::read(path.parent()?.join(uri)).ok()
-                }
-            }?;
-            let decoded = image::load_from_memory(&bytes).ok()?;
-            let (width, height) = decoded.dimensions();
-            let rgba = decoded.to_rgba8().into_raw();
-            Some(finish_texture(rgba, width, height))
-        })
-        .collect()
+        .map(|&index| (index, decode_image(&images[index], buffers, path)))
+        .collect();
+    let mut maps = Vec::with_capacity(decoded.len());
+    let mut slot_of_image = vec![NO_TEXTURE; images.len()];
+    for (index, map) in decoded {
+        let Some(map) = map else { continue };
+        if maps.len() >= NO_TEXTURE as usize {
+            break; // more images than a `u16` slot can name
+        }
+        slot_of_image[index] = maps.len() as u16;
+        maps.push(map);
+    }
+    (maps, slot_of_image)
+}
+
+/// Decode one image, borrowing an embedded image straight out of its buffer
+/// rather than copying it first — the decoder needs the bytes only for the
+/// length of the call, and a GLB's images are the bulk of what it carries.
+/// A `uri` is resolved (an inlined `data:` URI, or a file beside the model)
+/// into an owned buffer.
+fn decode_image(
+    image: &gltf::Image<'_>,
+    buffers: &[gltf::buffer::Data],
+    path: &Path,
+) -> Option<TextureMap> {
+    let bytes: std::borrow::Cow<'_, [u8]> = match image.source() {
+        gltf::image::Source::View { view, .. } => {
+            let buffer = buffers.get(view.buffer().index())?;
+            let start = view.offset();
+            std::borrow::Cow::Borrowed(&buffer[start..start + view.length()])
+        }
+        gltf::image::Source::Uri { uri, .. } => std::borrow::Cow::Owned(uri_bytes(uri, path)?),
+    };
+    let decoded = image::load_from_memory(&bytes).ok()?;
+    let (width, height) = decoded.dimensions();
+    let rgba = decoded.to_rgba8().into_raw();
+    Some(finish_texture(rgba, width, height))
+}
+
+/// The bytes an image `uri` names: an inlined `data:` URI decoded, or a file
+/// read from beside the model.
+///
+/// glTF spells URIs the URI way, and the spec calls a `data:` URI out
+/// explicitly — which Sketchfab-style `.gltf` exports lean on for their
+/// textures. Read as a file path, a `data:` URI is just a name no directory
+/// has, and the image vanishes. A relative path, conversely, is
+/// percent-decoded first: a file named `my texture.png` arrives as
+/// `my%20texture.png`, and reading it literally finds nothing.
+fn uri_bytes(uri: &str, path: &Path) -> Option<Vec<u8>> {
+    if let Some(data) = uri.strip_prefix("data:") {
+        return data_uri_bytes(data);
+    }
+    std::fs::read(path.parent()?.join(percent_decode(uri))).ok()
+}
+
+/// The payload of a `data:` URI — everything past the leading `data:`:
+/// `<mediatype>[;base64],<data>`. The image decoders sniff the format from the
+/// bytes, so the media type is dropped and only the base64 flag matters.
+fn data_uri_bytes(data: &str) -> Option<Vec<u8>> {
+    let (meta, payload) = data.split_once(',')?;
+    if meta.rsplit(';').next() == Some("base64") {
+        use base64::Engine as _;
+        base64::engine::general_purpose::STANDARD
+            .decode(payload)
+            .ok()
+    } else {
+        // Not base64: RFC 2397's other form spends percent-escapes on the
+        // bytes. Images are rarely spelled this way, but it costs a branch.
+        Some(percent_decode_bytes(payload))
+    }
+}
+
+/// Decode `%XX` escapes into the bytes they name.
+fn percent_decode_bytes(text: &str) -> Vec<u8> {
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && let (Some(hi), Some(lo)) = (hex_digit(bytes[i + 1]), hex_digit(bytes[i + 2]))
+        {
+            out.push(hi << 4 | lo);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    out
+}
+
+/// [`percent_decode_bytes`] as a string, for a path. A malformed escape — or a
+/// name that was never escaped — passes through as it stands.
+fn percent_decode(text: &str) -> String {
+    String::from_utf8_lossy(&percent_decode_bytes(text)).into_owned()
+}
+
+/// The value of one hex digit, upper or lower case.
+fn hex_digit(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }
 
 /// The nodes the default scene draws — or, for a document that names no
@@ -168,31 +305,12 @@ struct Builder {
     textures: Vec<TextureMap>,
     /// Per-vertex UV, parallel to `positions`.
     uv: Vec<[f32; 2]>,
-    /// Per-vertex texture slot, parallel to `positions`.
-    slots: Vec<u16>,
-    /// Per-vertex metallic-roughness texture slot, parallel to `positions`.
-    mr_slots: Vec<u16>,
-    /// Per-vertex `(metallic factor, roughness factor)`, parallel to
-    /// `positions`.
-    factors: Vec<[f32; 2]>,
-    /// Per-vertex normal-map texture slot, parallel to `positions`.
-    normal_slot: Vec<u16>,
-    /// Per-vertex normal-map strength, parallel to `positions`.
-    normal_scale: Vec<f32>,
-    /// Per-vertex ambient-occlusion texture slot, parallel to `positions`.
-    ao_slot: Vec<u16>,
-    /// Per-vertex occlusion strength, parallel to `positions`.
-    ao_strength: Vec<f32>,
-    /// Per-vertex emissive texture slot, parallel to `positions`.
-    emissive_slot: Vec<u16>,
-    /// Per-vertex emissive factor, parallel to `positions`.
-    emissive_factors: Vec<[f32; 3]>,
-    /// Per-vertex alpha cutoff and base-colour alpha factor, parallel to
-    /// `positions`. Negative cutoff = opaque.
-    alpha_cutoff: Vec<f32>,
-    alpha_factor: Vec<f32>,
-    /// Per-vertex double-sided flag, parallel to `positions`.
-    double_sided: Vec<bool>,
+    /// Per-vertex index into `materials`, parallel to `positions`. Every
+    /// vertex of a primitive names the same material — the primitive's — so
+    /// the material's constants are stored once, not once per vertex.
+    material_of_vertex: Vec<u16>,
+    /// The materials the primitives carry, in first-use order.
+    materials: Vec<MaterialSlot>,
     /// Vertices of `POINTS` primitives. Used only when the document has no
     /// triangles at all: a mesh is either a surface or a cloud.
     points: Vec<[f32; 3]>,
@@ -248,9 +366,14 @@ impl Builder {
 
         let base = self.positions.len() as u32;
         let count = local.len();
+        // The normal transform is constant for the whole primitive, so it is
+        // derived once here rather than inverted again inside the per-vertex
+        // map (which used to compute the same determinant and three cross
+        // products for every normal).
+        let normal_cols = normal_matrix(transform);
         let normals: Option<Vec<[f32; 3]>> = reader.read_normals().map(|normals| {
             normals
-                .map(|normal| transform_normal(transform, normal))
+                .map(|normal| apply_normal(normal_cols, normal))
                 .collect()
         });
         match normals {
@@ -324,94 +447,87 @@ impl Builder {
             }
         }
 
-        // The texture this primitive samples, and the UV it samples with. A
-        // primitive with neither carries the no-texture marker — the arrays
-        // stay parallel to the positions either way.
-        let slot = base_texture
-            .as_ref()
-            .map(|info| {
-                slot_of_texture
-                    .get(info.texture().index())
-                    .copied()
-                    .unwrap_or(NO_TEXTURE)
-            })
-            .unwrap_or(NO_TEXTURE);
-        // The metallic-roughness texture: its G channel carries roughness and
-        // its B channel metallic, both scaled by the material's factors. The
-        // factors default to the spec's (1.0, 1.0) — with the texture present
-        // that is the real data; without one they name a full metal at full
-        // roughness, which is what Blender's importer reads too.
-        let mr_slot = material
-            .pbr_metallic_roughness()
-            .metallic_roughness_texture()
-            .map(|info| {
-                slot_of_texture
-                    .get(info.texture().index())
-                    .copied()
-                    .unwrap_or(NO_TEXTURE)
-            })
-            .unwrap_or(NO_TEXTURE);
-        // A specular-glossiness material has no metallic-roughness block —
-        // the crate hands back the spec defaults for it, full metal at full
-        // roughness — so its own numbers are read instead: glossiness is
-        // roughness inverted, and the specular factor is a dielectric tint
-        // rather than a metal, the way Blender's importer converts it. Read
-        // as the defaults, the GPU preview multiplies the whole diffuse away
-        // and paints the file black.
-        let factors = material
-            .pbr_specular_glossiness()
-            .map(|sg| [0.0, (1.0 - sg.glossiness_factor()).clamp(0.0, 1.0)])
-            .unwrap_or_else(|| {
-                let pbr = material.pbr_metallic_roughness();
-                [pbr.metallic_factor(), pbr.roughness_factor()]
-            });
-        // The normal map relights the surface and the occlusion map darkens
-        // the lighting where the file says it is shadowed; both ride the same
-        // per-vertex slot table as the base colour, with their per-material
-        // strengths alongside.
+        // The material constants — the slots this primitive samples, the
+        // factors, the alpha and two-sidedness — are the same for every vertex
+        // of the primitive, so they are computed once here and stored once;
+        // the vertices below carry only an index into the table.
         let normal_texture = material.normal_texture();
-        let normal_slot = normal_texture
-            .as_ref()
-            .and_then(|info| slot_of_texture.get(info.texture().index()).copied())
-            .unwrap_or(NO_TEXTURE);
-        let normal_scale = normal_texture.map(|info| info.scale()).unwrap_or(1.0);
         let ao_texture = material.occlusion_texture();
-        let ao_slot = ao_texture
-            .as_ref()
-            .and_then(|info| slot_of_texture.get(info.texture().index()).copied())
-            .unwrap_or(NO_TEXTURE);
-        let ao_strength = ao_texture.map(|info| info.strength()).unwrap_or(1.0);
-        // Emissive is the light the surface gives off on its own — the glow
-        // that survives a dark scene. The texture, when there is one,
-        // multiplies the factor.
         let emissive_texture = material.emissive_texture();
-        let emissive_slot = emissive_texture
-            .as_ref()
-            .and_then(|info| slot_of_texture.get(info.texture().index()).copied())
-            .unwrap_or(NO_TEXTURE);
-        // KHR_materials_emissive_strength scales the factor; without the
-        // extension the spec's default multiplier is 1.
+        // KHR_materials_emissive_strength scales the emissive factor; without
+        // the extension the spec's default multiplier is 1.
         let emissive_strength = material.emissive_strength().unwrap_or(1.0);
-        let emissive_factor = material
-            .emissive_factor()
-            .map(|channel| channel * emissive_strength);
-        // The material's alpha, folded to the two numbers the renderers pack
-        // per vertex: the cutoff a texel's alpha is tested against (negative
-        // = never discard) and the base-colour factor's alpha that multiplies
-        // the texel into the value tested. A blended material needs per-pixel
-        // blending in draw order, which an off-screen preview has no sort
-        // for — clipping it at the default cutoff keeps the cutout silhouette
-        // a leaf card is meant to have instead of a sheet of black.
-        let alpha_cutoff = match material.alpha_mode() {
-            gltf::material::AlphaMode::Mask => material.alpha_cutoff().unwrap_or(0.5),
-            gltf::material::AlphaMode::Blend => 0.5,
-            gltf::material::AlphaMode::Opaque => -1.0,
+        let material_slot = MaterialSlot {
+            // The base-colour texture; a primitive with none carries the
+            // no-texture marker.
+            slot: base_texture
+                .as_ref()
+                .map(|info| {
+                    slot_of_texture
+                        .get(info.texture().index())
+                        .copied()
+                        .unwrap_or(NO_TEXTURE)
+                })
+                .unwrap_or(NO_TEXTURE),
+            // The metallic-roughness texture: its G channel carries roughness
+            // and its B channel metallic, both scaled by the factors.
+            mr_slot: material
+                .pbr_metallic_roughness()
+                .metallic_roughness_texture()
+                .map(|info| {
+                    slot_of_texture
+                        .get(info.texture().index())
+                        .copied()
+                        .unwrap_or(NO_TEXTURE)
+                })
+                .unwrap_or(NO_TEXTURE),
+            // A specular-glossiness material has no metallic-roughness block —
+            // the crate hands back the spec defaults for it, full metal at
+            // full roughness — so its own numbers are read instead: glossiness
+            // is roughness inverted, and the specular factor is a dielectric
+            // tint rather than a metal, the way Blender's importer converts
+            // it. Read as the defaults, the GPU preview multiplies the whole
+            // diffuse away and paints the file black.
+            factors: material
+                .pbr_specular_glossiness()
+                .map(|sg| [0.0, (1.0 - sg.glossiness_factor()).clamp(0.0, 1.0)])
+                .unwrap_or_else(|| {
+                    let pbr = material.pbr_metallic_roughness();
+                    [pbr.metallic_factor(), pbr.roughness_factor()]
+                }),
+            // The normal map relights the surface and the occlusion map
+            // darkens the lighting where the file says it is shadowed; both
+            // carry their per-material strengths.
+            normal_slot: normal_texture
+                .as_ref()
+                .and_then(|info| slot_of_texture.get(info.texture().index()).copied())
+                .unwrap_or(NO_TEXTURE),
+            normal_scale: normal_texture.map(|info| info.scale()).unwrap_or(1.0),
+            ao_slot: ao_texture
+                .as_ref()
+                .and_then(|info| slot_of_texture.get(info.texture().index()).copied())
+                .unwrap_or(NO_TEXTURE),
+            ao_strength: ao_texture.map(|info| info.strength()).unwrap_or(1.0),
+            // Emissive is the light the surface gives off on its own; the
+            // texture, when there is one, multiplies the factor.
+            emissive_slot: emissive_texture
+                .as_ref()
+                .and_then(|info| slot_of_texture.get(info.texture().index()).copied())
+                .unwrap_or(NO_TEXTURE),
+            emissive_factor: material
+                .emissive_factor()
+                .map(|channel| channel * emissive_strength),
+            // The alpha, folded to two numbers: the cutoff a texel's alpha is
+            // tested against (negative = never discard) and the base-colour
+            // factor's alpha that multiplies the texel into the value tested.
+            alpha_cutoff: match material.alpha_mode() {
+                gltf::material::AlphaMode::Mask => material.alpha_cutoff().unwrap_or(0.5),
+                gltf::material::AlphaMode::Blend => 0.5,
+                gltf::material::AlphaMode::Opaque => -1.0,
+            },
+            alpha_factor: factor[3],
+            double_sided: material.double_sided(),
         };
-        let alpha_factor = factor[3];
-        // The material's doubleSided: its back faces are the surface seen
-        // from behind, and no renderer may cull them — the flag rides the
-        // per-vertex table so the decision lands on the face that owns it.
-        let double_sided = material.double_sided();
         // KHR_texture_transform: the affine map one texture's uv go through
         // (scale, then a counter-clockwise rotation, then the offset). The
         // preview carries ONE uv per vertex, shared by every map the
@@ -430,46 +546,29 @@ impl Builder {
                     .as_ref()
                     .and_then(|info| info.texture_transform())
             });
-        match reader.read_tex_coords(0) {
-            Some(uv) => {
-                for uv in uv.into_f32() {
-                    self.uv.push(transform_uv(uv, &uv_transform));
-                    self.slots.push(slot);
-                    self.mr_slots.push(mr_slot);
-                    self.factors.push(factors);
-                    self.normal_slot.push(normal_slot);
-                    self.normal_scale.push(normal_scale);
-                    self.ao_slot.push(ao_slot);
-                    self.ao_strength.push(ao_strength);
-                    self.emissive_slot.push(emissive_slot);
-                    self.emissive_factors.push(emissive_factor);
-                    self.alpha_cutoff.push(alpha_cutoff);
-                    self.alpha_factor.push(alpha_factor);
-                    self.double_sided.push(double_sided);
+        // The UV is per vertex; the material is per primitive, stored once and
+        // named by every vertex of the primitive. Only built when the document
+        // carries images — `finish` attaches them to the mesh exactly then —
+        // so a model with no textures, which is most of them, builds neither.
+        if !self.textures.is_empty() {
+            let material_index = if self.materials.len() >= NO_TEXTURE as usize {
+                NO_TEXTURE // more materials than a slot index can name
+            } else {
+                self.materials.push(material_slot);
+                (self.materials.len() - 1) as u16
+            };
+            match reader.read_tex_coords(0) {
+                Some(uv) => {
+                    for uv in uv.into_f32() {
+                        self.uv.push(transform_uv(uv, &uv_transform));
+                        self.material_of_vertex.push(material_index);
+                    }
                 }
-            }
-            None => {
-                self.uv.extend(std::iter::repeat_n([0.0, 0.0], count));
-                self.slots.extend(std::iter::repeat_n(slot, count));
-                self.mr_slots.extend(std::iter::repeat_n(mr_slot, count));
-                self.factors.extend(std::iter::repeat_n(factors, count));
-                self.normal_slot
-                    .extend(std::iter::repeat_n(normal_slot, count));
-                self.normal_scale
-                    .extend(std::iter::repeat_n(normal_scale, count));
-                self.ao_slot.extend(std::iter::repeat_n(ao_slot, count));
-                self.ao_strength
-                    .extend(std::iter::repeat_n(ao_strength, count));
-                self.emissive_slot
-                    .extend(std::iter::repeat_n(emissive_slot, count));
-                self.emissive_factors
-                    .extend(std::iter::repeat_n(emissive_factor, count));
-                self.alpha_cutoff
-                    .extend(std::iter::repeat_n(alpha_cutoff, count));
-                self.alpha_factor
-                    .extend(std::iter::repeat_n(alpha_factor, count));
-                self.double_sided
-                    .extend(std::iter::repeat_n(double_sided, count));
+                None => {
+                    self.uv.extend(std::iter::repeat_n([0.0, 0.0], count));
+                    self.material_of_vertex
+                        .extend(std::iter::repeat_n(material_index, count));
+                }
             }
         }
 
@@ -477,10 +576,7 @@ impl Builder {
             Some(indices) => indices.into_u32().collect(),
             None => (0..(self.positions.len() - base as usize) as u32).collect(),
         };
-        for triangle in triangles_of(primitive.mode(), &indices) {
-            self.triangles
-                .push([base + triangle[0], base + triangle[1], base + triangle[2]]);
-        }
+        triangles_of(primitive.mode(), &indices, base, &mut self.triangles);
     }
 
     fn finish(self) -> Result<Mesh, String> {
@@ -501,18 +597,8 @@ impl Builder {
             if !self.textures.is_empty() && self.uv.len() == mesh.positions.len() {
                 mesh.texture = Some(Box::new(TextureData {
                     uv: self.uv,
-                    slot: self.slots,
-                    mr_slot: self.mr_slots,
-                    factors: self.factors,
-                    normal_slot: self.normal_slot,
-                    normal_scale: self.normal_scale,
-                    ao_slot: self.ao_slot,
-                    ao_strength: self.ao_strength,
-                    emissive_slot: self.emissive_slot,
-                    emissive_factor: self.emissive_factors,
-                    alpha_cutoff: self.alpha_cutoff,
-                    alpha_factor: self.alpha_factor,
-                    double_sided: self.double_sided,
+                    material: self.material_of_vertex,
+                    materials: self.materials,
                     maps: self.textures,
                 }));
             }
@@ -525,25 +611,27 @@ impl Builder {
     }
 }
 
-/// The triangles a primitive's index list describes, under its draw mode.
+/// Append the triangles a primitive's index list describes, under its draw
+/// mode, offset by `base` — the primitive's first vertex in the flattened
+/// mesh. Writing into the caller's list directly saves the intermediate `Vec`
+/// each primitive used to build and then copy.
 ///
-/// A mode that is not a triangle kind — lines, or points — contributes none.
-fn triangles_of(mode: gltf::mesh::Mode, indices: &[u32]) -> Vec<[u32; 3]> {
-    let mut triangles = Vec::new();
+/// A mode that is not a triangle kind — lines, or points — appends none.
+fn triangles_of(mode: gltf::mesh::Mode, indices: &[u32], base: u32, out: &mut Vec<[u32; 3]>) {
     match mode {
         gltf::mesh::Mode::Triangles => {
             for triangle in indices.as_chunks::<3>().0 {
-                triangles.push(*triangle);
+                out.push([base + triangle[0], base + triangle[1], base + triangle[2]]);
             }
         }
         gltf::mesh::Mode::TriangleStrip => {
             // Every window of three, with the winding alternated so the
             // strip's back faces do not flip on every other triangle.
             for (i, window) in indices.windows(3).enumerate() {
-                triangles.push(if i % 2 == 0 {
-                    [window[0], window[1], window[2]]
+                out.push(if i % 2 == 0 {
+                    [base + window[0], base + window[1], base + window[2]]
                 } else {
-                    [window[1], window[0], window[2]]
+                    [base + window[1], base + window[0], base + window[2]]
                 });
             }
         }
@@ -551,7 +639,7 @@ fn triangles_of(mode: gltf::mesh::Mode, indices: &[u32]) -> Vec<[u32; 3]> {
             // Every triangle shares the fan's first vertex; a sliding window
             // would produce a strip instead, with the wrong triangles.
             for i in 1..indices.len().saturating_sub(1) {
-                triangles.push([indices[0], indices[i], indices[i + 1]]);
+                out.push([base + indices[0], base + indices[i], base + indices[i + 1]]);
             }
         }
         gltf::mesh::Mode::Points
@@ -559,7 +647,6 @@ fn triangles_of(mode: gltf::mesh::Mode, indices: &[u32]) -> Vec<[u32; 3]> {
         | gltf::mesh::Mode::LineLoop
         | gltf::mesh::Mode::LineStrip => {}
     }
-    triangles
 }
 
 /// The longest edge a decoded texture may keep: a preview does not need the
@@ -625,35 +712,40 @@ fn transform_point(m: [[f32; 4]; 4], point: [f32; 3]) -> [f32; 3] {
     ]
 }
 
-/// Apply a composed node transform to a normal: the inverse transpose of the
-/// rotation-and-scale part, which is what keeps a normal perpendicular under a
-/// non-uniform scale. The length is not restored here: both renderers
-/// normalise. A degenerate scale has no inverse — the raw matrix is applied
-/// instead, and the normalised result is whatever it comes out as.
-fn transform_normal(m: [[f32; 4]; 4], normal: [f32; 3]) -> [f32; 3] {
+/// The 3×3 matrix a primitive's normals go through: the inverse transpose of
+/// the rotation-and-scale part, which is what keeps a normal perpendicular
+/// under a non-uniform scale. Derived once per primitive by the caller — it is
+/// constant for every vertex — and applied by [`apply_normal`].
+///
+/// A degenerate scale has no inverse: the raw rotation-and-scale block stands
+/// in, and the normalised result is whatever it comes out as.
+fn normal_matrix(m: [[f32; 4]; 4]) -> [[f32; 3]; 3] {
     // The three columns of the rotation-and-scale block.
     let c0 = [m[0][0], m[0][1], m[0][2]];
     let c1 = [m[1][0], m[1][1], m[1][2]];
     let c2 = [m[2][0], m[2][1], m[2][2]];
     let det = dot(c0, cross(c1, c2));
     if det.abs() < 1e-12 {
-        return [
-            m[0][0] * normal[0] + m[1][0] * normal[1] + m[2][0] * normal[2],
-            m[0][1] * normal[0] + m[1][1] * normal[1] + m[2][1] * normal[2],
-            m[0][2] * normal[0] + m[1][2] * normal[1] + m[2][2] * normal[2],
-        ];
+        return [c0, c1, c2];
     }
     // The inverse's columns are the cross products of the other two, scaled
     // by one determinant; the transpose then mixes equal components across
     // them.
     let one = 1.0 / det;
-    let i0 = scale3(cross(c1, c2), one);
-    let i1 = scale3(cross(c2, c0), one);
-    let i2 = scale3(cross(c0, c1), one);
     [
-        i0[0] * normal[0] + i1[0] * normal[1] + i2[0] * normal[2],
-        i0[1] * normal[0] + i1[1] * normal[1] + i2[1] * normal[2],
-        i0[2] * normal[0] + i1[2] * normal[1] + i2[2] * normal[2],
+        scale3(cross(c1, c2), one),
+        scale3(cross(c2, c0), one),
+        scale3(cross(c0, c1), one),
+    ]
+}
+
+/// Apply [`normal_matrix`]'s columns to one normal. The length is not
+/// restored: both renderers normalise.
+fn apply_normal(cols: [[f32; 3]; 3], normal: [f32; 3]) -> [f32; 3] {
+    [
+        cols[0][0] * normal[0] + cols[1][0] * normal[1] + cols[2][0] * normal[2],
+        cols[0][1] * normal[0] + cols[1][1] * normal[1] + cols[2][1] * normal[2],
+        cols[0][2] * normal[0] + cols[1][2] * normal[1] + cols[2][2] * normal[2],
     ]
 }
 
@@ -931,17 +1023,19 @@ mod tests {
         std::fs::remove_file(&path).ok();
         let texture = mesh.texture.as_ref().expect("the file carries an image");
         assert_eq!(texture.maps.len(), 1);
-        // The mapped primitive first, the bare one second.
-        assert_eq!(texture.normal_slot[0..3], [0, 0, 0]);
-        assert_eq!(texture.normal_scale[0..3], [2.0; 3]);
-        assert_eq!(texture.ao_slot[0..3], [0, 0, 0]);
-        assert_eq!(texture.ao_strength[0..3], [0.5; 3]);
+        // The mapped primitive first, the bare one second. A primitive's
+        // vertices share one material, so a vertex names it and reads it back.
+        let mapped = texture.material_of(0);
+        assert_eq!(mapped.normal_slot, 0);
+        assert_eq!(mapped.normal_scale, 2.0);
+        assert_eq!(mapped.ao_slot, 0);
+        assert_eq!(mapped.ao_strength, 0.5);
+        let bare = texture.material_of(3);
         assert_eq!(
-            texture.normal_slot[3..6],
-            [NO_TEXTURE; 3],
+            bare.normal_slot, NO_TEXTURE,
             "the unmapped material carries the no-texture marker"
         );
-        assert_eq!(texture.ao_slot[3..6], [NO_TEXTURE; 3]);
+        assert_eq!(bare.ao_slot, NO_TEXTURE);
     }
 
     /// `KHR_texture_transform` folds the base-colour texture's affine map —
@@ -1113,12 +1207,14 @@ mod tests {
         let texture = mesh.texture.as_ref().expect("the file carries an image");
         // The masked primitive first: its cutoff and alpha factor, and the
         // emissive factor times the extension's strength.
-        assert_eq!(texture.alpha_cutoff[0..3], [0.25; 3]);
-        assert_eq!(texture.alpha_factor[0..3], [0.8; 3]);
-        assert_eq!(texture.emissive_factor[0..3], [[1.5; 3]; 3]);
+        let masked = texture.material_of(0);
+        assert_eq!(masked.alpha_cutoff, 0.25);
+        assert_eq!(masked.alpha_factor, 0.8);
+        assert_eq!(masked.emissive_factor, [1.5; 3]);
         // The bare material second: opaque, so nothing is ever discarded.
-        assert_eq!(texture.alpha_cutoff[3..6], [-1.0; 3]);
-        assert_eq!(texture.alpha_factor[3..6], [1.0; 3]);
+        let bare = texture.material_of(3);
+        assert_eq!(bare.alpha_cutoff, -1.0);
+        assert_eq!(bare.alpha_factor, 1.0);
     }
 
     /// A node's placement is its own transform on top of every ancestor's.
@@ -1196,22 +1292,160 @@ mod tests {
         }
     }
 
+    /// A normal goes through the inverse transpose of the rotation-and-scale
+    /// block, derived once per primitive. This pins the values that
+    /// per-primitive helper must produce.
+    #[test]
+    fn a_normal_is_transformed_by_the_inverse_transpose() {
+        // Identity leaves a normal alone.
+        let id = normal_matrix(IDENTITY);
+        assert_eq!(apply_normal(id, [0.0, 1.0, 0.0]), [0.0, 1.0, 0.0]);
+
+        // Scale x by two: the normal's x component halves, so it stays
+        // perpendicular to a surface stretched along x.
+        let mut scaled = IDENTITY;
+        scaled[0][0] = 2.0;
+        let cols = normal_matrix(scaled);
+        assert_eq!(apply_normal(cols, [1.0, 0.0, 0.0]), [0.5, 0.0, 0.0]);
+        assert_eq!(apply_normal(cols, [0.0, 1.0, 0.0]), [0.0, 1.0, 0.0]);
+
+        // A degenerate scale has no inverse: the raw block stands in, so a
+        // zero scale flattens the normal rather than dividing by zero.
+        let mut zero = IDENTITY;
+        zero[0][0] = 0.0;
+        let cols = normal_matrix(zero);
+        assert_eq!(apply_normal(cols, [1.0, 1.0, 1.0]), [0.0, 1.0, 1.0]);
+    }
+
     /// A strip alternates winding; reading it as a triangle list instead
     /// yields half the triangles and the wrong ones.
     #[test]
     fn triangle_strips_and_fans_are_converted() {
-        let strip = triangles_of(gltf::mesh::Mode::TriangleStrip, &[0, 1, 2, 3]);
+        let mut strip = Vec::new();
+        triangles_of(gltf::mesh::Mode::TriangleStrip, &[0, 1, 2, 3], 0, &mut strip);
         assert_eq!(strip, vec![[0, 1, 2], [2, 1, 3]]);
-        let fan = triangles_of(gltf::mesh::Mode::TriangleFan, &[0, 1, 2, 3]);
+
+        // The primitive's `base` offsets every index, so a later primitive's
+        // triangles point at its own vertices in the flattened mesh.
+        let mut offset = Vec::new();
+        triangles_of(
+            gltf::mesh::Mode::TriangleStrip,
+            &[0, 1, 2, 3],
+            10,
+            &mut offset,
+        );
+        assert_eq!(offset, vec![[10, 11, 12], [12, 11, 13]]);
+
+        let mut fan = Vec::new();
+        triangles_of(gltf::mesh::Mode::TriangleFan, &[0, 1, 2, 3], 0, &mut fan);
         assert_eq!(fan, vec![[0, 1, 2], [0, 2, 3]]);
         // A list is taken three at a time, and a run that does not divide by
         // three is not a triangle.
-        assert_eq!(
-            triangles_of(gltf::mesh::Mode::Triangles, &[0, 1, 2, 3, 4, 5, 6]),
-            vec![[0, 1, 2], [3, 4, 5]]
+        let mut list = Vec::new();
+        triangles_of(
+            gltf::mesh::Mode::Triangles,
+            &[0, 1, 2, 3, 4, 5, 6],
+            0,
+            &mut list,
         );
-        // Lines and points are not surfaces.
-        assert!(triangles_of(gltf::mesh::Mode::Points, &[0, 1, 2]).is_empty());
-        assert!(triangles_of(gltf::mesh::Mode::LineStrip, &[0, 1, 2]).is_empty());
+        assert_eq!(list, vec![[0, 1, 2], [3, 4, 5]]);
+        // Lines and points are not surfaces: neither appends anything.
+        let mut none = Vec::new();
+        triangles_of(gltf::mesh::Mode::Points, &[0, 1, 2], 0, &mut none);
+        triangles_of(gltf::mesh::Mode::LineStrip, &[0, 1, 2], 0, &mut none);
+        assert!(none.is_empty());
+    }
+
+    /// A `data:` URI yields its payload: base64 as the spec writes it, or the
+    /// percent-escaped bytes RFC 2397 also allows.
+    #[test]
+    fn a_data_uri_yields_its_payload() {
+        // "PNG" base64-encodes to "UE5H".
+        assert_eq!(data_uri_bytes("image/png;base64,UE5H"), Some(b"PNG".to_vec()));
+        assert_eq!(data_uri_bytes("image/png,%41%42"), Some(b"AB".to_vec()));
+        // A URI with no comma names nothing.
+        assert_eq!(data_uri_bytes("image/png;base64"), None);
+    }
+
+    /// Percent escapes decode; a malformed or truncated one stands as written,
+    /// so a name that was never escaped survives.
+    #[test]
+    fn percent_escapes_decode_and_malformed_ones_stand() {
+        assert_eq!(percent_decode("my%20texture.png"), "my texture.png");
+        assert_eq!(percent_decode("plain.png"), "plain.png");
+        assert_eq!(percent_decode("odd%2"), "odd%2");
+        assert_eq!(percent_decode("bad%zz"), "bad%zz");
+    }
+
+    /// Write a self-contained `.gltf` (buffers and images inlined as `data:`
+    /// URIs) so a test needs no companion files.
+    fn gltf_file(json: &str) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "trove-gltf-test-{}.gltf",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::write(&path, json).unwrap();
+        path
+    }
+
+    /// An image carried inline as a `data:` URI becomes a texture slot like
+    /// any other. Sketchfab-style `.gltf` exports write their textures this
+    /// way, and reading the URI as a file path silently dropped every one.
+    #[test]
+    fn an_image_in_a_data_uri_becomes_a_slot() {
+        let png = {
+            let mut img = image::RgbaImage::new(2, 2);
+            for p in img.pixels_mut() {
+                *p = image::Rgba([128, 128, 255, 255]);
+            }
+            let mut bytes = std::io::Cursor::new(Vec::new());
+            image::DynamicImage::ImageRgba8(img)
+                .write_to(&mut bytes, image::ImageFormat::Png)
+                .unwrap();
+            bytes.into_inner()
+        };
+        let bin = {
+            let mut v = Vec::new();
+            for &[x, y, z] in &[[0f32, 0., 0.], [1., 0., 0.], [0., 1., 0.]] {
+                v.extend_from_slice(&x.to_le_bytes());
+                v.extend_from_slice(&y.to_le_bytes());
+                v.extend_from_slice(&z.to_le_bytes());
+            }
+            for idx in [0u32, 1, 2] {
+                v.extend_from_slice(&idx.to_le_bytes());
+            }
+            v
+        };
+        use base64::Engine as _;
+        let encode = |bytes: &[u8]| base64::engine::general_purpose::STANDARD.encode(bytes);
+        let json = format!(
+            r#"{{
+            "asset": {{"version": "2.0"}},
+            "scenes": [{{"nodes": [0]}}],
+            "scene": 0,
+            "nodes": [{{"mesh": 0}}],
+            "meshes": [{{"primitives": [{{"attributes": {{"POSITION": 0}}, "indices": 1, "material": 0}}]}}],
+            "materials": [{{"pbrMetallicRoughness": {{"baseColorTexture": {{"index": 0}}}}}}],
+            "textures": [{{"source": 0}}],
+            "images": [{{"uri": "data:image/png;base64,{}"}}],
+            "buffers": [{{"byteLength": 48, "uri": "data:application/octet-stream;base64,{}"}}],
+            "bufferViews": [
+                {{"buffer": 0, "byteOffset": 0, "byteLength": 36, "target": 34962}},
+                {{"buffer": 0, "byteOffset": 36, "byteLength": 12, "target": 34963}}
+            ],
+            "accessors": [
+                {{"bufferView": 0, "componentType": 5126, "count": 3, "type": "VEC3", "max": [1,1,0], "min": [0,0,0]}},
+                {{"bufferView": 1, "componentType": 5125, "count": 3, "type": "SCALAR"}}
+            ]
+        }}"#,
+            encode(&png),
+            encode(&bin)
+        );
+        let path = gltf_file(&json);
+        let mesh = load_gltf(&path).expect("a data-uri gltf parses");
+        std::fs::remove_file(&path).ok();
+        let texture = mesh.texture.as_ref().expect("the inline image becomes a slot");
+        assert_eq!(texture.maps.len(), 1);
+        assert_eq!(texture.material_of(0).slot, 0);
     }
 }

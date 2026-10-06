@@ -147,63 +147,107 @@ pub struct TextureMap {
 }
 
 /// The texture side of a mesh's materials, when the file carries any: the
-/// decoded base-colour textures, the per-vertex UV that reads them, and the
-/// slot each vertex samples. Boxed because a mesh without textures — most
-/// files — should not pay for three empty `Vec`s inside every geometry the
+/// decoded images, the per-vertex UV that reads them, and the material each
+/// primitive's vertices share. Boxed because a mesh without textures — most
+/// files — should not pay for four empty `Vec`s inside every geometry the
 /// renderers hand around.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct TextureData {
     /// Per-vertex UV, parallel to `positions`.
     pub uv: Vec<[f32; 2]>,
-    /// Per-vertex texture slot, parallel to `positions`. [`NO_TEXTURE`]
-    /// marks a vertex whose primitive carries no base-colour texture.
-    pub slot: Vec<u16>,
-    /// Per-vertex metallic-roughness texture slot, parallel to `positions`
-    /// (glTF's G channel is roughness, B is metallic). [`NO_TEXTURE`] when
-    /// the primitive has none and the factors stand alone.
-    pub mr_slot: Vec<u16>,
-    /// Per-vertex `(metallic factor, roughness factor)`, the multipliers the
-    /// glTF spec pairs with the two channels above.
-    pub factors: Vec<[f32; 2]>,
-    /// Per-vertex normal-map texture slot, parallel to `positions`. The map
-    /// is tangent-space, glTF's OpenGL convention, sampled with the same UV
-    /// as the base colour. [`NO_TEXTURE`] when the primitive carries none and
-    /// the geometric normal stands alone.
-    pub normal_slot: Vec<u16>,
-    /// Per-vertex normal-map strength — the material's `normalTexture.scale`,
-    /// applied to the tangent-plane components before the vector normalises.
-    pub normal_scale: Vec<f32>,
-    /// Per-vertex ambient-occlusion texture slot, parallel to `positions`
-    /// (glTF packs occlusion in the R channel). [`NO_TEXTURE`] when the
-    /// primitive carries none.
-    pub ao_slot: Vec<u16>,
-    /// Per-vertex occlusion strength — the material's
-    /// `occlusionTexture.strength`, lerping between unoccluded light and the
-    /// sampled value.
-    pub ao_strength: Vec<f32>,
-    /// Per-vertex emissive texture slot, parallel to `positions`.
-    /// [`NO_TEXTURE`] when the primitive carries none and the factor stands
-    /// alone.
-    pub emissive_slot: Vec<u16>,
-    /// Per-vertex emissive factor — the material's `emissiveFactor`, the
-    /// light the surface gives off before any texture multiplies it.
-    pub emissive_factor: Vec<[f32; 3]>,
-    /// Per-vertex alpha cutoff — the material's `alphaMode` folded into one
-    /// number: negative for `OPAQUE` (no pixel is ever discarded), the
-    /// `alphaCutoff` for `MASK`, and 0.5 for `BLEND`. The preview cannot blend
-    /// a whole mesh in draw order, so a blended material clips like a mask —
-    /// the read every cutout foliage export gets either way.
-    pub alpha_cutoff: Vec<f32>,
-    /// Per-vertex base-colour alpha factor — `baseColorFactor[3]`, the fourth
-    /// multiplier of the texel alpha the cutoff tests against.
-    pub alpha_factor: Vec<f32>,
-    /// Per-vertex double-sided flag — the material's `doubleSided`. A
-    /// double-sided material's back faces are the surface you see from
-    /// behind, so the renderers must not cull them even on a mesh whose
-    /// winding says closed.
-    pub double_sided: Vec<bool>,
+    /// Per-vertex index into `materials`, parallel to `positions`. Every
+    /// vertex of a primitive names the same material — the primitive's — so
+    /// the material data is stored once per primitive rather than once per
+    /// vertex, which for a dense mesh is the difference between a few hundred
+    /// bytes and a few hundred megabytes of the same constants repeated.
+    pub material: Vec<u16>,
+    /// The materials the mesh's primitives carry, in first-use order.
+    pub materials: Vec<MaterialSlot>,
     /// The decoded textures, in slot order.
     pub maps: Vec<TextureMap>,
+}
+
+/// Everything a file states per primitive rather than per vertex: the slots
+/// its maps sample, the factors those maps multiply, and the alpha and
+/// two-sidedness the renderers read. One per primitive, shared by its vertices
+/// through [`TextureData::material`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MaterialSlot {
+    /// The base-colour texture slot. [`NO_TEXTURE`] when the primitive has
+    /// none.
+    pub slot: u16,
+    /// The metallic-roughness texture slot (glTF's G channel is roughness, B
+    /// is metallic). [`NO_TEXTURE`] when the factors stand alone.
+    pub mr_slot: u16,
+    /// `(metallic factor, roughness factor)`, the multipliers the glTF spec
+    /// pairs with the two channels above.
+    pub factors: [f32; 2],
+    /// The normal-map slot; tangent-space, glTF's OpenGL convention, sampled
+    /// with the same UV as the base colour. [`NO_TEXTURE`] when the geometric
+    /// normal stands alone.
+    pub normal_slot: u16,
+    /// The normal map's `scale`, applied to the tangent-plane components
+    /// before the vector normalises.
+    pub normal_scale: f32,
+    /// The ambient-occlusion slot (glTF packs occlusion in the R channel).
+    /// [`NO_TEXTURE`] when the primitive carries none.
+    pub ao_slot: u16,
+    /// The occlusion `strength`, lerping between unoccluded light and the
+    /// sampled value.
+    pub ao_strength: f32,
+    /// The emissive texture slot. [`NO_TEXTURE`] when the factor stands alone.
+    pub emissive_slot: u16,
+    /// The `emissiveFactor` — the light the surface gives off before any
+    /// texture multiplies it.
+    pub emissive_factor: [f32; 3],
+    /// `alphaMode` folded into one number: negative for `OPAQUE` (no pixel is
+    /// ever discarded), the `alphaCutoff` for `MASK`, and 0.5 for `BLEND`. The
+    /// preview cannot blend a whole mesh in draw order, so a blended material
+    /// clips like a mask — the read every cutout foliage export gets either
+    /// way.
+    pub alpha_cutoff: f32,
+    /// `baseColorFactor[3]`, the fourth multiplier of the texel alpha the
+    /// cutoff tests against.
+    pub alpha_factor: f32,
+    /// The material's `doubleSided`. A double-sided material's back faces are
+    /// the surface you see from behind, so the renderers must not cull them
+    /// even on a mesh whose winding says closed.
+    pub double_sided: bool,
+}
+
+/// The material a vertex with no material — or an out-of-range index — reads:
+/// no textures at all, and the spec's defaults for the factors. This is the
+/// same set of values the per-vertex arrays used to carry for a vertex no
+/// primitive painted.
+impl Default for MaterialSlot {
+    fn default() -> Self {
+        Self {
+            slot: NO_TEXTURE,
+            mr_slot: NO_TEXTURE,
+            factors: [0.0, 0.0],
+            normal_slot: NO_TEXTURE,
+            normal_scale: 1.0,
+            ao_slot: NO_TEXTURE,
+            ao_strength: 1.0,
+            emissive_slot: NO_TEXTURE,
+            emissive_factor: [0.0; 3],
+            alpha_cutoff: -1.0,
+            alpha_factor: 1.0,
+            double_sided: false,
+        }
+    }
+}
+
+impl TextureData {
+    /// The material `vertex` samples — the primitive's, shared by every vertex
+    /// of the face — or [`MaterialSlot::default`] when it names none.
+    pub fn material_of(&self, vertex: usize) -> MaterialSlot {
+        self.material
+            .get(vertex)
+            .and_then(|index| self.materials.get(*index as usize))
+            .copied()
+            .unwrap_or_default()
+    }
 }
 
 /// The slot value a vertex with no base-colour texture carries.
@@ -430,7 +474,7 @@ impl Mesh {
     pub fn has_double_sided_material(&self) -> bool {
         self.texture
             .as_ref()
-            .is_some_and(|t| t.double_sided.iter().any(|doubled| *doubled))
+            .is_some_and(|t| t.materials.iter().any(|m| m.double_sided))
     }
 
     /// What the frame-size heuristics count: triangles for a mesh, points for

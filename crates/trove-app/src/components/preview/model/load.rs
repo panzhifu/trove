@@ -537,6 +537,9 @@ impl ModelViewport {
         }
         let mesh = self.mesh.clone();
         let serial = self.mesh_serial;
+        // The parse already established this mesh's winding for the viewport's
+        // own facts, so the upload is handed it rather than recomputing.
+        let winding = self.mesh_winding;
         let existing = self.gpu.clone();
         cx.spawn(async move |weak, cx| {
             let built = cx
@@ -571,7 +574,7 @@ impl ModelViewport {
                             "uploading a large mesh to the GPU"
                         );
                     }
-                    let uploaded = renderer.upload_checked(&mesh).await?;
+                    let uploaded = renderer.upload_checked(&mesh, winding).await?;
                     Ok::<_, GpuUnavailable>((renderer, uploaded))
                 })
                 .await;

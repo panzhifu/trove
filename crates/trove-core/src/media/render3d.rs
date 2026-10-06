@@ -1265,10 +1265,9 @@ pub fn vertex_data(mesh: &Mesh) -> VertexData {
 ///
 /// A closed mesh wound inside-out is easiest to fix here, on the way into the
 /// buffer, rather than by cloning the geometry: reversing the corner order
-/// both points the index list the right way and, on the flat-shaded path,
-/// flips the face normal that is computed from it. That lets the renderer
-/// cull back faces of a correctly wound surface whichever way the file
-/// spelled it.
+/// points the index list the right way, and — for a mesh with normals of its
+/// own — flips those too. That lets the renderer cull back faces of a
+/// correctly wound surface whichever way the file spelled it.
 pub fn vertex_data_with(mesh: &Mesh, flip_winding: bool) -> VertexData {
     let mut vertices = Vec::new();
     // The file's own colours ride along only when it has them: an empty array
@@ -1293,134 +1292,94 @@ pub fn vertex_data_with(mesh: &Mesh, flip_winding: bool) -> VertexData {
     }
     let tex_at = |index: usize| -> [f32; 18] {
         let data = mesh.texture.as_ref().expect("textured");
-        let slot = data.slot.get(index).copied().unwrap_or(NO_TEXTURE);
-        let mr_slot = data.mr_slot.get(index).copied().unwrap_or(NO_TEXTURE);
-        let normal_slot = data.normal_slot.get(index).copied().unwrap_or(NO_TEXTURE);
-        let ao_slot = data.ao_slot.get(index).copied().unwrap_or(NO_TEXTURE);
-        let emissive_slot = data.emissive_slot.get(index).copied().unwrap_or(NO_TEXTURE);
+        let material = data.material_of(index);
         let uv = data.uv.get(index).copied().unwrap_or([0.0, 0.0]);
-        let factors = data.factors.get(index).copied().unwrap_or([0.0, 0.0]);
-        let normal_scale = data.normal_scale.get(index).copied().unwrap_or(1.0);
-        let ao_strength = data.ao_strength.get(index).copied().unwrap_or(1.0);
-        let emissive = data.emissive_factor.get(index).copied().unwrap_or([0.0; 3]);
         [
             uv[0],
             uv[1],
-            if slot == NO_TEXTURE {
+            if material.slot == NO_TEXTURE {
                 0.0
             } else {
-                slot as f32 + 1.0
+                material.slot as f32 + 1.0
             },
-            if mr_slot == NO_TEXTURE {
+            if material.mr_slot == NO_TEXTURE {
                 0.0
             } else {
-                mr_slot as f32 + 1.0
+                material.mr_slot as f32 + 1.0
             },
-            factors[0],
-            factors[1],
-            if normal_slot == NO_TEXTURE {
+            material.factors[0],
+            material.factors[1],
+            if material.normal_slot == NO_TEXTURE {
                 0.0
             } else {
-                normal_slot as f32 + 1.0
+                material.normal_slot as f32 + 1.0
             },
-            if ao_slot == NO_TEXTURE {
+            if material.ao_slot == NO_TEXTURE {
                 0.0
             } else {
-                ao_slot as f32 + 1.0
+                material.ao_slot as f32 + 1.0
             },
-            normal_scale,
-            ao_strength,
-            if emissive_slot == NO_TEXTURE {
+            material.normal_scale,
+            material.ao_strength,
+            if material.emissive_slot == NO_TEXTURE {
                 0.0
             } else {
-                emissive_slot as f32 + 1.0
+                material.emissive_slot as f32 + 1.0
             },
-            emissive[0],
-            emissive[1],
-            emissive[2],
+            material.emissive_factor[0],
+            material.emissive_factor[1],
+            material.emissive_factor[2],
             // Negative cutoff = opaque: the shader tests only when it is set.
-            data.alpha_cutoff.get(index).copied().unwrap_or(-1.0),
-            data.alpha_factor.get(index).copied().unwrap_or(1.0),
+            material.alpha_cutoff,
+            material.alpha_factor,
             // The material's doubleSided, as the flag the shader's fragment
             // test reads; the trailing zero pads the vec4.
-            if data.double_sided.get(index).copied().unwrap_or(false) {
-                1.0
-            } else {
-                0.0
-            },
+            if material.double_sided { 1.0 } else { 0.0 },
             0.0,
         ]
     };
-    if mesh.has_vertex_normals() {
-        vertices.reserve(mesh.positions.len() * 6);
-        for (index, (p, n)) in mesh.positions.iter().zip(mesh.normals.iter()).enumerate() {
+    // One vertex per position, index-listed whether or not the file carries
+    // normals. A mesh without them leaves the normal at zero: the fragment
+    // stage derives the face normal from the surface itself, so the buffer is
+    // never expanded to three vertices per corner — a third of the size, and
+    // still partitionable into cullable clusters.
+    let has_normals = mesh.has_vertex_normals();
+    vertices.reserve(mesh.positions.len() * 6);
+    for (index, p) in mesh.positions.iter().enumerate() {
+        let n = if has_normals {
             // A flipped winding means the file's normals point the other way
             // too, or the shading would disagree with the culling.
-            let n = if flip_winding { neg(*n) } else { *n };
-            let n = normalize(n);
-            vertices.extend_from_slice(&[p[0], p[1], p[2], n[0], n[1], n[2]]);
-            if colored {
-                let c = base_color(mesh, index);
-                colors.extend_from_slice(&[c[0], c[1], c[2]]);
-            }
-            if textured {
-                let t = tex_at(index);
-                tex.extend_from_slice(&t);
-            }
+            let n = mesh.normals[index];
+            let n = if flip_winding { neg(n) } else { n };
+            normalize(n)
+        } else {
+            // The fragment stage supplies the geometric normal.
+            [0.0, 0.0, 0.0]
+        };
+        vertices.extend_from_slice(&[p[0], p[1], p[2], n[0], n[1], n[2]]);
+        if colored {
+            let c = base_color(mesh, index);
+            colors.extend_from_slice(&[c[0], c[1], c[2]]);
         }
-        let mut indices = Vec::with_capacity(mesh.triangles.len() * 3);
-        for triangle in &mesh.triangles {
-            if flip_winding {
-                indices.extend_from_slice(&[triangle[0], triangle[2], triangle[1]]);
-            } else {
-                indices.extend_from_slice(triangle);
-            }
+        if textured {
+            let t = tex_at(index);
+            tex.extend_from_slice(&t);
         }
-        VertexData {
-            vertices,
-            colors,
-            tex,
-            indices: Some(indices),
-            vertex_count: mesh.positions.len() as u32,
+    }
+    let mut indices = Vec::with_capacity(mesh.triangles.len() * 3);
+    for triangle in &mesh.triangles {
+        if flip_winding {
+            indices.extend_from_slice(&[triangle[0], triangle[2], triangle[1]]);
+        } else {
+            indices.extend_from_slice(triangle);
         }
-    } else {
-        vertices.reserve(mesh.triangles.len() * 18);
-        for triangle in &mesh.triangles {
-            // The expanded corners follow the winding, and so do their colours:
-            // the same slot indexes the same vertex of the source triangle.
-            let source = if flip_winding {
-                [triangle[0], triangle[2], triangle[1]]
-            } else {
-                *triangle
-            };
-            let corners = [
-                mesh.positions[source[0] as usize],
-                mesh.positions[source[1] as usize],
-                mesh.positions[source[2] as usize],
-            ];
-            let n = normalize(cross(
-                sub(corners[1], corners[0]),
-                sub(corners[2], corners[0]),
-            ));
-            for (slot, p) in corners.iter().enumerate() {
-                vertices.extend_from_slice(&[p[0], p[1], p[2], n[0], n[1], n[2]]);
-                if colored {
-                    let c = base_color(mesh, source[slot] as usize);
-                    colors.extend_from_slice(&[c[0], c[1], c[2]]);
-                }
-                if textured {
-                    let t = tex_at(source[slot] as usize);
-                    tex.extend_from_slice(&t);
-                }
-            }
-        }
-        VertexData {
-            vertex_count: (mesh.triangles.len() * 3) as u32,
-            vertices,
-            colors,
-            tex,
-            indices: None,
-        }
+    }
+    VertexData {
+        vertices,
+        colors,
+        tex,
+        indices: Some(indices),
+        vertex_count: mesh.positions.len() as u32,
     }
 }
 
@@ -1786,9 +1745,7 @@ fn paint(
             // mesh-level switch only reaches faces whose material lets it.
             // (The GPU, which culls per pipeline rather than per material,
             // reads the same flag per fragment instead — the pictures agree.)
-            let material_two_sided = texture
-                .and_then(|t| t.double_sided.get(i0).copied())
-                .unwrap_or(false);
+            let material_two_sided = texture.is_some_and(|t| t.material_of(i0).double_sided);
             if options.cull_backfaces && !material_two_sided && facing_away {
                 continue;
             }
@@ -1797,18 +1754,17 @@ fn paint(
             // One texture per face: a triangle belongs to one primitive, and
             // a primitive carries one material. `NO_TEXTURE` falls out of the
             // slot lookup naturally — no map answers at that index.
-            let face_slot = texture
-                .and_then(|t| t.slot.get(i0).copied())
-                .unwrap_or(NO_TEXTURE);
+            let face_slot = texture.map_or(NO_TEXTURE, |t| t.material_of(i0).slot);
             // The material's roughness and metallic: sampled from the
             // metallic-roughness texture when the primitive carries one (G =
             // roughness, B = metallic, times the factors), else the
             // fresh-Principled defaults the studio rig assumes. A height look
             // owns the colour but not the finish, so these stand regardless.
             let (roughness, metallic) = match texture.and_then(|t| {
+                let material = t.material_of(i0);
                 Some((
-                    t.maps.get(*t.mr_slot.get(i0)? as usize)?,
-                    *t.factors.get(i0)?,
+                    t.maps.get(material.mr_slot as usize)?,
+                    material.factors,
                     *t.uv.get(i0)?,
                 ))
             }) {
@@ -1833,34 +1789,34 @@ fn paint(
             // light where the file says its geometry shadows. Faces with
             // neither keep the geometric answer.
             let relief = texture.and_then(|t| {
-                let slot = t.normal_slot.get(i0).copied()?;
+                let material = t.material_of(i0);
+                let slot = material.normal_slot;
                 if slot == NO_TEXTURE {
                     return None;
                 }
                 let map = t.maps.get(slot as usize)?;
-                let scale = t.normal_scale.get(i0).copied().unwrap_or(1.0);
                 relief_normal(
                     [p0, p1, p2],
                     [*t.uv.get(i0)?, *t.uv.get(i1)?, *t.uv.get(i2)?],
                     shaded_face,
                     map,
                     *t.uv.get(i0)?,
-                    scale,
+                    material.normal_scale,
                 )
             });
             let occlusion = texture
                 .and_then(|t| {
-                    let slot = t.ao_slot.get(i0).copied()?;
+                    let material = t.material_of(i0);
+                    let slot = material.ao_slot;
                     if slot == NO_TEXTURE {
                         return None;
                     }
                     let map = t.maps.get(slot as usize)?;
                     let at = *t.uv.get(i0)?;
-                    let strength = t.ao_strength.get(i0).copied().unwrap_or(1.0);
                     // The occlusion channel is linear data like the MR pair's:
                     // re-encode the decoded sample back to the stored value.
                     let stored = encode_channel(map.sample(at[0], at[1]).0);
-                    Some((1.0 + strength * (stored - 1.0)).clamp(0.0, 1.0))
+                    Some((1.0 + material.ao_strength * (stored - 1.0)).clamp(0.0, 1.0))
                 })
                 .unwrap_or(1.0);
             // The emissive rides to the rasterizer as
@@ -1869,17 +1825,17 @@ fn paint(
             // gives off nothing however bright its map.
             let emissive = texture
                 .map(|t| {
-                    let slot = t.emissive_slot.get(i0).copied().unwrap_or(NO_TEXTURE);
-                    let factor = t.emissive_factor.get(i0).copied().unwrap_or([0.0; 3]);
+                    let material = t.material_of(i0);
+                    let slot = material.emissive_slot;
                     [
                         if slot == NO_TEXTURE {
                             0.0
                         } else {
                             slot as f32 + 1.0
                         },
-                        factor[0],
-                        factor[1],
-                        factor[2],
+                        material.emissive_factor[0],
+                        material.emissive_factor[1],
+                        material.emissive_factor[2],
                     ]
                 })
                 .unwrap_or([0.0; 4]);
@@ -1888,10 +1844,8 @@ fn paint(
             // cutoff (negative = opaque) and the base-colour factor's alpha.
             let alpha = texture
                 .map(|t| {
-                    [
-                        t.alpha_cutoff.get(i0).copied().unwrap_or(-1.0),
-                        t.alpha_factor.get(i0).copied().unwrap_or(1.0),
-                    ]
+                    let material = t.material_of(i0);
+                    [material.alpha_cutoff, material.alpha_factor]
                 })
                 .unwrap_or([-1.0, 1.0]);
             // The specular is per face — the same granularity the highlight
@@ -3147,18 +3101,21 @@ mod tests {
         .expect("quad builds");
         mesh.texture = Some(Box::new(TextureData {
             uv: vec![[0.1, 0.1], [0.7, 0.1], [0.7, 0.7], [0.1, 0.7]],
-            slot: vec![0; 4],
-            mr_slot: vec![NO_TEXTURE; 4],
-            factors: vec![[0.0, 1.0]; 4],
-            normal_slot: vec![NO_TEXTURE; 4],
-            normal_scale: vec![1.0; 4],
-            ao_slot: vec![NO_TEXTURE; 4],
-            ao_strength: vec![1.0; 4],
-            emissive_slot: vec![NO_TEXTURE; 4],
-            emissive_factor: vec![[0.0; 3]; 4],
-            alpha_cutoff: vec![cutoff; 4],
-            alpha_factor: vec![1.0; 4],
-            double_sided: vec![false; 4],
+            material: vec![0; 4],
+            materials: vec![crate::media::formats::types::MaterialSlot {
+                slot: 0,
+                mr_slot: NO_TEXTURE,
+                factors: [0.0, 1.0],
+                normal_slot: NO_TEXTURE,
+                normal_scale: 1.0,
+                ao_slot: NO_TEXTURE,
+                ao_strength: 1.0,
+                emissive_slot: NO_TEXTURE,
+                emissive_factor: [0.0; 3],
+                alpha_cutoff: cutoff,
+                alpha_factor: 1.0,
+                double_sided: false,
+            }],
             maps: vec![TextureMap {
                 rgba: vec![
                     0, 0, 0, 0, // transparent: the texel the test rejects
@@ -3296,8 +3253,8 @@ mod tests {
         let frame = |doubled: bool, cull: bool| {
             let mut mesh = textured_quad(-1.0);
             if let Some(texture) = mesh.texture.as_mut() {
-                for flag in texture.double_sided.iter_mut() {
-                    *flag = doubled;
+                for material in texture.materials.iter_mut() {
+                    material.double_sided = doubled;
                 }
             }
             // The quad faces +Z; the camera is parked half a turn away, so
@@ -4182,47 +4139,36 @@ mod tests {
         assert_eq!(&flipped.vertices[3..6], &[0.0, 0.0, -1.0]);
         assert_eq!(flipped.vertex_count, straight.vertex_count);
 
-        // Flat meshes recompute the face normal from the corners, so the flip
-        // has to reach them too.
+        // A flat mesh (no normals of its own) keeps its indexed vertices with
+        // a zero normal — the fragment stage derives the face normal — so the
+        // flip shows up only in the index order.
         let flat = load_obj("v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n").expect("mesh parses");
         let straight = vertex_data_with(&flat, false);
         let flipped = vertex_data_with(&flat, true);
-        assert_eq!(&straight.vertices[3..6], &[0.0, 0.0, 1.0]);
-        assert_eq!(&flipped.vertices[3..6], &[0.0, 0.0, -1.0]);
+        assert_eq!(&straight.vertices[3..6], &[0.0, 0.0, 0.0]);
+        assert_eq!(&flipped.vertices[3..6], &[0.0, 0.0, 0.0]);
+        assert_eq!(straight.indices.as_deref(), Some([0, 1, 2].as_slice()));
+        assert_eq!(flipped.indices.as_deref(), Some([0, 2, 1].as_slice()));
     }
 
+    /// A flat mesh keeps its indexed vertices with a zero normal, rather than
+    /// being expanded to one vertex per corner with a baked face normal: the
+    /// fragment stage derives the face normal from the surface, which is a
+    /// third of the buffer and still partitionable into cullable clusters.
     #[test]
-    fn vertex_data_expands_flat_meshes_with_face_normals() {
-        let data = vertex_data(&cube());
-        assert!(data.indices.is_none(), "flat meshes expand per face");
-        assert_eq!(data.vertex_count, 12 * 3);
-        assert_eq!(data.vertices.len(), 12 * 3 * 6);
+    fn vertex_data_keeps_flat_meshes_indexed_with_no_baked_normal() {
+        let mesh = cube();
+        let data = vertex_data(&mesh);
+        assert_eq!(data.vertex_count, mesh.vertex_count() as u32);
+        assert_eq!(data.vertices.len(), mesh.vertex_count() * 6);
         assert_eq!(data.triangle_count(), 12);
-        // Every corner of a triangle carries the same, unit-length normal,
-        // which is perpendicular to the face it belongs to.
-        for triangle in data.vertices.as_chunks::<18>().0.iter() {
-            let normal = [triangle[3], triangle[4], triangle[5]];
-            assert!((dot(normal, normal) - 1.0).abs() < 1e-4);
-            for corner in 1..3 {
-                let base = corner * 6;
-                assert_eq!(
-                    [triangle[base + 3], triangle[base + 4], triangle[base + 5]],
-                    normal
-                );
-            }
-            let edge_a = sub(
-                [triangle[6], triangle[7], triangle[8]],
-                [triangle[0], triangle[1], triangle[2]],
-            );
-            let edge_b = sub(
-                [triangle[12], triangle[13], triangle[14]],
-                [triangle[0], triangle[1], triangle[2]],
-            );
-            // Parallel to the corners' own cross product, so it must point
-            // along the stored normal.
-            let face = normalize(cross(edge_a, edge_b));
-            assert!(dot(face, normal).abs() > 0.9999, "face normal mismatch");
+        // Every vertex carries a zero normal — the marker the fragment stage
+        // reads to switch to the geometric normal.
+        for vertex in data.vertices.as_chunks::<6>().0 {
+            assert_eq!(&vertex[3..6], &[0.0, 0.0, 0.0]);
         }
+        // The index list is the mesh's own triangles, three per face.
+        assert_eq!(data.indices.as_deref().map(<[u32]>::len), Some(12 * 3));
     }
 
     // ---- point clouds ---------------------------------------------------
