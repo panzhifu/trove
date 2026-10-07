@@ -360,7 +360,7 @@ pub(super) fn specimen_available(data: &AssetPreviewData, cx: &mut App) -> bool 
 /// One specimen row: the text in the font itself, centered, clipped rather
 /// than wrapped — a specimen line that runs off the block reads as "long
 /// text", not as a broken preview.
-fn specimen_row(family: &str, text: &str, size: f32, cx: &App) -> Div {
+fn specimen_row(family: &str, text: &str, size: f32) -> Div {
     div()
         .flex()
         .items_center()
@@ -369,7 +369,10 @@ fn specimen_row(family: &str, text: &str, size: f32, cx: &App) -> Div {
         .overflow_hidden()
         .text_size(px(size))
         .line_height(px(size * ROW_LINE))
-        .text_color(cx.theme().foreground)
+        // The card ink, not the theme's: the block wears the fixed paper the
+        // baked cards are rasterized on (see `specimen_scaled`), and ink that
+        // followed the theme would vanish on it in the dark theme.
+        .text_color(crate::panels::common::card_ink())
         .font_family(family.to_string())
         .whitespace_nowrap()
         .child(text.to_string())
@@ -384,6 +387,13 @@ pub(super) fn specimen(data: &AssetPreviewData, cx: &mut App) -> Option<AnyEleme
 /// The specimen block at an explicit geometry: the stage picks the size, the
 /// font fills it. `text_size` is the *largest* row; the other two are its
 /// fixed fractions, so the whole block scales as one.
+///
+/// The block wears the same fixed paper the baked specimen cards are
+/// rasterized on. This is what keeps the fullscreen stage readable: the
+/// stage paints black behind whatever it holds, and this panel draws no
+/// surface of its own — theme ink centered on that read as nothing at all.
+/// On the card paper the ink is fixed too, so the block reads identically
+/// in the panel, on the stage and in either theme.
 pub(super) fn specimen_scaled(
     data: &AssetPreviewData,
     width: f32,
@@ -406,7 +416,7 @@ pub(super) fn specimen_scaled(
     }
     let rows = specimen_sizes(text_size)
         .into_iter()
-        .map(|size| specimen_row(family, &text, size, cx).font_weight(FontWeight(weight as f32)))
+        .map(|size| specimen_row(family, &text, size).font_weight(FontWeight(weight as f32)))
         .collect::<Vec<_>>();
     Some(
         div()
@@ -417,6 +427,8 @@ pub(super) fn specimen_scaled(
             .gap(px(ROW_GAP))
             .w(px(width))
             .h(px(height))
+            .bg(crate::panels::common::card_paper())
+            .rounded(cx.theme().radius)
             .children(rows)
             .into_any_element(),
     )

@@ -355,8 +355,10 @@ pub(crate) fn patch_os2_weight(bytes: &[u8], weight: u16) -> Option<Vec<u8>> {
 /// A live specimen has to wear it because the tiles beside it do: a baked card
 /// cannot follow the theme, so the grid is already a row of one fixed surface,
 /// and a font cell painted in a theme colour read as the odd one out — and
-/// flipped to a dark block entirely in the dark theme.
-fn card_paper() -> Background {
+/// flipped to a dark block entirely in the dark theme. The preview's main
+/// specimen wears it for the same reason, plus one more: the fullscreen stage
+/// paints black behind whatever it holds, and theme ink on that vanished.
+pub(crate) fn card_paper() -> Background {
     // The ramp's two ends as the RGB bytes the rasterizer would round to, so
     // the live card and a baked one meet at the same colour rather than at
     // whichever side of a rounding gap they land on.
@@ -376,7 +378,7 @@ fn card_paper() -> Background {
 
 /// The ink a generated card draws with, for the specimen that is drawn live
 /// rather than rasterized.
-fn card_ink() -> Hsla {
+pub(crate) fn card_ink() -> Hsla {
     gpui::rgb(trove_core::media::CARD_INK_RGB).into()
 }
 
