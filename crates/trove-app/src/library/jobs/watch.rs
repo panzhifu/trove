@@ -127,6 +127,7 @@ fn watch_signals(
             }
 
             let mut channel_open = true;
+            let mut took_a_capture = false;
             loop {
                 match rx.try_recv() {
                     Ok(WatchSignal::Inbox) => {
@@ -139,6 +140,10 @@ fn watch_signals(
                         inbox_pending = matches!(
                             outcome,
                             Ok(InboxDrain::Refused) | Ok(InboxDrain::CapReached)
+                        );
+                        took_a_capture |= matches!(
+                            outcome,
+                            Ok(InboxDrain::Started | InboxDrain::Refused | InboxDrain::CapReached)
                         );
                     }
                     Ok(WatchSignal::Files(files)) => pending.extend(files),
@@ -158,11 +163,24 @@ fn watch_signals(
                     if controller.read(cx).is_importing() {
                         return InboxDrain::Refused;
                     }
-                    collect_inbox_app(&controller, window, cx)
+                    let outcome = collect_inbox_app(&controller, window, cx);
+                    took_a_capture |= matches!(
+                        outcome,
+                        InboxDrain::Started | InboxDrain::Refused | InboxDrain::CapReached
+                    );
+                    outcome
                 });
                 if !matches!(outcome, Ok(InboxDrain::Refused | InboxDrain::CapReached)) {
                     inbox_pending = false;
                 }
+            }
+
+            // The focus a save asked for, spent on the pass that actually
+            // found files waiting: the window comes forward when the capture
+            // is being taken in, not while its upload is still in flight, and
+            // not on every pass afterwards.
+            if took_a_capture && trove_core::services::collect::take_wake_request() {
+                let _ = handle.update(cx, |_view, window, _cx| window.activate_window());
             }
 
             if !pending.is_empty() {

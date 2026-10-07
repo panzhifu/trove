@@ -8,20 +8,31 @@
 //!   whether a library is open and its asset count, import throughput, the
 //!   search outbox's backlog, thumbnail-cache hit rate, slow-query counts
 //!   ([`crate::metrics::snapshot`])
-//! - `POST /add?filename=NAME&source=URL` — body is the raw file bytes
+//! - `POST /add?filename=NAME&source=URL&collection=ID&focus=1` — body is the
+//!   raw file bytes
 //!   (`curl --data-binary @img.png 'http://127.0.0.1:P/add?filename=a.png'`)
 //! - `POST /fetch` — JSON body `{"url": "…", "name": "…", "source": "…",
-//!   "referer": "…", "reject_html": true}` downloads the URL server-side
-//!   (ureq + rustls). The request carries a browser-like User-Agent and, when
-//!   the caller knows it, the capturing page as Referer — that is the point
-//!   of the fallback: the extension lands here when its own request was
-//!   refused by hotlink protection. `reject_html` refuses a text/html answer
-//!   (a webpage, not a file) instead of landing one in the library.
+//!   "referer": "…", "reject_html": true, "collection": "ID", "focus": true}`
+//!   downloads the URL server-side (ureq + rustls). The request carries a
+//!   browser-like User-Agent and, when the caller knows it, the capturing page
+//!   as Referer — that is the point of the fallback: the extension lands here
+//!   when its own request was refused by hotlink protection. `reject_html`
+//!   refuses a text/html answer (a webpage, not a file) instead of landing one
+//!   in the library.
+//! - `GET /collections` — the open library's collection tree as JSON, the
+//!   target list the extension draws its save-into menu from. Answers 503 with
+//!   a reason while no library is recorded, so a caller can fall back to
+//!   "wherever imports go".
 //!
-//! Every saved file gets a `<name>.meta.json` sidecar recording the source
-//! URL; the importer writes it into `assets.source_url` and deletes both.
-//! The server never touches the database: it only writes files, so it can
-//! run on its own thread while the UI stays single-threaded.
+//! `collection` is a collection id and `focus` asks for the window to come
+//! forward; both are recorded on the file, not acted on here — see below.
+//!
+//! Every saved file gets a `<name>.meta.json` sidecar recording its source URL
+//! and, when the caller named one, its target collection; the importer applies
+//! both to the fresh asset and deletes the sidecar. The server writes no
+//! database at all — the only read it makes is a read-only connection over the
+//! open library for `/collections`, which is what lets it run on its own
+//! thread while the UI stays single-threaded.
 //!
 //! All responses carry `Access-Control-Allow-Origin: *` and OPTIONS
 //! preflights are answered: the browser extension calls us from
@@ -46,6 +57,7 @@
 use std::io::{BufWriter, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
@@ -54,6 +66,28 @@ use crate::error::Error;
 
 /// Default listen port for the collect service.
 pub const DEFAULT_PORT: u16 = 23916;
+
+/// Set by a save that asked for Trove's window to come forward. A worker
+/// thread cannot touch a window, so the request waits here and the inbox pump
+/// spends it — that pump runs on the UI thread and already wakes for every
+/// collected file, so the window rises when the file is really being taken in,
+/// not when the upload starts.
+static WAKE_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+/// Take the standing "bring Trove forward" request, clearing it.
+pub fn take_wake_request() -> bool {
+    WAKE_REQUESTED.swap(false, Ordering::Relaxed)
+}
+
+/// What the caller said about a captured file: where it came from, and which
+/// collection it should be filed into once it is an asset. Both travel on the
+/// file's sidecar because the server has no database to write to.
+#[derive(Default)]
+struct CollectMeta {
+    source: Option<String>,
+    /// Canonical collection id, already validated at the boundary.
+    collection: Option<String>,
+}
 
 /// Largest accepted upload/download (512 MB).
 const MAX_BODY: u64 = 512 * 1024 * 1024;
@@ -320,6 +354,10 @@ fn handle(mut stream: TcpStream, inbox: &Path) -> std::io::Result<()> {
                 .unwrap_or_else(|_| "{\"ok\":false,\"error\":\"snapshot\"}".to_string());
             respond(stream, 200, &body)
         }
+        ("GET", Some("/collections")) => {
+            let (status, body) = collections_body();
+            respond(stream, status, &body)
+        }
         ("POST", Some("/add")) => {
             if head.content_length > MAX_BODY {
                 return respond(stream, 413, "{\"ok\":false,\"error\":\"body too large\"}");
@@ -329,7 +367,22 @@ fn handle(mut stream: TcpStream, inbox: &Path) -> std::io::Result<()> {
                 .get("filename")
                 .cloned()
                 .unwrap_or_else(|| "collected.bin".to_string());
-            let source = query.get("source").cloned();
+            let collection = match collection_target(query.get("collection").map(String::as_str)) {
+                Ok(id) => id,
+                Err(message) => {
+                    // The upload is read and dropped rather than closed over:
+                    // resetting mid-body reaches the browser as "cannot reach
+                    // Trove", and the user would be told their app is not
+                    // running when what they got was a bad destination.
+                    let _ = pump_body(&mut stream, &head.rest, head.content_length, |_| Ok(()));
+                    return respond(stream, 400, &error_body(&message));
+                }
+            };
+            note_focus(flag_from_text(query.get("focus").map(String::as_str)));
+            let meta = CollectMeta {
+                source: query.get("source").cloned(),
+                collection,
+            };
             let mut landing = match Landing::new(inbox, &name) {
                 Ok(landing) => landing,
                 Err(e) => {
@@ -342,7 +395,7 @@ fn handle(mut stream: TcpStream, inbox: &Path) -> std::io::Result<()> {
                 landing.abort();
                 return respond(stream, 400, &format!("{{\"ok\":false,\"error\":\"{e}\"}}"));
             }
-            match landing.finish(source.as_deref()) {
+            match landing.finish(&meta) {
                 Ok(saved) => respond(
                     stream,
                     200,
@@ -390,6 +443,16 @@ fn handle(mut stream: TcpStream, inbox: &Path) -> std::io::Result<()> {
                 .get("reject_html")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
+            // Checked before anything is downloaded: a save cannot name a
+            // destination that does not exist, and finding that out after
+            // fetching the bytes would waste them.
+            let collection =
+                match collection_target(body.get("collection").and_then(|v| v.as_str())) {
+                    Ok(id) => id,
+                    Err(message) => return respond(stream, 400, &error_body(&message)),
+                };
+            note_focus(body.get("focus").and_then(|v| v.as_bool()).unwrap_or(false));
+            let meta = CollectMeta { source, collection };
             let mut landing = match Landing::new(inbox, &name) {
                 Ok(landing) => landing,
                 Err(e) => {
@@ -406,7 +469,7 @@ fn handle(mut stream: TcpStream, inbox: &Path) -> std::io::Result<()> {
                     &format!("{{\"ok\":false,\"error\":\"download failed: {e}\"}}"),
                 );
             }
-            match landing.finish(source.as_deref()) {
+            match landing.finish(&meta) {
                 Ok(saved) => respond(
                     stream,
                     200,
@@ -569,6 +632,161 @@ fn suggested_name(url: &str) -> Option<String> {
     (!name.is_empty()).then(|| name.to_string())
 }
 
+/// The `collection` argument, checked at the boundary and handed back
+/// canonicalised.
+///
+/// A caller that named a destination must not get a file that quietly landed
+/// somewhere else, so anything that is not a collection id fails the request
+/// instead of being dropped. An absent, empty, or `null` argument means "no
+/// preference" — a query string cannot spell null, and the extension's recent
+/// list carries the library root as `null`.
+fn collection_target(raw: Option<&str>) -> Result<Option<String>, String> {
+    let Some(text) = raw.map(str::trim).filter(|t| !t.is_empty() && *t != "null") else {
+        return Ok(None);
+    };
+    uuid::Uuid::parse_str(text)
+        .map(|id| Some(id.to_string()))
+        .map_err(|_| format!("collection `{text}` is not a collection id"))
+}
+
+/// A query-string flag: `1`, `true` and `yes` (any case) mean on.
+fn flag_from_text(value: Option<&str>) -> bool {
+    matches!(
+        value.map(str::trim).map(str::to_ascii_lowercase).as_deref(),
+        Some("1") | Some("true") | Some("yes")
+    )
+}
+
+/// Remember that the save wants Trove's window brought forward, for the UI
+/// thread to spend on its next inbox pass.
+fn note_focus(on: bool) {
+    if on {
+        WAKE_REQUESTED.store(true, Ordering::Relaxed);
+    }
+}
+
+/// A JSON error body. Through serde, because an argument echoed back in the
+/// message may itself contain quotes.
+fn error_body(message: &str) -> String {
+    serde_json::json!({ "ok": false, "error": message }).to_string()
+}
+
+/// The library the app runs on: the recorded active slug, resolved the way
+/// startup resolves it. `None` when nothing is recorded, or when its database
+/// is not on disk — then there is no tree to offer.
+fn active_library_db() -> Option<(String, PathBuf)> {
+    let config = AppConfig::load();
+    config.active_library.as_ref()?;
+    let entry = config.active_entry();
+    let db = entry.dir().join("library.db");
+    db.is_file().then(|| (entry.name.clone(), db))
+}
+
+/// `GET /collections` — the open library's collection tree, the list the
+/// extension draws its save-into menu from.
+///
+/// Flat and in display order (a parent, then its whole subtree) with
+/// `parentId` on every row, so nesting is the caller's business and one
+/// request covers any depth. `path` is carried because two collections may
+/// share a name at different depths, and an unqualified "图标" in a menu says
+/// which one it is only once its parent is spelled out.
+///
+/// Read-only by construction: a second connection over the same file is what
+/// WAL is for, and nothing in here writes. A library that is not open, or is
+/// unreadable, answers 503 with the reason rather than an empty tree — an
+/// empty tree would read as "this library has no collections", which is a
+/// different fact, and would send saves to the wrong place without a word.
+fn collections_body() -> (u16, String) {
+    let Some((library, db)) = active_library_db() else {
+        return (503, error_body("no library is open"));
+    };
+    catalog_body(&library, &db)
+}
+
+/// The catalog over one library file, split from [`collections_body`] so the
+/// tree it builds is testable without a written config pointing at it.
+fn catalog_body(library: &str, db: &Path) -> (u16, String) {
+    let conn = match rusqlite::Connection::open_with_flags(
+        db,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    ) {
+        Ok(conn) => conn,
+        Err(error) => {
+            tracing::warn!(%error, path = %db.display(), "collect service could not read the library");
+            return (
+                503,
+                error_body("the library could not be opened for reading"),
+            );
+        }
+    };
+    // A checkpoint holding the write lock must not make a menu request wait
+    // out the socket timeout; the caller keeps its last tree anyway.
+    if let Err(error) = conn.busy_timeout(Duration::from_millis(250)) {
+        tracing::warn!(%error, "collect service could not set a busy timeout");
+    }
+    let (collections, counts) = match (
+        crate::store::collections::list(&conn),
+        crate::store::collections::asset_counts(&conn),
+    ) {
+        (Ok(collections), Ok(counts)) => (collections, counts),
+        (Err(error), _) | (_, Err(error)) => {
+            tracing::warn!(%error, "collect service could not list collections");
+            return (503, error_body("the collection tree could not be read"));
+        }
+    };
+
+    // Children per parent, each sibling run ordered the way the app orders it:
+    // position, then name.
+    let mut children: std::collections::HashMap<
+        Option<uuid::Uuid>,
+        Vec<&crate::model::Collection>,
+    > = std::collections::HashMap::new();
+    for collection in &collections {
+        children
+            .entry(collection.parent_id)
+            .or_default()
+            .push(collection);
+    }
+    for siblings in children.values_mut() {
+        siblings.sort_by(|a, b| {
+            a.position
+                .cmp(&b.position)
+                .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+        });
+    }
+
+    // Walk down from the roots, so the array is readable as a list even to a
+    // caller that ignores `parentId`. A cycle could not terminate this walk,
+    // but `collections::move_to` refuses one, and a `parent_id` pointing at a
+    // missing row keeps that subtree out of the walk rather than hanging it.
+    let mut entries = Vec::with_capacity(collections.len());
+    let mut stack: Vec<(String, &crate::model::Collection)> = children
+        .get(&None)
+        .into_iter()
+        .flatten()
+        .rev()
+        .map(|c| (c.name.clone(), *c))
+        .collect();
+    while let Some((path, collection)) = stack.pop() {
+        entries.push(serde_json::json!({
+            "id": collection.id.to_string(),
+            "name": collection.name,
+            "parentId": collection.parent_id.map(|p| p.to_string()),
+            "path": path,
+            "assetCount": counts.get(&collection.id).copied().unwrap_or(0),
+        }));
+        if let Some(siblings) = children.get(&Some(collection.id)) {
+            for child in siblings.iter().rev() {
+                stack.push((format!("{path}/{}", child.name), *child));
+            }
+        }
+    }
+    (
+        200,
+        serde_json::json!({ "ok": true, "library": library, "collections": entries }).to_string(),
+    )
+}
+
 /// A file being landed in the inbox.
 ///
 /// Bytes go to `<stem>.part`; the visible name appears only via `rename`, once
@@ -636,7 +854,11 @@ impl Landing {
 
     /// Flush, write the sidecar, rename into the visible name, and hand the
     /// file name back for the response body.
-    fn finish(mut self, source: Option<&str>) -> std::io::Result<String> {
+    ///
+    /// No sidecar goes out when the caller said nothing about the file: the
+    /// drain would otherwise carry an empty description of a capture that
+    /// needs none.
+    fn finish(mut self, meta: &CollectMeta) -> std::io::Result<String> {
         let mut file = self.file.take().expect("open until finished");
         file.flush()?;
         // The rename is atomic against a concurrent reader; only fsync makes
@@ -644,9 +866,18 @@ impl Landing {
         // with nothing in it.
         file.get_ref().sync_all()?;
         drop(file);
-        if let Some(source) = source {
-            let meta = serde_json::json!({ "source_url": source });
-            std::fs::write(sidecar_path(&self.path), meta.to_string())?;
+        if meta.source.is_some() || meta.collection.is_some() {
+            let mut sidecar = serde_json::Map::new();
+            if let Some(source) = meta.source.as_deref() {
+                sidecar.insert("source_url".to_string(), serde_json::json!(source));
+            }
+            if let Some(collection) = meta.collection.as_deref() {
+                sidecar.insert("collection".to_string(), serde_json::json!(collection));
+            }
+            std::fs::write(
+                sidecar_path(&self.path),
+                serde_json::Value::Object(sidecar).to_string(),
+            )?;
         }
         std::fs::rename(&self.part, &self.path)?;
         Ok(self
@@ -709,7 +940,12 @@ pub fn fetch_to_inbox(url: &str) -> Result<String, Error> {
         landing.abort();
         return Err(e);
     }
-    landing.finish(Some(url)).map_err(Error::from)
+    landing
+        .finish(&CollectMeta {
+            source: Some(url.to_string()),
+            collection: None,
+        })
+        .map_err(Error::from)
 }
 
 /// The two schemes this service will fetch.
@@ -806,13 +1042,15 @@ fn index_page() -> String {
 <tr><th>Method</th><th>Path</th><th>Purpose</th></tr>
 <tr><td>GET</td><td><code>/ping</code></td><td>liveness check</td></tr>
 <tr><td>GET</td><td><code>/health</code></td><td>metrics &amp; health snapshot (JSON)</td></tr>
-<tr><td>POST</td><td><code>/add?filename=NAME&amp;source=URL</code></td><td>upload raw file bytes</td></tr>
-<tr><td>POST</td><td><code>/fetch</code></td><td>server downloads <code>{{"url": "…"}}</code></td></tr>
+<tr><td>GET</td><td><code>/collections</code></td><td>the open library&#39;s collection tree (JSON)</td></tr>
+<tr><td>POST</td><td><code>/add?filename=NAME&amp;source=URL&amp;collection=ID&amp;focus=1</code></td><td>upload raw file bytes</td></tr>
+<tr><td>POST</td><td><code>/fetch</code></td><td>server downloads <code>{{"url": "…", "collection": "ID"}}</code></td></tr>
 </table>
 <h3>Try it</h3>
 <pre>curl --data-binary @image.png   'http://127.0.0.1:{port}/add?filename=image.png&amp;source=https://example.com/image'</pre>
 <pre>curl -X POST http://127.0.0.1:{port}/fetch   -d '{{"url":"https://example.com/image.png"}}'</pre>
-<p class="dim">Files land in the inbox and import automatically (source URL is kept).
+<p class="dim">Files land in the inbox and import automatically (source URL, and a
+<code>collection</code> when one was named, are applied to the asset).
 设置 ▸ 通用 可关闭此服务。</p>
 </body>
 </html>
@@ -845,6 +1083,7 @@ fn respond(mut stream: TcpStream, status: u16, body: &str) -> std::io::Result<()
         404 => "Not Found",
         413 => "Payload Too Large",
         502 => "Bad Gateway",
+        503 => "Service Unavailable",
         _ => "Internal Server Error",
     };
     let head = format!(
@@ -858,6 +1097,7 @@ fn respond(mut stream: TcpStream, status: u16, body: &str) -> std::io::Result<()
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempdir::Temp;
 
     /// A file with any content, at its final path.
     fn write(dir: &Path, name: &str) -> PathBuf {
@@ -954,6 +1194,288 @@ mod tests {
         assert!(fetch_to_inbox("ftp://example.com/a.png").is_err());
         assert!(fetch_to_inbox("file:///etc/passwd").is_err());
         assert!(fetch_to_inbox("data:text/plain,hi").is_err());
+    }
+
+    /// A destination the caller names is honoured or the request fails: a save
+    /// must never land a file somewhere else because its id was wrong. Ids
+    /// come back canonical, because the sidecar's contents are compared
+    /// against the database.
+    #[test]
+    fn a_named_collection_is_canonicalised_and_a_wrong_one_is_refused() {
+        let id = uuid::Uuid::new_v4();
+        assert_eq!(
+            collection_target(Some(&id.to_string())).unwrap(),
+            Some(id.to_string())
+        );
+        assert_eq!(
+            collection_target(Some(&format!("{{{id}}}"))).unwrap(),
+            Some(id.to_string()),
+            "braces are the same id"
+        );
+        assert_eq!(
+            collection_target(Some(&id.simple().to_string())).unwrap(),
+            Some(id.to_string()),
+            "and so is the hyphenless spelling"
+        );
+        for no_preference in [None, Some(""), Some("  "), Some("null")] {
+            assert_eq!(
+                collection_target(no_preference).unwrap(),
+                None,
+                "{no_preference:?} is no preference"
+            );
+        }
+        assert!(collection_target(Some("favorites")).is_err());
+    }
+
+    #[test]
+    fn a_query_flag_reads_as_text() {
+        for on in ["1", "true", "TRUE", " yes "] {
+            assert!(flag_from_text(Some(on)), "{on} means on");
+        }
+        for off in [None, Some(""), Some("0"), Some("false"), Some("no")] {
+            assert!(!flag_from_text(off), "{off:?} means off");
+        }
+    }
+
+    /// The extension's save adds two things to the old `/add`: the collection
+    /// to file into and a request to bring Trove forward. Neither is acted on
+    /// here — the first waits on the sidecar for the importer, the second in a
+    /// process flag for the UI thread.
+    #[test]
+    fn an_upload_records_its_destination_and_its_wake_request() {
+        let inbox = std::env::temp_dir().join(format!("trove-inbox-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&inbox).unwrap();
+        let inbox_for_assert = inbox.clone();
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let _ = take_wake_request();
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let _ = handle(stream, &inbox);
+            }
+        });
+
+        let collection = uuid::Uuid::new_v4();
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        let body = b"png-bytes";
+        let head = format!(
+            "POST /add?filename=pic.png&source=https%3A%2F%2Fexample.com%2Fpic&collection={collection}&focus=1 HTTP/1.1\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        );
+        stream.write_all(head.as_bytes()).unwrap();
+        stream.write_all(body).unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).unwrap();
+        assert!(response.contains("\"ok\":true"), "{response}");
+
+        let sidecars: Vec<_> = std::fs::read_dir(&inbox_for_assert)
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.to_string_lossy().ends_with(".meta.json"))
+            .collect();
+        assert_eq!(sidecars.len(), 1, "one sidecar for the one upload");
+        let meta: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&sidecars[0]).unwrap()).unwrap();
+        assert_eq!(meta["source_url"], "https://example.com/pic");
+        assert_eq!(meta["collection"], collection.to_string());
+
+        assert!(
+            take_wake_request(),
+            "the wake request reaches the UI thread"
+        );
+        assert!(
+            !take_wake_request(),
+            "and is spent — it must not raise the window again later"
+        );
+
+        std::fs::remove_dir_all(&inbox_for_assert).unwrap();
+    }
+
+    /// A destination that is not a collection id is refused before a byte is
+    /// landed. Filing the capture where the user did not ask, and answering
+    /// `ok`, would be worse than failing the save.
+    #[test]
+    fn an_upload_naming_a_non_collection_lands_nothing() {
+        let inbox = std::env::temp_dir().join(format!("trove-inbox-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&inbox).unwrap();
+        let inbox_for_assert = inbox.clone();
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let _ = handle(stream, &inbox);
+            }
+        });
+
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        let body = b"png-bytes";
+        let head = format!(
+            "POST /add?filename=pic.png&collection=favorites HTTP/1.1\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        );
+        stream.write_all(head.as_bytes()).unwrap();
+        stream.write_all(body).unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).unwrap();
+        assert!(response.contains("400"), "{response}");
+        assert!(response.contains("not a collection id"), "{response}");
+        assert!(
+            inbox_items_in(&inbox_for_assert).is_empty(),
+            "a refused save leaves no file and no part behind"
+        );
+
+        std::fs::remove_dir_all(&inbox_for_assert).unwrap();
+    }
+
+    /// A library file: three collections (two roots, one nested) with real
+    /// assets filed into two of them. Real records because `Store` turns
+    /// foreign keys on, so a membership row needs both sides.
+    fn catalog_fixture() -> (Temp, PathBuf, [uuid::Uuid; 3]) {
+        let root = Temp::new("collect-catalog");
+        let db = root.path().join("library.db");
+        let store = crate::store::Store::open(&db).unwrap();
+        let conn = store.conn();
+        let new = |parent_id: Option<uuid::Uuid>, name: &str, position: i64| {
+            crate::store::collections::create(
+                conn,
+                &crate::model::NewCollection {
+                    parent_id,
+                    name: name.to_string(),
+                    position,
+                },
+            )
+            .unwrap()
+            .id
+        };
+        let reference = new(None, "参考", 0);
+        let icons = new(None, "图标", 1);
+        let png = new(Some(icons), "PNG", 0);
+        let file = |collection: uuid::Uuid, how_many: u64| {
+            for n in 0..how_many {
+                let asset = sample_asset(&format!("{collection}-{n}.png"));
+                crate::store::assets::insert(conn, &asset).unwrap();
+                crate::store::collections::add_asset(
+                    conn,
+                    crate::model::CollectionId(collection),
+                    crate::model::AssetId(asset.id),
+                )
+                .unwrap();
+            }
+        };
+        file(icons, 2);
+        file(png, 1);
+        drop(store);
+        (root, db, [reference, icons, png])
+    }
+
+    /// The smallest record `assets` accepts.
+    fn sample_asset(name: &str) -> crate::model::Asset {
+        use crate::model::{AssetKind, AssetLocation, AssetSeed, Placement, UsageStatus, now};
+        let id = uuid::Uuid::new_v4();
+        crate::model::Asset::from_seed(AssetSeed {
+            id,
+            location: AssetLocation::Stored {
+                rel_path: format!("media/{}/{}", &id.to_string()[..2], name),
+            },
+            file_name: name.to_string(),
+            ext: "png".into(),
+            mime: "image/png".into(),
+            size_bytes: 128,
+            content_hash: Some(crate::model::ContentHash::from_hasher("a".repeat(64))),
+            kind: AssetKind::Image,
+            width: Some(1),
+            height: Some(1),
+            duration_ms: None,
+            captured_at: None,
+            title: None,
+            description: None,
+            rating: None,
+            is_favorite: false,
+            source_url: None,
+            usage_status: UsageStatus::Unused,
+            commercial_use: None,
+            facts: Default::default(),
+            created_at: now(),
+            updated_at: now(),
+            placement: Placement::Live,
+        })
+    }
+
+    /// `GET /collections`: one flat array, a parent then its subtree, each row
+    /// naming its parent and carrying the whole path — the menu needs the path
+    /// because "图标" alone does not say which of two same-named collections
+    /// a save will land in.
+    #[test]
+    fn the_collection_catalog_is_flat_in_display_order_with_paths() {
+        let (_root, db, [reference, icons, png]) = catalog_fixture();
+        let (status, body) = catalog_body("我的素材库", &db);
+        assert_eq!(status, 200, "{body}");
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed["library"], "我的素材库");
+        let rows = parsed["collections"].as_array().unwrap();
+        let listed: Vec<(String, String, u64)> = rows
+            .iter()
+            .map(|row| {
+                (
+                    row["path"].as_str().unwrap().to_string(),
+                    row["id"].as_str().unwrap().to_string(),
+                    row["assetCount"].as_u64().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            listed
+                .iter()
+                .map(|(path, _, _)| path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["参考", "图标", "图标/PNG"],
+            "roots by position, each subtree right after its parent"
+        );
+        assert_eq!(
+            listed
+                .iter()
+                .map(|(_, _, count)| *count)
+                .collect::<Vec<_>>(),
+            vec![0, 2, 1],
+            "directly-held assets, not the subtree's"
+        );
+        assert_eq!(listed[0].1, reference.to_string());
+        assert_eq!(listed[2].1, png.to_string());
+        // Only the nested row names a parent, and it is the middle row's id.
+        let parents: Vec<Option<String>> = rows
+            .iter()
+            .map(|row| row["parentId"].as_str().map(str::to_string))
+            .collect();
+        assert_eq!(
+            parents,
+            vec![None, None, Some(icons.to_string())],
+            "nesting is carried per row, so one request covers any depth"
+        );
+    }
+
+    /// A file that is not a library answers 503 with the reason. An empty
+    /// `collections` array would be a *different* claim — "this library has
+    /// none" — and the extension would render a menu with nothing in it
+    /// instead of falling back to the default destination.
+    #[test]
+    fn an_unreadable_library_says_so_instead_of_claiming_no_collections() {
+        let root = Temp::new("collect-catalog-bogus");
+        let bogus = root.path().join("library.db");
+        std::fs::write(&bogus, b"definitely not sqlite").unwrap();
+        let (status, body) = catalog_body("我的素材库", &bogus);
+        assert_eq!(status, 503, "{body}");
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert!(
+            parsed.get("collections").is_none(),
+            "no tree is offered at all: {body}"
+        );
+        assert!(
+            parsed["error"]
+                .as_str()
+                .is_some_and(|why| why.contains("could not be")),
+            "the reason is stated, not swallowed: {body}"
+        );
     }
 
     /// `/fetch` validates its JSON — a missing url is a 400 — and the fields
@@ -1101,6 +1623,30 @@ mod tests {
         stream.read_to_string(&mut response).unwrap();
         assert!(response.contains("text/html"));
         assert!(response.contains("collect service is running"));
+
+        // `/collections` is routed. Whether the answer is a tree or a refusal
+        // depends on which library this process's configuration points at, and
+        // nothing here asserts either — the contract being pinned is that the
+        // path is served and answers JSON, which is what `catalog_body`'s own
+        // tests cannot see. Read-only throughout: the route never writes.
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        stream
+            .write_all(b"GET /collections HTTP/1.1\r\n\r\n")
+            .unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).unwrap();
+        assert!(!response.contains("404"), "{response}");
+        let body = response
+            .rsplit_once("\r\n\r\n")
+            .map(|(_, body)| body)
+            .unwrap_or("");
+        let parsed: serde_json::Value = serde_json::from_str(body).unwrap_or_else(|e| {
+            panic!("the catalog answer is not JSON ({e}): {response}");
+        });
+        assert!(
+            parsed["ok"].is_boolean() || parsed["error"].is_string(),
+            "{body}"
+        );
     }
 
     /// `/health` serves the metrics snapshot as JSON: parseable, versioned,
@@ -1247,5 +1793,34 @@ mod tests {
         assert!(entries.is_empty(), "left behind: {entries:?}");
 
         std::fs::remove_dir_all(&inbox_for_assert).ok();
+    }
+
+    /// A scratch directory that removes itself. The other tests here clean up
+    /// by hand; the catalog ones hold a `Store` and a read-only connection
+    /// over the same file, and a failing assertion should not leave both of
+    /// them sitting in `/tmp`.
+    mod tempdir {
+        use std::path::PathBuf;
+
+        pub struct Temp(PathBuf);
+        impl Temp {
+            pub fn new(name: &str) -> Self {
+                let p = std::env::temp_dir().join(format!(
+                    "trove-{name}-{}-{}",
+                    std::process::id(),
+                    crate::model::new_id().simple()
+                ));
+                std::fs::create_dir_all(&p).unwrap();
+                Temp(p)
+            }
+            pub fn path(&self) -> &std::path::Path {
+                &self.0
+            }
+        }
+        impl Drop for Temp {
+            fn drop(&mut self) {
+                std::fs::remove_dir_all(&self.0).ok();
+            }
+        }
     }
 }

@@ -1,6 +1,8 @@
 //! Collection store: the user's folder tree and its many-to-many asset
 //! membership.
 
+use std::collections::HashMap;
+
 use chrono::Utc;
 use rusqlite::{Connection, types::Value};
 use uuid::Uuid;
@@ -258,6 +260,25 @@ pub fn count_assets(conn: &Connection, collection_id: Uuid) -> Result<u64> {
         ),
         vec![rows::uuid(collection_id).into()],
     )? as u64)
+}
+
+/// How many visible assets every collection directly holds, in one query.
+///
+/// A caller that lists the whole tree (the collect service's collection
+/// catalog) would otherwise run one [`count_assets`] per row. The same
+/// hidden-frame guard applies to every group.
+pub fn asset_counts(conn: &Connection) -> Result<HashMap<Uuid, u64>> {
+    let counted = rows::query_map(
+        conn,
+        &format!(
+            "SELECT ac.collection_id, COUNT(*) FROM asset_collection ac \
+             WHERE {} GROUP BY ac.collection_id",
+            super::sequences::hidden_beside_guarded(conn, "ac.asset_id")?
+        ),
+        vec![],
+        |row| Ok((req_uuid(row, 0)?, int(row, 1)? as u64)),
+    )?;
+    Ok(counted.into_iter().collect())
 }
 
 /// The collections one asset belongs to, name-ordered. The reverse of

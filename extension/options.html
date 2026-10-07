@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <title>Trove 采集器 选项</title>
+  <style>
+    body { font: 14px/1.6 system-ui, -apple-system, "Segoe UI", sans-serif; max-width: 34rem;
+           margin: 3rem auto; padding: 0 1.5rem; color: #e6e6e6; background: #141414; }
+    h1 { font-size: 1.1rem; margin: 0 0 1rem; }
+    .item { display: flex; gap: .75rem; align-items: flex-start; padding: .7rem 0;
+           border-bottom: 1px solid #262626; }
+    .item input { margin-top: .3rem; }
+    .item label { flex: 1; }
+    .item .why { color: #8a8a8a; font-size: 12px; margin-top: .2rem; }
+    #saved { color: #4ade80; font-size: 12px; min-height: 1rem; margin-top: 1rem; }
+    .note { color: #777; font-size: 12px; margin-top: 1.5rem; }
+    .note b { color: #aaa; font-weight: normal; }
+    a { color: #7fb3ff; }
+  </style>
+</head>
+<body>
+  <h1>Trove 采集器</h1>
+
+  <div class="item">
+    <input id="notifications" type="checkbox" />
+    <label for="notifications">保存后发系统通知
+      <div class="why">拖拽保存本身会在页面上给出结果，这个开关只管右键那条路径。</div>
+    </label>
+  </div>
+
+  <div class="item">
+    <input id="focusAfterSave" type="checkbox" />
+    <label for="focusAfterSave">保存后把 Trove 窗口带到前台
+      <div class="why">窗口是在文件被取走那一刻升起来的，不是上传刚发出去的时候 —— 那时还看不出保存是否成功。</div>
+    </label>
+  </div>
+
+  <div class="item">
+    <input id="dragMenu" type="checkbox" />
+    <label for="dragMenu">拖拽网页图片/视频时打开合集菜单
+      <div class="why">关掉后拖拽完全交还给页面本身，右键菜单不受影响。</div>
+    </label>
+  </div>
+
+  <div id="saved"></div>
+
+  <p class="note">端口不在这里改 —— 它在扩展图标的<b>弹出窗口</b>里，因为那个数字描述的是这台机器上的 Trove，不是你的习惯。
+  需先启动 Trove 桌面应用（采集服务默认 <b>127.0.0.1:23916</b>）。</p>
+
+  <script src="preferences.js"></script>
+  <script src="options.js"></script>
+</body>
+</html>

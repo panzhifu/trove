@@ -39,7 +39,7 @@ use rusqlite::Connection;
 
 use super::JobContext;
 use crate::media::import::{self, ImportReport, ImportStorage};
-use crate::model::AssetPatch;
+use crate::model::{AssetId, AssetPatch, CollectionId};
 use crate::store::assets;
 
 /// Files per transaction — one definition, shared with the synchronous
@@ -471,7 +471,7 @@ fn commit_chunk(
         .transaction()
         .map_err(|e| crate::error::Error::Db(format!("begin batch: {e}")))?;
     let post = |conn: &Connection, file: &import::StagedFile, item: &import::ImportItem| {
-        stamp_collect_source(conn, sidecars, file, item);
+        apply_collect_sidecar(conn, sidecars, file, item);
     };
     import::commit_batch_tx(&mut tx, chunk, into_collection, Some(&post), report)?;
     tx.commit()
@@ -479,9 +479,11 @@ fn commit_chunk(
     Ok(())
 }
 
-/// Collect-inbox imports stamp the sidecar's `source_url` onto the fresh
-/// asset, inside the same savepoint as the insert.
-fn stamp_collect_source(
+/// Apply what the collect service recorded about a captured file: its source
+/// URL and, when the caller named one, the collection to file it into — both
+/// inside the same savepoint as the insert, so a file that fails to commit
+/// leaves neither behind.
+fn apply_collect_sidecar(
     conn: &Connection,
     sidecars: &HashMap<PathBuf, Option<PathBuf>>,
     file: &import::StagedFile,
@@ -490,20 +492,51 @@ fn stamp_collect_source(
     let Some(Some(sidecar)) = sidecars.get(&file.path) else {
         return;
     };
-    let Ok(meta) = std::fs::read_to_string(sidecar) else {
+    let Ok(raw) = std::fs::read_to_string(sidecar) else {
         return;
     };
-    let Ok(meta) = serde_json::from_str::<serde_json::Value>(&meta) else {
+    let Ok(meta) = serde_json::from_str::<serde_json::Value>(&raw) else {
         return;
     };
-    let Some(url) = meta.get("source_url").and_then(|v| v.as_str()) else {
+    if let Some(url) = meta.get("source_url").and_then(|v| v.as_str()) {
+        let patch = AssetPatch {
+            source_url: Some(Some(url.to_string())),
+            ..Default::default()
+        };
+        let _ = assets::update(conn, imported.asset_id, &patch);
+    }
+    if let Some(collection) = meta.get("collection").and_then(|v| v.as_str()) {
+        file_into_collection(conn, imported.asset_id, collection);
+    }
+}
+
+/// Put a freshly imported asset into the collection the save asked for.
+///
+/// An id that no longer resolves is left alone rather than guessed at: the
+/// collection may have been deleted between the menu opening and the import
+/// running, and the file belongs in the library either way. That is reported
+/// rather than swallowed, because the user aimed at something specific.
+fn file_into_collection(conn: &Connection, asset_id: uuid::Uuid, collection: &str) {
+    let Ok(id) = uuid::Uuid::parse_str(collection) else {
+        tracing::warn!(
+            collection,
+            "a collected file named a destination that is not an id"
+        );
         return;
     };
-    let patch = AssetPatch {
-        source_url: Some(Some(url.to_string())),
-        ..Default::default()
-    };
-    let _ = assets::update(conn, imported.asset_id, &patch);
+    match crate::store::collections::get(conn, id) {
+        Ok(Some(_)) => {
+            if let Err(error) =
+                crate::store::collections::add_asset(conn, CollectionId(id), AssetId(asset_id))
+            {
+                tracing::warn!(%error, %id, "a collected file could not join its collection");
+            }
+        }
+        Ok(None) => {
+            tracing::warn!(%id, "a collected file's destination collection no longer exists")
+        }
+        Err(error) => tracing::warn!(%error, %id, "the destination collection could not be read"),
+    }
 }
 
 /// Drop the sidecars of a processed inbox batch. The files themselves stay:
@@ -833,6 +866,123 @@ mod tests {
         assert_eq!(
             asset.source_url.as_deref(),
             Some("https://example.com/a.png")
+        );
+    }
+
+    /// A save that named a destination: the capture is filed into that
+    /// collection by the same sidecar pass that stamps its source URL, inside
+    /// the savepoint that inserted it.
+    #[test]
+    fn a_collected_file_lands_in_the_collection_the_save_named() {
+        let root = Temp::new("task-inbox-collection");
+        let inbox = root.path().join("inbox");
+        fs::create_dir_all(&inbox).unwrap();
+        let file = inbox.join("shot.png");
+        fs::write(&file, PNG_1X1).unwrap();
+        let sidecar = inbox.join("shot.png.meta.json");
+
+        let db = root.path().join("library.db");
+        let icons = {
+            let store = crate::store::Store::open(&db).unwrap();
+            crate::store::collections::create(
+                store.conn(),
+                &crate::model::NewCollection {
+                    parent_id: None,
+                    name: "图标".to_string(),
+                    position: 0,
+                },
+            )
+            .unwrap()
+            .id
+        };
+        fs::write(
+            &sidecar,
+            format!(r#"{{"source_url":"https://example.com/a.png","collection":"{icons}"}}"#,),
+        )
+        .unwrap();
+
+        let options = ImportOptions {
+            data_root: root.path().to_path_buf(),
+            cache_root: root.path().join("cache"),
+            pre_gate: true,
+            storage: ImportStorage::Link,
+            source: ImportSource::CollectInbox {
+                items: vec![(file.clone(), Some(sidecar.clone()))],
+            },
+        };
+        let outcome = run(&options, &JobContext::for_tests(false)).unwrap();
+        assert_eq!(
+            outcome.report.imported_count(),
+            1,
+            "{:?}",
+            outcome.report.skipped
+        );
+
+        let store = crate::store::Store::open(&options.db_path()).unwrap();
+        let filed = crate::store::collections::asset_ids(store.conn(), icons).unwrap();
+        assert_eq!(filed.len(), 1, "the capture reached its collection");
+        assert_eq!(
+            crate::store::collections::for_asset(store.conn(), filed[0])
+                .unwrap()
+                .iter()
+                .map(|c| c.name.clone())
+                .collect::<Vec<_>>(),
+            vec!["图标".to_string()],
+            "and only there"
+        );
+    }
+
+    /// A destination deleted between the menu opening and the import running:
+    /// the file still belongs in the library, so it imports and stays unfiled.
+    /// Failing the save over a collection that is gone would lose a capture
+    /// the user already has no way to repeat.
+    #[test]
+    fn a_collected_file_with_a_gone_destination_still_imports_unfiled() {
+        let root = Temp::new("task-inbox-gone");
+        let inbox = root.path().join("inbox");
+        fs::create_dir_all(&inbox).unwrap();
+        let file = inbox.join("shot.png");
+        fs::write(&file, PNG_1X1).unwrap();
+        let sidecar = inbox.join("shot.png.meta.json");
+        fs::write(
+            &sidecar,
+            format!(
+                r#"{{"source_url":"https://example.com/a.png","collection":"{}"}}"#,
+                uuid::Uuid::new_v4()
+            ),
+        )
+        .unwrap();
+
+        let options = ImportOptions {
+            data_root: root.path().to_path_buf(),
+            cache_root: root.path().join("cache"),
+            pre_gate: true,
+            storage: ImportStorage::Link,
+            source: ImportSource::CollectInbox {
+                items: vec![(file.clone(), Some(sidecar.clone()))],
+            },
+        };
+        let outcome = run(&options, &JobContext::for_tests(false)).unwrap();
+        assert_eq!(
+            outcome.report.imported_count(),
+            1,
+            "{:?}",
+            outcome.report.skipped
+        );
+
+        let store = crate::store::Store::open(&options.db_path()).unwrap();
+        let all = assets::query(store.conn(), &crate::model::AssetQuery::live()).unwrap();
+        let asset = &all.items[0];
+        assert_eq!(
+            asset.source_url.as_deref(),
+            Some("https://example.com/a.png"),
+            "what the sidecar still offered was still applied"
+        );
+        assert!(
+            crate::store::collections::for_asset(store.conn(), asset.id)
+                .unwrap()
+                .is_empty(),
+            "and nothing was invented for the collection that is not there"
         );
     }
 
