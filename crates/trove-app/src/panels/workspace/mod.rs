@@ -12,6 +12,7 @@ use std::cell::Cell as CellFlag;
 use std::path::PathBuf;
 use std::rc::Rc;
 
+use gpui_kit::base::animation::ease_out_cubic;
 use gpui_kit::base::{ElementExt as _, h_flex, v_flex};
 use gpui_kit::component::Sizable;
 use gpui_kit::component::WindowExt as _;
@@ -89,6 +90,11 @@ use toolbar::{
 /// Fallback layout width before the container has been measured once
 /// (assumes a ~1024px window minus the two side docks).
 const FALLBACK_WIDTH: f32 = 1024.0 - 590.0;
+/// How long the preview's arrival takes: one fade-and-rise, the grid tile
+/// entrance's gesture at the stage's pace.
+const PREVIEW_ENTRANCE_TIME: std::time::Duration = std::time::Duration::from_millis(180);
+/// How far the preview surface rises while it arrives, in px.
+const PREVIEW_ENTRANCE_RISE: f32 = 8.0;
 /// Rows rendered beyond the viewport by the virtualized list, in px.
 const LIST_OVERDRAW_PX: f32 = 400.0;
 /// Fixed height of one row in list view mode.
@@ -297,6 +303,18 @@ pub struct WorkspacePanel {
     preview_asset_ids: Vec<Uuid>,
     /// Current position within `preview_asset_ids`.
     preview_index: usize,
+    /// The preview's arrival is still on stage: `open_preview` raises the
+    /// flag, the render wraps the surface in its one-shot fade-and-rise
+    /// while it holds, and a one-shot timer lowers it once the entrance
+    /// could have finished. Arrow-stepping lowers it without raising —
+    /// stepping replays nothing.
+    preview_entrance_pending: bool,
+    /// Where the preview surface sat in the shell the last time the shell
+    /// painted it, measured by the surface wrapper's own prepaint. The
+    /// fullscreen stage reads it as the hero entrance's take-off rect;
+    /// while the stage is up the shell is not painted, so the rect rests
+    /// at exactly what the user was looking at.
+    preview_bounds: Entity<Bounds<Pixels>>,
     /// Which renderer is painting an open model viewport, as the status bar
     /// shows it. `None` when no model preview is open. Carried here — rather
     /// than read on demand by the app view, which cannot reach through the
@@ -375,6 +393,15 @@ impl WorkspacePanel {
             Some(MainPreview::Subtitle(editor)) => Some(editor.clone().into_any_element()),
             None => None,
         }
+    }
+
+    /// The rect the preview surface occupied in the shell at its last paint —
+    /// the fullscreen stage's hero take-off. `None` before the surface has
+    /// been measured (and whenever no preview is up: the measuring wrapper
+    /// only exists while one is).
+    pub(crate) fn preview_content_bounds(&self, cx: &App) -> Option<Bounds<Pixels>> {
+        let bounds = *self.preview_bounds.read(cx);
+        (bounds.size.width > px(0.) && bounds.size.height > px(0.)).then_some(bounds)
     }
 
     /// Tell the preview it now lives on the fullscreen stage — or that it
@@ -856,13 +883,43 @@ impl Render for WorkspacePanel {
         // layout are skipped entirely, so hiding the other assets also costs
         // nothing to keep hidden.
         if let Some(preview) = self.preview.clone() {
-            return shell
-                .child(match preview {
-                    MainPreview::Model(viewport) => viewport.into_any_element(),
-                    MainPreview::Asset(preview) => preview.into_any_element(),
-                    MainPreview::Subtitle(editor) => editor.into_any_element(),
+            let content = match preview {
+                MainPreview::Model(viewport) => viewport.into_any_element(),
+                MainPreview::Asset(preview) => preview.into_any_element(),
+                MainPreview::Subtitle(editor) => editor.into_any_element(),
+            };
+            // Measure the surface for the fullscreen stage's hero entrance —
+            // the rect the stage grows out of. While the stage is up this
+            // wrapper is not painted, so the rect rests at exactly what the
+            // user was last looking at.
+            let bounds = self.preview_bounds.clone();
+            let content = div()
+                .size_full()
+                .on_prepaint(move |measured: Bounds<Pixels>, _, cx| {
+                    bounds.update(cx, |slot, _| *slot = measured);
                 })
-                .into_any_element();
+                .child(content);
+            // The arrival: one fade-and-rise, only while
+            // `preview_entrance_pending` holds. The flag is the replay gate —
+            // arrow-stepping lowers it without raising, and coming back from
+            // the fullscreen stage finds it down, so neither replays.
+            let content = if self.preview_entrance_pending && !cx.reduce_motion() {
+                content
+                    .with_animation(
+                        ElementId::Name("preview-open".into()),
+                        Animation::new(PREVIEW_ENTRANCE_TIME),
+                        move |content, delta| {
+                            let eased = ease_out_cubic(delta);
+                            content
+                                .opacity(eased)
+                                .top(px((1.0 - eased) * PREVIEW_ENTRANCE_RISE))
+                        },
+                    )
+                    .into_any_element()
+            } else {
+                content.into_any_element()
+            };
+            return shell.child(content).into_any_element();
         }
 
         // --- context snapshot (drop the controller borrow early) -----------

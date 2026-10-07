@@ -71,6 +71,7 @@ use crate::app::actions::{EnterVideoFullscreen, ExitVideoFullscreen};
 use crate::components::controls::muted_label;
 use crate::library::LibraryController;
 use crate::library::jobs;
+use gpui_kit::base::motion::PresenceSample;
 
 /// How long the audio engine's idle loops sleep while there is nothing to do.
 pub(super) const IDLE_POLL: Duration = Duration::from_millis(120);
@@ -887,7 +888,7 @@ impl VideoPlayer {
 
     /// The floating transport bar: one surface in both modes, no separator
     /// line — the popover colour carries the contrast on its own.
-    fn chrome_bar(&self, cx: &mut Context<Self>) -> Div {
+    fn chrome_bar(&self, volume_fade: PresenceSample, cx: &mut Context<Self>) -> Div {
         div()
             .absolute()
             .bottom_0()
@@ -896,7 +897,7 @@ impl VideoPlayer {
             .px_3()
             .py_2()
             .bg(cx.theme().popover)
-            .child(self.controls(cx))
+            .child(self.controls(volume_fade, cx))
     }
 
     /// The pointer moved over the player: reveal the bar when it reaches the
@@ -1166,7 +1167,7 @@ impl VideoPlayer {
 
     /// Transport row: play/pause, scrubber, elapsed / total time, speed
     /// menu, volume, fullscreen.
-    fn controls(&self, cx: &mut Context<Self>) -> Div {
+    fn controls(&self, volume_fade: PresenceSample, cx: &mut Context<Self>) -> Div {
         let playing = self.playing;
         let speed = self.speed;
         let muted = self.muted;
@@ -1195,7 +1196,7 @@ impl VideoPlayer {
             ))
             .child(self.speed_control(speed, cx))
             .when(self.has_audio(), |row| {
-                row.child(self.volume_control(muted, cx))
+                row.child(self.volume_control(muted, volume_fade, cx))
             })
             .child(
                 Button::new("video-fullscreen")
@@ -1238,11 +1239,16 @@ impl VideoPlayer {
     /// subscription unmutes as soon as it moves again. The component
     /// `Popover` can't open upwards (its corner placement always extends
     /// down-right from the anchor), so the popup is positioned by hand.
-    fn volume_control(&self, muted: bool, cx: &mut Context<Self>) -> impl IntoElement {
+    fn volume_control(
+        &self,
+        muted: bool,
+        volume_fade: PresenceSample,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         transport::volume_button(
             self.volume,
             muted,
-            self.volume_open,
+            volume_fade,
             &self.volume_slider,
             &cx.entity(),
             Self::toggle_volume_popup,
@@ -1321,11 +1327,15 @@ impl Render for VideoPlayer {
                 .update(cx, |slider, cx| slider.set_value(volume, window, cx));
         }
         self.chrome.pin(self.volume_open);
-        let bar = self.chrome_bar(cx);
         // The transport's show/hide plays as a fade — see `chrome::presence`.
         // Both render paths below share the one sample: only one of them
         // paints in a given frame, so they may share the state it keys.
         let fade = chrome::presence(self.chrome.shown(), "video-bar", window, cx);
+        // The volume popup fades on its own state, through the same helper:
+        // it may outlive the bar's shown flag by a beat (it is pinned while
+        // open, so in practice they leave together).
+        let volume_fade = chrome::presence(self.volume_open, "video-volume", window, cx);
+        let bar = self.chrome_bar(volume_fade, cx);
         let chrome_bounds = self.chrome_bounds.clone();
         // Fullscreen is a bare picture: the transport row floats over the
         // bottom edge and hides itself, revealed when the pointer reaches it.

@@ -19,6 +19,10 @@ use trove_core::model::AssetKind;
 
 use super::{AssetPreviewData, fallback};
 
+/// How long a landing exposure render takes to fade in over the picture it
+/// replaces. Same order as the chrome fades.
+pub(super) const EXPOSURE_FADE_TIME: std::time::Duration = std::time::Duration::from_millis(160);
+
 /// Full-size still for the main area: the exposure-mapped render when the
 /// preview's exposure control has produced one, animated source when the file
 /// can play frames, thumbnail otherwise, kind icon when there is neither.

@@ -317,6 +317,8 @@ impl WorkspacePanel {
             preview_subscription: None,
             preview_asset_ids: Vec::new(),
             preview_index: 0,
+            preview_entrance_pending: false,
+            preview_bounds: cx.new(|_| Bounds::default()),
             viewport_backend: None,
             viewport_observer: None,
             total_refresh: None,

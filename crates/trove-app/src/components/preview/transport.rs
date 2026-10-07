@@ -14,6 +14,7 @@
 //! than trying to model both behaviours.
 
 use gpui_kit::assets::IconName as MediaIcon;
+use gpui_kit::base::motion::PresenceSample;
 use gpui_kit::base::{POPUP_PRIORITY, h_flex};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
@@ -187,10 +188,14 @@ pub(super) fn speed_button<H: 'static>(
 /// button — the host's Change subscription unmutes as soon as it moves again.
 /// The component `Popover` cannot open upwards (its corner placement always
 /// extends down-right from the anchor), so this one is positioned by hand.
+///
+/// `fade` carries the popup's show/hide fade, sampled by the host where a
+/// `Window` lives: the popup mounts through both directions of it and takes
+/// the sample's progress as its opacity, so it dissolves instead of popping.
 pub(super) fn volume_button<H: 'static>(
     volume: f32,
     muted: bool,
-    open: bool,
+    fade: PresenceSample,
     volume_slider: &Entity<SliderState>,
     host: &Entity<H>,
     toggle_open: fn(&mut H, &mut Context<H>),
@@ -223,7 +228,7 @@ pub(super) fn volume_button<H: 'static>(
                     host.update(cx, toggle_open);
                 }),
         )
-        .when(open, |anchor| {
+        .when(fade.should_render(), |anchor| {
             // Hangs off the button's top edge, centred on it; deferred so it
             // paints above the click-away overlay.
             anchor.child(
@@ -238,6 +243,7 @@ pub(super) fn volume_button<H: 'static>(
                         .border_1()
                         .border_color(border)
                         .shadow_lg()
+                        .opacity(fade.progress)
                         .child(
                             div()
                                 .flex()

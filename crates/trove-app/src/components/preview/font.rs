@@ -357,10 +357,23 @@ pub(super) fn specimen_available(data: &AssetPreviewData, cx: &mut App) -> bool 
         .is_some_and(|family| ensure_font_registered(family, data.original.as_deref(), cx))
 }
 
+/// The ink the specimen rows draw with. The preview panel hands down a
+/// stage-transitioned colour when it is rendering the specimen (sampled where
+/// a `Window` exists — see `AssetPreviewPanel::render`); every other
+/// constructor of the data — the grid's live tiles among them — leaves the
+/// slot empty and gets the static stage/theme rule.
+fn ink(data: &AssetPreviewData, cx: &App) -> Hsla {
+    data.specimen_ink.unwrap_or(if data.on_stage {
+        gpui::white()
+    } else {
+        cx.theme().foreground
+    })
+}
+
 /// One specimen row: the text in the font itself, centered, clipped rather
 /// than wrapped — a specimen line that runs off the block reads as "long
 /// text", not as a broken preview.
-fn specimen_row(family: &str, text: &str, size: f32, on_stage: bool, cx: &App) -> Div {
+fn specimen_row(family: &str, text: &str, size: f32, ink: Hsla) -> Div {
     div()
         .flex()
         .items_center()
@@ -370,13 +383,10 @@ fn specimen_row(family: &str, text: &str, size: f32, on_stage: bool, cx: &App) -
         .text_size(px(size))
         .line_height(px(size * ROW_LINE))
         // On the fullscreen stage the panel draws no surface of its own and
-        // the stage paints black behind it — theme ink would vanish. Stage
-        // ink there; the theme answers everywhere else.
-        .text_color(if on_stage {
-            gpui::white()
-        } else {
-            cx.theme().foreground
-        })
+        // the stage paints black behind it — theme ink would vanish there.
+        // What ink answers is decided by [`ink`]: sampled while the stage
+        // flag transitions, the static rule otherwise.
+        .text_color(ink)
         .font_family(family.to_string())
         .whitespace_nowrap()
         .child(text.to_string())
@@ -414,8 +424,7 @@ pub(super) fn specimen_scaled(
     let rows = specimen_sizes(text_size)
         .into_iter()
         .map(|size| {
-            specimen_row(family, &text, size, data.on_stage, cx)
-                .font_weight(FontWeight(weight as f32))
+            specimen_row(family, &text, size, ink(data, cx)).font_weight(FontWeight(weight as f32))
         })
         .collect::<Vec<_>>();
     Some(

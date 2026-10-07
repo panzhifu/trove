@@ -256,6 +256,10 @@ impl WorkspacePanel {
         let Some(id) = self.controller.read(cx).primary() else {
             return;
         };
+        // A genuine from-nothing open: the surface plays its arrival. Steps
+        // and stage round-trips do not come through here, which is the whole
+        // gate — see `preview_entrance_pending`.
+        self.begin_preview_entrance(cx);
         // A live card is a tile, and every tile is about to be gone: put the card
         // out rather than leave a clip playing behind a full-size preview.
         let quick_look = self.quick_look.clone();
@@ -290,6 +294,28 @@ impl WorkspacePanel {
             .flat_map(|row| row.cells.iter().map(|cell| cell.id))
             .collect();
         self.open_asset_preview(id, &asset_ids, window, cx);
+    }
+
+    /// Raise the arrival flag and arm the timer that lowers it. The render
+    /// wraps the surface in its fade-and-rise only while the flag holds, and
+    /// the timer takes it down once that entrance could have finished — so
+    /// the wrapper (and its animation state) exists for exactly one arrival,
+    /// and a later re-mount of the same surface replays nothing.
+    fn begin_preview_entrance(&mut self, cx: &mut Context<Self>) {
+        self.preview_entrance_pending = true;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(PREVIEW_ENTRANCE_TIME + std::time::Duration::from_millis(60))
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                if this.preview_entrance_pending {
+                    this.preview_entrance_pending = false;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
     }
 
     /// The kind of the loaded cell `id`, or `None` when the grid holds no tile
@@ -464,6 +490,9 @@ impl WorkspacePanel {
         if new_index == self.preview_index {
             return;
         }
+        // Stepping replaces one preview with another in place — no arrival
+        // plays, or flipping through a run would strobe.
+        self.preview_entrance_pending = false;
         let id = self.preview_asset_ids[new_index];
         self.preview_index = new_index;
         // Route by kind, exactly as Enter does (see `open_preview`): a model

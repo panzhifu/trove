@@ -25,6 +25,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use super::AssetPreviewData;
+use super::chrome;
 use super::soundtrack::AudioEngine;
 use super::transport::{self, Transport};
 
@@ -466,6 +467,10 @@ impl Render for AudioPlayer {
             .map(|(ratio, width)| (ratio * width - PLAYHEAD_W / 2.).max(0.));
         let playhead_bucket =
             playhead_ratio.map(|ratio| ratio * trove_core::media::waveform::PEAK_COUNT as f32);
+        // The bar itself stays put here (nothing moves underneath it to
+        // hide from), but its volume popup fades on the same clock as the
+        // video's — one popup, one behaviour.
+        let volume_fade = chrome::presence(self.transport.volume_open, "audio-volume", window, cx);
         let controls = transport::row(
             self.transport.position_ms,
             self.duration_ms,
@@ -480,7 +485,7 @@ impl Render for AudioPlayer {
             Some(transport::volume_button(
                 self.transport.volume,
                 self.transport.muted,
-                self.transport.volume_open,
+                volume_fade,
                 &self.transport.volume_slider,
                 &host,
                 AudioPlayer::toggle_volume,

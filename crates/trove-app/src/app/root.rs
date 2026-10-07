@@ -180,6 +180,11 @@ fn swap_session_to(cx: &mut App, entry: &LibraryEntry) -> bool {
 /// as motion, short enough that the picture a user asked for is not late.
 const STAGE_ENTER_TIME: std::time::Duration = std::time::Duration::from_millis(180);
 
+/// How long the hero entrance takes when the take-off rect is known: the
+/// surface grows from where it sat in the shell to the full window. A
+/// fraction longer than the settle — there is more distance to cover.
+const STAGE_HERO_TIME: std::time::Duration = std::time::Duration::from_millis(240);
+
 /// How long the exit fade plays before the window goes back to the shell.
 /// Shorter than the entrance — leaving should feel quicker than arriving.
 const STAGE_EXIT_TIME: std::time::Duration = std::time::Duration::from_millis(140);
@@ -195,6 +200,18 @@ const STAGE_SETTLE_SCALE: f32 = 0.97;
 /// it leaves. Same order of smallness as the grid tile entrance, so the two
 /// read as one house gesture.
 const STAGE_SETTLE_RISE: f32 = 8.0;
+
+/// Where the preview sat in the shell when the stage took over, as fractions
+/// of the window it sat in. The hero entrance grows the stage surface out of
+/// that rect to the full window; fractions rather than pixels because the OS
+/// fullscreen toggle resizes the window under the flight — relative units
+/// re-map against every frame's real window, pixels would strand it at the
+/// old size.
+#[derive(Clone, Copy)]
+struct StageOrigin {
+    origin: Point<f32>,
+    size: Size<f32>,
+}
 
 /// Root view: owns the controller and hosts the dock area, plus a drop
 /// surface that imports any dropped files into the current collection.
@@ -256,6 +273,12 @@ pub struct AppView {
     /// pointer has rested — hovered, it pins itself up so it cannot fade
     /// under the hand reaching for it. Rebuilt on every entry.
     stage_chrome: Chrome,
+    /// The take-off rect for the hero entrance, captured at
+    /// [`Self::enter_stage_fullscreen`] from the shell's last paint of the
+    /// preview. `None` leaves the entrance to the plain settle — before the
+    /// first measurement, and under reduced motion the whole flight is
+    /// skipped anyway.
+    stage_origin: Option<StageOrigin>,
     /// The tray icon, when the desktop has a tray that took it. `None` means
     /// no tray: the app then closes the old-fashioned way.
     tray: Option<tray::Tray>,
@@ -502,6 +525,7 @@ impl AppView {
             stage_generation: 0,
             stage_closing: false,
             stage_chrome: Chrome::new(),
+            stage_origin: None,
             tray,
             quitting,
             _appearance,
@@ -744,6 +768,32 @@ impl AppView {
         // reveal. The loop ends on the first tick after the stage is down,
         // so each entry owns exactly one watcher and none outlives its visit.
         self.stage_chrome = Chrome::new();
+        // The hero take-off, captured while this is still the shell window:
+        // where the preview surface sat, as fractions of the window. The
+        // fullscreen toggle below resizes the window under the entrance —
+        // fractions re-map every frame, so the flight stays true across it.
+        self.stage_origin = self
+            .workspace
+            .read(cx)
+            .preview_content_bounds(cx)
+            .filter(|bounds| bounds.size.width > px(0.) && bounds.size.height > px(0.))
+            .map(|bounds| {
+                let viewport = window.viewport_size();
+                let (w, h) = (
+                    f32::from(viewport.width).max(1.0),
+                    f32::from(viewport.height).max(1.0),
+                );
+                StageOrigin {
+                    origin: point(
+                        f32::from(bounds.origin.x) / w,
+                        f32::from(bounds.origin.y) / h,
+                    ),
+                    size: size(
+                        f32::from(bounds.size.width) / w,
+                        f32::from(bounds.size.height) / h,
+                    ),
+                }
+            });
         cx.spawn(async move |view, cx| {
             loop {
                 cx.background_executor().timer(chrome::WATCH_INTERVAL).await;
@@ -1276,14 +1326,18 @@ impl Render for AppView {
                     )
                 },
             );
-            // Arrive and leave through one gesture — fade while settling the
-            // last few percent of size and a few pixels of rise, reversed on
-            // the way home. The size is laid out, not transformed: gpui has
-            // no transform for divs, and the stage's content re-fits into
-            // the wrapper every frame anyway (see [`STAGE_SETTLE_SCALE`]).
-            // Each run gets its own id (the generation), so a re-entered
-            // stage replays from its own zero; reduced motion shows the
-            // stage as it is.
+            // Arrive and leave through one gesture. With a known take-off
+            // rect the arrival is the hero flight — the surface grows out of
+            // the rect it occupied in the shell, the picture the user was
+            // already looking at simply keeps going while its surroundings
+            // go black; no fade, the travel is the whole read. Without one
+            // it settles: fade while growing the last few percent of size
+            // and a few pixels of rise, reversed on the way home. The size
+            // is laid out, not transformed: gpui has no transform for divs,
+            // and the stage's content re-fits into the wrapper every frame
+            // anyway (see [`STAGE_SETTLE_SCALE`]). Each run gets its own id
+            // (the generation), so a re-entered stage replays from its own
+            // zero; reduced motion shows the stage as it is.
             let animated = if cx.reduce_motion() {
                 surface.into_any_element()
             } else if self.stage_closing {
@@ -1300,6 +1354,33 @@ impl Render for AppView {
                                 .w(relative(scale))
                                 .h(relative(scale))
                                 .top(px(STAGE_SETTLE_RISE * eased))
+                        },
+                    )
+                    .into_any_element()
+            } else if let Some(origin) = self.stage_origin {
+                let id = ElementId::Name(format!("stage-hero-{}", self.stage_generation).into());
+                surface
+                    .with_animation(
+                        id,
+                        Animation::new(STAGE_HERO_TIME),
+                        move |surface, delta| {
+                            let eased = ease_out_cubic(delta);
+                            // Fractions of the window: the flight re-maps
+                            // against each frame's real window, so the OS
+                            // fullscreen resize happening underneath cannot
+                            // strand it. At the end the rect is the whole
+                            // window — indistinguishable from the settled
+                            // stage, and as resize-proof.
+                            let left = origin.origin.x * (1.0 - eased);
+                            let top = origin.origin.y * (1.0 - eased);
+                            let width = origin.size.width + (1.0 - origin.size.width) * eased;
+                            let height = origin.size.height + (1.0 - origin.size.height) * eased;
+                            surface
+                                .absolute()
+                                .left(relative(left))
+                                .top(relative(top))
+                                .w(relative(width))
+                                .h(relative(height))
                         },
                     )
                     .into_any_element()

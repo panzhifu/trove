@@ -44,6 +44,8 @@ pub(crate) use subtitle::{SubtitleEditor, SubtitleEvent};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use gpui_kit::base::animation::ease_out_cubic;
+use gpui_kit::base::motion::{Transition, transition};
 use gpui_kit::base::{ElementExt as _, v_flex};
 use gpui_kit::component::ActiveTheme;
 use gpui_kit::component::slider::{SliderEvent, SliderState};
@@ -61,6 +63,10 @@ const STAGE_PAD: f32 = 32.0;
 /// How far `,` / `.` move a soundtrack that has no frames to step: five
 /// seconds, the scrub granularity a long-form player's arrow keys use.
 const AUDIO_STEP_MS: f64 = 5_000.0;
+
+/// How long the specimen ink takes to cross between the theme colour and the
+/// stage's white, when the stage flag flips. Same order as the chrome fades.
+const SPECIMEN_INK_TIME: std::time::Duration = std::time::Duration::from_millis(160);
 
 pub(crate) use quick_look::LiveCard;
 pub(crate) use video::VideoPlayer;
@@ -175,6 +181,16 @@ pub(super) fn fit_box(geometry: (f32, f32), area: (f32, f32)) -> Option<(f32, f3
     Some((gw * scale, gh * scale))
 }
 
+/// What the still stage is showing right now — the same pick the flat paths
+/// make, captured as the exposure crossfade's floor at the moment a fresh
+/// render is about to take over.
+fn still_source(data: &AssetPreviewData) -> Option<gpui_kit::ImageSource> {
+    data.exposed
+        .clone()
+        .or_else(|| data.animated.clone())
+        .or_else(|| data.thumb.clone().map(Into::into))
+}
+
 /// Which placement renders the preview; the kinds differ in what "as large
 /// as useful" means for them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -222,6 +238,16 @@ pub(crate) struct AssetPreviewData {
     /// its thumbnail until the user moves the slider, and shows it again the
     /// moment the slider returns to zero.
     pub(crate) exposed: Option<gpui_kit::ImageSource>,
+    /// The picture that was on the stage while a fresh exposure render fades
+    /// in over it. Swept by a one-shot timer once the fade could have
+    /// finished; `None` outside a crossfade, which leaves every still path
+    /// painting exactly one source as before.
+    pub(crate) exposure_underlay: Option<gpui_kit::ImageSource>,
+    /// Which crossfade [`Self::exposure_underlay`] belongs to — the panel's
+    /// generation counter at the time it was captured. The sweeper compares
+    /// before clearing, so a slow fade's sweeper never removes a newer
+    /// fade's floor.
+    pub(crate) exposure_fade_gen: u64,
     /// Animated image source (GIF / animated WebP / APNG) when the original
     /// file can play frames.
     pub(crate) animated: Option<gpui_kit::ImageSource>,
@@ -276,6 +302,12 @@ pub(crate) struct AssetPreviewData {
     /// the theme everywhere else. The panel copies its own stage flag here
     /// on every render.
     pub(crate) on_stage: bool,
+    /// The stage-transitioned ink for the specimen rows, sampled per render
+    /// while a live specimen is up (only `render` has the `Window` the
+    /// transition needs). `None` for every other constructor of the data —
+    /// the grid's live tiles among them — which then falls back to the
+    /// static [`Self::on_stage`] rule in `font::ink`.
+    pub(crate) specimen_ink: Option<Hsla>,
 }
 
 /// A frame run the preview can play: the run's frame rate and every frame's
@@ -413,6 +445,9 @@ impl AssetPreviewData {
             sequence: None,
             video_facts: None,
             on_stage: false,
+            specimen_ink: None,
+            exposure_underlay: None,
+            exposure_fade_gen: 0,
         }
     }
 
@@ -530,6 +565,9 @@ pub(crate) struct AssetPreviewPanel {
     /// request (the user moved the slider again mid-decode) is dropped instead
     /// of overwriting the newer answer.
     exposure_generation: u64,
+    /// Bumps on every crossfade begin; rides in [`AssetPreviewData::exposure_fade_gen`]
+    /// so each fade's sweeper only clears its own floor.
+    exposure_fade_generation: u64,
     /// The EXR part list, probed off-thread when a scene-linear preview
     /// opens. `None` until that probe lands, and empty for anything but an
     /// `.exr` — Radiance HDR and TGA have no parts to choose between.
@@ -710,6 +748,7 @@ impl AssetPreviewPanel {
                 exposure,
                 exposure_images: Vec::new(),
                 exposure_generation: 0,
+                exposure_fade_generation: 0,
                 exr_parts: None,
                 part: 0,
                 pan: PanZoom::new(),
@@ -948,6 +987,9 @@ impl AssetPreviewPanel {
     fn refresh_stage(&mut self, cx: &mut Context<Self>) {
         self.exposure_generation += 1;
         if self.stops == 0.0 && self.part == 0 {
+            // Back to as-authored: the thumbnail takes over from whatever
+            // render was up, through the same crossfade as any other swap.
+            self.begin_exposure_crossfade(cx);
             self.data.exposed = None;
             cx.notify();
             return;
@@ -969,10 +1011,35 @@ impl AssetPreviewPanel {
                 {
                     let render = Arc::new(render);
                     this.exposure_images.push(render.clone());
+                    this.begin_exposure_crossfade(cx);
                     this.data.exposed = Some(render.into());
                 }
                 cx.notify();
             })
+        })
+        .detach();
+    }
+
+    /// A new picture is about to take the still: whatever is on it becomes
+    /// the crossfade's floor, and the fresh render fades in above it. A
+    /// one-shot timer sweeps the floor away once the fade could have
+    /// finished; the generation guard keeps a slow fade's sweeper from
+    /// clearing a newer fade's floor.
+    fn begin_exposure_crossfade(&mut self, cx: &mut Context<Self>) {
+        self.data.exposure_underlay = still_source(&self.data);
+        self.exposure_fade_generation += 1;
+        self.data.exposure_fade_gen = self.exposure_fade_generation;
+        let generation = self.exposure_fade_generation;
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(image::EXPOSURE_FADE_TIME + std::time::Duration::from_millis(60))
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                if this.data.exposure_fade_gen == generation {
+                    this.data.exposure_underlay = None;
+                    cx.notify();
+                }
+            });
         })
         .detach();
     }
@@ -1213,12 +1280,42 @@ impl AssetPreviewPanel {
                     .or(self.data.thumb.clone().map(Into::into))
             };
             source.map(|source| {
-                img(source)
+                let picture = img(source)
                     .w(px(w))
                     .h(px(h))
                     .object_fit(ObjectFit::Contain)
-                    .rounded(cx.theme().radius)
-                    .into_any_element()
+                    .rounded(cx.theme().radius);
+                // A landing exposure render fades in over the picture it
+                // replaces — the floor is whatever the stage was showing,
+                // swept away by the fade's own timer. Both layers Contain-fit
+                // one box, so floor and picture always share a geometry.
+                // Reduced motion swaps directly.
+                if !cx.reduce_motion()
+                    && let Some(underlay) = self.data.exposure_underlay.clone()
+                {
+                    return div()
+                        .w(px(w))
+                        .h(px(h))
+                        .relative()
+                        .child(
+                            img(underlay)
+                                .absolute()
+                                .inset_0()
+                                .w_full()
+                                .h_full()
+                                .object_fit(ObjectFit::Contain)
+                                .rounded(cx.theme().radius),
+                        )
+                        .child(picture.w_full().h_full().with_animation(
+                            ElementId::Name(
+                                format!("exposure-fade-{}", self.data.exposure_fade_gen).into(),
+                            ),
+                            Animation::new(image::EXPOSURE_FADE_TIME),
+                            |img, delta| img.opacity(ease_out_cubic(delta)),
+                        ))
+                        .into_any_element();
+                }
+                picture.into_any_element()
             })
         };
         let Some(content) = content else {
@@ -1258,12 +1355,31 @@ impl AssetPreviewPanel {
 }
 
 impl Render for AssetPreviewPanel {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // The stage flag rides the data: the font specimen reads it to pick
         // its ink — white on the stage's black, theme colour everywhere
         // else — and every render re-answers, because the same panel entity
         // is drawn in the shell and on the stage at different moments.
         self.data.on_stage = self.stage_mode;
+        // The ink itself rides the data as a *sampled* colour: the stage
+        // flip is a transition, not a jump, and sampling is only possible
+        // here, where a Window exists — the specimen rows paint far from
+        // one. Off the stage the target is the theme ink, so leaving plays
+        // the same fade in reverse; reduced motion collapses to the flag.
+        if self.font_live {
+            let target = if self.stage_mode {
+                gpui::white()
+            } else {
+                cx.theme().foreground
+            };
+            self.data.specimen_ink = Some(transition(
+                "specimen-ink",
+                target,
+                Transition::new(SPECIMEN_INK_TIME),
+                window,
+                cx,
+            ));
+        }
         let content: AnyElement = match (&self.video, &self.audio, &self.text) {
             (Some(player), _, _) => player.clone().into_any_element(),
             // The audio transport renders itself, so gpui passes the window to
@@ -1284,10 +1400,16 @@ impl Render for AssetPreviewPanel {
                     player.clone().into_any_element()
                 } else if self.video_loading || self.anim_loading {
                     image::still_filling(&self.data)
-                } else if self.zoomable() && (self.pan.zoom != 1.0 || self.font_live) {
+                } else if self.zoomable()
+                    && (self.pan.zoom != 1.0
+                        || self.font_live
+                        || self.data.exposure_underlay.is_some())
+                {
                     // A live specimen renders through the zoom math even at
                     // zoom 1.0: its block may outgrow the stage at a large
-                    // font size, and the pan offsets live here.
+                    // font size, and the pan offsets live here. So does a
+                    // landing exposure render — the crossfade needs the
+                    // explicit box this path computes.
                     self.zoomed_still(cx)
                 } else {
                     element(&self.data, PreviewContext::Main, cx)

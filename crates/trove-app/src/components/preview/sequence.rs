@@ -11,14 +11,16 @@
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use gpui_kit::base::h_flex;
 use gpui_kit::base::v_flex;
+use gpui_kit::base::{ElementExt as _, h_flex};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::slider::{Slider, SliderEvent, SliderState};
 use gpui_kit::component::{ActiveTheme as _, Size};
 use gpui_kit::component::{IconName, Sizable as _};
+use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
+use super::chrome::{self, Chrome};
 use crate::components::controls::muted_label;
 use crate::components::preview::transport;
 
@@ -42,6 +44,12 @@ pub(crate) struct SequencePlayer {
     synced_position: f32,
     /// Held so the slider's subscription lives with the player.
     _subscription: Subscription,
+    /// The floating transport's visibility, on the same auto-hide clock as
+    /// the video and animated-image players: showing for the first stretch,
+    /// revealed at the picture's bottom edge, hidden once the pointer rests.
+    chrome: Chrome,
+    /// The player's own box, so the bar reveals at the picture's bottom edge.
+    chrome_bounds: Entity<Bounds<Pixels>>,
 }
 
 /// Where a drag on the timeline asks to land, as a frame index.
@@ -67,6 +75,7 @@ impl SequencePlayer {
         let fps = fps.clamp(1.0, 240.0);
         let interval = Duration::from_secs_f64(1.0 / fps);
         let total = frames.len();
+        let chrome_bounds = cx.new(|_| Bounds::default());
         let slider = cx.new(|_| {
             SliderState::new()
                 .min(0.)
@@ -110,8 +119,11 @@ impl SequencePlayer {
                 slider,
                 synced_position: -1.,
                 _subscription: subscription,
+                chrome: Chrome::new(),
+                chrome_bounds,
             }
         });
+        chrome::watch(entity.downgrade(), cx, Self::chrome_mut);
         let weak = entity.downgrade();
         cx.spawn(async move |cx| {
             let mut due = Instant::now() + interval;
@@ -145,6 +157,25 @@ impl SequencePlayer {
     fn toggle_playing(&mut self, cx: &mut Context<Self>) {
         self.playing = !self.playing;
         cx.notify();
+    }
+
+    /// The chrome accessor the shared auto-hide watcher drives.
+    fn chrome_mut(&mut self) -> &mut Chrome {
+        &mut self.chrome
+    }
+
+    /// Pointer moved over the player: reveal the bar at the picture's bottom
+    /// edge.
+    fn on_pointer_moved(
+        &mut self,
+        event: &MouseMoveEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let bounds = *self.chrome_bounds.read(cx);
+        if self.chrome.moved(bounds, event.position) {
+            cx.notify();
+        }
     }
 
     /// Step one frame, pausing: a user who walks wants to stay where they
@@ -227,12 +258,23 @@ impl Render for SequencePlayer {
                 cx,
             ))
             .child(muted_label(format!("{:.0} fps", self.fps), cx));
+        // The bar's show/hide plays as a fade and hides on the same idle
+        // clock as the video and animated-image bars — one contract for
+        // everything that plays frames.
+        let fade = chrome::presence(self.chrome.shown(), "sequence-bar", window, cx);
+        let bounds = self.chrome_bounds.clone();
         v_flex()
             .size_full()
             .relative()
             .overflow_hidden()
+            .on_prepaint(move |measured: Bounds<Pixels>, _, cx| {
+                bounds.update(cx, |slot, _| *slot = measured);
+            })
+            .on_mouse_move(cx.listener(Self::on_pointer_moved))
             .child(stage)
-            .child(transport)
+            .when(fade.should_render(), |root| {
+                root.child(transport.opacity(fade.progress))
+            })
     }
 }
 
