@@ -378,12 +378,15 @@ impl WorkspacePanel {
     }
 
     /// Tell the preview it now lives on the fullscreen stage — or that it
-    /// has come back. Only the video player changes anything (its transport
-    /// swaps the fullscreen button's direction); every other kind is drawn
-    /// on the stage as it is.
+    /// has come back. The video player changes its transport; the asset
+    /// panel changes its ink, because the stage paints black behind it and
+    /// the panel draws no surface of its own — theme ink on that vanished.
     pub(crate) fn set_stage_mode(&self, on: bool, cx: &mut App) {
         if let Some(player) = self.preview_player(cx) {
             player.update(cx, |player, cx| player.set_fullscreen_mode(on, cx));
+        }
+        if let Some(panel) = self.preview_asset_panel() {
+            panel.update(cx, |panel, cx| panel.set_stage_mode(on, cx));
         }
     }
 

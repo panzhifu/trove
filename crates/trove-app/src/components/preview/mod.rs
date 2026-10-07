@@ -269,6 +269,13 @@ pub(crate) struct AssetPreviewData {
     /// probe between the click and the picture; `None` (rows imported before
     /// the facts existed) falls back to probing while the still stands in.
     pub(crate) video_facts: Option<trove_core::media::video::VideoStreamFacts>,
+    /// Whether this preview is the fullscreen stage's surface right now. The
+    /// stage paints black behind whatever it hosts and this panel draws no
+    /// surface of its own, so a kind that renders theme ink — the font
+    /// specimen — flips to stage ink while it is the stage and answers to
+    /// the theme everywhere else. The panel copies its own stage flag here
+    /// on every render.
+    pub(crate) on_stage: bool,
 }
 
 /// A frame run the preview can play: the run's frame rate and every frame's
@@ -405,6 +412,7 @@ impl AssetPreviewData {
                 .map(|sha| (cache_root.to_path_buf(), sha.to_string())),
             sequence: None,
             video_facts: None,
+            on_stage: false,
         }
     }
 
@@ -538,6 +546,11 @@ pub(crate) struct AssetPreviewPanel {
     drag_from: Point<Pixels>,
     /// Whether the user is currently dragging to pan.
     dragging: bool,
+    /// Whether the app view currently renders this panel as the fullscreen
+    /// stage. The workspace's `set_stage_mode` flips it; the panel copies it
+    /// into `data.on_stage` on every render, which is what the font
+    /// specimen reads to pick its ink.
+    stage_mode: bool,
 }
 
 impl EventEmitter<AssetPreviewEvent> for AssetPreviewPanel {}
@@ -703,6 +716,7 @@ impl AssetPreviewPanel {
                 viewport,
                 drag_from: Point::default(),
                 dragging: false,
+                stage_mode: false,
             }
         });
         if video_loading {
@@ -1231,10 +1245,25 @@ impl AssetPreviewPanel {
             )
             .into_any_element()
     }
+    /// Tell the panel it now lives on the fullscreen stage — or that it has
+    /// come back. The stage paints black behind this panel, and the panel
+    /// draws no surface of its own; ink that follows the theme would
+    /// vanish there, so the kinds that draw some get told.
+    pub(crate) fn set_stage_mode(&mut self, on: bool, cx: &mut Context<Self>) {
+        if self.stage_mode != on {
+            self.stage_mode = on;
+            cx.notify();
+        }
+    }
 }
 
 impl Render for AssetPreviewPanel {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // The stage flag rides the data: the font specimen reads it to pick
+        // its ink — white on the stage's black, theme colour everywhere
+        // else — and every render re-answers, because the same panel entity
+        // is drawn in the shell and on the stage at different moments.
+        self.data.on_stage = self.stage_mode;
         let content: AnyElement = match (&self.video, &self.audio, &self.text) {
             (Some(player), _, _) => player.clone().into_any_element(),
             // The audio transport renders itself, so gpui passes the window to
