@@ -19,7 +19,7 @@
 
 mod anim;
 mod audio;
-mod chrome;
+pub(crate) mod chrome;
 mod fallback;
 pub(crate) mod font;
 mod gpu3d;

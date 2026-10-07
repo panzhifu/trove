@@ -5,6 +5,7 @@
 //! a whole-window file-drop surface. `main` only boots the window and mounts
 //! this view inside a `Root`.
 
+use gpui_kit::base::animation::{ease_in_cubic, ease_out_cubic};
 use gpui_kit::component::Sizable as _;
 use gpui_kit::component::WindowExt as _;
 use gpui_kit::component::dock::{
@@ -23,6 +24,7 @@ use crate::app::actions::*;
 use crate::app::title_bar::TitleBarView;
 use crate::app::tray;
 use crate::app::{capture, status_bar};
+use crate::components::preview::chrome::{self, Chrome};
 use crate::library::jobs;
 use crate::library::{LibraryController, SelectionSource};
 use crate::panels::{ExplorerPanel, FoldersPanel, InspectorPanel, TagsPanel, WorkspacePanel};
@@ -171,6 +173,29 @@ fn swap_session_to(cx: &mut App, entry: &LibraryEntry) -> bool {
     })
 }
 
+// ============================ stage motion ===================================
+
+/// How long the stage takes to arrive: a fade, the last few percent of its
+/// size and a few pixels of rise, played as one gesture. Long enough to read
+/// as motion, short enough that the picture a user asked for is not late.
+const STAGE_ENTER_TIME: std::time::Duration = std::time::Duration::from_millis(180);
+
+/// How long the exit fade plays before the window goes back to the shell.
+/// Shorter than the entrance — leaving should feel quicker than arriving.
+const STAGE_EXIT_TIME: std::time::Duration = std::time::Duration::from_millis(140);
+
+/// The size the stage settles from and sinks back to, as a fraction of the
+/// window: three percent under full, the distance between "appeared" and
+/// "arrived". The stage content re-fits into the shrinking wrapper every
+/// frame — the still and the video picture scale with it, the text block
+/// keeps its user-dialled size and merely breathes with the clip window.
+const STAGE_SETTLE_SCALE: f32 = 0.97;
+
+/// How far the stage rises while it settles in, in px, and sinks back while
+/// it leaves. Same order of smallness as the grid tile entrance, so the two
+/// read as one house gesture.
+const STAGE_SETTLE_RISE: f32 = 8.0;
+
 /// Root view: owns the controller and hosts the dock area, plus a drop
 /// surface that imports any dropped files into the current collection.
 pub struct AppView {
@@ -211,6 +236,26 @@ pub struct AppView {
     /// dead. Watching globally removes that dependency. Dropped on leave,
     /// which unregisters it.
     video_escape: Option<Subscription>,
+    /// Which stage transition comes next. Every enter and every leave bumps
+    /// it, and the count rides in the transition's element id, so each run's
+    /// animation starts from zero — including the exit, which would
+    /// otherwise inherit the entrance's finished state under a shared id
+    /// and read `delta = 1` on its first frame: gone without a fade.
+    stage_generation: u64,
+    /// The stage is playing its exit fade, and the real teardown — the
+    /// window back to the shell — is waiting for it in
+    /// [`Self::finish_leave_stage_fullscreen`]. Esc and `f` during the beat
+    /// find the guard in [`Self::leave_stage_fullscreen`] closed and wait
+    /// like everyone else; nothing re-enters a stage that is already
+    /// leaving, because [`Self::enter_stage_fullscreen`] guards on
+    /// `stage_fullscreen`, which stays up until the fade lands.
+    stage_closing: bool,
+    /// The stage corner exit's auto-hide chrome, shared with the players'
+    /// bars: it shows for the first stretch after the stage comes up,
+    /// reveals on any pointer movement over the stage, and hides once the
+    /// pointer has rested — hovered, it pins itself up so it cannot fade
+    /// under the hand reaching for it. Rebuilt on every entry.
+    stage_chrome: Chrome,
     /// The tray icon, when the desktop has a tray that took it. `None` means
     /// no tray: the app then closes the old-fashioned way.
     tray: Option<tray::Tray>,
@@ -454,6 +499,9 @@ impl AppView {
             stage_fullscreen: false,
             stage_focus: cx.focus_handle(),
             video_escape: None,
+            stage_generation: 0,
+            stage_closing: false,
+            stage_chrome: Chrome::new(),
             tray,
             quitting,
             _appearance,
@@ -687,6 +735,35 @@ impl AppView {
         self.workspace
             .update(cx, |ws, cx| ws.set_stage_mode(true, cx));
         self.stage_fullscreen = true;
+        // A fresh transition id: the entrance the next frame paints must run
+        // from its own zero, not inherit whatever state the previous stage's
+        // animation left under this node.
+        self.stage_generation += 1;
+        // Fresh chrome: the corner exit shows for the first stretch so it is
+        // discovered, then this visit's watcher hides it like any other
+        // reveal. The loop ends on the first tick after the stage is down,
+        // so each entry owns exactly one watcher and none outlives its visit.
+        self.stage_chrome = Chrome::new();
+        cx.spawn(async move |view, cx| {
+            loop {
+                cx.background_executor().timer(chrome::WATCH_INTERVAL).await;
+                let Ok(keep) = view.update(cx, |this, cx| {
+                    if !this.stage_fullscreen {
+                        return false;
+                    }
+                    if this.stage_chrome.tick() {
+                        cx.notify();
+                    }
+                    true
+                }) else {
+                    break;
+                };
+                if !keep {
+                    break;
+                }
+            }
+        })
+        .detach();
         Self::set_window_fullscreen(window, true);
         // Take the focus now: leaving it on whatever had it means the
         // dispatch tree falls back to the window root as soon as that
@@ -711,10 +788,50 @@ impl AppView {
         cx.notify();
     }
 
-    /// Give the window back to the shell.
+    /// Give the window back to the shell — but not all at once. The stage
+    /// first plays its exit fade: `stage_closing` keeps it on screen while it
+    /// dissolves, the video keeps playing through the beat, and the teardown
+    /// below lands when the fade does. Reduced motion skips the beat — there
+    /// is nothing to watch, so the window goes straight back.
     fn leave_stage_fullscreen(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         // The mirror of the guard above: an Exit arriving while the stage is
-        // down must not throw the window into fullscreen.
+        // down must not throw the window into fullscreen. A second one while
+        // the exit fade is playing finds `stage_closing` closed — the leaving
+        // has already begun, and cannot begin again.
+        if !self.stage_fullscreen || self.stage_closing {
+            return;
+        }
+        if cx.reduce_motion() {
+            self.finish_leave_stage_fullscreen(window, cx);
+            return;
+        }
+        self.stage_closing = true;
+        // A fresh transition id, distinct from the entrance's: reusing one id
+        // would let the exit inherit the entrance's elapsed time and read as
+        // an instant disappearance instead of a fade.
+        self.stage_generation += 1;
+        cx.spawn_in(window, async move |view, cx| {
+            // One beat past the fade, so the teardown never outruns the last
+            // frame of it: a stage that vanishes at three percent opacity
+            // reads exactly like the hard cut this replaces.
+            cx.background_executor()
+                .timer(STAGE_EXIT_TIME + std::time::Duration::from_millis(50))
+                .await;
+            let _ = view.update_in(cx, |this, window, cx| {
+                this.finish_leave_stage_fullscreen(window, cx);
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    /// The teardown behind [`Self::leave_stage_fullscreen`]: stop watching
+    /// keystrokes, hand the window and the focus back to the workspace.
+    /// Idempotent — the render path calls it directly when the preview dies
+    /// mid-stage (nothing left to fade), and the exit timer may land after
+    /// that has already happened.
+    fn finish_leave_stage_fullscreen(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.stage_closing = false;
         if !self.stage_fullscreen {
             return;
         }
@@ -1097,7 +1214,10 @@ impl Render for AppView {
         // `enter_stage_fullscreen`) and leave no visible way out.
         let stage = self.workspace.read(cx).preview_stage(cx);
         if self.stage_fullscreen && stage.is_none() {
-            self.leave_stage_fullscreen(window, cx);
+            // Nothing left to fade: the exit beat is for a stage that is
+            // still showing something, so the teardown lands right here
+            // rather than after [`STAGE_EXIT_TIME`] of an empty window.
+            self.finish_leave_stage_fullscreen(window, cx);
         }
 
         // Fullscreen preview: this very window becomes the stage, holding
@@ -1118,33 +1238,115 @@ impl Render for AppView {
             if !self.stage_focus.is_focused(window) {
                 window.focus(&self.stage_focus, cx);
             }
+            // The surface the stage hosts: the preview itself plus, for the
+            // kinds without controls of their own, the corner exit. One
+            // wrapper for both, so the arrival and the exit move and fade
+            // them together — the button is part of the stage's arrival, not
+            // a decal that was already there when the picture landed. The
+            // button hides and reveals like the players' bars do, through the
+            // same fade; hovering it pins it up for as long as the pointer
+            // rests there.
+            let exit_fade =
+                chrome::presence(self.stage_chrome.shown(), "stage-exit-button", window, cx);
+            let surface = div().relative().size_full().child(stage).when(
+                !on_video && exit_fade.should_render(),
+                |surface| {
+                    surface.child(
+                        div()
+                            .id("stage-exit-button")
+                            .absolute()
+                            .top_2()
+                            .right_2()
+                            .on_hover(cx.listener(|this, hovered: &bool, _, _cx| {
+                                this.stage_chrome.pin(*hovered);
+                            }))
+                            .opacity(exit_fade.progress)
+                            .child(
+                                crate::components::controls::icon_button(
+                                    "stage-exit-fullscreen",
+                                    gpui_kit::assets::IconName::Shrink,
+                                    rust_i18n::t!("video.exit_fullscreen").to_string(),
+                                )
+                                .on_click(cx.listener(
+                                    |_, _, window, cx| {
+                                        window.dispatch_action(Box::new(ExitVideoFullscreen), cx);
+                                    },
+                                )),
+                            ),
+                    )
+                },
+            );
+            // Arrive and leave through one gesture — fade while settling the
+            // last few percent of size and a few pixels of rise, reversed on
+            // the way home. The size is laid out, not transformed: gpui has
+            // no transform for divs, and the stage's content re-fits into
+            // the wrapper every frame anyway (see [`STAGE_SETTLE_SCALE`]).
+            // Each run gets its own id (the generation), so a re-entered
+            // stage replays from its own zero; reduced motion shows the
+            // stage as it is.
+            let animated = if cx.reduce_motion() {
+                surface.into_any_element()
+            } else if self.stage_closing {
+                let id = ElementId::Name(format!("stage-exit-{}", self.stage_generation).into());
+                surface
+                    .with_animation(
+                        id,
+                        Animation::new(STAGE_EXIT_TIME),
+                        move |surface, delta| {
+                            let eased = ease_in_cubic(delta);
+                            let scale = 1.0 - (1.0 - STAGE_SETTLE_SCALE) * eased;
+                            surface
+                                .opacity(1.0 - eased)
+                                .w(relative(scale))
+                                .h(relative(scale))
+                                .top(px(STAGE_SETTLE_RISE * eased))
+                        },
+                    )
+                    .into_any_element()
+            } else {
+                let id = ElementId::Name(format!("stage-enter-{}", self.stage_generation).into());
+                surface
+                    .with_animation(
+                        id,
+                        Animation::new(STAGE_ENTER_TIME),
+                        move |surface, delta| {
+                            let eased = ease_out_cubic(delta);
+                            let scale = STAGE_SETTLE_SCALE + (1.0 - STAGE_SETTLE_SCALE) * eased;
+                            surface
+                                .opacity(eased)
+                                .w(relative(scale))
+                                .h(relative(scale))
+                                .top(px((1.0 - eased) * STAGE_SETTLE_RISE))
+                        },
+                    )
+                    .into_any_element()
+            };
             return div()
                 .id("preview-stage")
                 .relative()
                 .size_full()
                 .bg(black())
+                // The animated surface sits centred so its entrance can grow
+                // from a shade under full size without drifting from the
+                // middle; at rest it fills this node exactly as the bare
+                // stage always did.
+                .flex()
+                .items_center()
+                .justify_center()
+                .overflow_hidden()
                 .track_focus(&self.stage_focus)
                 .key_context(crate::app::keybindings::VIDEO_FULLSCREEN_CONTEXT)
                 .on_action(cx.listener(|this, _: &ExitVideoFullscreen, window, cx| {
                     this.leave_stage_fullscreen(window, cx);
                 }))
-                .child(stage)
-                .when(!on_video, |stage| {
-                    stage.child(
-                        div().absolute().top_2().right_2().child(
-                            crate::components::controls::icon_button(
-                                "stage-exit-fullscreen",
-                                gpui_kit::assets::IconName::Shrink,
-                                rust_i18n::t!("video.exit_fullscreen").to_string(),
-                            )
-                            .on_click(cx.listener(
-                                |_, _, window, cx| {
-                                    window.dispatch_action(Box::new(ExitVideoFullscreen), cx);
-                                },
-                            )),
-                        ),
-                    )
-                })
+                .on_mouse_move(cx.listener(|this, _: &MouseMoveEvent, _, cx| {
+                    // Any movement over the stage is the gesture that reveals
+                    // the corner exit; only the reveal itself needs a paint.
+                    if this.stage_chrome.moved_anywhere() {
+                        cx.notify();
+                    }
+                }))
+                .child(animated)
                 .into_any_element();
         }
 

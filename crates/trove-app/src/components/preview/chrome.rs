@@ -1,27 +1,52 @@
 //! The floating control bar's visibility, shared by the video and
-//! animated-image players.
+//! animated-image players — and by the fullscreen stage's corner exit, which
+//! hides on the same idle clock but reveals on any pointer movement rather
+//! than at the picture's bottom edge.
 //!
 //! The bar hides itself and comes back when the pointer reaches the player's
 //! bottom edge — the arrangement the video fullscreen window already used, now
-//! the one both players and both modes follow.
+//! the one both players and both modes follow. What the pointer state drives
+//! is a boolean; the fade that boolean plays is [`presence`], so a bar grows
+//! in, dissolves out, and reverses mid-fade from the value on screen.
 
 use std::time::{Duration, Instant};
 
+use gpui_kit::base::motion::{Presence, PresenceSample, Transition};
 use gpui_kit::*;
 
 /// How long the bar stays after the pointer last revealed it.
 const HIDE_AFTER: Duration = Duration::from_millis(2500);
 
 /// How often the watcher checks that countdown.
-const WATCH_INTERVAL: Duration = Duration::from_millis(400);
+pub(crate) const WATCH_INTERVAL: Duration = Duration::from_millis(400);
+
+/// How long a chrome surface takes to fade in or out.
+const FADE_TIME: Duration = Duration::from_millis(150);
 
 /// Bottom band of the player that counts as "on the bar".
 const BAND: f32 = 96.;
 
+/// Sample the show/hide fade of a chrome surface keyed by `id`. The caller
+/// paints the surface while [`PresenceSample::should_render`] says so, using
+/// [`PresenceSample::progress`] as its opacity: a reveal grows in, a hide
+/// stays mounted while it dissolves, and a flip mid-fade reverses from the
+/// value on screen rather than restarting from an end. Reduced motion
+/// collapses the whole thing back to the bare boolean.
+pub(crate) fn presence(
+    shown: bool,
+    id: &'static str,
+    window: &mut Window,
+    cx: &mut App,
+) -> PresenceSample {
+    Presence::new(id, shown)
+        .transition(Transition::new(FADE_TIME))
+        .sample(window, cx)
+}
+
 /// Visibility of the floating control bar: it opens showing, hides once the
 /// pointer has rested off it, and comes back when the pointer reaches the
 /// player's bottom edge.
-pub(super) struct Chrome {
+pub(crate) struct Chrome {
     shown: bool,
     hovered: bool,
     pinned: bool,
@@ -29,7 +54,7 @@ pub(super) struct Chrome {
 }
 
 impl Chrome {
-    pub(super) fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             // Showing for the first stretch so the bar is discovered, then
             // the watcher hides it like any other reveal.
@@ -40,12 +65,12 @@ impl Chrome {
         }
     }
 
-    pub(super) fn shown(&self) -> bool {
+    pub(crate) fn shown(&self) -> bool {
         self.shown
     }
 
     /// A menu is open: the bar, and the menu's anchor with it, stays up.
-    pub(super) fn pin(&mut self, pinned: bool) {
+    pub(crate) fn pin(&mut self, pinned: bool) {
         self.pinned = pinned;
     }
 
@@ -60,6 +85,15 @@ impl Chrome {
         false
     }
 
+    /// Pointer moved anywhere over the surface. The corner exit answers this
+    /// rather than [`Self::moved`]: it sits top-right, so "near the bottom
+    /// edge" is the one place it should not key off — any movement is the
+    /// gesture that says someone is there.
+    pub(crate) fn moved_anywhere(&mut self) -> bool {
+        self.revealed_at = Instant::now();
+        self.reveal()
+    }
+
     pub(super) fn reveal(&mut self) -> bool {
         self.revealed_at = Instant::now();
         if self.shown {
@@ -70,7 +104,7 @@ impl Chrome {
     }
 
     /// The watcher's tick. Returns whether the bar just hid.
-    pub(super) fn tick(&mut self) -> bool {
+    pub(crate) fn tick(&mut self) -> bool {
         if self.shown && !self.hovered && !self.pinned && self.revealed_at.elapsed() >= HIDE_AFTER {
             self.shown = false;
             return true;

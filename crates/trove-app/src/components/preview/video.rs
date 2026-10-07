@@ -1322,6 +1322,10 @@ impl Render for VideoPlayer {
         }
         self.chrome.pin(self.volume_open);
         let bar = self.chrome_bar(cx);
+        // The transport's show/hide plays as a fade — see `chrome::presence`.
+        // Both render paths below share the one sample: only one of them
+        // paints in a given frame, so they may share the state it keys.
+        let fade = chrome::presence(self.chrome.shown(), "video-bar", window, cx);
         let chrome_bounds = self.chrome_bounds.clone();
         // Fullscreen is a bare picture: the transport row floats over the
         // bottom edge and hides itself, revealed when the pointer reaches it.
@@ -1346,7 +1350,9 @@ impl Render for VideoPlayer {
                         .overflow_hidden()
                         .child(self.frame_view(cx)),
                 )
-                .when(self.chrome.shown(), |root| root.child(bar))
+                .when(fade.should_render(), |root| {
+                    root.child(bar.opacity(fade.progress))
+                })
                 .when(self.volume_open, |root| {
                     root.child(div().absolute().inset_0().on_mouse_down(
                         MouseButton::Left,
@@ -1389,7 +1395,9 @@ impl Render for VideoPlayer {
                     .overflow_hidden()
                     .child(self.frame_view(cx)),
             )
-            .when(self.chrome.shown(), |root| root.child(bar))
+            .when(fade.should_render(), |root| {
+                root.child(bar.opacity(fade.progress))
+            })
             .when(self.volume_open, |root| {
                 root.child(div().absolute().inset_0().on_mouse_down(
                     MouseButton::Left,

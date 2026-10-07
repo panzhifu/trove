@@ -541,7 +541,10 @@ impl Render for AnimatedPlayer {
                 &cx.entity(),
                 Self::set_speed,
             ));
-        let shown = self.chrome.shown();
+        // The bar's show/hide plays as a fade: the sample renders through
+        // both directions and keeps the bar mounted while a hide dissolves,
+        // so a pointer that leaves the band sees it leave rather than vanish.
+        let fade = chrome::presence(self.chrome.shown(), "anim-bar", window, cx);
         let bounds = self.chrome_bounds.clone();
         div()
             .relative()
@@ -562,7 +565,9 @@ impl Render for AnimatedPlayer {
                         this.toggle_playing(cx);
                     })),
             )
-            .when(shown, |root| root.child(bar))
+            .when(fade.should_render(), |root| {
+                root.child(bar.opacity(fade.progress))
+            })
     }
 }
 
