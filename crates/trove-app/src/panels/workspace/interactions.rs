@@ -466,6 +466,15 @@ impl WorkspacePanel {
         }
         let id = self.preview_asset_ids[new_index];
         self.preview_index = new_index;
+        // Route by kind, exactly as Enter does (see `open_preview`): a model
+        // navigated onto takes the interactive viewport, not the flat still
+        // of its thumbnail. The run list survives both paths — neither open
+        // touches it when handed an empty slice — so stepping continues
+        // across kinds in both directions.
+        if let Some((name, path)) = model_source(self.controller.read(cx), id) {
+            self.open_model_preview(name, path, id, window, cx);
+            return;
+        }
         self.open_asset_preview(id, &[], window, cx);
     }
 

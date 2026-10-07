@@ -345,7 +345,7 @@ impl ModelViewport {
                 // Read zoom limits from config once per key press.
                 let cfg = trove_core::config::AppConfig::load();
                 let (zmin, zmax) = distance_bounds(&cfg);
-                // Shift turns the arrow keys from turning the model into
+                // Shift turns the model keys from turning the model into
                 // sliding it, so the keyboard can do everything the mouse can.
                 let pan = event.keystroke.modifiers.shift;
                 let key = event.keystroke.key.as_str();
@@ -356,21 +356,27 @@ impl ModelViewport {
                 let nudge = |this: &mut Self, dx: f32, dy: f32| {
                     if pan {
                         // Panning pushes the *view*: the model slides the other
-                        // way, which is what an arrow key does in every viewer.
+                        // way, which is what the sliding gesture does in every
+                        // viewer.
                         this.camera.pan_by([dx * panstep, dy * panstep]);
                     } else {
-                        // Turning follows the drag's convention instead, so an
-                        // arrow turns the model the way it points.
+                        // Turning follows the drag's convention instead, so a
+                        // key turns the model the way it points.
                         this.camera.orbit(-dx * keystep, dy * keystep);
                         this.pivot_shown = true;
                     }
                     this.dirty = true;
                 };
+                // The four arrows are deliberately not here. They are the
+                // preview's next/previous — the shell answers `Move*` for
+                // every kind the main area can hold — and a key this handler
+                // claims never reaches those bindings: `on_key_down` runs
+                // before the bindings are matched, and `stop_propagation`
+                // below ends the keystroke. Releasing the arrows is what
+                // makes stepping through the grid work from inside the
+                // viewport; the keyboard camera rides WASD, exactly as the
+                // on-screen hint says.
                 match key {
-                    "left" => nudge(this, -1.0, 0.0),
-                    "right" => nudge(this, 1.0, 0.0),
-                    "up" => nudge(this, 0.0, -1.0),
-                    "down" => nudge(this, 0.0, 1.0),
                     "w" => nudge(this, 0.0, -1.0),
                     "s" => nudge(this, 0.0, 1.0),
                     "a" => nudge(this, -1.0, 0.0),
@@ -394,15 +400,16 @@ impl ModelViewport {
                     "r" => this.reset_camera(cx),
                     _ => return,
                 }
-                // The key was aimed at the viewport: keep an arrow — or a
-                // `q`/`e` bound elsewhere — from also running the app's own
-                // action for it.
+                // The key was aimed at the viewport: keep it — or a `q`/`e`
+                // bound elsewhere — from also running the app's own action
+                // for it. An arrow never gets here, which is what leaves it
+                // to the preview's next/previous bindings.
                 cx.stop_propagation();
                 if key == "r" {
                     // `reset_camera` drew the settled frame itself.
                     cx.notify();
                 } else {
-                    // A held arrow repeats, so this is a gesture: draft frames
+                    // A held key repeats, so this is a gesture: draft frames
                     // while it moves, a settled frame once it stops.
                     this.begin_gesture(cx);
                 }
@@ -936,6 +943,7 @@ impl ModelViewport {
             ))
             .child(line(rust_i18n::t!("viewport.shortcut_zoom").to_string()))
             .child(line(rust_i18n::t!("viewport.shortcut_reset").to_string()))
+            .child(line(rust_i18n::t!("viewport.shortcut_arrows").to_string()))
     }
 
     /// What the canvas shows before the first frame arrives.
