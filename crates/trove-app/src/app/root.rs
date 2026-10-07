@@ -684,7 +684,8 @@ impl AppView {
             return;
         };
         drop(stage);
-        self.workspace.update(cx, |ws, cx| ws.set_stage_mode(true, cx));
+        self.workspace
+            .update(cx, |ws, cx| ws.set_stage_mode(true, cx));
         self.stage_fullscreen = true;
         Self::set_window_fullscreen(window, true);
         // Take the focus now: leaving it on whatever had it means the
@@ -1130,21 +1131,18 @@ impl Render for AppView {
                 .child(stage)
                 .when(!on_video, |stage| {
                     stage.child(
-                        div()
-                            .absolute()
-                            .top_2()
-                            .right_2()
-                            .child(
-                                crate::components::controls::icon_button(
-                                    "stage-exit-fullscreen",
-                                    gpui_kit::assets::IconName::Shrink,
-                                    rust_i18n::t!("video.exit_fullscreen").to_string(),
-                                )
-                                .on_click(cx.listener(|_, _, window, cx| {
-                                    window
-                                        .dispatch_action(Box::new(ExitVideoFullscreen), cx);
-                                })),
-                            ),
+                        div().absolute().top_2().right_2().child(
+                            crate::components::controls::icon_button(
+                                "stage-exit-fullscreen",
+                                gpui_kit::assets::IconName::Shrink,
+                                rust_i18n::t!("video.exit_fullscreen").to_string(),
+                            )
+                            .on_click(cx.listener(
+                                |_, _, window, cx| {
+                                    window.dispatch_action(Box::new(ExitVideoFullscreen), cx);
+                                },
+                            )),
+                        ),
                     )
                 })
                 .into_any_element();
