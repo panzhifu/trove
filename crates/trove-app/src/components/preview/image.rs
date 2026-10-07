@@ -74,18 +74,24 @@ pub(super) fn compact(data: &AssetPreviewData, cx: &App) -> AnyElement {
             .object_fit(ObjectFit::Contain)
             .into_any_element();
     }
-    // A model has no dimensions of its own, so its card takes the shape it is
-    // drawn at instead of the nominal height every other kind is clamped to:
-    // the frame is as wide as the panel and the card fills it exactly, with
-    // none of the side bands a mismatched height leaves behind. The ratio rides
-    // on a wrapper because `img` would otherwise derive its height from the
-    // file's pixels, which are unknown until the thumbnail has loaded.
-    if data.kind == AssetKind::Model
+    // A card the library bakes at a fixed size has no dimensions of its own, so
+    // its card takes the shape it is drawn at instead of the nominal height
+    // every other kind is clamped to: the frame is as wide as the panel and the
+    // card fills it exactly, with none of the side bands a mismatched height
+    // leaves behind. Those bands are more than dead space for an audio or text
+    // card — such a card carries the model card's gradient background, so a flat
+    // frame beside it shows two colours meeting. The ratio rides on a wrapper
+    // because `img` would otherwise derive its height from the file's pixels,
+    // which are unknown until the thumbnail has loaded.
+    let baked_card_aspect = data.baked_card_aspect.or_else(|| {
+        (data.kind == AssetKind::Model).then_some(trove_core::media::thumb::MODEL_CARD_ASPECT)
+    });
+    if let Some(aspect) = baked_card_aspect
         && let Some(path) = &data.thumb
     {
         return div()
             .w_full()
-            .aspect_ratio(trove_core::media::thumb::MODEL_CARD_ASPECT)
+            .aspect_ratio(aspect)
             .child(img(path.clone()).size_full().object_fit(ObjectFit::Contain))
             .into_any_element();
     }

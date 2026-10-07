@@ -2846,7 +2846,12 @@ mod tests {
         // normal references its own colour buffer and the two would land on
         // different pipelines for reasons that have nothing to do with the
         // normal.
-        let positions = vec![[-1.0, -1.0, 0.0], [1.0, -1.0, 0.0], [1.0, 1.0, 0.0], [-1.0, 1.0, 0.0]];
+        let positions = vec![
+            [-1.0, -1.0, 0.0],
+            [1.0, -1.0, 0.0],
+            [1.0, 1.0, 0.0],
+            [-1.0, 1.0, 0.0],
+        ];
         let triangles = vec![[0, 1, 2], [0, 2, 3]];
         let with_normals = Mesh::from_parts(
             positions.clone(),

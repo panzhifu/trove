@@ -189,20 +189,21 @@ pub struct AppView {
     /// notifies never steal the right dock's tab.
     last_selection: Vec<Uuid>,
     title_bar: Entity<TitleBarView>,
-    /// The workspace panel: reached for its preview's player when the
+    /// The workspace panel: reached for its preview's surface when the
     /// fullscreen stage is on.
     workspace: Entity<WorkspacePanel>,
-    /// Whether this window is currently the fullscreen video stage — the
-    /// window itself goes fullscreen and renders the preview's own player,
-    /// so no second window, player or soundtrack is ever built.
-    video_fullscreen: bool,
+    /// Whether this window is currently the fullscreen preview stage — the
+    /// window itself goes fullscreen and renders the preview's own surface
+    /// (the video player, the still, the model viewport, the subtitle
+    /// editor), so no second window, player or soundtrack is ever built.
+    stage_fullscreen: bool,
     /// Focus handle for that stage. It has to hold the window's focus while
     /// it is up: actions and key bindings are dispatched from the focused
     /// element upwards, and the element that had the focus when the stage
     /// came up is no longer in the frame — without this the dispatch falls
     /// back to the window root, which never sees the stage's context, and
     /// neither the exit button nor Esc can leave the stage.
-    video_stage_focus: FocusHandle,
+    stage_focus: FocusHandle,
     /// Watches every keystroke while the stage is up. Esc leaves through the
     /// same exit action as the button; the key binding alone cannot be
     /// relied on because it is matched against the focused element's
@@ -450,8 +451,8 @@ impl AppView {
             last_selection: Vec::new(),
             title_bar,
             workspace,
-            video_fullscreen: false,
-            video_stage_focus: cx.focus_handle(),
+            stage_fullscreen: false,
+            stage_focus: cx.focus_handle(),
             video_escape: None,
             tray,
             quitting,
@@ -669,25 +670,28 @@ impl AppView {
     }
 
     /// Take the stage over: the window goes fullscreen and renders the
-    /// preview's own player, which simply keeps playing. Leaving gives the
-    /// window back — the player never notices either way.
-    fn enter_video_fullscreen(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// preview's own surface, which simply keeps doing what it was doing —
+    /// the video keeps playing, the still keeps its pan/zoom, the model
+    /// keeps its camera. Leaving gives the window back; nothing on the
+    /// stage notices either way.
+    fn enter_stage_fullscreen(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         // Already the stage: answering twice would toggle the window back
         // out of fullscreen under the user.
-        if self.video_fullscreen {
+        if self.stage_fullscreen {
             return;
         }
-        let Some(player) = self.workspace.read(cx).preview_player(cx) else {
+        let Some(stage) = self.workspace.read(cx).preview_stage(cx) else {
             return;
         };
-        player.update(cx, |player, cx| player.set_fullscreen_mode(true, cx));
-        self.video_fullscreen = true;
+        drop(stage);
+        self.workspace.update(cx, |ws, cx| ws.set_stage_mode(true, cx));
+        self.stage_fullscreen = true;
         Self::set_window_fullscreen(window, true);
         // Take the focus now: leaving it on whatever had it means the
         // dispatch tree falls back to the window root as soon as that
         // element leaves the frame, which strands the stage (see
-        // [`AppView::video_stage_focus`]).
-        window.focus(&self.video_stage_focus, cx);
+        // [`AppView::stage_focus`]).
+        window.focus(&self.stage_focus, cx);
         // Belt and braces for Esc and the fullscreen key: this watch fires
         // only when a keystroke resolved to nothing (the docs: after
         // everything else, skipped if propagation stopped) — that is,
@@ -707,19 +711,18 @@ impl AppView {
     }
 
     /// Give the window back to the shell.
-    fn leave_video_fullscreen(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn leave_stage_fullscreen(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         // The mirror of the guard above: an Exit arriving while the stage is
         // down must not throw the window into fullscreen.
-        if !self.video_fullscreen {
+        if !self.stage_fullscreen {
             return;
         }
         // Stop watching keystrokes first: dropping the subscription
         // unregisters it, so the Esc that leaves cannot be seen twice.
         self.video_escape = None;
-        if let Some(player) = self.workspace.read(cx).preview_player(cx) {
-            player.update(cx, |player, cx| player.set_fullscreen_mode(false, cx));
-        }
-        self.video_fullscreen = false;
+        self.workspace
+            .update(cx, |ws, cx| ws.set_stage_mode(false, cx));
+        self.stage_fullscreen = false;
         Self::set_window_fullscreen(window, false);
         // Hand the focus back to the workspace: the stage's handle leaves
         // the frame with it, and a focus pointing at nothing would strand
@@ -1085,41 +1088,65 @@ impl Render for AppView {
         // through the `WindowState` root plugin (registered by `gpui_kit::init`),
         // which renders its own overlay above the root surface.
 
-        // The stage draws the preview's own player, so it needs that player
+        // The stage draws the preview's own surface, so it needs that surface
         // to exist. If the preview went away while the flag was still set —
         // dismissed, or replaced — give the window back here: rendering the
-        // shell in a fullscreen window with `video_fullscreen` stuck true
+        // shell in a fullscreen window with `stage_fullscreen` stuck true
         // would swallow every later `Enter` (see the guard in
-        // `enter_video_fullscreen`) and leave no visible way out.
-        if self.video_fullscreen && self.workspace.read(cx).preview_player(cx).is_none() {
-            self.leave_video_fullscreen(window, cx);
+        // `enter_stage_fullscreen`) and leave no visible way out.
+        let stage = self.workspace.read(cx).preview_stage(cx);
+        if self.stage_fullscreen && stage.is_none() {
+            self.leave_stage_fullscreen(window, cx);
         }
 
-        // Fullscreen video: this very window becomes the stage, holding the
-        // player the preview was already showing — no title bar, no dock, no
-        // status bar, and nothing is handed over, so neither the picture nor
-        // the sound notices the stage appearing or going away.
-        if self.video_fullscreen
-            && let Some(player) = self.workspace.read(cx).preview_player(cx)
+        // Fullscreen preview: this very window becomes the stage, holding
+        // the surface the preview was already showing — no title bar, no
+        // dock, no status bar, and nothing is handed over, so neither the
+        // picture nor the sound notices the stage appearing or going away.
+        // The video keeps its own exit button in the transport; every other
+        // kind gets the floating one in the corner, the one visible way out
+        // a stage without controls would otherwise lack.
+        if self.stage_fullscreen
+            && let Some(stage) = stage
         {
+            let on_video = self.workspace.read(cx).preview_player(cx).is_some();
             // Claim the focus the first frame the stage is up: the handle is
             // only findable once this node has been rendered, and the
-            // `focus` in `enter_video_fullscreen` may have landed before the
+            // `focus` in `enter_stage_fullscreen` may have landed before the
             // stage existed.
-            if !self.video_stage_focus.is_focused(window) {
-                window.focus(&self.video_stage_focus, cx);
+            if !self.stage_focus.is_focused(window) {
+                window.focus(&self.stage_focus, cx);
             }
             return div()
-                .id("video-stage")
+                .id("preview-stage")
                 .relative()
                 .size_full()
                 .bg(black())
-                .track_focus(&self.video_stage_focus)
+                .track_focus(&self.stage_focus)
                 .key_context(crate::app::keybindings::VIDEO_FULLSCREEN_CONTEXT)
                 .on_action(cx.listener(|this, _: &ExitVideoFullscreen, window, cx| {
-                    this.leave_video_fullscreen(window, cx);
+                    this.leave_stage_fullscreen(window, cx);
                 }))
-                .child(player)
+                .child(stage)
+                .when(!on_video, |stage| {
+                    stage.child(
+                        div()
+                            .absolute()
+                            .top_2()
+                            .right_2()
+                            .child(
+                                crate::components::controls::icon_button(
+                                    "stage-exit-fullscreen",
+                                    gpui_kit::assets::IconName::Shrink,
+                                    rust_i18n::t!("video.exit_fullscreen").to_string(),
+                                )
+                                .on_click(cx.listener(|_, _, window, cx| {
+                                    window
+                                        .dispatch_action(Box::new(ExitVideoFullscreen), cx);
+                                })),
+                            ),
+                    )
+                })
                 .into_any_element();
         }
 
@@ -1192,10 +1219,10 @@ impl Render for AppView {
                 );
             }))
             .on_action(cx.listener(|this, _: &EnterVideoFullscreen, window, cx| {
-                this.enter_video_fullscreen(window, cx);
+                this.enter_stage_fullscreen(window, cx);
             }))
             .on_action(cx.listener(|this, _: &ExitVideoFullscreen, window, cx| {
-                this.leave_video_fullscreen(window, cx);
+                this.leave_stage_fullscreen(window, cx);
             }))
             .on_action(cx.listener(|this, _: &Screenshot, window, cx| {
                 this.take_screenshot(window, cx);

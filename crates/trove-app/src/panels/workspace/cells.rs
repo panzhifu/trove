@@ -3,6 +3,7 @@
 //! wiring, plus the list-view row variant.
 
 use super::*;
+use gpui_kit::base::animation::ease_out_cubic;
 use gpui_kit::base::{Align, Placement, Positioner};
 
 /// Longest edge of the larger view a live still or specimen gets. The
@@ -19,6 +20,74 @@ const LOUPE_GAP: f32 = 10.;
 /// Deferred paint priority. Below Base's dialogs (`10 + layer`) and popups
 /// (`100`), so a menu or a sheet always covers the view rather than fighting it.
 const LOUPE_PRIORITY: usize = 5;
+
+// ============================ entrance cascade ===============================
+
+/// How the grid answers a new listing: the tiles fade in and rise the last
+/// few pixels, each row a step behind the one above it. One animation runs
+/// for the whole cascade ([`ENTRANCE_DURATION`]); each tile reads only its
+/// own slice of it, which is what makes the per-row delay free — no timers
+/// and no per-cell state beyond the animation's own start instant.
+///
+/// `epoch` rides in the animation's element id, so a new listing re-runs the
+/// cascade while every other render — a resize, a scroll that re-reveals a
+/// row after the window has passed — finds that id's animation already
+/// finished and paints the tile exactly as it would without it.
+#[derive(Clone, Copy, Default)]
+pub(super) struct Entrance {
+    epoch: u64,
+    step: usize,
+}
+
+/// Total window of the cascade. Each step waits [`ENTRANCE_STEP`] of this
+/// before its tiles start, so a tile's own animation is the span that
+/// remains.
+const ENTRANCE_DURATION: std::time::Duration = std::time::Duration::from_millis(560);
+
+/// How many rows behind the viewport top still get their own step; rows
+/// further down than this all move together, which is what keeps a tall
+/// window from stretching the last tile's wait past the point of reading as
+/// a wave.
+const ENTRANCE_MAX_STEPS: usize = 8;
+
+/// One row's wait, as a fraction of the total window.
+const ENTRANCE_STEP: f32 = 0.05;
+
+/// How far a tile rises while fading in.
+const ENTRANCE_RISE: f32 = 10.0;
+
+impl Entrance {
+    /// The cascade for the row at `row_ix` of the listing named by `epoch`.
+    pub(super) fn at(epoch: u64, row_ix: usize) -> Self {
+        Self {
+            epoch,
+            step: row_ix.min(ENTRANCE_MAX_STEPS),
+        }
+    }
+
+    /// Wrap the finished cell element with its slice of the cascade.
+    fn animated<E>(self, cell: E, id: Uuid) -> AnyElement
+    where
+        E: IntoElement + Styled + 'static,
+    {
+        let start = self.step as f32 * ENTRANCE_STEP;
+        let span = 1.0 - ENTRANCE_MAX_STEPS as f32 * ENTRANCE_STEP;
+        cell.with_animation(
+            ElementId::Name(format!("entrance-{}-{}", self.epoch, id.simple()).into()),
+            Animation::new(ENTRANCE_DURATION),
+            move |cell, delta| {
+                // gpui hands the raw elapsed fraction (its default easing is
+                // linear); the per-row delay carves a slice out of it, and
+                // the slice is eased here so each tile's own run keeps the
+                // fast-start, slow-settle read.
+                let t = ((delta - start) / span).clamp(0.0, 1.0);
+                let eased = ease_out_cubic(t);
+                cell.opacity(eased).top(px((1.0 - eased) * ENTRANCE_RISE))
+            },
+        )
+        .into_any_element()
+    }
+}
 
 // ============================ cell rendering =================================
 
@@ -49,6 +118,8 @@ pub(super) fn build_cell_element(
     cell: &Cell,
     w: f32,
     h: f32,
+    band_active: bool,
+    entrance: Entrance,
 ) -> AnyElement {
     let (kind, thumb, id, trashed) = (cell.kind, cell.thumb.clone(), cell.id, cell.trashed);
     let is_sel = controller.read(cx).selected_assets.contains(&id);
@@ -74,7 +145,7 @@ pub(super) fn build_cell_element(
                 .then(|| {
                     // Subtitled specimen card (fontmatrix style): three
                     // stacked rows (Latin / CJK / digits) under the label.
-                    crate::panels::common::font_specimen_card(family, cx)
+                    crate::panels::common::font_specimen_card(family)
                         .size_full()
                         .text_size(px(font_specimen_size(h)))
                         .into_any_element()
@@ -132,16 +203,19 @@ pub(super) fn build_cell_element(
             cx.theme().border
         })
         .overflow_hidden()
-        // A card baked on trove-core's fixed paper floats over this cell's
-        // background, and a theme surface behind it read as bands above and
-        // below the picture. Audio's waveform and every text card (a `.srt`
-        // subtitle, a `.txt`, a source file — which arrive as `Document` or
-        // `Other`) are all such cards, so those cells take the paper too and
-        // the bands disappear.
+        // A card baked by trove-core floats over this cell's background, and a
+        // theme surface behind it read as bands above and below the picture. Such
+        // a card carries the model renderer's background ramp, so the band takes
+        // that ramp's midpoint — the one colour a letterboxed card is judged
+        // against. Audio's waveform, the font specimen, and every text card (a
+        // `.srt` subtitle, a `.txt`, a source file — which arrive as `Document`
+        // or `Other`) are all such cards, so those cells take the paper too and
+        // the bands disappear; so does an asset whose card was never baked, whose
+        // kind icon then sits on the same surface as its neighbours' cards.
         .when(
             matches!(
                 kind,
-                AssetKind::Audio | AssetKind::Document | AssetKind::Other
+                AssetKind::Font | AssetKind::Audio | AssetKind::Document | AssetKind::Other
             ),
             |cell| cell.bg(gpui::rgb(trove_core::media::CARD_PAPER_RGB)),
         )
@@ -249,6 +323,12 @@ pub(super) fn build_cell_element(
         let m = event.modifiers();
         let multi = m.control || m.platform;
         ctl_click.update(_cx, move |ctl, _| {
+            // The leftover release of an Escape-canceled band is the ghost of
+            // an aborted gesture, not a click; see `WorkspacePanel::
+            // cancel_marquee`.
+            if std::mem::take(&mut ctl.suppress_next_click) {
+                return;
+            }
             if m.shift {
                 // Range select: anchor (last plain click) to this cell in
                 // display order, replacing the selection.
@@ -261,40 +341,56 @@ pub(super) fn build_cell_element(
         });
     });
 
-    // Drag source: drags the clicked asset, or the whole selection when it
-    // includes this one. Borrow before copying: this runs per visible cell
-    // per frame, so cloning the whole selection unconditionally would cost
-    // O(visible × selection) on every render (notably during a resize).
-    let ids_for_drag: Vec<Uuid> = {
-        let selected = controller.read(cx).selected_assets.as_slice();
-        if selected.contains(&id) {
-            selected.to_vec()
-        } else {
-            vec![id]
-        }
-    };
-    let base = base.on_drag(AssetsDrag(ids_for_drag), move |payload, _offset, _, cx| {
-        cx.new(|_cx| AssetsDragPreview {
-            count: payload.0.len(),
-        })
-    });
+    // Drag source — registered only for a tile that is already selected, and
+    // only while no band is in flight. A press on a tile is either the band's
+    // or the drag's, and gpui starts a registered drag after two pixels of
+    // travel, so a drag on an unselected tile would out-race the band's
+    // four-pixel threshold on every press and the band could never start
+    // there. The band-in-flight guard covers the gesture itself: the band
+    // selects the tile it started on the moment it moves, the selection
+    // re-renders the grid, and without the guard that re-render would
+    // register the drag mid-gesture and start a file drag under an active
+    // band. To drag a tile that is not selected, click it first — the drag
+    // carries the whole selection anyway.
+    let base = if is_sel && !band_active {
+        // Borrow before copying: this runs per visible cell
+        // per frame, so cloning the whole selection unconditionally would cost
+        // O(visible × selection) on every render (notably during a resize).
+        let ids_for_drag: Vec<Uuid> = {
+            let selected = controller.read(cx).selected_assets.as_slice();
+            if selected.contains(&id) {
+                selected.to_vec()
+            } else {
+                vec![id]
+            }
+        };
+        let base = base.on_drag(AssetsDrag(ids_for_drag), move |payload, _offset, _, cx| {
+            cx.new(|_cx| AssetsDragPreview {
+                count: payload.0.len(),
+            })
+        });
 
-    // Drag the cell out of the window: promote the in-app drag to a native
-    // file drag handed to the OS (droppable into editors, chats, file
-    // managers). The whole selection goes, exactly what the in-app drag above
-    // carries: one real file per asset, the blob for stored assets (the
-    // receiver sees the content-hash name), the linked original for linked
-    // ones. Must be registered AFTER on_drag with the same payload type.
-    let base = base.external_drag_payload({
-        let controller = controller.clone();
-        move |drag: &AssetsDrag, _, cx| external_files(controller.read(cx), drag)
-    });
+        // Drag the cell out of the window: promote the in-app drag to a native
+        // file drag handed to the OS (droppable into editors, chats, file
+        // managers). The whole selection goes, exactly what the in-app drag above
+        // carries: one real file per asset, the blob for stored assets (the
+        // receiver sees the content-hash name), the linked original for linked
+        // ones. Must be registered AFTER on_drag with the same payload type.
+        base.external_drag_payload({
+            let controller = controller.clone();
+            move |drag: &AssetsDrag, _, cx| external_files(controller.read(cx), drag)
+        })
+    } else {
+        base
+    };
 
     let ctl_menu = controller.clone();
-    base.context_menu(move |menu, window, cx| {
-        asset_context_menu(menu, window, cx, &ctl_menu, id, trashed)
-    })
-    .into_any_element()
+    entrance.animated(
+        base.context_menu(move |menu, window, cx| {
+            asset_context_menu(menu, window, cx, &ctl_menu, id, trashed)
+        }),
+        id,
+    )
 }
 
 /// Font size for a specimen card of the given height: the height actually left
@@ -340,7 +436,7 @@ fn loupe_for(cell: &Cell, anchor: Bounds<Pixels>, cx: &mut App) -> Option<AnyEle
         }
     };
     let content: AnyElement = if let Some(family) = family {
-        crate::panels::common::font_specimen_card(family, cx)
+        crate::panels::common::font_specimen_card(family)
             .size_full()
             .text_size(px(font_specimen_size(height)))
             .into_any_element()
@@ -444,6 +540,8 @@ pub(super) fn build_list_row_element(
     focus_handle: &FocusHandle,
     cell: &Cell,
     w: f32,
+    band_active: bool,
+    entrance: Entrance,
 ) -> AnyElement {
     let (kind, thumb, id, trashed) = (cell.kind, cell.thumb.clone(), cell.id, cell.trashed);
     let (name, size, added) = (cell.name.clone(), cell.size_bytes, cell.added.clone());
@@ -456,7 +554,7 @@ pub(super) fn build_list_row_element(
         && let Some(family) = cell.font_family.as_ref()
         && crate::panels::common::ensure_font_registered(family, cell.font_blob.as_deref(), cx)
     {
-        crate::panels::common::font_live_preview(family, cx)
+        crate::panels::common::font_live_preview(family)
             .w(px(60.))
             .h(px(36.))
             .text_size(px(18.))
@@ -554,6 +652,10 @@ pub(super) fn build_list_row_element(
         let m = event.modifiers();
         let multi = m.control || m.platform;
         ctl_click.update(_cx, move |ctl, _| {
+            // Same ghost-release guard as the grid cell above.
+            if std::mem::take(&mut ctl.suppress_next_click) {
+                return;
+            }
             if m.shift {
                 ctl.select_range_to(id);
             } else if multi {
@@ -564,37 +666,45 @@ pub(super) fn build_list_row_element(
         });
     });
 
-    // Same per-frame cost note as the grid cell drag source above.
-    let ids_for_drag: Vec<Uuid> = {
-        let selected = controller.read(cx).selected_assets.as_slice();
-        if selected.contains(&id) {
-            selected.to_vec()
-        } else {
-            vec![id]
-        }
-    };
-    let base = base.on_drag(AssetsDrag(ids_for_drag), move |payload, _offset, _, cx| {
-        cx.new(|_cx| AssetsDragPreview {
-            count: payload.0.len(),
-        })
-    });
+    // Same drag-source rule as the grid cell above: drag only from a row that
+    // is already selected, and never while a band is in flight — an
+    // unselected row's press belongs to the band, and a registered drag
+    // out-races it after two pixels of travel.
+    let base = if is_sel && !band_active {
+        // Borrow before copying: this runs per visible cell
+        // per frame, so cloning the whole selection unconditionally would cost
+        // O(visible × selection) on every render (notably during a resize).
+        let ids_for_drag: Vec<Uuid> = {
+            let selected = controller.read(cx).selected_assets.as_slice();
+            if selected.contains(&id) {
+                selected.to_vec()
+            } else {
+                vec![id]
+            }
+        };
+        let base = base.on_drag(AssetsDrag(ids_for_drag), move |payload, _offset, _, cx| {
+            cx.new(|_cx| AssetsDragPreview {
+                count: payload.0.len(),
+            })
+        });
 
-    // Drag the cell out of the window: promote the in-app drag to a native
-    // file drag handed to the OS (droppable into editors, chats, file
-    // managers). The whole selection goes, exactly what the in-app drag above
-    // carries: one real file per asset, the blob for stored assets (the
-    // receiver sees the content-hash name), the linked original for linked
-    // ones. Must be registered AFTER on_drag with the same payload type.
-    let base = base.external_drag_payload({
-        let controller = controller.clone();
-        move |drag: &AssetsDrag, _, cx| external_files(controller.read(cx), drag)
-    });
+        // Drag the row out of the window: same native promotion as the grid
+        // cell. Must be registered AFTER on_drag with the same payload type.
+        base.external_drag_payload({
+            let controller = controller.clone();
+            move |drag: &AssetsDrag, _, cx| external_files(controller.read(cx), drag)
+        })
+    } else {
+        base
+    };
 
     let ctl_menu = controller.clone();
-    base.context_menu(move |menu, window, cx| {
-        asset_context_menu(menu, window, cx, &ctl_menu, id, trashed)
-    })
-    .into_any_element()
+    entrance.animated(
+        base.context_menu(move |menu, window, cx| {
+            asset_context_menu(menu, window, cx, &ctl_menu, id, trashed)
+        }),
+        id,
+    )
 }
 
 // asset_context_menu, open_image_search and AssetsDragPreview moved to

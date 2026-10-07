@@ -392,6 +392,13 @@ pub struct LibraryController {
     pub row_height_scale: f32,
     /// How the selection was last changed (see [`SelectionSource`]).
     pub selection_source: SelectionSource,
+    /// One-shot click suppressor. When a band is canceled under a live press
+    /// (Escape), the release that follows still reads as a click to the tile
+    /// the press started on — gpui's pending mouse down knows nothing of the
+    /// cancel — and a plain click there would write a one-tile selection over
+    /// the restore. The grid arms this on cancel and disarms it on the next
+    /// press; a tile click consumes it and does nothing.
+    pub suppress_next_click: bool,
     /// Active visual-search results shown by the grid in place of the
     /// normal browse query. `None` = not searching.
     pub visual_results: Option<VisualSearchResults>,
@@ -541,6 +548,7 @@ impl LibraryController {
             grid_loaded: GRID_PAGE_SIZE,
             row_height_scale: config.grid_zoom(),
             selection_source: SelectionSource::None,
+            suppress_next_click: false,
             visual_results: None,
             notice: None,
             integrity_report: None,
@@ -1094,6 +1102,14 @@ impl LibraryController {
             self.query_vector = None;
         } else {
             self.active_smart = None;
+            // The browse ranks a search over the live listing only — in the
+            // trash and the recently-viewed list it ignores the term — so a
+            // search committed from either of those views has to leave them:
+            // otherwise the query is a silent no-op, the grid never moves,
+            // and the search reads as broken. The same leave-the-view rule
+            // the smart selection and the visual search already follow.
+            self.showing_trash = false;
+            self.showing_recent = false;
             // A typed search replaces the visual-search results view.
             self.close_visual_search();
         }
@@ -1281,6 +1297,23 @@ impl LibraryController {
     /// Select every asset currently displayed by the grid.
     pub fn select_all_visible(&mut self) {
         self.selected_assets = Rc::new(self.visible_assets().to_vec());
+        self.selection_source = SelectionSource::Multi;
+    }
+
+    /// Replace the selection with `ids`, which arrive in display order — that
+    /// is how a rubber band collects them, walking the frozen rows from the
+    /// first one down, and it is what makes the primary (last) id the lowest
+    /// tile the band covered rather than wherever the pointer left off.
+    ///
+    /// Like every other selection mutation here it must not bump the
+    /// generation: a band dragged across a few hundred tiles would otherwise
+    /// re-run the data pass — a SQL query plus a file stat per asset — on every
+    /// frame of the drag. Nothing is recorded as viewed either, because the
+    /// band's primary is a side effect of where the pointer stopped rather than
+    /// something the user looked at.
+    pub fn set_selection(&mut self, ids: Vec<Uuid>) {
+        self.selection_anchor = ids.last().copied();
+        self.selected_assets = Rc::new(ids);
         self.selection_source = SelectionSource::Multi;
     }
 

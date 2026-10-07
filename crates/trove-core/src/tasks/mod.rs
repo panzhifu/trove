@@ -1616,8 +1616,9 @@ mod tests {
         );
         let _ = gate_tx.send(());
         drop(gate_tx);
-        let order: Vec<&'static str> =
-            (0..2).filter_map(|_| done_rx.recv_timeout(std::time::Duration::from_secs(5)).ok()).collect();
+        let order: Vec<&'static str> = (0..2)
+            .filter_map(|_| done_rx.recv_timeout(std::time::Duration::from_secs(5)).ok())
+            .collect();
         assert_eq!(order, ["high", "normal"], "the priority lane runs first");
     }
 

@@ -244,6 +244,13 @@ pub(crate) struct AssetPreviewData {
     pub(crate) font_preview: Option<font::FontPreviewState>,
     /// Media dimensions, for the inspector card's aspect-fit height.
     pub(crate) dimensions: Option<(u32, u32)>,
+    /// The aspect ratio of a thumbnail that is a card baked by trove-core at a
+    /// fixed size — an audio waveform or a text/subtitle card — `None` for one
+    /// that is a picture of the file. The inspector sizes its frame by this:
+    /// such a card carries the model card's gradient background, so a frame
+    /// letterboxing it shows flat paper beside a gradient, which reads as the
+    /// card and its frame disagreeing on colour.
+    pub(crate) baked_card_aspect: Option<f32>,
     /// Cache root plus content hash, which is everything the waveform cache
     /// needs to key itself. Only audio uses it today; it is not folded into
     /// `thumb` because a thumbnail's path is a finished artifact while this is
@@ -386,6 +393,11 @@ impl AssetPreviewData {
             font_base_weight: asset.facts.font.weight,
             font_preview: None,
             dimensions: asset.width.zip(asset.height),
+            baked_card_aspect: trove_core::media::thumb::card_bake_size(
+                asset.kind,
+                asset.ext.as_str(),
+            )
+            .map(|(w, h)| w as f32 / h as f32),
             duration_ms: asset.duration_ms,
             wave_cache: asset
                 .content_hash
@@ -850,13 +862,6 @@ impl AssetPreviewPanel {
     /// grabbing a frame, and the reason the toolbar button appears only then.
     pub(crate) fn has_video(&self) -> bool {
         self.video.is_some()
-    }
-
-    /// Whether a player is on screen that the space bar can hold and resume:
-    /// a video, an animated image, or an audio track. The space bar answers
-    /// for all three.
-    pub(crate) fn has_playback(&self) -> bool {
-        self.video.is_some() || self.anim.is_some() || self.audio.is_some()
     }
 
     /// Whether this preview carries the exposure control at all: a

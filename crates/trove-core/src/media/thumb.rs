@@ -1,6 +1,6 @@
 //! Thumbnail cache: small JPEG previews generated beside the blobs.
 //!
-//! Layout mirrors the blob buckets: `thumbs/<sha[:2]>/<sha>.jpg`, with a
+//! Layout mirrors the blob buckets: `thumbs/<sha[:2]>/<sha[2:]>.jpg`, with a
 //! video's first-frame poster beside it as `<sha>.poster.jpg`. Both are
 //! derived purely from content, so they are safe to delete and regenerate.
 
@@ -315,9 +315,11 @@ fn write_font_card(blob_path: &Path, out: &Path) -> Option<PathBuf> {
     let font = fontdue::Font::from_bytes(bytes, fontdue::FontSettings::default()).ok()?;
 
     let (w, h) = FONT_CARD_SIZE;
-    let [r, g, b] = crate::media::CARD_PAPER;
-    let mut card = image::RgbaImage::from_pixel(w, h, image::Rgba([r, g, b, 0xFF]));
-    let ink = [0x20_u8, 0x21, 0x24];
+    // The same paper a model, a waveform or a subtitle card is drawn on. A flat
+    // fill of the paper's midpoint was the earlier surface here, and it sat next
+    // to the ramp the other cards carry as a block of its own colour.
+    let mut card = image::RgbaImage::from_raw(w, h, crate::media::render3d::background_rgba(w, h))?;
+    let ink = crate::media::CARD_INK;
     let lines = default_specimen_rows();
 
     // Rasterize every usable glyph up front: a row is dropped entirely when
@@ -855,6 +857,24 @@ const TEXT_CARD_COLUMNS: usize = 52;
 /// megabyte the viewer is allowed.
 const TEXT_CARD_READ_BYTES: usize = 8 * 1024;
 
+/// The size `ensure` bakes a card at, when this asset's thumbnail *is* a card
+/// rather than a picture of the file: an audio waveform, a font specimen, or a
+/// text/subtitle card (the arms are in `ensure`'s own order, so the picture
+/// kinds answer `None` even when their extension looks like text). All three are
+/// composited over the model card's gradient background, which is why the surface
+/// that shows one asks: a frame taller or wider than the card puts its own flat
+/// colour beside a gradient that runs top-to-bottom, and the seam reads as the
+/// card and its background disagreeing on colour.
+pub fn card_bake_size(kind: AssetKind, ext: &str) -> Option<(u32, u32)> {
+    match kind {
+        AssetKind::Audio => Some(AUDIO_CARD_SIZE),
+        AssetKind::Font => Some(FONT_CARD_SIZE),
+        AssetKind::Image | AssetKind::Video | AssetKind::Model => None,
+        _ if crate::media::text::is_text_ext(ext) => Some(TEXT_CARD_SIZE),
+        _ => None,
+    }
+}
+
 /// The card for a text file: the file's own opening lines, drawn as ink with
 /// no background of its own, composited over the model card's background so a
 /// text/subtitle card is the same surface as a model card.
@@ -918,13 +938,6 @@ fn card_lines(text: &str) -> Vec<String> {
     lines
 }
 
-/// The audio card: the file's envelope waveform.
-///
-/// The waveform is only drawn from an envelope that is *already* cached.
-/// Building one costs an ffmpeg pass, and this runs on the import hot path, so
-/// a file with no cached envelope keeps the kind icon it always had — until
-/// the envelope exists because the file was previewed, or until a thumbnail
-/// rebuild asks for it.
 /// The audio card: the file's envelope waveform.
 ///
 /// Building the envelope costs one ffmpeg pass, and the import pays it: the
@@ -1576,7 +1589,7 @@ mod tests {
     /// found (keep the suite independent of installed fonts).
     #[test]
     fn font_card_generated_from_system_font() {
-        let font_path = ["usr/share/fonts"]
+        let font_path = ["/usr/share/fonts"]
             .iter()
             .flat_map(|d| walkdir_candidates(std::path::Path::new(d)))
             .find(|p| {
@@ -1597,6 +1610,19 @@ mod tests {
         let img = image::open(out.expect("card")).unwrap();
         let (w, _) = img.dimensions();
         assert_eq!(w, FONT_CARD_SIZE.0);
+
+        // And it is baked on the model card's ramp rather than a flat fill, the
+        // same paper the waveform and text cards sit on: a grid row that mixes
+        // kinds is then one surface. A flat card answers with the same grey at
+        // both ends of the column, however the theme is set.
+        let card = img.to_rgb8();
+        let (w, h) = card.dimensions();
+        let top = card.get_pixel(w / 2, 2);
+        let bottom = card.get_pixel(w / 2, h - 3);
+        assert!(
+            i16::from(top[0]) - i16::from(bottom[0]) > 8,
+            "the specimen sits on the ramp, got {top:?} above {bottom:?}"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -1738,6 +1764,33 @@ mod tests {
         assert_eq!(lines[2].chars().count(), TEXT_CARD_COLUMNS, "cut to width");
         assert_eq!(lines[3], "", "a blank line survives as a blank line");
         assert_eq!(lines[4], "c");
+    }
+
+    /// A frame that shows a baked card sizes itself by the bake, so the answer
+    /// has to be exactly what `ensure` bakes: a waveform, a font specimen or a
+    /// text card gets the box it is drawn at, everything else gets nothing and
+    /// keeps letterboxing by the file's own aspect. The picture kinds are
+    /// answered first, the way `ensure` dispatches — a `.srt` recorded as a video
+    /// keeps its video frame, and a PDF, which is a `Document`, keeps its page.
+    #[test]
+    fn the_card_bake_answers_for_the_generated_cards_only() {
+        assert_eq!(
+            card_bake_size(AssetKind::Audio, "mp3"),
+            Some(AUDIO_CARD_SIZE)
+        );
+        assert_eq!(
+            card_bake_size(AssetKind::Document, "txt"),
+            Some(TEXT_CARD_SIZE)
+        );
+        assert_eq!(
+            card_bake_size(AssetKind::Other, "srt"),
+            Some(TEXT_CARD_SIZE)
+        );
+        assert_eq!(card_bake_size(AssetKind::Font, "ttf"), Some(FONT_CARD_SIZE));
+        assert_eq!(card_bake_size(AssetKind::Image, "jpg"), None);
+        assert_eq!(card_bake_size(AssetKind::Video, "srt"), None);
+        assert_eq!(card_bake_size(AssetKind::Document, "pdf"), None);
+        assert_eq!(card_bake_size(AssetKind::Archive, "zip"), None);
     }
 
     fn walkdir_candidates(dir: &Path) -> Vec<PathBuf> {

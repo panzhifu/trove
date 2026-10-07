@@ -61,7 +61,11 @@ gpui_kit::actions!(
         // in it and the committed query selected. Handled on `AppView` (the
         // window root), so it reaches the search box from any panel.
         FocusSearch,
-        // -- Fullscreen video stage -----------------------------------------
+        // -- Fullscreen preview stage ----------------------------------------
+        // The window itself becomes the stage and renders whatever the open
+        // preview hosts — video, still, model viewport, subtitle editor. The
+        // names keep their historical "Video": the gesture arrived with the
+        // video player, and the shortcut labels are keyed on them.
         EnterVideoFullscreen,
         ExitVideoFullscreen,
         // -- Live playback ---------------------------------------------------

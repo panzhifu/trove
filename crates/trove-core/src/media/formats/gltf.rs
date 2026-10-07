@@ -1322,7 +1322,12 @@ mod tests {
     #[test]
     fn triangle_strips_and_fans_are_converted() {
         let mut strip = Vec::new();
-        triangles_of(gltf::mesh::Mode::TriangleStrip, &[0, 1, 2, 3], 0, &mut strip);
+        triangles_of(
+            gltf::mesh::Mode::TriangleStrip,
+            &[0, 1, 2, 3],
+            0,
+            &mut strip,
+        );
         assert_eq!(strip, vec![[0, 1, 2], [2, 1, 3]]);
 
         // The primitive's `base` offsets every index, so a later primitive's
@@ -1361,7 +1366,10 @@ mod tests {
     #[test]
     fn a_data_uri_yields_its_payload() {
         // "PNG" base64-encodes to "UE5H".
-        assert_eq!(data_uri_bytes("image/png;base64,UE5H"), Some(b"PNG".to_vec()));
+        assert_eq!(
+            data_uri_bytes("image/png;base64,UE5H"),
+            Some(b"PNG".to_vec())
+        );
         assert_eq!(data_uri_bytes("image/png,%41%42"), Some(b"AB".to_vec()));
         // A URI with no comma names nothing.
         assert_eq!(data_uri_bytes("image/png;base64"), None);
@@ -1380,10 +1388,8 @@ mod tests {
     /// Write a self-contained `.gltf` (buffers and images inlined as `data:`
     /// URIs) so a test needs no companion files.
     fn gltf_file(json: &str) -> std::path::PathBuf {
-        let path = std::env::temp_dir().join(format!(
-            "trove-gltf-test-{}.gltf",
-            uuid::Uuid::new_v4()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("trove-gltf-test-{}.gltf", uuid::Uuid::new_v4()));
         std::fs::write(&path, json).unwrap();
         path
     }
@@ -1444,7 +1450,10 @@ mod tests {
         let path = gltf_file(&json);
         let mesh = load_gltf(&path).expect("a data-uri gltf parses");
         std::fs::remove_file(&path).ok();
-        let texture = mesh.texture.as_ref().expect("the inline image becomes a slot");
+        let texture = mesh
+            .texture
+            .as_ref()
+            .expect("the inline image becomes a slot");
         assert_eq!(texture.maps.len(), 1);
         assert_eq!(texture.material_of(0).slot, 0);
     }

@@ -1021,7 +1021,7 @@ impl InspectorPanel {
         let mut section = v_flex().gap_1();
         if let (Some(family), true) = (&facts.family, registered) {
             section = section.child(
-                crate::panels::common::font_live_preview(family, cx)
+                crate::panels::common::font_live_preview(family)
                     .h(px(48.))
                     .text_size(px(20.))
                     .rounded(cx.theme().radius),

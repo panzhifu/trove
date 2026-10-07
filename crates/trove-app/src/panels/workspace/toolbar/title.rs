@@ -19,6 +19,7 @@ use gpui_kit::component::{IconName, Sizable as _, WindowExt as _};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
+use crate::app::actions::EnterVideoFullscreen;
 use crate::components::controls::{icon_button, muted_label};
 use crate::components::preview::{AssetPreviewPanel, ModelViewport, SubtitleEditor, font};
 use crate::library::LibraryController;
@@ -223,9 +224,27 @@ impl DockPanel for WorkspacePanel {
 /// A thin adaptation rather than a reimplementation: the viewport owns these
 /// buttons, so the bar asks it for them and the two cannot drift.
 fn model_toolbar(viewport: &Entity<ModelViewport>, cx: &mut Context<WorkspacePanel>) -> AnyElement {
-    viewport.update(cx, |viewport, cx| {
+    let tools = viewport.update(cx, |viewport, cx| {
         viewport.title_tools(cx).into_any_element()
-    })
+    });
+    // Fullscreen rides beside the viewport's own tools: the action takes the
+    // window over, the canvas keeps its camera, and the toolbar's other
+    // controls are back the moment the window is.
+    h_flex()
+        .items_center()
+        .gap_1()
+        .child(tools)
+        .child(
+            icon_button(
+                "model-fullscreen",
+                gpui_kit::assets::IconName::Maximize,
+                rust_i18n::t!("video.fullscreen").to_string(),
+            )
+            .on_click(|_, window, cx| {
+                window.dispatch_action(Box::new(EnterVideoFullscreen), cx);
+            }),
+        )
+        .into_any_element()
 }
 
 /// The subtitle editor's title-bar controls — copy, edit, save, then close —
@@ -275,6 +294,19 @@ fn subtitle_toolbar(
                     })),
             )
         })
+        // Fullscreen for the editor too: the cues fill the window, and the
+        // editing state rides along — the same action every other preview
+        // uses, answered by the app view taking its own window over.
+        .child(
+            icon_button(
+                "subtitle-fullscreen",
+                MediaIcon::Maximize,
+                rust_i18n::t!("video.fullscreen").to_string(),
+            )
+            .on_click(|_, window, cx| {
+                window.dispatch_action(Box::new(EnterVideoFullscreen), cx);
+            }),
+        )
         .child(
             icon_button(
                 "subtitle-close",
@@ -551,6 +583,24 @@ fn preview_toolbar(
     let font_state = font::tool_state(preview.read(cx));
     if let Some(state) = font_state {
         bar = bar.child(font::toolbar(preview.clone(), state, window, cx));
+    }
+
+    // Fullscreen, for every preview without a player of its own: a video's
+    // transport already carries the toggle, and the others take the toolbar
+    // button so the gesture is discoverable beyond the `f` key. Both go
+    // through the same action the app view answers by taking its window
+    // over — the preview is not handed anywhere, it just fills the screen.
+    if !has_video {
+        bar = bar.child(
+            icon_button(
+                "preview-fullscreen",
+                ToolIcon::Maximize,
+                rust_i18n::t!("video.fullscreen").to_string(),
+            )
+            .on_click(move |_, window, cx| {
+                window.dispatch_action(Box::new(EnterVideoFullscreen), cx);
+            }),
+        );
     }
 
     bar.child(

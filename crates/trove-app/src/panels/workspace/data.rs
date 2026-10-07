@@ -102,16 +102,32 @@ impl Row {
             header: Some(label),
         }
     }
-    /// Horizontal center of each cell (for up/down nearest-column moves).
-    pub(super) fn centers(&self) -> Vec<f32> {
-        let mut x = GRID_GAP / 2.0;
+    /// Where each cell sits inside its row: `(left, width)` from the same
+    /// cumulative arithmetic the row is laid out with. The justified layout
+    /// sizes cells to `content_width − GRID_GAP · (n − 1)` and the row renders
+    /// `h_flex().gap(GRID_GAP)`, so the first cell is flush with the row's left
+    /// edge and every gap sits *between* cells — a leading half-gap would shift
+    /// every rectangle right, and anything that turns an x-coordinate back into
+    /// a cell would then disagree with what is on screen. That mapping reads
+    /// this: the keyboard's nearest-column move through [`Self::centers`], and
+    /// the rubber band's hit test directly.
+    pub(super) fn spans(&self) -> Vec<(f32, f32)> {
+        let mut x = 0.0;
         self.widths
             .iter()
-            .map(|w| {
-                let c = x + w / 2.0;
+            .map(|&w| {
+                let left = x;
                 x += w + GRID_GAP;
-                c
+                (left, w)
             })
+            .collect()
+    }
+
+    /// Horizontal center of each cell (for up/down nearest-column moves).
+    pub(super) fn centers(&self) -> Vec<f32> {
+        self.spans()
+            .into_iter()
+            .map(|(left, w)| left + w / 2.0)
             .collect()
     }
 }
@@ -286,6 +302,7 @@ impl WorkspacePanel {
             available_width,
             rows: Rc::new(Vec::new()),
             list_state,
+            marquee: None,
             zoom_slider,
             colour_similarity_slider,
             view_key: None,
@@ -310,6 +327,7 @@ impl WorkspacePanel {
             page_guard: Rc::new(CellFlag::new(usize::MAX)),
             last_search: String::new(),
             last_fused: false,
+            entrance_epoch: 0,
         };
         observe_controller(cx, &this.controller);
         // Quick look follows the card. Once the space bar has lit one, moving the

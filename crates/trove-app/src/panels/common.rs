@@ -349,21 +349,58 @@ pub(crate) fn patch_os2_weight(bytes: &[u8], weight: u16) -> Option<Vec<u8>> {
     None
 }
 
+/// The paper every generated card is baked on, as a UI background: the model
+/// renderer's own top-to-bottom ramp.
+///
+/// A live specimen has to wear it because the tiles beside it do: a baked card
+/// cannot follow the theme, so the grid is already a row of one fixed surface,
+/// and a font cell painted in a theme colour read as the odd one out — and
+/// flipped to a dark block entirely in the dark theme.
+fn card_paper() -> Background {
+    // The ramp's two ends as the RGB bytes the rasterizer would round to, so
+    // the live card and a baked one meet at the same colour rather than at
+    // whichever side of a rounding gap they land on.
+    let stop = |c: [f32; 3]| {
+        gpui::rgb(
+            ((c[0] * 255.0).round() as u32) << 16
+                | ((c[1] * 255.0).round() as u32) << 8
+                | (c[2] * 255.0).round() as u32,
+        )
+    };
+    linear_gradient(
+        180.,
+        linear_color_stop(stop(trove_core::media::render3d::BG_TOP), 0.),
+        linear_color_stop(stop(trove_core::media::render3d::BG_BOTTOM), 1.),
+    )
+}
+
+/// The ink a generated card draws with, for the specimen that is drawn live
+/// rather than rasterized.
+fn card_ink() -> Hsla {
+    gpui::rgb(trove_core::media::CARD_INK_RGB).into()
+}
+
+/// The ink's muted companion on the same paper — what a card's own label uses.
+fn card_ink_muted() -> Hsla {
+    gpui::rgb(trove_core::media::CARD_MUTED_RGB).into()
+}
+
 /// One live specimen line for a registered font: the built-in sample text
-/// rendered in the font itself, centered on a soft card background, single
-/// row. The caller sizes it (grid cells stretch, list leads get fixed dims).
-pub(crate) fn font_live_preview(family: &str, cx: &App) -> Div {
+/// rendered in the font itself, centered on the same paper the rasterized cards
+/// are baked on, single row. The caller sizes it (grid cells stretch, list leads
+/// get fixed dims).
+pub(crate) fn font_live_preview(family: &str) -> Div {
     div()
         .flex()
         .items_center()
         .justify_center()
         .overflow_hidden()
-        .bg(cx.theme().secondary)
+        .bg(card_paper())
         .child(
             div()
                 .font_family(family.to_string())
                 .whitespace_nowrap()
-                .text_color(cx.theme().foreground)
+                .text_color(card_ink())
                 .child(trove_core::media::thumb::DEFAULT_FONT_SAMPLE),
         )
 }
@@ -373,14 +410,14 @@ pub(crate) fn font_live_preview(family: &str, cx: &App) -> Div {
 /// digits at the bottom, the same rows the rasterized font card stacks —
 /// with a small UI-font family label pinned to the top-left corner (the
 /// "subtitled preview" mode), so every specimen stays attributable.
-pub(crate) fn font_specimen_card(family: &str, cx: &App) -> Div {
+pub(crate) fn font_specimen_card(family: &str) -> Div {
     div()
         .relative()
         .flex()
         .items_center()
         .justify_center()
         .overflow_hidden()
-        .bg(cx.theme().secondary)
+        .bg(card_paper())
         .child(
             div()
                 .flex()
@@ -396,7 +433,7 @@ pub(crate) fn font_specimen_card(family: &str, cx: &App) -> Div {
                             .whitespace_nowrap()
                             .truncate()
                             .max_w_full()
-                            .text_color(cx.theme().foreground)
+                            .text_color(card_ink())
                             .child(line)
                     }),
                 ),
@@ -409,7 +446,7 @@ pub(crate) fn font_specimen_card(family: &str, cx: &App) -> Div {
                 .right(px(7.))
                 .truncate()
                 .text_xs()
-                .text_color(cx.theme().muted_foreground)
+                .text_color(card_ink_muted())
                 .child(family.to_string()),
         )
 }

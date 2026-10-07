@@ -68,7 +68,7 @@ mod open_with_apps;
 mod rows;
 mod toolbar;
 
-use cells::{build_cell_element, build_list_row_element, model_source};
+use cells::{Entrance, build_cell_element, build_list_row_element, model_source};
 use data::{
     Cell, DataKey, Direction, Row, TIMELINE_HEADER_HEIGHT, ViewData, ViewKey, hsla_to_hex,
     same_listing, total_identity,
@@ -142,6 +142,83 @@ impl MainPreview {
     }
 }
 
+/// How far the pointer has to travel before a press on empty grid becomes a
+/// band rather than a click. Under this a release does what a click on empty
+/// grid does everywhere else: it drops the selection.
+const MARQUEE_THRESHOLD: f32 = 4.0;
+
+/// The band scrolls the grid while the pointer sits within this many pixels of
+/// the viewport's top or bottom edge, so one drag can reach rows the frozen
+/// list has not measured yet (`ListState::bounds_for_item` answers `None` past
+/// the overdraw, and an unmapped row cannot be hit-tested).
+const MARQUEE_EDGE: f32 = 24.0;
+
+/// How far one such frame steps. Deliberately movement-driven rather than a
+/// timer: the band advances on the frame a move arrives, so a pointer parked on
+/// the edge neither scrolls by itself nor keeps the frame loop awake.
+const MARQUEE_SCROLL_STEP: f32 = 24.0;
+
+/// A rubber band in flight. Its two corners are in window coordinates — the same
+/// space `ListState::bounds_for_item` reports — so the rectangle and the tiles
+/// are compared without translating either, and a scroll leaves the band exactly
+/// where the pointer left it while the content moves under it.
+struct Marquee {
+    origin: Point<Pixels>,
+    current: Point<Pixels>,
+    /// The selection as it was when the band began, kept because an additive
+    /// band adds to *that* rather than to whatever its own previous frame
+    /// wrote: a band swept left and back over the same tiles must not lose the
+    /// selection it started with, and must not double-count either.
+    base: Rc<Vec<Uuid>>,
+    additive: bool,
+    /// Past [`MARQUEE_THRESHOLD`], so the rectangle is real and the hit test
+    /// runs.
+    dragged: bool,
+    /// The press began on a tile rather than on empty grid. Unselected tiles
+    /// lend their press to the band — their file drag is only registered for
+    /// selected tiles, see `build_cell_element` — and the release then owes
+    /// the tile its own click: select, toggle, range, the double click's
+    /// preview. Only a click on *empty* grid is the band's to answer with a
+    /// clear.
+    on_tile: bool,
+}
+
+impl Marquee {
+    /// The band as a rectangle of non-negative size: dragging up and left
+    /// covers what dragging down and right does.
+    fn rect(&self) -> Bounds<Pixels> {
+        Bounds::from_corners(
+            point(
+                self.origin.x.min(self.current.x),
+                self.origin.y.min(self.current.y),
+            ),
+            point(
+                self.origin.x.max(self.current.x),
+                self.origin.y.max(self.current.y),
+            ),
+        )
+    }
+}
+
+/// What a band selects: its own tiles, and — when it adds rather than replaces
+/// — whatever was selected when the press began, after the band's tiles and
+/// without repeating anything.
+///
+/// The base is the selection *as it was at the press*, never as the previous
+/// frame of this same band left it: that is what lets a band swept over its own
+/// tiles and back lose nothing and double-count nothing. Spelled out here rather
+/// than inline because it is the one rule of this gesture a later change can get
+/// silently wrong.
+fn merge_band_selection(base: &[Uuid], hits: Vec<Uuid>, additive: bool) -> Vec<Uuid> {
+    if !additive {
+        return hits;
+    }
+    let mut seen: std::collections::HashSet<Uuid> = hits.iter().copied().collect();
+    let mut ids = hits;
+    ids.extend(base.iter().copied().filter(|id| seen.insert(*id)));
+    ids
+}
+
 pub struct WorkspacePanel {
     focus_handle: FocusHandle,
     /// Focus of the tiles themselves, as distinct from the panel. The space bar
@@ -175,6 +252,11 @@ pub struct WorkspacePanel {
     rows: Rc<Vec<Row>>,
     /// Virtualized list state (row count + scroll position).
     list_state: ListState,
+    /// A rubber band in flight, or `None` when nothing is being dragged. Held
+    /// here rather than on the controller because the band repaints the grid on
+    /// every frame it moves, and waking the controller would wake every panel
+    /// that observes the library — see [`Marquee`].
+    marquee: Option<Marquee>,
     /// Grid-zoom slider (title bar): pending scale before release; the
     /// committed value lives in [`LibraryController::row_height_scale`].
     zoom_slider: Entity<SliderState>,
@@ -258,6 +340,12 @@ pub struct WorkspacePanel {
     /// scroll back to row 0 the moment either moves.
     last_search: String,
     last_fused: bool,
+    /// Entrance cascade epoch: bumped every time the listing identity
+    /// changes (a search commits, a filter or view switches, the sort
+    /// moves). It names the animation generation the tiles belong to, so a
+    /// change re-runs the cascade while a scroll that re-reveals old rows
+    /// does not — see [`cells::Entrance`].
+    entrance_epoch: u64,
 }
 
 impl WorkspacePanel {
@@ -270,20 +358,40 @@ impl WorkspacePanel {
         }
     }
 
+    /// What the app view's fullscreen stage renders: the preview's own
+    /// surface, whichever kind is open. Nothing is handed over — the video
+    /// keeps playing, the still keeps its pan/zoom, the model keeps its
+    /// camera — the same contract the video stage established, extended to
+    /// every preview. A video renders through its bare player (no stage
+    /// padding around the picture, exactly as the video-only stage drew it);
+    /// every other kind renders through its host panel.
+    pub(crate) fn preview_stage(&self, cx: &App) -> Option<AnyElement> {
+        match &self.preview {
+            Some(MainPreview::Asset(panel)) => match panel.read(cx).video_player() {
+                Some(player) => Some(player.clone().into_any_element()),
+                None => Some(panel.clone().into_any_element()),
+            },
+            Some(MainPreview::Model(viewport)) => Some(viewport.clone().into_any_element()),
+            Some(MainPreview::Subtitle(editor)) => Some(editor.clone().into_any_element()),
+            None => None,
+        }
+    }
+
+    /// Tell the preview it now lives on the fullscreen stage — or that it
+    /// has come back. Only the video player changes anything (its transport
+    /// swaps the fullscreen button's direction); every other kind is drawn
+    /// on the stage as it is.
+    pub(crate) fn set_stage_mode(&self, on: bool, cx: &mut App) {
+        if let Some(player) = self.preview_player(cx) {
+            player.update(cx, |player, cx| player.set_fullscreen_mode(on, cx));
+        }
+    }
+
     /// The asset preview panel, whichever player it hosts.
     fn preview_asset_panel(&self) -> Option<Entity<AssetPreviewPanel>> {
         match &self.preview {
             Some(MainPreview::Asset(panel)) => Some(panel.clone()),
             _ => None,
-        }
-    }
-
-    /// Whether the open preview has a picture the space bar can hold and
-    /// resume: a video or an animated image.
-    fn preview_has_playback(&self, cx: &App) -> bool {
-        match &self.preview {
-            Some(MainPreview::Asset(panel)) => panel.read(cx).has_playback(),
-            _ => false,
         }
     }
 
@@ -637,11 +745,15 @@ impl Render for WorkspacePanel {
         // The action handlers are shared by both modes, so the shell is built
         // before the branch below picks what goes inside it.
         //
-        // `VideoPreview` rides along only while a video is open: the bare
+        // `VideoPreview` rides along only while a preview is open: the bare
         // letters and characters bound there (`f` for fullscreen, `space` for
-        // play/pause) would otherwise be those characters, gone from typing in
-        // the search box, which shares this node's `Workspace` context.
-        let playback_preview = self.preview_has_playback(cx);
+        // play/pause) would otherwise be those characters, gone from typing
+        // in the search box, which shares this node's `Workspace` context.
+        // Every preview carries it now, not just the playing ones — the
+        // fullscreen toggle belongs to a still and to a model the same way,
+        // and the playback bindings answer as no-ops where there is nothing
+        // to hold or step.
+        let preview_open = self.preview.is_some();
         // A node carries one `KeyContext`, but a `KeyContext` is a *set* of
         // names, parsed from a whitespace-separated string. Setting the second
         // name on its own would replace the first: gpui reads a node's single
@@ -649,7 +761,7 @@ impl Render for WorkspacePanel {
         // `Workspace` would vanish from the path for as long as a video was on
         // screen and take every binding scoped to it with it — Escape out of
         // the preview, the arrows that step through it, `Enter`, `Delete`.
-        let key_context = if playback_preview {
+        let key_context = if preview_open {
             format!(
                 "{} {}",
                 crate::app::keybindings::WORKSPACE_CONTEXT,
@@ -717,11 +829,15 @@ impl Render for WorkspacePanel {
                 }
             }))
             .on_action(cx.listener(|this, _: &ClearSelection, window, cx| {
-                // Escape backs out of the innermost thing: out of the
-                // main-area preview when one is open, then out of a live
-                // card, and only then to the app root, which clears the
-                // grid selection as before.
-                if this.preview.is_some() {
+                // Escape backs out of the innermost thing: out of a band still
+                // in flight, whose selection goes back to what the press
+                // started with, then out of the main-area preview when one is
+                // open, then out of a live card, and only then to the app
+                // root, which clears the grid selection as before.
+                if this.marquee.is_some() {
+                    this.cancel_marquee(cx);
+                    cx.stop_propagation();
+                } else if this.preview.is_some() {
                     this.dismiss_preview(window, cx);
                     cx.stop_propagation();
                 } else if this.quick_look.read(cx).is_on() {
@@ -1082,6 +1198,13 @@ impl Render for WorkspacePanel {
             // or a slider drag does not throw the user back to the top.
             layout_changed = true;
             let width_only = width_changed && !other_changed;
+            // A new view resets the scroll to the top, and the entrance
+            // cascade reads that as its starting line: every tile in the new
+            // listing waves in from the first visible row. A width-only
+            // re-justify is the same listing — its tiles must not re-run it.
+            if !width_only {
+                self.entrance_epoch = self.entrance_epoch.wrapping_add(1);
+            }
             let anchor = if width_only {
                 let top = self.list_state.logical_scroll_top();
                 self.rows
@@ -1238,6 +1361,17 @@ impl Render for WorkspacePanel {
         let grid_focus = self.grid_focus.clone();
         let rows_for_render = rows.clone();
         let rows_len = rows.len();
+        // Whether a band is in flight, read once per render. The tiles read it
+        // to withhold their drag registration for the length of the gesture —
+        // the band selects the tile it started on as soon as it moves, and
+        // without this the re-render that follows would register a file drag
+        // under an active band. See `build_cell_element`.
+        let band_active = self.marquee.is_some();
+        // The entrance cascade this listing belongs to, read once per render.
+        // Each row's wave step is its distance below the viewport top, so the
+        // first screenful arrives as a stagger; rows revealed later (scroll,
+        // pagination) read the window as already passed and paint statically.
+        let entrance_epoch = self.entrance_epoch;
         let list_mode = view_mode == ViewMode::List;
         // One page request per `grid_loaded` value at most. The guard lives on
         // the panel and remembers the cursor the last request was issued for,
@@ -1278,7 +1412,15 @@ impl Render for WorkspacePanel {
             let cells = row.cells.clone();
             if list_mode {
                 // One full-width info row per asset.
-                return build_list_row_element(cx, &controller, &grid_focus, &cells[0], widths[0]);
+                return build_list_row_element(
+                    cx,
+                    &controller,
+                    &grid_focus,
+                    &cells[0],
+                    widths[0],
+                    band_active,
+                    Entrance::at(entrance_epoch, ix),
+                );
             }
             h_flex()
                 .w_full()
@@ -1297,6 +1439,8 @@ impl Render for WorkspacePanel {
                                 cell,
                                 *w,
                                 height,
+                                band_active,
+                                Entrance::at(entrance_epoch, ix),
                             )
                         })
                         .collect::<Vec<_>>(),
@@ -1371,6 +1515,64 @@ impl Render for WorkspacePanel {
                             }
                         }
                     })
+                    // Rubber-band selection. The press opens a band everywhere
+                    // except on a tile that is already selected: there the
+                    // tile's own gestures own the press — its click selects,
+                    // its drag carries the selection out of the window — and
+                    // gpui bubbles a mouse event innermost-first, so the tile
+                    // is always told before the grid area is. An unselected
+                    // tile has no drag registered to out-race the band (see
+                    // `build_cell_element`) and its click only lands on
+                    // release, so the band can hold the press and hand the
+                    // release back to the click — `end_marquee` keeps the two
+                    // from stepping on each other.
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                            // A fresh press re-arms tile clicks: the one-shot
+                            // suppressor from an Escape-canceled band must not
+                            // outlive the press it belonged to.
+                            this.controller
+                                .update(cx, |ctl, _| ctl.suppress_next_click = false);
+                            let on_tile = this.cell_at(event.position);
+                            if let Some(id) = on_tile
+                                && this.controller.read(cx).selected_assets.contains(&id)
+                            {
+                                return;
+                            }
+                            // Focus the grid so the keys that act on a selection
+                            // — Delete, Ctrl+A, Escape — apply to what the band
+                            // is about to pick, exactly as a tile click does.
+                            window.focus(&this.grid_focus, cx);
+                            this.begin_marquee(
+                                event.position,
+                                &event.modifiers,
+                                on_tile.is_some(),
+                                cx,
+                            );
+                            // Deliberately not stopping propagation: no ancestor
+                            // of the grid area acts on a mouse-down, and popup
+                            // dismissal happens in the popup's own layer, which
+                            // this could not reach anyway. Claiming the event
+                            // would only add a rule nothing here needs.
+                        }),
+                    )
+                    .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
+                        if this.marquee.is_some() {
+                            this.move_marquee(event.position, cx);
+                        }
+                    }))
+                    // Both the plain and the escaped release land here: a band
+                    // whose pointer wandered off the area still ends where it was
+                    // last drawn.
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(|this, _: &MouseUpEvent, _, cx| this.end_marquee(cx)),
+                    )
+                    .on_mouse_up_out(
+                        MouseButton::Left,
+                        cx.listener(|this, _: &MouseUpEvent, _, cx| this.end_marquee(cx)),
+                    )
                     // Empty-state hint sits UNDER the grid so the grid keeps
                     // all mouse handling (deselect on click, etc.).
                     .when(!empty_message.is_empty(), |area| {
@@ -1382,6 +1584,31 @@ impl Render for WorkspacePanel {
                     .when(selected.len() >= 2, |area| {
                         let ids = selected.clone();
                         area.child(selection_toolbar(&toolbar_controller, in_trash, ids, cx))
+                    })
+                    // The band paints last, over the tiles it is crossing. Its
+                    // box is a plain absolutely-positioned div: gpui only inserts
+                    // a hitbox for a div that carries an id, a listener, a cursor
+                    // or a scroll offset, so this one is invisible to hit-testing
+                    // and the tiles underneath keep their own hover and click.
+                    .when_some(self.marquee.as_ref(), |area, band| {
+                        let rect = band.rect();
+                        let ink = cx.theme().primary;
+                        area.child(
+                            div().absolute().size_full().child(
+                                gpui::canvas(
+                                    |_, _, _| {},
+                                    move |_, _, window, _| {
+                                        window.paint_quad(gpui::fill(rect, ink.opacity(0.14)));
+                                        window.paint_quad(gpui::outline(
+                                            rect,
+                                            ink.opacity(0.8),
+                                            gpui::BorderStyle::default(),
+                                        ));
+                                    },
+                                )
+                                .size_full(),
+                            ),
+                        )
                     }),
             )
             .into_any_element()
@@ -1658,12 +1885,99 @@ mod tests {
     // attribute macro from the gpui prelude, which makes expanding `#[test]`
     // below recurse.
     use super::{
-        Cell, Row, close_commits, color_change_commits, next_cell_row, next_window,
-        picker_just_closed, prev_cell_row, same_listing, timeline_rows,
+        Cell, GRID_GAP, Marquee, Row, close_commits, color_change_commits, merge_band_selection,
+        next_cell_row, next_window, picker_just_closed, point, prev_cell_row, px, same_listing,
+        timeline_rows,
     };
     use trove_core::layout::target_row_height_for_scale;
     use trove_core::model::AssetKind;
     use uuid::Uuid;
+
+    /// A band is drawn corner to corner in whichever direction the pointer
+    /// travelled, but it covers the same tiles either way: what the hit test
+    /// reads is always the normalized rectangle.
+    #[test]
+    fn a_band_covers_the_same_tiles_whichever_way_it_is_dragged() {
+        let band = |x0, y0, x1, y1| Marquee {
+            origin: point(px(x0), px(y0)),
+            current: point(px(x1), px(y1)),
+            base: std::rc::Rc::new(Vec::new()),
+            additive: false,
+            dragged: true,
+            on_tile: false,
+        };
+        let down_right = band(10., 20., 120., 260.).rect();
+        let up_left = band(120., 260., 10., 20.).rect();
+        assert_eq!(
+            down_right.origin, up_left.origin,
+            "the same top-left corner"
+        );
+        assert_eq!(down_right.size, up_left.size, "the same extent");
+        assert_eq!(f32::from(down_right.size.width), 110.0);
+        assert_eq!(f32::from(down_right.size.height), 240.0);
+    }
+
+    /// An adding band adds to the selection as it was at the *press*, never as
+    /// its own previous frame left it: that is what lets a band sweep over its
+    /// own tiles and back without losing or repeating anything.
+    #[test]
+    fn an_adding_band_adds_to_the_selection_at_the_press() {
+        let (a, b, c) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        let base = vec![a, b];
+
+        // Replacing is exactly what the band covers, base ignored.
+        assert_eq!(merge_band_selection(&base, vec![c], false), vec![c]);
+
+        assert_eq!(
+            merge_band_selection(&base, vec![b, c], true),
+            vec![b, c, a],
+            "the band's tiles in its own order, then what it started with, nothing twice"
+        );
+        assert_eq!(
+            merge_band_selection(&base, vec![a, b], true),
+            vec![a, b],
+            "sweeping back over the base neither shrinks nor repeats it"
+        );
+        assert_eq!(
+            merge_band_selection(&base, vec![], true),
+            vec![a, b],
+            "a band over nothing still does not drop what was selected"
+        );
+    }
+
+    /// The row's cell spans are the single source behind both the keyboard's
+    /// nearest-column centres and the band's tile rectangles. The first cell is
+    /// flush with the row's left edge — the justified layout fits
+    /// `content_width − gap·(n−1)` of cells into it and `gap()` only spaces
+    /// between — and every later cell starts one gap after the previous one
+    /// ends. Get this off by half a gap and a press on the left edge of a tile
+    /// reads as empty grid, which is exactly where a band must not start.
+    #[test]
+    fn a_row_maps_its_cells_from_one_span_table() {
+        let row = Row {
+            height: 160.0,
+            widths: std::rc::Rc::from(vec![100.0, 50.0, 25.0]),
+            cells: std::rc::Rc::from(Vec::new()),
+            header: None,
+        };
+        assert_eq!(
+            row.spans(),
+            vec![
+                (0.0, 100.0),
+                (100.0 + GRID_GAP, 50.0),
+                (100.0 + 50.0 + 2.0 * GRID_GAP, 25.0),
+            ]
+        );
+        assert_eq!(
+            row.centers(),
+            vec![
+                50.0,
+                100.0 + GRID_GAP + 25.0,
+                100.0 + 50.0 + 2.0 * GRID_GAP + 12.5,
+            ],
+            "the keyboard and the band read the same table"
+        );
+    }
 
     /// A square image cell on `day`, enough for the layout to work with.
     fn cell(seed: u8, day: &str) -> Cell {

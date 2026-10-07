@@ -34,22 +34,42 @@ pub mod thumb;
 pub mod video;
 pub mod waveform;
 
-/// The paper every generated card is baked on — waveform, text/subtitle,
-/// font specimen — as `0xRRGGBB` for the UI surfaces that show one: a baked
-/// thumbnail cannot follow the theme, so the frame it sits in matches this
-/// instead of a theme surface reading as a grey band around the art.
+/// The midpoint of the paper every generated card is baked on — the model
+/// renderer's own background ramp, [`render3d::BG_TOP`] → [`render3d::BG_BOTTOM`]
+/// — as `0xRRGGBB` for the UI surfaces that hold one: a baked thumbnail cannot
+/// follow the theme, so the frame it sits in takes this instead of a theme
+/// surface reading as a grey band around the art.
 ///
-/// The value is the midpoint of the background the 3D model card is rendered
-/// on (`render3d::BG_TOP` → `render3d::BG_BOTTOM`), so a waveform or a
-/// subtitle card reads as the same surface as a model card rather than a warm
-/// paper sitting next to a cool grey.
+/// A card that fills its frame never shows it. What remains is the fallback —
+/// an asset whose card has not been baked, which shows a kind icon on this
+/// colour — and the single colour a letterboxed card is judged against, which
+/// is why it is the ramp's midpoint rather than either end.
 pub const CARD_PAPER_RGB: u32 = 0xEA_EC_EF;
 
-/// The same paper as RGB bytes, for the rasterizers that fill a bitmap.
-pub const CARD_PAPER: [u8; 3] = [
-    (CARD_PAPER_RGB >> 16) as u8,
-    (CARD_PAPER_RGB >> 8) as u8,
-    CARD_PAPER_RGB as u8,
+/// The ink a generated card draws with: the same dark grey for a waveform bar,
+/// a specimen glyph and a text card's lines, so the cards differ only in what
+/// they show, not in what they are drawn with. `0xRRGGBB` for the UI surfaces
+/// that draw one of these cards live (the font specimen in the grid).
+pub const CARD_INK_RGB: u32 = 0x20_21_24;
+
+/// The ink's muted companion on the same paper — the grey a live waveform strip
+/// draws with, and what a card's own label uses. Fixed rather than themed for
+/// the same reason as [`CARD_INK_RGB`]: it sits on paper that does not follow
+/// the theme.
+pub const CARD_MUTED_RGB: u32 = 0x8C_8C_96;
+
+/// [`CARD_INK_RGB`] as RGB bytes, for the rasterizers that blend a card's ink.
+pub const CARD_INK: [u8; 3] = [
+    (CARD_INK_RGB >> 16) as u8,
+    (CARD_INK_RGB >> 8) as u8,
+    CARD_INK_RGB as u8,
+];
+
+/// [`CARD_MUTED_RGB`] as RGB bytes, for the same reason.
+pub const CARD_MUTED: [u8; 3] = [
+    (CARD_MUTED_RGB >> 16) as u8,
+    (CARD_MUTED_RGB >> 8) as u8,
+    CARD_MUTED_RGB as u8,
 ];
 
 pub use formats::streaming_point_cloud::StreamingPointCloud;

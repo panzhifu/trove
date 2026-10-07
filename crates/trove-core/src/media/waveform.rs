@@ -14,7 +14,7 @@
 //!
 //! ## Shape of the cache
 //!
-//! `<cache>/libraries/<slug>/waveforms/<sha[:2]>/<sha>.bin`: an eight-byte
+//! `<cache>/libraries/<slug>/waveforms/<sha[:2]>/<sha[2:]>.bin`: an eight-byte
 //! header and [`PEAK_COUNT`] bytes of level, 0 = silence to 255 = the file's
 //! loudest slice. Like thumbnails it is derived purely from content, so
 //! deleting it costs a recompute and nothing else.
@@ -264,17 +264,18 @@ impl Style {
     /// is painted in.
     pub const PREVIEW: Style = Style {
         span: 44,
-        ink: [140, 140, 150],
+        ink: crate::media::CARD_MUTED,
         background: None,
     };
 
-    /// A grid card for an audio file with no cover art: dark bars on the same
-    /// paper the font and model cards are drawn on, tall enough that the shape
-    /// is readable at thumbnail size.
+    /// A grid card for an audio file: dark bars on the model card's background,
+    /// tall enough that the shape is readable at thumbnail size. The background
+    /// is left to the caller — the card is composited over the same paper a model
+    /// is rendered on, so no card brings a paper of its own.
     pub const CARD: Style = Style {
         span: 72,
-        ink: [0x20, 0x21, 0x24],
-        background: Some(crate::media::CARD_PAPER),
+        ink: crate::media::CARD_INK,
+        background: None,
     };
 }
 
@@ -389,20 +390,18 @@ mod tests {
         );
     }
 
+    /// The card style is ink over nothing at all: the caller lays it on the paper
+    /// every generated card shares, so an audio card is the same surface as the
+    /// model card beside it in the grid rather than a paper of its own. The ink
+    /// value is spelled out here because it is the one thing the card style
+    /// promises, and changing it must be a decision, not a rename.
     #[test]
-    fn a_card_bitmap_brings_its_own_paper() {
+    fn a_card_bitmap_is_ink_over_the_caller_s_paper() {
         let peaks = vec![255u8; PEAK_COUNT];
         let image = bitmap(&peaks, 64, 48, &Style::CARD).unwrap();
-        // 72% of 48 rows: the bar reaches rows 7..=41, so the corner is paper.
-        assert_eq!(
-            image.get_pixel(0, 0).0,
-            [
-                crate::media::CARD_PAPER[0],
-                crate::media::CARD_PAPER[1],
-                crate::media::CARD_PAPER[2],
-                255
-            ]
-        );
+        // 72% of 48 rows: the bar reaches rows 7..=41, so the corner is the paper
+        // showing through, untouched.
+        assert_eq!(image.get_pixel(0, 0).0, [0, 0, 0, 0]);
         assert_eq!(image.get_pixel(0, 24).0, [0x20, 0x21, 0x24, 255]);
     }
 

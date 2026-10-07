@@ -250,6 +250,11 @@ pub(crate) fn selection_toolbar(
         .right_0()
         .bottom_3()
         .flex()
+        // The bar floats over the grid, so a press on its own padding would
+        // otherwise reach the grid area behind it and start a rubber band from
+        // under the buttons. gpui bubbles innermost-first, so saying it here is
+        // saying it before the area is asked.
+        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
         .justify_center()
         .child(bar)
 }

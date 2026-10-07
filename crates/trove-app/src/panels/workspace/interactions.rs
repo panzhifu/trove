@@ -500,3 +500,214 @@ impl WorkspacePanel {
         }
     }
 }
+
+impl WorkspacePanel {
+    // ============================ rubber band ============================
+
+    /// The tiles the list has measured, in display order, each with its window
+    /// rectangle as `(left, top, right, bottom)`. Rows the virtualized list has
+    /// not laid out are not here — they have no position to compare against —
+    /// which is what the band's edge auto-scroll exists to bring into the
+    /// measurement rather than a guess at where they would be.
+    fn measured_cells(&self) -> Vec<(Uuid, (f32, f32, f32, f32))> {
+        let mut out = Vec::new();
+        let first = self.list_state.logical_scroll_top().item_ix;
+        for (ix, row) in self.rows.iter().enumerate().skip(first) {
+            let Some(bounds) = self.list_state.bounds_for_item(ix) else {
+                break;
+            };
+            // A timeline day header is a row with no cells in it.
+            if row.header.is_some() {
+                continue;
+            }
+            let left = f32::from(bounds.origin.x);
+            let top = f32::from(bounds.origin.y);
+            let height = f32::from(bounds.size.height);
+            for (cell, (cell_left, cell_width)) in row.cells.iter().zip(row.spans()) {
+                out.push((
+                    cell.id,
+                    (
+                        left + cell_left,
+                        top,
+                        left + cell_left + cell_width,
+                        top + height,
+                    ),
+                ));
+            }
+        }
+        out
+    }
+
+    /// Which tile covers a window point, if any. A band asks this before it
+    /// starts, because a press on a tile is that tile's own gesture — it is how
+    /// a click selects and how a drag carries files out of the window — and gpui
+    /// bubbles a mouse event innermost-first, so the grid area is never told
+    /// about the press before the tile is. The one rule that cannot be argued
+    /// with is not to start there.
+    pub(super) fn cell_at(&self, at: Point<Pixels>) -> Option<Uuid> {
+        let (x, y) = (f32::from(at.x), f32::from(at.y));
+        self.measured_cells()
+            .into_iter()
+            .find(|(_, (left, top, right, bottom))| {
+                x >= *left && x <= *right && y >= *top && y <= *bottom
+            })
+            .map(|(id, _)| id)
+    }
+
+    /// The tiles a band covers, in display order — which is what makes the last
+    /// one the primary rather than wherever the pointer happened to stop. A tile
+    /// counts as soon as the band touches it: requiring full containment would
+    /// make the band's own edge decide whether a tile is in, which reads as the
+    /// gesture dropping tiles it plainly crossed.
+    fn ids_in_rect(&self, rect: Bounds<Pixels>) -> Vec<Uuid> {
+        let left = f32::from(rect.origin.x);
+        let top = f32::from(rect.origin.y);
+        let right = left + f32::from(rect.size.width);
+        let bottom = top + f32::from(rect.size.height);
+        self.measured_cells()
+            .into_iter()
+            .filter(|(_, (cell_left, cell_top, cell_right, cell_bottom))| {
+                *cell_left <= right
+                    && *cell_right >= left
+                    && *cell_top <= bottom
+                    && *cell_bottom >= top
+            })
+            .map(|(id, _)| id)
+            .collect()
+    }
+
+    /// Open a band at a press on empty grid — or on a tile that is not
+    /// selected, which lends its press to the band because it has no drag
+    /// registered to claim it (see `build_cell_element`). `on_tile` says
+    /// which press it was; the release treats the two differently, and the
+    /// band's own work — thresholds, hit tests, the additive merge — is the
+    /// same either way.
+    pub(super) fn begin_marquee(
+        &mut self,
+        at: Point<Pixels>,
+        modifiers: &Modifiers,
+        on_tile: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let base = self.controller.read(cx).selected_assets.clone();
+        // The band's modifiers follow the tile's own: Ctrl/Cmd (and the platform
+        // key that means the same thing here) adds rather than replaces, and
+        // Shift — which extends a range on a tile — adds here too, since a range
+        // has no meaning across a rectangle.
+        let additive = modifiers.control || modifiers.platform || modifiers.shift;
+        self.marquee = Some(Marquee {
+            origin: at,
+            current: at,
+            base,
+            additive,
+            dragged: false,
+            on_tile,
+        });
+    }
+
+    /// Move the band, re-run its hit test, write the selection.
+    ///
+    /// The two cost rules of a gesture that fires on every pixel the pointer
+    /// travels: the controller is mutated *without* notifying, because its
+    /// `observe` fan-out would wake every panel holding the library and let the
+    /// inspector chase the band frame by frame; and only this panel repaints,
+    /// which is what draws the tile borders and the rectangle. The rest of the
+    /// dock is told once, when the band ends.
+    pub(super) fn move_marquee(&mut self, to: Point<Pixels>, cx: &mut Context<Self>) {
+        let Some(mut band) = self.marquee.take() else {
+            return;
+        };
+        band.current = to;
+        // A press that has not travelled yet is still a press, not a gesture.
+        let moved = (f32::from(to.x) - f32::from(band.origin.x)).abs()
+            + (f32::from(to.y) - f32::from(band.origin.y)).abs();
+        band.dragged |= moved > MARQUEE_THRESHOLD;
+        let (dragged, additive, base, rect) =
+            (band.dragged, band.additive, band.base.clone(), band.rect());
+        self.marquee = Some(band);
+        if !dragged {
+            return;
+        }
+
+        let ids = merge_band_selection(&base, self.ids_in_rect(rect), additive);
+        let controller = self.controller.clone();
+        controller.update(cx, |ctl, _| ctl.set_selection(ids));
+
+        // Reach past the viewport: while the pointer is inside the edge band the
+        // list steps, and the tiles it reveals are hit-tested on the next frame
+        // with the rectangle still where the pointer left it.
+        let viewport = self.list_state.viewport_bounds();
+        let top = f32::from(viewport.origin.y);
+        let bottom = top + f32::from(viewport.size.height);
+        let y = f32::from(to.y);
+        if y > bottom - MARQUEE_EDGE {
+            self.list_state.scroll_by(px(MARQUEE_SCROLL_STEP));
+        } else if y < top + MARQUEE_EDGE {
+            self.list_state.scroll_by(px(-MARQUEE_SCROLL_STEP));
+        }
+        cx.notify();
+    }
+
+    /// Close the band.
+    ///
+    /// A band that travelled wakes the rest of the dock once, and writes the
+    /// selection once more rather than trusting what its last move left: the
+    /// release can land back on the tile the press started on, that tile's
+    /// click runs innermost-first — before this handler — and a plain click
+    /// would otherwise write a one-tile selection over the band's work. The
+    /// rectangle gets the last word.
+    ///
+    /// A press that never travelled is a click. On empty grid that is the one
+    /// gesture every file manager agrees on — a click there drops the
+    /// selection. On a tile the press was lent to the band only for the drag's
+    /// sake, and the click has already spoken by now (select, toggle, range,
+    /// the double click's preview); the band stays silent. Either way this is
+    /// where the press is known not to have been on a *selected* tile:
+    /// `cell_at` already turned those over to the tile on the way in.
+    pub(super) fn end_marquee(&mut self, cx: &mut Context<Self>) {
+        let Some(band) = self.marquee.take() else {
+            return;
+        };
+        if band.dragged {
+            let ids =
+                merge_band_selection(&band.base, self.ids_in_rect(band.rect()), band.additive);
+            self.controller.update(cx, |ctl, cx| {
+                ctl.set_selection(ids);
+                cx.notify();
+            });
+        } else if !band.on_tile && !self.controller.read(cx).selected_assets.is_empty() {
+            // `clear_selection` only moves the state when there was something to
+            // clear, and the fan-out is worth the same test: an empty grid clicked
+            // a hundred times should not wake a hundred panel repaints.
+            self.controller.update(cx, |ctl, cx| {
+                ctl.clear_selection();
+                cx.notify();
+            });
+        }
+        cx.notify();
+    }
+
+    /// Cancel the band under a live press: Escape's answer to a drag gone
+    /// wrong.
+    ///
+    /// The selection goes back to what it was at the press — every frame of
+    /// the band had been writing its own answer over it, so this is a real
+    /// write, not a no-op — and the band vanishes now rather than waiting for
+    /// the release. The release is still out there though, and over the tile
+    /// the press started on it would read as a click; the controller absorbs
+    /// that one click so an aborted gesture lands as nothing at all. The
+    /// next grid mouse-down disarms the flag, so a fresh press clicks
+    /// normally.
+    pub(super) fn cancel_marquee(&mut self, cx: &mut Context<Self>) {
+        let Some(band) = self.marquee.take() else {
+            return;
+        };
+        let base = (*band.base).clone();
+        self.controller.update(cx, |ctl, cx| {
+            ctl.set_selection(base);
+            ctl.suppress_next_click = true;
+            cx.notify();
+        });
+        cx.notify();
+    }
+}

@@ -89,7 +89,7 @@ const BOUNCE_SIGMA: f32 = 14.0;
 /// Open the audio preview for `data`, or `None` when there is nothing to play:
 /// no file behind the asset, or no engine (no ffmpeg, or a stream the probe
 /// cannot find). The caller then keeps the still, which for an audio asset is
-/// its cover art or kind icon — the same picture, without the transport.
+/// its waveform card or kind icon — the same picture, without the transport.
 pub(super) fn spawn_player(data: &AssetPreviewData, cx: &mut App) -> Option<Entity<AudioPlayer>> {
     let path = data.original.clone()?;
     if !path.is_file() {
