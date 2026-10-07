@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Trove 采集器",
-  "version": "1.2.0",
+  "version": "1.4.0",
   "description": "把网页图片或视频存进本地 Trove 素材库，可指定合集；支持右键与拖拽保存。",
   "browser_specific_settings": {
     "gecko": {
@@ -25,6 +25,7 @@
       "preferences.js",
       "collections.js",
       "hotlink-sites.js",
+      "site-license.js",
       "background.js"
     ],
     "service_worker": "background.js"
@@ -42,6 +43,8 @@
         "media-target.js",
         "save-bubble.js",
         "tree-menu.js",
+        "site-license.js",
+        "picker.js",
         "content-script.js"
       ],
       "all_frames": true,

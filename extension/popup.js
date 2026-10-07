@@ -32,4 +32,21 @@ document.getElementById('ping').addEventListener('click', () => {
   report();
 });
 
+// Ask the front frame of the active tab to open the picker panel. A page the
+// content script never entered (chrome://, the store, PDFs) or a tab without
+// host permission answers with lastError — that is the user's report, not a
+// console note.
+document.getElementById('grab').addEventListener('click', () => {
+  chrome.tabs.query({ active: true, currentWindow: true }, ([tab]) => {
+    if (!tab?.id) return;
+    chrome.tabs.sendMessage(tab.id, { type: 'trove-grab-open' }, { frameId: 0 }, () => {
+      if (chrome.runtime.lastError) {
+        status.textContent = '这个页面抓不了：浏览器内置页面，或未授予站点权限';
+        return;
+      }
+      window.close();
+    });
+  });
+});
+
 report();

@@ -28,7 +28,7 @@
 // Firefox reads `background.scripts` from the manifest and has no
 // `importScripts` in an event page.
 if (typeof importScripts === 'function') {
-  importScripts('preferences.js', 'collections.js', 'hotlink-sites.js');
+  importScripts('preferences.js', 'collections.js', 'hotlink-sites.js', 'site-license.js');
 }
 
 // Above this size the bytes are not relayed through the service worker: a
@@ -280,6 +280,17 @@ async function buildMenus() {
       budget -= await addCollectionMenu(context.key, node, parent, 1, budget);
     }
   }
+
+  // One page-wide entry beside the three per-target trees. It names no
+  // destination — the picker panel opens and asks for one — so it sits outside
+  // the MENU_CONTEXTS loop, and it works from inside an iframe too (the click
+  // carries the frame it happened in).
+  await chrome.contextMenus.create({
+    id: 'trove-grab-page',
+    title: '抓取本页媒体到 Trove…',
+    contexts: ['page', 'frame'],
+    enabled: connected,
+  });
 }
 
 // One collection as a submenu: the folder itself is a clickable child, because
@@ -538,6 +549,20 @@ if (chrome.contextMenus.onShown) {
 }
 
 chrome.contextMenus.onClicked.addListener(async (info, tab) => {
+  if (info.menuItemId === 'trove-grab-page') {
+    if (tab?.id == null) return;
+    chrome.tabs.sendMessage(
+      tab.id,
+      { type: 'trove-grab-open' },
+      { frameId: Number.isInteger(info.frameId) ? info.frameId : 0 },
+      async () => {
+        // Browser pages (chrome://, the store, PDFs) have no content script;
+        // say so instead of letting the error die in a console.
+        if (chrome.runtime.lastError) await notify('这个页面抓不了：内容脚本进不去浏览器内置页面');
+      },
+    );
+    return;
+  }
   const target = parseMenuId(info.menuItemId);
   if (!target) return;
   sourceTabId = tab?.id ?? null;
@@ -557,7 +582,9 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
     const where = target.collection
       ? `到「${catalog?.collections.find((c) => c.id === target.collection)?.path || '合集'}」`
       : '';
-    await notify(`已保存${where}：${savedName}`);
+    // A recognized source rides along in the toast; nothing known stays quiet.
+    const license = TroveLicense.short(source, url);
+    await notify(`已保存${where}：${savedName}${license ? `（${license}）` : ''}`);
   } catch (error) {
     await notify(error.refusal ? error.message : `保存失败：${error.message}`);
   }

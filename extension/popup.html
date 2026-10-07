@@ -8,6 +8,7 @@
     .row { display: flex; gap: 6px; margin: 8px 0; align-items: center; }
     input { flex: 1; background: #1f1f1f; border: 1px solid #333; color: #eee; border-radius: 6px; padding: 4px 8px; }
     button { background: #2563eb; border: 0; color: white; border-radius: 6px; padding: 5px 10px; cursor: pointer; }
+    button.wide { width: 100%; }
     #status { min-height: 18px; color: #9a9a9a; }
     .hint { color: #777; line-height: 1.5; margin: 8px 0 0; }
     .hint b { color: #aaa; font-weight: normal; }
@@ -15,12 +16,13 @@
 </head>
 <body>
   <h1>Trove 采集器</h1>
+  <div class="row"><button id="grab" class="wide">抓取本页媒体</button></div>
   <div class="row">
     <input id="port" type="number" placeholder="端口" />
     <button id="save">保存</button>
   </div>
   <div class="row"><button id="ping">测试连接</button><span id="status"></span></div>
-  <p class="hint">右键网页图片/视频/链接 →「保存到 Trove」，或<b>直接把图片拖出页面</b>，在开开的合集菜单里松手即存到那一格。
+  <p class="hint">右键网页图片/视频/链接 →「保存到 Trove」，<b>直接把图片拖出页面</b>在菜单里松手即存，或点上面的按钮<b>批量抓取本页媒体</b>（右键页面空白处也有这一项）。
   需先启动 Trove 桌面应用。开关（通知 / 保存后聚焦 / 拖拽菜单）在扩展图标的<b>选项</b>页。<br>
   连不上时：确认 Trove 正在运行；Firefox 还需在 <b>about:addons ▸ Trove 采集器 ▸ 权限</b> 里勾选「访问所有网站的数据」。</p>
   <script src="popup.js"></script>
