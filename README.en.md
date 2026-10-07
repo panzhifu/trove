@@ -21,11 +21,16 @@
 
 - **Search** — full-text + query expressions (qualifiers / AND-OR-NOT / phrases) + pinyin matching, freely combined with tag, rating and aspect filters
 - **Visual search** — find by image or by color; fingerprints are computed at import, no AI inference involved
+- **Semantic search** — assets that mean something similar, ranked by embedding vectors computed locally with candle/BGE or by a cloud endpoint, blended into the full-text results
+- **AI analysis** — a multimodal model writes back description / tags / rating in batches; tags it invents are filed under one parent tag so a run is easy to review, and one command undoes the whole batch
+- **Speech to text** — transcribes audio and video with local Whisper (candle) or a cloud endpoint; the transcript is editable and exports as SRT
 - **Organize** — hierarchical tags, smart collections, nested collection tree, ratings & favorites
 - **Import** — drag-and-drop / paste / URL / watched folders / one-click collect from the browser extension; link only, never copy — files stay where they are
-- **Preview** — images, video & audio with sound, live font specimens, RAW / HEIC / PSD / SVG, plus a GPU 3D viewport for OBJ / STL / PLY / glTF / GLB
+- **Migration** — move in from an Eagle or Billfish library: tags, ratings, notes, source URLs and the folder structure come along, files stay where they are
+- **Preview** — images, video & audio with sound, live font specimens, RAW / HEIC / PSD / SVG, plus a GPU 3D viewport for OBJ / STL / PLY / glTF / GLB / Blend (.blend goes through a local Blender install)
 - **Edit** — batch rotate / flip / crop, format conversion, XMP sidecar export, region screenshots straight into the library
 - **Maintenance** — trash, BLAKE3 integrity check, daily auto backup, duplicate finder, multiple libraries
+- **Desktop integration** — closing the window tucks the app into the system tray and the tray menu brings it back (platforms without a tray just quit), and a single-instance lock keeps exactly one desktop app writing to the library
 - **Localization** — 9 UI languages, switched live; follows the system by default
 
 ## 🎯 Who it's for
@@ -68,7 +73,7 @@ trove analyze --limit 50        # a vision model writes back description / tags 
 trove doctor                    # library, index and ffmpeg self-check
 ```
 
-Twenty subcommands in all; stdout is always one JSON document, and `--help` is the whole contract.
+Twenty-three subcommands in all; stdout is always one JSON document, and `--help` is the whole contract.
 
 ## 🛠 Development
 
