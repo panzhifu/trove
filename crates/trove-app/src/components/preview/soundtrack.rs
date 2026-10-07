@@ -371,7 +371,24 @@ impl AudioEngine {
     /// it on a background thread while the poster is on screen. An engine on a
     /// silent file would just feed nothing.
     pub(super) fn spawn(path: PathBuf, cx: &mut App) -> Entity<Self> {
-        let engine = cx.new(|_| Self {
+        let engine = cx.new(|_| Self::held(path));
+        engine.update(cx, |engine, cx| engine.start(cx));
+        engine
+    }
+
+    /// Build the engine without starting it, for a soundtrack that must not
+    /// lead the picture: the video player holds the engine until its first
+    /// frame is on screen and starts it there (see
+    /// `VideoPlayer::start_soundtrack`), so sound and motion begin on the
+    /// same frame instead of the audio playing over a poster. Everything the
+    /// player pokes before that moment — the play flag, volume, speed —
+    /// lands in the shared block and is read the moment the task runs.
+    pub(super) fn spawn_held(path: PathBuf, cx: &mut App) -> Entity<Self> {
+        cx.new(|_| Self::held(path))
+    }
+
+    fn held(path: PathBuf) -> Self {
+        Self {
             path,
             shared: Arc::new(Mutex::new(EngineShared {
                 // The task opens its first pipe when the sequence moves, so
@@ -386,9 +403,7 @@ impl AudioEngine {
             level: Arc::new(AtomicU32::new(0.0f32.to_bits())),
             spectrum: Arc::new(Mutex::new(vec![0.0; BAND_COUNT])),
             alive: Arc::new(AtomicBool::new(true)),
-        });
-        engine.update(cx, |engine, cx| engine.start(cx));
-        engine
+        }
     }
 
     /// The clock the video loops follow. Handing out the `Arc` lets them
@@ -478,7 +493,11 @@ impl AudioEngine {
     /// pace against. It also watches the audio output's generation: when the
     /// default device moves, the sink dies with the old stream and the
     /// soundtrack requeues from where the playhead stands.
-    fn start(&mut self, cx: &mut Context<Self>) {
+    ///
+    /// Idempotence is the caller's: the video player starts its held engine
+    /// exactly once, on the first presented frame; a second `start` would
+    /// run a second task against the same shared block.
+    pub(super) fn start(&mut self, cx: &mut Context<Self>) {
         let path = self.path.clone();
         let output = AudioOutput::global(cx);
         output.follow_default();

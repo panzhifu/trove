@@ -14,6 +14,13 @@ use crate::model::{Asset, AssetKind, AssetLocation};
 /// Longest edge of generated thumbnails, in pixels.
 pub const THUMB_MAX: u32 = 512;
 
+/// Width the player's first-frame poster bakes at: the decode pipe's own
+/// output width (`video::DEFAULT_MAX_WIDTH`). The poster's one job is to be
+/// indistinguishable from that first frame — same box, same content — so it
+/// must not be softer than the picture replacing it, or the swap reads as a
+/// sharpness step instead of playback starting.
+pub const POSTER_WIDTH: u32 = super::video::DEFAULT_MAX_WIDTH;
+
 /// Relative path of the thumbnail for `sha`, e.g. `thumbs/ab/<sha>.jpg`.
 pub fn rel_path(sha: &str) -> String {
     let (a, b) = sha.split_at(2);
@@ -123,7 +130,7 @@ pub fn regenerate(root: &Path, sha: &str, kind: AssetKind, blob_path: &Path) -> 
             let thumb = write_video_thumb(blob_path, &out);
             // The player's stand-in rides the same rebuild: a library rebuilt
             // after posters existed gains the first frame with it.
-            let _ = write_video_frame(blob_path, &poster_abs_path(root, sha), "0");
+            let _ = write_video_frame(blob_path, &poster_abs_path(root, sha), "0", POSTER_WIDTH);
             thumb
         }
         AssetKind::Font => write_font_card(blob_path, &out),
@@ -153,9 +160,34 @@ pub fn ensure_poster(root: &Path, sha: &str, kind: AssetKind, blob_path: &Path) 
     }
     let out = poster_abs_path(root, sha);
     if out.is_file() {
-        return Some(out);
+        // A poster an older build baked may be narrower than the playback
+        // width; re-bake it in place so the swap to the first frame stays
+        // invisible. A failed re-bake leaves the old file standing, which is
+        // still a poster.
+        if poster_up_to_date(&out) {
+            return Some(out);
+        }
+        return write_video_frame(blob_path, &out, "0", POSTER_WIDTH).or(Some(out));
     }
-    write_video_frame(blob_path, &out, "0")
+    write_video_frame(blob_path, &out, "0", POSTER_WIDTH)
+}
+
+/// Whether the poster on disk is wide enough to swap invisibly for the
+/// player's first decoded frame. A file that answers no dimensions — or is
+/// gone — is stale by definition.
+pub fn poster_up_to_date(poster: &Path) -> bool {
+    image::image_dimensions(poster)
+        .map(|(width, _)| width >= POSTER_WIDTH)
+        .unwrap_or(false)
+}
+
+/// Bake the first-frame poster at the playback width, overwriting `out`.
+/// The route [`ensure_poster`] takes: ffmpeg writes a temp file that is
+/// renamed into place, so a failed bake never leaves a half-written poster.
+/// The preview calls this in the background for a poster a past import
+/// baked below [`POSTER_WIDTH`].
+pub fn bake_poster(blob_path: &Path, out: &Path) -> Option<PathBuf> {
+    write_video_frame(blob_path, out, "0", POSTER_WIDTH)
 }
 
 /// Lower-case extension of a blob, without the dot.
@@ -519,14 +551,14 @@ fn write_model_card(blob_path: &Path, out: &Path) -> Option<PathBuf> {
 fn write_video_thumb(blob_path: &Path, out: &Path) -> Option<PathBuf> {
     // One second in: past the black or fade-in frames that open many clips,
     // which is the frame a grid card wants to show.
-    write_video_frame(blob_path, out, "1")
+    write_video_frame(blob_path, out, "1", THUMB_MAX)
 }
 
 /// Extract the frame at `seek` seconds and write it as a JPEG with the system
 /// `ffmpeg`. The frame is written by ffmpeg, then moved into place. Shared by
 /// the grid thumbnail (one second in) and the player's first-frame poster
 /// (zero), which differ only in that timestamp.
-fn write_video_frame(blob_path: &Path, out: &Path, seek: &str) -> Option<PathBuf> {
+fn write_video_frame(blob_path: &Path, out: &Path, seek: &str, max_width: u32) -> Option<PathBuf> {
     let parent = out.parent()?;
     std::fs::create_dir_all(parent).ok()?;
     // Must keep a known extension (ffmpeg picks the muxer from it): the
@@ -543,7 +575,7 @@ fn write_video_frame(blob_path: &Path, out: &Path, seek: &str) -> Option<PathBuf
             "-frames:v",
             "1",
             "-vf",
-            &format!("scale='min({THUMB_MAX},iw)':-2"),
+            &format!("scale='min({max_width},iw)':-2"),
         ])
         .arg(&tmp);
     let output = super::proc::output_with_timeout(command).ok()?;

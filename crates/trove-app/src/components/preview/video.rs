@@ -144,10 +144,12 @@ pub(super) fn load_player(panel: Entity<AssetPreviewPanel>, cx: &mut App) {
                 return;
             };
             // One engine per playback, owned by the panel: windows come and go
-            // without touching the soundtrack.
+            // without touching the soundtrack. Held, not started: the player
+            // starts it when the first frame lands, so the sound never plays
+            // over the poster.
             let audio = facts
                 .has_audio
-                .then(|| AudioEngine::spawn(path.clone(), cx));
+                .then(|| AudioEngine::spawn_held(path.clone(), cx));
             // The still the panel is standing in with fills the content area,
             // so seed the stage with that same area: the first frame occupies
             // the same box instead of the picture's intrinsic pixels.
@@ -503,8 +505,26 @@ impl VideoPlayer {
         this.start_presenter(cx);
         // The engine may be shared with other windows: it follows this
         // player's state from the start, so playing here plays everywhere.
+        // It is not running yet, though — `start_soundtrack` launches it on
+        // the first presented frame, and until then everything pushed here
+        // just waits in the shared block.
         this.apply_volume(cx);
         this.apply_playing_state(cx);
+        // A poster a past import baked may be narrower than the playback
+        // width, and the swap to the first frame would then read as a
+        // sharpness step. One background ffmpeg pass brings it up to the
+        // pipe's width; the poster already on screen keeps the old file this
+        // open, and the next one swaps like for like.
+        if let Some(poster) = this.poster.clone() {
+            let blob = this.path.clone();
+            cx.background_executor()
+                .spawn(async move {
+                    if !trove_core::media::thumb::poster_up_to_date(&poster) {
+                        trove_core::media::thumb::bake_poster(&blob, &poster);
+                    }
+                })
+                .detach();
+        }
         this
     }
 
@@ -844,6 +864,20 @@ impl VideoPlayer {
             shared.playing = self.playing && !self.seeking;
             shared.speed = self.speed;
         }
+    }
+
+    /// Start the soundtrack the player was built holding. Called once, from
+    /// the first presented frame (see `render`); the play flag, volume and
+    /// speed it should come up with are already in the engine's shared
+    /// block, pushed by the ordinary controls before the task ever ran.
+    fn start_soundtrack(&mut self, cx: &mut Context<Self>) {
+        let Some(audio) = self.audio.clone() else {
+            return;
+        };
+        audio.update(cx, |engine, cx| engine.start(cx));
+        // Re-push the state now that a task is listening, and re-anchor the
+        // sync point: the engine's clock begins at the frame on screen.
+        self.apply_playing_state(cx);
     }
 
     /// The chrome accessor the shared auto-hide watcher drives.
@@ -1252,11 +1286,19 @@ impl Render for VideoPlayer {
             .ok()
             .and_then(|mut shared| shared.arrived.take());
         if let Some(arrival) = arrival {
+            // The very first presented frame is the moment the held
+            // soundtrack starts: sound and motion begin on the same picture
+            // instead of the audio playing over the poster (and its clock
+            // running ahead, judging real frames late before any existed).
+            let first = self.shown.is_none();
             if let Some(old) = self.shown.take() {
                 let _ = window.drop_image(old);
             }
             self.shown = Some(arrival.frame);
             self.position_ms = arrival.position_ms;
+            if first {
+                self.start_soundtrack(cx);
+            }
         }
         // Keep the scrubber on the playhead and the volume slider on the
         // applied level — but only when the external value actually moved.

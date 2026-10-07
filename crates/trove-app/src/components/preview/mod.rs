@@ -579,9 +579,12 @@ impl AssetPreviewPanel {
                 // its first-frame poster, and skips the probe entirely.
                 Some(facts) => match data.original.clone() {
                     Some(original) => {
+                        // Held rather than started: the player launches the
+                        // soundtrack when its first frame lands, so the
+                        // sound never plays over the poster.
                         let audio = facts
                             .has_audio
-                            .then(|| soundtrack::AudioEngine::spawn(original.clone(), cx));
+                            .then(|| soundtrack::AudioEngine::spawn_held(original.clone(), cx));
                         // The first-frame poster hides the decoder's start-up;
                         // a library that predates posters falls back to the
                         // one-second thumbnail.
