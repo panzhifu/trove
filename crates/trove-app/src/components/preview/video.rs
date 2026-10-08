@@ -535,7 +535,7 @@ impl VideoPlayer {
     fn start_decoding(&mut self, cx: &mut Context<Self>) {
         let path = self.path.clone();
         let facts = self.facts;
-        let frame_ms = self.facts.frame_ms() as f64;
+        let frame_ms = self.facts.frame_ms();
         let duration_ms = self.facts.duration_ms as f64;
 
         let shared = self.shared.clone();
@@ -777,27 +777,26 @@ impl VideoPlayer {
     /// Stepping pauses first: the point of a frame step is to look at the frame,
     /// and a clip that keeps running has already moved past it.
     ///
-    /// The distance is [`VideoStreamFacts::frame_ms`] — `1000 / fps` truncated —
-    /// so at 60 fps one step is 16 ms rather than 16.6 ms. Each press aims at an
-    /// absolute target, so the error cannot accumulate across a run of steps; the
-    /// same truncation makes continuous playback itself read fast, and that is a
-    /// separate defect which this neither touches nor pretends to fix.
+    /// The distance is [`VideoStreamFacts::frame_ms`], which is a fraction: at
+    /// 60 fps one step is 16.6… ms, not 16. The whole milliseconds only appear
+    /// at the end, on the *absolute* target — rounding the increment instead
+    /// would drop the same 0.6 ms on every press through the clip.
     pub(crate) fn step_frame(&mut self, forward: bool, cx: &mut Context<Self>) {
-        let step = self.facts.frame_ms().max(1);
-        let position = self.position_ms.round().max(0.) as u64;
+        let step = self.facts.frame_ms();
+        let position = self.position_ms.max(0.);
         let target = if forward {
-            position.saturating_add(step).min(self.facts.duration_ms)
+            (position + step).min(self.facts.duration_ms as f64)
         } else {
-            position.saturating_sub(step)
+            (position - step).max(0.)
         };
         self.playing = false;
         if let Ok(mut shared) = self.shared.lock() {
-            shared.seek_to = Some(target);
+            shared.seek_to = Some(target.round() as u64);
         }
         // Reflect the landing immediately: the decode loop answers the seek on
         // its own schedule, and a playhead lagging a step behind the key reads
         // as a dropped press.
-        self.position_ms = target as f64;
+        self.position_ms = target;
         self.apply_playing_state(cx);
         self.publish_controls();
         cx.notify();

@@ -72,12 +72,19 @@ pub struct VideoStreamFacts {
 
 impl VideoStreamFacts {
     /// Milliseconds between frames at this frame rate.
-    pub fn frame_ms(&self) -> u64 {
-        if self.fps == 0 {
-            1000 / FALLBACK_FPS as u64
+    ///
+    /// A fraction, not a whole number: the rate itself is rounded to an
+    /// integer when the container is probed, and `1000 / 60` in integer
+    /// arithmetic then throws away another 4%. A clip paced that way reads
+    /// fast for its whole length and never catches up — the audio clock hides
+    /// the error when there is one, a silent video has nothing to blame.
+    pub fn frame_ms(&self) -> f64 {
+        let fps = if self.fps == 0 {
+            FALLBACK_FPS
         } else {
-            1000 / u64::from(self.fps)
-        }
+            f64::from(self.fps)
+        };
+        1000.0 / fps
     }
 }
 
@@ -600,7 +607,26 @@ mod tests {
             duration_ms: 1000,
             has_audio: false,
         };
-        assert_eq!(facts.frame_ms(), 40);
+        assert_eq!(facts.frame_ms(), 40.0);
+    }
+
+    /// A thousand frames at 60 fps is 16.7 seconds of video. Whole-millisecond
+    /// pacing (`1000 / 60 == 16`) runs the entire clip about 4% fast, and the
+    /// clip never catches up, so the frame length has to keep the fraction.
+    #[test]
+    fn frame_pacing_keeps_the_fraction_of_a_rate_that_does_not_divide() {
+        let facts = VideoStreamFacts {
+            width: 640,
+            height: 480,
+            fps: 60,
+            duration_ms: 0,
+            has_audio: false,
+        };
+        let thousand: f64 = (0..1000).map(|_| facts.frame_ms()).sum();
+        assert!(
+            (thousand - 16_666.7).abs() < 1.0,
+            "1000 frames at 60 fps paced {thousand} ms, expected ~16666.7"
+        );
     }
 
     /// The mp4 header read — the no-ffprobe fallback, and the path the

@@ -422,19 +422,19 @@ impl LiveCard {
                 mailbox.duration_ms = duration_ms;
             }
             let mut pipe: Option<FramePipe> = None;
-            let mut playhead = 0u64;
+            let mut playhead = 0f64;
             while alive.load(Ordering::SeqCst) {
                 let mut opened = pipe.take();
                 if let Some(target) = mailbox.lock().ok().and_then(|m| m.seek) {
                     opened = None;
-                    playhead = target;
+                    playhead = target as f64;
                     if let Ok(mut m) = mailbox.lock() {
                         m.seek = None;
                     }
                 }
                 let Some(pipe_now) = opened else {
                     let open_path = path.clone();
-                    let at = playhead;
+                    let at = playhead as u64;
                     // A copy per open: the spawn below moves what it captures,
                     // and this loop opens the pipe again on every jump.
                     let open_facts = facts;
@@ -466,24 +466,24 @@ impl LiveCard {
                     // turn reads nothing again without ever reopening — a card
                     // that quietly burns a core.
                     pipe = None;
-                    playhead = 0;
+                    playhead = 0.0;
                     if let Ok(mut m) = mailbox.lock() {
                         m.ratio = 0.;
                     }
                     continue;
                 };
-                playhead = playhead.saturating_add(frame_ms);
+                playhead += frame_ms;
                 let image = card_frame(width, height, bytes);
                 if let Ok(mut m) = mailbox.lock() {
                     m.frame = image;
                     m.ratio = if duration_ms > 0 {
-                        (playhead as f64 / duration_ms as f64).clamp(0., 1.) as f32
+                        (playhead / duration_ms as f64).clamp(0., 1.) as f32
                     } else {
                         m.ratio
                     };
                 }
                 cx.background_executor()
-                    .timer(Duration::from_millis(frame_ms))
+                    .timer(Duration::from_secs_f64(frame_ms / 1000.0))
                     .await;
             }
             entity.update(cx, |this, cx| {
