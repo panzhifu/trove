@@ -2,10 +2,12 @@
 //! streamed file pulls, and size probes.
 //!
 //! candle is an inference engine — it ships no weights — so every local
-//! model (the transcriber's Whisper, the embedder's BGE) is fetched from a
-//! HuggingFace-style resolve URL at the user's ask. The mirrors are tried in
-//! order: hf-mirror first, because it is the path that works where
-//! huggingface.co does not, and where it works both serve identical bytes.
+//! model (the transcriber's Whisper, the embedder's BGE, the background
+//! remover's U²-Net) is fetched at the user's ask. Most of them come from a
+//! HuggingFace-style resolve URL, tried against the mirrors in order:
+//! hf-mirror first, because it is the path that works where huggingface.co
+//! does not, and where it works both serve identical bytes. A model published
+//! off-Hub names its own base instead — see [`urls_for`].
 //! A wrinkle the mirror order alone cannot hide: hf-mirror redirects the
 //! large checkpoints to HuggingFace's own CDN, whose connect/stream
 //! behaviour on constrained networks swings between fast and dead — so
@@ -44,8 +46,26 @@ pub(crate) const FETCH_ATTEMPTS: usize = 3;
 /// comfortably above the largest catalog checkpoint.
 const MAX_RESPONSE_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 
-/// Stream one model file to `dest` through the mirrors, returning the bytes
-/// written. `report` is called per chunk with the newly received bytes.
+/// The URLs a (source, file) pair can come from, in the order to try them.
+///
+/// A source is normally a HuggingFace-style `owner/repo`, which each mirror
+/// resolves. A model published somewhere other than the Hub — U²-Net's
+/// release assets — names its own base instead, and going through the mirror
+/// for that would be trusting whoever copied it there.
+fn urls_for(source: &str, file: &str) -> Vec<String> {
+    if source.starts_with("http://") || source.starts_with("https://") {
+        vec![format!("{source}/{file}")]
+    } else {
+        MIRRORS
+            .iter()
+            .map(|mirror| format!("{mirror}/{source}/resolve/main/{file}"))
+            .collect()
+    }
+}
+
+/// Stream one model file to `dest`, trying each URL the source resolves to,
+/// and return the bytes written. `report` is called per chunk with the newly
+/// received bytes.
 pub(crate) fn fetch_file(
     repo: &str,
     file: &str,
@@ -54,32 +74,29 @@ pub(crate) fn fetch_file(
     mut report: impl FnMut(u64),
 ) -> Result<u64> {
     let mut last_error: Option<Error> = None;
-    for mirror in MIRRORS {
-        match fetch_file_from(mirror, repo, file, dest, cancel, &mut report) {
+    for url in urls_for(repo, file) {
+        match fetch_url_from(&url, dest, cancel, &mut report) {
             Ok(written) => return Ok(written),
             Err(error) if cancel.load(Ordering::Relaxed) => return Err(error),
             Err(error) => {
-                tracing::warn!(mirror, file, %error, "model fetch: mirror failed, trying the next");
+                tracing::warn!(url, file, %error, "model fetch: source failed, trying the next");
                 last_error = Some(error);
             }
         }
     }
     Err(last_error.unwrap_or_else(|| Error::External {
         program: "model-fetch".into(),
-        message: "no mirror answered".into(),
+        message: "no source answered".into(),
     }))
 }
 
-fn fetch_file_from(
-    mirror: &str,
-    repo: &str,
-    file: &str,
+fn fetch_url_from(
+    url: &str,
     dest: &Path,
     cancel: &AtomicBool,
     report: &mut impl FnMut(u64),
 ) -> Result<u64> {
-    let url = format!("{mirror}/{repo}/resolve/main/{file}");
-    let response = ureq::get(&url)
+    let response = ureq::get(url)
         .config()
         .timeout_global(Some(Duration::from_secs(60 * 60)))
         .timeout_connect(Some(CONNECT_TIMEOUT))
@@ -126,14 +143,13 @@ fn fetch_file_from(
     Ok(written)
 }
 
-/// Ask a mirror how big `file` is. A server that does not advertise a
-/// length is fine — the progress bar loses its total, not the download.
+/// Ask a source how big `file` is. A server that does not advertise a length
+/// is fine — the progress bar loses its total, not the download.
 pub(crate) fn content_length(repo: &str, file: &str, cancel: &AtomicBool) -> Result<Option<u64>> {
-    for mirror in MIRRORS {
+    for url in urls_for(repo, file) {
         if cancel.load(Ordering::Relaxed) {
             break;
         }
-        let url = format!("{mirror}/{repo}/resolve/main/{file}");
         let probe = ureq::get(&url)
             .config()
             .timeout_global(Some(Duration::from_secs(60)))
@@ -144,16 +160,16 @@ pub(crate) fn content_length(repo: &str, file: &str, cancel: &AtomicBool) -> Res
         let response = match probe {
             Ok(response) => response,
             Err(error) => {
-                tracing::warn!(mirror, file, %error, "size probe: mirror failed, trying the next");
+                tracing::warn!(url, file, %error, "size probe: source failed, trying the next");
                 continue;
             }
         };
         if !(200..300).contains(&response.status().as_u16()) {
             tracing::warn!(
-                mirror,
+                url,
                 file,
                 status = response.status().as_u16(),
-                "size probe: mirror answered with an error status, trying the next"
+                "size probe: source answered with an error status, trying the next"
             );
             continue;
         }
@@ -165,7 +181,7 @@ pub(crate) fn content_length(repo: &str, file: &str, cancel: &AtomicBool) -> Res
     }
     Err(Error::External {
         program: "model-fetch".into(),
-        message: "no mirror answered the size probe".into(),
+        message: "no source answered the size probe".into(),
     })
 }
 

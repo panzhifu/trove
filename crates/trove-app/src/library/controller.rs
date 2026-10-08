@@ -76,6 +76,9 @@ pub enum Retryable {
     Transcription {
         request: trove_core::tasks::transcription::TranscribeRunRequest,
     },
+    Cutout {
+        ids: Vec<uuid::Uuid>,
+    },
 }
 
 /// The kind of a [`Retryable`], used as its map key.
@@ -87,6 +90,7 @@ pub fn retryable_kind(retryable: &Retryable) -> trove_core::tasks::TaskKind {
         Retryable::Analysis { .. } => TaskKind::AiAnalysis,
         Retryable::Export { .. } => TaskKind::Export,
         Retryable::Transcription { .. } => TaskKind::Transcription,
+        Retryable::Cutout { .. } => TaskKind::Matting,
     }
 }
 
@@ -441,6 +445,14 @@ pub struct LibraryController {
     /// download's progress or failure — the row matches on this before
     /// showing the state.
     pub embed_model_download_for: Option<String>,
+    /// The background-removal checkpoint's download state — the same shape
+    /// again, and its own slot so a cutout download never overwrites the
+    /// progress a Whisper or BGE download is reporting.
+    pub matting_model_download: Option<ModelDownload>,
+    /// Files a finished cutout run wrote into the incoming directory. The job
+    /// watcher has no window to import with, so it leaves the list here and
+    /// the app view's observer runs the import.
+    pub pending_cutout_import: Option<Vec<std::path::PathBuf>>,
     /// Assets a just-finished transcription run asked to export as subtitle
     /// sidecars. The job watcher leaves the ids here and the app view's
     /// controller observer — which has a window — does the writing and the
@@ -560,6 +572,8 @@ impl LibraryController {
             local_model_download: None,
             embed_model_download: None,
             embed_model_download_for: None,
+            matting_model_download: None,
+            pending_cutout_import: None,
             pending_subtitle_save: None,
             pending_subtitle_open: None,
             query_vector: None,

@@ -84,6 +84,7 @@ fn task_kind_label(kind: &TaskKind) -> SharedString {
         TaskKind::EmbeddingBackfill | TaskKind::VisualBackfill => "task.kind_embedding",
         TaskKind::AiAnalysis | TaskKind::AutoTag => "task.kind_analysis",
         TaskKind::Transcription => "task.kind_transcription",
+        TaskKind::Matting => "task.kind_matting",
         TaskKind::Maintenance => "task.kind_maintenance",
         TaskKind::WatchScan => "task.kind_watch",
         TaskKind::ModelPreview => "task.kind_model",

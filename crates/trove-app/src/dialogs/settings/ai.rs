@@ -83,6 +83,7 @@ pub(super) fn ai_page(controller: &Entity<LibraryController>, cx: &App) -> Setti
         .group(analysis_run_group(controller))
         .group(transcription_group(controller, &transcription_probe))
         .group(transcription_run_group(controller))
+        .group(matting_group(controller))
 }
 
 // ============================ vendor registry ================================
@@ -1333,7 +1334,7 @@ fn local_model_row(controller: &Entity<LibraryController>, cx: &mut App) -> Div 
             cx.theme().danger,
             Some(rust_i18n::t!("settings.local_model_retry").to_string()),
         ),
-        None => match lm::status() {
+        None => match lm::status(&lm::WHISPER) {
             lm::ModelStatus::Ready { path } => (
                 rust_i18n::t!(
                     "settings.local_model_ready",
@@ -1380,7 +1381,7 @@ fn local_model_row(controller: &Entity<LibraryController>, cx: &mut App) -> Div 
                 }),
         );
     }
-    if matches!(lm::status(), lm::ModelStatus::Ready { .. }) {
+    if matches!(lm::status(&lm::WHISPER), lm::ModelStatus::Ready { .. }) {
         let controller = controller.clone();
         row = row.child(
             Button::new("local-model-delete")
@@ -1396,6 +1397,105 @@ fn local_model_row(controller: &Entity<LibraryController>, cx: &mut App) -> Div 
     }
     row
 }
+/// The background remover's own group: the checkpoint it needs, where it came
+/// from, and the one button that fetches it. Not gated on any setting — the
+/// menu item is the feature's switch, and this row is what it asks for when
+/// the weights are not there yet.
+fn matting_group(controller: &Entity<LibraryController>) -> SettingGroup {
+    SettingGroup::new().item(
+        SettingItem::new(
+            rust_i18n::t!("matting.model_item").to_string(),
+            SettingField::render({
+                let controller = controller.clone();
+                move |_, _, cx| matting_model_row(&controller, cx)
+            }),
+        )
+        .description(rust_i18n::t!("matting.model_desc").to_string()),
+    )
+}
+
+/// The U²-Net checkpoint's row: where it is, how the download is going, and
+/// the button that starts or retries it.
+fn matting_model_row(controller: &Entity<LibraryController>, cx: &mut App) -> Div {
+    use trove_core::services::local_model as lm;
+
+    let status = lm::status(&lm::U2NET);
+    let (text, color, download_label) = match controller.read(cx).matting_model_download.clone() {
+        Some(ModelDownload::Running { received, total }) => {
+            let text = if total > 0 {
+                rust_i18n::t!(
+                    "matting.model_progress",
+                    received = received / 1_048_576,
+                    total = total / 1_048_576
+                )
+                .to_string()
+            } else {
+                rust_i18n::t!("matting.model_downloading").to_string()
+            };
+            (text, cx.theme().muted_foreground, None)
+        }
+        Some(ModelDownload::Failed { message }) => (
+            rust_i18n::t!("matting.model_failed", error = message.as_str()).to_string(),
+            cx.theme().danger,
+            Some(rust_i18n::t!("matting.model_retry").to_string()),
+        ),
+        None => match &status {
+            lm::ModelStatus::Ready { path } => (
+                rust_i18n::t!("matting.model_ready", path = path.display().to_string()).to_string(),
+                cx.theme().success,
+                None,
+            ),
+            lm::ModelStatus::Missing => (
+                rust_i18n::t!("matting.model_missing").to_string(),
+                cx.theme().muted_foreground,
+                Some(rust_i18n::t!("matting.model_download").to_string()),
+            ),
+        },
+    };
+
+    let mut row = h_flex()
+        .w_full()
+        .items_center()
+        .justify_between()
+        .gap_2()
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .text_sm()
+                .text_color(color)
+                .child(text),
+        );
+    if let Some(label) = download_label {
+        let controller = controller.clone();
+        row = row.child(
+            Button::new("matting-model-download")
+                .outline()
+                .small()
+                .flex_none()
+                .label(label)
+                .on_click(move |_, window, cx| {
+                    crate::library::jobs::start_u2net_download_app(&controller, None, window, cx);
+                }),
+        );
+    }
+    if matches!(status, lm::ModelStatus::Ready { .. }) {
+        let controller = controller.clone();
+        row = row.child(
+            Button::new("matting-model-delete")
+                .ghost()
+                .small()
+                .flex_none()
+                .icon(IconName::Trash)
+                .tooltip(rust_i18n::t!("settings.model_delete").to_string())
+                .on_click(move |_, window, cx| {
+                    crate::library::jobs::delete_u2net_app(&controller, window, cx);
+                }),
+        );
+    }
+    row
+}
+
 /// The connection-test row for the transcription endpoint. The probe uploads
 /// silence, so an empty reply is the *success* shape here — the row says so
 /// rather than showing a blank line.

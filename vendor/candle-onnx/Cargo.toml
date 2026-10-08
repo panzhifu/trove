@@ -1,0 +1,30 @@
+# Vendored candle-onnx 0.11.0. Provenance: crates.io `candle-onnx` 0.11.0
+# (MIT OR Apache-2.0), repository https://github.com/huggingface/candle —
+# `Cargo.toml.orig` is upstream's own manifest, and `src/` is upstream's
+# `src/` plus one generated file.
+#
+# The one change: `prost-build` needs a `protoc` binary at build time and does
+# not ship one, so an unpatched candle-onnx makes *every* build — CI's four
+# release targets among them, none of which install protobuf — depend on a
+# system compiler. The message code is therefore checked in as
+# `src/onnx_generated.rs` (generated once from the bundled `onnx.proto3`) and
+# `build.rs` is gone. Nothing else differs. Re-copy from the registry when
+# candle moves, and regenerate the file rather than editing it.
+[package]
+name = "candle-onnx"
+version = "0.11.0"
+edition = "2021"
+build = false
+description = "ONNX support for Candle"
+keywords = ["blas", "tensor", "machine-learning"]
+categories = ["science"]
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+candle = { version = "0.11.0", package = "candle-core" }
+candle-nn = "0.11.0"
+prost = "0.14.1"
+
+[dev-dependencies]
+anyhow = { version = "1", features = ["backtrace"] }
+clap = { version = "4.5.49", features = ["derive"] }

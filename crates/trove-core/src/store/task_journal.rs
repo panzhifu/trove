@@ -198,6 +198,7 @@ fn kind_to_str(kind: &TaskKind) -> String {
         TaskKind::Transcription => "transcribe".into(),
         TaskKind::Migration => "migration".into(),
         TaskKind::Export => "export".into(),
+        TaskKind::Matting => "matting".into(),
         TaskKind::Custom(name) => format!("plugin:{name}"),
     }
 }
@@ -218,6 +219,7 @@ fn str_to_kind(s: &str) -> TaskKind {
         "transcribe" => TaskKind::Transcription,
         "migration" => TaskKind::Migration,
         "export" => TaskKind::Export,
+        "matting" => TaskKind::Matting,
         other => {
             // Custom kinds are stored as "plugin:<name>"; unknown slugs
             // without the prefix are still surfaced as Custom so the journal

@@ -106,7 +106,7 @@ pub(crate) fn asset_context_menu(
             .and_then(|a| trove_core::media::thumb::blob_path(ctl.library.root(), &a))
     };
 
-    let mut menu = menu
+    let menu = menu
         .min_w(px(200.))
         .item(
             PopupMenuItem::new(rust_i18n::t!("autotag.menu").to_string()).on_click({
@@ -134,6 +134,22 @@ pub(crate) fn asset_context_menu(
                 }
             }),
         );
+
+    // Background removal works on pixels, so it is an image item; and it takes
+    // the whole selection, because cutting out fifty product shots is one job
+    // with one progress line, not fifty clicks.
+    let mut menu = menu;
+    if is_image {
+        let c_cutout = controller.clone();
+        menu = menu.item(
+            PopupMenuItem::new(rust_i18n::t!("matting.menu").to_string()).on_click(
+                move |_, window, cx| {
+                    let ids = c_cutout.read(cx).action_targets(asset_id);
+                    crate::library::jobs::cutout_assets_app(&c_cutout, ids, window, cx);
+                },
+            ),
+        );
+    }
 
     if is_av && (has_transcript || has_srt) {
         let c_view = controller.clone();

@@ -210,9 +210,10 @@ sys-locale = "0.3"
 # priority over the X11 backend when the compositor speaks the protocol.
 arboard = { version = "3", features = ["wayland-data-control"] }
 
-# No `[patch.crates-io]` section on purpose: `gpui-kit` is declared as a git
-# dependency above, and everything else it drags in is either a path member of
-# that checkout or a crates.io crate at the version upstream asks for.
+# `gpui-kit` needs no entry below: it is declared as a git dependency above,
+# and everything it drags in is either a path member of that checkout or a
+# crates.io crate at the version upstream asks for. The two entries that are
+# here patch candle itself, for reasons recorded next to each.
 
 # CUDA 13's headers ship __hmax_nan/__hmin_nan for host and device, which
 # collides with candle-kernels 0.11's own compatibility shim; the vendored
@@ -222,3 +223,7 @@ arboard = { version = "3", features = ["wayland-data-control"] }
 # release with CUDA 13 support.
 [patch.crates-io]
 candle-kernels = { path = "vendor/candle-kernels" }
+# The ONNX interpreter the background remover drives. Vendored for one reason:
+# its build script calls prost-build, which requires a system `protoc` it does
+# not provide — see vendor/candle-onnx/Cargo.toml.
+candle-onnx = { path = "vendor/candle-onnx" }

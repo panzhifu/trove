@@ -21,7 +21,7 @@ mod embed_local;
 pub use embed_local::LocalBert;
 mod embedding_openai;
 mod http;
-mod local_device;
+pub(crate) mod local_device;
 pub mod mock;
 pub mod search_planner;
 pub mod transcribe;

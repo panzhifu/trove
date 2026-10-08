@@ -31,7 +31,7 @@ pub fn ensure_local_model_app(
     cx: &mut App,
 ) -> bool {
     if matches!(
-        local_model::status(),
+        local_model::status(&local_model::WHISPER),
         local_model::ModelStatus::Ready { .. }
     ) {
         return true;
@@ -59,7 +59,7 @@ pub fn ensure_local_model_app(
             .description(
                 rust_i18n::t!(
                     "settings.local_model_dialog_description",
-                    mb = local_model::MODEL_DOWNLOAD_MB
+                    mb = local_model::WHISPER.download_mb
                 )
                 .to_string(),
             )
@@ -114,7 +114,7 @@ pub fn delete_local_model_app(
             .description(
                 rust_i18n::t!(
                     "settings.model_delete_body",
-                    mb = local_model::MODEL_DOWNLOAD_MB
+                    mb = local_model::WHISPER.download_mb
                 )
                 .to_string(),
             )
@@ -122,7 +122,7 @@ pub fn delete_local_model_app(
             .ok_text(rust_i18n::t!("settings.model_delete").to_string())
             .cancel_text(rust_i18n::t!("settings.local_model_not_now").to_string())
             .on_ok(move |_, window, cx| {
-                match local_model::delete() {
+                match local_model::delete(&local_model::WHISPER) {
                     Ok(()) => {
                         window.push_notification(
                             Notification::success(
@@ -182,10 +182,13 @@ pub fn start_model_download_app(
             let outcome = outcome.clone();
             cx.background_executor()
                 .spawn(async move {
-                    let result =
-                        local_model::download(&AtomicBool::new(false), &|received, total| {
+                    let result = local_model::download(
+                        &local_model::WHISPER,
+                        &AtomicBool::new(false),
+                        &|received, total| {
                             *progress.lock().unwrap() = (received, total);
-                        });
+                        },
+                    );
                     *outcome.lock().unwrap() =
                         Some(result.map(|_| ()).map_err(|error| error.to_string()));
                     finished.store(true, Ordering::Relaxed);

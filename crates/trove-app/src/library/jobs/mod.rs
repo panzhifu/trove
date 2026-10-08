@@ -16,6 +16,8 @@ mod embedding;
 mod export;
 mod import;
 mod local_model;
+mod matting;
+mod matting_model;
 mod migrate;
 mod search;
 mod subtitles;
@@ -227,6 +229,8 @@ pub use self::{
         ImportTaskHandle, InboxDrain, collect_inbox_app, import_copied_app, import_paths_app,
     },
     local_model::{delete_local_model_app, start_model_download_app},
+    matting::cutout_assets_app,
+    matting_model::{delete_u2net_app, start_u2net_download_app},
     migrate::{start_migration_job_app, start_migration_standalone},
     search::{request_ai_plan_app, request_query_embedding_app},
     subtitles::{auto_save_subtitles_app, ensure_subtitle_asset},

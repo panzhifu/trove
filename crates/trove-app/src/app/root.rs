@@ -424,6 +424,12 @@ impl AppView {
             {
                 crate::library::jobs::auto_save_subtitles_app(&controller, request, window, cx);
             }
+            // A finished cutout run left its PNGs in the incoming directory;
+            // they become assets only here, where there is a window to import
+            // with and a collection to file them under.
+            if let Some(paths) = controller.update(cx, |ctl, _| ctl.pending_cutout_import.take()) {
+                crate::library::jobs::import_paths_app(&controller, paths, window, cx);
+            }
             // A thumbnail rebuild rewrites the files but not their paths; the
             // epoch is the signal to drop the cached decodes so the next
             // paint re-reads the pictures from disk.

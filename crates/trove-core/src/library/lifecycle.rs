@@ -91,6 +91,52 @@ impl Library {
     /// `{n}` in `pattern` expands to the running index starting at
     /// `start_number`; `{name}` expands to the original file stem. Recorded
     /// as one undoable operation.
+    /// Start one background-removal run over this library's images.
+    ///
+    /// The checkpoint path comes in resolved, so the caller owns the "is the
+    /// model on disk" conversation. Retried once: the ways the run fails *as a
+    /// whole* are opening ones (database, output directory, a model file that
+    /// vanished mid-run), and an asset that failed inside a run is counted,
+    /// not retried.
+    pub fn start_cutout(
+        &self,
+        options: crate::tasks::matting::CutoutOptions,
+    ) -> std::result::Result<
+        (
+            crate::tasks::TaskId,
+            std::sync::mpsc::Receiver<crate::tasks::matting::CutoutOutcome>,
+        ),
+        crate::tasks::StartError,
+    > {
+        let label = format!("matting ({})", options.only.len());
+        self.tasks.start_with_retry(
+            crate::tasks::TaskKind::Matting,
+            label,
+            crate::tasks::RetryPolicy::times(1),
+            move || {
+                let options = options.clone();
+                Box::new(move |ctx| crate::tasks::matting::run(&options, ctx))
+            },
+        )
+    }
+
+    /// The options a cutout run over `ids` would use: this library's files,
+    /// the global incoming directory for the results, and the model the caller
+    /// confirmed is on disk.
+    pub fn cutout_options(
+        &self,
+        ids: &[Uuid],
+        model_path: std::path::PathBuf,
+    ) -> crate::tasks::matting::CutoutOptions {
+        crate::tasks::matting::CutoutOptions {
+            db_path: self.root.join("library.db"),
+            data_root: self.root.clone(),
+            out_dir: crate::paths::incoming_dir(),
+            model_path,
+            only: ids.to_vec(),
+        }
+    }
+
     pub fn batch_rename(&self, ids: &[Uuid], pattern: &str, start_number: u32) -> Result<u64> {
         let pattern = pattern.trim();
         if pattern.is_empty() {

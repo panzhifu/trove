@@ -78,7 +78,7 @@ impl LocalWhisper {
 /// broken install fails the run with a clear message instead of at first
 /// use.
 pub fn build(config: &TranscriptionConfig) -> crate::error::Result<LocalWhisper> {
-    let dir = match crate::services::local_model::status() {
+    let dir = match crate::services::local_model::status(&crate::services::local_model::WHISPER) {
         crate::services::local_model::ModelStatus::Ready { path } => path,
         crate::services::local_model::ModelStatus::Missing => {
             return Err(crate::error::Error::External {

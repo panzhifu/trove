@@ -19,6 +19,8 @@ pub mod hdr;
 pub mod height_color;
 pub mod import;
 pub mod index;
+/// Background removal: a U²-Net saliency graph through candle-onnx.
+pub mod matting;
 pub mod metadata;
 pub mod pipeline;
 pub mod precheck;

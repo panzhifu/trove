@@ -49,6 +49,7 @@ pub mod embed;
 pub mod export;
 pub mod ignore;
 pub mod import;
+pub mod matting;
 pub mod migration;
 pub mod transcription;
 pub mod watch;
@@ -123,6 +124,10 @@ pub enum TaskKind {
     /// remuxed through the system ffmpeg. Reads the library, writes only
     /// outside it.
     Export,
+    /// Background removal: run the local saliency graph over a set of images
+    /// and write each transparent PNG. CPU-bound and serial by nature — one
+    /// inference per asset, two seconds each on a modern desktop core.
+    Matting,
     /// A plugin-registered task type. The string is the plugin's stable name
     /// for the kind, used in logs, the journal, and mutual-exclusion checks.
     Custom(Cow<'static, str>),
@@ -146,6 +151,7 @@ impl TaskKind {
             TaskKind::Transcription => Cow::Borrowed("transcribe"),
             TaskKind::Migration => Cow::Borrowed("migration"),
             TaskKind::Export => Cow::Borrowed("export"),
+            TaskKind::Matting => Cow::Borrowed("matting"),
             TaskKind::Custom(name) => Cow::Borrowed(name),
         }
     }

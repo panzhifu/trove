@@ -1085,6 +1085,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "candle-onnx"
+version = "0.11.0"
+dependencies = [
+ "candle-core",
+ "candle-nn",
+ "prost",
+]
+
+[[package]]
 name = "candle-transformers"
 version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7363,6 +7372,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "prost"
+version = "0.14.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "528ac67416ff8646872a3c02cad9cc4ee5dc9f9540c9b10771855c95cb2e5ae1"
+dependencies = [
+ "bytes",
+ "prost-derive",
+]
+
+[[package]]
+name = "prost-derive"
+version = "0.14.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b570b25f7617e43d59005d0990ccb79e950a423952cea19671b7a876da390adf"
+dependencies = [
+ "anyhow",
+ "itertools 0.14.0",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
+
+[[package]]
 name = "psd"
 version = "0.3.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9861,6 +9893,7 @@ dependencies = [
  "blake3",
  "candle-core",
  "candle-nn",
+ "candle-onnx",
  "candle-transformers",
  "chardetng",
  "chrono",

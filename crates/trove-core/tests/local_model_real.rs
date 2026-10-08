@@ -7,8 +7,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 #[test]
 #[ignore]
 fn model_is_complete_on_disk() {
-    let dir = trove_core::services::local_model::download(&AtomicBool::new(false), &|_, _| {})
-        .expect("the download must succeed");
+    let dir = trove_core::services::local_model::download(
+        &trove_core::services::local_model::WHISPER,
+        &AtomicBool::new(false),
+        &|_, _| {},
+    )
+    .expect("the download must succeed");
     println!("landed at {dir:?}");
 }
 

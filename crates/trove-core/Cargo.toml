@@ -117,6 +117,7 @@ candle-transformers = "0.11"
 # Whisper's own tokenizer (BPE), loaded from the model directory. The
 # tokenizers crate is pure Rust.
 tokenizers = "0.21"
+candle-onnx = "0.11.0"
 
 [dev-dependencies]
 # Same reasoning as `exr` above, and the same shape of problem: `image`'s GIF

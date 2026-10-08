@@ -239,7 +239,7 @@ pub fn start_analysis_app(
     if transcription.engine == trove_core::config::TranscriptionEngine::Local
         && matches!(target, AnalysisTarget::Selection)
         && !matches!(
-            trove_core::services::local_model::status(),
+            trove_core::services::local_model::status(&trove_core::services::local_model::WHISPER),
             trove_core::services::local_model::ModelStatus::Ready { .. }
         )
     {
@@ -411,6 +411,9 @@ pub fn retry_task_app(
         }
         Retryable::Transcription { request } => {
             start_transcription_request_app(controller, request.clone(), window, cx)
+        }
+        Retryable::Cutout { ids } => {
+            super::matting::cutout_assets_app(controller, ids.clone(), window, cx)
         }
     }
 }

@@ -2236,3 +2236,74 @@ fn ensure_linked_file_is_idempotent_and_refreshes_content() {
 
     std::fs::remove_dir_all(&root).ok();
 }
+
+/// The whole cutout path against a real library and the real checkpoint:
+/// import one image, run the job exactly as the context menu does, and check
+/// a transparent PNG of the source's own dimensions came out the other side.
+/// Needs the 168 MB model on disk, so it is a gate to run by hand rather than
+/// a cost every `cargo test` pays.
+///
+/// ```text
+/// TROVE_U2NET=/path/u2net.onnx cargo test -p trove-core --lib cutout -- --ignored
+/// ```
+#[test]
+#[ignore = "needs the u2net checkpoint on disk"]
+fn a_cutout_run_writes_a_transparent_png_per_asset() {
+    use crate::tasks::matting::CutoutOptions;
+
+    let model = std::env::var("TROVE_U2NET").expect("set TROVE_U2NET to a u2net.onnx");
+    let (lib, root) = temp_library("cutout");
+    let outside = std::env::temp_dir().join(format!("trove-cutout-src-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&outside).unwrap();
+
+    // A subject on a ground, big enough that "some pixels kept, some dropped"
+    // is a claim about the mask rather than about interpolation noise.
+    let subject = image::RgbaImage::from_fn(640, 480, |x, y| {
+        if (x as i32 - 320).abs() < 120 && (y as i32 - 240).abs() < 90 {
+            image::Rgba([230, 200, 40, 255])
+        } else {
+            let v = 40 + (x as u8) / 4;
+            image::Rgba([v, v, v, 255])
+        }
+    });
+    let source = outside.join("subject.png");
+    subject.save(&source).unwrap();
+
+    let report = lib
+        .import_into_store(std::slice::from_ref(&source), None)
+        .unwrap();
+    assert_eq!(report.imported_count(), 1);
+    let ids: Vec<Uuid> = assets::query(lib.store().conn(), &AssetQuery::live())
+        .unwrap()
+        .items
+        .iter()
+        .map(|asset| asset.id)
+        .collect();
+
+    let options = CutoutOptions {
+        db_path: root.join("library.db"),
+        data_root: root.clone(),
+        out_dir: outside.join("out"),
+        model_path: PathBuf::from(&model),
+        only: ids,
+    };
+    let (_task, rx) = lib.start_cutout(options).unwrap();
+    let outcome = rx.recv().unwrap();
+    assert_eq!(outcome.cut, 1, "outcome says {outcome:?}");
+    assert_eq!(outcome.written.len(), 1);
+
+    let written = &outcome.written[0];
+    assert!(written.is_file(), "the run reported {}", written.display());
+    let cutout = image::open(written).unwrap().to_rgba8();
+    assert_eq!((cutout.width(), cutout.height()), (640, 480));
+    let kept = cutout.pixels().filter(|p| p[3] > 200).count();
+    let dropped = cutout.pixels().filter(|p| p[3] < 60).count();
+    assert!(
+        kept > 1000 && dropped > 1000,
+        "kept {kept}, dropped {dropped} of {}",
+        640 * 480
+    );
+
+    std::fs::remove_dir_all(&outside).ok();
+    std::fs::remove_dir_all(&root).ok();
+}
