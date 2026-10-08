@@ -139,8 +139,14 @@ jobs:
       # What miri *can* check is the pure-Rust surface, which is where a new
       # hand-written `unsafe` would most likely appear; the filters keep the
       # run off the FFI paths it would abort on.
+      #
+      # The filter is a substring, not a prefix: bare `model::` also selects
+      # `services::embed_model` and `services::local_model`, and those tests
+      # create directories — which Miri's isolation refuses outright
+      # (`unsupported operation: mkdir not available`). `--skip services::`
+      # keeps the step to what its name claims: the `model::` module.
       - name: Miri (model)
-        run: "cargo +nightly miri test -p trove-core --lib model::"
+        run: "cargo +nightly miri test -p trove-core --lib -- model:: --skip services::"
 
       - name: Miri (sync)
-        run: "cargo +nightly miri test -p trove-core --lib sync::"
+        run: "cargo +nightly miri test -p trove-core --lib -- sync::"

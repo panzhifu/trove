@@ -231,6 +231,20 @@ pub fn open_url(url: &str) -> Result<(), Error> {
 mod tests {
     use super::*;
 
+    /// The argument list `plan` owes an explicit app on *this* platform: the
+    /// file and nothing invented around it — except on macOS, where the file
+    /// has to reach the app through `open -a`, so the launcher's own two
+    /// arguments ride in front. Asserting the Linux shape unconditionally is
+    /// what made these two tests fail on the mac runner while the code they
+    /// cover was right.
+    fn expected_app_args(app: &str, path: &str) -> Vec<String> {
+        if cfg!(target_os = "macos") {
+            vec!["-a".into(), app.into(), path.into()]
+        } else {
+            vec![path.into()]
+        }
+    }
+
     #[test]
     fn default_plan_builds_a_command() {
         let _ = plan(Path::new("/tmp/file.png"), OpenTarget::Default);
@@ -287,7 +301,11 @@ mod tests {
             .get_args()
             .map(|arg| arg.to_string_lossy().into_owned())
             .collect();
-        assert_eq!(args, vec!["/tmp/scene.blend"], "a .blend opens natively");
+        assert_eq!(
+            args,
+            expected_app_args("/usr/bin/blender", "/tmp/scene.blend"),
+            "a .blend opens natively"
+        );
     }
 
     #[test]
@@ -300,7 +318,10 @@ mod tests {
             .get_args()
             .map(|arg| arg.to_string_lossy().into_owned())
             .collect();
-        assert_eq!(args, vec!["/tmp/model.obj"]);
+        assert_eq!(
+            args,
+            expected_app_args("/usr/bin/meshlab", "/tmp/model.obj")
+        );
     }
 
     #[test]
